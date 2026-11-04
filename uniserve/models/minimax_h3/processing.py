@@ -4,7 +4,7 @@ The serving path plans and presents every MiniMax-H3 request in Rust
 (``crates/daemon/src/serving/video``): the canvas and frame count, the size
 every condition is prepared at, the Qwen3-VL vision grids and the tokenized
 presentation. Those rules are the ``models`` crate's
-(``crates/models/src/video``), checked against
+(``crates/models/rules/src/video``), checked against
 ``tests/python/fixtures/minimax_h3_plan.json``, which is generated from the
 diffusers reference pipeline.
 

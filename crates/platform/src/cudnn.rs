@@ -48,6 +48,33 @@
 //! and the current implementation keeps that precision (§9). The audio
 //! decoder's convolutions use the same FP32 type.
 //!
+//! # Layouts, bias and groups
+//!
+//! [`Tensor`] carries strides as well as dimensions, so a tensor's layout is
+//! whatever its strides say: contiguous `NCDHW`, or channels-last `NDHWC`
+//! with strides `(D·H·W·C, 1, H·W·C, W·C, C)`, which is the layout the video
+//! VAE keeps its weights and activations in. cuDNN proposes engines only for
+//! the layouts it supports, so a layout it has none for is a plan that names
+//! no engine.
+//!
+//! A convolution here has no bias and no groups: PyTorch adds a cuDNN
+//! convolution's bias in a separate pass, so the caller adds it, and cuDNN's
+//! backend convolution descriptor has no group field, so a grouped
+//! convolution (the audio decoder's depthwise alias-free resamplers, which
+//! design §9 fuses into kernel programs) is not served by this binding.
+//!
+//! # Alignment
+//!
+//! cuDNN 9 requires every tensor descriptor to declare the alignment of the
+//! storage it will be pointed at, and proposes the engines that are valid for
+//! it; a descriptor without one is refused at `cudnnBackendFinalize` with
+//! `CUDNN_STATUS_BAD_PARAM`. [`Tensor::contiguous`] declares 16 bytes — what
+//! every device allocation of this crate and every torch storage provide —
+//! and [`Tensor::with_alignment`] states a smaller one for a view into the
+//! middle of a row. [`Cudnn::run`] refuses an address that is not aligned the
+//! way the plan's tensors declare, so a wrong declaration is an error here
+//! rather than a misaligned read on the device.
+//!
 //! # Streams and graphs
 //!
 //! Every call enters the device's primary context on the calling thread, so
@@ -61,13 +88,18 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DataType, Device, DeviceId, Error, Result, Stream};
+use crate::{DataType, Device, DeviceId, DeviceRange, Error, Result, Stream};
 
 const LIBCUDNN: &str = "libcudnn.so.9";
 
 /// `cudnnStatus_t`.
 type Status = i32;
 const STATUS_SUCCESS: Status = 0;
+
+/// The alignment [`Tensor::contiguous`] declares: every device allocation of
+/// this crate and every torch storage is at least this aligned, and cuDNN's
+/// engines that vectorize want it.
+const DEFAULT_ALIGNMENT: i64 = 16;
 
 /// `cudnnBackendDescriptorType_t`: the kinds of descriptor this module
 /// creates.
@@ -94,6 +126,7 @@ const ATTR_ENGINEHEUR_MODE: i32 = 200;
 const ATTR_ENGINEHEUR_OPERATION_GRAPH: i32 = 201;
 const ATTR_ENGINEHEUR_RESULTS: i32 = 202;
 const ATTR_ENGINECFG_ENGINE: i32 = 300;
+const ATTR_EXECUTION_PLAN_HANDLE: i32 = 400;
 const ATTR_EXECUTION_PLAN_ENGINE_CONFIG: i32 = 401;
 const ATTR_EXECUTION_PLAN_WORKSPACE_SIZE: i32 = 402;
 const ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA: i32 = 700;
@@ -108,7 +141,9 @@ const ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC: i32 = 708;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_W: i32 = 709;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
+const ATTR_OPERATIONGRAPH_HANDLE: i32 = 800;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
+const ATTR_TENSOR_BYTE_ALIGNMENT: i32 = 900;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
 const ATTR_TENSOR_STRIDES: i32 = 903;
@@ -117,24 +152,41 @@ const ATTR_VARIANT_PACK_UNIQUE_IDS: i32 = 1000;
 const ATTR_VARIANT_PACK_DATA_POINTERS: i32 = 1001;
 const ATTR_VARIANT_PACK_WORKSPACE: i32 = 1003;
 const ATTR_ENGINE_GLOBAL_INDEX: i32 = 1301;
+const ATTR_ENGINE_NUMERICAL_NOTE: i32 = 1303;
 
 /// `cudnnBackendAttributeType_t`: the C type of each attribute's value.
+const TYPE_HANDLE: i32 = 0;
 const TYPE_DATA_TYPE: i32 = 1;
 const TYPE_INT64: i32 = 3;
 const TYPE_FLOAT: i32 = 4;
 const TYPE_VOID_PTR: i32 = 6;
 const TYPE_CONVOLUTION_MODE: i32 = 7;
 const TYPE_HEUR_MODE: i32 = 8;
+const TYPE_NUMERICAL_NOTE: i32 = 11;
 const TYPE_BACKEND_DESCRIPTOR: i32 = 15;
 
 /// `CUDNN_HEUR_MODE_A`: cuDNN's own heuristic, which measures nothing and
 /// returns the engines it knows for the shape, best first. This is how the
 /// tuning data is made (§5.4); service never calls it.
 const HEURISTIC_MODE_A: i32 = 3;
+/// `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`: an engine that reduces its
+/// inputs' precision before multiplying them — TF32 for FP32 inputs.
+const NUMERICAL_NOTE_DOWN_CONVERT_INPUTS: i32 = 1;
+
 /// `CUDNN_CROSS_CORRELATION`: the convolution PyTorch's `Conv*d` computes.
 const CROSS_CORRELATION: i32 = 1;
 
-/// The most engine configurations one heuristic query is asked to return.
+/// `CUDNN_HEUR_MODE_B`: the exhaustive list of engine configurations for the
+/// operation graph, where [`HEURISTIC_MODE_A`] is the performance shortlist
+/// (often one configuration).
+const HEURISTIC_MODE_B: i32 = 1;
+
+/// The most engine configurations a query keeps after reading them all.
+///
+/// The array handed to the library always holds one created descriptor per
+/// configuration the heuristic reported, never fewer: it is the *requested*
+/// count, and asking for part of a list is not how the library is written to
+/// work. This cap is applied to what is kept.
 const MAX_ENGINE_CONFIGS: usize = 32;
 
 /// The unique ids that tie the three tensors of the operation graph to the
@@ -239,19 +291,24 @@ impl Api {
         if status == STATUS_SUCCESS {
             return Ok(());
         }
+        Err(Error::Cudnn {
+            call,
+            code: status,
+            message: self.last_error(),
+        })
+    }
+
+    /// The library's text for the last call that failed.
+    fn last_error(&self) -> String {
         let mut message = [0 as c_char; 256];
         // SAFETY: the library writes at most `message.len()` bytes; the
         // buffer outlives the call.
         unsafe { (self.get_last_error)(message.as_mut_ptr(), message.len()) };
         // SAFETY: the library fills the buffer with a NUL-terminated string.
-        let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+        unsafe { CStr::from_ptr(message.as_ptr()) }
             .to_str()
-            .unwrap_or("non-UTF-8 cuDNN error");
-        Err(Error::Cudnn {
-            call,
-            code: status,
-            message: text.to_owned(),
-        })
+            .unwrap_or("non-UTF-8 cuDNN error")
+            .to_owned()
     }
 
     /// Sets one attribute from `values`, whose C type the caller names.
@@ -306,7 +363,12 @@ impl Api {
         values: &mut [T],
         call: &'static str,
     ) -> Result<usize> {
-        let mut written = 0i64;
+        // cuDNN's element count is an in/out parameter: the library is told
+        // how many elements the array holds by `requestedElementCount` and
+        // how many it may write by this value, and it answers a `0` with a
+        // write of nothing — a full list read back as empty. `cuDNN_frontend`
+        // initialises it to `-1` before every read, and so does this.
+        let mut written = -1i64;
         // SAFETY: `values` has room for `values.len()` elements of the
         // attribute's documented C type, and both outlive the call; the
         // descriptor is live.
@@ -326,7 +388,9 @@ impl Api {
 
     /// Reads the element count of an attribute that holds a list.
     fn count(&self, descriptor: &Descriptor, attribute: i32, kind: i32) -> Result<usize> {
-        let mut written = 0i64;
+        // As in `get`: the count is in/out and starts at `-1`, which is what
+        // asks the library for the list's length rather than for nothing.
+        let mut written = -1i64;
         // SAFETY: an element count of zero asks for the list's length and
         // writes no element; the local outlives the call and the descriptor
         // is live.
@@ -359,6 +423,13 @@ pub struct Tensor {
     pub dims: Vec<i64>,
     pub strides: Vec<i64>,
     pub dtype: DataType,
+    /// The alignment of the tensor's base address in bytes, which the
+    /// descriptor declares to cuDNN: the storage the operation is handed must
+    /// be aligned to it. Every device allocation this crate makes and every
+    /// torch storage are at least 16-byte aligned, which is what
+    /// [`Tensor::contiguous`] declares; a view into the middle of an element
+    /// boundary is not, and says so with [`Tensor::with_alignment`].
+    pub byte_alignment: i64,
 }
 
 impl Tensor {
@@ -373,7 +444,16 @@ impl Tensor {
             dims,
             strides,
             dtype,
+            byte_alignment: DEFAULT_ALIGNMENT,
         }
+    }
+
+    /// The same tensor, with the alignment of its storage declared as
+    /// `bytes`: cuDNN uses it to choose engines that may vectorize, so it
+    /// must be what the address really is — never more.
+    pub fn with_alignment(mut self, bytes: i64) -> Self {
+        self.byte_alignment = bytes;
+        self
     }
 
     /// The number of dimensions: `N` and `C` plus the spatial ones.
@@ -393,6 +473,18 @@ impl Tensor {
                 "a convolution tensor of rank {} has {} strides",
                 self.dims.len(),
                 self.strides.len()
+            )));
+        }
+        if self.byte_alignment < 1 || !(self.byte_alignment as u64).is_power_of_two() {
+            return Err(Error::invalid(format!(
+                "a convolution tensor's alignment is a power of two of at least one byte, not {}",
+                self.byte_alignment
+            )));
+        }
+        if self.strides.iter().any(|&stride| stride <= 0) {
+            return Err(Error::invalid(format!(
+                "a convolution tensor's strides are positive element counts, not {:?}",
+                self.strides
             )));
         }
         if self.dims.iter().any(|&dim| dim <= 0) {
@@ -453,6 +545,11 @@ pub struct Convolution {
     /// The accumulation type; FP32 keeps the video VAE's precision while
     /// allowing TF32.
     pub compute: DataType,
+    /// Whether an engine that down-converts the inputs to TF32 may run the
+    /// convolution. True by default, which is what `torch.backends.cudnn`'s
+    /// `allow_tf32` gives an FP32 convolution; false restricts the engines to
+    /// the ones cuDNN does not mark as down-converting.
+    pub allow_tf32: bool,
 }
 
 impl Convolution {
@@ -477,6 +574,7 @@ impl Convolution {
             dilation,
             output_padding: Vec::new(),
             compute: DataType::F32,
+            allow_tf32: true,
         }
     }
 
@@ -516,6 +614,7 @@ impl Convolution {
             dilation,
             output_padding,
             compute: DataType::F32,
+            allow_tf32: true,
         }
     }
 
@@ -544,14 +643,36 @@ impl Convolution {
         self.x.rank().saturating_sub(2)
     }
 
+    /// The same convolution, with engines that down-convert the inputs to
+    /// TF32 refused: what a model that declares full FP32 precision asks for.
+    pub fn with_tf32_allowed(mut self, allowed: bool) -> Self {
+        self.allow_tf32 = allowed;
+        self
+    }
+
+    /// The alignment each of the three tensors' addresses declares.
+    pub(crate) fn alignment(&self) -> ConvolutionAlignment {
+        ConvolutionAlignment {
+            x: self.x.byte_alignment,
+            w: self.w.byte_alignment,
+            y: self.y.byte_alignment,
+        }
+    }
+
     /// The bytes each of the three tensors spans, for checking the caller's
     /// buffers.
     pub fn bytes(&self) -> ConvolutionBytes {
+        // The span a tensor touches, not the number of its elements: a view
+        // with a stride larger than its extent reaches further than its
+        // dimensions multiply out to, and the caller's range must cover that.
         let element = |tensor: &Tensor| {
             let elements = tensor
                 .dims
                 .iter()
-                .try_fold(1i64, |total, &dim| total.checked_mul(dim))
+                .zip(&tensor.strides)
+                .try_fold(1i64, |total, (&dim, &stride)| {
+                    total.checked_add((dim - 1).checked_mul(stride)?)
+                })
                 .unwrap_or(0);
             elements.max(0) as u64 * tensor.dtype.bytes() as u64
         };
@@ -707,6 +828,16 @@ pub struct ConvolutionBytes {
     pub y: u64,
 }
 
+/// The alignment each of a convolution's operand addresses declares to cuDNN,
+/// in bytes: a descriptor whose tensor declares 16 bytes is only usable with
+/// an address that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConvolutionAlignment {
+    pub x: i64,
+    pub w: i64,
+    pub y: i64,
+}
+
 /// The engine that runs a convolution: cuDNN's global index for it, which is
 /// the program's tuning data for this shape (§5.4).
 ///
@@ -768,12 +899,30 @@ struct Operation {
 }
 
 impl Operation {
+    /// The whole operation: its three tensors, its convolution description,
+    /// the operation itself, and the graph that holds it.
     fn describe(api: &'static Api, convolution: &Convolution) -> Result<Self> {
         let x = Self::tensor(api, &convolution.x, UID_X)?;
         let w = Self::tensor(api, &convolution.w, UID_W)?;
         let y = Self::tensor(api, &convolution.y, UID_Y)?;
+        let kernel = Self::convolution(api, convolution)?;
+        let forward = Self::forward(api, convolution, &kernel, &x, &w, &y)?;
+        let graph = Self::graph(api, &forward, None)?;
+        Ok(Self {
+            graph,
+            _forward: forward,
+            _convolution: kernel,
+            _x: x,
+            _w: w,
+            _y: y,
+        })
+    }
 
-        let descriptor = Descriptor::create(api, DESCRIPTOR_CONVOLUTION)?;
+    /// The convolution description: compute type, mode, spatial rank, the
+    /// padding on both sides of each spatial dimension, the filter's strides
+    /// and its dilations.
+    fn convolution(api: &'static Api, convolution: &Convolution) -> Result<Descriptor> {
+        let kernel = Descriptor::create(api, DESCRIPTOR_CONVOLUTION)?;
         let compute = convolution.compute.cudnn();
         let mode = CROSS_CORRELATION;
         let spatial = convolution.rank() as i64;
@@ -785,70 +934,78 @@ impl Operation {
         let lower = convolution.lower_padding().to_vec();
         let upper = convolution.upper_padding();
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_COMP_TYPE,
             TYPE_DATA_TYPE,
             &compute,
             call,
         )?;
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_CONV_MODE,
             TYPE_CONVOLUTION_MODE,
             &mode,
             call,
         )?;
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_SPATIAL_DIMS,
             TYPE_INT64,
             &spatial,
             call,
         )?;
-        // A symmetric padding: the padding before and after each spatial
-        // dimension are the convolution layer's own, so the output keeps the
-        // input's shape under stride one.
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_PRE_PADDINGS,
             TYPE_INT64,
             &lower,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_POST_PADDINGS,
             TYPE_INT64,
             &upper,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_FILTER_STRIDES,
             TYPE_INT64,
             &convolution.stride,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_DILATIONS,
             TYPE_INT64,
             &convolution.dilation,
             call,
         )?;
-        api.finalize(&descriptor, "cudnnBackendFinalize")?;
+        api.finalize(&kernel, "cudnnBackendFinalize")?;
+        Ok(kernel)
+    }
 
-        // `y = alpha · op(x, w) + beta · y`: FP32 scalars, the scale type of
-        // an FP32 convolution.
+    /// The operation itself: the four descriptors and the two scalars of
+    /// `y = alpha · op(x, w) + beta · y`, as FP32 — the scale type of an FP32
+    /// convolution.
+    fn forward(
+        api: &'static Api,
+        convolution: &Convolution,
+        kernel: &Descriptor,
+        x: &Descriptor,
+        w: &Descriptor,
+        y: &Descriptor,
+    ) -> Result<Descriptor> {
         let (alpha, beta) = (1.0f32, 0.0f32);
-        let (op, attributes) = match convolution.kind {
+        let (operation, attributes) = match convolution.kind {
             ConvolutionKind::Forward => (
                 DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD,
                 [
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &descriptor),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, kernel),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_X, x),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_W, w),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, y),
                 ],
             ),
             // Backward data: `dx` is the layer's output, `dy` its input, and
@@ -857,14 +1014,14 @@ impl Operation {
             ConvolutionKind::Transposed => (
                 DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA,
                 [
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &descriptor),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &y),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &x),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, kernel),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, y),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, w),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, x),
                 ],
             ),
         };
-        let forward = Descriptor::create(api, op)?;
+        let forward = Descriptor::create(api, operation)?;
         let (alpha_attribute, beta_attribute) = match convolution.kind {
             ConvolutionKind::Forward => (
                 ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
@@ -875,6 +1032,7 @@ impl Operation {
                 ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA,
             ),
         };
+        let call = "cudnnBackendSetAttribute";
         api.set_one(&forward, alpha_attribute, TYPE_FLOAT, &alpha, call)?;
         api.set_one(&forward, beta_attribute, TYPE_FLOAT, &beta, call)?;
         for (attribute, tensor) in attributes {
@@ -887,25 +1045,40 @@ impl Operation {
             )?;
         }
         api.finalize(&forward, "cudnnBackendFinalize")?;
+        Ok(forward)
+    }
 
+    /// The operation graph of one operation.
+    ///
+    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`,
+    /// which 9.8 stopped requiring: a plan is built without it, and
+    /// [`Cudnn::probe`] tries it to tell a library that still wants it from a
+    /// description cuDNN refuses.
+    fn graph(
+        api: &'static Api,
+        operation: &Descriptor,
+        handle: Option<&Handle>,
+    ) -> Result<Descriptor> {
         let graph = Descriptor::create(api, DESCRIPTOR_OPERATION_GRAPH)?;
+        let call = "cudnnBackendSetAttribute";
+        if let Some(handle) = handle {
+            api.set_one(
+                &graph,
+                ATTR_OPERATIONGRAPH_HANDLE,
+                TYPE_HANDLE,
+                handle,
+                call,
+            )?;
+        }
         api.set_one(
             &graph,
             ATTR_OPERATIONGRAPH_OPS,
             TYPE_BACKEND_DESCRIPTOR,
-            &forward.raw,
+            &operation.raw,
             call,
         )?;
         api.finalize(&graph, "cudnnBackendFinalize")?;
-
-        Ok(Self {
-            graph,
-            _forward: forward,
-            _convolution: descriptor,
-            _x: x,
-            _w: w,
-            _y: y,
-        })
+        Ok(graph)
     }
 
     fn tensor(api: &'static Api, tensor: &Tensor, uid: i64) -> Result<Descriptor> {
@@ -934,6 +1107,16 @@ impl Operation {
             call,
         )?;
         api.set_one(&descriptor, ATTR_TENSOR_UNIQUE_ID, TYPE_INT64, &uid, call)?;
+        // cuDNN 9 requires every tensor to declare the alignment of its
+        // storage: an engine config it proposes is only valid for an address
+        // aligned that way.
+        api.set_one(
+            &descriptor,
+            ATTR_TENSOR_BYTE_ALIGNMENT,
+            TYPE_INT64,
+            &tensor.byte_alignment,
+            call,
+        )?;
         api.finalize(&descriptor, "cudnnBackendFinalize")?;
         Ok(descriptor)
     }
@@ -957,6 +1140,8 @@ pub struct ConvolutionPlan {
     plan: Descriptor,
     engine: Engine,
     workspace_bytes: usize,
+    bytes: ConvolutionBytes,
+    alignment: ConvolutionAlignment,
     device: DeviceId,
     // Held only for their lifetime: the plan refers to the engine
     // configuration it was built from, which the heuristic's operation graph
@@ -977,24 +1162,53 @@ impl ConvolutionPlan {
         self.workspace_bytes
     }
 
+    /// The bytes each of the convolution's three tensors spans, which is what
+    /// [`Cudnn::run`] checks its ranges against.
+    pub fn bytes(&self) -> ConvolutionBytes {
+        self.bytes
+    }
+
     /// The device the plan was built for.
     pub fn device(&self) -> DeviceId {
         self.device
     }
 }
 
-/// The device pointers of one execution of a convolution.
+/// The device storage one execution of a convolution reads and writes: the
+/// input, the filter, the output and the plan's workspace.
 ///
-/// Every pointer addresses device storage the caller keeps alive until the
-/// stream work completes, and that stays at its address for a captured
-/// graph's life.
+/// Each range states the bytes the caller has for that tensor; [`Cudnn::run`]
+/// checks them against what the convolution needs before the driver sees the
+/// call, so a short range fails with the size it needed. The ranges own
+/// nothing: the storage must outlive the stream work, and must stay at its
+/// address for a captured graph's life, which the arenas give.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvolutionArgs {
-    pub x: u64,
-    pub w: u64,
-    pub y: u64,
-    /// The workspace's address; at least [`ConvolutionPlan::workspace_bytes`].
-    pub workspace: u64,
+    /// The layer's input, `N × C × …`.
+    pub x: DeviceRange,
+    /// The filter, `K × C × …` for a forward convolution and the layer's
+    /// `C × K × …` weight for a transposed one.
+    pub w: DeviceRange,
+    /// The layer's output, `N × K × …`; the convolution writes it.
+    pub y: DeviceRange,
+    /// The workspace, at least [`ConvolutionPlan::workspace_bytes`].
+    pub workspace: DeviceRange,
+}
+
+impl ConvolutionArgs {
+    /// The ranges of four buffers, for a caller that allocates whole blocks.
+    pub fn new(x: DeviceRange, w: DeviceRange, y: DeviceRange, workspace: DeviceRange) -> Self {
+        Self { x, w, y, workspace }
+    }
+}
+
+/// Whether two device ranges share a byte.
+fn overlaps(left: DeviceRange, right: DeviceRange) -> bool {
+    let start = left.ptr().address();
+    let end = start.saturating_add(left.bytes() as u64);
+    let other_start = right.ptr().address();
+    let other_end = other_start.saturating_add(right.bytes() as u64);
+    start < other_end && other_start < end
 }
 
 /// A cuDNN handle for one device's primary context.
@@ -1010,6 +1224,66 @@ pub struct Cudnn {
 // SAFETY: a cuDNN handle is used by one thread at a time; moving it between
 // threads is safe because every call enters the device's context.
 unsafe impl Send for Cudnn {}
+
+/// What one heuristic query proposed, and what the exactness filter did with
+/// it.
+///
+/// The two ways a query can leave nothing to serve a request are different
+/// facts — the heuristic listed no engine at all, or it listed engines and
+/// every one of them down-converts its inputs — and a request that fails says
+/// which one it was.
+struct Configs {
+    /// The mode the query asked: [`HEURISTIC_MODE_A`] or [`HEURISTIC_MODE_B`].
+    mode: i32,
+    /// How many configurations the heuristic listed.
+    returned: usize,
+    /// How many of them were read back.
+    inspected: usize,
+    /// Whether the query dropped the engines that down-convert their inputs.
+    exact: bool,
+    /// The ones this request may use, best first.
+    kept: Vec<Descriptor>,
+    /// The numerical notes of the ones the exactness filter refused.
+    dropped: Vec<i32>,
+}
+
+impl Configs {
+    /// The error for a request this proposal cannot serve.
+    fn empty(&self, shape: &str) -> Error {
+        if self.returned == 0 {
+            return Error::invalid(format!(
+                "cuDNN's heuristic (mode {}) returned no engine configuration for {shape}",
+                mode_name(self.mode)
+            ));
+        }
+        if !self.exact {
+            return Error::invalid(format!(
+                "cuDNN's heuristic (mode {}) listed {} engine configuration(s) for {shape} and                  filled none of them",
+                mode_name(self.mode),
+                self.returned
+            ));
+        }
+        Error::invalid(format!(
+            "cuDNN's heuristic (mode {}) listed {} engine configuration(s) for {shape}; of the \
+             {} it returned here, every one down-converts its inputs to TF32 (numerical notes \
+             {:?}), so this cuDNN version has no engine that keeps the convolution's inputs in \
+             FP32 precision",
+            mode_name(self.mode),
+            self.returned,
+            self.inspected,
+            self.dropped
+        ))
+    }
+}
+
+/// The name cuDNN's header gives the heuristic `mode`, for an error message.
+fn mode_name(mode: i32) -> &'static str {
+    match mode {
+        HEURISTIC_MODE_A => "A",
+        HEURISTIC_MODE_B => "B",
+        _ => "?",
+    }
+}
 
 impl Cudnn {
     /// Creates a cuDNN handle for `device`.
@@ -1043,34 +1317,52 @@ impl Cudnn {
         unsafe { (self.api.get_version)() }
     }
 
-    /// The engines cuDNN's heuristic proposes for `convolution`, best first,
-    /// at most `limit` of them.
+    /// The engines this shape has under `convolution`'s precision rule, best
+    /// first, at most `limit` of them.
     ///
     /// This is how the tuning data is made: the program's package runs it
-    /// once on an idle GPU (§5.4) and records one [`Engine`] per shape.
+    /// once on an idle GPU (§5.4) and records one [`Engine`] per shape. It asks
+    /// the heuristic's exhaustive list (mode B), not the performance shortlist:
+    /// the record has to be found again when the program loads, and a
+    /// shortlist is not a list to search for a property in.
+    ///
+    /// When `convolution` requires exact numerics, the engines that
+    /// down-convert their inputs are not among the ones this shape has.
     pub fn engines(&self, convolution: &Convolution, limit: usize) -> Result<Vec<Engine>> {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let configs = self.configs(&operation, limit)?;
-        if configs.is_empty() {
-            return Err(Error::invalid(
-                "cuDNN's heuristic proposes no engine for this convolution",
-            ));
+        let proposal = self.configs(
+            &operation.graph,
+            limit,
+            HEURISTIC_MODE_B,
+            !convolution.allow_tf32,
+        )?;
+        if proposal.kept.is_empty() {
+            return Err(proposal.empty("this convolution"));
         }
-        configs
+        proposal
+            .kept
             .iter()
             .map(|config| self.global_index(config))
             .collect()
     }
 
     /// Builds the execution plan for `convolution`, running the recorded
-    /// `engine` when one is given (the program's tuning data) or the
-    /// heuristic's first choice otherwise.
+    /// `engine` when one is given (the program's tuning data) or the fastest
+    /// engine the heuristic offers otherwise.
     ///
     /// The heuristic is asked once here, at program load; service reuses the
     /// plan.
+    ///
+    /// Which list it asks follows from what the request is for. Without a
+    /// recorded engine and without a precision rule, the performance
+    /// shortlist (mode A) is exactly the list wanted: its first entry is the
+    /// fastest engine. A recorded engine has to be found rather than picked,
+    /// and a shape that requires exact numerics has to be searched for an
+    /// engine that keeps its inputs in FP32 — neither is a property of a
+    /// shortlist, so both ask the exhaustive list (mode B).
     pub fn plan(
         &self,
         convolution: &Convolution,
@@ -1080,16 +1372,20 @@ impl Cudnn {
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let mut configs = self.configs(&operation, MAX_ENGINE_CONFIGS)?;
-        if configs.is_empty() {
-            return Err(Error::invalid(
-                "cuDNN's heuristic proposes no engine for this convolution",
-            ));
+        let exact = !convolution.allow_tf32;
+        let mode = if engine.is_some() || exact {
+            HEURISTIC_MODE_B
+        } else {
+            HEURISTIC_MODE_A
+        };
+        let mut proposal = self.configs(&operation.graph, MAX_ENGINE_CONFIGS, mode, exact)?;
+        if proposal.kept.is_empty() {
+            return Err(proposal.empty("this convolution"));
         }
         let position = match engine {
             Some(recorded) => {
                 let mut position = None;
-                for (index, config) in configs.iter().enumerate() {
+                for (index, config) in proposal.kept.iter().enumerate() {
                     if self.global_index(config)? == recorded {
                         position = Some(index);
                         break;
@@ -1097,45 +1393,28 @@ impl Cudnn {
                 }
                 position.ok_or_else(|| {
                     Error::invalid(format!(
-                        "cuDNN's heuristic proposes no engine {} for this convolution; \
-                         the shape has to be measured again against this cuDNN version",
+                        "cuDNN's heuristic (mode {}) lists {} engine configuration(s) for this \
+                         convolution and none of them is engine {}; the shape has to be \
+                         measured again against this cuDNN version",
+                        mode_name(mode),
+                        proposal.kept.len(),
                         recorded.global_index
                     ))
                 })?
             }
             None => 0,
         };
-        let chosen = configs.swap_remove(position);
+        let chosen = proposal.kept.swap_remove(position);
         let recorded = self.global_index(&chosen)?;
 
-        let plan = Descriptor::create(self.api, DESCRIPTOR_EXECUTION_PLAN)?;
-        self.api.set_one(
-            &plan,
-            ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
-            TYPE_BACKEND_DESCRIPTOR,
-            &chosen.raw,
-            "cudnnBackendSetAttribute",
-        )?;
-        self.api.finalize(&plan, "cudnnBackendFinalize")?;
-        let mut workspace_bytes = 0i64;
-        self.api.get(
-            &plan,
-            ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
-            TYPE_INT64,
-            std::slice::from_mut(&mut workspace_bytes),
-            "cudnnBackendGetAttribute",
-        )?;
-        if workspace_bytes < 0 {
-            return Err(Error::invalid(format!(
-                "cuDNN reports a negative workspace of {workspace_bytes} bytes for engine {}",
-                recorded.global_index
-            )));
-        }
+        let (plan, workspace_bytes) = self.execution_plan(&chosen, None)?;
 
         Ok(ConvolutionPlan {
             plan,
             engine: recorded,
-            workspace_bytes: workspace_bytes as usize,
+            workspace_bytes,
+            bytes: convolution.bytes(),
+            alignment: convolution.alignment(),
             device: self.device,
             _config: chosen,
             _operation: operation,
@@ -1147,12 +1426,12 @@ impl Cudnn {
     /// The call issues device work and returns without waiting for it; on a
     /// capturing stream it is captured into the graph.
     ///
-    /// # Safety
-    ///
-    /// `args` must address device storage that outlives every execution of
-    /// the convolution: each tensor at least [`Convolution::bytes`] long and
-    /// the workspace at least [`ConvolutionPlan::workspace_bytes`].
-    pub unsafe fn run(
+    /// Each range is checked against what the convolution needs before any
+    /// driver call: the input, filter and output at least their tensors'
+    /// bytes, the workspace at least the plan's, and the output must not
+    /// overlap the input or the filter. The storage itself must outlive the
+    /// stream work, as any device storage a stream touches must.
+    pub fn run(
         &self,
         plan: &ConvolutionPlan,
         args: ConvolutionArgs,
@@ -1164,16 +1443,56 @@ impl Cudnn {
                 plan.device, self.device
             )));
         }
-        if args.x == 0 || args.w == 0 || args.y == 0 {
-            return Err(Error::invalid(
-                "a convolution needs the addresses of its input, filter and output",
-            ));
+        let bytes = plan.bytes;
+        for (name, range, needed, alignment) in [
+            ("input", args.x, bytes.x, plan.alignment.x),
+            ("filter", args.w, bytes.w, plan.alignment.w),
+            ("output", args.y, bytes.y, plan.alignment.y),
+        ] {
+            if range.ptr().address() == 0 {
+                return Err(Error::invalid(format!(
+                    "the convolution's {name} has no address"
+                )));
+            }
+            if (range.bytes() as u64) < needed {
+                return Err(Error::invalid(format!(
+                    "the convolution's {name} spans {} bytes, its tensor needs {needed}",
+                    range.bytes()
+                )));
+            }
+            // The descriptor declares the alignment the plan's engines were
+            // chosen for, so an address that is not aligned that way is
+            // refused here rather than read wrongly on the device.
+            if alignment > 1 {
+                let address = range.ptr().address();
+                if address % alignment as u64 != 0 {
+                    return Err(Error::invalid(format!(
+                        "the convolution's {name} address {address:#x} is not aligned to the \
+                         {alignment} bytes its tensor declares"
+                    )));
+                }
+            }
         }
-        if plan.workspace_bytes > 0 && args.workspace == 0 {
+        if args.workspace.ptr().address() == 0 && plan.workspace_bytes > 0 {
             return Err(Error::invalid(format!(
                 "the plan needs {} bytes of workspace, no address was given",
                 plan.workspace_bytes
             )));
+        }
+        if args.workspace.bytes() < plan.workspace_bytes {
+            return Err(Error::invalid(format!(
+                "the plan needs {} bytes of workspace, the range holds {}",
+                plan.workspace_bytes,
+                args.workspace.bytes()
+            )));
+        }
+        // The output is written while the input and the filter are read.
+        for (name, read) in [("input", args.x), ("filter", args.w)] {
+            if overlaps(args.y, read) {
+                return Err(Error::invalid(format!(
+                    "the convolution's output overlaps its {name}"
+                )));
+            }
         }
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
@@ -1186,12 +1505,12 @@ impl Cudnn {
         // replay resends them through the captured node.
         let variant = Descriptor::create(self.api, DESCRIPTOR_VARIANT_PACK)?;
         let pointers: [*mut c_void; 3] = [
-            args.x as *mut c_void,
-            args.w as *mut c_void,
-            args.y as *mut c_void,
+            args.x.ptr().address() as *mut c_void,
+            args.w.ptr().address() as *mut c_void,
+            args.y.ptr().address() as *mut c_void,
         ];
         let uids: [i64; 3] = [UID_X, UID_W, UID_Y];
-        let workspace = args.workspace as *mut c_void;
+        let workspace = args.workspace.ptr().address() as *mut c_void;
         let call = "cudnnBackendSetAttribute";
         self.api.set(
             &variant,
@@ -1224,39 +1543,420 @@ impl Cudnn {
         )
     }
 
-    /// The engine configurations cuDNN's heuristic proposes for `operation`,
-    /// best first: descriptors this module created for the library to fill,
-    /// so it owns and destroys them.
-    fn configs(&self, operation: &Operation, limit: usize) -> Result<Vec<Descriptor>> {
-        let heuristic = Descriptor::create(self.api, DESCRIPTOR_ENGINE_HEURISTIC)?;
-        let mode = HEURISTIC_MODE_A;
+    /// The execution plan of `config`.
+    ///
+    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_EXECUTION_PLAN_HANDLE`,
+    /// which 9.8 stopped requiring: a plan is built without it, and
+    /// [`Cudnn::probe`] tries it.
+    fn execution_plan(
+        &self,
+        config: &Descriptor,
+        handle: Option<&Handle>,
+    ) -> Result<(Descriptor, usize)> {
+        let plan = Descriptor::create(self.api, DESCRIPTOR_EXECUTION_PLAN)?;
         let call = "cudnnBackendSetAttribute";
+        if let Some(handle) = handle {
+            self.api
+                .set_one(&plan, ATTR_EXECUTION_PLAN_HANDLE, TYPE_HANDLE, handle, call)?;
+        }
         self.api.set_one(
+            &plan,
+            ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+            TYPE_BACKEND_DESCRIPTOR,
+            &config.raw,
+            call,
+        )?;
+        self.api.finalize(&plan, "cudnnBackendFinalize")?;
+        let mut workspace_bytes = 0i64;
+        self.api.get(
+            &plan,
+            ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+            TYPE_INT64,
+            std::slice::from_mut(&mut workspace_bytes),
+            "cudnnBackendGetAttribute",
+        )?;
+        if workspace_bytes < 0 {
+            return Err(Error::invalid(format!(
+                "cuDNN reports a negative workspace of {workspace_bytes} bytes"
+            )));
+        }
+        Ok((plan, workspace_bytes as usize))
+    }
+
+    /// Builds `convolution` the way [`Cudnn::plan`] does, one descriptor and
+    /// one heuristically chosen plan at a time, and answers for each step
+    /// whether cuDNN accepted it: the message beside the first `Some` is what
+    /// cuDNN refused, and the steps after it were not run.
+    ///
+    /// It also tries the two deprecated handle attributes that cuDNN 9.8
+    /// stopped requiring, one on the operation graph and one on the execution
+    /// plan, so a single run separates a library that still requires them
+    /// from a description cuDNN refuses. This is a diagnostic for a shape a
+    /// device refuses — a plan's own error names the call but not the
+    /// descriptor — and never a second way to build plans.
+    pub fn probe(&self, convolution: &Convolution) -> Vec<(String, Option<String>)> {
+        let mut steps: Vec<(String, Option<String>)> = Vec::new();
+        macro_rules! stage {
+            ($name:expr, $call:expr) => {
+                match $call {
+                    Ok(value) => {
+                        steps.push((String::from($name), None));
+                        value
+                    }
+                    Err(error) => {
+                        steps.push((String::from($name), Some(error.to_string())));
+                        return steps;
+                    }
+                }
+            };
+        }
+
+        let device = stage!("the device and its context", Device::new(self.device));
+        let _context = stage!("entering the device's context", device.enter());
+        stage!("the convolution's own checks", convolution.check());
+
+        let x = stage!(
+            "tensor x: type, dimensions, strides, unique id, byte alignment, finalize",
+            Operation::tensor(self.api, &convolution.x, UID_X)
+        );
+        let w = stage!(
+            "tensor w: type, dimensions, strides, unique id, byte alignment, finalize",
+            Operation::tensor(self.api, &convolution.w, UID_W)
+        );
+        let y = stage!(
+            "tensor y: type, dimensions, strides, unique id, byte alignment, finalize",
+            Operation::tensor(self.api, &convolution.y, UID_Y)
+        );
+        let kernel = stage!(
+            "convolution: compute type, mode, spatial dims, pre and post paddings, filter strides, dilations, finalize",
+            Operation::convolution(self.api, convolution)
+        );
+        let forward = stage!(
+            "operation: alpha, beta, conv desc, x, w, y, finalize",
+            Operation::forward(self.api, convolution, &kernel, &x, &w, &y)
+        );
+        let graph = stage!(
+            "operation graph: ops, finalize",
+            Operation::graph(self.api, &forward, None)
+        );
+
+        let heuristic = stage!(
+            "engine heuristic: mode A, operation graph, finalize",
+            Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
+        );
+        let available = stage!(
+            "engine heuristic: count the configurations",
+            self.api
+                .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
+        );
+        // The other way a request ends up with no engine is the exactness
+        // filter dropping everything the heuristic listed, and that can only
+        // be seen in the exhaustive list: mode A is the performance shortlist
+        // and may hold one configuration. Both are counted and their notes
+        // read here, so one run separates "no engine for this shape" from "no
+        // engine that keeps its inputs in FP32".
+        let mode_b = stage!(
+            "engine heuristic: mode B, operation graph, finalize",
+            Self::heuristic(self.api, &graph, HEURISTIC_MODE_B)
+        );
+        let listed_b = stage!(
+            "engine heuristic: mode B, count the configurations",
+            self.api
+                .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
+        );
+        steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
+        let exhaustive = stage!(
+            "engine heuristic: mode B, read up to eight configurations and their numerical notes",
+            self.configs(&graph, 8, HEURISTIC_MODE_B, false)
+        );
+        let mut notes_b = Vec::new();
+        for config in &exhaustive.kept {
+            notes_b.push(stage!(
+                "engine heuristic: a mode B configuration's numerical notes",
+                self.numerical_notes(config)
+            ));
+        }
+        steps.push((
+            format!(
+                "engine heuristic: mode B listed {listed_b} configuration(s); the numerical \
+                 notes of the first {} are {notes_b:?}, and note {NUMERICAL_NOTE_DOWN_CONVERT_INPUTS} \
+                 (TF32 for FP32 inputs) is the one a full-precision request refuses",
+                notes_b.len()
+            ),
+            None,
+        ));
+        if available == 0 {
+            steps.push((
+                String::from("engine heuristic: cuDNN proposes no engine for this convolution"),
+                Some(String::from("no configuration")),
+            ));
+            return steps;
+        }
+        let shortlist = stage!(
+            "engine heuristic: mode A, read every configuration it lists",
+            self.configs(&graph, MAX_ENGINE_CONFIGS, HEURISTIC_MODE_A, false)
+        );
+        let Some(config) = shortlist.kept.into_iter().next() else {
+            steps.push((
+                format!(
+                    "engine heuristic: mode A listed {} configuration(s) and the library filled none",
+                    shortlist.returned
+                ),
+                Some(String::from("nothing filled")),
+            ));
+            return steps;
+        };
+        let notes_a = stage!(
+            "engine heuristic: mode A's first configuration's numerical notes",
+            self.numerical_notes(&config)
+        );
+        steps.push((
+            format!("engine heuristic: mode A's first configuration carries the numerical notes {notes_a:?}"),
+            None,
+        ));
+        stage!(
+            "engine configuration: read the engine's global index",
+            self.global_index(&config)
+        );
+        let (plan, workspace_bytes) = stage!(
+            "execution plan: engine config, finalize, read the workspace size",
+            self.execution_plan(&config, None)
+        );
+        steps.push((
+            format!("execution plan: {workspace_bytes} bytes of workspace"),
+            None,
+        ));
+        // The two deprecated handle attributes are asked last, and their
+        // refusal is recorded without ending the walk: a library that answers
+        // `CUDNN_STATUS_DEPRECATED` for them is telling us the same thing as
+        // one that accepts them.
+        macro_rules! alternative {
+            ($name:expr, $call:expr) => {
+                match $call {
+                    Ok(_) => steps.push((String::from($name), None)),
+                    Err(error) => steps.push((String::from($name), Some(error.to_string()))),
+                }
+            };
+        }
+        alternative!(
+            "operation graph with the deprecated handle attribute, finalize",
+            Operation::graph(self.api, &forward, Some(&self.handle))
+        );
+        alternative!(
+            "execution plan with the deprecated handle attribute, finalize",
+            self.execution_plan(&config, Some(&self.handle))
+        );
+        drop((plan, x, w, y));
+        steps
+    }
+
+    /// The six readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
+    /// wants of the array it is handed, against one finalized `heuristic`
+    /// descriptor and one that no count query has touched, so the only
+    /// difference between them is the request.
+    ///
+    /// A diagnostic: it decides nothing and changes nothing. Each line says
+    /// the status, the element count the library answered, and how many slots
+    /// hold a handle afterwards, because those three separate the readings —
+    /// a list that is written but not counted looks like a list that was left
+    /// empty from the caller's side.
+    fn fill_variants(
+        &self,
+        graph: &Descriptor,
+        heuristic: &Descriptor,
+        listed: usize,
+    ) -> Vec<(String, Option<String>)> {
+        let mut steps = Vec::new();
+        // (name, requestedElementCount, slots, initial count, slots are null)
+        let variants: [(&str, i64, usize, i64, bool); 5] = [
+            (
+                "1 the code as it was: requested = the list's length, count starts at 0",
+                listed as i64,
+                listed.max(1),
+                0,
+                false,
+            ),
+            (
+                "2 the same request with the count initialised to the list's length",
+                listed as i64,
+                listed.max(1),
+                listed as i64,
+                false,
+            ),
+            (
+                "3 the counted descriptor, MAX_ENGINE_CONFIGS created slots requested",
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                0,
+                false,
+            ),
+            (
+                "4 requested larger than the list: list + MAX_ENGINE_CONFIGS",
+                (listed + MAX_ENGINE_CONFIGS) as i64,
+                listed + MAX_ENGINE_CONFIGS,
+                0,
+                false,
+            ),
+            (
+                "5 null slots: the library creates the descriptors and writes their handles",
+                listed as i64,
+                listed.max(1),
+                -1,
+                true,
+            ),
+        ];
+        for (name, requested, slots, initial, nulls) in variants {
+            // A variant the library refuses is one reading of the contract that
+            // does not hold, which is exactly what the probe asks about: it is
+            // reported in its line, not counted as a refusal of the probe.
+            let line = match self.fill_once(heuristic, requested, slots, initial, nulls) {
+                Ok(line) => line,
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((format!("engine heuristic fill {name}: {line}"), None));
+        }
+        // 6: a heuristic descriptor no count query has touched. It separates
+        // "the count query consumed the list", which variant 3 cannot, because
+        // 3 asks the descriptor that was counted.
+        let line = match Self::heuristic(self.api, graph, HEURISTIC_MODE_B).and_then(|fresh| {
+            self.fill_once(
+                &fresh,
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                -1,
+                false,
+            )
+        }) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 6 a fresh descriptor, never counted, MAX_ENGINE_CONFIGS slots requested: {line}"),
+            None,
+        ));
+        steps
+    }
+
+    /// One fill of the heuristic's results with the slots and the initial
+    /// element count a variant names.
+    ///
+    /// `nulls` hands the library an array of empty slots, which is the reading
+    /// that it creates the descriptors itself; otherwise the slots are
+    /// descriptors created here, which is the reading that it fills them.
+    ///
+    /// Answers with the status and what the array holds afterwards; handles the
+    /// library wrote that this call did not create are destroyed, so a library
+    /// that creates or replaces descriptors does not leak through the probe.
+    fn fill_once(
+        &self,
+        heuristic: &Descriptor,
+        requested: i64,
+        slots: usize,
+        initial: i64,
+        nulls: bool,
+    ) -> Result<String> {
+        let mut ours = Vec::with_capacity(if nulls { 0 } else { slots });
+        if !nulls {
+            for _ in 0..slots {
+                ours.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
+            }
+        }
+        let mine: Vec<Handle> = ours.iter().map(|descriptor| descriptor.raw).collect();
+        let mut handles: Vec<Handle> = if nulls {
+            vec![std::ptr::null_mut(); slots]
+        } else {
+            mine.clone()
+        };
+        let mut written = initial;
+        // SAFETY: every slot is either a descriptor this module created with
+        // `cudnnBackendCreateDescriptor` or a null the library may fill, which
+        // is what the call takes, and both the array and the slots outlive it.
+        let status = unsafe {
+            (self.api.backend_get_attribute)(
+                heuristic.raw,
+                ATTR_ENGINEHEUR_RESULTS,
+                TYPE_BACKEND_DESCRIPTOR,
+                requested,
+                &mut written,
+                handles.as_mut_ptr().cast(),
+            )
+        };
+        let mut replaced = 0usize;
+        for handle in &handles {
+            if handle.is_null() || mine.contains(handle) {
+                continue;
+            }
+            replaced += 1;
+            // SAFETY: a handle the library wrote into a slot this call handed
+            // it is a descriptor it created and handed over; destroyed once.
+            unsafe { (self.api.backend_destroy_descriptor)(*handle) };
+        }
+        let held = handles.iter().filter(|handle| !handle.is_null()).count();
+        Ok(format!(
+            "status {status}{}, wrote {written}, {held} of {} slots hold a handle, {replaced} of them new",
+            if status == STATUS_SUCCESS {
+                String::new()
+            } else {
+                format!(" ({})", self.api.last_error())
+            },
+            handles.len()
+        ))
+    }
+
+    /// The engine heuristic descriptor of `graph` in `mode`, finalized.
+    fn heuristic(api: &'static Api, graph: &Descriptor, mode: i32) -> Result<Descriptor> {
+        let heuristic = Descriptor::create(api, DESCRIPTOR_ENGINE_HEURISTIC)?;
+        let call = "cudnnBackendSetAttribute";
+        api.set_one(
             &heuristic,
             ATTR_ENGINEHEUR_OPERATION_GRAPH,
             TYPE_BACKEND_DESCRIPTOR,
-            &operation.graph.raw,
+            &graph.raw,
             call,
         )?;
-        self.api.set_one(
+        api.set_one(
             &heuristic,
             ATTR_ENGINEHEUR_MODE,
             TYPE_HEUR_MODE,
             &mode,
             call,
         )?;
-        self.api.finalize(&heuristic, "cudnnBackendFinalize")?;
+        api.finalize(&heuristic, "cudnnBackendFinalize")?;
+        Ok(heuristic)
+    }
 
-        let available =
+    /// The engine configurations cuDNN's heuristic proposes for `operation` in
+    /// `mode`, best first: descriptors this module created for the library to
+    /// fill, so it owns and destroys them.
+    ///
+    /// `exact` keeps only the configurations whose engine does not down-convert
+    /// its inputs, which is what a model that declares full FP32 precision
+    /// asks for; [`Configs`] says what the filter dropped, so a request it
+    /// empties can name the reason instead of reporting a missing engine.
+    fn configs(&self, graph: &Descriptor, limit: usize, mode: i32, exact: bool) -> Result<Configs> {
+        let heuristic = Self::heuristic(self.api, graph, mode)?;
+        let returned =
             self.api
                 .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)?;
-        let wanted = available.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
-        let mut configs = Vec::with_capacity(wanted);
-        for _ in 0..wanted {
+        let mut proposal = Configs {
+            mode,
+            returned,
+            inspected: 0,
+            exact,
+            kept: Vec::new(),
+            dropped: Vec::new(),
+        };
+        // One created engine-configuration descriptor per configuration the
+        // heuristic reported: the library fills the descriptors it is handed,
+        // and an array shorter than the list is a request it answers with
+        // nothing (`cudnn_frontend` reads the count first and asks for exactly
+        // that many, never fewer).
+        let mut configs = Vec::with_capacity(returned);
+        for _ in 0..returned {
             configs.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
         }
         if configs.is_empty() {
-            return Ok(configs);
+            return Ok(proposal);
         }
         let mut handles: Vec<Handle> = configs.iter().map(|config| config.raw).collect();
         let written = self.api.get(
@@ -1269,11 +1969,30 @@ impl Cudnn {
         // Keep the configurations the library filled; the rest are destroyed
         // with their `Descriptor`.
         configs.truncate(written);
-        Ok(configs)
+        proposal.inspected = configs.len();
+        for config in configs {
+            if exact {
+                // A model that declares full FP32 precision refuses the
+                // engines cuDNN marks as down-converting their inputs, which is
+                // where TF32 lives.
+                let notes = self.numerical_notes(&config)?;
+                if notes.contains(&NUMERICAL_NOTE_DOWN_CONVERT_INPUTS) {
+                    for note in notes {
+                        if !proposal.dropped.contains(&note) {
+                            proposal.dropped.push(note);
+                        }
+                    }
+                    continue;
+                }
+            }
+            proposal.kept.push(config);
+        }
+        proposal.kept.truncate(limit.clamp(1, MAX_ENGINE_CONFIGS));
+        Ok(proposal)
     }
 
-    /// The engine a finalized engine configuration names.
-    fn global_index(&self, config: &Descriptor) -> Result<Engine> {
+    /// The engine descriptor a finalized engine configuration names.
+    fn engine_of(&self, config: &Descriptor) -> Result<Descriptor> {
         let engine = Descriptor::create(self.api, DESCRIPTOR_ENGINE)?;
         let mut handles = [engine.raw];
         let written = self.api.get(
@@ -1288,6 +2007,34 @@ impl Cudnn {
                 "a cuDNN engine configuration names no engine",
             ));
         }
+        Ok(engine)
+    }
+
+    /// The numerical notes `config`'s engine declares — the properties cuDNN
+    /// warns about, of which `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS` (TF32
+    /// for FP32 inputs) is the one a full-precision request refuses.
+    fn numerical_notes(&self, config: &Descriptor) -> Result<Vec<i32>> {
+        let engine = self.engine_of(config)?;
+        let count = self
+            .api
+            .count(&engine, ATTR_ENGINE_NUMERICAL_NOTE, TYPE_NUMERICAL_NOTE)?;
+        let mut notes = vec![0i32; count];
+        if count == 0 {
+            return Ok(notes);
+        }
+        self.api.get(
+            &engine,
+            ATTR_ENGINE_NUMERICAL_NOTE,
+            TYPE_NUMERICAL_NOTE,
+            &mut notes,
+            "cudnnBackendGetAttribute",
+        )?;
+        Ok(notes)
+    }
+
+    /// The engine a finalized engine configuration names.
+    fn global_index(&self, config: &Descriptor) -> Result<Engine> {
+        let engine = self.engine_of(config)?;
         let mut index = 0i64;
         self.api.get(
             &engine,
@@ -1357,6 +2104,24 @@ mod tests {
     }
 
     #[test]
+    fn a_tensor_declares_the_alignment_of_its_storage() {
+        let tensor = Tensor::contiguous(vec![1, 6, 512], DataType::F32);
+        assert_eq!(tensor.byte_alignment, 16, "a device allocation's alignment");
+        assert!(tensor.check().is_ok());
+
+        // A view at an element boundary declares the element's own alignment,
+        // which an engine that vectorizes then knows it cannot use.
+        assert!(tensor.clone().with_alignment(4).check().is_ok());
+
+        let mut wrong = tensor;
+        wrong.byte_alignment = 3;
+        let error = wrong
+            .check()
+            .expect_err("three bytes is not a power of two");
+        assert!(error.to_string().contains("power of two"), "{error}");
+    }
+
+    #[test]
     fn the_output_dimensions_follow_padding_stride_and_dilation() {
         // A three-dimensional convolution with padding, stride and dilation.
         let mut convolution = Convolution::new(
@@ -1375,8 +2140,9 @@ mod tests {
             .expect_err("a wrong output length is caught");
         assert!(error.to_string().contains("give 4"), "{error}");
 
-        // The audio decoder's one-dimensional convolution: rank three.
-        let audio = conv1d(vec![1, 6, 512], vec![12, 6, 7], vec![1, 12, 513]);
+        // The audio decoder's one-dimensional convolution: rank three in
+        // NCDHW form, output (512 + 2·0 - 1·(7 - 1) - 1) + 1 = 508.
+        let audio = conv1d(vec![1, 6, 512], vec![12, 6, 7], vec![1, 12, 508]);
         assert!(audio.check().is_ok(), "{audio:?}");
         assert_eq!(audio.rank(), 1);
     }
@@ -1538,6 +2304,35 @@ mod tests {
                 y: 16 * 4,
             }
         );
+
+        // A channels-last tensor spans the same bytes as its contiguous twin,
+        // and a view with a wider stride spans more than its elements.
+        let channels_last = Tensor {
+            dims: vec![1, 2, 2, 2, 2],
+            strides: vec![16, 1, 8, 4, 2],
+            dtype: DataType::F32,
+            byte_alignment: 16,
+        };
+        let spanned = Convolution {
+            x: channels_last.clone(),
+            ..convolution.clone()
+        };
+        assert_eq!(spanned.bytes().x, 16 * 4, "a packed channels-last tensor");
+
+        let padded = Tensor {
+            strides: vec![32, 1, 16, 8, 4],
+            ..channels_last
+        };
+        let spanned = Convolution {
+            x: padded,
+            ..convolution
+        };
+        // 1 + (1−1)·32 + (2−1)·1 + (2−1)·16 + (2−1)·8 + (2−1)·4 = 30 elements.
+        assert_eq!(
+            spanned.bytes().x,
+            30 * 4,
+            "a view whose outermost stride is wider than its extent"
+        );
     }
 
     #[test]
@@ -1557,5 +2352,212 @@ mod tests {
         fn movable<T: Send>() {}
 
         movable::<Cudnn>();
+    }
+
+    /// Every number this binding passes to cuDNN is compared with the header that
+    /// defines it. A wrong descriptor type or attribute id is not a compile error:
+    /// it is a refused call, a silently ignored attribute, or a plan against the
+    /// wrong descriptor — and the only way to notice used to be a GPU round trip.
+    #[test]
+    fn the_descriptor_numbers_are_the_headers() {
+        crate::header::assert_constants(
+            "cudnn_graph_v9.h",
+            &[
+                (
+                    "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR",
+                    DESCRIPTOR_CONVOLUTION as i64,
+                ),
+                ("CUDNN_BACKEND_ENGINE_DESCRIPTOR", DESCRIPTOR_ENGINE as i64),
+                (
+                    "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR",
+                    DESCRIPTOR_ENGINE_CONFIG as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR",
+                    DESCRIPTOR_ENGINE_HEURISTIC as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR",
+                    DESCRIPTOR_EXECUTION_PLAN as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_GRAPH as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR",
+                    DESCRIPTOR_VARIANT_PACK as i64,
+                ),
+                ("CUDNN_BACKEND_TENSOR_DESCRIPTOR", DESCRIPTOR_TENSOR as i64),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_COMP_TYPE",
+                    ATTR_CONVOLUTION_COMP_TYPE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_CONV_MODE",
+                    ATTR_CONVOLUTION_CONV_MODE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_DILATIONS",
+                    ATTR_CONVOLUTION_DILATIONS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES",
+                    ATTR_CONVOLUTION_FILTER_STRIDES as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_POST_PADDINGS",
+                    ATTR_CONVOLUTION_POST_PADDINGS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS",
+                    ATTR_CONVOLUTION_PRE_PADDINGS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS",
+                    ATTR_CONVOLUTION_SPATIAL_DIMS as i64,
+                ),
+                ("CUDNN_ATTR_ENGINEHEUR_MODE", ATTR_ENGINEHEUR_MODE as i64),
+                (
+                    "CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH",
+                    ATTR_ENGINEHEUR_OPERATION_GRAPH as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINEHEUR_RESULTS",
+                    ATTR_ENGINEHEUR_RESULTS as i64,
+                ),
+                ("CUDNN_ATTR_ENGINECFG_ENGINE", ATTR_ENGINECFG_ENGINE as i64),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_HANDLE",
+                    ATTR_EXECUTION_PLAN_HANDLE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG",
+                    ATTR_EXECUTION_PLAN_ENGINE_CONFIG as i64,
+                ),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE",
+                    ATTR_EXECUTION_PLAN_WORKSPACE_SIZE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_BETA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_W as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_X as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_Y as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_W as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_HANDLE",
+                    ATTR_OPERATIONGRAPH_HANDLE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_OPS",
+                    ATTR_OPERATIONGRAPH_OPS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT",
+                    ATTR_TENSOR_BYTE_ALIGNMENT as i64,
+                ),
+                ("CUDNN_ATTR_TENSOR_DATA_TYPE", ATTR_TENSOR_DATA_TYPE as i64),
+                (
+                    "CUDNN_ATTR_TENSOR_DIMENSIONS",
+                    ATTR_TENSOR_DIMENSIONS as i64,
+                ),
+                ("CUDNN_ATTR_TENSOR_STRIDES", ATTR_TENSOR_STRIDES as i64),
+                ("CUDNN_ATTR_TENSOR_UNIQUE_ID", ATTR_TENSOR_UNIQUE_ID as i64),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS",
+                    ATTR_VARIANT_PACK_UNIQUE_IDS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS",
+                    ATTR_VARIANT_PACK_DATA_POINTERS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_WORKSPACE",
+                    ATTR_VARIANT_PACK_WORKSPACE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINE_GLOBAL_INDEX",
+                    ATTR_ENGINE_GLOBAL_INDEX as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE",
+                    ATTR_ENGINE_NUMERICAL_NOTE as i64,
+                ),
+                ("CUDNN_TYPE_HANDLE", TYPE_HANDLE as i64),
+                ("CUDNN_TYPE_DATA_TYPE", TYPE_DATA_TYPE as i64),
+                ("CUDNN_TYPE_INT64", TYPE_INT64 as i64),
+                ("CUDNN_TYPE_FLOAT", TYPE_FLOAT as i64),
+                ("CUDNN_TYPE_VOID_PTR", TYPE_VOID_PTR as i64),
+                ("CUDNN_TYPE_CONVOLUTION_MODE", TYPE_CONVOLUTION_MODE as i64),
+                ("CUDNN_TYPE_HEUR_MODE", TYPE_HEUR_MODE as i64),
+                ("CUDNN_TYPE_NUMERICAL_NOTE", TYPE_NUMERICAL_NOTE as i64),
+                (
+                    "CUDNN_TYPE_BACKEND_DESCRIPTOR",
+                    TYPE_BACKEND_DESCRIPTOR as i64,
+                ),
+                ("CUDNN_HEUR_MODE_A", HEURISTIC_MODE_A as i64),
+                ("CUDNN_HEUR_MODE_B", HEURISTIC_MODE_B as i64),
+                (
+                    "CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS",
+                    NUMERICAL_NOTE_DOWN_CONVERT_INPUTS as i64,
+                ),
+                // `cudnn.h` is a wrapper that only includes the real headers,
+                // so the mode and the statuses are read from `cudnn_graph_v9.h`
+                // itself, where they are defined.
+                ("CUDNN_CROSS_CORRELATION", CROSS_CORRELATION as i64),
+                ("CUDNN_STATUS_SUCCESS", STATUS_SUCCESS as i64),
+            ],
+        );
     }
 }

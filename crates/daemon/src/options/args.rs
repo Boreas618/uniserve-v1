@@ -92,6 +92,11 @@ pub struct ServeArgs {
     /// (`worker_config.executable`).
     #[arg(long, value_name = "PATH")]
     pub worker_executable: Option<PathBuf>,
+    /// This host's Program Server socket, which the daemon prepares an
+    /// epoch's programs against (`program_server`); the Program Server's
+    /// default socket when unset.
+    #[arg(long, value_name = "PATH")]
+    pub program_server: Option<PathBuf>,
     /// TOML file of serving options; the flags and `--set` override it.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -247,6 +252,7 @@ impl ServeArgs {
                 "worker_config.executable",
                 self.worker_executable.as_ref().map(path),
             ),
+            ("program_server", self.program_server.as_ref().map(path)),
         ]
         .into_iter()
         .filter_map(|(path, value)| value.map(|value| (path, value)))

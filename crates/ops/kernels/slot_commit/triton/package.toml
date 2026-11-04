@@ -1,0 +1,34 @@
+# The slot_commit operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program applies the whole step's commit rows with `block` lanes, so the
+# row count is a runtime word and one module serves every step of that shape.
+
+op = "slot_commit"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/slot_commit.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `index_i64_verified_i32_penalties_i32_stride_32_future_stride_8_vocab_151936_block_64`.
+[kernel.descriptors]
+dimensions = { index = ["i64"], verified = ["i32"], penalties = ["i32"], stride = ["32", "256"], future_stride = ["8", "16"], vocab = ["151936", "248320"], block = ["32", "64", "256"] }
+
+[parameters]

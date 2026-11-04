@@ -20,12 +20,12 @@
 use std::error::Error;
 use std::process::ExitCode;
 
-use scheduling::Engine;
 use scheduling::guest::wire;
 use scheduling::guest::{
-    CallView, Duration, Event, ExpertLoad, Init, Limits, Plan, RankView, ReplicaView, RequestId,
-    RequestView, Room, Shortage, Snapshot, Storage,
+    CallView, Duration, Event, ExpertLoad, Limits, Parameters, Plan, RankView, ReplicaView,
+    RequestId, RequestView, Room, Shortage, Snapshot, Storage,
 };
+use scheduling::Engine;
 use serde::de::DeserializeOwned;
 
 fn main() -> ExitCode {
@@ -65,12 +65,10 @@ fn run(path: &str, precompile: bool) -> Result<(), Box<dyn Error>> {
         engine.module(&bytes)?
     };
 
-    let init = Init {
-        parameters: Default::default(),
-        state: snapshot()?,
-    };
+    // The program's arguments construct the policy; the state is its `init`.
+    let parameters = Parameters::default();
     let ceilings = Limits::default();
-    let mut policy = module.instantiate(&init, &ceilings)?;
+    let mut policy = module.instantiate(&snapshot()?, &parameters, &ceilings)?;
     let limits = policy.limits();
     println!(
         "limits: chunked_prefill_size {} max_batch {} max_num_batched_tokens {} \

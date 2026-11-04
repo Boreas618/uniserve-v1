@@ -92,6 +92,17 @@ pub trait Source: Send + Sync {
         toolchain: &dyn Toolchain,
         dir: &Workspace,
     ) -> Result<Built>;
+
+    /// The module the installed revision already holds, written into `dir`, or
+    /// `None` when the module is made by compiling.
+    ///
+    /// A package that is built when it is installed (design section 6.2, the
+    /// wasm policy) carries its module beside its manifest; publishing it needs
+    /// no toolchain, so a host that cannot compile it can still serve it.
+    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        let _ = (key, target, dir);
+        Ok(None)
+    }
 }
 
 /// Makes the source a package's manifest names.
@@ -869,6 +880,14 @@ impl Source for CubinSource {
 
 /// A scheduling policy: wasm32, then precompiled for this host's CPU
 /// (design section 5.3).
+///
+/// A policy is the one package built when it is *installed* (design section
+/// 6.2): its build is the publisher's crate inside the publisher's workspace, so
+/// it can only run while the directory the install named still exists. The
+/// server keeps the precompiled module in the revision directory beside the
+/// manifest, and [`Source::stored`] publishes it — so a host with no wasm
+/// precompiler, or one whose `cargo` cannot build the crate, still serves a
+/// policy the upstream server built.
 #[derive(Clone, Debug)]
 pub struct WasmSource {
     package: PackageSource,
@@ -882,9 +901,27 @@ impl WasmSource {
     }
 }
 
+impl WasmSource {
+    /// The precompiled module an installed revision keeps beside its manifest.
+    fn artifact(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        let installed = self.package.root.join(MODULE_WASM);
+        if !installed.is_file() {
+            return Ok(None);
+        }
+        std::fs::copy(&installed, dir.path().join(MODULE_WASM))?;
+        let mut files = vec![MODULE_WASM.to_owned()];
+        files.extend(copy_tuning(&self.package, key, target, dir)?);
+        Ok(Some(Built { files }))
+    }
+}
+
 impl Source for WasmSource {
     fn toolchain(&self) -> ToolchainKind {
         ToolchainKind::Wasm
+    }
+
+    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        self.artifact(key, target, dir)
     }
 
     fn build(
@@ -897,6 +934,16 @@ impl Source for WasmSource {
     ) -> Result<Built> {
         let package = &self.package;
         let log = build_log(dir);
+        // A policy is one module with no descriptor and no target, so it is
+        // built once, when the package is installed, and the revision keeps the
+        // precompiled artifact beside its manifest (design section 6.2). A
+        // `prepare` after a restart copies it and runs no compiler: the build
+        // that produced it belongs to the publisher's directory, which this
+        // host need not have.
+        if let Some(stored) = self.stored(key, target, dir)? {
+            return Ok(stored);
+        }
+        let output = dir.path().join(MODULE_WASM);
         // The raw module: either the package's own build writes it (it knows
         // how its guest crate is assembled), or the package is a crate that
         // `cargo build` compiles for wasm32 as it stands.
@@ -940,7 +987,6 @@ impl Source for WasmSource {
                       scheduling-precompile builds it"
                 .into(),
         })?;
-        let output = dir.path().join(MODULE_WASM);
         // A script may write the raw module under the output's own name; move
         // it aside so the precompiler does not overwrite its input.
         let raw = if raw == output {
@@ -1123,11 +1169,18 @@ mod tests {
     fn vendor_package(directory: &Path, metadata: Option<&str>) {
         std::fs::create_dir_all(directory.join("cubin")).unwrap();
         std::fs::write(directory.join("cubin/dtype_bf16.cubin"), b"a cubin").unwrap();
-        std::fs::write(
-            directory.join("cubin/dtype_bf16.json"),
-            br#"{"name": "vendor"}"#,
-        )
-        .unwrap();
+        // A package without launch metadata carries no metadata JSON at all;
+        // one that names the metadata file carries a JSON per descriptor.
+        let files = if metadata.is_some() {
+            std::fs::write(
+                directory.join("cubin/dtype_bf16.json"),
+                br#"{"name": "vendor"}"#,
+            )
+            .unwrap();
+            r#"["cubin/{descriptor}.cubin", "cubin/{descriptor}.json"]"#
+        } else {
+            r#"["cubin/{descriptor}.cubin"]"#
+        };
         let metadata = metadata.map_or(String::new(), |name| format!("metadata = \"{name}\"\n"));
         std::fs::write(
             directory.join("package.toml"),
@@ -1145,7 +1198,7 @@ form = "cubin"
 {metadata}
 [source]
 kind = "cubin"
-files = ["cubin/{{descriptor}}.cubin", "cubin/{{descriptor}}.json"]
+files = {files}
 
 [kernel]
 architectures = ["sm_100a"]
@@ -1207,7 +1260,7 @@ keys = ["dtype_bf16"]
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("dtype_bf16.json"),
+            error.to_string().contains("metadata"),
             "the error names the missing metadata: {error}"
         );
     }

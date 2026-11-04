@@ -146,6 +146,13 @@ pub struct ToolchainDeps {
     /// The version the package is written for, compared with the toolchain's
     /// own version before a build (design section 6.2). A change is a new
     /// revision.
+    ///
+    /// An empty version means any version this host has: the package's build
+    /// does not depend on the patch release, so a host whose toolchain is
+    /// another build of the same release builds it and the store keeps the
+    /// module under the revision it was installed as. A fixture that must run
+    /// on whichever host the caller's test uses declares it; a serving package
+    /// declares the version its modules were validated against.
     pub version: String,
     /// The Python packages the sources import, such as FlashAttention-4 and
     /// FlashInfer's CuTe kernels, with the versions the Program Server's
@@ -396,6 +403,12 @@ impl Manifest {
             ));
         }
         match (&self.kernel, self.module.form) {
+            (Some(_), ModuleForm::Wasm) => {
+                return Err(ManifestError::Invalid(
+                    "a scheduling policy fills a whole interface, so it names no kernel program"
+                        .into(),
+                ));
+            }
             (Some(kernel), _) if kernel.architectures.is_empty() => {
                 return Err(ManifestError::Invalid(
                     "the package must name the architectures it supports".into(),

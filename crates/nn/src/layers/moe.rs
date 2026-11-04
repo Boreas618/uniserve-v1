@@ -25,8 +25,9 @@
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
-    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, RouteGemm, RouteGemmArgs,
-    RouteGemmDescriptor,
+    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4,
+    GatherGemmNvfp4Args, GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor,
+    RouteGemmNvfp4, RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
 };
 use ops::moe::routing::{
     ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
@@ -37,7 +38,7 @@ use ops::{DType, DevicePtr, Op, Shape, TensorView};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::Linear;
-use crate::weights::Weight;
+use crate::weights::{QuantizedStack, Weight};
 
 /// The tile geometry the grouped products' packages are compiled for.
 ///
@@ -48,11 +49,60 @@ const MMA_TILE: (u32, u32) = (128, 128);
 /// The cluster shape the grouped products' packages are compiled for.
 const MMA_CLUSTER: (u32, u32) = (1, 1);
 
+/// The expert stacks a block multiplies.
+///
+/// A checkpoint is either dense (BF16/F16 expert matrices) or calibrated NVFP4 (the encoded fields
+/// the loader publishes as a [`QuantizedStack`]); the routing, the sort and the combine are the
+/// same, and only the two multiplies differ.
+///
+/// The variants differ by a few hundred bytes and the encoded one is already boxed; the remaining
+/// difference is not worth another indirection on a value built once per layer.
+#[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a block's stacks are built once at load, never collected, and the encoded variant \
+              already boxes its weights"
+)]
+enum ExpertStacks {
+    /// `[experts, 2·intermediate, hidden]` and `[experts, hidden, intermediate]`.
+    Dense { up_gate: Weight, down: Weight },
+    /// The same two stacks and their block scales, packed two codes a byte. Boxed because a
+    /// [`QuantizedStack`] carries three weights and the dense variant carries two views: the
+    /// difference would otherwise size every block by its rarest variant.
+    Encoded {
+        up_gate: Box<QuantizedStack>,
+        down: Box<QuantizedStack>,
+    },
+}
+
+/// What a block's routing prefix produced: the views every expert product and the combine read.
+///
+/// All of them are the forward's arena, sized from the routing geometry, so a captured graph
+/// replays over the same addresses however the router routes a later batch.
+#[derive(Clone, Copy)]
+struct Routes {
+    /// `[tokens, top]` i32: the weight row of each route.
+    local_ids: TensorView,
+    /// `[tokens, top]` f32: the route's normalized weight.
+    weights: TensorView,
+    /// The permuted rows the products write, padding included.
+    rows: u64,
+    /// `[max_tiles]` i32: the expert of each tile.
+    tile_to_expert: TensorView,
+    /// `[max_tiles]` i32: the live rows of each tile.
+    tile_to_limit: TensorView,
+    /// `[tokens, top]` i32: the permuted row of each expanded route.
+    expanded_to_permuted: TensorView,
+    /// `[max_permuted_rows]` i32: the expanded route of each permuted row.
+    permuted_to_expanded: TensorView,
+    /// `[1]` i32: the live tiles.
+    num_non_exiting_tiles: TensorView,
+}
+
 /// A mixture-of-experts block over a colocated expert group.
 pub struct Moe {
     router: Linear,
-    up_gate: Weight,
-    down: Weight,
+    stacks: ExpertStacks,
     map: Option<Weight>,
     experts: u32,
     top: u32,
@@ -94,8 +144,50 @@ impl Moe {
         // The colocated case: every expert of the vocabulary is resident here.
         Self::build(
             router,
-            up_gate,
-            down,
+            ExpertStacks::Dense { up_gate, down },
+            map,
+            experts,
+            experts,
+            0,
+            top,
+            activation,
+            renormalize,
+            scale,
+        )
+    }
+
+    /// A block whose experts are a calibrated NVFP4 checkpoint's encoded fields.
+    ///
+    /// Each stack is `[experts, 2·intermediate, hidden/2]` (up first, gate second) or
+    /// `[experts, hidden, intermediate/2]` packed two E2M1 codes a byte, with its block scales and
+    /// its per-expert tensor reciprocals — what [`WeightLoader::nvfp4_stack`] publishes. The block
+    /// routes, sorts and combines exactly as the dense one does; only the two multiplies read
+    /// packed weights, and both stay in FP32 until the store.
+    ///
+    /// [`WeightLoader::nvfp4_stack`]: crate::WeightLoader::nvfp4_stack
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the same arguments as the dense constructor, with the encoded stacks in place \
+                  of the dense weights"
+    )]
+    pub fn quantized(
+        router: Linear,
+        up_gate: QuantizedStack,
+        down: QuantizedStack,
+        map: Option<Weight>,
+        experts: u32,
+        top: u32,
+        activation: Activation,
+        renormalize: bool,
+        scale: Option<Weight>,
+    ) -> Result<Self> {
+        // A quantized block is colocated: the encoded stacks hold every expert the router names.
+        Self::build(
+            router,
+            ExpertStacks::Encoded {
+                up_gate: Box::new(up_gate),
+                down: Box::new(down),
+            },
             map,
             experts,
             experts,
@@ -115,8 +207,7 @@ impl Moe {
     )]
     fn build(
         router: Linear,
-        up_gate: Weight,
-        down: Weight,
+        stacks: ExpertStacks,
         map: Option<Weight>,
         experts: u32,
         local: u32,
@@ -163,31 +254,65 @@ impl Moe {
                 format!("a window of {local} experts at {local_offset} does not lie in {experts}"),
             ));
         }
-        if up_gate.shape().rank() != 3 || up_gate.shape().dim(0) != u64::from(local) {
+        // The two kinds state their geometry differently — a dense stack's output width is its
+        // second axis, a packed one's is half of it — so each is checked against its own layout and
+        // the block keeps only the geometry both agree on.
+        let (up_gate_shape, down_shape) = match &stacks {
+            ExpertStacks::Dense { up_gate, down } => (up_gate.shape(), down.shape()),
+            ExpertStacks::Encoded { up_gate, down } => {
+                let packed = up_gate.values.shape();
+                let contraction = down.values.shape();
+                if packed.rank() != 3
+                    || packed.dim(0) != u64::from(local)
+                    || contraction.rank() != 3
+                    || contraction.dim(0) != u64::from(local)
+                {
+                    return Err(Error::shape(
+                        "Moe",
+                        format!(
+                            "the encoded stacks are {:?} and {:?}, [{local}, 2·intermediate, \
+                             hidden/2] and [{local}, hidden, intermediate/2] expected",
+                            packed.dims(),
+                            contraction.dims()
+                        ),
+                    ));
+                }
+                // `[experts, 2·intermediate, hidden/2]` and `[experts, hidden, intermediate/2]`, so
+                // the logical widths are twice the packed ones.
+                let up = Shape::new(&[packed.dim(0), packed.dim(1), packed.dim(2) * 2]);
+                let down = Shape::new(&[
+                    contraction.dim(0),
+                    contraction.dim(1),
+                    contraction.dim(2) * 2,
+                ]);
+                (up, down)
+            }
+        };
+        if up_gate_shape.rank() != 3 || up_gate_shape.dim(0) != u64::from(local) {
             return Err(Error::shape(
                 "Moe",
                 format!(
                     "the up/gate weight is {:?}, [{local}, 2·intermediate, hidden] expected",
-                    up_gate.shape().dims()
+                    up_gate_shape.dims()
                 ),
             ));
         }
-        let intermediate = up_gate.shape().dim(1) / 2;
-        if down.shape().rank() != 3
-            || down.shape().dim(0) != u64::from(local)
-            || down.shape().dim(1) != up_gate.shape().dim(2)
-            || down.shape().dim(2) != intermediate
+        let intermediate = up_gate_shape.dim(1) / 2;
+        if down_shape.rank() != 3
+            || down_shape.dim(0) != u64::from(local)
+            || down_shape.dim(1) != up_gate_shape.dim(2)
+            || down_shape.dim(2) != intermediate
         {
             return Err(Error::shape(
                 "Moe",
                 format!(
                     "the down weight is {:?}, [{local}, {}, {intermediate}] expected",
-                    down.shape().dims(),
-                    up_gate.shape().dim(2)
+                    down_shape.dims(),
+                    up_gate_shape.dim(2)
                 ),
             ));
         }
-        let hidden = u32::try_from(up_gate.shape().dim(2))
+        let hidden = u32::try_from(up_gate_shape.dim(2))
             .map_err(|_| Error::shape("Moe", "a hidden width above u32::MAX".to_owned()))?;
         let intermediate = u32::try_from(intermediate)
             .map_err(|_| Error::shape("Moe", "an expert width above u32::MAX".to_owned()))?;
@@ -215,8 +340,7 @@ impl Moe {
         }
         Ok(Self {
             router,
-            up_gate,
-            down,
+            stacks,
             map,
             experts,
             top,
@@ -257,8 +381,7 @@ impl Moe {
     ) -> Result<Self> {
         Self::build(
             router,
-            up_gate,
-            down,
+            ExpertStacks::Dense { up_gate, down },
             map,
             experts,
             local,
@@ -285,40 +408,18 @@ impl Moe {
         self.experts
     }
 
-    /// `out = Σ_routes weight · expert(hidden)`.
+    /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
+    /// routes into the tiles a grouped product reads.
     ///
-    /// `hidden` and `out` are `[tokens, hidden]`.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        if self.local != self.experts || f.exchange.is_some() {
-            return Err(Error::Unsupported(
-                "Moe: this block's experts are split across ranks; call \
-                 forward_expert_parallel so the routes travel over the exchange"
-                    .to_owned(),
-            ));
-        }
-        let hidden_width = u64::from(self.hidden);
-        hidden
-            .require_row("Moe", hidden.dtype, hidden_width)
-            .map_err(Error::from)?;
-        out.require_row("Moe", out.dtype, hidden_width)
-            .map_err(Error::from)?;
-        if hidden.rows() != out.rows() {
-            return Err(Error::shape(
-                "Moe",
-                format!(
-                    "{} input rows against {} output rows",
-                    hidden.rows(),
-                    out.rows()
-                ),
-            ));
-        }
+    /// Every expert product a block can run starts here and differs only in the two multiplies, so
+    /// the prefix is one path: a variant that multiplies something else still routes, sorts and
+    /// combines identically, and a heavy quantized product cannot drift from the dense one.
+    fn route(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
         let tokens = hidden.rows();
         let top = u64::from(self.top);
         let experts = u64::from(self.experts);
-        let intermediate = u64::from(self.intermediate);
         let arena = f.arena();
 
-        // 1. The replicated router, then its top-k.
         let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
         let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
@@ -339,7 +440,7 @@ impl Moe {
 
         f.operate::<TopkSoftmax>(&routing, args)?;
 
-        // 2. Logical ids become weight rows.
+        // Logical ids become weight rows.
         let local_ids = match &self.map {
             Some(map) => {
                 let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
@@ -359,7 +460,7 @@ impl Moe {
             None => ids,
         };
 
-        // 3. Group the routes by expert into the tiles the products read.
+        // Group the routes by expert into the tiles the products read.
         let tiles = ops::moe::max_tiles(tokens, top, experts, u64::from(self.tile));
         let rows = ops::moe::max_permuted_rows(tokens, top, experts, u64::from(self.tile));
         let tile_to_expert = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
@@ -389,8 +490,59 @@ impl Moe {
 
         f.operate::<MoeSort>(&sort, args)?;
 
+        Ok(Routes {
+            local_ids,
+            weights,
+            rows,
+            tile_to_expert,
+            tile_to_limit,
+            expanded_to_permuted,
+            permuted_to_expanded,
+            num_non_exiting_tiles,
+        })
+    }
+
+    /// `out = Σ_routes weight · expert(hidden)`.
+    ///
+    /// `hidden` and `out` are `[tokens, hidden]`.
+    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+        if self.local != self.experts || f.exchange.is_some() {
+            return Err(Error::Unsupported(
+                "Moe: this block's experts are split across ranks; call \
+                 forward_expert_parallel so the routes travel over the exchange"
+                    .to_owned(),
+            ));
+        }
+        let hidden_width = u64::from(self.hidden);
+        hidden
+            .require_row("Moe", hidden.dtype, hidden_width)
+            .map_err(Error::from)?;
+        out.require_row("Moe", out.dtype, hidden_width)
+            .map_err(Error::from)?;
+        if hidden.rows() != out.rows() {
+            return Err(Error::shape(
+                "Moe",
+                format!(
+                    "{} input rows against {} output rows",
+                    hidden.rows(),
+                    out.rows()
+                ),
+            ));
+        }
+        let ExpertStacks::Dense { up_gate, down } = &self.stacks else {
+            // An encoded stack runs the packed products instead; the routing above is the same.
+            return self.forward_encoded(f, hidden, out);
+        };
+        let tokens = hidden.rows();
+        let top = u64::from(self.top);
+        let intermediate = u64::from(self.intermediate);
+        let arena = f.arena();
+
+        // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
+        let routes = self.route(f, hidden)?;
+
         // 4. FC1: the gated product of each permuted row, then FC2.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
+        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -403,12 +555,12 @@ impl Moe {
         };
         let args = GatherGemmArgs {
             hidden,
-            weights: self.up_gate.view(),
-            ids: local_ids,
-            tile_to_expert,
-            tile_to_limit,
-            permuted_to_expanded,
-            num_non_exiting_tiles,
+            weights: up_gate.view(),
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: gated,
         };
 
@@ -426,12 +578,12 @@ impl Moe {
         };
         let args = RouteGemmArgs {
             rows: gated,
-            weights: self.down.view(),
-            ids: local_ids,
-            tile_to_expert,
-            tile_to_limit,
-            permuted_to_expanded,
-            num_non_exiting_tiles,
+            weights: down.view(),
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: products,
         };
 
@@ -448,8 +600,103 @@ impl Moe {
         };
         let args = UnpermuteArgs {
             routes: products,
-            expanded_to_permuted,
-            scales: weights,
+            expanded_to_permuted: routes.expanded_to_permuted,
+            scales: routes.weights,
+            out,
+        };
+
+        f.operate::<MoeUnpermute>(&combine, args)
+    }
+
+    /// `out = Σ_routes weight · expert(hidden)` over packed experts.
+    ///
+    /// The routing, the sort and the combine are the dense block's; the two products read the
+    /// encoded stacks, and each carries its own block scales and per-expert reciprocals. FC2 writes
+    /// one row per route — the `top` repeats are what `moe_unpermute` sums — and its rows are the
+    /// permuted ones, padding included, which the combine reads through the same map.
+    fn forward_encoded(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+        let ExpertStacks::Encoded { up_gate, down } = &self.stacks else {
+            return Err(Error::Unsupported(
+                "Moe::forward_encoded: the block's experts are dense".to_owned(),
+            ));
+        };
+        let hidden_width = u64::from(self.hidden);
+        let intermediate = u64::from(self.intermediate);
+        let arena = f.arena();
+
+        // 1-3. The same prefix the dense block runs.
+        let routes = self.route(f, hidden)?;
+
+        // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
+        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
+        let first = GatherGemmNvfp4Descriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            activation: self.activation,
+            dtype: hidden.dtype,
+            scale: up_gate.scales.dtype(),
+            layout: up_gate.layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        };
+        let args = GatherGemmNvfp4Args {
+            hidden,
+            weights: up_gate.values.view(),
+            scales: up_gate.scales.view(),
+            global_scale: up_gate.global_scale.view(),
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
+            out: gated,
+        };
+
+        f.operate::<GatherGemmNvfp4>(&first, args)?;
+
+        // 5. FC2 over the packed down stack: one hidden row per route.
+        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
+        let second = RouteGemmNvfp4Descriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            dtype: hidden.dtype,
+            scale: down.scales.dtype(),
+            layout: down.layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        };
+        let args = RouteGemmNvfp4Args {
+            hidden: gated,
+            weights: down.values.view(),
+            scales: down.scales.view(),
+            global_scale: down.global_scale.view(),
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
+            out: products,
+        };
+
+        f.operate::<RouteGemmNvfp4>(&second, args)?;
+
+        // 6. Sum the routes back in FP32 and round once to the hidden dtype.
+        let combine = combine::Descriptor {
+            hidden: self.hidden,
+            top: self.top,
+            experts: self.experts,
+            input: products.dtype,
+            scales: DType::F32,
+            output: out.dtype,
+        };
+        let args = UnpermuteArgs {
+            routes: products,
+            expanded_to_permuted: routes.expanded_to_permuted,
+            scales: routes.weights,
             out,
         };
 
@@ -484,6 +731,13 @@ impl Moe {
             )
         })?;
         exchange.require_extents("Moe")?;
+        let ExpertStacks::Dense { up_gate, down } = &self.stacks else {
+            return Err(Error::Unsupported(
+                "Moe::forward_expert_parallel: an encoded stack has no exchange path yet; the \
+                 quantized block is colocated"
+                    .to_owned(),
+            ));
+        };
         let hidden_width = u64::from(self.hidden);
         let top = u64::from(self.top);
         let ranks = u64::from(exchange.ranks);
@@ -652,11 +906,16 @@ impl Moe {
         f.operate::<MoeSort>(&sort, args)?;
 
         // 5. FC1 and FC2 over the received rows, with this rank's experts.
+        //
+        // The products name the resident stack's expert count, not the vocabulary's: `up_gate` and
+        // `down` hold `local` experts, and the sort rebased every received route into that window
+        // with `local_offset`, so the vocabulary count would name a stack this rank does not hold
+        // (and the operator's shape check would refuse the launch).
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             activation: self.activation,
             dtype: hidden.dtype,
@@ -665,7 +924,7 @@ impl Moe {
         };
         let args = GatherGemmArgs {
             hidden: exchange.states,
-            weights: self.up_gate.view(),
+            weights: up_gate.view(),
             ids: exchange.ids,
             tile_to_expert,
             tile_to_limit,
@@ -680,7 +939,7 @@ impl Moe {
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             dtype: hidden.dtype,
             tile: MMA_TILE,
@@ -688,7 +947,7 @@ impl Moe {
         };
         let args = RouteGemmArgs {
             rows: gated,
-            weights: self.down.view(),
+            weights: down.view(),
             ids: exchange.ids,
             tile_to_expert,
             tile_to_limit,
@@ -736,14 +995,21 @@ impl Moe {
     }
 
     /// The bound the combined rows' implementations may differ by.
+    ///
+    /// A dense block combines its own element type; an encoded one combines BF16, the element type
+    /// a calibrated NVFP4 checkpoint's consumers run in.
     pub fn tolerance(&self) -> ops::Tolerance {
+        let dtype = match &self.stacks {
+            ExpertStacks::Dense { up_gate, .. } => up_gate.dtype(),
+            ExpertStacks::Encoded { .. } => DType::BF16,
+        };
         MoeUnpermute::tolerance(&combine::Descriptor {
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
-            input: self.up_gate.dtype(),
+            input: dtype,
             scales: DType::F32,
-            output: self.up_gate.dtype(),
+            output: dtype,
         })
     }
 }
@@ -802,6 +1068,82 @@ pub(super) mod tests {
             true,
             None,
         )
+    }
+
+    /// A quantized block's stacks are packed: the same Qwen3-MoE geometry, two codes a byte along
+    /// the contraction, one block scale per sixteen elements and one reciprocal per expert.
+    fn quantized_block(hidden: u64, intermediate: u64) -> Result<Moe> {
+        let experts = 128;
+        let router = Linear::new(
+            weight(DType::BF16, &[u64::from(experts), hidden]),
+            None,
+            WeightOrder::NxK,
+        )?;
+        let stack = |rows: u64, columns: u64| QuantizedStack {
+            values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
+            scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
+            global_scale: weight(DType::F32, &[u64::from(experts)]),
+            layout: ops::fp4::ScaleLayout::Linear,
+        };
+        Moe::quantized(
+            router,
+            stack(2 * intermediate, hidden),
+            stack(hidden, intermediate),
+            None,
+            experts,
+            8,
+            Activation::Silu,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_quantized_block_builds_from_the_same_geometry_as_a_dense_one() {
+        let quantized = quantized_block(2048, 768).unwrap();
+        assert_eq!(quantized.experts(), 128);
+        assert_eq!(quantized.local_experts(), 128);
+        assert_eq!(quantized.top(), 8);
+        // The combine bound is BF16's, because that is what a calibrated checkpoint multiplies.
+        assert_eq!(
+            quantized.tolerance().atol,
+            block(128, 8, 2048, 768).unwrap().tolerance().atol,
+            "the dense BF16 block and the encoded block share a combine bound"
+        );
+    }
+
+    /// The packed stacks must describe the geometry the router and the block were built for: a
+    /// contraction of another width is refused at the constructor rather than at a launch.
+    #[test]
+    fn a_quantized_stack_of_another_geometry_is_refused() {
+        let experts = 128u32;
+        let router = Linear::new(
+            weight(DType::BF16, &[u64::from(experts), 2048]),
+            None,
+            WeightOrder::NxK,
+        )
+        .unwrap();
+        let stack = |rows: u64, columns: u64| QuantizedStack {
+            values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
+            scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
+            global_scale: weight(DType::F32, &[u64::from(experts)]),
+            layout: ops::fp4::ScaleLayout::Linear,
+        };
+        // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
+        assert!(
+            Moe::quantized(
+                router,
+                stack(1536, 2048),
+                stack(2048, 512),
+                None,
+                experts,
+                8,
+                Activation::Silu,
+                true,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

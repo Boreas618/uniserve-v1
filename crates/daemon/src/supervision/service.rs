@@ -25,6 +25,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -333,6 +334,8 @@ pub(crate) fn serve_leader(
     listener: Listener,
     joins: Option<Joins>,
     members: Vec<Membership>,
+    commands: Receiver<(u64, process::Command)>,
+    reports: Sender<(u64, process::Report)>,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut nodes = vec![Node {
@@ -356,6 +359,8 @@ pub(crate) fn serve_leader(
             engines: HashMap::new(),
             next_engine: 1,
             stops: HashMap::new(),
+            commands,
+            reports,
         },
         stop,
     )
@@ -376,6 +381,13 @@ pub(crate) struct LeaderService {
     /// Stops of an engine, by its request id, awaiting the members'
     /// answers.
     stops: HashMap<(u64, u64), PendingStop>,
+    /// The commands the daemon sends down to engines' main processes
+    /// (`supervision::ProcessCommands`), each carried to its engine's
+    /// connection.
+    commands: Receiver<(u64, process::Command)>,
+    /// Where each `Upstream::Report` an engine's main process sends goes,
+    /// with the engine that sent it.
+    reports: Sender<(u64, process::Report)>,
 }
 
 /// Runs the leader's service from `service` until `stop`.
@@ -393,6 +405,8 @@ pub(crate) fn run_leader(
         mut engines,
         mut next_engine,
         mut stops,
+        mut commands,
+        reports,
     } = service;
     let host = host.as_str();
     loop {
@@ -407,6 +421,8 @@ pub(crate) fn run_leader(
                 engines,
                 next_engine,
                 stops,
+                commands,
+                reports,
             };
             return service.hand_over().map(Some);
         }
@@ -435,9 +451,30 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The daemon's commands down to a main process (§2.3, §7.3): each
+        // goes to its engine's connection, and a connection that cannot be
+        // written closes that engine below.
+        let mut closed = Vec::new();
+        while let Ok((engine, command)) = commands.try_recv() {
+            let Some(peer) = engines.get_mut(&engine) else {
+                tracing::warn!(engine, "a command names an engine that is not connected");
+                continue;
+            };
+            if peer
+                .connection
+                .send(&Downstream {
+                    kind: Some(downstream::Kind::Event(process::Event {
+                        kind: Some(event::Kind::Command(command)),
+                    })),
+                })
+                .is_err()
+            {
+                closed.push(engine);
+            }
+        }
+
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
-        let mut closed = Vec::new();
         for (&engine, peer) in &mut engines {
             loop {
                 if !peer.welcomed {
@@ -484,6 +521,13 @@ pub(crate) fn run_leader(
                             closed.push(engine);
                             break;
                         }
+                    }
+                    Ok(Some(Upstream {
+                        kind: Some(upstream::Kind::Report(report)),
+                    })) => {
+                        // Reports go to the daemon's switch (§7.3); a
+                        // daemon that stopped reading them drops them.
+                        let _ = reports.send((engine, report));
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
@@ -833,6 +877,10 @@ impl LeaderService {
             engines,
             next_engine,
             stops,
+            // The command channel is the daemon's, not the service's: the
+            // successor makes its own ends when it resumes (`ProcessCommands`).
+            commands: _,
+            reports: _,
         } = self;
         let (listener_descriptor, unix, address) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];
@@ -887,6 +935,8 @@ pub(crate) fn resume(
     host: String,
     handed: HandedService,
     descriptors: Vec<OwnedFd>,
+    commands: Receiver<(u64, process::Command)>,
+    reports: Sender<(u64, process::Report)>,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut descriptors = descriptors.into_iter();
@@ -965,6 +1015,8 @@ pub(crate) fn resume(
                     engines: adopted_engines,
                     next_engine,
                     stops,
+                    commands,
+                    reports,
                 },
                 stop,
             )

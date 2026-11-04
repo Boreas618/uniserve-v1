@@ -900,6 +900,9 @@ impl Scheduler {
                             {
                                 free_products.push(freed);
                             }
+                            // The entry is live now, whether created or
+                            // re-activated; the policy's LRU is told.
+                            self.record_encoded(cache_key);
 
                             let stored = self.storage.encoder_cache.peek_product(cache_key)
                                 == Some(feature.clone());
@@ -941,6 +944,9 @@ impl Scheduler {
                                     product: product.clone(),
                                 });
                             }
+                            // Pinning it is a use: the entry moves in the order
+                            // the policy evicts by.
+                            self.record_encoded(cache_key);
                             product
                         } else if let Some(st) = self.running.get_mut(&id) {
                             st.transient_encoder_products.push(feature.clone());
@@ -1300,8 +1306,15 @@ impl Scheduler {
             return false;
         }
         let published = self.emit(id, Event::TextToken { id: tok, logprob });
-        if published && let Some(state) = self.running.get_mut(&id) {
-            state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
+        if published {
+            if let Some(state) = self.running.get_mut(&id) {
+                state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
+            }
+            // The policy is told the request emitted a token, and when.
+            let at =
+                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+            self.recorder
+                .record(views::emitted(scheduling::guest::RequestId(id.0), 1, at));
         }
         true
     }
@@ -1321,8 +1334,17 @@ impl Scheduler {
         }
         let count = tokens.len();
         let published = self.emit(id, Event::TextTokens { ids: tokens });
-        if published && let Some(state) = self.running.get_mut(&id) {
-            state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
+        if published {
+            if let Some(state) = self.running.get_mut(&id) {
+                state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
+            }
+            let at =
+                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+            self.recorder.record(views::emitted(
+                scheduling::guest::RequestId(id.0),
+                u32::try_from(count).unwrap_or(u32::MAX),
+                at,
+            ));
         }
     }
 
@@ -1628,6 +1650,18 @@ impl Scheduler {
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
     fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
+        // The policy sees the request end, with how it ended.
+        let end = match &terminal {
+            TokenTerminal::Migratable(..) => scheduling::guest::End::Migratable,
+            TokenTerminal::Finished { reason, .. } => match reason {
+                FinishReason::Cancelled => scheduling::guest::End::Cancelled,
+                FinishReason::Error => scheduling::guest::End::Failed,
+                _ => scheduling::guest::End::Completed,
+            },
+        };
+        let request = scheduling::guest::RequestId(id.0);
+        self.recorder.record(views::finished(request, end));
+        self.watchdog.finished(request);
         if matches!(terminal, TokenTerminal::Migratable(..))
             && self.config.canvas.is_none()
             && self
