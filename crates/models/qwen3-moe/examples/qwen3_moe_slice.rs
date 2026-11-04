@@ -667,7 +667,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             let values = download_bf16(&stream, rows, tokens_usize(&batch), width)?;
             let mut first_above = None;
             report_stage(
-                &args,
+                args,
                 &format!("hidden_{:02}.npy", layer + 1),
                 layer + 1,
                 &values,
@@ -693,7 +693,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         let mut first_above = None;
         let embedded = download_bf16(&stream, hidden, rows, width)?;
         report_stage(
-            &args,
+            args,
             "hidden_00.npy",
             0,
             &embedded,
