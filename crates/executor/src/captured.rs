@@ -41,6 +41,8 @@ pub struct Captured {
     nodes: Nodes,
     /// Every kernel the graph calls, so it stays loaded while the graph can be replayed.
     kernels: Vec<Arc<Kernel>>,
+    /// How many kernel nodes the graph has: what one replay launches (7.3's counters).
+    kernel_nodes: u64,
 }
 
 impl Captured {
@@ -65,11 +67,20 @@ impl Captured {
                 "a captured graph with kernels has no node table".into(),
             ));
         }
+        let mut kernel_nodes = 0u64;
+        for (_, _, launch) in &nodes {
+            for node in launch {
+                if node.kind()? == platform::GraphNodeKind::Kernel {
+                    kernel_nodes += 1;
+                }
+            }
+        }
         Ok(Self {
             exec,
             template,
             nodes,
             kernels,
+            kernel_nodes,
         })
     }
 
@@ -96,6 +107,11 @@ impl Captured {
     /// Every kernel the graph calls.
     pub fn kernels(&self) -> &[Arc<Kernel>] {
         &self.kernels
+    }
+
+    /// How many kernel nodes the graph has: the launches one replay issues.
+    pub fn kernel_nodes(&self) -> u64 {
+        self.kernel_nodes
     }
 
     /// Whether the graph launches `operator` at all.
