@@ -123,7 +123,8 @@ fn a_calibration_that_quantizes_the_router_is_refused_by_name() {
     assert!(format!("{refused}").contains("the router's scoring projection"), "{refused}");
 
     // And the model's whole set is refused, not just the name a caller happened to ask about: the
-    // first parameter whose role this tree serves dense is the one that stops the load.
+    // walk stops at the router — a `Linear` in the checkpoint's module tree, which is the reason the
+    // calibrated checkpoint names it in its exclusion list.
     let stopped = qwen3_moe::representation::parameters(&config)
         .into_iter()
         .find_map(|(parameter, role)| {
@@ -133,7 +134,7 @@ fn a_calibration_that_quantizes_the_router_is_refused_by_name() {
                 .map(|error| (parameter, error))
         })
         .expect("a parameter the calibration packed and the model serves dense");
-    assert!(stopped.0.contains("embed_tokens"), "{}", stopped.0);
+    assert_eq!(stopped.0, "model.layers.0.mlp.gate.weight");
 }
 
 #[test]
