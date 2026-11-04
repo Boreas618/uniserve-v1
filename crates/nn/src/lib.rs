@@ -41,6 +41,7 @@
 pub mod capability;
 pub mod checkpoint;
 pub mod error;
+pub mod exchange;
 pub mod forward;
 pub mod group;
 pub mod layers;
@@ -55,6 +56,7 @@ pub use capability::{
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
+pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
