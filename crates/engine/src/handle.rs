@@ -657,6 +657,11 @@ pub enum Command {
     /// §7.3 step 2's failure: the precopied generation is dropped and the
     /// serving policy kept.
     DiscardPolicy,
+    /// §12's cost counters: the calls this scheduler's policy has made and the
+    /// fuel they consumed, or `None` before its first switchover.
+    PolicyUsage {
+        answer: crossbeam_channel::Sender<Option<crate::scheduler::PolicyUsage>>,
+    },
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
     TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
@@ -1079,6 +1084,16 @@ impl CommandSender {
     /// Drops a precopied generation that failed or was abandoned (§7.3 step 2).
     pub fn discard_policy(&self) {
         let _ = self.send(Command::DiscardPolicy);
+    }
+
+    /// §12's cost counters, polled rather than waited for: the caller is the
+    /// engine's control thread, which no scheduler may hold.
+    pub fn policy_usage(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyUsage>> {
+        let (answer, usage) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PolicyUsage { answer });
+        usage
     }
 
     /// Takes the policy failure this scheduler recorded since the last call,
