@@ -32,7 +32,7 @@ use serde::de::DeserializeOwned;
 pub const EXPORT_ALLOC: &str = "sched_alloc";
 /// The export that releases a buffer.
 pub const EXPORT_FREE: &str = "sched_free";
-/// The export that instantiates: its message is [`crate::policy::Init`].
+/// The export that instantiates: its message is [`crate::policy::Instantiation`].
 pub const EXPORT_INIT: &str = "sched_init";
 /// The export that observes events: its message is `Vec<Event>`.
 pub const EXPORT_OBSERVE: &str = "sched_observe";

@@ -10,9 +10,18 @@ use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, R
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
 /// storage.
+///
+/// The API documentation gives it as `0x01`; the system `nccl.h` this crate
+/// builds against does not define it at all, and only newer NCCL headers carry
+/// `#define NCCL_SUSPEND_MEM 0x01`. It is therefore a flag from the
+/// documentation rather than a header number, and
+/// [`tests::the_nccl_constants_are_the_headers`] does not table it: naming it
+/// there would fail on every machine whose header lacks it.
 const NCCL_SUSPEND_MEM: i32 = 0x01;
 
-/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes.
+/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
+/// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
+/// [`tests::the_nccl_constants_are_the_headers`].
 const NCCL_SPLIT_NOCOLOR: i32 = -1;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
@@ -597,5 +606,78 @@ mod tests {
     fn a_communicator_moves_to_its_device_thread() {
         fn movable<T: Send>() {}
         movable::<Communicator>();
+    }
+
+    /// `ncclUniqueId` is a 128-byte opaque token in `nccl.h`, and this crate
+    /// passes it to NCCL by value and compares it between ranks, so its size is
+    /// the contract: a larger `UniqueId` would be a different rendezvous value
+    /// than the other ranks hold.
+    ///
+    /// `ncclConfig_t` is the other structure the header offers and this crate
+    /// never builds one: `ncclCommSplit` is called with a null config (the
+    /// defaults) and `ncclCommInitRankConfig` is not called at all, so there is
+    /// no attribute encoding here to compare. A crate that starts passing a
+    /// config owes this test that structure's size and its attribute offsets.
+    /// Every entry point this crate requires is declared by `nccl.h`.
+    ///
+    /// The four it binds only when the library has them — `ncclCommSplit`,
+    /// `ncclAlltoAll`, `ncclCommSuspend`, `ncclCommResume` — are not asserted:
+    /// they are newer than some `nccl.h` a host ships, which is why the crate
+    /// treats their absence as a supported library rather than a broken one.
+    #[test]
+    fn every_required_nccl_entry_point_is_declared_by_the_header() {
+        for name in [
+            "ncclGetErrorString",
+            "ncclGetUniqueId",
+            "ncclCommInitRank",
+            "ncclCommDestroy",
+            "ncclCommAbort",
+            "ncclAllReduce",
+            "ncclReduceScatter",
+            "ncclAllGather",
+            "ncclBroadcast",
+            "ncclSend",
+            "ncclRecv",
+            "ncclGroupStart",
+            "ncclGroupEnd",
+        ] {
+            match crate::header::declares("nccl.h", name) {
+                Some(true) => {}
+                Some(false) => panic!("nccl.h does not declare {name}, which this crate binds"),
+                None => {
+                    eprintln!(
+                        "skipped: nccl.h is not provisioned here, so its entry points were not compared"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_nccl_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        let ours = std::mem::size_of::<super::UniqueId>();
+        assert_eq!(ours, 128, "ncclUniqueId is 128 bytes in nccl.h");
+        match struct_size("nccl.h", "ncclUniqueId") {
+            Some(header) => assert_eq!(
+                header, ours,
+                "nccl.h lays ncclUniqueId out in {header} bytes, this crate in {ours}"
+            ),
+            None => eprintln!(
+                "skipped: nccl.h does not let ncclUniqueId be laid out here, so the crate's \
+                 {ours} bytes for it went uncompared"
+            ),
+        }
+    }
+
+    /// The one constant this crate takes from `nccl.h` is compared with it: a
+    /// split is only correct if the "not in this group" colour is the header's.
+    #[test]
+    fn the_nccl_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "nccl.h",
+            &[("NCCL_SPLIT_NOCOLOR", super::NCCL_SPLIT_NOCOLOR as i64)],
+        );
     }
 }

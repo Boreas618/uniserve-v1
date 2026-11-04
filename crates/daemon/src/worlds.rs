@@ -3204,6 +3204,7 @@ mod tests {
                 format!("unix:{}", socket.display()),
                 "source".into(),
                 "model".into(),
+                None,
             )
             .unwrap(),
         );

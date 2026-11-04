@@ -221,7 +221,7 @@ The [architecture guide](docs/architecture.md) describes how the daemons, the en
 
 ```text
 crates/proto/                 The interfaces across builds: the request interface and the process interface (Protobuf)
-crates/models/                Model-family request semantics: the family registry, the SenseNova, Bagel and DiffusionGemma checkpoint facts and prompt rules, and the MiniMax-H3 video rules
+crates/models/rules/          Model-family request semantics: the family registry, the SenseNova, Bagel and DiffusionGemma checkpoint facts and prompt rules, and the MiniMax-H3 video rules
 crates/storage/               The Storage Server's protocol and client
 crates/storage-server/        The Storage Server, its Mooncake connector and its Transfer Server
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor

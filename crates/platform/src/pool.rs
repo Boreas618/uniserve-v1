@@ -246,6 +246,14 @@ impl VirtualPool {
     /// Returns the chunk at `address` to the pool, which keeps it mapped
     /// and gives it out again. An address the pool did not give out is
     /// ignored.
+    ///
+    /// A freed chunk's storage stays mapped on purpose: a block's physical
+    /// memory goes back to the driver only when the pool is suspended
+    /// ([`Self::suspend`], which keeps every address and every byte's contents
+    /// for [`Self::restore`]) or dropped. There is no partial shrink — a caller
+    /// that must give back part of a range while keeping its addresses needs a
+    /// new operation, with its own contract and its own test, not this one
+    /// quietly unmapping a tail.
     pub fn free(&mut self, address: u64) {
         if let Some(chunk) = self
             .chunks
