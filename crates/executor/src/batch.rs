@@ -66,6 +66,7 @@ pub struct BatchOutput {
 /// `shape` is what the runner pads to. It is the mechanism's statement of the batch's size — the
 /// rows and tokens it wrote — and the runner serves the batch from the smallest captured bucket
 /// that holds it; a shape no bucket holds is an error, never an eager fallback (4.5).
+#[derive(Clone)]
 pub struct Batch {
     /// The batch's number, for the stall report and the completion the mechanism reads (2.4).
     pub id: BatchId,
@@ -200,6 +201,7 @@ impl Jobs {
 }
 
 /// One job the device executor issues, in submission order.
+#[derive(Clone)]
 pub enum Job {
     /// Replays the captured graph of `bucket`: the runner staged the batch's inputs already.
     Replay {
@@ -246,7 +248,7 @@ pub enum Job {
     /// A storage owner's recorded issue work, performed on its stream in submission order.
     Issue {
         /// The recorded copies, fills, fences and waits.
-        work: recorded::Batch,
+        work: std::sync::Arc<std::sync::Mutex<recorded::Batch>>,
     },
     /// A job whose only work is the wait for the events the event pool deferred work on.
     After {
@@ -339,7 +341,13 @@ impl std::fmt::Debug for Job {
                 .finish(),
             Self::Issue { work } => formatter
                 .debug_struct("Issue")
-                .field("work", &work.len())
+                .field(
+                    "work",
+                    &work
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty(),
+                )
                 .finish(),
             Self::After { events } => formatter
                 .debug_struct("After")
@@ -357,12 +365,22 @@ impl std::fmt::Debug for Job {
 pub enum JobKind {
     /// Serving one batch: staging it and replaying its bucket's graph.
     Batch,
+    /// A replay of a captured bucket inside a serving command.
+    Replay,
+    /// A capture of one bucket (warmup or a recapture of the update's generation).
+    Capture,
+    /// A bucket's kernel rebind.
+    Rebind,
+    /// A paired forward of one changed operator (7.3).
+    Shadow,
     /// Capturing every bucket of the serving generation before it serves.
     Warmup,
     /// Preparing the next generation (7.3 step 2).
     Precopy,
     /// Switching the serving generation at a batch boundary (7.3 step 3).
     Switchover,
+    /// The discard of a prepared generation (7.3 step 4's revert).
+    Revert,
     /// Releasing an old generation's graphs (7.3 step 6).
     Purge,
     /// A storage job: the copies, fills and fences a storage owner recorded.
@@ -376,6 +394,10 @@ impl JobKind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Batch => "batch",
+            Self::Replay => "replay",
+            Self::Capture => "capture",
+            Self::Rebind => "rebind",
+            Self::Shadow => "shadow",
             Self::Warmup => "warmup",
             Self::Precopy => "precopy",
             Self::Switchover => "switchover",

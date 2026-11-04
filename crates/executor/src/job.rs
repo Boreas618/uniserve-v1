@@ -69,7 +69,7 @@ pub(crate) enum Command {
     /// Release the graphs that reference a generation older than this (7.3 step 6).
     Purge(u64),
     /// A storage owner's recorded issue work.
-    Issue(recorded::Batch),
+    Issue(std::sync::Arc<std::sync::Mutex<recorded::Batch>>),
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -221,7 +221,12 @@ impl JobQueue {
 
     /// The recorded issue work of one storage submission, named for the queue.
     pub(crate) fn issue(&self, work: recorded::Batch) -> Result<JobId> {
-        self.push(Command::Issue(work), None, JobKind::Issue, None)
+        self.push(
+            Command::Issue(std::sync::Arc::new(std::sync::Mutex::new(work))),
+            None,
+            JobKind::Issue,
+            None,
+        )
     }
 
     /// The next command, once one is pending or `timeout` passed; `None` when the queue closed.
@@ -384,6 +389,7 @@ pub(crate) fn kind_of(command: &Command) -> JobKind {
         Command::Batch(_) => JobKind::Batch,
         Command::Warmup => JobKind::Warmup,
         Command::Precopy(_) => JobKind::Precopy,
+        Command::Steps { .. } => JobKind::Precopy,
         Command::Switchover(_) => JobKind::Switchover,
         Command::Revert(_) => JobKind::Revert,
         Command::Purge(_) => JobKind::Purge,
@@ -592,3 +598,4 @@ mod tests {
         );
     }
 }
+

@@ -76,6 +76,15 @@ pub trait Runner: Send {
         crate::arena::PoolMetrics::default()
     }
 
+    /// Gives the runner the device's graph pools, before its first capture.
+    ///
+    /// One pool set exists per device and every runner issuing on it books into the same one
+    /// (4.1): two runners each reserving their own range would double-book the device's graph
+    /// storage. The device executor calls this when it starts.
+    fn attach_pools(&mut self, pools: std::sync::Arc<std::sync::Mutex<crate::arena::Pools>>) {
+        let _ = pools;
+    }
+
     /// Performs one job this runner returned from `submit` or `precopy`, on the device executor's
     /// thread, when the executor reaches it in submission order.
     ///
