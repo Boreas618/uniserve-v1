@@ -727,6 +727,7 @@ impl<K: Order> Policy for Arrival<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::End;
     use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
     use crate::policy::Instantiation;
@@ -1442,5 +1443,233 @@ mod tests {
             Event::Unknown,
         ]);
         assert!(fcfs.dispatch(&room(1024, 8)).work.is_empty());
+    }
+    /// A policy with three phases: 0 prefill, 1 decode, 2 denoise.
+    fn policy_with_media() -> Arrival<crate::ArrivalOrder> {
+        let mut fcfs = Arrival::default();
+        fcfs.instantiate(&Instantiation {
+            parameters: Parameters::default(),
+            state: Snapshot {
+                phases: vec![
+                    PhaseView {
+                        id: PhaseId(0),
+                        kind: PhaseKind::Prefill,
+                        block: ComponentId(0),
+                    },
+                    PhaseView {
+                        id: PhaseId(1),
+                        kind: PhaseKind::Decode,
+                        block: ComponentId(0),
+                    },
+                    PhaseView {
+                        id: PhaseId(2),
+                        kind: PhaseKind::Denoise,
+                        block: ComponentId(1),
+                    },
+                ],
+                ..Snapshot::default()
+            },
+        });
+        fcfs
+    }
+
+    /// **The pages a step offloads are the ones no resident request continues
+    /// from, in least-recently-used order.**
+    ///
+    /// The mechanism refuses to free a page a resident request still continues
+    /// from (`validate_victims`), so naming one would fail the policy at the
+    /// first offload; `RequestView::cached_pages` and the mechanism's own
+    /// `evictable` flag are how the policy knows. The flag moves after a page
+    /// is announced (`Cached` carries it every time), so the case also shows
+    /// the page becoming offloadable once its last user finished.
+    #[test]
+    fn a_page_a_request_still_continues_from_is_not_offloaded() {
+        let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
+        fcfs.instantiate(&Instantiation {
+            parameters: Parameters::default(),
+            state: Snapshot {
+                pages: vec![
+                    PageView {
+                        id: PageId(1),
+                        tokens: 16,
+                        last_used: Nanos(1),
+                        on_host: false,
+                        evictable: true,
+                    },
+                    PageView {
+                        id: PageId(2),
+                        tokens: 16,
+                        last_used: Nanos(2),
+                        on_host: false,
+                        evictable: false,
+                    },
+                ],
+                ..Snapshot::default()
+            },
+        });
+
+        assert_eq!(fcfs.dispatch(&room(1024, 8)).offload, vec![PageId(1)]);
+
+        // The mechanism states the page's last user is gone: it is now the
+        // least recently used page no request continues from.
+        fcfs.observe(&[Event::Cached {
+            page: PageView {
+                id: PageId(2),
+                tokens: 16,
+                last_used: Nanos(3),
+                on_host: false,
+                evictable: true,
+            },
+        }]);
+        assert_eq!(
+            fcfs.dispatch(&room(1024, 8)).offload,
+            vec![PageId(1), PageId(2)]
+        );
+    }
+
+    /// **A host hit shorter than the floor is not worth prefetching.**
+    ///
+    /// Today's `PREFETCH_MIN_TOKENS`: a deepening of fewer tokens is computed
+    /// faster than it is fetched, so the policy asks for the fetches that pay
+    /// and leaves the rest. A policy that asked for every deepening would
+    /// spend the step's transfers on hits the mechanism would drop anyway.
+    #[test]
+    fn a_hit_shorter_than_the_floor_is_not_prefetched() {
+        let mut fcfs = policy();
+        let floor = Policy::limits(&fcfs).prefetch_min_tokens;
+
+        let mut short = view(1, 0, 1);
+        short.prefetch_tokens = floor - 1;
+        let mut deep = view(2, 0, 2);
+        deep.prefetch_tokens = floor;
+        admit_with_phase(&mut fcfs, short, PhaseId(1));
+        admit_with_phase(&mut fcfs, deep, PhaseId(1));
+
+        assert_eq!(fcfs.dispatch(&room(1024, 8)).prefetch, vec![RequestId(2)]);
+    }
+
+    /// **A warming epoch warms no more than the tokens it is given.**
+    ///
+    /// `Room::prefill_tokens` is the reservation a precopy charges new prefix
+    /// writes against, in tokens; a page holds `page_tokens`, so the budget is
+    /// that many pages, and a budget of one page warms exactly one. With no
+    /// bound stated the whole candidate list is the bound, which is what the
+    /// mechanism states outside a precopy's own accounting.
+    #[test]
+    fn a_warming_epoch_warms_no_more_than_the_tokens_it_is_given() {
+        let mut fcfs = policy();
+        let candidates = || {
+            vec![
+                Warming {
+                    request: RequestId(1),
+                    pages: vec![PageId(1), PageId(2), PageId(3)],
+                },
+                Warming {
+                    request: RequestId(2),
+                    pages: vec![PageId(4)],
+                },
+            ]
+        };
+
+        let bounded = Room {
+            page_tokens: 16,
+            prefill_tokens: Some(16),
+            warming: candidates(),
+            ..Room::default()
+        };
+        assert_eq!(fcfs.warm(&bounded), vec![PageId(1)]);
+
+        let two_pages = Room {
+            page_tokens: 16,
+            prefill_tokens: Some(32),
+            warming: candidates(),
+            ..Room::default()
+        };
+        assert_eq!(fcfs.warm(&two_pages), vec![PageId(1), PageId(2)]);
+
+        let unbounded = Room {
+            page_tokens: 16,
+            prefill_tokens: None,
+            warming: candidates(),
+            ..Room::default()
+        };
+        assert_eq!(
+            fcfs.warm(&unbounded),
+            vec![PageId(1), PageId(2), PageId(3), PageId(4)]
+        );
+    }
+
+    /// **The two paths alternate their precedence between steps.**
+    ///
+    /// Today's `prefer_media`: after a step that carried both a media call and
+    /// a generation call, the path that was second goes first in the next
+    /// step, so neither a decoder nor a generation request waits behind the
+    /// other indefinitely. A policy that always preferred one path would pass
+    /// every case that serves one class of request and starve the other.
+    #[test]
+    fn the_two_paths_alternate_their_precedence_between_steps() {
+        let mut fcfs = policy_with_media();
+        admit_with_phase(&mut fcfs, view(1, 0, 1), PhaseId(1));
+        let mut media = view(2, 0, 2);
+        media.class = RequestClass::Media;
+        admit_with_phase(&mut fcfs, media, PhaseId(2));
+
+        let step = room(16, 4);
+        let first: Vec<u64> = fcfs
+            .dispatch(&step)
+            .work
+            .iter()
+            .map(|work| work.request.0)
+            .collect();
+        assert_eq!(first, vec![1, 2]);
+        let second: Vec<u64> = fcfs
+            .dispatch(&step)
+            .work
+            .iter()
+            .map(|work| work.request.0)
+            .collect();
+        assert_eq!(second, vec![2, 1]);
+    }
+
+    /// **A rejected request is left behind once its end is announced.**
+    ///
+    /// The policy rejects a request whose worst-case reservation is larger than
+    /// the whole cache, and the mechanism drops it from its queue and reports
+    /// `End::Rejected`. From then on the policy names it nowhere: not in
+    /// `admit` (the mechanism no longer queues it, and naming it there is a
+    /// refused decision that stops the epoch) and not in `reject` again. The
+    /// requests behind it are unaffected.
+    #[test]
+    fn a_rejected_request_is_left_behind_once_its_end_is_announced() {
+        let mut fcfs = policy();
+        let mut over = view(1, 0, 1);
+        over.reservation_units = 1_000;
+        let mut fits = view(2, 0, 2);
+        fits.reservation_units = 10;
+        fcfs.observe(&[
+            Event::Arrived { request: over },
+            Event::Arrived { request: fits },
+        ]);
+
+        let step = Room {
+            capacity_units: 100,
+            ..room(1024, 8)
+        };
+        let plan = fcfs.dispatch(&step);
+        assert_eq!(plan.reject, vec![RequestId(1)]);
+        assert_eq!(plan.admit, vec![RequestId(2)]);
+
+        fcfs.observe(&[
+            Event::Admitted {
+                request: RequestId(2),
+            },
+            Event::Finished {
+                request: RequestId(1),
+                end: End::Rejected,
+            },
+        ]);
+        let plan = fcfs.dispatch(&step);
+        assert!(plan.admit.is_empty());
+        assert!(plan.reject.is_empty());
     }
 }
