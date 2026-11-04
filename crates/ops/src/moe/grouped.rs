@@ -1651,6 +1651,10 @@ mod nvfp4_launch_tests {
         odd.hidden = 2047;
         let mut odd_args = fc1_args();
         odd_args.weights = table(DType::U8, &[128, 1536, 1023]);
+        // The packed activations shrink with the contraction (`hidden / 2`), so the descriptor's odd
+        // width and the operand it is refused for agree; otherwise the shape check fires first and
+        // the test would be green about the wrong rule.
+        odd_args.hidden = table(DType::U8, &[3, 1023]);
         let error = GatherGemmNvfp4::validate(&odd, &odd_args).unwrap_err();
         assert!(format!("{error}").contains("odd"), "{error}");
 
