@@ -544,6 +544,16 @@ pub(crate) struct MainProcess {
     /// How many switchovers this epoch has served (§7.3 step 3). The epoch's first one is what
     /// installs a policy, so only it is checked for a policy that never arrived.
     switchovers: u32,
+    /// When this process stated itself as `Ready` or `Standby`, and how many program-layer
+    /// commands it has been given since the epoch began: a process that was read as ready and is
+    /// given no command looks exactly like one that is working, from the daemon's side and from
+    /// its own.
+    announced_at: Option<Instant>,
+    commands_seen: u64,
+    /// The two waits of the epoch's start that no event ends: the daemon's first command, and this
+    /// node's warmup.
+    command_wait: Wait,
+    warmup_wait: Wait,
     /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
     ///
     /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
@@ -769,6 +779,10 @@ impl MainProcess {
             precopy: None,
             warming: Vec::new(),
             switchovers: 0,
+            announced_at: None,
+            commands_seen: 0,
+            command_wait: Wait::default(),
+            warmup_wait: Wait::default(),
             policy_probe_at: None,
             policy_missing_since: None,
             prepared: Vec::new(),
@@ -910,6 +924,7 @@ impl MainProcess {
 
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
+            self.note_waits();
             self.advance_precopy()?;
             if let Some(failure) = self.advance_warmup()? {
                 return Ok(Some(failure));
@@ -1288,6 +1303,7 @@ impl MainProcess {
         // §7.3's stages are the epoch's steps, and a step that never arrives is the failure this
         // line is for: it names the command and the generation, so a log that stops after "claimed
         // the deployment's storage" says which step the process is waiting for.
+        self.commands_seen += 1;
         tracing::info!(
             stage = program_stage(&command),
             boundary = self.boundary,
@@ -1301,10 +1317,28 @@ impl MainProcess {
                 programs,
                 policy,
             } => {
+                // The receipt: this line says the daemon's step reached this process and what it
+                // carried, before anything is resolved, built or installed. A run that stops with
+                // no such line stopped before the daemon sent it, and one that stops after it
+                // stopped here.
+                tracing::info!(
+                    generation,
+                    operators = programs.len(),
+                    policy = %policy.backend,
+                    policy_revision = policy.revision,
+                    "received the daemon's precopy"
+                );
                 self.start_precopy(generation, &programs, &policy, reply)?;
                 return Ok(None);
             }
-            ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
+            ProgramCommand::Switchover { generation, step } => {
+                tracing::info!(
+                    generation,
+                    step = step.unwrap_or_default(),
+                    "received the daemon's switchover"
+                );
+                self.switchover(generation, step)?
+            }
             ProgramCommand::Commit { generation } => self.commit(generation)?,
             // The operator's rollback is the daemon's decision, and its reason - when the
             // daemon states one - is what the record keeps. It is not a policy failure: nothing
@@ -1324,6 +1358,13 @@ impl MainProcess {
     /// Delivers a program-layer status: to the peer that asked, and to the
     /// daemon.
     fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
+        // §7.3's steps are answered here. A run that stops between two of them needs to know which
+        // one was answered last, and the daemon's own log of its commands is not this side's.
+        tracing::info!(
+            status = status_name(&status),
+            to_peer = reply.is_some(),
+            "answering the epoch's program layer"
+        );
         if let Some(rank) = reply {
             if let Some(channel) = self.control.peer_mut(rank) {
                 if let Err(error) = channel.send(&status) {
@@ -1392,6 +1433,16 @@ impl MainProcess {
             programs
         };
 
+        tracing::info!(
+            generation,
+            operators = programs.len(),
+            candidates = candidates
+                .values()
+                .filter(|ordered| ordered.len() > 1)
+                .count(),
+            devices = self.executors.len(),
+            "this process is installing the generation the daemon named"
+        );
         let (tasks, unavailable) = match self.admit_installs(programs, &BTreeMap::new()) {
             Ok(admitted) => admitted,
             Err(failure) => return self.abandon_precopy(generation, failure, reply),
@@ -1406,6 +1457,9 @@ impl MainProcess {
             tried: std::collections::BTreeSet::new(),
             backends: BTreeMap::new(),
             unavailable,
+            stage_name: "modules",
+            since: Instant::now(),
+            warned: false,
             learned: BTreeMap::new(),
             policy_requested: false,
             next: Vec::new(),
@@ -1741,6 +1795,25 @@ impl MainProcess {
         Ok(None)
     }
 
+    /// Reports the two waits of the epoch's start when they outlast a stall bound: the daemon's
+    /// first program-layer command, and this node's warmup. Neither fails anything - the failures
+    /// they precede state themselves - but a run that hangs here now says what it was waiting for.
+    fn note_waits(&mut self) {
+        let now = Instant::now();
+        let bound = self.watchdog.stall_bound();
+        self.command_wait
+            .note(self.announced_at.is_some() && self.commands_seen == 0, now);
+        self.command_wait
+            .report("the daemon's first program-layer command", 0, bound, now);
+        self.warmup_wait.note(!self.warming.is_empty(), now);
+        let generation = self
+            .warming
+            .first()
+            .map_or(0, |(_, _, generation)| *generation);
+        self.warmup_wait
+            .report("this node's warmup", generation, bound, now);
+    }
+
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
     /// as it is, and the next serve pass looks again.
@@ -1749,6 +1822,30 @@ impl MainProcess {
             return Ok(());
         };
         let generation = precopy.generation;
+        // Every stage of §7.3 step 2 is polled rather than waited for, so a stage that never
+        // advances is the one shape of hang this process can have. It says so twice: when it enters
+        // a stage, and once, by name, when that stage has stood longer than the watchdog's stall
+        // bound - the same bound the §2.4 rule uses for a job, applied to the step itself.
+        let entered = stage_name(&precopy.stage);
+        if entered != precopy.stage_name {
+            precopy.stage_name = entered;
+            precopy.since = Instant::now();
+            precopy.warned = false;
+            tracing::info!(
+                generation,
+                stage = entered,
+                "the precopy entered a stage of the update"
+            );
+        } else if !precopy.warned && precopy.since.elapsed() > self.watchdog.stall_bound() {
+            precopy.warned = true;
+            tracing::warn!(
+                generation,
+                stage = entered,
+                waited_s = precopy.since.elapsed().as_secs(),
+                "the precopy has stood in this stage past the watchdog's stall bound and nothing \
+                 has answered: the Program Server, a device or a scheduler is the one to look at"
+            );
+        }
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
@@ -2975,6 +3072,12 @@ impl MainProcess {
             devices = self.executors.len(),
             "stating what this process is to the daemon"
         );
+        if matches!(
+            state,
+            proto::request::wire::EngineState::Ready | proto::request::wire::EngineState::Standby
+        ) {
+            self.announced_at.get_or_insert_with(Instant::now);
+        }
         announce(&mut self.control, state, info)
     }
 
@@ -3037,7 +3140,9 @@ impl MainProcess {
                 .as_ref()
                 .map(|denoiser| denoiser.description.clone())
                 .unwrap_or_default(),
-            latent_encoding_units: first.media_units(ipc::MediaCall::LatentEncoding).unwrap_or(0),
+            latent_encoding_units: first
+                .media_units(ipc::MediaCall::LatentEncoding)
+                .unwrap_or(0),
             schedulers: u32::try_from(self.schedulers.len()).unwrap_or(u32::MAX),
             capacity: Some(proto::request::wire::BatchCapacity {
                 max_batch: info.max_batch_calls,
@@ -3198,6 +3303,20 @@ impl MainProcess {
 ///
 /// A status the daemon learns another way - none today - answers `None`, and the caller logs it
 /// instead of inventing a report.
+/// The name of a program-layer status, for the line that says which step was answered.
+fn status_name(status: &ProgramStatus) -> &'static str {
+    match status {
+        ProgramStatus::Precopied { .. } => "precopied",
+        ProgramStatus::PrecopyFailed { .. } => "precopy_failed",
+        ProgramStatus::Switched { .. } => "switched",
+        ProgramStatus::Committed { .. } => "committed",
+        ProgramStatus::Reverted { .. } => "reverted",
+        ProgramStatus::Purged { .. } => "purged",
+        ProgramStatus::PolicyReverted { .. } => "policy_reverted",
+        ProgramStatus::Failed { .. } => "failed",
+    }
+}
+
 fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
@@ -3642,6 +3761,15 @@ impl HostAction for Install {
             .programs
             .lock()
             .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+        // The one call that leaves this process while a generation is prepared: a run that hangs
+        // before it reaches the Program Server and one that hangs inside it look the same from the
+        // daemon, so both sides state it.
+        tracing::info!(
+            programs = self.request.programs.len(),
+            descriptors = self.request.descriptors.len(),
+            target = %self.target,
+            "asking the Program Server to prepare this generation's modules"
+        );
         let prepared = client
             .prepare(&self.request, &mut |progress| {
                 tracing::debug!(
@@ -3705,6 +3833,11 @@ impl HostAction for Install {
                 }
             }
         }
+        tracing::info!(
+            modules = entries.len(),
+            target = %self.target,
+            "this device's modules are installed for the new generation"
+        );
         Ok(entries)
     }
 
@@ -3737,6 +3870,12 @@ struct Precopy {
     backends: BTreeMap<String, Vec<String>>,
     /// The refusal the generation's installs met, shared with the device loads that found it.
     unavailable: UnavailableCell,
+    /// The stage the precopy is in, since when, and whether the wait has already been reported:
+    /// every stage of §7.3 step 2 is a poll, so a stage that never advances is a run that hangs
+    /// without a line unless the process says which step it is standing on.
+    stage_name: &'static str,
+    since: Instant,
+    warned: bool,
     /// The descriptor keys the walk has taught this generation, by operator. The epoch's first
     /// generation has no serving generation to take them from (§7.3 step 2).
     learned: BTreeMap<String, Vec<String>>,
@@ -3763,6 +3902,72 @@ enum PrecopyStage {
     Shadow(Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>),
     /// A stage being replaced; the driver never observes it.
     Done,
+}
+
+/// A wait of the control path: when it began and when it was last reported.
+///
+/// Every step of §7.3 is polled rather than blocked on, so a step that never advances is a run
+/// that hangs without a line. Each such wait reports itself by name, generation and elapsed time
+/// once per stall bound, and never ends the epoch: the command's own failure path decides, and a
+/// deadline that killed would be a second failure beside the one being chased.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wait {
+    since: Option<Instant>,
+    reported_at: Option<Instant>,
+}
+
+impl Wait {
+    /// Notes whether the wait is on: it begins on the first pass that finds it waiting, and the
+    /// next pass that finds it over clears it.
+    fn note(&mut self, waiting: bool, now: Instant) {
+        if waiting {
+            self.since.get_or_insert(now);
+        } else {
+            self.since = None;
+            self.reported_at = None;
+        }
+    }
+
+    /// Reports the wait when it has stood a stall bound since it began, and again once per bound
+    /// after each report. Returns whether this pass reported it.
+    fn report(
+        &mut self,
+        name: &'static str,
+        generation: u64,
+        bound: Duration,
+        now: Instant,
+    ) -> bool {
+        let Some(since) = self.since else {
+            return false;
+        };
+        if now.duration_since(since) < bound {
+            return false;
+        }
+        if self
+            .reported_at
+            .is_some_and(|at| now.duration_since(at) < bound)
+        {
+            return false;
+        }
+        self.reported_at = Some(now);
+        tracing::warn!(
+            generation,
+            wait = name,
+            waited_s = now.duration_since(since).as_secs(),
+            "the control path is still waiting on this step and nothing has answered it yet"
+        );
+        true
+    }
+}
+
+/// The name of a precopy stage, for the line that says which step the process is standing on.
+fn stage_name(stage: &PrecopyStage) -> &'static str {
+    match stage {
+        PrecopyStage::Modules(_) => "the module load lane",
+        PrecopyStage::Executors(_) => "this node's devices",
+        PrecopyStage::Shadow(_) => "the schedulers' shadow step",
+        PrecopyStage::Done => "done",
+    }
 }
 
 /// What polling a stage's submissions found.
