@@ -303,3 +303,93 @@ fn a_generation_reports_a_missing_kernel_with_what_was_asked_for() {
         other => panic!("expected a missing-kernel error, found {other}"),
     }
 }
+
+#[test]
+fn modulation_keys_separate_every_compiled_variant() {
+    use ops::modulation::{GatedResidualDescriptor, ModulatedRmsNormDescriptor};
+    use ops::{DType, Float};
+
+    let norm = ModulatedRmsNormDescriptor {
+        dtype: DType::BF16,
+        output: DType::BF16,
+        indices: DType::I32,
+        width: 3072,
+        block: 4096,
+        epsilon: Float::from(1e-6_f32),
+        gate_stride: 3072,
+        shift_stride: 3072,
+        scale_stride: 3072,
+        update: true,
+        retain: false,
+    };
+    let key = ops::descriptor::key(&norm);
+    // The same descriptor prints the same key, so a program is compiled once.
+    assert_eq!(key, ops::descriptor::key(&norm));
+    // The epsilon enters by bit pattern, so two epsilons that differ in one bit are two variants.
+    let other_epsilon = ModulatedRmsNormDescriptor {
+        epsilon: Float::from(1e-6_f32 + f32::EPSILON * 1e-6_f32),
+        ..norm
+    };
+    assert_ne!(key, ops::descriptor::key(&other_epsilon));
+    assert!(
+        !key.contains("0.000001"),
+        "a decimal spelling would alias: {key}"
+    );
+    for (name, variant) in [
+        (
+            "update",
+            ModulatedRmsNormDescriptor {
+                update: false,
+                ..norm
+            },
+        ),
+        (
+            "retain",
+            ModulatedRmsNormDescriptor {
+                retain: true,
+                ..norm
+            },
+        ),
+        (
+            "output",
+            ModulatedRmsNormDescriptor {
+                output: DType::F8E4M3,
+                ..norm
+            },
+        ),
+        (
+            "gate_stride",
+            ModulatedRmsNormDescriptor {
+                gate_stride: 6144,
+                ..norm
+            },
+        ),
+        (
+            "width",
+            ModulatedRmsNormDescriptor {
+                width: 1536,
+                block: 2048,
+                ..norm
+            },
+        ),
+    ] {
+        let changed = ops::descriptor::key(&variant);
+        assert_ne!(key, changed, "changing {name} must select another variant");
+    }
+
+    let residual = GatedResidualDescriptor {
+        dtype: DType::BF16,
+        indices: DType::I32,
+        width: 3072,
+        elements: 3072 * 64,
+        gate_stride: 3072,
+    };
+    assert_ne!(
+        ops::descriptor::key(&residual),
+        ops::descriptor::key(&GatedResidualDescriptor {
+            elements: 3072 * 65,
+            ..residual
+        }),
+        "the walked element count is part of the compiled variant"
+    );
+}
