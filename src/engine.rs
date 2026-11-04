@@ -74,34 +74,36 @@
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
 //! `crates/executor` and are used as they are written there.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use clap::Args;
 
-use executor::blocking::ThreadPool;
+use executor::batch::Submission;
+use executor::blocking::{BlockingKind, ThreadPool};
 use executor::completion::Outcome;
 use executor::control::{Control, Endpoints, Ready};
 use executor::device::{Executor, Probe};
+use executor::host::{HostAction, HostTask, Lane};
 use executor::hot_update::{Action, HotUpdate};
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use nn::{Checkpoint, Model, Partition, WeightLoader};
-use ops::Generation;
-use program_server::{BuildConfig, Client, EpochRecord, Module, Program, Programs, Target};
-
-use crate::cli::LogLevels;
-use crate::logging;
+use ops::{Generation, KernelEntry};
+use program_server::{
+    BuildConfig, Client, Descriptors, EpochRecord, PrepareRequest, Program, ProgramRequest,
+    ProgramSlot, Programs, Selector, Target,
+};
 
 /// The options of `uniserve engine`.
 ///
-/// The daemon launches one main process per node and epoch. Everything the
-/// process is built from comes from its build config (§7.1); the options name
-/// only where that config is and how this node takes part in the epoch.
+/// The daemon launches one main process per node and epoch, from the epoch's
+/// build config: the options name where that config is and how this node takes
+/// part in the epoch, and nothing that the build config states.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineArgs {
     /// The epoch's build config for this node, which the daemon wrote.
@@ -113,6 +115,11 @@ pub(crate) struct EngineArgs {
     /// The engine number the daemon started this main process under.
     #[arg(long)]
     pub engine: u64,
+    /// The daemon's process socket, through which the previous architecture
+    /// started worker processes. The main process starts none; the argument is
+    /// accepted and unused until the daemon's launcher stops passing it.
+    #[arg(long)]
+    pub processes: String,
     /// This node's rank in the deployment.
     #[arg(long, default_value_t = 0)]
     pub node_rank: u32,
@@ -126,15 +133,20 @@ pub(crate) struct EngineArgs {
     pub peers: Vec<String>,
 }
 
-/// Runs the `engine` command.
-pub(crate) fn run(args: &EngineArgs, lifeline: Option<i32>, log: &LogLevels) -> Result<ExitCode> {
+/// Runs the `uniserve engine` command.
+pub(crate) fn run(
+    args: &EngineArgs,
+    lifeline: Option<i32>,
+    log: &crate::cli::LogLevels,
+) -> Result<ExitCode> {
     crate::follow_lifeline(lifeline);
-    logging::init_tracing(
+    crate::logging::init_tracing(
         "Engine",
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
     );
 
+    let _ = &args.processes;
     let build = BuildConfig::read(&args.build_config)
         .with_context(|| format!("reading the build config {}", args.build_config.display()))?;
     let mut main = MainProcess::start(args, &build)?;
@@ -158,23 +170,25 @@ pub(crate) struct MainProcess {
     executors: Vec<Executor>,
     memory: Memory,
     blocking: ThreadPool,
+    /// The blocking lane module loads run on (§2.4, §7.3 step 2).
+    modules: Lane<Install>,
     /// The program-layer update's phases and bookkeeping (§7.3).
     update: HotUpdate,
     /// The stall and sticky-error rules of §2.4.
     watchdog: Watchdog,
-    /// The Program Server client precopy resolves modules with (§6.3).
-    programs: Client,
+    /// The Program Server client, shared with the module-load lane.
+    programs: Arc<Mutex<Client>>,
+    /// The precopy between serve passes, if one is in flight (§7.3 step 2).
+    precopy: Option<Precopy>,
     /// The generation each device serves now, in `executors` order.
     generations: Vec<Arc<Generation>>,
     /// What this node resolves a module for (§5.3).
-    targets: Vec<program_server::Target>,
-    /// The epoch record the daemon pinned (§5.1).
-    record: EpochRecord,
+    targets: Vec<Target>,
 }
 
 impl MainProcess {
-    /// Builds the main process for `build`: connects to the daemon, loads the
-    /// epoch's model, and starts the epoch's threads in the order §2.4 lists.
+    /// Connects to the daemon, loads the epoch's model, and starts the epoch's
+    /// threads in the order §2.4 lists.
     fn start(args: &EngineArgs, build: &BuildConfig) -> Result<Self> {
         let mut control = Control::connect(
             &Endpoints {
@@ -185,7 +199,7 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and
         // the daemon answers with the engine spec and the epoch record (§2.3).
-        let record = handshake(&mut control, args, build)?;
+        let record = handshake(&mut control, args)?;
 
         let model = load_model(
             record.model_class(),
@@ -199,6 +213,9 @@ impl MainProcess {
         // released in reverse order by `close`.
         let mut memory = build.open_memory()?;
         let blocking = ThreadPool::new(build.blocking_limits());
+        let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
+        let programs = Arc::new(Mutex::new(Client::connect(build.program_server())?));
+
         let mut executors = Vec::with_capacity(build.devices().len());
         let mut generations = Vec::with_capacity(build.devices().len());
         for device in build.devices() {
@@ -228,12 +245,13 @@ impl MainProcess {
             executors,
             memory,
             blocking,
+            modules,
             update,
             watchdog,
-            programs: Client::connect(build.program_server())?,
+            programs,
+            precopy: None,
             generations,
             targets: build.targets(),
-            record,
         })
     }
 
@@ -271,6 +289,10 @@ impl MainProcess {
                     Ready::Woken | Ready::Idle => {}
                 }
             }
+
+            // A precopy in flight advances one stage per pass, never waiting on
+            // its builds or its devices (§7.3 step 2).
+            self.advance_precopy()?;
 
             running = self.read_executors();
             if let Some(failure) = self.watch(&running)? {
@@ -384,8 +406,9 @@ impl MainProcess {
                 // Every request of one submission is queued before the next
                 // batch is formed (§2.3).
                 for request in submit.requests {
-                    let request = proto::request::Request::from_wire(request)
-                        .map_err(|error| anyhow::anyhow!("a submission did not convert: {error}"))?;
+                    let request = proto::request::Request::from_wire(request).map_err(|error| {
+                        anyhow::anyhow!("a submission did not convert: {error}")
+                    })?;
                     let rank = self.route(&request);
                     let Some(scheduler) = self.schedulers.get_mut(rank) else {
                         bail!("a request was routed to rank {rank}, which holds no scheduler");
@@ -398,9 +421,7 @@ impl MainProcess {
                 self.request_command(command)?;
                 Ok(None)
             }
-            proto::request::wire::to_engine::Kind::Engine(command) => {
-                self.engine_command(command)
-            }
+            proto::request::wire::to_engine::Kind::Engine(command) => self.engine_command(command),
         }
     }
 
@@ -416,24 +437,31 @@ impl MainProcess {
             }) else {
                 return Ok(None);
             };
-            if let Some(status) = self.program(command)? {
-                if let Some(channel) = self.control.peer_mut(rank) {
-                    channel.send(&status)?;
-                }
+            if let Some(status) = self.program(command, Some(rank))? {
+                self.answer(Some(rank), status);
             }
         }
     }
 
     /// §7.3: one program-layer command.
-    fn program(&mut self, command: ProgramCommand) -> Result<Option<ProgramStatus>> {
+    ///
+    /// A precopy answers later, from [`Self::advance_precopy`], because its
+    /// module builds run between serve passes; every other stage answers at
+    /// once.
+    fn program(
+        &mut self,
+        command: ProgramCommand,
+        reply: Option<u32>,
+    ) -> Result<Option<ProgramStatus>> {
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
                 programs,
-            } => self.precopy(generation, &programs)?,
-            ProgramCommand::Switchover { generation, step } => {
-                self.switchover(generation, step)?
+            } => {
+                self.start_precopy(generation, &programs, reply)?;
+                return Ok(None);
             }
+            ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
             ProgramCommand::Commit { generation } => self.commit(generation)?,
             ProgramCommand::Revert { generation } => self.revert(
                 generation,
@@ -446,162 +474,322 @@ impl MainProcess {
         Ok(Some(status))
     }
 
-    /// §7.3 step 2: resolve and load the new generation on the blocking pool,
-    /// build it per device, let the scheduler instantiate the candidate policy
-    /// and dry-run its decisions, ask each executor for its rebinds or
-    /// recaptures, and run one shadow batch on the resident requests.
-    fn precopy(&mut self, generation: u64, programs: &Programs) -> Result<ProgramStatus> {
+    /// Delivers a program-layer status: to the peer that asked, and to the
+    /// daemon.
+    fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
+        if let Some(rank) = reply {
+            if let Some(channel) = self.control.peer_mut(rank) {
+                if let Err(error) = channel.send(&status) {
+                    tracing::warn!(%error, rank, "answering a peer's program command failed");
+                }
+            }
+        }
+        self.report(status);
+    }
+
+    /// §7.3 step 2, first half: states the new generation to the Program Server
+    /// and admits one install per device on the module-load lane, whose
+    /// builds run while serving goes on.
+    fn start_precopy(
+        &mut self,
+        generation: u64,
+        programs: &Programs,
+        reply: Option<u32>,
+    ) -> Result<()> {
         if let Err(error) = self.update.begin_precopy(generation) {
-            return Ok(ProgramStatus::PrecopyFailed {
-                generation,
-                failure: UpdateFailure::Precopy {
-                    reason: error.to_string(),
+            let failure = UpdateFailure::Precopy {
+                reason: error.to_string(),
+            };
+            self.answer(
+                reply,
+                ProgramStatus::PrecopyFailed {
+                    generation,
+                    failure,
                 },
+            );
+            return Ok(());
+        }
+
+        // The scheduling policy is one program among the others, in the epoch's
+        // `scheduling` slot (§4.4, §5.1).
+        let Some(policy) = programs.get(&ProgramSlot::all(SCHEDULING)).cloned() else {
+            return self.abandon_precopy(
+                generation,
+                UpdateFailure::Precopy {
+                    reason: format!("the update names no {SCHEDULING} program"),
+                },
+                reply,
+            );
+        };
+
+        // The descriptors each operator must cover are exactly the keys the
+        // serving generation holds: an update changes implementations and never
+        // the set of descriptors (§7.3 step 2, §5.3).
+        let mut descriptors = Vec::with_capacity(programs.len());
+        let mut requests = Vec::with_capacity(programs.len());
+        for (slot, program) in programs {
+            let Some(operator) = ops::operator_name(&slot.op) else {
+                return self.abandon_precopy(
+                    generation,
+                    UpdateFailure::Precopy {
+                        reason: format!("operator {} has no implementation in this build", slot.op),
+                    },
+                    reply,
+                );
+            };
+            let keys = descriptor_keys(&self.generations[0], operator);
+            if keys.is_empty() {
+                return self.abandon_precopy(
+                    generation,
+                    UpdateFailure::Precopy {
+                        reason: format!(
+                            "operator {} holds no descriptor in the serving generation",
+                            slot.op
+                        ),
+                    },
+                    reply,
+                );
+            }
+            descriptors.push(Descriptors {
+                op: slot.op.clone(),
+                keys,
+            });
+            requests.push(ProgramRequest {
+                slot: slot.clone(),
+                selector: Selector::Fixed(program.clone()),
             });
         }
 
-        // One generation per device: a Kernel belongs to the device context that
-        // loaded it, so the same modules are loaded once per device.
-        let mut next = Vec::with_capacity(self.executors.len());
-        for index in 0..self.executors.len() {
-            let current = Arc::clone(&self.generations[index]);
-            match self.build_generation(index, generation, programs, &current) {
-                Ok(built) => next.push(built),
+        let mut tasks = Vec::with_capacity(self.executors.len());
+        for (index, executor) in self.executors.iter().enumerate() {
+            let ordinal = executor.device();
+            let device = match platform::Device::new(ordinal) {
+                Ok(device) => device,
                 Err(error) => {
-                    let failure = UpdateFailure::Precopy {
-                        reason: format!(
-                            "resolving device {}: {error:#}",
-                            self.executors[index].device().0
-                        ),
-                    };
-                    return self.precopy_failed(generation, failure);
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!("opening device {}: {error}", ordinal.0),
+                        },
+                        reply,
+                    );
+                }
+            };
+            let Some(target) = self.targets.get(index).cloned() else {
+                return self.abandon_precopy(
+                    generation,
+                    UpdateFailure::Precopy {
+                        reason: format!("device {} has no build target", ordinal.0),
+                    },
+                    reply,
+                );
+            };
+            let install = Install {
+                programs: Arc::clone(&self.programs),
+                device,
+                target: target.clone(),
+                request: PrepareRequest {
+                    targets: vec![target],
+                    programs: requests.clone(),
+                    descriptors: descriptors.clone(),
+                },
+            };
+            match self.modules.admit(install) {
+                Ok(task) => tasks.push(task),
+                Err(error) => {
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!("admitting a module load: {error}"),
+                        },
+                        reply,
+                    );
                 }
             }
         }
 
-        // The candidate scheduling policy is instantiated on the current
-        // snapshot, and every decision is dry-run against the hard constraints
+        self.precopy = Some(Precopy {
+            generation,
+            reply,
+            policy,
+            next: Vec::new(),
+            stage: Stage::Modules(tasks),
+        });
+        Ok(())
+    }
+
+    /// §7.3 step 2, second half: advances the precopy at most one stage. It
+    /// never waits on a job: a stage that has not finished leaves the precopy
+    /// as it is, and the next serve pass looks again.
+    fn advance_precopy(&mut self) -> Result<()> {
+        let Some(mut precopy) = self.precopy.take() else {
+            return Ok(());
+        };
+        let generation = precopy.generation;
+        let stage = std::mem::replace(&mut precopy.stage, Stage::Done);
+
+        match stage {
+            Stage::Modules(tasks) => {
+                let mut loaded = Vec::with_capacity(tasks.len());
+                for task in &tasks {
+                    match task.outcome() {
+                        None => {
+                            // A build is still running: the tasks keep their
+                            // results and the lane keeps its capacity.
+                            precopy.stage = Stage::Modules(tasks);
+                            self.precopy = Some(precopy);
+                            return Ok(());
+                        }
+                        Some(Outcome::Success(entries)) => loaded.push((*entries).clone()),
+                        Some(Outcome::Failed(error)) => {
+                            return self.abandon_precopy(
+                                generation,
+                                UpdateFailure::Precopy {
+                                    reason: format!("loading this node's kernels: {error}"),
+                                },
+                                precopy.reply,
+                            );
+                        }
+                        Some(Outcome::Cancelled) => {
+                            return self.abandon_precopy(
+                                generation,
+                                UpdateFailure::Precopy {
+                                    reason: "the module load was cancelled".to_owned(),
+                                },
+                                precopy.reply,
+                            );
+                        }
+                    }
+                }
+                self.after_modules(precopy, loaded)
+            }
+            Stage::Executors(submissions) => {
+                if let Some(failure) = unfinished(&submissions, "preparing this node's devices") {
+                    match failure {
+                        StageFailure::Pending => {
+                            precopy.stage = Stage::Executors(submissions);
+                            self.precopy = Some(precopy);
+                            return Ok(());
+                        }
+                        StageFailure::Failed(reason) => {
+                            return self.abandon_precopy(
+                                generation,
+                                UpdateFailure::Precopy { reason },
+                                precopy.reply,
+                            );
+                        }
+                    }
+                }
+
+                // Shadow execution: one batch per occupied bucket on the
+                // resident requests, sent to every rank of the group that holds
+                // them (§7.3 step 2).
+                let mut batches = Vec::new();
+                for scheduler in &mut self.schedulers {
+                    batches.extend(scheduler.shadow(generation)?);
+                }
+                let mut shadow = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    let Some(executor) = self.executors.get(batch.rank) else {
+                        return self.abandon_precopy(
+                            generation,
+                            UpdateFailure::Precopy {
+                                reason: format!("a shadow batch named rank {}", batch.rank),
+                            },
+                            precopy.reply,
+                        );
+                    };
+                    shadow.push(executor.submit(batch.batch)?);
+                }
+                precopy.stage = Stage::Shadow(shadow);
+                self.precopy = Some(precopy);
+                Ok(())
+            }
+            Stage::Shadow(submissions) => {
+                if let Some(failure) = unfinished(&submissions, "a shadow batch") {
+                    match failure {
+                        StageFailure::Pending => {
+                            precopy.stage = Stage::Shadow(submissions);
+                            self.precopy = Some(precopy);
+                            return Ok(());
+                        }
+                        StageFailure::Failed(reason) => {
+                            return self.abandon_precopy(
+                                generation,
+                                UpdateFailure::Precopy { reason },
+                                precopy.reply,
+                            );
+                        }
+                    }
+                }
+
+                self.generations = std::mem::take(&mut precopy.next);
+                self.update.precopied(generation)?;
+                self.answer(precopy.reply, ProgramStatus::Precopied { generation });
+                Ok(())
+            }
+            Stage::Done => Ok(()),
+        }
+    }
+
+    /// The generations the loaded kernels build, the candidate policy
+    /// instantiated, and the executors' rebind or recapture admitted.
+    fn after_modules(&mut self, precopy: Precopy, loaded: Vec<Vec<KernelEntry>>) -> Result<()> {
+        let generation = precopy.generation;
+        // One generation per device: a kernel belongs to the device context
+        // that loaded it.
+        let mut next = Vec::with_capacity(loaded.len());
+        for (index, entries) in loaded.into_iter().enumerate() {
+            let current = Arc::clone(&self.generations[index]);
+            next.push(Arc::new(current.replace(generation, entries)));
+        }
+
+        // The candidate policy is instantiated on the current snapshot, and
+        // every decision it would make is dry-run against the hard constraints
         // before anything switches (§4.4, §7.3 step 2).
-        if let Err(error) = precopy_policy(&mut self.schedulers, &programs.policy) {
-            let failure = UpdateFailure::Policy {
-                error: format!("{error:#}"),
-            };
-            return self.precopy_failed(generation, failure);
+        if let Err(error) = precopy_policy(&mut self.schedulers, &precopy.policy) {
+            return self.abandon_precopy(
+                generation,
+                UpdateFailure::Policy {
+                    error: format!("{error:#}"),
+                },
+                precopy.reply,
+            );
         }
 
         // Rebind or recapture, as jobs between serving batches (§4.5).
+        let mut submissions = Vec::with_capacity(next.len());
         for (index, built) in next.iter().enumerate() {
-            let prepared = self.executors[index].precopy(Arc::clone(built))?;
-            if let Err(error) = completed(prepared.wait()) {
-                let failure = UpdateFailure::Precopy {
-                    reason: format!(
-                        "preparing device {}: {error}",
-                        self.executors[index].device().0
-                    ),
-                };
-                return self.precopy_failed(generation, failure);
-            }
+            submissions.push(self.executors[index].precopy(Arc::clone(built))?);
         }
-
-        // Shadow execution: one batch per occupied bucket on the resident
-        // requests; the new implementation writes twins and is compared within
-        // the operator's tolerance, never writing resident memory (§7.3).
-        for scheduler in &mut self.schedulers {
-            for shadow in scheduler.shadow(generation)? {
-                let submission = self
-                    .executors
-                    .get(shadow.rank)
-                    .ok_or_else(|| anyhow::anyhow!("a shadow batch named rank {}", shadow.rank))?
-                    .submit(shadow.batch)?;
-                if let Err(error) = completed(submission.wait()) {
-                    let failure = UpdateFailure::Precopy {
-                        reason: format!("shadow batch on rank {}: {error}", shadow.rank),
-                    };
-                    return self.precopy_failed(generation, failure);
-                }
-            }
-        }
-
-        self.generations = next;
-        self.update.precopied(generation)?;
-        Ok(ProgramStatus::Precopied { generation })
+        let mut precopy = precopy;
+        precopy.next = next;
+        precopy.stage = Stage::Executors(submissions);
+        self.precopy = Some(precopy);
+        Ok(())
     }
 
-    /// Builds one device's generation of the new programs: an operator whose
-    /// program did not change keeps its kernels, and a changed one resolves its
-    /// modules and loads them into this device's context.
-    fn build_generation(
-        &mut self,
-        index: usize,
-        generation: u64,
-        programs: &Programs,
-        current: &Arc<Generation>,
-    ) -> Result<Arc<Generation>> {
-        let ordinal = self.executors[index].device();
-        let device = platform::Device::new(ordinal)
-            .with_context(|| format!("opening device {}", ordinal.0))?;
-        let mut entries = Vec::new();
-        for (slot, program) in &programs.kernels {
-            let operator = ops::operator_name(&slot.op).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "operator {} of program {} has no implementation in this build",
-                    slot.op,
-                    program.backend
-                )
-            })?;
-            // A program-layer switch changes implementations, never the set of
-            // descriptors: it resolves exactly the keys the current generation
-            // holds for this operator (§7.3).
-            let keys: Vec<String> = current
-                .iter()
-                .filter(|(name, _, _)| *name == operator)
-                .map(|(_, key, _)| key.to_owned())
-                .collect();
-            if keys.is_empty() {
-                bail!(
-                    "operator {} holds no descriptor in the serving generation",
-                    slot.op
-                );
-            }
-            for key in keys {
-                for target in &self.targets {
-                    let module = self.programs.resolve(
-                        &slot.op,
-                        program,
-                        target,
-                        &key,
-                        &mut |progress| {
-                            tracing::debug!(
-                                op = %slot.op,
-                                descriptor = %key,
-                                state = ?progress.state,
-                                "resolving a module of the new generation"
-                            );
-                        },
-                    )?;
-                    if let Some(entry) = ops::install(&device, operator, &key, module)? {
-                        entries.push(entry);
-                    }
-                }
-            }
-        }
-        Ok(Arc::new(current.replace(generation, entries)))
-    }
-
-    /// A precopy failure: the new generation is discarded and serving goes on
+    /// A failed precopy: the new generation is discarded and serving goes on
     /// (§7.3 step 2).
-    fn precopy_failed(
+    fn abandon_precopy(
         &mut self,
         generation: u64,
         failure: UpdateFailure,
-    ) -> Result<ProgramStatus> {
+        reply: Option<u32>,
+    ) -> Result<()> {
         discard_policy(&mut self.schedulers);
-        self.update
-            .precopy_failed(generation, failure.clone())?;
-        Ok(ProgramStatus::PrecopyFailed {
-            generation,
-            failure,
-        })
+        self.precopy = None;
+        if let Err(error) = self.update.precopy_failed(generation, failure.clone()) {
+            tracing::error!(%error, "discarding a failed precopy failed");
+        }
+        self.answer(
+            reply,
+            ProgramStatus::PrecopyFailed {
+                generation,
+                failure,
+            },
+        );
+        Ok(())
     }
 
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
@@ -842,6 +1030,147 @@ fn discard_policy(schedulers: &mut [Scheduler]) {
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 
+/// The program slot that holds the epoch's scheduling policy (§4.4, §5.1).
+const SCHEDULING: &str = "scheduling";
+
+/// One device's half of §7.3 step 2, on the module-load lane: the Program
+/// Server compiles and caches what the generation's descriptors need, each
+/// module is resolved for this node's target, and each is loaded into this
+/// device's context as a kernel.
+///
+/// It runs on the blocking pool because compiling can take minutes and no
+/// device stream and no scheduler thread may wait on it (§2.4).
+struct Install {
+    programs: Arc<Mutex<Client>>,
+    device: platform::Device,
+    target: Target,
+    request: PrepareRequest,
+}
+
+impl HostAction for Install {
+    type Output = Vec<KernelEntry>;
+
+    fn run(&self) -> Result<Self::Output> {
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the Program Server client was poisoned"))?;
+        let prepared = client.prepare(&self.request, &mut |progress| {
+            tracing::debug!(
+                path = %progress.path,
+                state = ?progress.state,
+                "building a module for the new generation"
+            );
+        })?;
+
+        let mut entries = Vec::new();
+        for chosen in &prepared.programs {
+            let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "operator {} has no implementation in this build",
+                    chosen.slot.op
+                )
+            })?;
+            let keys: Vec<String> = self
+                .request
+                .descriptors
+                .iter()
+                .filter(|descriptor| descriptor.op == chosen.slot.op)
+                .flat_map(|descriptor| descriptor.keys.iter().cloned())
+                .collect();
+            for key in keys {
+                let module = client.resolve(
+                    &chosen.slot.op,
+                    &chosen.program,
+                    &self.target,
+                    &key,
+                    &mut |progress| {
+                        tracing::debug!(
+                            path = %progress.path,
+                            state = ?progress.state,
+                            "resolving a module of the new generation"
+                        );
+                    },
+                )?;
+                if let Some(entry) = ops::install(&self.device, operator, &key, module)? {
+                    entries.push(entry);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn release(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn input_outcome(&self) -> Outcome {
+        Outcome::Success(())
+    }
+}
+
+/// The precopy of one generation, advanced between serve passes (§7.3 step 2).
+struct Precopy {
+    generation: u64,
+    /// The peer whose command this precopy answers, when a peer asked.
+    reply: Option<u32>,
+    /// The policy program the update installs.
+    policy: Program,
+    /// The generation built for each device, in `executors` order.
+    next: Vec<Arc<Generation>>,
+    stage: Stage,
+}
+
+/// The stage a precopy is in.
+enum Stage {
+    /// The module-load lane builds, resolves and installs each device's
+    /// kernels.
+    Modules(Vec<Arc<HostTask<Install>>>),
+    /// The executors rebind or recapture their buckets.
+    Executors(Vec<Submission>),
+    /// The shadow batches compare the new implementations on the resident
+    /// requests.
+    Shadow(Vec<Submission>),
+    /// A stage being replaced; the driver never observes it.
+    Done,
+}
+
+/// What polling a stage's submissions found.
+enum StageFailure {
+    /// At least one submission has not finished.
+    Pending,
+    /// A submission failed, or was cancelled.
+    Failed(String),
+}
+
+/// Whether every submission finished, and if not, why the first unfinished or
+/// failed one did not.
+fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
+    for submission in submissions {
+        match submission.outcome() {
+            None => return Some(StageFailure::Pending),
+            Some(Outcome::Success(_)) => {}
+            Some(Outcome::Failed(error)) => {
+                return Some(StageFailure::Failed(format!("{what}: {error}")));
+            }
+            Some(Outcome::Cancelled) => {
+                return Some(StageFailure::Failed(format!("{what}: cancelled")));
+            }
+        }
+    }
+    None
+}
+
+/// The descriptor keys `generation` holds for `operator`: what a precopy must
+/// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
+fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<String> {
+    generation
+        .iter()
+        .filter(|(name, _, _)| *name == operator)
+        .map(|(_, key, _)| key.to_owned())
+        .collect()
+}
+
 /// The scheduling policy's source: sched's `PolicySource`, filled from this
 /// node's Program Server client (§7.3 step 2, §4.4).
 ///
@@ -893,11 +1222,7 @@ fn completed<T>(outcome: Outcome<T>) -> Result<()> {
 
 /// The handshake with the daemon, which answers with the engine spec and the
 /// epoch record (§2.3).
-fn handshake(
-    control: &mut Control,
-    args: &EngineArgs,
-    build: &BuildConfig,
-) -> Result<EpochRecord> {
+fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> Result<EpochRecord> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: args.engine,
         node_rank: args.node_rank,
