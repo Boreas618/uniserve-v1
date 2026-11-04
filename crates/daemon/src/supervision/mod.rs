@@ -155,6 +155,16 @@ pub struct Daemon {
     /// the adapter; behind a lock because a `Daemon` is shared between the
     /// HTTP threads and the channel ends are not themselves `Sync`.
     link: std::sync::Mutex<Option<roster::EpochLink>>,
+    /// A clone of the requests channel inside `link`, kept for the processes
+    /// this daemon starts itself: the frontend is spawned and commanded
+    /// through the node's service too, and its channel must not be the epoch
+    /// layer's to take (§2.1, §2.3).
+    requests: Option<
+        std::sync::mpsc::Sender<(
+            proto::process::Request,
+            std::sync::mpsc::Sender<proto::process::Reply>,
+        )>,
+    >,
     /// The processes this node supervises, which the service keeps current
     /// (§2.3): the epoch layer and `GET /admin/config` read them.
     table: Option<service::ProcessTable>,
@@ -205,7 +215,7 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (served, thread, commands, link, awake, table) = if options.node_rank == 0 {
+        let (served, thread, commands, link, requests, awake, table) = if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -266,7 +276,7 @@ impl Daemon {
                 reports: Arc::new(std::sync::Mutex::new(reports_rx)),
             };
             let link = Some(roster::EpochLink {
-                requests,
+                requests: requests.clone(),
                 greetings: greetings_rx,
                 exits: exits_rx,
                 commands: commands.clone(),
@@ -276,6 +286,7 @@ impl Daemon {
                 thread,
                 Some(commands),
                 link,
+                Some(requests),
                 Some(awake),
                 Some(table),
             )
@@ -287,12 +298,13 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
                 .context("starting the daemon's service")?;
-            (None, thread, None, None, None, None)
+            (None, thread, None, None, None, None, None)
         };
         let (address, socket) = served.unzip();
         Ok(Self {
             commands,
             table,
+            requests,
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(awake),
             address,
@@ -360,7 +372,7 @@ impl Daemon {
         });
         let link = match (&commands, leader) {
             (Some(commands), true) => Some(roster::EpochLink {
-                requests,
+                requests: requests.clone(),
                 greetings: greetings_rx,
                 exits: exits_rx,
                 commands: commands.clone(),
@@ -370,6 +382,7 @@ impl Daemon {
         let (address, socket) = address.unzip();
         Ok(Self {
             table: leader.then_some(table),
+            requests: leader.then_some(requests),
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(leader.then_some(awake)),
             commands,
@@ -411,6 +424,24 @@ impl Daemon {
     /// supervises; `None` on a member, which supervises none here.
     pub fn commands(&self) -> Option<ProcessCommands> {
         self.commands.clone()
+    }
+
+    /// The requests channel down to this node's service, for the processes the
+    /// daemon starts itself rather than through the epoch layer: a spawn, a
+    /// command and the answer to each (§2.1, §2.3).
+    ///
+    /// `None` on a member daemon, which answers no request for a process of its
+    /// own. It is a clone of the channel inside [`Self::epoch_link`], so a
+    /// caller that takes both gets two independent senders over one service.
+    pub fn requests(
+        &self,
+    ) -> Option<
+        std::sync::mpsc::Sender<(
+            proto::process::Request,
+            std::sync::mpsc::Sender<proto::process::Reply>,
+        )>,
+    > {
+        self.requests.clone()
     }
 
     /// The epoch layer's ends of this node's service: `None` on a member
