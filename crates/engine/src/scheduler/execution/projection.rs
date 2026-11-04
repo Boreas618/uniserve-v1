@@ -722,7 +722,7 @@ impl Scheduler {
                     && self.peek_next_call_variant(id).is_none_or(|kind| {
                         self.placement
                             .worker_target(
-                                self.executor.as_ref(),
+                                self.executor.inner(),
                                 &self.info,
                                 RequestKey::new(self.engine_id, id, state.request_epoch),
                                 kind,
