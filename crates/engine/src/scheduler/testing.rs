@@ -231,36 +231,64 @@ fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
     }
 }
 
-/// The module `SCHED_POLICY_WASM` names: the `fcfs` program this tree builds
-/// for `wasm32-unknown-unknown`.
-fn packaged_module() -> Vec<u8> {
-    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| built_module());
-    std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("the scheduling policy module `{path}` cannot be read: {error}")
-    })
+/// The `fcfs` module this tree builds for `wasm32-unknown-unknown`, read once
+/// per process and shared by every fixture that installs a policy.
+///
+/// `SCHED_POLICY_WASM` names a module to serve with instead, which a caller
+/// testing a build of its own sets. Unset, the module is built from this tree's
+/// `scheduling-policy-fcfs` on first use, into a target directory of its own
+/// (`target/it-policy`), so a test run needs no setup step and the build does
+/// not contend for the lock of the tree the running tests were built in.
+pub fn packaged_module() -> Vec<u8> {
+    static MODULE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    MODULE
+        .get_or_init(|| match std::env::var("SCHED_POLICY_WASM") {
+            Ok(path) => std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
+            }),
+            Err(_) => build_packaged_module(),
+        })
+        .clone()
 }
 
-/// The module `cargo build -p scheduling-policy-fcfs --target
-/// wasm32-unknown-unknown --release` writes in this tree, for a caller that
-/// named none.
+/// Builds this tree's `fcfs` policy package and returns the module bytes.
 ///
-/// It is this tree's own build of the `fcfs` policy — the same bytes a caller
-/// would name — read from where `cargo build` puts them, so a test run needs
-/// no variable to serve a policy. A workspace that builds elsewhere
-/// (`CARGO_TARGET_DIR`) should still state `SCHED_POLICY_WASM`; absent both,
-/// this fails with the command that writes the module rather than serving none.
-fn built_module() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm");
-    if !path.is_file() {
-        panic!(
-            "SCHED_POLICY_WASM is unset and {} does not exist. Build it with `cargo build -p \
-             scheduling-policy-fcfs --target wasm32-unknown-unknown --release`, or set \
-             SCHED_POLICY_WASM to the file that build writes.",
-            path.display()
-        );
-    }
-    path.display().to_string()
+/// The build runs the same `cargo` that started the tests (`CARGO`), so the
+/// toolchain and the target the caller selected are the ones the module is
+/// built with. A failure states the status and the end of the build's stderr,
+/// and names the export that skips the build.
+fn build_packaged_module() -> Vec<u8> {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/engine lives two levels below the workspace root")
+        .to_path_buf();
+    let target_dir = workspace.join("target").join("it-policy");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(&cargo)
+        .current_dir(&workspace)
+        .arg("build")
+        .args(["-q", "-p", "scheduling-policy-fcfs"])
+        .args(["--target", "wasm32-unknown-unknown", "--release"])
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("running {cargo:?} to build the fcfs policy module: {error}")
+        });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+    let tail: Vec<&str> = tail.into_iter().rev().collect();
+    assert!(
+        output.status.success(),
+        "building this tree's fcfs policy module failed ({}). Set SCHED_POLICY_WASM to a module \
+         built with `cargo build -p scheduling-policy-fcfs --target wasm32-unknown-unknown \
+         --release` to run without the build. The build's stderr ended:\n{}",
+        output.status,
+        tail.join("\n"),
+    );
+    let path = target_dir.join("wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm");
+    std::fs::read(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
 }
 
 #[cfg(test)]
