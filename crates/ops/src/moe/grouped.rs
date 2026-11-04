@@ -1662,6 +1662,10 @@ mod nvfp4_launch_tests {
         partial.hidden = 2040;
         let mut partial_args = fc1_args();
         partial_args.weights = table(DType::U8, &[128, 1536, 1020]);
+        // The same rule as the odd case: the packed activations shrink with the contraction, so a
+        // stale width here would be refused by the shape check instead of by the block rule, and the
+        // test would be green about the wrong refusal.
+        partial_args.hidden = table(DType::U8, &[3, 1020]);
         let error = GatherGemmNvfp4::validate(&partial, &partial_args).unwrap_err();
         assert!(format!("{error}").contains("scale blocks"), "{error}");
     }
