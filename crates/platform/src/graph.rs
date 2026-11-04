@@ -211,20 +211,10 @@ impl Graph {
         )?;
 
         // Each parameter's size comes from the kernel's signature: the node's
-        // array carries no count, and the driver answers past the last
-        // parameter with CUDA_ERROR_INVALID_VALUE.
+        // array carries no count, so the walk ends where the driver does.
         let mut sizes = Vec::new();
-        loop {
-            let (mut offset, mut size) = (0usize, 0usize);
-            // SAFETY: the function is the node's, live while its library is.
-            let status = unsafe {
-                (driver.func_get_param_info)(raw.func, sizes.len(), &mut offset, &mut size)
-            };
-            if status == driver::CUDA_ERROR_INVALID_VALUE {
-                break;
-            }
-            driver.check(status, "cuFuncGetParamInfo")?;
-            sizes.push((offset, size));
+        while let Some(parameter) = crate::launch::param_at(raw.func, sizes.len())? {
+            sizes.push((parameter.offset(), parameter.size()));
         }
 
         let mut parameters = Vec::with_capacity(sizes.len());
