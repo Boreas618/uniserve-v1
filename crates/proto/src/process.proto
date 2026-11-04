@@ -392,10 +392,11 @@ message Command {
 message Precopy {
   repeated KernelProgram kernels = 1;
   Program policy = 2;
-  // The generation this precopy prepares; `Report::Precopied` echoes it, so
-  // a daemon matches an answer to the epoch it was preparing. The main
-  // process's own counter is not a substitute: the number is the daemon's.
-  uint64 generation = 3;
+  // The main process numbers its program generations and reports the number
+  // it prepared in `Report::Precopied`; the daemon sends that number back in
+  // `Switchover` and `Purge`. It never assigns a generation itself, so this
+  // message carries none.
+  reserved 3;
 }
 
 message Park {}
