@@ -387,6 +387,58 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Publish host-computed bytes as a weight, without a checkpoint tensor behind them.
+    ///
+    /// The rotary frequency table is the first such weight: `inv_freq` is computed once at loading
+    /// from `rope_theta` and `rope_scaling` (specs/worker.md 9), and the `rotary_factors` operator
+    /// reads it as a device weight, so it takes the same retained-storage path as a checkpoint
+    /// weight. The key carries no file identity — there is no file — and `name` identifies the
+    /// constant, so two calls with the same name, element type, extents and bytes reuse one
+    /// retained region and a different constant needs a different name.
+    pub fn constant(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+    ) -> Result<Weight> {
+        let element = dtype.bytes().ok_or_else(|| {
+            Error::weight(name, format!("{dtype} has no whole-byte element size"))
+        })?;
+        let expected = shape
+            .numel()
+            .checked_mul(element)
+            .ok_or_else(|| Error::weight(name, "the constant's bytes overflow"))?;
+        if bytes.len() as u64 != expected {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "{} bytes for {:?} of {dtype}, {expected} expected",
+                    bytes.len(),
+                    shape.dims()
+                ),
+            ));
+        }
+        let key = WeightKey {
+            files: Vec::new(),
+            dtype,
+            layout: WeightLayout::ROW_MAJOR,
+            region: WeightRegion {
+                tensors: vec![name.to_owned()],
+                start: 0,
+                shape,
+            },
+        };
+        let backing = match self.store.retained(&key)? {
+            Some(backing) => backing,
+            None => self.store.publish(&key, dtype, shape, bytes)?,
+        };
+        Ok(Weight {
+            view: backing.view(dtype, shape)?,
+            backing,
+        })
+    }
+
     /// The identity of each of `names`' files, in order.
     fn identities(&self, names: &[String]) -> Result<Vec<FileIdentity>> {
         names
