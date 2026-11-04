@@ -4,9 +4,9 @@
 //! execution; a policy decides. This module holds the three parts of the
 //! mechanism that exist only because decisions come from outside it:
 //!
-//! - [`Decisions`], the trait the mechanism asks through. It is the mechanism's
-//!   whole view of the policy: one implementation (`scheduler/policy.rs`) wraps
-//!   the live policy instance, its previous module and the switch.
+//! - The policy itself (`scheduler/policy.rs`'s `PolicySlot`): the live instance,
+//!   its previous module and the switch. It is the mechanism's whole view of the
+//!   policy; nothing here reaches past it.
 //! - The validators ([`validate_plan`], [`validate_victims`],
 //!   [`validate_route`], [`validate_place`], [`validate_warm`],
 //!   [`validate_experts`]): every answer is checked against the live state and
@@ -21,6 +21,22 @@
 //! switch's trial evaluation (§7.3, `policy.rs`) calls the same ones the live
 //! path does: a policy that passes probation cannot later be failed by a rule
 //! it never met.
+//!
+//! # Validated and deferred
+//!
+//! Two rows of §4.4's table are decisions the mechanism checks and does not
+//! execute, because the act belongs to an edge outside this crate. Neither is
+//! silently dropped: each is called at its moment, validated, and handed to the
+//! owner that performs it.
+//!
+//! - `warm(room)` names the pages a precopy warms, in order. Warming is the KV
+//!   storage client's act — the mechanism issues the loads in the policy's order
+//!   — and the storage client is today the interim host-page gap, so no
+//!   executor is wired here yet. The owner is the KV storage client.
+//! - `experts(load)` answers a placement of experts on ranks, which the
+//!   executor's world setup applies (§7.6), not the scheduler. The owner is the
+//!   executor's edge, reached through the world setup; the load itself is
+//!   deferred by ruling.
 
 use std::collections::{BTreeMap, BTreeSet};
 

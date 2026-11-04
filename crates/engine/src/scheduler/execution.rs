@@ -493,6 +493,15 @@ impl Scheduler {
     /// is still in flight, keeps what it had: the plan asked, the cache is not
     /// ready, and no request is at fault.
     fn prefetch_host(&mut self, id: ipc::RequestId) {
+        // §4.4: the mechanism deepens a prefix hit only by at least the floor
+        // the policy declared, so a smaller deepening is not a prefetch at all.
+        // The floor is the policy's, not a constant here, because a policy that
+        // asks for less eager deepenings must get them.
+        let floor = self
+            .policy
+            .as_ref()
+            .map_or(0, |policy| policy.limits().prefetch_min_tokens)
+            as usize;
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -500,9 +509,14 @@ impl Scheduler {
             return;
         };
         let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
-        if let admission::HostHit::Serving(boundary) =
-            admission::host_prefix(&mut self.kv_offload, state, &target, device_hit, usize::MAX)
-        {
+        if let admission::HostHit::Serving(boundary) = admission::host_prefix(
+            &mut self.kv_offload,
+            state,
+            &target,
+            device_hit,
+            usize::MAX,
+            floor,
+        ) {
             self.recorder.prefix_hit(
                 scheduling::guest::RequestId(id.0),
                 u32::try_from(device_hit).unwrap_or(u32::MAX),
