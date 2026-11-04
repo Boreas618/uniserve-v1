@@ -284,8 +284,8 @@ mod tests {
                 columns[column as usize] += 1;
             }
         }
-        assert_eq!(rows.iter().copied().min(), Some(1));
-        assert_eq!(columns.iter().copied().min(), Some(1));
+        assert!(rows.iter().all(|count| *count >= 1));
+        assert!(columns.iter().all(|count| *count >= 1));
     }
 
     #[test]
@@ -376,8 +376,10 @@ mod tests {
             let origin = band.origin;
             let mut written = vec![false; (stop - start) as usize];
             for tile in &band.tiles {
-                let first = tile.rows.0.max(start) - origin;
-                let last = (tile.rows.0 + tile.rows.1).min(stop) - origin;
+                // The callers' rows, not the run's: `written` covers the crop, and the run starts
+                // `start - origin` rows before it.
+                let first = tile.rows.0.max(start) - start;
+                let last = (tile.rows.0 + tile.rows.1).min(stop) - start;
                 for row in first..last {
                     written[row as usize] = true;
                 }
