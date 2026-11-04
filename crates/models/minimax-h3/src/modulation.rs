@@ -244,7 +244,7 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
             // A visual condition sits at the generated video's level until that level is cleaner
             // than its anchor, and an audio reference is always clean.
             levels.push(video.max(crate::denoiser::VISUAL_CONDITION_TIME));
-            levels.push(1.0);
+            levels.push(crate::denoiser::AUDIO_CONDITION_TIME);
         }
         for level in levels {
             let position = match times
