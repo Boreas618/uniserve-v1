@@ -231,6 +231,31 @@ const DEFAULT_PROMPT: &str = "a cat walking on the grass";
 /// at the first index where the two part.
 const DEFAULT_IDS: [u32; 6] = [64, 8251, 11435, 389, 279, 16359];
 
+/// The one element type the export's `text_encoder` holds.
+///
+/// `dtype = auto` is the checkpoint's own representation and converts nothing, so the width of every
+/// page this stage writes follows the export rather than a harness constant. Two types in one
+/// component is a deployment question, not a diagnosis one: it is refused, by name and with both
+/// types, rather than answered by picking one.
+fn checkpoint_dtype(source: &Checkpoint) -> Result<DType> {
+    match source.dtypes().as_slice() {
+        [only] => Ok(*only),
+        [] => Err(Failure::message(
+            "the export's text encoder holds no tensors: nothing to encode with",
+        )),
+        many => Err(Failure::message(format!(
+            "the export's text encoder holds {} element types ({}); the precision rule keeps the \
+             checkpoint's own representation and converts nothing, so this stage refuses rather \
+             than choose one",
+            many.len(),
+            many.iter()
+                .map(|dtype| dtype.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 /// The names the export's `text_encoder` index holds.
 fn index_names(root: &Path) -> Result<Vec<String>> {
     let path = root
@@ -282,9 +307,11 @@ fn stage_weights(args: &Args) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
+    println!("dtype: {}, the checkpoint's own", checkpoint_dtype(source)?);
     let mut store = HostStore::new();
     let mut loader = WeightLoader::new(source, &mut store, None, None);
-    let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), nn::DType::BF16)?;
+    let dtype = checkpoint_dtype(source)?;
+    let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
     println!(
         "load: published {} weight regions on the host, {} retained layers",
         store.len(),
@@ -629,8 +656,27 @@ fn upload_i32(
     Ok(tensor)
 }
 
-fn download_bf16(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0_u8; elements * 2];
+/// The container's element-type code (`.h3t`, from `tools/dump_tables.py`'s table).
+///
+/// The page is written at the checkpoint's own element type, so its code is derived from the dtype
+/// the load used: a hard-coded code would describe a tensor of another width, which is the one
+/// defect a reader of the page cannot see.
+fn code_of(dtype: DType) -> u8 {
+    match dtype {
+        DType::F32 => 1,
+        DType::I32 => 3,
+        DType::BF16 => 4,
+        DType::F16 => 5,
+        _ => 4,
+    }
+}
+
+/// `elements` of `view`'s own width, copied back from the device.
+fn download(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<u8>> {
+    let width = usize::try_from(view.dtype.bytes().unwrap_or(u64::MAX)).map_err(|_| {
+        Failure::message("an element type wider than this host addresses".to_owned())
+    })?;
+    let mut bytes = vec![0_u8; elements * width];
     // SAFETY: `bytes` is written by the copy, which completes before the wait below.
     unsafe {
         platform::memcpy_async(
@@ -715,12 +761,19 @@ fn stage_encode(args: &Args) -> Result<()> {
     // 2. The weights, through the loader's own boundary: every tensor is checked for its element
     //    type and shape as it is handed over, so a checkpoint this encoder cannot read is refused
     //    here rather than at the first launch.
+    //
+    //    The element type is the checkpoint's own, read from its tensor headers: `dtype = auto`
+    //    converts nothing, and a harness that chose a width would be reporting a page for a model
+    //    nobody serves. An export holding two element types in one component gets a refusal, not a
+    //    choice: which one is a deployment question and this stage has no business answering it.
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
+    let dtype = checkpoint_dtype(source)?;
+    println!("dtype: {dtype}, the checkpoint's own");
     let mut weights = DeviceWeights::new(&device, 0)?;
     let encoder = {
         let mut loader = WeightLoader::new(source, &mut weights, None, None);
-        TextEncoder::load(&mut loader, text, &Partition::single(), DType::BF16)?
+        TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?
     };
 
     // 3. The arena. The encoder's own temporaries are reserved inside the forward, so this region
@@ -808,7 +861,7 @@ fn stage_encode(args: &Args) -> Result<()> {
         })
         .collect::<Result<Vec<i32>>>()?;
     let ids_view = upload_i32(&stream, &arena, Shape::new(&[tokens64]), &signed)?;
-    let output = arena.tensor(DType::BF16, Shape::new(&[u64::from(layout.rows), hidden]))?;
+    let output = arena.tensor(dtype, Shape::new(&[u64::from(layout.rows), hidden]))?;
 
     // 7. The encode, with the executor's own recorder installed for its duration: the walk is what
     //    proves every program the forward binds is in the store's list.
@@ -833,7 +886,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     let rows = u64::from(layout.rows);
     let elements = usize::try_from(rows * hidden)
         .map_err(|_| Failure::message("the output is larger than this host addresses"))?;
-    let payload = download_bf16(&stream, output, elements)?;
+    let payload = download(&stream, output, elements)?;
     let walked = walk.text();
     println!(
         "walk: {} launches, {} distinct programs",
@@ -847,7 +900,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("prompt_hidden.h3t"),
         &[rows, hidden],
-        4,
+        code_of(dtype),
         &payload,
     )?;
     std::fs::write(directory.join("walk.txt"), walked)
@@ -860,9 +913,10 @@ fn stage_encode(args: &Args) -> Result<()> {
     let case = format!(
         "{{\n  \"task\": \"t2va\",\n  \"text_tokens\": {tokens},\n  \"hidden\": {hidden},\n  \
          \"prompt\": {prompt},\n  \"prompt_ids\": [{ids_json}],\n  \"vision\": \"none\",\n  \
-         \"vocab_size\": {vocab}\n}}\n",
+         \"vocab_size\": {vocab},\n  \"dtype\": \"{element}\"\n}}\n",
         prompt = json_string(&args.prompt),
         vocab = text.vocab_size,
+        element = dtype,
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
