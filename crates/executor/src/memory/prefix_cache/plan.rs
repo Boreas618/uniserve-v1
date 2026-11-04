@@ -17,13 +17,13 @@ use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
 
 use crate::memory::GroupShape;
 use crate::memory::request_slots::SlotField;
-use crate::tensor::DType;
+use crate::memory::allocation::ElementType;
 /// One field of a cache layer kept per request slot: `name` is
 /// `layer/field`, `shape` one slot's extent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateField {
     pub name: String,
-    pub dtype: DType,
+    pub dtype: ElementType,
     pub shape: Vec<i64>,
 }
 
@@ -84,8 +84,8 @@ pub struct CacheGroupPlan {
     pub kv_head_offset: u32,
     pub head_dim: u32,
     /// Stored element type of the group's planes.
-    pub dtype: DType,
-    pub compute_dtype: DType,
+    pub dtype: ElementType,
+    pub compute_dtype: ElementType,
 }
 
 impl CacheGroupPlan {
@@ -269,7 +269,7 @@ impl CachePlan {
     }
 
     /// The compute dtype cache exports declare.
-    pub(crate) fn compute_dtype(&self) -> DType {
+    pub(crate) fn compute_dtype(&self) -> ElementType {
         self.groups[0].compute_dtype
     }
 
@@ -388,7 +388,7 @@ fn state_fields(text: &str) -> Result<Vec<StateField>> {
         .into_iter()
         .map(|field| {
             Ok(StateField {
-                dtype: DType::parse(&field.dtype)?,
+                dtype: ElementType::parse(&field.dtype)?,
                 name: field.name,
                 shape: field.shape,
             })
@@ -421,13 +421,13 @@ mod tests {
             vec![
                 SlotField {
                     name: "layers.0.mixer/conv.values".into(),
-                    dtype: DType::BF16,
+                    dtype: ElementType::BF16,
                     shape: vec![4, 8],
                     host: false,
                 },
                 SlotField {
                     name: "layers.0.mixer/conv.initialized".into(),
-                    dtype: DType::Bool,
+                    dtype: ElementType::Bool,
                     shape: vec![],
                     host: false,
                 },

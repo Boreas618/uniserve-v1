@@ -22,7 +22,8 @@ use platform::DeviceId;
 
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::Retained;
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The version of the page encoding: an output's bytes, rows in order,
@@ -165,7 +166,7 @@ impl EncoderHostPool {
         StorageView::contiguous(
             Arc::clone(&self.storage) as Arc<dyn Backing>,
             (slot * self.page_bytes) as usize,
-            DType::U8,
+            ElementType::U8,
             &[self.page_bytes as i64],
         )
     }

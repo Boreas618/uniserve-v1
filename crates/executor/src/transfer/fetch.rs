@@ -1,6 +1,6 @@
 //! Plan a logical tensor's reads from its locations and submit them.
 
-use crate::tensor::DType;
+use crate::memory::allocation::ElementType;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ pub(crate) fn plan(
         .first()
         .ok_or_else(|| Error::Invalid("tensor transfer has no locations".into()))?;
     let shape: Vec<u64> = region.iter().map(|range| range.end - range.start).collect();
-    destination.validate_destination(&shape, DType::parse(&first.dtype)?, destination.device())?;
+    destination.validate_destination(&shape, ElementType::parse(&first.dtype)?, destination.device())?;
 
     let mut ordered: Vec<_> = tensor.locations.iter().enumerate().collect();
     ordered.sort_by_key(|(_, location)| TransportKind::of(location) != TransportKind::Local);

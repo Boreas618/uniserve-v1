@@ -10,7 +10,8 @@ use std::ops::Range;
 use platform::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
 
 use crate::memory::allocation::StorageView;
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 
 /// Ordered first-axis spans of one logical tensor. Every span has the same
@@ -54,7 +55,7 @@ impl Spans {
         &self.views[0]
     }
 
-    pub(crate) fn dtype(&self) -> DType {
+    pub(crate) fn dtype(&self) -> ElementType {
         self.first().dtype()
     }
 
@@ -119,7 +120,7 @@ impl Spans {
     pub(crate) fn validate_destination(
         &self,
         shape: &[u64],
-        dtype: DType,
+        dtype: ElementType,
         device: MemoryKind,
     ) -> Result<()> {
         if self.dtype() != dtype || self.device() != device || self.shape() != shape {
@@ -275,7 +276,7 @@ mod tests {
 
     use super::*;
     use crate::memory::allocation::Storage;
-    use crate::tensor::Backing;
+    use crate::memory::allocation::Backing;
 
     fn write_floats(storage: &Arc<dyn Backing>, values: &[f32]) {
         // SAFETY: test storage is host storage owned by the caller.
@@ -297,8 +298,8 @@ mod tests {
     fn regions_split_across_spans_in_local_coordinates() -> Result<()> {
         let storage: Arc<dyn Backing> = Storage::host(12 * 4);
         let pages = Spans::new(vec![
-            StorageView::contiguous(Arc::clone(&storage), 0, DType::F32, &[2, 3])?,
-            StorageView::contiguous(Arc::clone(&storage), 24, DType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&storage), 24, ElementType::F32, &[2, 3])?,
         ])?;
         assert_eq!(pages.shape(), vec![4, 3]);
 
@@ -319,25 +320,25 @@ mod tests {
             StorageView::strided(
                 Arc::clone(&storage),
                 first * 4,
-                DType::F32,
+                ElementType::F32,
                 &[count, 4],
                 &[1, 4],
             )
         };
         let interleaved = Spans::new(vec![columns(0, 2)?])?;
-        interleaved.validate_destination(&[2, 4], DType::F32, MemoryKind::Host)?;
+        interleaved.validate_destination(&[2, 4], ElementType::F32, MemoryKind::Host)?;
 
         let even = columns(0, 1)?;
         let odd = columns(1, 1)?;
         Spans::new(vec![even.clone(), odd])?.validate_destination(
             &[2, 4],
-            DType::F32,
+            ElementType::F32,
             MemoryKind::Host,
         )?;
         let aliased = Spans::new(vec![even.clone(), even])?;
         assert!(
             aliased
-                .validate_destination(&[2, 4], DType::F32, MemoryKind::Host)
+                .validate_destination(&[2, 4], ElementType::F32, MemoryKind::Host)
                 .is_err()
         );
         Ok(())
@@ -354,14 +355,14 @@ mod tests {
         let source = Spans::single(StorageView::contiguous(
             Arc::clone(&source_storage),
             0,
-            DType::F32,
+            ElementType::F32,
             &[4, 3],
         )?)?;
         // Destination pages store rows in reverse page order.
         let target = Spans::new(vec![
-            StorageView::contiguous(Arc::clone(&target_storage), 24, DType::F32, &[1, 3])?,
-            StorageView::contiguous(Arc::clone(&target_storage), 0, DType::F32, &[2, 3])?,
-            StorageView::contiguous(Arc::clone(&target_storage), 36, DType::F32, &[1, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 24, ElementType::F32, &[1, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 0, ElementType::F32, &[2, 3])?,
+            StorageView::contiguous(Arc::clone(&target_storage), 36, ElementType::F32, &[1, 3])?,
         ])?;
 
         let mut plan = copy_planner(None, SourceOrder::Stream)?;
@@ -410,7 +411,7 @@ mod tests {
         let page = StorageView::strided(
             Arc::clone(&planes) as Arc<dyn Backing>,
             0,
-            DType::U8,
+            ElementType::U8,
             &[tokens as i64, columns as i64, row as i64],
             &[row as i64, (2 * granularity) as i64, 1],
         )?;
@@ -418,7 +419,7 @@ mod tests {
         let frozen = StorageView::contiguous(
             Arc::clone(&staging) as Arc<dyn Backing>,
             0,
-            DType::U8,
+            ElementType::U8,
             &[tokens as i64, columns as i64, row as i64],
         )?;
         let host = PinnedBuffer::new(device, tokens * columns * row)?;

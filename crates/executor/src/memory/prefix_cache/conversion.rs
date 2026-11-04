@@ -22,7 +22,7 @@ use platform::Stream;
 
 use crate::Result;
 use crate::memory::allocation::{Storage, StorageView};
-use crate::tensor::DType;
+use crate::memory::allocation::ElementType;
 
 /// One source span to convert, and the destination units to write it into.
 pub(crate) struct ConversionRequest<'a> {
@@ -38,10 +38,10 @@ pub(crate) struct ConversionRequest<'a> {
     /// The destination group's index in the pool's plan.
     pub(crate) group: usize,
     /// The source's stored element type.
-    pub(crate) source_dtype: DType,
+    pub(crate) source_dtype: ElementType,
     /// The source's logical element type, through which decoded values round
     /// before the destination encoding.
-    pub(crate) compute_dtype: DType,
+    pub(crate) compute_dtype: ElementType,
     /// Tokens of the span: `[layers, heads, head_dim]` each.
     pub(crate) count: u64,
     /// First destination token within the page.
@@ -106,9 +106,9 @@ impl ConversionScratch {
     /// The whole scratch as one `u8` view.
     pub(crate) fn view(&self) -> Result<StorageView> {
         StorageView::contiguous(
-            Arc::clone(&self.storage) as Arc<dyn crate::tensor::Backing>,
+            Arc::clone(&self.storage) as Arc<dyn crate::memory::allocation::Backing>,
             0,
-            DType::U8,
+            ElementType::U8,
             &[self.bytes as i64],
         )
     }

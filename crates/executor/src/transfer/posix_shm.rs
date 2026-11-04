@@ -24,7 +24,8 @@ use super::{
 };
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::tensor::{Backing, MemoryKind};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 
 pub(crate) const SHM_HEADER_BYTES: usize = 512;

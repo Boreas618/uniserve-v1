@@ -267,7 +267,8 @@ mod tests {
 
     use super::*;
     use crate::memory::allocation::{Storage, StorageView};
-    use crate::tensor::{Backing, DType};
+    use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
     use crate::transfer::{TransferCapacity, notify};
 
     /// A host value of `elements` bytes.
@@ -275,7 +276,7 @@ mod tests {
         Spans::single(StorageView::contiguous(
             Storage::host(elements as usize) as Arc<dyn Backing>,
             0,
-            DType::U8,
+            ElementType::U8,
             &[elements],
         )?)
     }

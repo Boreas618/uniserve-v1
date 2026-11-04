@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ipc::{BufferAllocation, BufferId};
 
 use crate::memory::allocation::Storage;
-use crate::tensor::MemoryKind;
+use crate::memory::allocation::MemoryKind;
 use crate::{Error, Result};
 
 /// One pool-issued physical range. Views retain their allocation; this

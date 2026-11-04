@@ -172,7 +172,7 @@ impl LatentPlan {
         max_total_tokens: Option<usize>,
         block_size: usize,
         width: usize,
-        dtype: crate::tensor::DType,
+        dtype: crate::memory::allocation::ElementType,
     ) -> Result<Self> {
         if block_size > MAX_BLOCK_SIZE {
             return Err(Error::Unsupported(format!(

@@ -4,7 +4,8 @@ use platform::DeviceId;
 use std::sync::Arc;
 
 use crate::memory::allocation::{Storage, StorageView};
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// One field of per-slot state a model declares: `shape` is one slot's
@@ -12,7 +13,7 @@ use crate::{Error, Result};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SlotField {
     pub name: String,
-    pub dtype: DType,
+    pub dtype: ElementType,
     pub shape: Vec<i64>,
     pub host: bool,
 }
@@ -111,13 +112,13 @@ mod tests {
         let fields = [
             SlotField {
                 name: "tokens".into(),
-                dtype: DType::I32,
+                dtype: ElementType::I32,
                 shape: vec![4],
                 host: false,
             },
             SlotField {
                 name: "seed".into(),
-                dtype: DType::I64,
+                dtype: ElementType::I64,
                 shape: vec![],
                 host: true,
             },

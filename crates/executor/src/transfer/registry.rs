@@ -177,7 +177,8 @@ mod tests {
 
     use super::*;
     use crate::memory::allocation::{Storage, StorageView};
-    use crate::tensor::{Backing, DType};
+    use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
     use crate::transfer::backing::TransportBuffer;
     use crate::transfer::{ByteReservation, Spans, TransferCapacity};
 
@@ -192,7 +193,7 @@ mod tests {
         let spans = Spans::single(StorageView::contiguous(
             storage as Arc<dyn Backing>,
             0,
-            DType::U8,
+            ElementType::U8,
             &[4],
         )?)?;
         let buffer = TransportBuffer::local(spans, None, ByteReservation::new(capacity, 4)?);

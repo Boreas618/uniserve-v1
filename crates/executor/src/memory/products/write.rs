@@ -3,7 +3,7 @@
 use super::*;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::tensor::MemoryKind;
+use crate::memory::allocation::MemoryKind;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, Result};
 use ipc::{BufferAllocation, BufferId, RequestKey, TensorRef};
@@ -221,7 +221,7 @@ impl ProductStore {
                 };
                 let views = (|| -> Result<(StorageView, StorageView)> {
                     let storage = StorageView::contiguous(
-                        arena as Arc<dyn crate::tensor::Backing>,
+                        arena as Arc<dyn crate::memory::allocation::Backing>,
                         binding.physical_offset() as usize,
                         dtype,
                         &signed(storage_shape),

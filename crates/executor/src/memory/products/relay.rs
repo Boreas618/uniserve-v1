@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::memory::allocation::{Storage, StorageView};
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 use ipc::CallId;
 use ipc::{RequestKey, TensorRef};
@@ -13,17 +14,17 @@ use std::sync::Arc;
 pub(crate) type EntryKey = (MemoryKind, usize, usize);
 
 /// A relay element: its entry, the field's dtype and index.
-pub(crate) type RelayKey = (EntryKey, DType, usize);
+pub(crate) type RelayKey = (EntryKey, ElementType, usize);
 
 /// A relay arena: its storage, dtype and field index.
-pub(crate) type ArenaKey = (MemoryKind, DType, usize);
+pub(crate) type ArenaKey = (MemoryKind, ElementType, usize);
 
 pub(super) type RelayCall = (MemoryKind, usize, RequestKey, CallId);
 
 /// A call holds its relay entry until all scalar fields have retired.
 pub(super) struct Entry {
     pub(super) call: CallKey,
-    pub(super) fields: HashSet<(DType, usize)>,
+    pub(super) fields: HashSet<(ElementType, usize)>,
 }
 
 impl ProductStore {
@@ -38,7 +39,7 @@ impl ProductStore {
         }
         self.reclaim(state)?;
         let mut seen = HashSet::new();
-        let mut fields = HashMap::<(RelayCall, DType), usize>::new();
+        let mut fields = HashMap::<(RelayCall, ElementType), usize>::new();
         let mut buffers = Vec::new();
         let result = (|| -> Result<()> {
             for (reference, device) in bindings {
@@ -100,7 +101,7 @@ impl ProductStore {
                                 MemoryKind::Host | MemoryKind::PinnedHost => Storage::host(bytes),
                             };
                             let arena = StorageView::contiguous(
-                                storage as Arc<dyn crate::tensor::Backing>,
+                                storage as Arc<dyn crate::memory::allocation::Backing>,
                                 0,
                                 dtype,
                                 &[count as i64],

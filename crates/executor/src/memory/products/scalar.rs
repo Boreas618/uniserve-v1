@@ -3,7 +3,8 @@
 use super::*;
 use crate::memory::allocation::StorageView;
 use crate::stream::{Fill, Issue};
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 use platform::{CopyBatch, SourceOrder};
 use std::collections::HashSet;
@@ -11,21 +12,21 @@ use std::sync::Arc;
 
 /// The bits of the integer `integer` stored as one element of `dtype`, and
 /// their width in bytes.
-pub(super) fn scalar_bits(integer: i64, dtype: DType) -> Result<(u64, usize)> {
+pub(super) fn scalar_bits(integer: i64, dtype: ElementType) -> Result<(u64, usize)> {
     let float = integer as f64;
     Ok(match dtype {
-        DType::Bool => (u64::from(float != 0.0), 1),
-        DType::U8 => (u64::from(integer as u8), 1),
-        DType::I8 => (u64::from(integer as i8 as u8), 1),
-        DType::I16 => (u64::from(integer as i16 as u16), 2),
-        DType::I32 => (u64::from(integer as i32 as u32), 4),
-        DType::U32 => (u64::from(integer as u32), 4),
-        DType::I64 => (integer as u64, 8),
-        DType::F16 => (u64::from(f16_bits(float as f32)), 2),
-        DType::BF16 => (u64::from(bf16_bits(float as f32)), 2),
-        DType::F32 => (u64::from((float as f32).to_bits()), 4),
-        DType::F64 => (float.to_bits(), 8),
-        DType::F8E4M3 | DType::F8E5M2 => {
+        ElementType::Bool => (u64::from(float != 0.0), 1),
+        ElementType::U8 => (u64::from(integer as u8), 1),
+        ElementType::I8 => (u64::from(integer as i8 as u8), 1),
+        ElementType::I16 => (u64::from(integer as i16 as u16), 2),
+        ElementType::I32 => (u64::from(integer as i32 as u32), 4),
+        ElementType::U32 => (u64::from(integer as u32), 4),
+        ElementType::I64 => (integer as u64, 8),
+        ElementType::F16 => (u64::from(f16_bits(float as f32)), 2),
+        ElementType::BF16 => (u64::from(bf16_bits(float as f32)), 2),
+        ElementType::F32 => (u64::from((float as f32).to_bits()), 4),
+        ElementType::F64 => (float.to_bits(), 8),
+        ElementType::F8E4M3 | ElementType::F8E5M2 => {
             return Err(Error::Unsupported(
                 "scalar products are not stored as FP8".into(),
             ));
@@ -289,10 +290,10 @@ mod tests {
 
     #[test]
     fn scalar_bits_follow_the_storage_dtype() -> Result<()> {
-        assert_eq!(scalar_bits(-1, DType::I32)?, (0xffff_ffff, 4));
-        assert_eq!(scalar_bits(-2, DType::I64)?, (u64::MAX - 1, 8));
-        assert_eq!(scalar_bits(1, DType::F32)?, (0x3f80_0000, 4));
-        assert!(scalar_bits(1, DType::F8E4M3).is_err());
+        assert_eq!(scalar_bits(-1, ElementType::I32)?, (0xffff_ffff, 4));
+        assert_eq!(scalar_bits(-2, ElementType::I64)?, (u64::MAX - 1, 8));
+        assert_eq!(scalar_bits(1, ElementType::F32)?, (0x3f80_0000, 4));
+        assert!(scalar_bits(1, ElementType::F8E4M3).is_err());
         Ok(())
     }
 }

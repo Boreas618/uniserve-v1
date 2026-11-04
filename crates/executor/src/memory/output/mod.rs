@@ -20,7 +20,8 @@ use platform::{DeviceId, Event};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result, lock};
 
 mod logprobs;
@@ -168,7 +169,7 @@ impl OutputBuffer {
         let view = StorageView::contiguous(
             backing,
             storage.byte_offset() + offset,
-            DType::U8,
+            ElementType::U8,
             &[count as i64],
         )?;
         self.begin_copy(device, stream, events)?;
@@ -294,7 +295,7 @@ impl OutputBuffer {
         let view = StorageView::contiguous(
             backing,
             storage.byte_offset() + offset * size_of::<i64>(),
-            DType::I64,
+            ElementType::I64,
             &[(available - offset) as i64],
         )?;
         self.tokens = available;
@@ -776,7 +777,7 @@ mod tests {
     use super::{LogprobLayout, OutputBuffer, OutputPool};
     use crate::memory::allocation::StorageView;
     use crate::stream::EventPool;
-    use crate::tensor::DType;
+    use crate::memory::allocation::ElementType;
     use crate::{Result, lock};
 
     /// Write `values` into the lent host words `lent`, as the executor
@@ -804,7 +805,7 @@ mod tests {
         let events = EventPool::default();
         let lent = buffer.lend_bytes(5, None, None::<&platform::Stream>, &events)?;
         assert_eq!(lent.shape(), &[5]);
-        assert_eq!(lent.dtype(), DType::U8);
+        assert_eq!(lent.dtype(), ElementType::U8);
         // Five bytes from the back leave one whole token word.
         let (offset, words) = buffer.lend_words()?;
         assert_eq!((offset, words.shape()), (0, &[1_i64][..]));
