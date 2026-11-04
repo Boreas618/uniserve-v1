@@ -7,12 +7,16 @@
 //! at every call.
 
 use ops::TensorView;
+use ops::fp4::{
+    BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, Nvfp4Quantize, QuantizeArgs,
+    QuantizeDescriptor, ScaleLayout,
+};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::ACCUMULATE;
-use crate::weights::Weight;
+use crate::weights::{QuantizedWeight, Weight};
 
 /// A dense projection `out = input · weight + bias`.
 pub struct Linear {
@@ -142,5 +146,352 @@ impl Linear {
         };
 
         f.operate::<Gemm>(&descriptor, args)
+    }
+}
+
+/// A dense projection over an NVFP4 weight: the activation is encoded, then contracted.
+///
+/// The layer holds the checkpoint's packed weight (`[n, k/2]` bytes, two E2M1 codes a byte), its
+/// block scales in the layout the checkpoint stores them, the bias when the epilogue adds one, and
+/// the activation encoder's global scale. It holds no scratch: the packed activation and its block
+/// scales of one call come from [`Forward::arena`](crate::Forward::arena), and the tensor scale the
+/// product is scaled by is a **device operand** the caller passes, because the epilogue reads it as
+/// each thread block starts rather than after a host round trip.
+///
+/// The two operators are one layer because `nvfp4_quantize` produces exactly what `nvfp4_gemm`'s
+/// activation side reads, in the same layout: splitting them would let a model pair a quantizer and
+/// a product whose scale layouts differ, which no shape check would catch.
+pub struct Nvfp4Linear {
+    packed: Weight,
+    scales: Weight,
+    bias: Option<Weight>,
+    /// The layout of the activation's block scales, which also names the product.
+    layout: ScaleLayout,
+    /// The encoder's global scale: the reciprocal of this projection's activation tensor scale.
+    activation_global_scale: f32,
+    /// The activation element type the encoder is compiled for.
+    input: ops::DType,
+    /// Elements one encoder program covers.
+    block: u32,
+    k: u32,
+    n: u32,
+}
+
+impl Nvfp4Linear {
+    /// A projection whose weight `weight` is the checkpoint's, in `layout` for its activations.
+    ///
+    /// `weight.packed` is `[n, k/2]` bytes and `weight.scales` the checkpoint's own block scales
+    /// over `[n, k]`; the module's weight side is swizzled, so the layer does not re-key it. The
+    /// contraction is geometry the descriptor bakes in, so `k` must be whole sixteen-element
+    /// blocks — the encoder's and the product's own requirement.
+    ///
+    /// `activation_global_scale` is the reciprocal of the projection's activation tensor scale:
+    /// the checkpoint's `input_scale`, which a calibrated export states per quantized module. It
+    /// is a constructor argument rather than a checkpoint read because the loading boundary owns
+    /// that field; a caller that has none cannot serve this projection.
+    pub fn new(
+        weight: &QuantizedWeight,
+        bias: Option<Weight>,
+        layout: ScaleLayout,
+        activation_global_scale: f32,
+        input: ops::DType,
+        block: u32,
+    ) -> Result<Self> {
+        if weight.packed.shape().rank() != 2 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "a packed weight is a byte matrix, not {:?}",
+                    weight.packed.shape().dims()
+                ),
+            ));
+        }
+        let n = weight.packed.shape().dim(0);
+        let half = weight.packed.shape().dim(1);
+        let k = half * 2;
+        if weight.packed.dtype() != ops::DType::U8 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!("packed weights are U8 bytes, not {}", weight.packed.dtype()),
+            ));
+        }
+        if !k.is_multiple_of(u64::from(BLOCK_ELEMENTS)) || k == 0 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!("a contraction of {k} elements is not whole sixteen-element blocks"),
+            ));
+        }
+        let expected = weight.layout.shape(n, k);
+        if weight.scales.shape() != expected {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "the checkpoint's block scales are {:?}; {} rows of {k} elements take {:?}",
+                    weight.scales.shape().dims(),
+                    n,
+                    expected.dims()
+                ),
+            ));
+        }
+        if !activation_global_scale.is_finite() || activation_global_scale <= 0.0 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "an activation global scale of {activation_global_scale} is not a positive \
+                     reciprocal"
+                ),
+            ));
+        }
+        if input != ops::DType::BF16 && input != ops::DType::F16 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!("{input} activations; NVFP4 encodes BF16 or FP16"),
+            ));
+        }
+        if block == 0 || !block.is_multiple_of(BLOCK_ELEMENTS) {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!("{block} elements per encoder program are not whole blocks"),
+            ));
+        }
+        if let Some(bias) = bias.as_ref()
+            && bias.shape().numel() != n
+        {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "a bias of {} elements cannot be added to {n} output channels",
+                    bias.shape().numel()
+                ),
+            ));
+        }
+        Ok(Self {
+            packed: weight.packed,
+            scales: weight.scales,
+            bias,
+            layout,
+            activation_global_scale,
+            input,
+            block,
+            k: u32::try_from(k).map_err(|_| {
+                Error::shape("Nvfp4Linear", format!("a contraction of {k} elements"))
+            })?,
+            n: u32::try_from(n)
+                .map_err(|_| Error::shape("Nvfp4Linear", format!("{n} output channels")))?,
+        })
+    }
+
+    /// The contraction length, in elements.
+    pub const fn k(&self) -> u32 {
+        self.k
+    }
+
+    /// The number of output channels.
+    pub const fn n(&self) -> u32 {
+        self.n
+    }
+
+    /// The packed weight view, `[n, k/2]` bytes.
+    pub fn weight(&self) -> TensorView {
+        self.packed.view()
+    }
+
+    /// `out = input · weight + bias`, with the activation encoded on the way.
+    ///
+    /// `input` is `[m, k]` of the encoder's element type and unit stride on its last axis; `out` is
+    /// `[m, n]`; `alpha` is `[1]` FP32, the product of the activation's and the weight's tensor
+    /// scales, computed on device by whoever produced the activation scale. The packed activation
+    /// and its block scales are taken from the forward's arena.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        input: TensorView,
+        alpha: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let k = u64::from(self.k);
+        let n = u64::from(self.n);
+        input
+            .require_row("Nvfp4Linear", self.input, k)
+            .map_err(Error::from)?;
+        out.require_row("Nvfp4Linear", out.dtype, n)
+            .map_err(Error::from)?;
+        alpha
+            .require_row("Nvfp4Linear", ops::DType::F32, 1)
+            .map_err(Error::from)?;
+        let rows = input.rows();
+        if rows == 0 {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                "a projection of no rows has no program".to_owned(),
+            ));
+        }
+        if out.rows() != rows {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!("{rows} input rows against {} output rows", out.rows()),
+            ));
+        }
+        let m = u32::try_from(rows)
+            .map_err(|_| Error::shape("Nvfp4Linear", format!("{rows} activation rows")))?;
+
+        // 1. Encode the activation into the layout the product reads, into this forward's scratch.
+        let arena = f.arena();
+        let values = arena.tensor(ops::DType::U8, ops::Shape::new(&[rows, k / 2]))?;
+        let scale_shape = self.layout.shape(rows, k);
+        let scales = arena.tensor(ops::DType::U8, scale_shape)?;
+        let quantize = QuantizeDescriptor {
+            input: self.input,
+            columns: self.k,
+            layout: self.layout,
+            block: self.block,
+            pdl: false,
+        };
+        let encoded = QuantizeArgs {
+            input,
+            values,
+            scales,
+            global_scale: self.activation_global_scale,
+        };
+        f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
+
+        // 2. Contract the encoded activation with the checkpoint's weight.
+        let descriptor = GemmDescriptor {
+            packed: ops::DType::U8,
+            scale: self.scales.dtype(),
+            accumulate: ACCUMULATE,
+            output: out.dtype,
+            layout: self.layout,
+            epilogue: if self.bias.is_some() {
+                Epilogue::Bias
+            } else {
+                Epilogue::None
+            },
+            m,
+            n: self.n,
+            k: self.k,
+            pdl: false,
+        };
+        let args = GemmArgs {
+            input: values,
+            weight: self.packed.view(),
+            input_scales: scales,
+            weight_scales: self.scales.view(),
+            alpha,
+            bias: self.bias.as_ref().map(Weight::view),
+            out,
+        };
+        f.operate::<Nvfp4Gemm>(&descriptor, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ops::{DType, DevicePtr, Shape};
+
+    use super::*;
+    use crate::Backing;
+
+    fn weight(dtype: DType, shape: &[u64]) -> Weight {
+        Weight {
+            backing: Backing::new(DevicePtr::new(0x1_0000), 1 << 20),
+            view: TensorView::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape)),
+        }
+    }
+
+    /// A calibrated projection: `[n, k]` logical, so the packed weight is `[n, k/2]` bytes and the
+    /// block scales carry the shape the checkpoint's layout gives them.
+    fn packed(n: u64, k: u64, layout: ScaleLayout) -> QuantizedWeight {
+        QuantizedWeight {
+            packed: weight(DType::U8, &[n, k / 2]),
+            scales: weight(DType::U8, layout.shape(n, k).dims()),
+            global_scale: 0.125,
+            layout,
+        }
+    }
+
+    #[test]
+    fn a_packed_projection_states_its_contraction_and_its_channels() {
+        let projection = Nvfp4Linear::new(
+            &packed(8, 64, ScaleLayout::Swizzled128X4),
+            None,
+            ScaleLayout::Swizzled128X4,
+            0.25,
+            DType::BF16,
+            128,
+        )
+        .unwrap();
+        assert_eq!(projection.k(), 64);
+        assert_eq!(projection.n(), 8);
+        assert_eq!(projection.weight().dtype, DType::U8);
+        assert_eq!(projection.weight().shape.dims(), &[8, 32]);
+    }
+
+    #[test]
+    fn a_packed_projection_refuses_what_it_cannot_contract() {
+        let refuse = |weight: QuantizedWeight, layout, scale, input, block| {
+            Nvfp4Linear::new(&weight, None, layout, scale, input, block)
+        };
+        // Twelve elements are not whole sixteen-element blocks, so no encoder could produce them.
+        let odd = packed(8, 62, ScaleLayout::Swizzled128X4);
+        assert!(refuse(odd, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
+        // A weight that is not packed bytes is a BF16 matrix, which this product does not read.
+        let mut unpacked = packed(8, 64, ScaleLayout::Swizzled128X4);
+        unpacked.packed = weight(DType::BF16, &[8, 32]);
+        assert!(refuse(unpacked, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
+        // The scales answer the layout's own shape, so a matrix of them is not one.
+        let mut unscaled = packed(8, 64, ScaleLayout::Swizzled128X4);
+        unscaled.scales = weight(DType::U8, &[8, 4]);
+        assert!(refuse(unscaled, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
+        // The encoder's global scale is a positive reciprocal, never zero and never NaN.
+        for scale in [0.0, -1.0, f32::NAN] {
+            assert!(
+                refuse(
+                    packed(8, 64, ScaleLayout::Swizzled128X4),
+                    ScaleLayout::Swizzled128X4,
+                    scale,
+                    DType::BF16,
+                    128
+                )
+                .is_err()
+            );
+        }
+        // NVFP4 encodes BF16 and FP16 activations only.
+        assert!(
+            refuse(
+                packed(8, 64, ScaleLayout::Swizzled128X4),
+                ScaleLayout::Swizzled128X4,
+                0.25,
+                DType::F32,
+                128
+            )
+            .is_err()
+        );
+        // A program encodes whole blocks.
+        assert!(
+            refuse(
+                packed(8, 64, ScaleLayout::Swizzled128X4),
+                ScaleLayout::Swizzled128X4,
+                0.25,
+                DType::BF16,
+                12
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_packed_projection_refuses_a_bias_it_cannot_add() {
+        let error = Nvfp4Linear::new(
+            &packed(8, 64, ScaleLayout::Swizzled128X4),
+            Some(weight(DType::F32, &[7])),
+            ScaleLayout::Swizzled128X4,
+            0.25,
+            DType::BF16,
+            128,
+        )
+        .err()
+        .expect("a seven-element bias cannot be added to eight channels");
+        assert!(error.to_string().contains("8 output channels"), "{error}");
     }
 }
