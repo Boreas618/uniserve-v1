@@ -207,6 +207,7 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                             size: "the cubin bytes".len() as u64,
                         }],
                         entry: String::new(),
+                        entries: std::collections::HashMap::new(),
                         metadata: "metadata.json".into(),
                     })),
                 },
@@ -230,7 +231,7 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
     assert_eq!(module.files[0].name, "module.cubin");
     assert_eq!(module.files[0].size, "the cubin bytes".len() as u64);
     assert_eq!(module.metadata.as_deref(), Some("metadata.json"));
-    assert_eq!(module.entry, None);
+    assert!(module.entries.is_empty());
     let mut bytes = Vec::new();
     let mut file = &module.files[0].file;
     file.seek(SeekFrom::Start(0)).unwrap();
@@ -270,6 +271,54 @@ fn a_listing_names_the_packages_revisions_and_modules() {
     assert_eq!(package.modules.len(), 1);
     assert_eq!(package.modules[0].descriptor, "dtype_bf16");
     assert_eq!(package.modules[0].form, ModuleForm::Cubin);
+}
+
+#[test]
+fn a_native_module_comes_back_with_its_entries_by_role() {
+    let mut client = server_on(|connection| {
+        let _ = connection.receive::<wire::Request>().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"the shared object").unwrap();
+        connection
+            .send(
+                &wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Resolved(wire::Resolved {
+                        form: wire::ModuleForm::Native as i32,
+                        files: vec![wire::ModuleFile {
+                            name: "module.so".into(),
+                            size: "the shared object".len() as u64,
+                        }],
+                        entry: String::new(),
+                        entries: [
+                            ("launch".to_owned(), "uniserve_launch".to_owned()),
+                            ("restore".to_owned(), "uniserve_restore".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        metadata: String::new(),
+                    })),
+                },
+                &[OwnedFd::from(file)],
+            )
+            .unwrap();
+    });
+
+    let module = client
+        .resolve(
+            "expert_exchange",
+            &program(),
+            &Target::new("sm_100a"),
+            "dtype_bf16",
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(module.form, ModuleForm::Native);
+    assert_eq!(
+        module.entries.get("launch").map(String::as_str),
+        Some("uniserve_launch")
+    );
+    assert_eq!(module.entries.len(), 2);
+    assert!(module.metadata.is_none());
 }
 
 #[test]

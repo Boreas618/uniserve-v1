@@ -149,11 +149,18 @@ pub struct ModuleSpec {
     /// package writes in the same fields for nvcc (design section 5.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
-    /// The C entry symbol, for a native module: what the main process calls
-    /// after `dlopen` (design section 4.2).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry: Option<String>,
+    /// A native module's C entry symbols, by role: what the main process
+    /// calls after `dlopen` (design section 4.2). [`LAUNCH_ENTRY`] is the
+    /// entry that launches the kernel and every native module has it; the
+    /// other roles are lifecycle entries with the same calling convention,
+    /// such as an expert exchange creating, suspending and restoring a
+    /// transport workspace around a launch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, String>,
 }
+
+/// The entry role every native module has: the one that launches the kernel.
+pub const LAUNCH_ENTRY: &str = "launch";
 
 /// A package's sources and how they are compiled.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,15 +394,23 @@ impl Manifest {
                 "the package names files it does not have: {missing:?}"
             )));
         }
-        if self.module.form == ModuleForm::Native && self.module.entry.is_none() {
-            return Err(ManifestError::Invalid(
-                "a native module must name its C entry".into(),
-            ));
-        }
-        if self.module.form == ModuleForm::Wasm && self.module.entry.is_some() {
-            return Err(ManifestError::Invalid(
-                "a wasm module has no C entry; it is a precompiled module, not a library".into(),
-            ));
+        match self.module.form {
+            ModuleForm::Native => {
+                if !self.module.entries.contains_key(LAUNCH_ENTRY) {
+                    return Err(ManifestError::Invalid(format!(
+                        "a native module must name its {LAUNCH_ENTRY} entry, and its other \
+                         lifecycle entries, in [module.entries]"
+                    )));
+                }
+            }
+            ModuleForm::Cubin | ModuleForm::Wasm => {
+                if !self.module.entries.is_empty() {
+                    return Err(ManifestError::Invalid(
+                        "only a native module has C entries; a cubin or wasm module has none"
+                            .into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
