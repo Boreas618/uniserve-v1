@@ -148,20 +148,33 @@ impl Serving {
     }
 
     /// The batch's calls, each answered as a completed call that sampled
-    /// [`SAMPLED`] and stands one token past the start of its prompt.
+    /// [`SAMPLED`] and stands one token past the cache extent the mechanism
+    /// wrote into the batch's own rows.
+    ///
+    /// The positions are the columns', not invented: a real executor reports
+    /// the slot's state after the commit, and the mechanism's next call reads
+    /// them to know what a successor may read.
     fn serve(&self, batch: Batch) -> Submission {
         let calls = batch
             .calls
             .iter()
             .enumerate()
             .map(|(index, call)| {
+                let seen = batch
+                    .columns
+                    .rows
+                    .seq_lens
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as u32;
                 CallOutput::completed(
                     *call,
                     vec![SAMPLED + index as u32],
                     RowState {
-                        step_index: 1,
-                        cache_computed_len: 1,
-                        cache_visible_len: 1,
+                        step_index: seen + 1,
+                        cache_computed_len: seen + 1,
+                        cache_visible_len: seen + 1,
                     },
                 )
             })
