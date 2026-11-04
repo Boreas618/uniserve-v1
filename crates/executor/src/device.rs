@@ -431,8 +431,6 @@ enum Step {
     Requeued,
 }
 
-/// The device's graph-storage budget, as the allocator books against it (4.1).
-
 /// What a sticky-error probe found (2.4).
 #[derive(Debug)]
 pub enum Probe {
