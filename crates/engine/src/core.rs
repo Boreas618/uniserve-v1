@@ -550,7 +550,10 @@ pub struct SchedulerHandle {
     /// over the worker-process executor has none; the shadow pass and the
     /// in-process submission both need it.
     batches: Option<Arc<dyn Batches>>,
-    next_id: AtomicU64,
+    /// Request ids, shared with the warm-up's view of this scheduler.
+    next_id: Arc<AtomicU64>,
+    /// Set once a policy instance actually serves (§7.3); see `wait_serving`.
+    serving: tokio::sync::watch::Receiver<bool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -976,10 +979,11 @@ impl SchedulerHandle {
 
         let waker = executor.command_waker();
         let scheduler = Self::assemble(config.clone(), Box::new(executor), waker)?;
-        // Each scheduler's serving path runs the requests its workers'
-        // reports call for before the scheduler serves; a successor's
-        // run on units of its own world while its predecessor serves.
-        crate::warmup::warm(&scheduler, config)?;
+        // The serving path's warm-up is the serving path's: a scheduler with no
+        // policy forms no batch, so it can only run once the epoch's first
+        // policy serves. It is recorded here, on a thread of its own, and
+        // startup — and the daemon's readiness contract — does not wait for it.
+        crate::warmup::after_serving(&scheduler, config);
         Ok(scheduler)
     }
 
@@ -1084,6 +1088,8 @@ impl SchedulerHandle {
         let latent_seed = scheduler.latent_seed();
         let stats = scheduler.stats_handle();
         let failure = scheduler.failure_handle();
+        // Taken before the scheduler moves onto its thread.
+        let serving = scheduler.serving_receiver();
         let trial = scheduler.on_trial();
 
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -1112,9 +1118,40 @@ impl SchedulerHandle {
             failure,
             trial,
             batches: None,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
+            serving,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// Everything the serving path's warm-up submits through, so a thread of
+    /// the engine's can warm this rank without holding the handle it owns.
+    pub(crate) fn warmup(&self) -> crate::warmup::Warm {
+        crate::warmup::Warm {
+            info: self.info.clone(),
+            generation_limits: self.generation_limits.clone(),
+            next_id: Arc::clone(&self.next_id),
+            dead: Arc::clone(&self.dead),
+            failure: Arc::clone(&self.failure),
+            commands: self.commands.clone(),
+        }
+    }
+
+    /// Blocks until a policy instance actually serves this scheduler, or the
+    /// scheduler stops first (§7.3).
+    ///
+    /// Before the epoch's first switchover the mechanism decides nothing, so a
+    /// scheduler with no policy forms no batch; whatever must run under a
+    /// policy — the serving path's warm-up, above all — waits here instead of at
+    /// startup.
+    pub fn wait_serving(&self) {
+        crate::warmup::wait_serving(self.serving.clone());
+    }
+
+    /// The scheduler's serving signal, for a thread that waits on it without
+    /// holding the handle ([`crate::warmup::after_serving`]).
+    pub(crate) fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.serving.clone()
     }
 
     /// The policy slot of this scheduler, as the control thread holds it (§7.3):
