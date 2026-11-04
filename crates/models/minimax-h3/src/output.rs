@@ -415,6 +415,41 @@ pub fn timeline_frames(clips: &[Splice]) -> Result<u32> {
 mod tests {
     use super::*;
 
+    fn constants(values: [f32; 3]) -> Weight {
+        // The constants are host bytes the executor uploads; a test only needs a weight that names
+        // three values, never a device that holds them.
+        let bytes: &'static [u8] = Box::leak(
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<u8>>()
+                .into_boxed_slice(),
+        );
+        let ptr = nn::DevicePtr::new(bytes.as_ptr() as u64);
+        Weight {
+            backing: nn::Backing::new(ptr, bytes.len() as u64),
+            view: TensorView::new(ptr, DType::F32, Shape::new(&[3])),
+        }
+    }
+
+    #[test]
+    fn the_byte_step_refuses_constants_that_are_not_three_channels() {
+        let mean = constants(PIXEL_MEAN);
+        let std = constants(PIXEL_STD);
+        assert!(RgbBytes::new(DType::F16, 3, mean, std).is_ok());
+        // Two channels cannot de-normalize an RGB raster; the layer refuses at construction rather
+        // than reading past the constant.
+        let two = {
+            let bytes: &'static [u8] = Box::leak(vec![0u8; 8].into_boxed_slice());
+            let ptr = nn::DevicePtr::new(bytes.as_ptr() as u64);
+            Weight {
+                backing: nn::Backing::new(ptr, bytes.len() as u64),
+                view: TensorView::new(ptr, DType::F32, Shape::new(&[2])),
+            }
+        };
+        assert!(RgbBytes::new(DType::F16, 2, two, constants(PIXEL_STD)).is_err());
+    }
+
     #[test]
     fn a_normalized_pixel_restores_its_bytes() {
         let rgb = Rgb::of(1, 1, 1);
