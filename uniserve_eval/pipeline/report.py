@@ -59,6 +59,9 @@ def build_summary(
             `ValidationResult.merged` requires disjoint check names.
     """
     metrics = summarize(records, dur_s, tokenizer=tokenizer)
+    # A scoring task adds its own values, such as GSM8K's accuracy, to the
+    # generic throughput and latency metrics before metrics are validated.
+    metrics.update(task.summary_metrics(records))
     validation = task.validate(records).merged(
         _metric_validation(point.metrics, metrics)
     )

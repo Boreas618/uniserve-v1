@@ -13,7 +13,9 @@ use std::thread;
 use std::time::Duration;
 
 use engine::Event;
-use engine::{CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor};
+use engine::{
+    CommandWaker, Executor, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor,
+};
 use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
     ImageEncoderInput, ImageGenerationConfig, ImageTrigger, ModelDtype,
@@ -21,8 +23,13 @@ use engine::{
 use ipc::{ImageParams, RequestId, SamplingParams};
 
 fn main() -> anyhow::Result<()> {
-    let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(
+    let mut sim = SimEngine::new();
+    // Two batches may be in flight at once, so a step never waits on the one
+    // before it to be retired.
+    sim.set_queue_depth(2);
+    let executor = Box::new(SimExecutor::new(sim));
+    let capacity = engine::BatchCapacity::of(&executor.info().runtime_info()?);
+    let mut sched = Scheduler::new(
         engine::Submissions::new(executor),
         SimEngine::special_tokens(),
         SchedulerConfig {
@@ -32,6 +39,14 @@ fn main() -> anyhow::Result<()> {
         ModelDtype::BFloat16,
         SimEngine::generation_limits(),
     )?;
+
+    // A scheduler with no policy decides nothing — no plan, no admission, no
+    // batch — so a world that serves must be given the default one: `fcfs`
+    // revision one, instantiated for the capacity this pool was built for.
+    let (program, module) = engine::packaged_policy(capacity);
+    sched
+        .install_policy(program, &engine::PolicyBytes::new(module))
+        .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))?;
 
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
@@ -57,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             }],
             sample_feedback_continuation: true,
         };
-        let prompt_token_ids = vec![1, 2, 3];
+        let prompt_token_ids = vec![1, 2, 3, 4, 5];
 
         let image = ImageParams {
             steps: 6,
@@ -68,14 +83,15 @@ fn main() -> anyhow::Result<()> {
         // scheduler resolves its limits separately against the executor.
         let limits = GenerationLimits {
             features: engine::GenerationFeatures::UNDERSTANDING
+                | engine::GenerationFeatures::VISION_ENCODE
                 | engine::GenerationFeatures::IMAGE_GENERATION,
-            max_latent_units: 64,
+            max_latent_units: 65_536,
             latent_downsample: 16,
-            max_vae_grid_tokens: 64,
-            max_vit_grid_tokens: 64,
-            latent_bytes_per_unit: (1 << 20) / 64,
-            max_latent_feature_bytes: 1 << 20,
-            max_vision_feature_bytes: 1 << 20,
+            max_vae_grid_tokens: 65_536,
+            max_vit_grid_tokens: 8_192,
+            latent_bytes_per_unit: (256 << 20) / 65_536,
+            max_latent_feature_bytes: 256 << 20,
+            max_vision_feature_bytes: 256 << 20,
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             encoder_cache_entries: 256,
@@ -89,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             sampling: SamplingParams::default(),
             image,
             max_images: 1,
-            max_und_tokens: 20,
+            max_und_tokens: 16,
             include_stop_token: false,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
@@ -123,10 +139,12 @@ fn main() -> anyhow::Result<()> {
     let mut done = 0usize;
     let total = rxs.len();
     let mut counts: HashMap<RequestId, (String, usize, usize, bool)> = HashMap::new();
+    let mut watched = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while done < total && std::time::Instant::now() < deadline {
         for (id, (kind, rx)) in rxs.iter_mut() {
             while let Ok(ev) = rx.try_recv() {
+                watched += 1;
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
                 match ev {
                     Event::TextToken { .. } => e.1 += 1,
@@ -142,6 +160,15 @@ fn main() -> anyhow::Result<()> {
         thread::sleep(Duration::from_millis(2));
     }
 
+    let general = &handle.stats().general;
+    println!(
+        "events={watched} steps={} running={} in_flight={} dead={} failure={:?}",
+        general.steps.load(std::sync::atomic::Ordering::Relaxed),
+        general.running.load(std::sync::atomic::Ordering::Relaxed),
+        general.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+        handle.is_dead(),
+        handle.failure(),
+    );
     let mut ok = done == total;
     for (id, (kind, toks, imgs, fin)) in &counts {
         println!(
