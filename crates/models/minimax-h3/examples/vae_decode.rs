@@ -539,6 +539,25 @@ fn stage_decode(args: &Args) -> Result<()> {
     let directory = args.out.join("video_decoder");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The page is this run's or it does not exist. A decode that stops in the loader - or anywhere
+    // before its last write - would otherwise leave the previous run's `latents.h3t`, `raster.h3t` and
+    // `case.json` in place, and a comparator pairing those would be reporting a residual between two
+    // runs nobody can attribute. Clearing first makes "a page exists" mean "this run produced it".
+    let mut cleared = 0_u32;
+    for name in ["latents.h3t", "raster.h3t", "case.json"] {
+        let path = directory.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+            cleared += 1;
+        }
+    }
+    if cleared > 0 {
+        println!(
+            "cleared {cleared} file(s) of a previous run from {}",
+            directory.display()
+        );
+    }
     let (latent_bytes, generated) = match &args.latents {
         Some(path) if !path.exists() => {
             // An input the caller named is read, never substituted - but the operating system's own
@@ -635,6 +654,23 @@ fn stage_decode(args: &Args) -> Result<()> {
     ops::capture::set_sink(Some(&mut walk));
     let decode_result = clip.decode_clip(&forward, &decoder, &tiles, latents, positions, out);
     ops::capture::set_sink(None);
+    // The walk is written before the outcome is read: the launch after its last line is the one that
+    // stopped, so a decode that fails still says where it got to. A walk written only on success makes
+    // a stop indistinguishable from a stage that never opened the device.
+    let walk_path = args.out.join("walk.txt");
+    std::fs::write(&walk_path, walk.text())
+        .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    if decode_result.is_err() {
+        println!(
+            "walk: {} launches of {} distinct programs before the stop -> {}",
+            walk.0.len(),
+            walk.distinct(),
+            walk_path.display()
+        );
+        for (operator, key) in walk.0.iter().rev().take(5).rev() {
+            println!("  {operator}\t{key}");
+        }
+    }
     decode_result?;
     stream.synchronize()?;
     // The plan against what the decode actually bumped. `video_arena` is a sum of named buffers and
