@@ -795,6 +795,64 @@ fn main() {
         );
     }
 
+    // ---- The text encoder's MLP and its token embedding, and the two packed gated activations.
+    //
+    // The language layers' MLP is a `GatedActivation` over two *separate* contiguous projections —
+    // `text_encoder.rs` runs its own `gate` and `up` Linears into their own `[tokens, intermediate]`
+    // buffers before the activation — so both row strides are the intermediate width, 25600. The
+    // activation is `silu` (`hidden_act`), the layer's block is 1024, and `wide` is false because the
+    // output is in bytes far below the u32 element count.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: DType::BF16,
+            width: 25600,
+            block: 1024,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 25600,
+            value_stride: 25600,
+            wide: false,
+            pdl: PDL,
+            stepwise: false,
+        }
+        .to_string(),
+    );
+    // The two packed forms: the DiT's block MLP and the conditioning projection both contract to
+    // `ffn_dim 14336` in BF16 from a packed `[rows, 2 · width]` row, and the video VAE decoder's to
+    // its own `mlp` width 8192 in FP16 (`decoders.md`'s arena: `mlp [rows, 8192]`). The row stride is
+    // twice the width because the two halves are packed beside each other, and no call site passes a
+    // bias.
+    for (dtype, width) in [(DType::BF16, 14336_u32), (DType::F16, 8192)] {
+        push(
+            "value_first_swiglu",
+            ops::activation::ValueFirstSwigluDescriptor {
+                dtype,
+                width,
+                block: 1024,
+                input_stride: 2 * u64::from(width),
+                bias: false,
+                absmax: false,
+            }
+            .to_string(),
+        );
+    }
+    // The text encoder's token embedding, at the single-partition shape: the whole vocabulary
+    // (151936 rows of 5120) with i32 ids, eight tokens per program. A sharded deployment re-keys it,
+    // because `first` and `rows` are the rank's slice of the vocabulary.
+    push(
+        "embedding",
+        ops::embedding::Descriptor {
+            dtype: DType::BF16,
+            ids: DType::I32,
+            hidden: 5120,
+            first: 0,
+            rows: 151936,
+            block: 8,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
     // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
