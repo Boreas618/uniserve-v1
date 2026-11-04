@@ -81,7 +81,13 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 const SORT_TILE: u32 = 128;
 
 /// The candidate width the slice's sampler keeps per row (`Sampler::new`'s `width`).
-const CANDIDATE_WIDTH: u32 = 2048;
+///
+/// It is the **vocabulary**, not a top-k bound: a request may ask for any top-k it likes, so the
+/// runner builds the sampler with a candidate buffer as wide as the vocabulary — a narrower one
+/// would silently sample a different set (`crates/executor/src/engine_plan.rs`, the one place a
+/// runner's geometry is stated). A deployment that narrowed it would change these keys, which is
+/// why the width is a descriptor field at all.
+const CANDIDATE_WIDTH: u32 = VOCABULARY;
 
 /// Extra counted tokens a sampling row carries in the slice's request state.
 const EXTRAS: u32 = 0;
@@ -316,8 +322,11 @@ fn main() {
     ));
     lines.push((
         "logits_shape".to_owned(),
+        // The logits are the runner's buffer, and it allocates them in FP32 whatever the model's
+        // activations are (`causal_lm.rs`: the plan's `logits_dtype`), so this row is the one place
+        // the sampler chain's element type is not the model's.
         key(&ops::sampler::ShapeDescriptor {
-            dtype,
+            dtype: DType::F32,
             vocabulary: VOCABULARY,
             block: row_tile(VOCABULARY),
             extras: EXTRAS,
