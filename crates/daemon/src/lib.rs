@@ -41,7 +41,6 @@ pub mod openai;
 pub mod options;
 pub mod output;
 pub mod profiling;
-pub mod program_restart;
 pub mod restart;
 pub mod standby;
 pub mod supervision;
