@@ -593,7 +593,25 @@ impl Scheduler {
         // are all read after it: a page announced now is a page this step's
         // plan may name, so the validators must already see it.
         self.pump_page_changes();
+        // Every request the mechanism holds is stated to the policy here, and
+        // `close` emits an `Updated` for the ones whose view moved: a policy's
+        // state is append-only, so a phase it is never told about is a phase it
+        // does not have, and an admitted request it never hears of again is one
+        // it can never plan work for. The filter is `close`'s, not this loop's,
+        // so a step whose requests did not move tells the policy nothing.
+        for view in views::requests(self, self.recorder.recorded()) {
+            self.recorder.update(view);
+        }
         self.recorder.close();
+        // The policy's knowledge and the mechanism's own must be the same set,
+        // and the run of silent divergence that cost four caller runs is why
+        // this is checked at all: a request the mechanism holds and the policy
+        // never heard of is one it cannot plan work for, and a request the
+        // policy still holds after the mechanism ended it is one it offers in
+        // `admit` and the mechanism refuses as "not queued" - a policy
+        // failure, which stops the epoch.
+        #[cfg(debug_assertions)]
+        self.assert_policy_in_sync();
         let room = self.room();
         // The starvation rule names only a request the watchdog tracks, so the
         // step states those views and not a view of every resident.
@@ -650,6 +668,54 @@ impl Scheduler {
         }
         self.policy = Some(policy);
         Some(plan)
+    }
+
+    /// Asserts that the policy knows exactly the requests the mechanism holds.
+    ///
+    /// A policy's state is append-only and it learns requests only from this
+    /// mechanism's events, so the two sets are one fact. The mechanism holds a
+    /// request from its submission (`waiting`/`waiting_media`) through its
+    /// residence (`running`/`running_media`) to its end, and every one of those
+    /// transitions is announced (`Arrived`, `Admitted`, `Finished`). A step
+    /// boundary is the one place both are complete: nothing is mid-transition
+    /// there.
+    ///
+    /// Debug builds only: it is a statement about the mechanism's bookkeeping,
+    /// not a decision the mechanism makes.
+    #[cfg(debug_assertions)]
+    fn assert_policy_in_sync(&self) {
+        // The policy's ids and the mechanism's name the same request; the two
+        // newtypes are the interface's, so the sets are compared in the
+        // interface's.
+        let guest = |id: u64| scheduling::guest::RequestId(id);
+        let held: std::collections::BTreeSet<scheduling::guest::RequestId> = self
+            .waiting
+            .iter()
+            .map(|state| guest(state.req.request_id.0))
+            .chain(
+                self.waiting_media
+                    .iter()
+                    .map(|pending| guest(pending.request.request_id.0)),
+            )
+            .chain(self.running.keys().map(|id| guest(id.0)))
+            .chain(self.running_media.keys().map(|id| guest(id.0)))
+            .collect();
+        let told: std::collections::BTreeSet<scheduling::guest::RequestId> =
+            self.recorder.known().collect();
+        for id in held.difference(&told) {
+            debug_assert!(
+                false,
+                "the policy was never told of request {}: the mechanism holds it, so nothing can                          plan its work",
+                id.0
+            );
+        }
+        for id in told.difference(&held) {
+            debug_assert!(
+                false,
+                "the policy still holds request {}: the mechanism ended it without saying so",
+                id.0
+            );
+        }
     }
 
     /// Ends the step's accounting: the step number, and the policy's per-step
