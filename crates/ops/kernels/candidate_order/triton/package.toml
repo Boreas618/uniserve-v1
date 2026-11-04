@@ -1,0 +1,39 @@
+# The candidate_order operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program orders one row's candidates by token id. The row count comes from
+# the grid and the candidate count arrives as the launch's last scalar, because
+# the reference's width follows the request's top-k: a descriptor extent would
+# recompile the sampler for every request.
+
+op = "candidate_order"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/candidate_order.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `values_f32_ids_i32_pdl_false`.
+[kernel.descriptors]
+dimensions = { values = ["f32"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+
+[parameters]
+# The row tile the program walks a candidate row in; the candidate count is a launch value, so the
+# program loops over the row in tiles of this width.
+block = 256
