@@ -43,6 +43,11 @@
 //! The SenseNova and omni readout output filters declare no state; item 2
 //! removes their routes from the covered set, and until then a response they
 //! write ends at the boundary.
+//!
+//! A video artifact's body is not covered yet: it would take a session that
+//! streams the retained media from the byte the predecessor reached, which
+//! does not exist. Such a response is left with the predecessor, which
+//! finishes it, and the successor is not told it was taken over.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -312,11 +317,51 @@ fn take_over(
             );
             let outcome =
                 leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run =
-                crate::output::run::GenerationRun::resume(&chat, leader.tokenizer(), events, outcome)?;
+            let run = crate::output::run::GenerationRun::resume_stream(
+                &chat,
+                leader.tokenizer(),
+                events,
+                outcome,
+            )?;
+            // Server-sent events: the body keeps its connection alive while
+            // it waits for the engine.
             ResponseStream::start(Box::new(run), true)
         }
-        other => anyhow::bail!("a handed-over response of an unsupported kind: {other:?}"),
+        handoff::stream::Application::ChatResponse(chat) => {
+            // `Leader::take_over_request` reads the three position fields the
+            // two handed states share, so a `ChatStream` carrying only those
+            // names the same engine stream. The leader takes the fields
+            // themselves next; this adapter goes with it.
+            let position = handoff::ChatStream {
+                engine_replica: chat.engine_replica,
+                engine_request_id: chat.engine_request_id.clone(),
+                consumed_events: chat.consumed_events,
+                ..Default::default()
+            };
+            let events = leader.take_over_request(&position)?;
+            let started = crate::output::run::started_instant(
+                chat.lowering
+                    .as_ref()
+                    .map_or(0, |lowering| lowering.started_unix_us),
+            );
+            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
+            let run = crate::output::run::GenerationRun::resume_collection(
+                &chat,
+                leader.tokenizer(),
+                events,
+                outcome,
+            )?;
+            // One JSON body: no server-sent events, so no keep-alive comment.
+            ResponseStream::start(Box::new(run), false)
+        }
+        // A video artifact's body has no session a successor resumes yet: the
+        // response stays with the predecessor, which finishes it, and is not
+        // named among the adopted ones.
+        handoff::stream::Application::VideoContent(content) => anyhow::bail!(
+            "a handed-over video response of job {} at byte {} has no session here yet",
+            content.job_id,
+            content.offset
+        ),
     };
     info!(
         request_id = %record.request_id,

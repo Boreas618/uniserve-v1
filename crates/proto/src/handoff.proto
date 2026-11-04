@@ -130,6 +130,9 @@ message ChatResponse {
   string engine_request_id = 7;
   uint64 consumed_events = 8;
   uint64 consumed_tokens = 9;
+  // Which of the deployment's engine replicas serves the request, as
+  // `ChatStream.engine_replica`.
+  uint32 engine_replica = 10;
 }
 
 // A video job's artifact streamed as the response body.

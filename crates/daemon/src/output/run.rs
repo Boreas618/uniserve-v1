@@ -66,8 +66,201 @@ pub(crate) struct ChatOutputInputs {
     pub(crate) context: ChatResponseContext,
 }
 
+/// The parts of a handed state that every response body shares.
+pub(crate) struct ResumeState<'a> {
+    /// How input processing lowered the request.
+    pub(crate) lowering: Option<&'a handoff::Lowering>,
+    /// The incremental detokenizer's state.
+    pub(crate) decode: Option<&'a handoff::Decode>,
+    /// The output parsers' state.
+    pub(crate) processor: Option<&'a handoff::Processor>,
+    /// The assembled blocks.
+    pub(crate) assembly: Option<&'a handoff::Assembly>,
+    /// The response timestamp every chunk repeats.
+    pub(crate) created: u64,
+}
+
+impl<'a> ResumeState<'a> {
+    /// The shared parts of a streamed response's state.
+    pub(crate) fn of_chat_stream(state: &'a handoff::ChatStream) -> Self {
+        Self {
+            lowering: state.lowering.as_ref(),
+            decode: state.decode.as_ref(),
+            processor: state.processor.as_ref(),
+            assembly: state.assembly.as_ref(),
+            created: state.chunks.as_ref().map_or(0, |chunks| chunks.created),
+        }
+    }
+
+    /// The shared parts of a response answered as one body.
+    pub(crate) fn of_chat_response(state: &'a handoff::ChatResponse) -> Self {
+        Self {
+            lowering: state.lowering.as_ref(),
+            decode: state.decode.as_ref(),
+            processor: state.processor.as_ref(),
+            assembly: state.assembly.as_ref(),
+            created: state
+                .lowering
+                .as_ref()
+                .and_then(|lowering| lowering.response.as_ref())
+                .map_or(0, |response| response.created),
+        }
+    }
+}
+
+impl GenerationRun<ChatStreamEmitter> {
+    /// Continues the streamed response `state` describes, whose engine events
+    /// arrive on `events`, taken over from the connection that consumed them
+    /// (design §7.5.1 step 4).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no response or no prompt, or when the
+    /// family's parsers cannot be built.
+    pub(crate) fn resume_stream(
+        state: &handoff::ChatStream,
+        tokenizer: DynTokenizer,
+        events: RequestEvents,
+        outcome: RequestOutcome,
+    ) -> anyhow::Result<GenerationRun<ChatStreamEmitter>> {
+        let parts = ResumeState::of_chat_stream(state);
+        let created = state.chunks.as_ref().map_or(0, |chunks| chunks.created);
+        GenerationRun::<ChatStreamEmitter>::resume(parts, tokenizer, events, outcome, |context| {
+            let mut emitter = ChatStreamEmitter::new(context, created);
+            if let Some(chunks) = state.chunks.as_ref() {
+                emitter.resume(chunks);
+            }
+            emitter
+        })
+    }
+}
+
+impl GenerationRun<ChatBodySink> {
+    /// Continues the response answered as one JSON body that `state`
+    /// describes, whose engine events arrive on `events`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no response or no prompt, or when the
+    /// family's parsers cannot be built.
+    pub(crate) fn resume_collection(
+        state: &handoff::ChatResponse,
+        tokenizer: DynTokenizer,
+        events: RequestEvents,
+        outcome: RequestOutcome,
+    ) -> anyhow::Result<GenerationRun<ChatBodySink>> {
+        let parts = ResumeState::of_chat_response(state);
+        let created = parts.created;
+        GenerationRun::<ChatBodySink>::resume(parts, tokenizer, events, outcome, |context| {
+            let mut sink = ChatBodySink::new(context, created);
+            if let Some(collection) = state.collection.as_ref() {
+                sink.resume(collection);
+            }
+            sink
+        })
+    }
+}
+
+/// What a response body's outputs become: the frames it writes.
+pub(crate) trait ResponseSink: Send + 'static {
+    /// The frames `output` produces, in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails as the response does; the body then ends with its error frame.
+    fn push(&mut self, output: &RequestOutput) -> Result<Vec<Bytes>, ApiError>;
+
+    /// Whether the request's terminal output arrived.
+    fn done(&self) -> bool;
+
+    /// The sink's own state, as the response's application states it.
+    fn body_state(&self) -> Option<BodyState>;
+}
+
+/// The body's own state, which one response's application carries.
+pub(crate) enum BodyState {
+    /// The chunks and server-sent events of a streamed response.
+    Stream(handoff::ChatChunks),
+    /// What a response answered as one body collected.
+    Collection(handoff::ChatCollection),
+}
+
+impl ResponseSink for ChatStreamEmitter {
+    fn push(&mut self, output: &RequestOutput) -> Result<Vec<Bytes>, ApiError> {
+        let chunks = ChatStreamEmitter::push(self, output)?;
+        let mut frames: Vec<Bytes> = chunks.iter().map(chunk_frame).collect();
+        if matches!(output, RequestOutput::Finished { .. }) {
+            frames.push(done_frame());
+        }
+        Ok(frames)
+    }
+
+    fn done(&self) -> bool {
+        ChatStreamEmitter::done(self)
+    }
+
+    fn body_state(&self) -> Option<BodyState> {
+        ChatStreamEmitter::state(self).map(BodyState::Stream)
+    }
+}
+
+/// A response answered as one JSON body, collected output by output.
+pub(crate) struct ChatBodySink {
+    collector: crate::openai::chat_completions::ChatCollector,
+    context: ChatResponseContext,
+    created: u64,
+    /// Set once the body was written, so a later output writes nothing.
+    written: bool,
+}
+
+impl ChatBodySink {
+    /// The sink of the response `context` describes, whose timestamp is
+    /// `created`.
+    pub(crate) fn new(context: &ChatResponseContext, created: u64) -> Self {
+        Self {
+            collector: crate::openai::chat_completions::ChatCollector::new(),
+            context: context.clone(),
+            created,
+            written: false,
+        }
+    }
+
+    /// Takes over a state this sink produced.
+    pub(crate) fn resume(&mut self, state: &handoff::ChatCollection) {
+        self.collector.resume(state);
+    }
+}
+
+impl ResponseSink for ChatBodySink {
+    fn push(&mut self, output: &RequestOutput) -> Result<Vec<Bytes>, ApiError> {
+        self.collector.push(output)?;
+        if !self.collector.done() || self.written {
+            return Ok(Vec::new());
+        }
+        self.written = true;
+        let response = crate::openai::chat_completions::chat_response(
+            self.collector.collected()?,
+            &self.context,
+            self.created,
+        )?;
+        let body = serde_json::to_vec(&response).unwrap_or_else(|_| {
+            br#"{"error":{"message":"failed to serialize chat completion","type":"server_error"}}"#
+                .to_vec()
+        });
+        Ok(vec![Bytes::from(body)])
+    }
+
+    fn done(&self) -> bool {
+        self.written
+    }
+
+    fn body_state(&self) -> Option<BodyState> {
+        Some(BodyState::Collection(self.collector.state()))
+    }
+}
+
 /// One streamed chat completion's body, driven one engine event at a time.
-pub(crate) struct GenerationRun {
+pub(crate) struct GenerationRun<S: ResponseSink> {
     request_id: String,
     /// The response timestamp every chunk repeats, in seconds since the UNIX
     /// epoch.
@@ -81,7 +274,7 @@ pub(crate) struct GenerationRun {
     parser: handoff::Parser,
     blocks: StructuredEventState,
     clock: StreamClock,
-    emitter: ChatStreamEmitter,
+    sink: S,
     events: RequestEvents,
     image_count: u32,
     image_steps: u32,
@@ -96,7 +289,7 @@ pub(crate) struct GenerationRun {
     ended: bool,
 }
 
-impl GenerationRun {
+impl<S: ResponseSink> GenerationRun<S> {
     /// The body of `request_id`, whose pipeline is `inputs` and whose engine
     /// events arrive on `events`, which the caller submitted.
     ///
@@ -109,6 +302,7 @@ impl GenerationRun {
         inputs: ChatOutputInputs,
         events: RequestEvents,
         outcome: RequestOutcome,
+        sink: S,
     ) -> Result<Self, crate::output::text::Error> {
         let ChatOutputInputs {
             tokenizer,
@@ -142,7 +336,7 @@ impl GenerationRun {
             parser,
             blocks: StructuredEventState::new(),
             clock: StreamClock::new(started, compile_us),
-            emitter: ChatStreamEmitter::new(&context, created),
+            sink,
             context,
             events,
             replica: outcome.engine(),
@@ -270,13 +464,9 @@ impl GenerationRun {
     fn frames(&mut self, output: RequestOutput) -> Result<Vec<Bytes>, ApiError> {
         self.outcome.observe(&output);
         let visible = is_visible(&output);
-        let chunks = self.emitter.push(&output)?;
+        let frames = self.sink.push(&output)?;
         if visible {
             self.clock.visible();
-        }
-        let mut frames: Vec<Bytes> = chunks.iter().map(chunk_frame).collect();
-        if matches!(output, RequestOutput::Finished { .. }) {
-            frames.push(done_frame());
         }
         Ok(frames)
     }
@@ -291,15 +481,22 @@ impl GenerationRun {
     ///
     /// Fails when the state names no response or no prompt, or when the
     /// family's parsers cannot be built.
+    /// Rebuilds the stages every response body shares and takes the body's own
+    /// stage over from `sink`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no lowering or response fields, no prompt,
+    /// or a family whose parsers cannot be built.
     pub(crate) fn resume(
-        state: &handoff::ChatStream,
+        state: ResumeState<'_>,
         tokenizer: DynTokenizer,
         events: RequestEvents,
         outcome: RequestOutcome,
+        sink: impl FnOnce(&ChatResponseContext) -> S,
     ) -> anyhow::Result<Self> {
         let lowering = state
             .lowering
-            .as_ref()
             .context("a handed response states no lowering")?;
         let response = lowering
             .response
@@ -331,7 +528,7 @@ impl GenerationRun {
             handoff::parser::Kind::ParserKindSenseNova
             | handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
         };
-        if let Some(parsers) = state.processor.as_ref() {
+        if let Some(parsers) = state.processor {
             processor.resume(parsers);
         }
         let decode = DecodeStream::resume(
@@ -341,17 +538,14 @@ impl GenerationRun {
             lowering.prompt_logprobs,
             lowering.logprobs,
             options,
-            state.decode.as_ref().unwrap_or(&Default::default()),
+            state.decode.unwrap_or(&Default::default()),
         )
         .context("resuming the incremental decoder")?;
-        let assembly = state.assembly.clone().unwrap_or_default();
+        let assembly = state.assembly.cloned().unwrap_or_default();
         let mut blocks = StructuredEventState::new();
         blocks.resume(&assembly);
-        let mut emitter = ChatStreamEmitter::new(&context, state.chunks.as_ref().map_or(0, |chunks| chunks.created));
-        if let Some(chunks) = state.chunks.as_ref() {
-            emitter.resume(chunks);
-        }
-        let created = state.chunks.as_ref().map_or(0, |chunks| chunks.created);
+        let created = state.created;
+        let sink = sink(&context);
         let replica = outcome.engine();
         Ok(Self {
             request_id,
@@ -365,7 +559,7 @@ impl GenerationRun {
             parser,
             blocks,
             clock: StreamClock::resume(&assembly, lowering.started_unix_us, lowering.compile_us),
-            emitter,
+            sink,
             events,
             image_count: assembly.images,
             image_steps: assembly.image_steps,
@@ -378,44 +572,68 @@ impl GenerationRun {
 
     /// The state a successor goes on writing from, or `None` when this
     /// response cannot be handed over.
-    pub(crate) fn freeze_state(&self) -> Option<handoff::ChatStream> {
+    pub(crate) fn freeze_body(&self) -> Option<handoff::stream::Application> {
         let processor = self.processor.state()?;
-        let chunks = self.emitter.state()?;
         let mut assembly = self.blocks.state();
         self.clock.state(&mut assembly);
         assembly.images = self.image_count;
         assembly.image_steps = self.image_steps;
         let (consumed_events, consumed_tokens) = self.events.progress();
-        Some(handoff::ChatStream {
-            request: self.events.submitted().unwrap_or_default(),
-            lowering: Some(handoff::Lowering {
-                prompt_token_ids: self.prompt_token_ids.clone(),
-                decode_options: Some(decode_state(&self.decode.options())),
-                prompt_logprobs: self.prompt_logprobs,
-                logprobs: self.logprobs,
-                parser: Some(self.parser.clone()),
-                response: Some(handoff::ChatResponseOptions::from(&self.context)),
-                compile_us: self.clock.compile_us(),
-                started_unix_us: self.clock.started_unix_us(),
+        let lowering = handoff::Lowering {
+            prompt_token_ids: self.prompt_token_ids.clone(),
+            decode_options: Some(decode_state(&self.decode.options())),
+            prompt_logprobs: self.prompt_logprobs,
+            logprobs: self.logprobs,
+            parser: Some(self.parser.clone()),
+            response: Some(handoff::ChatResponseOptions {
+                created: self.created,
+                ..handoff::ChatResponseOptions::from(&self.context)
             }),
-            decode: Some(self.decode.state()),
-            processor: Some(processor),
-            assembly: Some(assembly),
-            chunks: Some(chunks),
-            consumed_events,
-            consumed_tokens,
-            usage_owed: self.context.include_usage && !self.emitter.done(),
-            engine_request_id: self
-                .events
-                .engine_request_id()
-                .map(|id| id.0.to_string())
-                .unwrap_or_default(),
-            engine_replica: self.replica,
+            compile_us: self.clock.compile_us(),
+            started_unix_us: self.clock.started_unix_us(),
+        };
+        let body = self.sink.body_state()?;
+        Some(match body {
+            BodyState::Stream(chunks) => handoff::stream::Application::ChatStream(handoff::ChatStream {
+                request: self.events.submitted().unwrap_or_default(),
+                lowering: Some(lowering),
+                decode: Some(self.decode.state()),
+                processor: Some(processor),
+                assembly: Some(assembly),
+                chunks: Some(chunks),
+                consumed_events,
+                consumed_tokens,
+                usage_owed: self.context.include_usage && !self.sink.done(),
+                engine_request_id: self
+                    .events
+                    .engine_request_id()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
+                engine_replica: self.replica,
+            }),
+            BodyState::Collection(collection) => {
+                handoff::stream::Application::ChatResponse(handoff::ChatResponse {
+                    request: self.events.submitted().unwrap_or_default(),
+                    lowering: Some(lowering),
+                    decode: Some(self.decode.state()),
+                    processor: Some(processor),
+                    assembly: Some(assembly),
+                    collection: Some(collection),
+                    engine_request_id: self
+                        .events
+                        .engine_request_id()
+                        .map(|id| id.0.to_string())
+                        .unwrap_or_default(),
+                    consumed_events,
+                    consumed_tokens,
+                    engine_replica: self.replica,
+                })
+            }
         })
     }
 }
 
-impl Session for GenerationRun {
+impl<S: ResponseSink> Session for GenerationRun<S> {
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         loop {
             if self.ended {
@@ -458,7 +676,12 @@ impl Session for GenerationRun {
     }
 
     fn freeze(&mut self) -> Option<Application> {
-        self.freeze_state().map(Application::ChatStream)
+        let body = self.freeze_body()?;
+        Some(match body {
+            handoff::stream::Application::ChatStream(chat) => Application::ChatStream(chat),
+            handoff::stream::Application::ChatResponse(chat) => Application::ChatResponse(chat),
+            handoff::stream::Application::VideoContent(video) => Application::VideoContent(video),
+        })
     }
 
     fn abort(&mut self) {
