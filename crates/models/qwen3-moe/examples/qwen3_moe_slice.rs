@@ -193,13 +193,8 @@ fn run() -> Result<()> {
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Embedding => stage_embedding(&args),
-        Stage::Decode => stage_decode(&args),
-        Stage::Block => Err(Failure::message(format!(
-            "stage `{}` (layer {}) is not wired: `Qwen3Moe` walks every layer in one call and has no \
-             per-layer entry point, so one block cannot be run on its own. Stages `weights`, \
-             `embedding` and `decode` run today.",
-            "block", args.layer
-        ))),
+        Stage::Decode => run_stack(&args, None),
+        Stage::Block => run_stack(&args, Some(args.layer)),
     }
 }
 
@@ -461,7 +456,9 @@ fn decode_arena_bytes(plan: &qwen3_moe::Plan, tokens: u64, config: &Config) -> u
         .saturating_add(1 << 30)
 }
 
-fn stage_decode(args: &Args) -> Result<()> {
+/// The stack over one prompt: `last = Some(layer)` stops after that layer and digests its output,
+/// `None` finishes the model and prints the last row's top-10.
+fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
@@ -575,9 +572,49 @@ fn stage_decode(args: &Args) -> Result<()> {
     }];
     let cache = KvView { groups: &groups };
 
-    // The forward: embed, walk the stack, project the last row.
+    // The forward: embed, then either stop at one layer or walk the stack and project the last row.
     let hidden = arena.tensor(DType::BF16, Shape::new(&[count, plan.hidden]))?;
     model.embed_input_ids(&forward, positions, hidden)?;
+    if let Some(layer) = last {
+        // The layer's rows, twice: a block has no reference capture, so what it can prove is that
+        // every key it composes resolves and that two identical runs agree. A digest that moves
+        // between them is a race or an uninitialized buffer, which is worth knowing before a
+        // numerical comparison blames the arithmetic.
+        let mut digests = Vec::new();
+        for run in 0..2 {
+            let rows = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let values = download_bf16(
+                &stream,
+                rows,
+                tokens_usize(&batch),
+                usize::try_from(plan.hidden).unwrap_or(0),
+            )?;
+            digests.push(digest(&values));
+            println!(
+                "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
+                count,
+                usize::try_from(plan.hidden).unwrap_or(0),
+            );
+        }
+        println!(
+            "block: layer {layer} {} across two runs; worst |value| {:.6}, sum {:.6}",
+            if digests[0] == digests[1] {
+                "reproduced"
+            } else {
+                "DIFFERS"
+            },
+            digests[0].1,
+            digests[0].0,
+        );
+        if digests[0] != digests[1] {
+            return Err(Failure::message(format!(
+                "layer {layer} gave two different outputs from the same inputs: the digest moved                  from {:?} to {:?}",
+                digests[0], digests[1]
+            )));
+        }
+        return Ok(());
+    }
     model.forward(&forward, &batch, &cache, hidden)?;
     let logits = arena.tensor(
         DType::F32,
@@ -603,6 +640,21 @@ fn stage_decode(args: &Args) -> Result<()> {
         println!("  {token}\t{logprob:.6}");
     }
     Ok(())
+}
+
+/// The batch's token count, as a `usize`, for the host-side readbacks.
+fn tokens_usize(batch: &TokenBatch) -> usize {
+    usize::try_from(batch.num_tokens).unwrap_or(0)
+}
+
+/// A cheap digest of a block's output: its sum and its largest magnitude, both rounded so that a
+/// stable kernel and the same kernel on a second run compare equal.
+fn digest(values: &[f32]) -> (i64, i64) {
+    let sum: f64 = values.iter().map(|value| f64::from(*value)).sum();
+    let worst = values
+        .iter()
+        .fold(0.0_f32, |worst, value| worst.max(value.abs()));
+    ((sum * 1e3) as i64, (f64::from(worst) * 1e3) as i64)
 }
 
 /// The ten largest `log_softmax` values of one row, as (token id, logprob), largest first.
