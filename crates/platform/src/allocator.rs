@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::pool::VirtualPool;
 use crate::vmm::{HandleType, ShareableHandle};
-use crate::{Device, DeviceId, Error, PrimaryContext, Result};
+use crate::{Device, DeviceId, Error, PrimaryContext, Protection, Result};
 
 const POOLS: usize = 3;
 
@@ -264,6 +264,27 @@ impl Allocator {
         if let Some(allocator) = self.pools[buffer.pool.index()].as_mut() {
             allocator.free(buffer.address);
         }
+    }
+
+    /// Changes what the pool's device and its peers may do with `buffer`'s
+    /// storage, at its unchanged address: design 8's park makes a standby's
+    /// blocks read-only and promotion makes them read-write again, so a
+    /// captured graph that addresses them stays valid across the pair.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `buffer` belongs to another allocator or pool, when its pool
+    /// is suspended, and when the driver refuses the change.
+    pub fn set_protection(&mut self, buffer: &Buffer, protection: Protection) -> Result<()> {
+        if buffer.device() != self.device.id() {
+            return Err(Error::invalid(format!(
+                "{buffer:?} belongs to {}, not to {}",
+                buffer.device(),
+                self.device.id()
+            )));
+        }
+        self.pool(buffer.pool())?
+            .protect(buffer.address(), protection)
     }
 
     /// The physical storage `pool` maps now, or would map once restored:
