@@ -521,6 +521,13 @@ fn stage_block(args: &Args) -> Result<()> {
     let forward = Forward::new(&stream, &generation, &arena);
 
     // 6. The modulation cache, computed once: the schedule's own times, its own groups.
+    //
+    // The walk starts here rather than at the forward, because this stage's first launches are the
+    // cache's own F32 projections - one of them was a stop, and a walk that began at the stack would
+    // have reported a complete list while the run still refused at the cache.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let sink = SinkGuard;
     cache_projections(&forward, &projections, &memory)?;
 
     // 7. The inputs: the packed rows' rotary, the row table, the step, and the tokens themselves.
@@ -558,11 +565,6 @@ fn stage_block(args: &Args) -> Result<()> {
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
     println!("step    {evaluation} of the schedule");
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
-    // The walk: what this forward binds, recorded rather than inferred. `tools/walk_gaps.py` diffs it
-    // against the store's key list, so a bound key the store has no program for is one command away
-    // instead of one device round.
-    let mut walk = Walk(Vec::new());
-    ops::capture::set_sink(Some(&mut walk));
     let forward_result = stack.forward(
         &forward,
         &cache,
@@ -578,6 +580,7 @@ fn stage_block(args: &Args) -> Result<()> {
     // Removed before the result is read: an installed sink is reported to by every later launch on
     // this thread, and a failure must not leave one behind.
     ops::capture::set_sink(None);
+    drop(sink);
     forward_result?;
     stream.synchronize()?;
     if walk.0.is_empty() {
@@ -851,6 +854,19 @@ struct Walk(Vec<(&'static str, String)>);
 impl ops::capture::Sink for Walk {
     fn launched(&mut self, operator: &'static str, key: &str) {
         self.0.push((operator, key.to_owned()));
+    }
+}
+
+/// Removes the capture sink when it leaves scope, so a failing launch cannot leave one installed.
+///
+/// The sink is thread-local and every later launch on the thread reports to it; a `?` between the
+/// install and the explicit removal would otherwise leak it, and the next stage's walk would then
+/// record launches that belong to another pass.
+struct SinkGuard;
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        ops::capture::set_sink(None);
     }
 }
 
