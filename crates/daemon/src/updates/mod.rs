@@ -15,4 +15,5 @@
 //! pause it measures, the trial's verdict and the commit, revert and purge
 //! it commands.
 
+pub(crate) mod change;
 pub(crate) mod switch;
