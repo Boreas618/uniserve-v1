@@ -537,7 +537,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let needed = planned
         + table_bytes(&constant_specs)
         + table_bytes(&state_specs)
-        + text_rows * hidden * 2
+        + (text_rows + u64::from(shape.condition_rows) + 1) * hidden * 2
         + video_elements * 4
         + audio_rows.unwrap_or(0) * audio_width * 4;
     let arena_bytes = needed.max(args.arena_gib << 30);
@@ -588,10 +588,26 @@ fn stage_denoise(args: &Args) -> Result<()> {
             ))
         })?;
 
-    // 7. The prefix source as a file: fixed bytes at the layout's text capacity, so both sides read
-    //    the same rows and neither re-derives an encoder's output. `denoise` reads its dtype as the
-    //    forward's own.
-    let (text, text_bytes) = pseudo_rows(&stream, &arena, text_rows, hidden)?;
+    // 7. The prefix source: one buffer of `text_rows + condition_rows + 1` rows - the prompt's
+    //    rows, one row per packed condition row, then the zero row every generated and padding row
+    //    gathers, which is the model's own statement of the layout (`denoiser.rs`, "The prefix
+    //    source is one buffer") and derives its text capacity by subtraction. A `t2va` request has
+    //    no condition rows, so the source is the synthetic prompt followed by that one zero row.
+    //
+    //    The text rows are fixed bytes, so both sides read the same ones and neither re-derives an
+    //    encoder's output; the zero row is not synthetic data and pseudo-noise there would be wrong
+    //    in every packed row that reads it. `text_features.h3t` holds the text segment alone,
+    //    because the zero row is the runner's and the reference producer appends its own.
+    let prefix_rows = text_rows + u64::from(shape.condition_rows) + 1;
+    let text_width = hidden * dtype.bytes().unwrap_or(2);
+    let mut source_bytes = pseudo_bytes(text_rows, hidden);
+    source_bytes.resize(usize::try_from(prefix_rows * text_width).unwrap_or(0), 0);
+    let text = arena.tensor(dtype, Shape::new(&[prefix_rows, hidden]))?;
+    upload_bytes(&stream, text, &source_bytes)?;
+    println!(
+        "prefix: {prefix_rows} rows of {hidden} - {text_rows} text, {} condition, one zero",
+        shape.condition_rows
+    );
 
     // 8. The latents at their native extents - the raster a step patchifies, and the audio's rows -
     //    then the draw. A `t2va` request has no condition rows, so the prefix source carries none.
@@ -675,7 +691,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let case = format!(
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
-         \"text_rows\": {text_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
+         \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
          \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
          \"schedule\": \"{}\", \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \
          \"video_shape\": {}}}\n",
@@ -695,7 +711,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
         &directory.join("text_features.h3t"),
         &[text_rows, hidden],
         4,
-        &text_bytes,
+        &source_bytes[..usize::try_from(text_rows * text_width).unwrap_or(0)],
     )?;
     let drew = write_sample(&stream, &directory, "e0", video_latents, audio_latents)?;
 
@@ -1283,6 +1299,16 @@ fn pseudo_rows(
     rows: u64,
     columns: u64,
 ) -> Result<(TensorView, Vec<u8>)> {
+    let bytes = pseudo_bytes(rows, columns);
+    let tensor = arena.tensor(DType::BF16, Shape::new(&[rows, columns]))?;
+    upload_bytes(stream, tensor, &bytes)?;
+    Ok((tensor, bytes))
+}
+
+/// The same rows as host bytes, for a buffer that holds more than they do.
+///
+/// A fixed function of nothing: no seed, no case, so two runs and both sides read the same bytes.
+fn pseudo_bytes(rows: u64, columns: u64) -> Vec<u8> {
     let count = usize::try_from(rows * columns).unwrap_or(0);
     let mut bytes = Vec::with_capacity(count * 2);
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
@@ -1298,18 +1324,7 @@ fn pseudo_rows(
         let value = ((state >> 39) as f32) / ((1_u64 << 24) as f32) - 1.0;
         bytes.extend_from_slice(&half_of(value).to_le_bytes());
     }
-    let tensor = arena.tensor(DType::BF16, Shape::new(&[rows, columns]))?;
-    // SAFETY: `bytes` outlives the copy, which completes before the wait below.
-    unsafe {
-        platform::memcpy_async(
-            tensor.ptr.address(),
-            bytes.as_ptr() as u64,
-            bytes.len(),
-            stream,
-        )?;
-    }
-    stream.synchronize()?;
-    Ok((tensor, bytes))
+    bytes
 }
 
 /// A BF16 holding the high half of `value`, rounded to nearest even.
