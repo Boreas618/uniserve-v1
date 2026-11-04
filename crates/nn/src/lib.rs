@@ -52,7 +52,7 @@ pub mod weights;
 pub use capability::{
     BatchRow, BatchRows, CausalLm, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder,
     EncoderInputs, EncoderOutputs, ImageInput, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind,
-    Seed, Step, TokenBatch, VideoRequest, VideoTask,
+    Seed, StateTable, Step, TokenBatch, VideoRequest, VideoTask,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
@@ -60,11 +60,13 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
-    Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d,
-    Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation, LayerNorm, Linear,
-    ModulatedRmsNorm, Moe, Noise, PackedSwiGlu, ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler,
-    SamplerState, Samples, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, SwiGlu,
-    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
+    AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry,
+    ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation,
+    GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey, PackedSwiGlu,
+    ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation, Sampler, SamplerState,
+    Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections,
+    Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
+    gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
