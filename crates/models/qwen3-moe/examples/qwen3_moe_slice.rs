@@ -518,6 +518,14 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
     let count = u64::try_from(tokens.len()).unwrap_or(0);
 
+    // A reference stack is one prompt's activations, so comparing another prompt against it would
+    // report the prompt and not the model. The reference's own `meta.json` records the ids it ran,
+    // and a run that names different ones is refused before the first launch rather than after
+    // forty-eight stages of disagreement.
+    if let Some(dir) = args.reference.as_deref() {
+        check_reference_prompt(dir, &tokens)?;
+    }
+
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let device =
@@ -779,6 +787,50 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 /// The batch's token count, as a `usize`, for the host-side readbacks.
 fn tokens_usize(batch: &TokenBatch) -> usize {
     usize::try_from(batch.num_tokens).unwrap_or(0)
+}
+
+/// Refuse a reference stack that was captured from other prompt ids than the run's.
+///
+/// `meta.json` beside the `.npy` files records `"ids": [...]`. A stack without one is read as is -
+/// the caller may have built the arrays elsewhere - but a stack that names a prompt and does not
+/// match is a comparison that cannot say anything about the model, so it stops here.
+fn check_reference_prompt(dir: &std::path::Path, tokens: &[i32]) -> Result<()> {
+    let path = dir.join("meta.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Some(ids_at) = text.find("\"ids\"") else {
+        return Ok(());
+    };
+    let Some(list_at) = text[ids_at..].find('[').map(|at| at + ids_at) else {
+        return Ok(());
+    };
+    let Some(list_end) = text[list_at..].find(']').map(|at| at + list_at) else {
+        return Ok(());
+    };
+    let theirs: Vec<i32> = text[list_at + 1..list_end]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    if theirs.is_empty() || theirs == tokens {
+        return Ok(());
+    }
+    let shown = |ids: &[i32]| {
+        ids.iter()
+            .take(16)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Err(Failure::message(format!(
+        "{} holds a stack for {} tokens ({}), and this run names {} ({}): a different prompt would \
+         disagree at every stage and say nothing about the model",
+        path.display(),
+        theirs.len(),
+        shown(&theirs),
+        tokens.len(),
+        shown(tokens)
+    )))
 }
 
 /// The relative distance a stage is allowed from the reference before it is a divergence.
