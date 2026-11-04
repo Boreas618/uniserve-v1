@@ -1585,9 +1585,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
     ///
-    /// The paired forward runs over the batch's own columns but a scratch KV: every page it writes
-    /// is a scratch page, so the new kernel cannot touch a page a serving request reads. The
-    /// model's `Forward::operate` does the branch, once, for every layer alike.
+    /// The paired forward runs over a scratch KV: every page it writes is a scratch page, so the
+    /// new kernel cannot touch a page a serving request reads. The model's `Forward::operate` does
+    /// the branch, once, for every layer alike.
+    ///
+    /// Its columns are the ones the bucket has staged. A shadow job the mechanism submits right
+    /// after a batch stages that batch, so the comparison runs on served work; a precopy-driven
+    /// shadow job has no batch staged, and this stages a warm pose instead - the same bucket, the
+    /// same launches, every slot `-1` so the cache write is inert. Both are sound for a kernel
+    /// comparison (each operator is compared on the inputs its old kernel saw), and the warm one is
+    /// what a precopy can have: the update is checked before the generation that would serve it has
+    /// served anything.
     fn walk_paired(
         &mut self,
         bucket: Bucket,
