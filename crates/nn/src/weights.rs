@@ -92,6 +92,16 @@ pub enum Quantization {
     NvFp4,
 }
 
+impl Quantization {
+    /// The element type this policy's encoded weights are stored in.
+    pub const fn encoding(self) -> DType {
+        match self {
+            Self::Fp8 | Self::Mxfp8 => DType::F8E4M3,
+            Self::NvFp4 => DType::U8,
+        }
+    }
+}
+
 impl fmt::Display for Quantization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -542,20 +552,58 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
-    /// Borrow this loader for another checkpoint: the same store, the same conversion, a
-    /// different shard set.
+    /// Borrow this loader for another checkpoint: the same store, the same element-type and
+    /// quantization policy, a different shard set.
     ///
-    /// A pipeline's components each keep their own index in their own directory (`transformer/`,
-    /// `vae/`, `text_encoder/`), so a model crate opens one [`Checkpoint`] per component and reads
-    /// each through one loader. Retained storage stays the loader's, so a weight converted once for
+    /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
+    /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
+    /// opens the root once and reads every component through one store: a weight converted once for
     /// one component is reused for another and never converted twice (specs/worker.md 8).
-    pub fn for_checkpoint<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> WeightLoader<'b> {
-        WeightLoader {
+    ///
+    /// The policy is the loader's, not the component's, so a component that its policy does not
+    /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
+    /// a component whose weights are an FP8 or NVFP4 encoding, would read weights as something they
+    /// are not, which is a wrong answer rather than a convenience. A model that needs two policies
+    /// builds two loaders over the same store.
+    pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
+        self.check_policy(checkpoint)?;
+        Ok(WeightLoader {
             checkpoint,
             store: self.store,
             dtype: self.dtype,
             quantization: self.quantization,
+        })
+    }
+
+    /// Whether this loader's policy describes `checkpoint`'s weights.
+    fn check_policy(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let held = checkpoint.dtypes();
+        let listed = held
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(quantization) = self.quantization {
+            let encoding = quantization.encoding();
+            if !held.contains(&encoding) {
+                return Err(Error::policy(format!(
+                    "a {quantization} policy encodes weights as {encoding}, and this checkpoint \
+                     holds {listed}"
+                )));
+            }
         }
+        if let Some(dtype) = self.dtype {
+            for encoded in [DType::F8E4M3, DType::F4E2M1] {
+                if held.contains(&encoded) {
+                    return Err(Error::policy(format!(
+                        "this checkpoint holds {encoded} encoded weights, which a {dtype} element \
+                         type does not describe; the quantization is the loader's policy, not its \
+                         element type"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
