@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use executor::blocking::{BlockingKind, LaneLimits, Limits};
-use executor::capacity::{graph_storage_budget_bytes, quota};
+use executor::capacity::{graph_storage_bytes, quota};
 use executor::device::GraphStorage;
 use executor::memory::Memory;
 use executor::plan::{Buckets, Variant};
@@ -210,17 +210,32 @@ impl EpochPlan {
     pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
-        let total = handle.total_memory();
-        let bytes = graph_storage_budget_bytes(i64::try_from(total)?);
+        let storage = handle.memory_info()?;
+        let total = storage.total;
+        // The graph reservation is the design's share of the whole device (4.1), so its base is
+        // the device's total and not what is left of it. One pool is opened here, for the serving
+        // generation: `online-operations.md` states a preparation's cost as a SECOND pool of the
+        // same size, and that reservation belongs to the preparation, not to the epoch's open - a
+        // deployment that never prepares must not pay for a pool no generation uses. A recapture
+        // that finds no room for its second pool is refused by name at the ledger, and §7.3's
+        // `precopy` reports it as the update's failure rather than the rank's.
+        let bytes = capacity::graph_storage_bytes(i64::try_from(total)?, false, false);
         if bytes == 0 {
             bail!("device {} reports no memory to capture graphs in", device.0);
         }
         let scratch = bytes / 8;
-        let budget = quota(total, self.build.mem_fraction_static);
+        // Every pool on this device is booked against `budget`, so `budget` is what the device has
+        // left to give: the epoch's weights are device-resident retained storage, mapped before
+        // this call (4.1), and an allowance drawn from the total would let the graph, scratch and
+        // resident pools map past the device by exactly the model's size. The deployment's
+        // fraction still caps the pools' share of the whole device, and the smaller of the two
+        // rules is the allowance: a deployment that asks for a smaller share gets it, and a device
+        // already holding the weights gets only what remains.
+        let budget = quota(total, self.build.mem_fraction_static).min(storage.free);
         if budget < bytes + scratch {
             bail!(
-                "device {} grants {budget} bytes at mem_fraction_static {}, less than the graph and \
-                 scratch reservation of {}",
+                "device {} has {budget} bytes left of {total} once the model is mapped, at \
+                 mem_fraction_static {}, less than the graph and scratch reservation of {}",
                 device.0,
                 self.build.mem_fraction_static,
                 bytes + scratch
