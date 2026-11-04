@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::http::header;
+use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Json, Router};
@@ -41,6 +44,7 @@ use crate::input::chat::{
     ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
 };
 use crate::input::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
+use crate::http::handoff::Handoff;
 use crate::leader::Leader;
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
@@ -62,9 +66,15 @@ use crate::output::tools;
 use crate::output::{FinishReason, RequestOutput, StopReason};
 
 /// The chat completions route.
-pub(crate) fn router(engine: Arc<Leader>) -> Router {
+///
+/// `handoff` is the registry a hot restart pauses the responses in flight
+/// through: every streamed response registers with it before it starts, so
+/// the process that hands the deployment over freezes it at an engine event
+/// boundary and the successor goes on writing it (design §7.5.1).
+pub(crate) fn router(engine: Arc<Leader>, handoff: Arc<Handoff>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(Extension(handoff))
         .with_state(engine)
 }
 
@@ -76,6 +86,7 @@ pub(crate) fn router(engine: Arc<Leader>) -> Router {
 /// stream has started are reported inside the stream.
 async fn chat_completions(
     State(engine): State<Arc<Leader>>,
+    Extension(handoff): Extension<Arc<crate::http::handoff::Handoff>>,
     Extension(RequestId(base_id)): Extension<RequestId>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
@@ -103,26 +114,79 @@ async fn chat_completions(
     // One timestamp for the whole response, shared by every streamed chunk.
     let created = crate::openai::unix_time();
 
-    let serve_stream = match engine
-        .generate(request)
-        .instrument(request_span.clone())
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-
     if stream {
-        let chunk_stream = chat_completion_chunk_stream(serve_stream, response, created);
-        let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
-
-        // Emit periodic SSE keep-alive comments so long prefills (no chunks
-        // yet) do not get torn down by idle-timeout proxies between client
-        // and server.
-        Sse::new(sse_stream)
-            .keep_alive(KeepAlive::default())
-            .into_response()
+        let (events, output, compile_us, outcome) = match engine
+            .generate_handed(request)
+            .instrument(request_span.clone())
+            .await
+        {
+            Ok(parts) => parts,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+        let crate::output::OutputParams {
+            tokenizer,
+            prompt_token_ids,
+            decode,
+            prompt_logprobs,
+            logprobs,
+            processor,
+        } = output;
+        let request_id = response.request_id.clone();
+        let inputs = crate::output::run::ChatOutputInputs {
+            tokenizer,
+            prompt_token_ids,
+            decode,
+            prompt_logprobs,
+            logprobs,
+            processor,
+            context: response,
+        };
+        let run = match crate::output::run::GenerationRun::new(
+            request_id.clone(),
+            compile_us,
+            inputs,
+            events,
+            outcome,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                return ApiError::from(crate::output::OutputError {
+                    request_id,
+                    source: error.into(),
+                })
+                .into_response();
+            }
+        };
+        // The response registers before it writes a frame, so a hot restart
+        // pauses it at its next engine event boundary (design §7.5.1).
+        let registration = handoff.register();
+        let stream = crate::http::stream::ResponseStream::start(Box::new(run), true);
+        let Some(body) = crate::http::stream::HandedBody::new(
+            stream,
+            Some(registration),
+            request_id.clone(),
+        ) else {
+            return ApiError::server_error("the response cannot be handed over".to_string())
+                .into_response();
+        };
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        crate::http::stream::attach(&mut response, body);
+        response
     } else {
+        let serve_stream = match engine
+            .generate(request)
+            .instrument(request_span.clone())
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
         match collect_chat_completion(serve_stream, response, created)
             .instrument(request_span)
             .await
