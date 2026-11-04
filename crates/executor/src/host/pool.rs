@@ -51,6 +51,22 @@ pub struct HostTask<A: HostAction> {
 }
 
 impl<A: HostAction> HostTask<A> {
+    /// The task's outcome, once it ended.
+    pub fn outcome(&self) -> Option<Outcome<Arc<A::Output>>> {
+        self.completion.outcome()
+    }
+
+    /// Waits for the task's outcome.
+    pub fn wait(&self) -> Outcome<Arc<A::Output>> {
+        self.completion.wait()
+    }
+
+    /// Waits at most `timeout` for the task's outcome; `Duration::ZERO` is a
+    /// poll, which is what a serve loop does between batches.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> Option<Outcome<Arc<A::Output>>> {
+        self.completion.wait_timeout(timeout)
+    }
+
     fn state(&self) -> MutexGuard<'_, TaskState<A>> {
         lock(&self.state)
     }

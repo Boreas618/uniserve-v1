@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::host::{HostAction, HostPool};
+use crate::host::{HostAction, HostPool, Lane};
 use crate::{Error, Result, lock};
 
 /// The four kinds of blocking host work of §2.4.
@@ -90,12 +90,12 @@ impl Limits {
 }
 
 /// What the pool keeps of a lane, with its action type erased.
-trait Lane: Send + Sync {
+trait LaneHandle: Send + Sync {
     fn abort(&self);
     fn close(&self) -> Vec<Error>;
 }
 
-impl<A: HostAction> Lane for HostPool<A> {
+impl<A: HostAction> LaneHandle for HostPool<A> {
     fn abort(&self) {
         HostPool::abort(self);
     }
@@ -109,7 +109,7 @@ impl<A: HostAction> Lane for HostPool<A> {
 /// orderly end.
 pub struct ThreadPool {
     limits: Limits,
-    lanes: Mutex<Vec<(BlockingKind, Arc<dyn Lane>)>>,
+    lanes: Mutex<Vec<(BlockingKind, Arc<dyn LaneHandle>)>>,
 }
 
 impl ThreadPool {
@@ -121,9 +121,12 @@ impl ThreadPool {
         }
     }
 
-    /// Creates `kind`'s lane and returns the pool its owner admits work on.
-    /// One lane per kind: the second creation of a kind is refused.
-    pub fn lane<A: HostAction>(&self, kind: BlockingKind) -> Result<Arc<HostPool<A>>> {
+    /// Creates `kind`'s lane and returns it, ready to admit work.
+    ///
+    /// The lane is the caller's whole surface: `admit` queues an action and
+    /// hands back the task whose outcome it waits on. One lane per kind: the
+    /// second creation of a kind is refused.
+    pub fn lane<A: HostAction>(&self, kind: BlockingKind) -> Result<Lane<A>> {
         let limits = self.limits.of(kind);
         let pool = Arc::new(HostPool::new(
             limits.capacity,
@@ -138,10 +141,10 @@ impl ThreadPool {
                     kind.as_str()
                 )));
             }
-            let erased: Arc<dyn Lane> = Arc::clone(&pool) as Arc<dyn Lane>;
+            let erased: Arc<dyn LaneHandle> = Arc::clone(&pool) as Arc<dyn LaneHandle>;
             lanes.push((kind, erased));
         }
-        Ok(pool)
+        Ok(Lane::new(pool))
     }
 
     /// The kinds whose lane exists.
