@@ -394,18 +394,27 @@ mod tests {
 
         // Block `k` holds `k * 10 + j` at byte `j`, so a swap is visible byte by byte.
         let mut fill = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        // SAFETY: the pinned buffer is the only writer of these bytes and holds
+        // `blocks` of them, which is the whole field.
         for (index, byte) in unsafe { fill.as_mut_slice() }.iter_mut().enumerate() {
             *byte = u8::try_from(index / WIDTH * 10 + index % WIDTH).expect("a byte");
         }
+        // SAFETY: both ranges are the same `blocks` bytes, in buffers of their
+        // own, and the copy is ordered on `stream`.
         unsafe { memcpy_async(field.address(), fill.address(), blocks, &stream) }
             .expect("fill the field");
         // Page A reads blocks 3 and 4; page B writes block 4 and then block 3.
         for (buffer, cells) in [(&read, [3i64, 4]), (&write, [4i64, 3])] {
             let mut stage = PinnedBuffer::new(DEVICE, 16).expect("staging");
+            // SAFETY: the staging buffer holds 16 bytes and the two cells below
+            // fill exactly them.
             let bytes = unsafe { stage.as_mut_slice() };
             for (index, cell) in cells.iter().enumerate() {
                 bytes[index * 8..index * 8 + 8].copy_from_slice(&cell.to_ne_bytes());
             }
+            // SAFETY: the cell buffer holds these two `i64` indices and the
+            // staging buffer holds their 16 bytes; the copy is ordered on
+            // `stream`, so the launch below reads them after it.
             unsafe { memcpy_async(buffer.address(), stage.address(), 16, &stream) }
                 .expect("write the cells");
         }
@@ -415,9 +424,9 @@ mod tests {
             let mut rows = 2i32;
             let mut width = WIDTH as i32;
             let mut arguments: [*mut std::ffi::c_void; 5] = [
-                (destination as u64 as *mut std::ffi::c_void),
-                (cells as u64 as *mut std::ffi::c_void),
-                (source as u64 as *mut std::ffi::c_void),
+                (destination as *mut std::ffi::c_void),
+                (cells as *mut std::ffi::c_void),
+                (source as *mut std::ffi::c_void),
                 (&raw mut rows).cast(),
                 (&raw mut width).cast(),
             ];
@@ -445,10 +454,15 @@ mod tests {
         );
         stream.synchronize().expect("order the copies");
 
-        let mut back = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        let back = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        // SAFETY: the read-back buffer holds `blocks` bytes and the field holds
+        // the same, on one device; the copy is ordered on `stream` after both
+        // launches.
         unsafe { memcpy_async(back.address(), field.address(), blocks, &stream) }
             .expect("read the field back");
         stream.synchronize().expect("synchronize");
+        // SAFETY: the staging copy above has completed (`synchronize` below the
+        // launches) and nothing writes these bytes while they are read.
         let bytes = unsafe { back.as_slice() };
         let block = |index: usize| bytes[index * WIDTH..(index + 1) * WIDTH].to_vec();
         let pattern = |index: usize| -> Vec<u8> {
