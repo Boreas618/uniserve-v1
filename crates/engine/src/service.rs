@@ -197,6 +197,10 @@ impl Routing {
 
     /// The state a policy is instantiated with, as the first live scheduler
     /// holds it and with the ranks the control thread knows (§7.3).
+    ///
+    /// `None` when no scheduler is alive or none answered in time: the caller
+    /// decides whether that fails the operation, and a hollow state is never
+    /// used in its place.
     fn policy_state(&self, ranks: &[RankView]) -> Option<TrialState> {
         self.slots
             .iter()
@@ -278,9 +282,9 @@ impl Routing {
     /// §7.3 step 2 on the control thread: prepares the route instance of
     /// `program` on the state the schedulers hold, without putting it in.
     ///
-    /// The first epoch's precopy has no scheduler state to prepare on — no
-    /// scheduler serves before its first switchover — so it prepares on the
-    /// state of an epoch that holds nothing yet.
+    /// The state is the mechanism's rather than a serving policy's, so an
+    /// epoch's first precopy prepares on the state the schedulers hold before
+    /// any policy serves.
     fn precopy_route(
         &self,
         source: &dyn PolicySource,
@@ -289,7 +293,12 @@ impl Routing {
         let engine = crate::scheduler::process_engine().map_err(|error| error.to_string())?;
         let ceilings = self.ceilings();
         let ranks = self.ranks();
-        let state = self.policy_state(&ranks).unwrap_or_default();
+        let Some(state) = self.policy_state(&ranks) else {
+            return Err(
+                "no live scheduler answered the state the route policy is instantiated on"
+                    .to_owned(),
+            );
+        };
         let candidate =
             RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)
                 .map_err(|error| error.to_string())?;
