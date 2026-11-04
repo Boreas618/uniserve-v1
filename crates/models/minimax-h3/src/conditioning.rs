@@ -207,11 +207,7 @@ impl RefinerBlock {
 
     /// The query, key and value the attention reads: `[rows, local_heads, head_dim]` over the whole
     /// sequence.
-    fn exchange<'a>(
-        &self,
-        f: &Forward,
-        rows: &'a Rows,
-    ) -> Result<(TensorView, TensorView, TensorView)> {
+    fn exchange(&self, f: &Forward, rows: &Rows) -> Result<(TensorView, TensorView, TensorView)> {
         match &self.exchange {
             None => Ok((rows.query_normed, rows.key_normed, rows.value)),
             Some(exchange) => {
@@ -228,7 +224,7 @@ impl RefinerBlock {
     }
 
     /// Put the attended head shards back together into this rank's rows.
-    fn gather<'a>(&self, f: &Forward, attended: TensorView, rows: &'a Rows) -> Result<TensorView> {
+    fn gather(&self, f: &Forward, attended: TensorView, rows: &Rows) -> Result<TensorView> {
         match &self.exchange {
             None => Ok(attended),
             Some(exchange) => {
