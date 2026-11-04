@@ -868,12 +868,277 @@ mod nvfp4_tests {
         );
     }
 
+    fn route_descriptor() -> RouteGemmNvfp4Descriptor {
+        RouteGemmNvfp4Descriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            dtype: DType::BF16,
+            scale: DType::F8E4M3,
+            layout: ScaleLayout::Swizzled128X4,
+            tile: (128, 128),
+            cluster: (1, 1),
+        }
+    }
+
     #[test]
-    fn a_table_that_does_not_cover_the_packed_field_is_refused() {
-        // 2·intermediate = 1536 elements per expert, 96 blocks of sixteen; the scales must cover
-        // every expert of that, or a launch would read whatever follows the table.
-        let blocks = (2 * 768u64).div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
-        assert_eq!(blocks, 96);
-        assert_eq!(128 * blocks, 12288);
+    fn fc2_mirrors_fc1_without_an_activation() {
+        // FC1 applies the gated product inside its launch; FC2 only contracts, so the activation is
+        // not in its descriptor and the key says so by not naming one.
+        let key = route_descriptor().to_string();
+        assert!(key.starts_with("hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16"));
+        assert!(!key.contains("activation"));
+        // The bound is the dense FC2's: contraction at `intermediate`, FP32 accumulation.
+        let dense = RouteGemmDescriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            dtype: DType::BF16,
+            tile: (128, 128),
+            cluster: (1, 1),
+        };
+        assert_eq!(
+            RouteGemmNvfp4::tolerance(&route_descriptor()),
+            RouteGemm::tolerance(&dense)
+        );
+    }
+
+    #[test]
+    fn the_scale_table_covers_the_contraction_in_blocks_of_sixteen() {
+        // The scales are one per sixteen elements *along the contraction*, one row per output row:
+        // 2048/16 = 128 blocks for each of the 1536 rows of one expert's fused stack, times 128
+        // experts. A table that covers less is a checkpoint the loader should have refused.
+        let block_elements = u64::from(crate::fp4::BLOCK_ELEMENTS);
+        let blocks_per_row = 2048u64 / block_elements;
+        assert_eq!(blocks_per_row, 128);
+        assert_eq!(128 * (2 * 768u64) * blocks_per_row, 25_165_824);
+        // The two geometry rules the size of that table rests on: an even contraction (two codes a
+        // byte) and a contraction that is whole scale blocks.
+        assert!(2048u64.is_multiple_of(2) && 2048u64.is_multiple_of(block_elements));
+        assert!(!2815u64.is_multiple_of(2));
+        assert!(!(2816u64 - 8).is_multiple_of(block_elements));
+    }
+}
+
+/// One compilation of `route_gemm_nvfp4`.
+///
+/// FC2 of an encoded expert block: the same descriptor as `gather_gemm_nvfp4` less the activation,
+/// because FC1 applies the gated product and FC2 only contracts it. Its contraction is the expert
+/// width, so the packed weights are `[experts, hidden, intermediate/2]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RouteGemmNvfp4Descriptor {
+    /// Hidden elements of a token: FC2's output width.
+    pub hidden: u32,
+    /// Expert width: FC2's contraction length.
+    pub intermediate: u32,
+    /// Experts the weight stacks.
+    pub experts: u32,
+    /// Routes per token.
+    pub top: u32,
+    /// Element type of the rows and of the output; the weights are packed.
+    pub dtype: DType,
+    /// Element type of the block scales.
+    pub scale: DType,
+    /// The block-scale layout the checkpoint uses.
+    pub layout: ScaleLayout,
+    /// The MMA tile the package compiled for: rows by columns.
+    pub tile: (u32, u32),
+    /// The cluster shape the package compiled for: rows by columns.
+    pub cluster: (u32, u32),
+}
+
+impl fmt::Display for RouteGemmNvfp4Descriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("hidden", self.hidden)
+            .field("intermediate", self.intermediate)
+            .field("experts", self.experts)
+            .field("top", self.top)
+            .field("dtype", self.dtype)
+            .field("scale", self.scale)
+            .field("layout", self.layout)
+            .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
+            .field(
+                "cluster",
+                format_args!("{}x{}", self.cluster.0, self.cluster.1),
+            )
+            .finish(formatter)
+    }
+}
+
+/// The arguments of one encoded FC2 launch.
+#[derive(Clone, Copy)]
+pub struct RouteGemmNvfp4Args {
+    /// `[routes, intermediate]` the gated product.
+    pub hidden: TensorView,
+    /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte along the contraction.
+    pub weights: TensorView,
+    /// The block scales, one per sixteen elements of the contraction and one row per output row.
+    pub scales: TensorView,
+    /// `[experts]` f32: the reciprocal of each expert's tensor scale.
+    pub global_scale: TensorView,
+    /// `[routes]` i32: the expert each row belongs to.
+    pub ids: TensorView,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: TensorView,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: TensorView,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: TensorView,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: TensorView,
+    /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
+    /// `moe_unpermute`, not here.
+    pub out: TensorView,
+}
+
+/// FC2 of an encoded, block-scaled expert block.
+pub struct RouteGemmNvfp4;
+
+impl Op for RouteGemmNvfp4 {
+    const NAME: &'static str = "route_gemm_nvfp4";
+
+    type Descriptor = RouteGemmNvfp4Descriptor;
+    type Args<'a> = RouteGemmNvfp4Args;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let experts = u64::from(descriptor.experts);
+        let routes = args.out.rows();
+
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[routes, intermediate]))?;
+        args.hidden
+            .require_row(Self::NAME, descriptor.dtype, intermediate)?;
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
+        args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // The contraction is this operator's packed axis, and it must be even and whole scale blocks
+        // for the same reason FC1's is: two codes share a byte, and a partial block has no scale.
+        if !intermediate.is_multiple_of(2) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("a contraction of {intermediate} is odd, and two E2M1 codes share a byte"),
+            ));
+        }
+        let block_elements = u64::from(crate::fp4::BLOCK_ELEMENTS);
+        if !intermediate.is_multiple_of(block_elements) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a contraction of {intermediate} is not whole {block_elements}-element scale \
+                     blocks"
+                ),
+            ));
+        }
+        args.weights
+            .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate / 2]))?;
+        if args.weights.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the packed E2M1 field as u8, found {}",
+                    args.weights.dtype
+                ),
+            ));
+        }
+        if args.scales.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} block scales, found {}",
+                    descriptor.scale, args.scales.dtype
+                ),
+            ));
+        }
+        let blocks_per_row = intermediate / block_elements;
+        let covered: u64 = args.scales.shape.dims().iter().product();
+        if covered < experts * hidden * blocks_per_row {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} block scales do not cover {experts} experts of {hidden} rows by \
+                     {blocks_per_row} blocks"
+                ),
+            ));
+        }
+        args.global_scale
+            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+        if args.global_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected f32 tensor scales, found {}",
+                    args.global_scale.dtype
+                ),
+            ));
+        }
+        for (name, view) in [
+            ("ids", args.ids),
+            ("permuted_to_expanded", args.permuted_to_expanded),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[routes]))?;
+            if view.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected i32 {name}, found {}", view.dtype),
+                ));
+            }
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.hidden)
+            .view(args.weights)
+            .view(args.scales)
+            .view(args.global_scale)
+            .view(args.ids)
+            .view(args.tile_to_expert)
+            .view(args.tile_to_limit)
+            .view(args.permuted_to_expanded)
+            .view(args.num_non_exiting_tiles)
+            .view(args.out)
+            .u32(descriptor.hidden)
+            .u32(descriptor.intermediate)
+            .u32(descriptor.experts)
+            .u32(descriptor.top)
+            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
+            .u32(descriptor.tile.0)
+            .u32(descriptor.tile.1)
+            .u32(descriptor.cluster.0)
+            .u32(descriptor.cluster.1);
+        let tiles = args.num_non_exiting_tiles.rows().max(1);
+        kernel.launch(
+            LaunchGrid::new([tiles, hidden.div_ceil(u64::from(descriptor.tile.1)), 1])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        RouteGemmNvfp4Args {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The contraction is the expert width, accumulated in FP32, and the packed weights are the
+        // reference's own operands: the bound is the dense `route_gemm`'s.
+        let reduction = u64::from(descriptor.intermediate);
+        let accumulate = DType::F32;
+        let gamma = crate::tolerance::gamma(reduction, accumulate);
+        let atol =
+            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+        Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }
