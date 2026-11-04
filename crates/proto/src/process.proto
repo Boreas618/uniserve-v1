@@ -327,6 +327,8 @@ enum PhaseKind {
   PHASE_KIND_UNSPECIFIED = 0;
   PHASE_KIND_PREFILL = 1;
   PHASE_KIND_DECODE = 2;
+  PHASE_KIND_ENCODE = 3;
+  PHASE_KIND_DENOISE = 4;
 }
 
 // One operator's kernel program, or one phase's of it: the epoch record's
@@ -482,7 +484,9 @@ message Precopied {
 // set, no previous policy module is left and the daemon treats it as the
 // main process's failure (§7.3).
 message PolicyReverted {
-  uint32 scheduler = 1;
+  // The scheduler thread whose policy call failed; absent for the route
+  // instance the engine's control thread runs.
+  optional uint32 scheduler = 1;
   string backend = 2;
   uint32 revision = 3;
   string reason = 4;
