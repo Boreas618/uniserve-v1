@@ -65,11 +65,15 @@ impl Sparse {
         let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
         let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
         let frequencies = frequencies(loader, config, rotated)?;
+        // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
+        // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
+        // named the global count would refuse its own query view at any degree above one.
+        let local_heads = partition.denoiser_heads(config.num_attention_heads);
         let rotary = Rotary::new(
             frequencies,
             config.head_dim,
-            config.num_attention_heads,
-            config.num_attention_heads,
+            local_heads,
+            local_heads,
             config.qk_norm_eps,
             Rotation::Half,
             1.0,
