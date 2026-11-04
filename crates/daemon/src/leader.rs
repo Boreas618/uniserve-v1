@@ -1354,6 +1354,18 @@ impl Leader {
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
         let current = self.serving_config()?;
+        // One update at a time (§7.2, §7.4): an epoch switch and a program
+        // update are each the deployment's one update, and the program
+        // layer's callers reach this method directly as well as through the
+        // entry, so the check lives here.
+        if let Some(update) = crate::updates::in_flight(
+            self.updates.running(),
+            self.epochs().program_update().is_some(),
+        ) {
+            return Err(UpdateError::Refused(format!(
+                "another update is in flight: {update}"
+            )));
+        }
         let Some(update) = self.route(&current, target, false).await? else {
             return Ok(None);
         };
