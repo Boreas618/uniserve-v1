@@ -45,6 +45,11 @@ struct Chunk {
     block: Option<Arc<Block>>,
     /// The chunk's contents while suspended.
     saved: Option<PinnedBuffer>,
+    /// What the chunk's device and peers may do with it now. A block is given
+    /// out read-write; a holder may park it read-only with
+    /// [`VirtualPool::protect`], and the pool puts it back before handing it to
+    /// the next holder.
+    protection: Protection,
     free: bool,
 }
 
@@ -169,7 +174,7 @@ impl VirtualPool {
     pub fn mapped_bytes(&self) -> usize {
         self.chunks
             .iter()
-            .filter(|chunk| chunk.block.is_some())
+            .filter(|chunk| chunk.block.as_ref().is_some_and(|block| block.is_mapped()))
             .map(|chunk| chunk.bytes)
             .sum()
     }
@@ -212,12 +217,23 @@ impl VirtualPool {
             return Err(Error::invalid("a suspended pool gives out no storage"));
         }
         let bytes = bytes.max(1).next_multiple_of(self.granularity);
-        if let Some(chunk) = self
+        if let Some(index) = self
             .chunks
-            .iter_mut()
-            .find(|chunk| chunk.free && chunk.bytes == bytes)
+            .iter()
+            .position(|chunk| chunk.free && chunk.bytes == bytes)
         {
-            chunk.free = false;
+            // A block is a block from the pool's point of view: the next holder
+            // gets it read-write whatever the last one asked the device for.
+            // A read-only block handed on would fault the new holder's first
+            // write, and a device fault is a sticky error that kills the
+            // process rather than failing the call.
+            if self.chunks[index].protection != Protection::ReadWrite {
+                let offset = self.chunks[index].offset;
+                self.set_access(offset, bytes, Protection::ReadWrite)?;
+                self.chunks[index].protection = Protection::ReadWrite;
+            }
+            self.chunks[index].free = false;
+            let chunk = &self.chunks[index];
             let block = chunk
                 .block
                 .clone()
@@ -231,13 +247,20 @@ impl VirtualPool {
             )));
         }
         let offset = self.used as u64;
-        let block = self.map(offset, bytes)?;
+        let handle = self.map_handle(offset, bytes)?;
         self.used += bytes;
+        let block = Arc::new(Block::new(
+            handle,
+            bytes,
+            self.handle_type,
+            self.context.clone(),
+        ));
         self.chunks.push(Chunk {
             offset,
             bytes,
             block: Some(Arc::clone(&block)),
             saved: None,
+            protection: Protection::ReadWrite,
             free: false,
         });
         Ok((self.address + offset, block))
@@ -268,7 +291,7 @@ impl VirtualPool {
     /// `address`, at its unchanged address (`cuMemSetAccess`): a parked
     /// standby's blocks become read-only and become read-write again when it
     /// is promoted, and a captured graph that addresses them stays valid.
-    pub(crate) fn protect(&self, address: u64, protection: Protection) -> Result<()> {
+    pub(crate) fn protect(&mut self, address: u64, protection: Protection) -> Result<()> {
         let Some(chunk) = self
             .chunks
             .iter()
@@ -279,12 +302,27 @@ impl VirtualPool {
                 self.device
             )));
         };
-        if chunk.block.is_none() {
+        if !chunk.block.as_ref().is_some_and(|block| block.is_mapped()) {
             return Err(Error::invalid(
                 "a suspended pool's block has no storage to change the access of",
             ));
         }
-        let bytes = chunk.bytes;
+        let (offset, bytes) = (chunk.offset, chunk.bytes);
+        self.set_access(offset, bytes, protection)?;
+        if let Some(chunk) = self
+            .chunks
+            .iter_mut()
+            .find(|chunk| self.address + chunk.offset == address)
+        {
+            chunk.protection = protection;
+        }
+        Ok(())
+    }
+
+    /// What the pool's device and its peers may do with the chunk at `offset`
+    /// (`cuMemSetAccess`), at its unchanged address.
+    fn set_access(&self, offset: u64, bytes: usize, protection: Protection) -> Result<()> {
+        let address = self.address + offset;
         let access: Vec<MemAccessDesc> = self
             .access
             .iter()
@@ -309,7 +347,7 @@ impl VirtualPool {
     /// Creates `bytes` of physical storage and maps it at `offset`, readable
     /// and writable by the pool's device and its peers, booking it against the
     /// pool's budget first when the pool has one. Returns the block.
-    fn map(&self, offset: u64, bytes: usize) -> Result<Arc<Block>> {
+    fn map_handle(&self, offset: u64, bytes: usize) -> Result<u64> {
         if let Some(booking) = &self.booking {
             let total = self.mapped_bytes() as u64 + bytes as u64;
             // The booking comes first: a refusal must leave nothing mapped.
@@ -363,12 +401,7 @@ impl VirtualPool {
         });
 
         match mapped {
-            Ok(handle) => Ok(Arc::new(Block::new(
-                handle,
-                bytes,
-                self.handle_type,
-                self.context.clone(),
-            ))),
+            Ok(handle) => Ok(handle),
             Err(error) => {
                 // Nothing stayed mapped, so the pool's total is what it was
                 // before the booking; restoring it must not mask the failure.
@@ -388,6 +421,12 @@ impl VirtualPool {
     /// caller has drained all work that reads or writes the pool and starts
     /// none until [`Self::restore`]. Suspending a suspended pool does
     /// nothing.
+    ///
+    /// A caller that exported a chunk with `Buffer::export` drains whoever
+    /// imported it first: the importer holds its own reference to the storage
+    /// this call releases, so its mapping outlives the suspension and keeps the
+    /// contents the copy took — while [`Self::restore`] maps new storage at the
+    /// same address, which the importer's mapping is not.
     ///
     /// # Errors
     ///
@@ -426,7 +465,12 @@ impl VirtualPool {
                 // SAFETY: the handle is this pool's reference.
                 driver.check(unsafe { (driver.mem_release)(block.raw()) }, "cuMemRelease")
             })?;
-            self.chunks[index].block = None;
+            // The block stays with the chunk: a buffer handed out before the
+            // suspension still holds it, and its address and contents are what
+            // the restore brings back. Only its handle goes.
+            if let Some(block) = &self.chunks[index].block {
+                block.unmap();
+            }
             self.chunks[index].saved = Some(saved);
             // The device maps this storage no longer, so its budget must stop
             // counting it: an over-count would refuse an allocation that fits.
@@ -454,18 +498,36 @@ impl VirtualPool {
         let mut mapped: Vec<usize> = Vec::new();
         let mut failure: Option<Error> = None;
         for index in 0..self.chunks.len() {
-            if self.chunks[index].block.is_some() {
+            if self.chunks[index]
+                .block
+                .as_ref()
+                .is_some_and(|block| block.is_mapped())
+            {
                 continue;
             }
             let (offset, bytes) = (self.chunks[index].offset, self.chunks[index].bytes);
-            let block = match self.map(offset, bytes) {
-                Ok(block) => block,
+            let handle = match self.map_handle(offset, bytes) {
+                Ok(handle) => handle,
                 Err(error) => {
                     failure = Some(error);
                     break;
                 }
             };
-            self.chunks[index].block = Some(block);
+            // The chunk keeps the block it had, so every buffer handed out
+            // before the suspension names the storage this restore created.
+            self.chunks[index].protection = Protection::ReadWrite;
+            match self.chunks[index].block.clone() {
+                Some(block) => block.remap(handle),
+                None => {
+                    self.chunks[index].block = Some(Arc::new(Block::new(
+                        handle,
+                        bytes,
+                        self.handle_type,
+                        self.context.clone(),
+                    )));
+                    self.chunks[index].protection = Protection::ReadWrite;
+                }
+            }
             mapped.push(index);
             let Some(saved) = self.chunks[index].saved.as_ref() else {
                 continue;
@@ -510,10 +572,16 @@ impl VirtualPool {
 
     /// Releases the chunk `index` this pool mapped, keeping its saved contents
     /// and the booked total true to what the pool maps.
+    /// Releases the storage of the chunk at `index` and keeps the block: a
+    /// buffer handed out before may still hold it, and a pool that was rolled
+    /// back out of a restore may be restored again into the same block.
     fn release_chunk(&mut self, index: usize) -> Result<()> {
-        let Some(block) = self.chunks[index].block.take() else {
+        let Some(block) = self.chunks[index].block.clone() else {
             return Ok(());
         };
+        if !block.is_mapped() {
+            return Ok(());
+        }
         let address = self.address + self.chunks[index].offset;
         let bytes = self.chunks[index].bytes;
         in_context(self.context.raw(), |driver| {
@@ -529,6 +597,7 @@ impl VirtualPool {
                 "cuMemRelease",
             )
         })?;
+        block.unmap();
         self.rebook();
         Ok(())
     }
@@ -547,10 +616,11 @@ impl Drop for VirtualPool {
             .chunks
             .iter()
             .filter_map(|chunk| {
-                chunk
-                    .block
-                    .as_ref()
-                    .map(|block| (address + chunk.offset, chunk.bytes, block.raw()))
+                chunk.block.as_ref().and_then(|block| {
+                    block
+                        .is_mapped()
+                        .then(|| (address + chunk.offset, chunk.bytes, block.raw()))
+                })
             })
             .collect();
         // The owner destroyed every graph that addresses the pool and
