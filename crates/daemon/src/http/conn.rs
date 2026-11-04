@@ -1110,8 +1110,9 @@ impl RequestBody {
                         wake(&mut shared);
                         return Ok(fed);
                     }
-                    let take = usize::try_from((*remaining).min(room as u64).min(buffer.len() as u64))
-                        .unwrap_or(usize::MAX);
+                    let take =
+                        usize::try_from((*remaining).min(room as u64).min(buffer.len() as u64))
+                            .unwrap_or(usize::MAX);
                     if take == 0 {
                         wake(&mut shared);
                         return Ok(fed);
@@ -1339,8 +1340,11 @@ mod tests {
         /// rather than hanging.
         async fn fill(&mut self) -> usize {
             let mut chunk = [0_u8; 8192];
-            match tokio::time::timeout(std::time::Duration::from_secs(5), self.stream.read(&mut chunk))
-                .await
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.stream.read(&mut chunk),
+            )
+            .await
             {
                 Ok(Ok(read)) => {
                     self.buffered.extend_from_slice(&chunk[..read]);
@@ -1389,11 +1393,16 @@ mod tests {
                             self.buffered.drain(..end + 2);
                             break line;
                         }
-                        assert!(self.fill().await > 0, "the connection closed inside a chunk");
+                        assert!(
+                            self.fill().await > 0,
+                            "the connection closed inside a chunk"
+                        );
                     };
-                    let size =
-                        usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16)
-                            .expect("a chunk size");
+                    let size = usize::from_str_radix(
+                        size.split(';').next().unwrap_or_default().trim(),
+                        16,
+                    )
+                    .expect("a chunk size");
                     if size == 0 {
                         // The trailer section ends with an empty line, which
                         // is the last CRLF of the message.
@@ -1441,10 +1450,7 @@ mod tests {
     fn app() -> Router {
         Router::new()
             .route("/hello", get(|| async { "hello" }))
-            .route(
-                "/echo",
-                post(|body: axum::body::Bytes| async move { body }),
-            )
+            .route("/echo", post(|body: axum::body::Bytes| async move { body }))
     }
 
     /// Serves `app` on a socket pair and returns the client side.
@@ -1477,7 +1483,9 @@ mod tests {
         );
 
         // The same connection serves a second request.
-        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /hello HTTP/1.1", "").as_bytes())
+            .await;
         let second = client.read_response().await;
         assert_eq!(second.body, "hello");
     }
@@ -1513,14 +1521,18 @@ mod tests {
     #[tokio::test]
     async fn a_head_request_answers_without_a_body() {
         let mut client = serve_on_pair(app());
-        client.send(head("HEAD /hello HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("HEAD /hello HTTP/1.1", "").as_bytes())
+            .await;
         // The HEAD response carries the GET's headers and no body; the next
         // request on the connection proves the framing did not consume it.
         let answered = client.read_head().await;
         assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
         assert!(answered.contains("Content-Length: 5"), "{answered}");
 
-        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /hello HTTP/1.1", "").as_bytes())
+            .await;
         let second = client.read_response().await;
         assert_eq!(second.body, "hello");
     }
@@ -1762,7 +1774,9 @@ mod tests {
             "handoff-stream-1",
             pair,
         );
-        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
         frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
         tokio::task::yield_now().await;
 
@@ -1802,7 +1816,9 @@ mod tests {
             "handoff-stream-2",
             pair,
         );
-        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
         frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
         tokio::task::yield_now().await;
 
@@ -1817,7 +1833,10 @@ mod tests {
 
         let raw = client.read_to_end().await;
         assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
-        assert!(!raw.contains("data: b"), "nothing follows the boundary: {raw}");
+        assert!(
+            !raw.contains("data: b"),
+            "nothing follows the boundary: {raw}"
+        );
         assert!(
             !raw.ends_with("0\r\n\r\n"),
             "the body was not terminated here: {raw}"
@@ -1874,7 +1893,9 @@ mod tests {
         assert_eq!(response.body, "data: a\n\ndata: b\n\ndata: c\n\n");
 
         // The connection is kept alive and the successor serves on it.
-        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /hello HTTP/1.1", "").as_bytes())
+            .await;
         let next = client.read_response().await;
         assert_eq!(next.body, "hello");
         drop(client);
@@ -1898,11 +1919,17 @@ mod tests {
             pair,
             false,
         );
-        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
         frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
         // Pause only once the frame reached the socket: what this process
         // wrote before the boundary stays written.
-        while !client.buffered.windows(7).any(|window| window == b"data: a") {
+        while !client
+            .buffered
+            .windows(7)
+            .any(|window| window == b"data: a")
+        {
             client.fill().await;
         }
 
@@ -1939,7 +1966,9 @@ mod tests {
             "handoff-stream-3",
             small_buffered_pair,
         );
-        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
         // Far more than these socket buffers take, and the client reads none
         // of it.
         let big = Bytes::from(vec![b'x'; 1 << 20]);
