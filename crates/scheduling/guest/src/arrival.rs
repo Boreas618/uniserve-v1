@@ -173,7 +173,13 @@ impl<K: Order> Arrival<K> {
         if self.has_readout() {
             return Pass::Token;
         }
-        let prefill_ready = self.has_work_of_class(PhaseClass::Context);
+        // A refill is a prefill-class chunk: a step whose only prefill work is
+        // a refill's is a prefill step, as today's `select_batch_kind` has it.
+        let prefill_ready = self.has_work_of_class(PhaseClass::Context)
+            || self
+                .views
+                .values()
+                .any(|view| view.state == RequestState::Resident && self.refill_due(view));
         let window_open = room.inflight.prefill_batches < PREFILL_WINDOW_CREDITS;
         if prefill_ready && window_open {
             return Pass::Prefill;
@@ -222,13 +228,6 @@ impl<K: Order> Arrival<K> {
         if !kind.writes_prefix_cache() {
             return (work_tokens(kind, 0, view.next_tokens), false);
         }
-        if kind == PhaseKind::Refill {
-            // A refill call's work is the gap its draft cache is short, not a
-            // prompt chunk: today's scheduler plans the gap. Zero means the
-            // request waits for its draft cache; it draws on the prefill
-            // budget all the same (D1 gap (b)).
-            return (view.refill_tokens.unwrap_or(0), true);
-        }
         let start = view
             .cached_prefix_tokens
             .saturating_add(view.prefilled_tokens);
@@ -255,15 +254,12 @@ impl<K: Order> Arrival<K> {
     /// do not carry; the policy's parameters replace them, as design §7.7
     /// says they may.
     fn refill_due(&self, view: &RequestView) -> bool {
-        // A refill is plannable only when it is the request's next call: a
-        // decoding request whose draft cache is short is given a
-        // prefill-class refill chunk by the mechanism, and `plan.refill` is
-        // the one decision that names it. A request whose refill call is in
-        // flight has no ready phase, so it cannot be asked for twice.
-        if !view
-            .phase
-            .is_some_and(|phase| self.phases.kind(phase) == PhaseKind::Refill)
-        {
+        // A request with a call in flight is not a candidate (today's
+        // `can_schedule_next`). A refill is prefill work of the step that
+        // names it, and `plan.refill` is the one decision that names it; the
+        // request's phase stays the one it will serve next, so no phase kind
+        // is asked for here.
+        if view.phase.is_none() {
             return false;
         }
         let Some(tokens) = view.refill_tokens else {
@@ -483,6 +479,10 @@ impl<K: Order> Policy for Arrival<K> {
                     .is_some_and(|view| view.reservation_units > room.capacity_units)
             })
             .collect();
+        // The step's kind, decided before the plan is built: a refill is named
+        // as the step's prefill work only when the step is not a token step
+        // (today's `pass_kind != Some(BatchKind::Decode)`).
+        let pass = self.pass(room);
         let mut plan = Plan {
             // Every other queued request, in order. The mechanism admits them
             // until the first it cannot place, which is the admission
@@ -511,15 +511,17 @@ impl<K: Order> Policy for Arrival<K> {
                 .collect(),
             ..Plan::default()
         };
-        // A draft cache with a gap is refilled, which is prefill work of the
-        // request's next step (`PhaseKind::Refill`).
-        plan.refill = self
-            .admission
-            .iter()
-            .filter(|id| self.views.get(id).is_some_and(|view| self.refill_due(view)))
-            .copied()
-            .collect();
-        let pass = self.pass(room);
+        // A draft cache with a gap is refilled as the step's prefill work. In a
+        // token step the request is planned as its decode instead, which is
+        // what today's `plan_refill` replaces only outside a decode pass.
+        if pass != Pass::Token {
+            plan.refill = self
+                .admission
+                .iter()
+                .filter(|id| self.views.get(id).is_some_and(|view| self.refill_due(view)))
+                .copied()
+                .collect();
+        }
         let shares = Shares::of(room);
         let mut step = Step::new(shares);
         let mut media_path = false;
@@ -527,6 +529,11 @@ impl<K: Order> Policy for Arrival<K> {
         for id in self.assembly_order() {
             if step.shares().full() {
                 break;
+            }
+            // The step's refill is the request's call: planning its decode too
+            // would plan two calls, the second before the one it depends on.
+            if plan.refill.contains(&id) {
+                continue;
             }
             let Some(view) = self.views.get(&id).cloned() else {
                 continue;
@@ -1154,42 +1161,38 @@ mod tests {
     }
 
     #[test]
-    fn a_refill_is_prefill_work() {
-        let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
-        fcfs.instantiate(&Instantiation {
-            parameters: Parameters::default(),
-            state: Snapshot {
-                phases: vec![
-                    PhaseView {
-                        id: PhaseId(0),
-                        kind: PhaseKind::Refill,
-                        block: ComponentId(0),
-                    },
-                    PhaseView {
-                        id: PhaseId(1),
-                        kind: PhaseKind::Decode,
-                        block: ComponentId(0),
-                    },
-                ],
-                ..Snapshot::default()
-            },
-        });
-        let mut refilling = view(1, 0, 0);
-        refilling.phase = Some(PhaseId(0));
-        refilling.prefilled_tokens = 16;
-        refilling.refill_tokens = Some(4);
-        let _ = admit_with_phase(&mut fcfs, refilling, PhaseId(0));
-        let mut decoding = view(2, 0, 1);
-        decoding.phase = Some(PhaseId(1));
+    fn a_refill_is_the_steps_prefill_work() {
+        let mut fcfs = policy();
+        // A decoding request whose draft cache is 4 tokens short, and a plain
+        // decode. No view sits in a refill phase: the refill is a call the
+        // mechanism builds for a request the plan names.
+        let mut short = view(1, 0, 0);
+        short.phase = Some(PhaseId(1));
+        short.prefilled_tokens = 16;
+        short.refill_tokens = Some(4);
+        let _ = admit_with_phase(&mut fcfs, short, PhaseId(1));
+        let decoding = view(2, 0, 1);
         let _ = admit_with_phase(&mut fcfs, decoding, PhaseId(1));
-        // The refill is prefill work, so it is planned in a prefill step and
-        // its call draws on the prefill budget.
+
+        // A refill-due resident is prefill work, so with the window open the
+        // step is a prefill step: it names the refill and plans no work entry
+        // for that request — the refill is its call.
         let plan = fcfs.dispatch(&room(1024, 8));
         assert_eq!(plan.refill, vec![RequestId(1)]);
-        assert_eq!(
-            plan.work.first().map(|work| (work.request, work.tokens)),
-            Some((RequestId(1), 4))
-        );
+        assert!(plan.work.is_empty(), "{:?}", plan.work);
+
+        // Two prefill batches in flight close the window: the step is a token
+        // step, so the refill is not named and both requests decode.
+        let mut closed = room(1024, 8);
+        closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
+        let plan = fcfs.dispatch(&closed);
+        assert!(plan.refill.is_empty());
+        let work: Vec<(u64, u32)> = plan
+            .work
+            .iter()
+            .map(|work| (work.request.0, work.tokens))
+            .collect();
+        assert_eq!(work, vec![(1, 1), (2, 1)]);
     }
 
     #[test]
@@ -1301,6 +1304,9 @@ mod tests {
         let mut closed = room.clone();
         closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
         let plan = fcfs.dispatch(&closed);
+        // A token step plans a refill-due request as its decode, so it names
+        // no refill.
+        assert!(plan.refill.is_empty());
         let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
         assert_eq!(order, vec![21, 22]);
         assert!(plan.work.iter().all(|work| work.tokens == 1));
