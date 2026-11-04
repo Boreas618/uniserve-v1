@@ -483,7 +483,20 @@ impl Op for CacheCopyRegion {
             .view(args.source)
             .view(args.units)
             .u64(args.offset)
-            .u64(args.count);
+            .u64(args.count)
+            // The field's units *per column*. `values` and `initialized` are addressed as
+            // `[column, unit, …]` and the unit ids arrive per page, so a program needs the pool's own
+            // shape to turn (column, unit) into an offset; the views do not carry extents into the
+            // kernel.
+            .u32(u32::try_from(args.values.shape.dim(1)).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the field's {} units per column do not fit a kernel parameter",
+                        args.values.shape.dim(1)
+                    ),
+                )
+            })?);
         // One program per (column, unit slot, token): it writes that column's row of one unit and
         // raises that cell's initialized flag.
         kernel.launch(
