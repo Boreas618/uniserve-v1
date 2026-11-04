@@ -1662,9 +1662,9 @@ mod tests {
     fn four_ranks_split_the_heads_the_intermediate_width_and_the_vocabulary() {
         let config = config();
         let partition = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 4,
             tensor_rank: 2,
+            ..Partition::single()
         };
         let rank = Rank::new(&config, &partition).expect("four ranks");
         assert_eq!(rank.query_heads, 16);
@@ -1688,15 +1688,14 @@ mod tests {
     fn a_degree_that_does_not_split_the_heads_is_refused() {
         let config = config();
         let partition = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 3,
-            tensor_rank: 0,
+            ..Partition::single()
         };
         assert!(Rank::new(&config, &partition).is_err());
         let out_of_range = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 4,
             tensor_rank: 4,
+            ..Partition::single()
         };
         assert!(Rank::new(&config, &out_of_range).is_err());
     }
