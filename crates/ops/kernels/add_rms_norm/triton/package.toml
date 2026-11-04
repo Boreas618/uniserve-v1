@@ -8,7 +8,7 @@ op = "add_rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 packages = []
 

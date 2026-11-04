@@ -14,7 +14,9 @@ packages = []
 
 [module]
 form = "native"
-entry = "uniserve_routing_softmax_topk"
+
+[module.entries]
+launch = "uniserve_routing_softmax_topk"
 
 [source]
 kind = "cuda"

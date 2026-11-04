@@ -8,7 +8,7 @@ op = "commit"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 packages = []
 

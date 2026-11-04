@@ -8,13 +8,15 @@ op = "gather_gemm"
 backend = "cute_dsl"
 
 [toolchain]
-kind = "python"
+kind = "cute_dsl"
 version = "4.6.2"
 packages = [{ name = "cutlass-dsl", version = "4.6.2" }, { name = "flashinfer-python", version = "0.6.18" }]
 
 [module]
 form = "native"
-entry = "uniserve_gather_gemm"
+
+[module.entries]
+launch = "uniserve_gather_gemm"
 
 [source]
 kind = "cute_dsl"
