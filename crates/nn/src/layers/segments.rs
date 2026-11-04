@@ -38,6 +38,8 @@ pub struct VsaTiles {
     rotated: u32,
     norm: bool,
     block_rows: u32,
+    /// The bound on the key tiles one compression reduces over, when the model stated it.
+    max_tiles: u32,
 }
 
 impl VsaTiles {
@@ -66,7 +68,24 @@ impl VsaTiles {
             rotated: 0,
             norm: false,
             block_rows: segments::BLOCK_ROWS,
+            max_tiles: 0,
         })
+    }
+
+    /// The bound on the key tiles a compression reduces over: the deployment's own tile count.
+    ///
+    /// It is not derived here because it is a property of the sequence length the deployment
+    /// serves, not of a tile's geometry, and the tolerance of the compression is written against
+    /// it. A model that never compresses needs nothing; one that does states it once.
+    pub fn with_tile_bound(mut self, tiles: u32) -> Result<Self> {
+        if tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a tile bound of zero leaves the compression nothing to reduce".to_owned(),
+            ));
+        }
+        self.max_tiles = tiles;
+        Ok(self)
     }
 
     /// The default tile of a video sparse attention block.
@@ -333,6 +352,83 @@ impl VsaTiles {
             out: scores,
         };
         f.operate::<segments::VsaScores>(&descriptor, args)
+    }
+
+    /// Each query tile's softmax over the live key tiles weights their pooled values.
+    ///
+    /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous, exactly what [`Self::scores`]
+    /// writes; `values` is `[tiles, heads, width]` FP32, what the pooling writes; `sizes` is
+    /// `[tiles]` i32, each key tile's live rows. A tile of no live rows is masked out of the softmax
+    /// rather than zeroed, because a zeroed pooled value under a live score would still take weight
+    /// and scale the others down.
+    ///
+    /// `out` is `[heads, query tiles, width]` in the attention's own element type — the layout the
+    /// gate step reads, and one row per (head, query tile) rather than one per row, because every
+    /// row of a query tile compresses to the same vector.
+    pub fn compress(
+        &self,
+        f: &Forward,
+        scores: TensorView,
+        values: TensorView,
+        sizes: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if self.max_tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a compression needs the deployment's key-tile bound: call with_tile_bound"
+                    .to_owned(),
+            ));
+        }
+        if scores.shape.rank() != 3 || values.shape.rank() != 3 {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the scores are [heads, query tiles, tiles] and the values [tiles, heads, \
+                     width], not {:?} and {:?}",
+                    scores.shape.dims(),
+                    values.shape.dims()
+                ),
+            ));
+        }
+        if scores.shape.dim(0) != u64::from(self.heads)
+            || values.shape.dim(1) != u64::from(self.heads)
+        {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the compression is over {} heads, and the views carry {} and {}",
+                    self.heads,
+                    scores.shape.dim(0),
+                    values.shape.dim(1)
+                ),
+            ));
+        }
+        if values.shape.dim(2) != u64::from(self.width) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the pooled values carry {} features, and the block's heads carry {}",
+                    values.shape.dim(2),
+                    self.width
+                ),
+            ));
+        }
+        let descriptor = segments::CompressPooledDescriptor::new(
+            out.dtype,
+            self.heads,
+            self.width,
+            self.max_tiles,
+            self.width.next_power_of_two(),
+            false,
+        );
+        let args = segments::CompressPooledArgs {
+            scores,
+            values,
+            sizes,
+            out,
+        };
+        f.operate::<segments::VsaCompressPooled>(&descriptor, args)
     }
 
     /// Choose each query tile's key tiles from its pooled scores.
