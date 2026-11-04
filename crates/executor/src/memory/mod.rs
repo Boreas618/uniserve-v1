@@ -11,6 +11,7 @@
 pub mod allocation;
 pub mod buffer;
 pub mod encoders;
+pub mod latent;
 pub mod output;
 pub mod pinned_pool;
 pub mod prefix_cache;
