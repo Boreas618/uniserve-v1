@@ -207,7 +207,17 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub(crate) fn graph(&self, device: DeviceId, resident: u64) -> Result<GraphStorage> {
+    /// `snapshot` is the state group's snapshot (`CachePlan::state_snapshot_bytes`, design 4.5),
+    /// which the scratch pool has to hold beside the shadow region. Both are stated as **one**
+    /// figure: the pool is reserved once at construction, and a second reservation of the same pool
+    /// kind is a no-op the allocator refuses, so splitting them would surface at the shadow pair's
+    /// first mapping rather than where the figure was planned.
+    pub(crate) fn graph(
+        &self,
+        device: DeviceId,
+        resident: u64,
+        snapshot: u64,
+    ) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let storage = handle.memory_info()?;
@@ -226,7 +236,16 @@ impl EpochPlan {
         if bytes == 0 {
             bail!("device {} reports no memory to capture graphs in", device.0);
         }
-        let scratch = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
+        // The shadow region §7.3 step 2 runs a replaced operator in, plus the state group's
+        // snapshot §4.5 copies units through: one scratch pool, sized once, never allocated per
+        // step or per batch.
+        let shadow = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
+        let scratch = shadow.checked_add(snapshot).with_context(|| {
+            format!(
+                "device {} reserves a {shadow}-byte shadow region and a {snapshot}-byte state snapshot, more than one scratch pool holds",
+                device.0
+            )
+        })?;
         // Every pool on this device is booked against `budget`, so `budget` is what the device has
         // left to give: the epoch's weights are device-resident retained storage, mapped before
         // this call (4.1), and an allowance drawn from the total would let the graph, scratch and
@@ -459,7 +478,12 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory, ipc::WorkerInfo)> {
+    ) -> Result<(
+        Arc<qwen3_moe::Qwen3Moe>,
+        Memory,
+        ipc::WorkerInfo,
+        GraphStorage,
+    )> {
         let placement = &self.placement;
         let class = architectural_class(&self.checkpoint)?;
         match class.as_str() {
@@ -482,8 +506,8 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let (memory, info) = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory, info))
+                let (memory, info, graph) = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory, info, graph))
             }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
@@ -504,7 +528,7 @@ impl EpochPlan {
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Memory, ipc::WorkerInfo)> {
+    ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
         let device = *self
             .devices
             .first()
@@ -561,7 +585,8 @@ impl EpochPlan {
             (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
             _ => 0,
         };
-        let graph = self.graph(device, resident)?;
+        let snapshot = planned.state_snapshot_bytes();
+        let graph = self.graph(device, resident, snapshot)?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -589,7 +614,7 @@ impl EpochPlan {
         // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
         // rank rather than a second one derived here.
-        Ok((memory, planned.plan.info.clone()))
+        Ok((memory, planned.plan.info.clone(), graph))
     }
 
     /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).

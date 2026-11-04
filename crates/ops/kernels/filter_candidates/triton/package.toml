@@ -3,8 +3,9 @@
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# One program filters one row of candidates in place; the row count comes from
-# the grid.
+# One program filters one row of candidates in place; the row count comes from the
+# grid, and the row is walked in `tile`-sized chunks, so the candidate width is a
+# runtime value: one module serves every count, a vocabulary-sized row included.
 
 op = "filter_candidates"
 backend = "triton"
@@ -27,8 +28,11 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `width_2048_ids_i32_pdl_false`.
+# `width_151936_tile_4096_ids_i32_pdl_false`.
+#
+# The width and the tile are both compilation fields: the width is the deployment's
+# candidate bound, and the tile is the chunk its program walks the row in.
 [kernel.descriptors]
-dimensions = { width = ["2048", "4096", "1024", "128"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+dimensions = { width = ["128", "1024", "2048", "4096", "151936"], tile = ["1024", "2048", "4096", "8192"], ids = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]

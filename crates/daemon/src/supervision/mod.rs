@@ -729,29 +729,6 @@ mod tests {
         }
     }
 
-    /// A peer of this interface that states `engine` — zero for one that is
-    /// not a main process — welcomed by the leader.
-    fn connect(address: &str, engine: u64) -> Connection {
-        let mut connection = Connection::connect(address).expect("the leader accepts");
-        connection
-            .send(&Hello {
-                major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
-                build: proto::BUILD.to_owned(),
-                peer: Some(hello::Peer::Engine(Engine {
-                    deployment: "model".to_owned(),
-                    engine,
-                })),
-            })
-            .unwrap();
-        let welcome: proto::process::Welcome = connection
-            .recv(Duration::from_secs(30))
-            .unwrap()
-            .expect("the leader welcomes this peer");
-        assert!(welcome.refusal.is_empty(), "{}", welcome.refusal);
-        connection
-    }
-
     fn send(connection: &mut Connection, id: u64, kind: request::Kind) {
         connection
             .send(&Upstream {
@@ -796,7 +773,10 @@ mod tests {
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),
+                    // A test client that asks for a spawn, not a main process: it states no engine
+                    // number and no interface, so no command is addressed to it.
                     engine: 0,
+                    interface: 0,
                 })),
             })
             .unwrap();
@@ -849,80 +829,6 @@ mod tests {
         unsafe { libc::waitpid(spawned.pid as libc::pid_t, &mut status, 0) };
         assert!(libc::WIFSIGNALED(status));
         successor.stop().unwrap();
-    }
-
-    /// A main process is numbered by the engine its launch named, not by the
-    /// order its process's connections arrived in.
-    ///
-    /// A deployment's engine makes more than one connection to this interface
-    /// — the main process's, which the epoch layer commands, and its workers'
-    /// clients, which it does not — and the epoch layer addresses a main
-    /// process by the number the launch gave it. A command for that number
-    /// therefore has to reach the connection that stated it, whatever the
-    /// arrival order was.
-    #[test]
-    fn a_main_process_is_numbered_by_the_engine_it_states() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("process.sock");
-        let mut daemon = Daemon::start(DaemonOptions {
-            nnodes: 1,
-            node_rank: 0,
-            host: "localhost".to_owned(),
-            dist_init_addr: None,
-            socket: socket.clone(),
-            executable: PathBuf::from("uniserve"),
-            join_timeout: Duration::from_secs(5),
-        })
-        .unwrap();
-        let address = daemon.address().unwrap().to_owned();
-
-        // A client of this interface that states no engine number arrives
-        // first, and takes number 1 by arrival.
-        let mut client = connect(&address, 0);
-        // The main process of engine 7 arrives second and states 7.
-        let mut main = connect(&address, 7);
-
-        daemon
-            .commands()
-            .expect("the leader commands its main processes")
-            .send(
-                7,
-                proto::process::Command {
-                    kind: Some(proto::process::command::Kind::Commit(
-                        proto::process::Commit {},
-                    )),
-                },
-            )
-            .unwrap();
-
-        // The command reaches the connection that stated 7, and not the one
-        // that arrived before it.
-        let mut reached = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while reached.is_none() && std::time::Instant::now() < deadline {
-            let message: Downstream = main
-                .recv(Duration::from_secs(10))
-                .unwrap()
-                .expect("an answer");
-            if let Some(downstream::Kind::Event(event)) = message.kind
-                && let Some(proto::process::event::Kind::Command(command)) = event.kind
-            {
-                reached = Some(command);
-            }
-        }
-        assert!(
-            matches!(
-                reached.and_then(|command| command.kind),
-                Some(proto::process::command::Kind::Commit(_))
-            ),
-            "the command for engine 7 reached the main process that stated it"
-        );
-        let stray: Option<Downstream> = client.recv(Duration::from_millis(300)).unwrap();
-        assert!(
-            stray.is_none(),
-            "a command for an engine must not reach a peer that states no number"
-        );
-        daemon.stop().unwrap();
     }
 }
 

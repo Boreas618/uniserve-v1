@@ -91,6 +91,27 @@ impl Arena {
         self.cursor.set(0);
     }
 
+    /// The current offset, for a later [`Arena::release`].
+    ///
+    /// One forward reserves its layer-independent buffers once and then runs every layer; the
+    /// scratch a single layer reserves is dead as soon as that layer's launches are enqueued. A
+    /// captured bucket replays the same addresses, so a layer that took a fresh reservation each
+    /// pass would ask the region for `layers` copies of it — which is neither what the plan states
+    /// nor what a replayed graph needs.
+    pub fn mark(&self) -> u64 {
+        self.cursor.get()
+    }
+
+    /// Hand back everything reserved since `mark`.
+    ///
+    /// The memory stays in the region and the bytes are handed out again to the next layer, which
+    /// is what makes a plan one layer deep. The caller owes that nothing it still uses was reserved
+    /// after `mark`: the stream orders the layer's launches before the next layer's, so reusing the
+    /// same addresses is what a captured graph already does.
+    pub fn release(&self, mark: u64) {
+        self.cursor.set(mark);
+    }
+
     /// Reserve `bytes` bytes at [`ALIGNMENT`] and answer their first address.
     pub fn reserve(&self, bytes: u64) -> Result<DevicePtr> {
         let at = self.cursor.get().next_multiple_of(ALIGNMENT);
@@ -303,6 +324,23 @@ mod tests {
         arena.reset();
         let again = arena.tensor(DType::BF16, Shape::new(&[16])).unwrap();
         assert_eq!(first.ptr, again.ptr);
+    }
+
+    /// One forward reserves its layer-independent buffers once and runs every layer: a layer's
+    /// scratch is handed back at its end and the next layer receives the same addresses, which is
+    /// what a replayed graph expects and what keeps the plan one layer deep.
+    #[test]
+    fn releasing_to_a_mark_hands_the_same_scratch_to_the_next_layer() {
+        let arena = Arena::new(DevicePtr::new(0x1_0000), 4096);
+        let held = arena.tensor(DType::BF16, Shape::new(&[16])).unwrap();
+        let mark = arena.mark();
+        let first = arena.tensor(DType::BF16, Shape::new(&[1024])).unwrap();
+        arena.release(mark);
+        let second = arena.tensor(DType::BF16, Shape::new(&[1024])).unwrap();
+        assert_eq!(first.ptr, second.ptr);
+        assert_eq!(second.ptr.address(), held.ptr.address() + ALIGNMENT);
+        // The buffer reserved before the mark is still the arena's, and still where it was.
+        assert_eq!(arena.used(), ALIGNMENT + 2048);
     }
 
     #[test]

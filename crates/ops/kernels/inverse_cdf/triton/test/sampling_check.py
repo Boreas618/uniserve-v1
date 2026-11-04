@@ -441,18 +441,24 @@ def run_inverse_cdf(case):
     draws = torch.tensor(case["draws"][:rows], dtype=torch.float32)
     tokens = torch.full((rows,), -1, dtype=torch.int32)
 
+    # The operator's contract: the candidates arrive in ascending id order. Sort the row here, so
+    # the buffer the kernel reads is the one its caller (`nn::Sampler`, after `candidate_order`)
+    # builds rather than a row it would have to sort itself.
+    order = torch.argsort(ids.long(), dim=1, stable=True)
+    ids = torch.gather(ids.long(), 1, order).to(torch.int32)
+    probabilities = torch.gather(probabilities, 1, order)
+
+    tile = case["tile"]
     kernels._inverse_cdf_kernel[(rows,)](
-        probabilities, ids, draws, tokens, rows, WIDTH=width
+        probabilities, ids, draws, tokens, rows, width, BLOCK=tile
     )
 
     failures = 0
     wanted = []
     for row in range(rows):
-        row_probabilities = probabilities[row].double()
         row_ids = ids[row].long()
-        order = torch.argsort(row_ids)
-        ordered_ids = row_ids[order]
-        ordered = row_probabilities[order]
+        ordered_ids = row_ids
+        ordered = probabilities[row].double()
         total = ordered.sum()
         cumulative = torch.cumsum(ordered, dim=0)
         # Strict, as the operator's rule reads: a zero-mass candidate is never drawn, and
@@ -471,7 +477,7 @@ def run_inverse_cdf(case):
     failures, line = compare_exact("tokens", tokens.cpu(), wanted)
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: inverse_cdf, {case['label']} — "
-        f"{rows} x {width}, draws {case['draws'][:rows]}"
+        f"{rows} x {width} in tiles of {case['tile']}, draws {case['draws'][:rows]}"
     )
     print(line)
     return failures
@@ -710,6 +716,17 @@ def cases(operator, flags):
     if operator == "inverse_cdf":
         return [
             {
+                "label": "a row far wider than one tile, walked in ten of them",
+                "rows": 2,
+                "width": 20480,
+                "tile": 2048,
+                "draws": (0.0, 0.5),
+                "zero_mass": False,
+                "one_survivor": False,
+                "last_holds_mass": False,
+                "seed": 5,
+            },
+            {
                 "label": "the fixture's width, four draws across the mass",
                 "rows": 4,
                 "width": flags.width,
@@ -717,6 +734,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": False,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 1,
             },
             {
@@ -727,6 +745,7 @@ def cases(operator, flags):
                 "zero_mass": True,
                 "one_survivor": False,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 2,
             },
             {
@@ -737,6 +756,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": False,
                 "last_holds_mass": True,
+                "tile": min(flags.width, 8192),
                 "seed": 4,
             },
             {
@@ -747,6 +767,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": True,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 3,
             },
         ]

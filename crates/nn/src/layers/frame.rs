@@ -81,9 +81,16 @@ impl FrameMoments {
     }
 
     /// The descriptor one moments launch takes, for a walk without a device.
+    ///
+    /// The reduction class is derived from the frame's own shape, so a launch can never name a class
+    /// narrower than the reduction it asks for: `channels_per_group · pixels`, padded to a power of
+    /// two because that is what the compiled program's bound is.
     pub fn moments_descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
+        let channels = values.shape.dim(1);
+        let pixels = values.shape.dim(3) * values.shape.dim(4);
         frame::FrameMomentsDescriptor {
             dtype: values.dtype,
+            reduction: frame::frame_reduction_class(channels / self.groups.max(1), pixels),
             epsilon: Float::from(self.eps),
         }
     }
@@ -205,6 +212,11 @@ impl FrameNormPad {
         let single_pixel = out.shape.dim(height_axis) == 1 && out.shape.dim(width_axis) == 1;
         let descriptor = frame::FrameNormPadDescriptor {
             dtype: values.dtype,
+            // The same reduction `frame_moments` takes of the same frame, from the frame's shape.
+            reduction: frame::frame_reduction_class(
+                values.shape.dim(1) / self.groups.max(1),
+                values.shape.dim(3) * values.shape.dim(4),
+            ),
             channels_last: self.channels_last,
             centered: self.weight.is_none(),
             single_pixel,
