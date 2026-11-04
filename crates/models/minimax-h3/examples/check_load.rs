@@ -90,7 +90,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the earlier root shadows the later one per tensor name, and a component keeps both roots'
     // shards.
     let paths = roots.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-    let checkpoint = nn::Checkpoint::open_roots(&paths)?;
+    let checkpoint = match nn::Checkpoint::open_roots(&paths) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            return Err(format!(
+                "{error}\nnote: this instrument loads weights, so it needs the export's shards and \
+                 not only its indexes and sidecars. An export of `*.index.json` with no \
+                 `*.safetensors` beside it cannot be loaded on this host at all; run this where the \
+                 weights are."
+            )
+            .into());
+        }
+    };
     println!(
         "roots: {} ({} components: {})",
         roots
