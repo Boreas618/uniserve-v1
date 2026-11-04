@@ -474,6 +474,129 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     assert!(store.published.is_empty());
 }
 
+/// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
+/// expert-major, up before gate — and its tensor scales become one reciprocal per expert, because a
+/// stack's scale varies per expert where a single matrix has one.
+#[test]
+fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // Two experts, `[2, 64]` packed (32 bytes a row), two projections each, four block scales a row.
+    let mut tensors: Vec<(String, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut expected = Vec::new();
+    for expert in 0..2u8 {
+        for (index, projection) in ["up", "gate"].iter().enumerate() {
+            let stem = format!("experts.{expert}.{projection}_proj");
+            let values: Vec<u8> = (0..64)
+                .map(|byte| byte as u8 + expert * 64 + index as u8)
+                .collect();
+            let scales: Vec<u8> = (0..8)
+                .map(|byte| 0x20 + byte as u8 + expert * 8 + index as u8)
+                .collect();
+            expected.extend_from_slice(&values);
+            tensors.push((format!("{stem}.weight"), vec![2, 32], values));
+            tensors.push((format!("{stem}.weight_scale"), vec![2, 4], scales.clone()));
+            tensors.push((
+                format!("{stem}.weight_scale_2"),
+                vec![1],
+                (0.5f32 * (expert + 1) as f32).to_le_bytes().to_vec(),
+            ));
+        }
+    }
+    let views: Vec<(&str, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, shape, bytes)| (name.as_str(), shape.clone(), bytes.clone()))
+        .collect();
+    shard_u8(directory, "model.safetensors", &views);
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let stack = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                2,
+                ops::fp4::ScaleLayout::Linear,
+            )
+            .unwrap()
+    };
+
+    assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
+    assert_eq!(stack.values.dtype(), DType::U8);
+    assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
+    assert_eq!(stack.global_scale.shape().dims(), &[2]);
+    assert_eq!(stack.global_scale.dtype(), DType::F32);
+    // The store received the values in reading order, then the scales, then the reciprocals.
+    assert_eq!(store.published.len(), 3);
+    assert_eq!(store.published[0].1, expected);
+    assert_eq!(store.published[0].0.layout, WeightLayout::NVFP4_VALUES);
+    assert_eq!(store.published[2].0.layout, WeightLayout::ROW_MAJOR);
+    let reciprocals: Vec<f32> = store.published[2]
+        .1
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    assert_eq!(reciprocals, [2.0, 1.0], "1 / (0.5 · (e + 1))");
+
+    // A second load of the same checkpoint publishes nothing: the three keys hit the store.
+    let again = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                2,
+                ops::fp4::ScaleLayout::Linear,
+            )
+            .unwrap()
+    };
+    assert_eq!(again.values.shape().dims(), stack.values.shape().dims());
+    assert_eq!(store.published.len(), 3, "the retained regions were reused");
+}
+
+/// A stack whose experts disagree on their geometry is refused rather than read as one stack.
+#[test]
+fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let byte = |values: usize| vec![0u8; values];
+    shard_u8(
+        directory,
+        "model.safetensors",
+        &[
+            ("experts.0.up_proj.weight", vec![2, 32], byte(64)),
+            ("experts.0.up_proj.weight_scale", vec![2, 4], byte(8)),
+            ("experts.0.up_proj.weight_scale_2", vec![1], byte(4)),
+            ("experts.1.up_proj.weight", vec![4, 32], byte(128)),
+            ("experts.1.up_proj.weight_scale", vec![4, 4], byte(16)),
+            ("experts.1.up_proj.weight_scale_2", vec![1], byte(4)),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let error = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up",
+            "experts",
+            &["up"],
+            2,
+            ops::fp4::ScaleLayout::Linear,
+        )
+        .expect_err("two experts of different shapes are not one stack");
+    assert!(
+        format!("{error}").contains("against the stack's"),
+        "{error}"
+    );
+    assert!(store.published.is_empty());
+}
+
 /// A pipeline's components keep their indexes apart; one loader reborrows another checkpoint and
 /// keeps the store, so the two components share the conversion path and its retained weights.
 #[test]
