@@ -30,11 +30,11 @@ use super::vmm::{CudaExports, Exported};
 use super::{
     ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::Storage;
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result, lock};
 
 /// A transfer mechanism.
