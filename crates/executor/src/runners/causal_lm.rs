@@ -460,6 +460,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         Ok(Jobs::new(jobs))
     }
 
+    fn revert(&mut self, generation: u64) {
+        // The prepared generation never serves: its graphs go, and with them the kernels they
+        // held. The old generation's graphs, its arena plans and its sampler regions stay exactly
+        // as they were, so a reverted update cannot disturb a batch in flight.
+        let dropped = self.graphs.purge(generation);
+        if self.next.as_ref().map(|next| next.number()) == Some(generation) {
+            self.next = None;
+        }
+        tracing::info!(
+            dropped,
+            generation,
+            "reverted the prepared generation; the serving generation is unchanged"
+        );
+    }
+
     fn switchover(&mut self, generation: u64) {
         // From the next batch on, the prepared generation serves; the old one stays for a revert
         // (7.3 step 4). A generation that was not prepared here is a generation of kernels only,

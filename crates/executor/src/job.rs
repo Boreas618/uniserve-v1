@@ -58,6 +58,8 @@ pub(crate) enum Command {
     Precopy(Arc<Generation>),
     /// Switch the serving generation at a batch boundary (7.3 step 3).
     Switchover(u64),
+    /// Discard the update prepared for a generation, keeping the serving one (7.3 step 4).
+    Revert(u64),
     /// Release the graphs that reference a generation older than this (7.3 step 6).
     Purge(u64),
     /// A storage owner's recorded issue work.
@@ -345,6 +347,7 @@ pub(crate) fn kind_of(command: &Command) -> JobKind {
         Command::Warmup => JobKind::Warmup,
         Command::Precopy(_) => JobKind::Precopy,
         Command::Switchover(_) => JobKind::Switchover,
+        Command::Revert(_) => JobKind::Revert,
         Command::Purge(_) => JobKind::Purge,
         Command::Issue(_) => JobKind::Issue,
         Command::After(_) => JobKind::After,

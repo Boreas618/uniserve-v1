@@ -121,6 +121,15 @@ impl Executor {
         Ok(submission)
     }
 
+    /// Discards the update prepared for `generation` and keeps the serving one (7.3 step 4).
+    pub fn revert(&self, generation: u64) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::Revert(generation), &submission, JobKind::Revert, None)?;
+        Ok(submission)
+    }
+
     /// Releases the graphs that still reference a generation older than `generation` (7.3 step 6).
     pub fn purge(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
@@ -305,6 +314,13 @@ impl Device {
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
                     named.runner.switchover(generation);
+                }
+                self.streams.synchronize()?;
+                Ok(BatchOutput::default())
+            }
+            Command::Revert(generation) => {
+                for named in &mut self.runners {
+                    named.runner.revert(generation);
                 }
                 self.streams.synchronize()?;
                 Ok(BatchOutput::default())

@@ -379,6 +379,7 @@ impl JobKind {
             Self::Warmup => "warmup",
             Self::Precopy => "precopy",
             Self::Switchover => "switchover",
+            Self::Revert => "revert",
             Self::Purge => "purge",
             Self::Issue => "issue",
             Self::After => "after",
