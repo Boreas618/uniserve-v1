@@ -231,6 +231,8 @@ impl Connection {
             let Some(head) = self.read_head().await? else {
                 return Ok(());
             };
+            debug!(method = %head.method, target = %head.target, "a request head");
+
             self.written = 0;
             self.frames = 0;
             let keep_alive = head.keep_alive;
@@ -246,6 +248,10 @@ impl Connection {
                 .write_response(response, keep_alive, &mut body)
                 .await
                 .context("writing a response")?;
+            debug!(
+                keep_alive = matches!(outcome, Outcome::KeepAlive),
+                "a response written"
+            );
             match outcome {
                 Outcome::KeepAlive => {
                     if self.accepting.is_cancelled() {
@@ -392,9 +398,11 @@ impl Connection {
             .and_then(|value| value.parse::<u64>().ok());
         // A handed body has no body of its own: the session produces every
         // frame, so only a length the handler declared is the response's, and
-        // without one the body is chunked.
+        // without one the body is chunked. A declared zero is the placeholder
+        // of the empty body a handed response carries, never its length: a
+        // body whose length is zero is chunked as well, and ends at once.
         let (chunked, content_length) = match &handed {
-            Some(_) => match declared {
+            Some(_) => match declared.filter(|length| *length > 0) {
                 Some(length) => (false, Some(length)),
                 None => (true, None),
             },
@@ -938,24 +946,37 @@ struct RequestBody {
 }
 
 /// How the client frames the request body.
+#[derive(Debug)]
 enum Framing {
     /// No body.
     None,
     /// A body of `remaining` bytes.
     Length { remaining: u64 },
     /// A chunked body.
-    Chunked(Chunked),
+    Chunked(ChunkedStep),
 }
 
-/// Where the chunked parser stands.
-#[derive(Default)]
-struct Chunked {
-    /// The current chunk's size line, until its CRLF arrives.
-    size_line: BytesMut,
-    /// Data bytes of the current chunk still to come.
-    remaining: u64,
-    /// The last chunk arrived; the trailer section is being read.
-    trailers: bool,
+/// Where the chunked parser of a request body stands.
+#[derive(Clone, Copy, Debug)]
+enum ChunkedStep {
+    /// Reading a chunk's size line.
+    Size,
+    /// Reading the data bytes of a chunk of `remaining` bytes.
+    Data { remaining: u64 },
+    /// Reading the CRLF that ends a chunk's data.
+    DataEnd,
+    /// The last chunk arrived; reading the trailer section's empty line.
+    Trailers,
+}
+
+/// What one step of the chunked parser did.
+enum ChunkedOutcome {
+    /// It consumed bytes and can be stepped again.
+    Progress,
+    /// It needs more bytes from the socket.
+    NeedMore,
+    /// The body ended.
+    Ended,
 }
 
 impl RequestBody {
@@ -986,7 +1007,7 @@ impl RequestBody {
                 if !chunked {
                     return Err(HeadError::UnsupportedFraming);
                 }
-                Ok(Self::framed(Framing::Chunked(Chunked::default())))
+                Ok(Self::framed(Framing::Chunked(ChunkedStep::Size)))
             }
             (false, Some(0) | None) => Ok(Self::empty()),
             (false, Some(remaining)) => Ok(Self::framed(Framing::Length { remaining })),
@@ -1101,14 +1122,19 @@ impl RequestBody {
                     fed = true;
                 }
                 Framing::Chunked(state) => {
-                    if !chunked_step(state, buffer, &mut shared.ready, room, &mut self.ended)? {
-                        wake(&mut shared);
-                        return Ok(fed);
+                    match chunked_step(state, buffer, &mut shared.ready, room)? {
+                        ChunkedOutcome::Progress => fed = true,
+                        ChunkedOutcome::NeedMore => {
+                            wake(&mut shared);
+                            return Ok(fed);
+                        }
+                        ChunkedOutcome::Ended => {
+                            self.ended = true;
+                            shared.ended = true;
+                            wake(&mut shared);
+                            return Ok(fed);
+                        }
                     }
-                    if self.ended {
-                        shared.ended = true;
-                    }
-                    fed = true;
                 }
             }
         }
@@ -1118,72 +1144,72 @@ impl RequestBody {
     }
 }
 
-/// Advances the chunked parser by at most `room` data bytes; `false` when it
-/// needs more bytes from the socket.
+/// Advances the chunked parser of a request body by at most `room` data bytes.
 fn chunked_step(
-    state: &mut Chunked,
+    state: &mut ChunkedStep,
     buffer: &mut BytesMut,
     ready: &mut BytesMut,
     room: usize,
-    ended: &mut bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<ChunkedOutcome> {
+    let mut progressed = false;
     loop {
-        if state.trailers {
-            // The trailer section ends with an empty line; item 1 hands over
-            // no request body, so an empty one is all the server accepts.
-            match take_line(buffer) {
-                Some(line) if line.is_empty() => {
-                    *ended = true;
-                    return Ok(true);
-                }
+        let more = if progressed {
+            ChunkedOutcome::Progress
+        } else {
+            ChunkedOutcome::NeedMore
+        };
+        match *state {
+            ChunkedStep::Trailers => match take_line(buffer) {
+                None => return Ok(more),
+                // The trailer section ends with an empty line. Item 1 hands no
+                // request body over, so the server serves no trailers.
+                Some(line) if line.is_empty() => return Ok(ChunkedOutcome::Ended),
                 Some(_) => return Err(anyhow::anyhow!("request trailers are not served")),
-                None => return Ok(false),
-            }
-        }
-        if state.remaining > 0 {
-            if buffer.is_empty() || room == 0 {
-                return Ok(false);
-            }
-            let take = usize::try_from(state.remaining.min(room as u64).min(buffer.len() as u64))
-                .unwrap_or(usize::MAX);
-            let chunk = buffer.split_to(take);
-            ready.extend_from_slice(&chunk);
-            state.remaining -= u64::try_from(take).unwrap_or(u64::MAX);
-            return Ok(true);
-        }
-        if ready.len() >= room {
-            return Ok(false);
-        }
-        // The chunk's size line, or its trailing CRLF once its data arrived.
-        if state.size_line.is_empty() {
-            match take_line(buffer) {
-                Some(line) => {
-                    let size = line
-                        .split(';')
-                        .next()
-                        .unwrap_or_default()
-                        .trim();
-                    let size = u64::from_str_radix(size, 16)
-                        .map_err(|_| anyhow::anyhow!("malformed chunk size"))?;
-                    if size == 0 {
-                        state.trailers = true;
-                    } else {
-                        state.remaining = size;
-                    }
+            },
+            ChunkedStep::DataEnd => {
+                if buffer.len() < 2 {
+                    return Ok(more);
                 }
-                None => return Ok(false),
+                if &buffer[..2] != b"\r\n" {
+                    return Err(anyhow::anyhow!("a chunk does not end with CRLF"));
+                }
+                let _ = buffer.split_to(2);
+                *state = ChunkedStep::Size;
+                progressed = true;
+            }
+            ChunkedStep::Size => {
+                let Some(line) = take_line(buffer) else {
+                    return Ok(more);
+                };
+                // A chunk's extension follows its size after a semicolon.
+                let size = line.split(';').next().unwrap_or_default().trim().to_owned();
+                let size = u64::from_str_radix(&size, 16)
+                    .map_err(|_| anyhow::anyhow!("malformed chunk size"))?;
+                *state = if size == 0 {
+                    ChunkedStep::Trailers
+                } else {
+                    ChunkedStep::Data { remaining: size }
+                };
+                progressed = true;
+            }
+            ChunkedStep::Data { remaining } => {
+                if buffer.is_empty() || ready.len() >= room {
+                    return Ok(more);
+                }
+                let room = u64::try_from(room - ready.len()).unwrap_or(u64::MAX);
+                let take = usize::try_from(remaining.min(room).min(buffer.len() as u64))
+                    .unwrap_or(usize::MAX);
+                let chunk = buffer.split_to(take);
+                ready.extend_from_slice(&chunk);
+                let left = remaining - u64::try_from(take).unwrap_or(u64::MAX);
+                *state = if left == 0 {
+                    ChunkedStep::DataEnd
+                } else {
+                    ChunkedStep::Data { remaining: left }
+                };
+                return Ok(ChunkedOutcome::Progress);
             }
         }
-        if state.size_line.is_empty() && state.remaining == 0 && !state.trailers {
-            // A size line ended with a zero chunk's CRLF; the next line is the
-            // trailer section's empty line.
-            state.trailers = true;
-            continue;
-        }
-        if state.remaining > 0 {
-            continue;
-        }
-        return Ok(true);
     }
 }
 
@@ -1257,6 +1283,31 @@ mod tests {
         (Either::Right(server), client)
     }
 
+    /// A pair whose socket buffers are small, so that a write of more than a
+    /// few kilobytes cannot be accepted until the peer reads.
+    fn small_buffered_pair() -> (Io, UnixStream) {
+        let (server, client) = UnixStream::pair().expect("a socket pair");
+        for stream in [&server, &client] {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                let size: libc::c_int = 4096;
+                // SAFETY: the descriptor is open and `SO_SNDBUF`/`SO_RCVBUF`
+                // take an int.
+                let set = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&raw const size).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(set, 0, "a socket buffer of {} bytes", 4096);
+            }
+        }
+        (Either::Right(server), client)
+    }
+
     /// One response read off the wire: status, headers and body.
     struct Wire {
         status: u16,
@@ -1264,69 +1315,113 @@ mod tests {
         body: String,
     }
 
-    /// Reads one response, content-length or chunked, from `client`.
-    async fn read_response(client: &mut UnixStream) -> Wire {
-        let mut raw = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let head_end = loop {
-            if let Some(end) = find_head_end(&raw) {
-                break end;
+    /// The client side of a connection under test, holding the bytes it read
+    /// and did not consume yet: two responses may arrive in one read.
+    struct TestClient {
+        stream: UnixStream,
+        buffered: Vec<u8>,
+    }
+
+    impl TestClient {
+        fn new(stream: UnixStream) -> Self {
+            Self {
+                stream,
+                buffered: Vec::new(),
             }
-            let read = client.read(&mut chunk).await.expect("a response head");
-            assert!(read > 0, "the connection closed inside a response head");
-            raw.extend_from_slice(&chunk[..read]);
-        };
-        let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
-        let status = head
-            .split(' ')
-            .nth(1)
-            .and_then(|status| status.parse().ok())
-            .expect("a status code");
-        let headers = head.to_ascii_lowercase();
-        let body_start = head_end;
-        let body = if headers.contains("transfer-encoding: chunked") {
+        }
+
+        /// Writes a request's bytes.
+        async fn send(&mut self, bytes: &[u8]) {
+            self.stream.write_all(bytes).await.expect("a request");
+        }
+
+        /// Reads once from the connection into the buffer, failing the test
+        /// rather than hanging.
+        async fn fill(&mut self) -> usize {
+            let mut chunk = [0_u8; 8192];
+            match tokio::time::timeout(std::time::Duration::from_secs(5), self.stream.read(&mut chunk))
+                .await
+            {
+                Ok(Ok(read)) => {
+                    self.buffered.extend_from_slice(&chunk[..read]);
+                    read
+                }
+                Ok(Err(error)) => panic!("reading a response: {error}"),
+                Err(_) => panic!("a response stalled: nothing arrived for 5 s"),
+            }
+        }
+
+        /// Reads until the buffer holds at least `len` bytes.
+        async fn need(&mut self, len: usize) {
+            while self.buffered.len() < len {
+                assert!(self.fill().await > 0, "the connection closed early");
+            }
+        }
+
+        /// Takes the next response's head off the wire.
+        async fn read_head(&mut self) -> String {
+            let end = loop {
+                if let Some(end) = find_head_end(&self.buffered) {
+                    break end;
+                }
+                assert!(self.fill().await > 0, "the connection closed inside a head");
+            };
+            let head = String::from_utf8_lossy(&self.buffered[..end]).into_owned();
+            self.buffered.drain(..end);
+            head
+        }
+
+        /// Takes the next response off the wire, body included.
+        async fn read_response(&mut self) -> Wire {
+            let head = self.read_head().await;
+            let status = head
+                .split(' ')
+                .nth(1)
+                .and_then(|status| status.parse().ok())
+                .expect("a status code");
+            let headers = head.to_ascii_lowercase();
             let mut body = Vec::new();
-            let mut at = body_start;
-            loop {
-                while find_line_end(&raw, at).is_none() {
-                    let read = client.read(&mut chunk).await.expect("chunk sizes");
-                    assert!(read > 0, "the connection closed inside a chunked body");
-                    raw.extend_from_slice(&chunk[..read]);
+            if headers.contains("transfer-encoding: chunked") {
+                loop {
+                    let size = loop {
+                        if let Some(end) = find_line_end(&self.buffered, 0) {
+                            let line = String::from_utf8_lossy(&self.buffered[..end]).into_owned();
+                            self.buffered.drain(..end + 2);
+                            break line;
+                        }
+                        assert!(self.fill().await > 0, "the connection closed inside a chunk");
+                    };
+                    let size =
+                        usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16)
+                            .expect("a chunk size");
+                    if size == 0 {
+                        break;
+                    }
+                    self.need(size + 2).await;
+                    body.extend_from_slice(&self.buffered[..size]);
+                    self.buffered.drain(..size + 2);
                 }
-                let line_end = find_line_end(&raw, at).expect("a chunk size line");
-                let size_line = String::from_utf8_lossy(&raw[at..line_end]).into_owned();
-                let size = usize::from_str_radix(size_line.split(';').next().unwrap().trim(), 16)
-                    .expect("a chunk size");
-                at = line_end + 2;
-                if size == 0 {
-                    break;
-                }
-                while raw.len() < at + size + 2 {
-                    let read = client.read(&mut chunk).await.expect("chunk data");
-                    assert!(read > 0, "the connection closed inside a chunk");
-                    raw.extend_from_slice(&chunk[..read]);
-                }
-                body.extend_from_slice(&raw[at..at + size]);
-                at += size + 2;
+            } else {
+                let length = headers
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                self.need(length).await;
+                body.extend_from_slice(&self.buffered[..length]);
+                self.buffered.drain(..length);
             }
-            String::from_utf8_lossy(&body).into_owned()
-        } else {
-            let length = headers
-                .split("\r\n")
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            while raw.len() < body_start + length {
-                let read = client.read(&mut chunk).await.expect("a response body");
-                assert!(read > 0, "the connection closed inside a response body");
-                raw.extend_from_slice(&chunk[..read]);
+            Wire {
+                status,
+                headers,
+                body: String::from_utf8_lossy(&body).into_owned(),
             }
-            String::from_utf8_lossy(&raw[body_start..body_start + length]).into_owned()
-        };
-        Wire {
-            status,
-            headers,
-            body,
+        }
+
+        /// Reads everything the connection still writes, and returns it.
+        async fn read_to_end(&mut self) -> String {
+            while self.fill().await > 0 {}
+            String::from_utf8_lossy(&self.buffered).into_owned()
         }
     }
 
@@ -1349,10 +1444,10 @@ mod tests {
     }
 
     /// Serves `app` on a socket pair and returns the client side.
-    fn serve_on_pair(app: Router) -> UnixStream {
+    fn serve_on_pair(app: Router) -> TestClient {
         let (io, client) = pair();
         tokio::spawn(serve_connection(io, app, CancellationToken::new()));
-        client
+        TestClient::new(client)
     }
 
     /// A request head for `request` with the given extra header lines.
@@ -1364,22 +1459,22 @@ mod tests {
     async fn a_content_length_body_reaches_the_handler_and_the_connection_is_kept() {
         let mut client = serve_on_pair(app());
         client
-            .write_all(head("POST /echo HTTP/1.1", "Content-Length: 5\r\n").as_bytes())
-            .await
-            .unwrap();
-        client.write_all(b"hello").await.unwrap();
+            .send(head("POST /echo HTTP/1.1", "Content-Length: 5\r\n").as_bytes())
+            .await;
+        client.send(b"hello").await;
 
-        let first = read_response(&mut client).await;
+        let first = client.read_response().await;
         assert_eq!(first.status, 200);
         assert_eq!(first.body, "hello");
-        assert!(first.headers.contains("connection: keep-alive"), "{}", first.headers);
+        assert!(
+            first.headers.contains("connection: keep-alive"),
+            "{}",
+            first.headers
+        );
 
         // The same connection serves a second request.
-        client
-            .write_all(head("GET /hello HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
-        let second = read_response(&mut client).await;
+        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        let second = client.read_response().await;
         assert_eq!(second.body, "hello");
     }
 
@@ -1387,16 +1482,14 @@ mod tests {
     async fn a_chunked_body_arrives_chunk_by_chunk() {
         let mut client = serve_on_pair(app());
         client
-            .write_all(head("POST /echo HTTP/1.1", "Transfer-Encoding: chunked\r\n").as_bytes())
-            .await
-            .unwrap();
+            .send(head("POST /echo HTTP/1.1", "Transfer-Encoding: chunked\r\n").as_bytes())
+            .await;
         for chunk in ["3\r\nhel\r\n", "2\r\nlo\r\n", "0\r\n\r\n"] {
-            client.write_all(chunk.as_bytes()).await.unwrap();
-            client.flush().await.unwrap();
+            client.send(chunk.as_bytes()).await;
             tokio::task::yield_now().await;
         }
 
-        let response = read_response(&mut client).await;
+        let response = client.read_response().await;
         assert_eq!(response.body, "hello");
     }
 
@@ -1405,12 +1498,27 @@ mod tests {
         let mut client = serve_on_pair(app());
         let mut requests = head("GET /hello HTTP/1.1", "");
         requests.push_str(&head("GET /hello HTTP/1.1", ""));
-        client.write_all(requests.as_bytes()).await.unwrap();
+        client.send(requests.as_bytes()).await;
 
-        let first = read_response(&mut client).await;
-        let second = read_response(&mut client).await;
+        let first = client.read_response().await;
+        let second = client.read_response().await;
         assert_eq!((first.status, first.body.as_str()), (200, "hello"));
         assert_eq!((second.status, second.body.as_str()), (200, "hello"));
+    }
+
+    #[tokio::test]
+    async fn a_head_request_answers_without_a_body() {
+        let mut client = serve_on_pair(app());
+        client.send(head("HEAD /hello HTTP/1.1", "").as_bytes()).await;
+        // The HEAD response carries the GET's headers and no body; the next
+        // request on the connection proves the framing did not consume it.
+        let answered = client.read_head().await;
+        assert!(answered.starts_with("HTTP/1.1 200"), "{answered}");
+        assert!(answered.contains("Content-Length: 5"), "{answered}");
+
+        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        let second = client.read_response().await;
+        assert_eq!(second.body, "hello");
     }
 
     /// A session that produces the frames the test sends it, and freezes with
@@ -1466,14 +1574,15 @@ mod tests {
         response
     }
 
-    /// Serves one handoffable response on a socket pair, and hands the test
-    /// the client side, the frames' producer and the registry the response
+    /// Serves one handoffable response on a socket pair, and hands the test the
+    /// client side, the frames' producer and the registry the response
     /// registers in.
     fn serve_handed(
         registry: Handoff,
         registration: Arc<Registration>,
         request_id: &str,
-    ) -> (UnixStream, mpsc::UnboundedSender<Bytes>) {
+        pair: fn() -> (Io, UnixStream),
+    ) -> (TestClient, mpsc::UnboundedSender<Bytes>) {
         let request_id = request_id.to_owned();
         let (frames, produced) = mpsc::unbounded_channel();
         let produced = Arc::new(std::sync::Mutex::new(Some(produced)));
@@ -1504,7 +1613,7 @@ mod tests {
         let (io, client) = pair();
         tokio::spawn(serve_connection(io, app, CancellationToken::new()));
         let _ = registry;
-        (client, frames)
+        (TestClient::new(client), frames)
     }
 
     /// One streamed response paused at a boundary and resumed by the
@@ -1514,12 +1623,13 @@ mod tests {
     async fn a_paused_response_resumes_and_writes_its_carried_frames() {
         let registry = Handoff::new();
         let registration = registry.register();
-        let (mut client, frames) =
-            serve_handed(registry.clone(), Arc::clone(&registration), "handoff-stream-1");
-        client
-            .write_all(head("GET /stream HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
+        let (mut client, frames) = serve_handed(
+            registry.clone(),
+            Arc::clone(&registration),
+            "handoff-stream-1",
+            pair,
+        );
+        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
         frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
         tokio::task::yield_now().await;
 
@@ -1537,7 +1647,7 @@ mod tests {
 
         frames.send(Bytes::from_static(b"data: b\n\n")).unwrap();
         drop(frames);
-        let response = read_response(&mut client).await;
+        let response = client.read_response().await;
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data: a"), "{}", response.body);
         assert!(
@@ -1553,12 +1663,13 @@ mod tests {
     async fn an_adopted_response_stops_writing_and_closes() {
         let registry = Handoff::new();
         let registration = registry.register();
-        let (mut client, frames) =
-            serve_handed(registry.clone(), Arc::clone(&registration), "handoff-stream-2");
-        client
-            .write_all(head("GET /stream HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
+        let (mut client, frames) = serve_handed(
+            registry.clone(),
+            Arc::clone(&registration),
+            "handoff-stream-2",
+            pair,
+        );
+        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
         frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
         tokio::task::yield_now().await;
 
@@ -1568,25 +1679,10 @@ mod tests {
         assert_eq!(frozen.len(), 1);
         let frozen = frozen.into_iter().next().expect("one frozen response");
         frozen.decision.send(Decision::Adopt).unwrap();
-        // The successor writes the carried bytes; this process wrote the head
-        // and stops there.
+        // The successor writes the carried bytes; this process stops here.
         frames.send(Bytes::from_static(b"data: b\n\n")).unwrap();
 
-        let mut raw = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.read(&mut chunk),
-            )
-            .await
-            .expect("the adopted connection closes")
-            {
-                Ok(0) | Err(_) => break,
-                Ok(read) => raw.extend_from_slice(&chunk[..read]),
-            }
-        }
-        let raw = String::from_utf8_lossy(&raw);
+        let raw = client.read_to_end().await;
         assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
         assert!(!raw.contains("data: b"), "nothing follows the boundary: {raw}");
         assert!(
@@ -1602,14 +1698,16 @@ mod tests {
     async fn a_pause_stops_a_write_the_socket_does_not_take() {
         let registry = Handoff::new();
         let registration = registry.register();
-        let (mut client, frames) =
-            serve_handed(registry.clone(), Arc::clone(&registration), "handoff-stream-3");
-        client
-            .write_all(head("GET /stream HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
-        // More than a socket's send buffer, and the client reads none of it.
-        let big = Bytes::from(vec![b'x'; 8 << 20]);
+        let (mut client, frames) = serve_handed(
+            registry.clone(),
+            Arc::clone(&registration),
+            "handoff-stream-3",
+            small_buffered_pair,
+        );
+        client.send(head("GET /stream HTTP/1.1", "").as_bytes()).await;
+        // Far more than these socket buffers take, and the client reads none
+        // of it.
+        let big = Bytes::from(vec![b'x'; 1 << 20]);
         frames.send(big.clone()).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1621,7 +1719,9 @@ mod tests {
         let http = frozen.state.http.as_ref().expect("the HTTP framing");
         assert!(
             !http.unwritten.is_empty(),
-            "the bytes the kernel did not take are carried"
+            "the bytes the kernel did not take are carried: written {} of {}",
+            http.written,
+            big.len()
         );
         assert!(
             http.written < big.len() as u64,
@@ -1633,54 +1733,8 @@ mod tests {
 
         // The client reads what the socket holds, and the connection ends
         // without writing the rest.
-        let mut raw = Vec::new();
-        let mut chunk = [0_u8; 64 << 10];
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.read(&mut chunk),
-            )
-            .await
-            .expect("the adopted connection closes")
-            {
-                Ok(0) | Err(_) => break,
-                Ok(read) => raw.extend_from_slice(&chunk[..read]),
-            }
-        }
+        let raw = client.read_to_end().await;
         assert!(raw.len() < big.len(), "the rest went to the successor");
         drop(frames);
-    }
-
-    #[tokio::test]
-    async fn a_head_request_answers_without_a_body() {
-        let mut client = serve_on_pair(app());
-        client
-            .write_all(head("HEAD /hello HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
-        // The HEAD response carries the GET's headers and no body; the next
-        // request on the connection proves the framing did not consume it.
-        let raw = {
-            let mut raw = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let head_end = loop {
-                if let Some(end) = find_head_end(&raw) {
-                    break end;
-                }
-                let read = client.read(&mut chunk).await.expect("a response head");
-                assert!(read > 0);
-                raw.extend_from_slice(&chunk[..read]);
-            };
-            String::from_utf8_lossy(&raw[..head_end]).into_owned()
-        };
-        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
-        assert!(raw.contains("content-length: 5"), "{raw}");
-
-        client
-            .write_all(head("GET /hello HTTP/1.1", "").as_bytes())
-            .await
-            .unwrap();
-        let second = read_response(&mut client).await;
-        assert_eq!(second.body, "hello");
     }
 }
