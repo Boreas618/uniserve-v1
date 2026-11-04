@@ -1321,6 +1321,8 @@ impl Denoiser {
         let modulation = arena.tensor(DType::F32, Shape::new(&[groups, 2 * hidden_size]))?;
         self.cache.output(f, entries, modulation)?;
 
+        // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
+        let coefficient = arena.tensor(DType::F32, Shape::new(&[1, 1]))?;
         let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
         let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
@@ -1336,8 +1338,18 @@ impl Denoiser {
         )?;
         let velocity = arena.tensor(dtype, video.shape)?;
         unpatch.forward(f, velocity_rows, velocity)?;
-        self.solver
-            .step(f, Modality::Video, video, velocity, step.index)?;
+        // The solver's coefficient is gathered on the device from the executor's `step` table, so
+        // this launch addresses one staging word whose contents change per evaluation rather than
+        // one buffer per evaluation; the same word serves the audio step's gather.
+        self.solver.step(
+            f,
+            Modality::Video,
+            video,
+            velocity,
+            step.index,
+            tables.get("step")?,
+            coefficient,
+        )?;
 
         if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
@@ -1361,8 +1373,15 @@ impl Denoiser {
                 Shape::new(&[audio_rows, features]),
                 nn::Strides::new(&[features, 1]),
             );
-            self.solver
-                .step(f, Modality::Audio, flat, velocity, step.index)?;
+            self.solver.step(
+                f,
+                Modality::Audio,
+                flat,
+                velocity,
+                step.index,
+                tables.get("step")?,
+                coefficient,
+            )?;
         }
         Ok(())
     }
