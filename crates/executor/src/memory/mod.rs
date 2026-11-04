@@ -199,9 +199,12 @@ impl Memory {
     /// It is the cache planes, the latent pages, the product store's arenas and
     /// the request-slot banks, and it counts MAPPED device storage only: host and
     /// page-locked storage is outside the device's budget, and a sleeping rank's
-    /// released segments are not in it. It reads the owners' books and asks no
-    /// driver, so a figure that could not be computed is left out rather than
-    /// failing the report.
+    /// released segments are not in it. It excludes the graph pools and the
+    /// cache's scratch page set as well: those are the executor's and the
+    /// paired forward's own regions, so `graph + resident + scratch <= budget`
+    /// is three disjoint figures of one device allowance. It reads the owners'
+    /// books and asks no driver, so a figure that could not be computed is left
+    /// out rather than failing the report.
     pub fn mapped_resident(&self) -> u64 {
         let planes = self.prefix_cache.mapped_bytes();
         let latents = self
