@@ -10,6 +10,22 @@
 //! `uniserve/models/minimax_h3/video_vae.py` (`CausalCNN`, `Encoder`) and `uniserve/nn/vae/tiled.py`
 //! (`TiledEncoder`) are the reference.
 //!
+//! ## Precision
+//!
+//! Every convolution of the video encoder runs FP32 with TF32 allowed — `specs/worker.md` 9's
+//! `conv3d` row — because the checkpoint's VAE encoder is evaluated at the quality preset. The audio
+//! encoder's convolutions and its `Snake` activations run FP32 and keep no TF32: its magnitudes are
+//! amplitudes, where the reference compares samples, not feature maps.
+//!
+//! **The audio encoder's attention is FP32 throughout** — query, key and value projections, the
+//! scores, the softmax and the output — whatever the checkpoint's preset says. `specs/worker.md` 9
+//! states the row in its own words: 「FP32 注意力（`ref2va` 的音频编码器、VSA 压缩分支） | cuBLASLt
+//! SGEMM 加 softmax kernel program」 — FP32 attention for `ref2va`'s audio encoder and the VSA
+//! compression branch, as a cuBLASLt SGEMM plus a softmax kernel program. It is the declaration §9
+//! asks the model to make instead of leaning on `torch.autocast`, and it is the opposite of the
+//! video VAE decoder's rule (one FP16 element type for parameters and residual). The layer is
+//! [`nn::layers::Attention::fp32`]; no call site may construct the dense backend for these blocks.
+//!
 //! ## The encoder's input
 //!
 //! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the same
