@@ -44,10 +44,10 @@
 //! removes their routes from the covered set, and until then a response they
 //! write ends at the boundary.
 //!
-//! A video artifact's body is not covered yet: it would take a session that
-//! streams the retained media from the byte the predecessor reached, which
-//! does not exist. Such a response is left with the predecessor, which
-//! finishes it, and the successor is not told it was taken over.
+//! A video artifact's body is covered too: its state names the job and the
+//! byte the predecessor reached, and the successor streams the job's retained
+//! media from there. The media is the one the successor adopted with the job,
+//! so a response whose media did not come over stays with the predecessor.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,7 @@ use tracing::{info, warn};
 use crate::http::handoff::{Decision, FrozenStream};
 use crate::http::stream::ResponseStream;
 use crate::leader::Leader;
+use crate::openai::video_jobs::VideoJobs;
 
 /// One response the predecessor froze, as it travels to the successor.
 ///
@@ -261,12 +262,13 @@ pub(crate) struct Adoption {
 pub(crate) fn adopt(
     leader: &Arc<Leader>,
     records: Vec<StreamHandoff>,
+    jobs: &Arc<VideoJobs>,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> Adoption {
     let mut taken = Vec::new();
     let mut streams = Vec::new();
     for record in records {
-        match take_over(leader, &record, next) {
+        match take_over(leader, jobs, &record, next) {
             Ok(response) => {
                 streams.push(Taken {
                     request_id: response.request_id.clone(),
@@ -292,6 +294,7 @@ pub(crate) fn adopt(
 /// from the state, then its connection.
 fn take_over(
     leader: &Arc<Leader>,
+    jobs: &Arc<VideoJobs>,
     record: &StreamHandoff,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> anyhow::Result<Adopted> {
@@ -352,14 +355,25 @@ fn take_over(
             // One JSON body: no server-sent events, so no keep-alive comment.
             ResponseStream::start(Box::new(run), false)
         }
-        // A video artifact's body has no session a successor resumes yet: the
-        // response stays with the predecessor, which finishes it, and is not
-        // named among the adopted ones.
-        handoff::stream::Application::VideoContent(content) => anyhow::bail!(
-            "a handed-over video response of job {} at byte {} has no session here yet",
-            content.job_id,
-            content.offset
-        ),
+        handoff::stream::Application::VideoContent(content) => {
+            // The artifact is the successor's own retained media: the job was
+            // adopted from the predecessor before its responses are, so a job
+            // that is not here is one whose media did not come over.
+            let media = jobs.content(&content.job_id).with_context(|| {
+                format!(
+                    "the retained media of the handed-over job {} is not here",
+                    content.job_id
+                )
+            })?;
+            let run = crate::output::run::VideoContentRun::new(
+                content.job_id.clone(),
+                content.content_type.clone(),
+                media,
+            )
+            .from_offset(usize::try_from(content.offset).unwrap_or(usize::MAX));
+            // Artifact bytes, not events: no server-sent keep-alive.
+            ResponseStream::start(Box::new(run), false)
+        }
     };
     info!(
         request_id = %record.request_id,
