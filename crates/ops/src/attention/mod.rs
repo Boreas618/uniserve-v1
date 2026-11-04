@@ -662,7 +662,7 @@ impl Op for PagedAttention {
             ("value", args.value),
             ("out", args.out),
         ] {
-            if address(view.ptr) % 16 != 0 {
+            if !address(view.ptr).is_multiple_of(16) {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
@@ -686,7 +686,7 @@ impl Op for PagedAttention {
             }
         }
         for (name, view) in [("page_table", args.page_table), ("seq_lens", args.seq_lens)] {
-            if address(view.ptr) % 16 != 0 {
+            if !address(view.ptr).is_multiple_of(16) {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
