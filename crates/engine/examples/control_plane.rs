@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut rxs: HashMap<RequestId, (String, engine::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
-    let mut mk = |constraint: GenerationConstraint| {
+    let mut mk = |constraint: GenerationConstraint, generated: Vec<u32>| {
         let id = RequestId(next_id);
         next_id += 1;
         let policy = ImageGenerationConfig {
@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
             cache,
             image_generation: policy,
             readout: Vec::new(),
-            generated_token_ids: Vec::new(),
+            generated_token_ids: generated,
             adapter: 0,
             generated_images: Vec::new(),
             trajectory: Default::default(),
@@ -122,15 +122,31 @@ fn main() -> anyhow::Result<()> {
         anyhow::Ok((id, request))
     };
 
-    for _ in 0..3 {
-        let (id, request) = mk(GenerationConstraint::UndOnly)?;
-        let rx = handle.submit(request)?;
-        rxs.insert(id, ("text".to_string(), rx));
+    // A scenario argument narrows the world to the kinds it names, so a
+    // failure can be attributed to one kind of request rather than to the mix.
+    let wanted = std::env::args().nth(1);
+    let wants = |kind: &str| wanted.as_deref().is_none_or(|only| only == kind || only == "all");
+    if wants("text") {
+        for _ in 0..3 {
+            let (id, request) = mk(GenerationConstraint::UndOnly, Vec::new())?;
+            let rx = handle.submit(request)?;
+            rxs.insert(id, ("text".to_string(), rx));
+        }
     }
-    for _ in 0..2 {
-        let (id, request) = mk(GenerationConstraint::GenOnly)?;
+    if wants("image") {
+        for _ in 0..2 {
+            let (id, request) = mk(GenerationConstraint::GenOnly, Vec::new())?;
+            let rx = handle.submit(request)?;
+            rxs.insert(id, ("image".to_string(), rx));
+        }
+    }
+    // A request that resumes a generation: its prompt continues the tokens it
+    // carries, so its context is prefilled from `prompt + carried` and its
+    // budget, penalties and stop rules continue from the carried token count.
+    if wants("migrated") {
+        let (id, request) = mk(GenerationConstraint::UndOnly, vec![1_500, 1_501])?;
         let rx = handle.submit(request)?;
-        rxs.insert(id, ("image".to_string(), rx));
+        rxs.insert(id, ("migrated".to_string(), rx));
     }
 
     // Poll every event receiver until each request has reported `Finished`
@@ -138,6 +154,7 @@ fn main() -> anyhow::Result<()> {
     // text tokens and images and records whether `Finished` was seen.
     let mut done = 0usize;
     let total = rxs.len();
+    anyhow::ensure!(total > 0, "the scenario names no request kind: {wanted:?}");
     let mut counts: HashMap<RequestId, (String, usize, usize, bool)> = HashMap::new();
     let mut watched = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -153,6 +170,10 @@ fn main() -> anyhow::Result<()> {
                         e.3 = true;
                         done += 1;
                     }
+                    Event::Rejected { kind, message } => {
+                        println!("req {id:?} rejected ({kind:?}): {message}");
+                    }
+                    Event::Error { message, .. } => println!("req {id:?} failed: {message}"),
                     _ => {}
                 }
             }
@@ -179,6 +200,9 @@ fn main() -> anyhow::Result<()> {
             ok = false;
         }
         if kind == "image" && *imgs == 0 {
+            ok = false;
+        }
+        if kind == "migrated" && (*toks == 0 || !*fin) {
             ok = false;
         }
     }

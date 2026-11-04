@@ -714,7 +714,12 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// canvas-generating request's commit extends the context past its prompt, and
 /// the prefill that writes it is sized from this end.
 fn prefill_end(state: &RequestState) -> u32 {
-    let prompt = u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX);
+    // The end of the context the next prefill must reach. A migrated request's
+    // prompt continues with the tokens it generated before it moved here
+    // (`Scheduler::request_state`), so the prompt ids say how far the context
+    // goes, while `RequestState::prompt_tokens` is only what the request's
+    // usage charges and leaves those tokens out.
+    let prompt = u32::try_from(state.req.prompt_token_ids.len()).unwrap_or(u32::MAX);
     // Every vision block of an input image writes its cache tokens into the
     // context at its prompt position, so the prefill that reaches it is sized
     // past the text around it.
