@@ -50,8 +50,9 @@ pub struct Attention {
 impl Attention {
     /// Paged attention of `head_dim` elements per head over `page_size`-token pages.
     ///
-    /// `max_kv_len` is the longest key reduction the captured bucket serves: it enters the
-    /// descriptor, and with it the tolerance bound. `window` is the inclusive history window, when
+    /// `max_kv_len` is the longest key reduction the deployment serves (40960 for the Qwen3-MoE
+    /// slice): it enters the descriptor and with it the tolerance bound, so a deployment that
+    /// serves longer sequences needs another module, not another launch. `window` is the inclusive history window, when
     /// the model has one.
     pub fn paged(
         head_dim: u32,
@@ -266,18 +267,25 @@ impl Attention {
             windowed: self.window.is_some(),
             max_kv_len: self.max_kv_len,
         };
-        // A quantized cache divides each page by its own FP32 scale; the page layout of those
-        // scales is the FP8 cache step's, so a quantized cache is refused here rather than read
-        // without them.
-        let (key_scale, value_scale) = match (planes.key.dtype, group_view.scales) {
-            (ops::DType::F8E4M3, Some(_)) => {
-                return Err(Error::Unsupported(
-                    "Attention: an FP8 cache's per-page key and value scales are the FP8 KV-page \
-                     step; this attention reads only caches without them"
-                        .to_owned(),
-                ));
-            }
-            _ => (None, None),
+        // An FP8 cache stores each page divided by its own FP32 scale, one for keys and one for
+        // values; the descriptor's `kv` dtype decides whether the call carries them, so a mismatch
+        // in either direction is an argument error rather than a silently unscaled read.
+        let (key_scale, value_scale) = if planes.key.dtype == ops::DType::F8E4M3 {
+            let key = group_view.key_scales.ok_or_else(|| {
+                Error::shape(
+                    "Attention::attend",
+                    "an FP8 key cache needs its per-page scales".to_owned(),
+                )
+            })?;
+            let value = group_view.value_scales.ok_or_else(|| {
+                Error::shape(
+                    "Attention::attend",
+                    "an FP8 value cache needs its per-page scales".to_owned(),
+                )
+            })?;
+            (Some(key), Some(value))
+        } else {
+            (None, None)
         };
         let args = Args {
             query,

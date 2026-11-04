@@ -170,8 +170,11 @@ pub struct KvGroup<'a> {
     pub page_size: u32,
     /// Element type of the planes (BF16, or FP8 for an FP8 cache).
     pub dtype: DType,
-    /// Per-page scales of an FP8 cache, when the planes are FP8.
-    pub scales: Option<TensorView>,
+    /// `[pages, 1, 1, 1]` f32: each page's key scale, required for an FP8 cache and absent
+    /// otherwise. The page holds `key / scale`; the attention kernel multiplies it back in FP32.
+    pub key_scales: Option<TensorView>,
+    /// `[pages, 1, 1, 1]` f32: each page's value scale, as `key_scales`.
+    pub value_scales: Option<TensorView>,
     /// One entry per layer that reads this group, in model order.
     pub layers: &'a [KvPlanes],
 }
