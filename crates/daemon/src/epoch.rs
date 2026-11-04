@@ -878,6 +878,38 @@ impl Epochs {
     /// Fails when a main process does not answer the revert. The epochs'
     /// records are the previous generation's either way.
     pub fn revert_programs(&self, reason: &str) -> anyhow::Result<bool> {
+        self.revert_programs_because(reason, None)
+    }
+
+    /// Reverts the program-layer update on probation because a main process
+    /// failed, and records that failure as the update's first one (§7.3
+    /// step 4): a main process that exits, an executor it can no longer use, a
+    /// stuck job, a non-finite logit or a policy error all end the probation in
+    /// favour of the generation that served before it, and the update stays
+    /// unavailable with this failure until it is applied with `force` (§7.2).
+    ///
+    /// Answers whether an update was on probation to revert. A process that
+    /// cannot be told is logged, not returned: what serves is the previous
+    /// generation either way, and the report moves nothing.
+    pub fn program_failure(&self, failure: Failure) -> bool {
+        if !self.program_in_flight() {
+            return false;
+        }
+        let reason = format!("{}: {}", failure.kind, failure.reason);
+        if let Err(error) = self.revert_programs_because(&reason, Some(failure)) {
+            tracing::warn!(%error, "reverting the program update after a failure");
+        }
+        true
+    }
+
+    /// [`Self::revert_programs`], with the failure that caused an automatic
+    /// revert recorded as the update's first one when the processes did not
+    /// produce one themselves.
+    fn revert_programs_because(
+        &self,
+        reason: &str,
+        cause: Option<Failure>,
+    ) -> anyhow::Result<bool> {
         let Some(program) = self.program_update() else {
             return Ok(false);
         };
@@ -905,7 +937,13 @@ impl Epochs {
         );
         let outcome = switch.revert(reason);
         self.reverted(program.epoch);
-        *locked(&self.update) = Some(switch.update().clone());
+        let mut update = switch.update().clone();
+        // The failure that made the revert automatic is the update's first one
+        // unless a process reported one of its own while it was being told.
+        if let Some(cause) = cause {
+            update.fail(cause);
+        }
+        *locked(&self.update) = Some(update);
         *locked(&self.program) = None;
         if let Err(failure) = outcome {
             anyhow::bail!("reverting the program update: {}", failure.reason);
@@ -1418,6 +1456,75 @@ mod tests {
                 (7, Seen::Purge(11)),
                 (8, Seen::Purge(12)),
             ]
+        );
+    }
+
+    /// A main process that fails during the probation ends it in favour of the
+    /// generation that served before, and the update stays unavailable with the
+    /// failure that caused it until it is applied with `force` (§7.2, §7.3
+    /// step 4).
+    #[test]
+    fn a_main_process_failure_during_probation_reverts_the_program_update() {
+        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+
+        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs.clone();
+        epochs
+            .apply_programs(Update::new(1, target.clone()), vec![process("rank-0", 7)], false)
+            .expect("the update switches over");
+        assert!(epochs.program_in_flight());
+
+        let failure = Failure {
+            kind: "illegal_address".to_owned(),
+            reason: "the executor can no longer run".to_owned(),
+            device: Some(0),
+        };
+        assert!(
+            epochs.program_failure(failure.clone()),
+            "a failure during probation reverts the update"
+        );
+
+        // The previous generation serves again, nothing is in flight, and the
+        // update is unavailable for the failure that caused the revert.
+        let record = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(record.status, Status::Serving);
+        assert_eq!(record.policy, serving.programs.policy);
+        assert!(record.previous_policy.is_none());
+        assert!(epochs.program_update().is_none());
+        assert_eq!(
+            epochs.update().expect("the update is recorded").first_failure,
+            Some(failure.clone())
+        );
+        assert_eq!(epochs.unavailable(&target), Some(failure));
+        assert!(
+            !epochs.program_failure(Failure {
+                kind: "policy_error".to_owned(),
+                reason: "no probation to end".to_owned(),
+                device: None,
+            }),
+            "a failure after the revert moves nothing"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            matches!(seen.last(), Some((7, Seen::Revert(_)))),
+            "the main process was told to revert: {seen:?}"
         );
     }
 
