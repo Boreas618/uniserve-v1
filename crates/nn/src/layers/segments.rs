@@ -259,6 +259,49 @@ impl VsaTiles {
         f.operate::<segments::VsaComposeGatedRows>(&descriptor, args)
     }
 
+    /// Contract the pooled query and key tiles into the scores `select` ranks.
+    ///
+    /// `pooled_query` is `[heads, query tiles, width]` and `pooled_key` `[heads, tiles, width]`, both
+    /// of the layer's dtype; `scores` is `[heads, query tiles, tiles]` FP32, contiguous, written here
+    /// and read by [`Self::select`]. One dot product per (query tile, key tile) and head — no scale
+    /// and no softmax, because the selection only compares and the attention scales its own products.
+    pub fn scores(
+        &self,
+        f: &Forward,
+        pooled_query: TensorView,
+        pooled_key: TensorView,
+        scores: TensorView,
+    ) -> Result<()> {
+        if pooled_query.shape.rank() != 3 {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the pooled query is [heads, query tiles, width], not {:?}",
+                    pooled_query.shape.dims()
+                ),
+            ));
+        }
+        let width = u32::try_from(pooled_query.shape.dim(2)).map_err(|_| {
+            Error::shape(
+                "VsaTiles",
+                format!("{} features per head", pooled_query.shape.dim(2)),
+            )
+        })?;
+        let descriptor = segments::ScoresDescriptor::new(
+            pooled_query.dtype,
+            self.heads,
+            width,
+            width.next_power_of_two(),
+            false,
+        );
+        let args = segments::ScoresArgs {
+            pooled_query,
+            pooled_key,
+            out: scores,
+        };
+        f.operate::<segments::VsaScores>(&descriptor, args)
+    }
+
     /// Choose each query tile's key tiles from its pooled scores.
     ///
     /// `scores` is `[heads, query tiles, tiles]` FP32 contiguous; `segments` and `sizes` are

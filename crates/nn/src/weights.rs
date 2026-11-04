@@ -324,21 +324,48 @@ pub struct QuantizedWeight {
 /// A calibrated NVFP4 **stack of experts**, as `gather_gemm_nvfp4` and `route_gemm_nvfp4` read it.
 ///
 /// A model's expert block multiplies whole stacks: its weights are `[experts, rows, columns/2]` U8,
-/// its block scales carry one entry per expert, and the tensor scale varies per expert — so the
-/// scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may not build the table
-/// itself (constructing a weight is the loader's, not a model's). The loader publishes all three
-/// from the checkpoint's per-expert tensors: the encoded values and scales concatenated in the
-/// operator's reading order, and the reciprocals as a `[experts]` f32 weight.
+/// its block scales carry one entry per expert, and the tensor scale varies per expert **and per
+/// projection** — so the scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may
+/// not build the table itself (constructing a weight is the loader's, not a model's). The loader
+/// publishes all three from the checkpoint's per-expert, per-projection tensors: the encoded values
+/// and scales concatenated in the operator's reading order, and the reciprocals as an
+/// `[experts, projections]` f32 weight.
+///
+/// The stack fused from an expert's `up_proj` and `gate_proj` is why the second axis exists: each of
+/// those has its own `weight_scale_2` in the checkpoint, so one scalar per expert would dequantize
+/// the gate half with the up half's scale and be wrong by the ratio of the two, silently.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedStack {
     /// `[experts, rows, columns/2]` U8: two E2M1 codes a byte, packed along the contraction.
     pub values: Weight,
-    /// `[experts, ...]` U8: the block scales in [`Self::layout`], one per sixteen elements.
+    /// `[experts, ...]` in the checkpoint's scale type — `F8_E4M3`, or `U8` where the export labels
+    /// the same bytes as raw — the block scales in [`Self::layout`], one per sixteen elements.
+    /// Every expert of a stack agrees on it, and it is published unchanged: a model puts
+    /// [`Self::scales`]`.dtype()` in the product's descriptor and nothing converts.
     pub scales: Weight,
-    /// `[experts]` f32: the reciprocal of each expert's checkpoint tensor scale.
+    /// `[experts, projections]` f32, row-major, in the stack's own projection order: the reciprocal
+    /// of each expert's **per-projection** checkpoint tensor scale.
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
+}
+
+/// Whether `dtype` is one of the two element types a block-scale field may have.
+///
+/// The block scales are eight bits per sixteen elements, and a checkpoint stores each as an E4M3
+/// float — or, where an export labels the same bytes as raw, as `U8`. Both are one byte, both are
+/// published unchanged, and nothing converts: a reader that multiplied a scale by a constant would
+/// be wrong, and a loader that relabeled it would hide which one the checkpoint meant.
+fn block_scale_dtype(tensor: &str, dtype: DType) -> Result<DType> {
+    match dtype {
+        DType::U8 | DType::F8E4M3 => Ok(dtype),
+        other => Err(Error::weight(
+            tensor,
+            format!(
+                "block scales are one byte each — F8_E4M3, or U8 where the export says so — not                  {other}"
+            ),
+        )),
+    }
 }
 
 /// A weight a layer reads: its view and the region that keeps the bytes alive.
@@ -636,8 +663,10 @@ impl<'a> WeightLoader<'a> {
     /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
     ///
     /// `values` is `[rows, columns / 2]` U8 (two E2M1 codes a byte), `scales` holds the block
-    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names — U8, as every
-    /// program reads them — and `global_scale` is the reciprocal of the checkpoint's FP32 tensor
+    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names, in whatever
+    /// one-byte type the checkpoint stores them (`F8_E4M3`, or `U8` where the export says so;
+    /// [`QuantizedWeight::scales`]`.dtype()` is that type, unchanged), and `global_scale` is the
+    /// reciprocal of the checkpoint's FP32 tensor
     /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
     /// scales' product, which the runner copies into one device scalar once at load.
     pub fn nvfp4(
@@ -688,12 +717,7 @@ impl<'a> WeightLoader<'a> {
             ));
         }
         let scales = self.load(&scales_request)?;
-        if scales.dtype() != DType::U8 {
-            return Err(Error::weight(
-                &scales_request.tensor,
-                format!("block scales are U8 bytes, not {}", scales.dtype()),
-            ));
-        }
+        block_scale_dtype(&scales_request.tensor, scales.dtype())?;
         Ok(QuantizedWeight {
             packed,
             scales,
@@ -708,9 +732,13 @@ impl<'a> WeightLoader<'a> {
     /// The checkpoint stores each expert's projection as its own tensor, so a stack is a
     /// concatenation: expert-major, and within an expert the projections in `projections`' order
     /// (the gated product reads up first, gate second). The three fields answer the three the
-    /// operators take — packed values, block scales, and one reciprocal per expert — and all three
-    /// are published through retained storage under one key per field, so a second load of the same
-    /// checkpoint costs nothing.
+    /// operators take — packed values, block scales, and one reciprocal per **expert and
+    /// projection** — and all three are published through retained storage under one key per field,
+    /// so a second load of the same checkpoint costs nothing.
+    ///
+    /// The tensor scales are two per expert for a fused `up`/`gate` stack: the checkpoint gives each
+    /// projection its own `weight_scale_2`, and dequantizing the gate half with the up half's scale
+    /// would be wrong by the ratio of the two with nothing to show for it.
     ///
     /// `name` names the stack in keys and errors and must not collide with a tensor's: a computed
     /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a
@@ -741,6 +769,7 @@ impl<'a> WeightLoader<'a> {
         let mut scales_bytes = Vec::new();
         let mut reciprocals = Vec::with_capacity(experts as usize);
         let mut scale_shape = None;
+        let mut scale_dtype = None;
         for expert in 0..count {
             for projection in projections {
                 let stem = format!("{prefix}.{expert}.{projection}_proj");
@@ -786,11 +815,19 @@ impl<'a> WeightLoader<'a> {
                 agreed(&mut columns, columns_here, "columns")?;
 
                 let scales = self.checkpoint.read(&scales_name)?;
-                if scales.dtype != DType::U8 {
-                    return Err(Error::weight(
-                        &scales_name,
-                        format!("block scales are U8 bytes, not {}", scales.dtype),
-                    ));
+                let here = block_scale_dtype(&scales_name, scales.dtype)?;
+                match scale_dtype {
+                    None => scale_dtype = Some(here),
+                    Some(agreed) if agreed != here => {
+                        return Err(Error::weight(
+                            &scales_name,
+                            format!(
+                                "block scales are {here} here against the stack's {agreed}: one \
+                                 stack is one scale type"
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
                 }
                 let expected = layout.shape(rows_here, columns_here);
                 if scales.shape != expected {
@@ -871,10 +908,13 @@ impl<'a> WeightLoader<'a> {
             values_shape,
             &values_bytes,
         )?;
+        // The stack's scale type is the checkpoint's own: an E4M3 field stays E4M3, and the model
+        // puts it in the descriptor unchanged.
+        let scale_dtype = scale_dtype.unwrap_or(DType::U8);
         let scales = self.publish_computed(
             WeightKey {
                 files: files.clone(),
-                dtype: DType::U8,
+                dtype: scale_dtype,
                 layout: match layout {
                     ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
                     ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
@@ -901,11 +941,11 @@ impl<'a> WeightLoader<'a> {
                         .chain(names.iter().cloned())
                         .collect(),
                     start: 0,
-                    shape: Shape::new(&[count]),
+                    shape: Shape::new(&[count, per]),
                     stride: None,
                 },
             },
-            Shape::new(&[count]),
+            Shape::new(&[count, per]),
             &scale_bytes,
         )?;
         Ok(QuantizedStack {
