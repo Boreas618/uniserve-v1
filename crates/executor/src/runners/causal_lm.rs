@@ -1573,7 +1573,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "no graph of bucket {bucket} in generation {current}"
             )));
         }
-        let walked = self.walk_capture(bucket, self.generation.number(), &kernels)?;
+        // The walk is for the generation being *prepared*: its kernels are what the walk launches,
+        // and a recapture below inserts the result under that number. Recording the annotation
+        // against the serving generation here would describe a graph this walk never touched.
+        let walked = self.walk_capture(bucket, generation, &kernels)?;
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
