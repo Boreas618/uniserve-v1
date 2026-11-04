@@ -832,6 +832,39 @@ pub trait KvProvider: Send + Sync {
         Ok(())
     }
 
+    /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
+    /// batch's forward reads them.
+    ///
+    /// Two things happen here and nowhere else: the units the mechanism acquired for the request's
+    /// slot become the cache's own (an imported unit's flags say it holds bytes, so a later read
+    /// does not treat it as unwritten), and every `(source, destination)` pair is copied - the
+    /// request reuses a leased prefix, and a destination that still held an older page would serve
+    /// the wrong tokens. The source's lease is the mechanism's and runs to completion; the copy
+    /// reads it and never writes it.
+    ///
+    /// Issuing on the batch's stream is what orders the copy before the graph: the forward that
+    /// reads those pages runs on the same stream afterwards, so no barrier is needed and none is
+    /// taken (a barrier here would serialize the batch's own work).
+    ///
+    /// A provider that holds no cache refuses an allocation rather than dropping it: a batch whose
+    /// prefix copies were dropped serves the wrong pages, and a silent drop is the one failure this
+    /// seam must not have.
+    fn apply_cache_units(
+        &mut self,
+        units: &[ipc::CacheUnitAllocation],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        if units.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Unsupported(
+            "this runner's cache provider does not apply a batch's cache units, so a request \
+             reusing a cached prefix would read pages that were never copied"
+                .into(),
+        ))
+    }
+
     /// How many attention groups the model's layers index.
     fn groups(&self) -> usize;
 
@@ -1103,6 +1136,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // What the mechanism allocated for this batch's pages is applied here, on the batch's
+        // stream, before the replay: the copies it names must be in place when the graph reads
+        // those pages, and stream order is what puts them there. A batch that cannot be applied is
+        // refused at submit - the same place, and with the same kind of error, as any other batch
+        // this device cannot serve.
+        self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
         // The upload and the device views are staged by the executor's stream work, then the
         // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
         // and platform's allocator are published, the staging is as far as this path can go; the
