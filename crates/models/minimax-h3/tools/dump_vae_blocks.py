@@ -490,8 +490,30 @@ def run_encode_rows(options) -> int:
     layout = module.output_layout(size)["video"]
     shape = tuple(int(extent) for extent in layout.shape)
     print(f"layout  {shape}, the conditioner's input rows")
-    draw = torch.empty(module.posterior_shape(size), dtype=torch.float32, device=device)
-    module.draw_noise(size, draw)
+    # The noise the posterior is given. When the case names the draw the crate made, this reads it:
+    # two independent draws would put a difference of the same size as the encoder's own into every
+    # row, and the page would look like an arithmetic disagreement. A case that names no noise is
+    # the reference's own stream, said out loud.
+    shape_noise = tuple(int(extent) for extent in module.posterior_shape(size))
+    stated_noise = case.get("noise_file")
+    noise_path = Path(stated_noise) if isinstance(stated_noise, str) else None
+    if noise_path is not None and not noise_path.is_absolute():
+        noise_path = stack / noise_path
+    if noise_path is not None and noise_path.is_file():
+        draw = read_tensor(noise_path).to(device=device, dtype=torch.float32)
+        if tuple(int(extent) for extent in draw.shape) != shape_noise:
+            raise SystemExit(
+                f"{noise_path} holds {tuple(draw.shape)} where the encoder's posterior"
+                f" takes {shape_noise}: the case names a draw of another shape"
+            )
+        print(f"noise   {noise_path.name}: {shape_noise} read from the case")
+    else:
+        draw = torch.empty(shape_noise, dtype=torch.float32, device=device)
+        module.draw_noise(size, draw)
+        if noise_path is None:
+            print("noise   the case names none; the reference's own stream drew it")
+        else:
+            print(f"noise   {noise_path} is absent; the reference's own stream drew it")
     # The pattern the harness writes is an integer over 255, so scaling back is exact.
     frames_rgb = (
         pixels.mul(255.0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 3, 0)
