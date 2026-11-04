@@ -164,7 +164,7 @@ pub(crate) unsafe fn all_to_all(
 ///
 /// A sub-byte type has no collective counterpart: it travels inside a program's own encoded layout,
 /// never as a buffer a collective reads.
-pub(crate) fn collective_type(dtype: DType) -> Option<CollectiveType> {
+pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
     Some(match dtype {
         DType::U8 => CollectiveType::Uint8,
         DType::I32 => CollectiveType::Int32,
