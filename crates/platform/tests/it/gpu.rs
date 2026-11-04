@@ -18,8 +18,8 @@ use platform::{
     GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library,
     Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
     Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
-    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
-    memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, WaitValue,
+    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -226,6 +226,84 @@ fn strided_copies_match_the_reference_in_every_direction() {
     }
     stream.synchronize().unwrap();
     assert_eq!(read(&host), pattern);
+}
+
+/// One stream tells another that work is done by writing a 32-bit flag the
+/// other waits on, and nothing on the host polls or synchronizes in between: the
+/// reading stream's copy observes the fill only because the wait held it until
+/// the writer's write landed, and the two conditions exercised release on the
+/// value they name.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_wait_on_a_written_flag_orders_one_stream_behind_another() {
+    let _driver = exclusive_driver();
+    let writing = Stream::new(DEVICE).unwrap();
+    let reading = Stream::new(DEVICE).unwrap();
+    let data = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+    let flag = DeviceAllocation::linear(DEVICE, 4).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 4096).unwrap();
+    let flag_address = DevicePtr::from_address(flag.address());
+
+    // The flag starts at zero before either side of the handoff is queued, so
+    // the wait below cannot be satisfied by whatever the allocation happened to
+    // contain.
+    // SAFETY: the flag lies inside `flag`, which outlives the synchronization.
+    unsafe { memset_d32(flag.address(), 0, 1, &writing) }.unwrap();
+    writing.synchronize().unwrap();
+
+    // The reader queues its wait before the writer queues anything, so a pass
+    // says the wait did the ordering rather than the order of submission.
+    // SAFETY: every range lies inside an allocation that outlives the
+    // synchronization below.
+    unsafe {
+        reading
+            .wait_value32(flag_address, 1, WaitValue::Equal)
+            .unwrap();
+        memcpy_async(host.address(), data.address(), 4096, &reading).unwrap();
+        memset_d32(data.address(), 0x5a5a_5a5a, 1024, &writing).unwrap();
+        writing.write_value32(flag_address, 1).unwrap();
+    }
+    reading.synchronize().unwrap();
+
+    assert!(
+        read(&host).iter().all(|byte| *byte == 0x5a),
+        "the reader observed the fill because the flag ordered it"
+    );
+
+    // The flag reads back as written, so the wait released on the value it
+    // names rather than on something else.
+    // SAFETY: the copy reads inside `flag`, and the host buffer holds four bytes.
+    unsafe { memcpy_async(host.address(), flag.address(), 4, &reading) }.unwrap();
+    reading.synchronize().unwrap();
+    assert_eq!(u32::from_ne_bytes(read(&host)[..4].try_into().unwrap()), 1);
+
+    // The bit-test condition holds while no bit of the value is set and
+    // releases once one is: an event recorded behind the wait says whether the
+    // stream got past it, so the wait is observed without a host block.
+    let passed = Event::new(EventFlags::default());
+    // SAFETY: the flag lies inside `flag`, which outlives this block.
+    unsafe { memset_d32(flag.address(), 0, 1, &writing) }.unwrap();
+    writing.synchronize().unwrap();
+    // SAFETY: the wait names the same flag the writer just wrote.
+    reading
+        .wait_value32(flag_address, 2, WaitValue::AnyBitSet)
+        .unwrap();
+    passed.record(&reading).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        !passed.query().unwrap(),
+        "a flag without the named bit leaves the wait outstanding"
+    );
+
+    // SAFETY: as above, and the write is ordered behind nothing the reader
+    // needs beyond the flag itself.
+    unsafe { memset_d32(flag.address(), 2, 1, &writing) }.unwrap();
+    writing.write_value32(flag_address, 2).unwrap();
+    reading.synchronize().unwrap();
+    assert!(
+        passed.query().unwrap(),
+        "the wait releases once the flag has the named bit"
+    );
 }
 
 #[test]
