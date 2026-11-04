@@ -93,6 +93,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _, Result};
 use clap::Args;
 
+use crate::engine_plan::EpochPlan;
+use daemon::epoch::BuildConfig;
+use engine::{PolicyProgram, PolicySource, ProgramSource};
 use executor::batch::Submission;
 use executor::blocking::{BlockingKind, ThreadPool};
 use executor::completion::Outcome;
@@ -104,9 +107,6 @@ use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
-use crate::engine_plan::EpochPlan;
-use daemon::epoch::BuildConfig;
-use engine::{PolicyProgram, PolicySource, ProgramSource};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -260,9 +260,11 @@ impl ProcessInterface {
             major: proto::PROTOCOL_MAJOR,
             minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
-            peer: Some(proto::process::hello::Peer::Engine(proto::process::Engine {
-                deployment: deployment.to_owned(),
-            })),
+            peer: Some(proto::process::hello::Peer::Engine(
+                proto::process::Engine {
+                    deployment: deployment.to_owned(),
+                },
+            )),
         })?;
         // The welcome is the daemon's acceptance of this process: a node that has not admitted it
         // would mint a claim for a process it does not supervise, so nothing is asked before it
@@ -332,7 +334,10 @@ impl ProcessInterface {
                     return Ok(reply);
                 }
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
-                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                    tracing::warn!(
+                        id = reply.id,
+                        "an answer to a request this process did not send"
+                    );
                 }
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 None => {}
@@ -356,7 +361,10 @@ impl ProcessInterface {
             match message.kind {
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
-                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                    tracing::warn!(
+                        id = reply.id,
+                        "an answer to a request this process did not send"
+                    );
                 }
                 None => {}
             }
@@ -395,19 +403,21 @@ fn claim(
 ) -> Result<ipc::StorageLaunch> {
     let request = proto::process::Request {
         id: 1,
-        kind: Some(proto::process::request::Kind::Claim(proto::process::Claim {
-            host: host.to_owned(),
-            deployment: launch.deployment.clone(),
-            scopes: vec![proto::process::Scope {
-                group: launch.group.clone(),
-                rank: launch.rank,
-            }],
-            // A server the daemon starts for this claim takes the deployment's connector settings;
-            // the main process has none of its own to state.
-            server_arguments: Vec::new(),
-            world: launch.world,
-            retire: Vec::new(),
-        })),
+        kind: Some(proto::process::request::Kind::Claim(
+            proto::process::Claim {
+                host: host.to_owned(),
+                deployment: launch.deployment.clone(),
+                scopes: vec![proto::process::Scope {
+                    group: launch.group.clone(),
+                    rank: launch.rank,
+                }],
+                // A server the daemon starts for this claim takes the deployment's connector settings;
+                // the main process has none of its own to state.
+                server_arguments: Vec::new(),
+                world: launch.world,
+                retire: Vec::new(),
+            },
+        )),
     };
     let reply = process.request(request, CLAIM_TIMEOUT)?;
     if !reply.error.is_empty() {
@@ -467,12 +477,7 @@ pub(crate) fn run(
         std::fs::File::open(&launch.build_config)
             .with_context(|| format!("opening {}", launch.build_config.display()))?,
     )
-    .with_context(|| {
-        format!(
-            "reading the build config {}",
-            launch.build_config.display()
-        )
-    })?;
+    .with_context(|| format!("reading the build config {}", launch.build_config.display()))?;
     let mut main = MainProcess::start(&launch, &build)?;
     let ending = main.serve();
     main.close();
@@ -655,13 +660,8 @@ impl MainProcess {
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
-            let executor = Executor::spawn(
-                *device,
-                runners,
-                plan.events(),
-                Arc::clone(&pools),
-                scratch,
-            )?;
+            let executor =
+                Executor::spawn(*device, runners, plan.events(), Arc::clone(&pools), scratch)?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
@@ -732,9 +732,11 @@ impl MainProcess {
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
         self.send_report(proto::process::Report {
-            kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
-                generation: self.update.current(),
-            })),
+            kind: Some(proto::process::report::Kind::Parked(
+                proto::process::Parked {
+                    generation: self.update.current(),
+                },
+            )),
         });
         Ok(())
     }
@@ -763,7 +765,10 @@ impl MainProcess {
             let stall = self.watchdog.deadline(oldest(&running));
             let mut due = reported + METRICS_EVERY;
             if self.rollback.is_some()
-                && matches!(self.update.phase(), executor::hot_update::Phase::Probation { .. })
+                && matches!(
+                    self.update.phase(),
+                    executor::hot_update::Phase::Probation { .. }
+                )
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
@@ -1008,7 +1013,11 @@ impl MainProcess {
                             // A request that does not convert is the daemon's, not this process's:
                             // it ends with the refusal's event and every other request of the
                             // submission is still admitted.
-                            self.reject(id, proto::request::RejectionKind::Invalid, error.to_string());
+                            self.reject(
+                                id,
+                                proto::request::RejectionKind::Invalid,
+                                error.to_string(),
+                            );
                             continue;
                         }
                     };
@@ -1019,14 +1028,12 @@ impl MainProcess {
                     match scheduler.submit(request) {
                         Ok(stream) => {
                             self.streams.push((id, rank, stream));
-                            self.send_event(
-                                proto::request::wire::from_engine::Kind::Accepted(
-                                    proto::request::wire::Accepted {
-                                        request: id,
-                                        scheduler: rank as u32,
-                                    },
-                                ),
-                            );
+                            self.send_event(proto::request::wire::from_engine::Kind::Accepted(
+                                proto::request::wire::Accepted {
+                                    request: id,
+                                    scheduler: rank as u32,
+                                },
+                            ));
                         }
                         Err(error) => {
                             let kind = match error {
@@ -1085,9 +1092,11 @@ impl MainProcess {
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
                     self.send_report(proto::process::Report {
-                        kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
-                            generation: current,
-                        })),
+                        kind: Some(proto::process::report::Kind::Parked(
+                            proto::process::Parked {
+                                generation: current,
+                            },
+                        )),
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
@@ -1289,14 +1298,20 @@ impl MainProcess {
             let mut known: Vec<String> = learned.get(operator).cloned().unwrap_or_default();
             if keys.is_empty() {
                 if listing.is_none() {
-                    listing = Some(self.listing().map_err(invalid)?);
+                    let read = self.listing().map_err(invalid)?;
+                    listing = Some(read);
                 }
-                let declared = built_keys(
-                    listing.as_ref().expect("the listing was read above"),
-                    &slot.op,
-                    program,
-                    &self.targets,
-                );
+                // The slot was filled immediately above. Reading it through a match rather than a
+                // panic keeps a fault in this function a named refusal, not a dead process: the
+                // workspace denies `expect` for exactly that reason.
+                let declared = match listing.as_ref() {
+                    Some(store) => built_keys(store, &slot.op, program, &self.targets),
+                    None => {
+                        return Err(invalid(
+                            "the Program Server's listing was not read".to_owned(),
+                        ));
+                    }
+                };
                 if declared.is_empty() {
                     // The listing names the modules this host has *built*, not what the package
                     // declares, so an empty answer is a host that built none yet - not a program
@@ -1331,10 +1346,7 @@ impl MainProcess {
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             let Some(target) = self.targets.get(index).cloned() else {
-                return Err(invalid(format!(
-                    "device {} has no build target",
-                    ordinal.0
-                )));
+                return Err(invalid(format!("device {} has no build target", ordinal.0)));
             };
             let install = Install {
                 programs: Arc::clone(&self.programs),
@@ -1393,7 +1405,6 @@ impl MainProcess {
         self.warming = pending;
         Ok(None)
     }
-
 
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
@@ -1509,15 +1520,17 @@ impl MainProcess {
                                 "the walk names a descriptor key this generation learns"
                             );
                             precopy.learned.entry(operator).or_default().push(key);
-                            let tasks = match self.admit_installs(
-                                &precopy.programs,
-                                &precopy.learned,
-                            ) {
-                                Ok(tasks) => tasks,
-                                Err(failure) => {
-                                    return self.abandon_precopy(generation, failure, precopy.reply);
-                                }
-                            };
+                            let tasks =
+                                match self.admit_installs(&precopy.programs, &precopy.learned) {
+                                    Ok(tasks) => tasks,
+                                    Err(failure) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            failure,
+                                            precopy.reply,
+                                        );
+                                    }
+                                };
                             precopy.stage = PrecopyStage::Modules(tasks);
                             self.precopy = Some(precopy);
                             return Ok(());
@@ -1704,8 +1717,7 @@ impl MainProcess {
         // *served* - a reverse switchover on every device - and not a discard of one that never
         // cut over, which is what the phase decides, and it cannot be asked before this line.
         self.update.switchover(generation, Instant::now())?;
-        self.retired =
-            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+        self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
 
         // §4.5: the first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
@@ -1851,7 +1863,10 @@ impl MainProcess {
                 window.as_secs()
             ),
         };
-        tracing::info!(seconds = window.as_secs(), "an update outlived its probation and is reverted");
+        tracing::info!(
+            seconds = window.as_secs(),
+            "an update outlived its probation and is reverted"
+        );
         // A device that cannot put the generation that served back is a device with no generation at
         // all: the revert's refusal is the epoch's, and it ends by that name rather than continuing to
         // serve a generation the process has just decided it cannot stand behind.
@@ -1968,7 +1983,10 @@ impl MainProcess {
                 _ => executor.revert(current),
             };
             let submission = queued.with_context(|| {
-                format!("queueing device {}'s revert to generation {current}", device.0)
+                format!(
+                    "queueing device {}'s revert to generation {current}",
+                    device.0
+                )
             })?;
             device_command(&self.watchdog, device, "revert", submission)?;
         }
@@ -2074,7 +2092,8 @@ impl MainProcess {
         let Some(scheduler) = self.schedulers.get(*rank) else {
             tracing::debug!(
                 request = command.request,
-                rank, "a request command names a rank this node does not hold"
+                rank,
+                "a request command names a rank this node does not hold"
             );
             return Ok(());
         };
@@ -2112,15 +2131,13 @@ impl MainProcess {
                     error: WORKER_ERA.to_owned(),
                 }),
             ),
-            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
-                Some(proto::request::wire::from_engine::Kind::Hooked(
-                    proto::request::wire::Hooked {
-                        id: resize.id,
-                        results: Vec::new(),
-                        error: WORKER_ERA.to_owned(),
-                    },
-                ))
-            }
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: resize.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
             Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
                 proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
                     id: update.id,
@@ -2168,14 +2185,14 @@ impl MainProcess {
             ),
             // The scheduling limits are the schedulers', applied at their next step through the
             // policy slot the process connection names (§4.4).
-            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => Some(
-                proto::request::wire::from_engine::Kind::Configured(
+            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => {
+                Some(proto::request::wire::from_engine::Kind::Configured(
                     proto::request::wire::Configured {
                         id: configure.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                     },
-                ),
-            ),
+                ))
+            }
             // The storage ledgers and the transfer budgets are each node's daemon's, read over
             // its claim (§8); an epoch's main process holds no claim of the deployment's.
             Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
@@ -2194,24 +2211,24 @@ impl MainProcess {
             ),
             // What the prefix cache holds is the schedulers' answer, and they are asked through
             // the process connection.
-            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => Some(
-                proto::request::wire::from_engine::Kind::CacheDescribed(
+            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => {
+                Some(proto::request::wire::from_engine::Kind::CacheDescribed(
                     proto::request::wire::CacheDescribed {
                         id: describe.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                         segments: Vec::new(),
                     },
-                ),
-            ),
-            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => Some(
-                proto::request::wire::from_engine::Kind::RequestsDescribed(
+                ))
+            }
+            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => {
+                Some(proto::request::wire::from_engine::Kind::RequestsDescribed(
                     proto::request::wire::RequestsDescribed {
                         id: describe.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                         requests: Vec::new(),
                     },
-                ),
-            ),
+                ))
+            }
             // Promote, FlushCache and Attach state no id and are answered with a state this
             // process does not own: there is nothing to answer on, and a log line is what is
             // left.
@@ -2271,7 +2288,8 @@ impl MainProcess {
         }
         // The schedulers state their own figures; a node that holds none reports the executors'
         // and a step count of zero, because no step happened here.
-        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) = (0, 0, 0, 0, 0);
+        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) =
+            (0, 0, 0, 0, 0);
         for scheduler in &self.schedulers {
             // A scheduler answers its counters on its own thread: a metrics report is not worth
             // stalling the control thread for, so the pass takes what is there.
@@ -2473,7 +2491,11 @@ impl MainProcess {
         let program = PolicyProgram::from_arguments(
             policy.backend.clone(),
             policy.revision,
-            &policy.arguments.iter().map(|(name, value)| (name.clone(), value.to_string())).collect(),
+            &policy
+                .arguments
+                .iter()
+                .map(|(name, value)| (name.clone(), value.to_string()))
+                .collect(),
         )
         .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
         let source = Arc::new(
@@ -2493,7 +2515,11 @@ impl MainProcess {
     /// node can name; the control thread does not choose one.
     fn switchover_policy(&self, _generation: u64, _step: Option<u64>) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(scheduler.switchover_policy(), self.watchdog.stall_bound(), "the policy switchover") {
+            if let Err(error) = answer(
+                scheduler.switchover_policy(),
+                self.watchdog.stall_bound(),
+                "the policy switchover",
+            ) {
                 tracing::error!(%error, "switching the scheduling policy failed");
             }
         }
@@ -2511,7 +2537,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(scheduler.revert_policy(), self.watchdog.stall_bound(), "the policy revert") {
+            if let Err(error) = answer(
+                scheduler.revert_policy(),
+                self.watchdog.stall_bound(),
+                "the policy revert",
+            ) {
                 tracing::error!(%error, "reverting the scheduling policy failed");
             }
         }
@@ -2536,11 +2566,9 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied { generation } => {
-            Kind::Precopied(proto::process::Precopied {
-                generation: *generation,
-            })
-        }
+        ProgramStatus::Precopied { generation } => Kind::Precopied(proto::process::Precopied {
+            generation: *generation,
+        }),
         ProgramStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {
                 reason: failure.reason(),
@@ -2550,11 +2578,9 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
             generation: *generation,
         }),
         ProgramStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
-        ProgramStatus::Reverted { reason, .. } => {
-            Kind::Reverted(proto::process::Reverted {
-                reason: reason.clone(),
-            })
-        }
+        ProgramStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {
+            reason: reason.clone(),
+        }),
         ProgramStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
             generation: *generation,
         }),
@@ -2800,9 +2826,11 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
             // The image's kernel symbol is its metadata's name; without metadata the package names
             // the entry itself, and `ops` falls back to the module's single entry.
             let entry = match &metadata {
-                Some(metadata) => ops::CubinMetadata::parse(metadata)
-                    .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
-                    .name,
+                Some(metadata) => {
+                    ops::CubinMetadata::parse(metadata)
+                        .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
+                        .name
+                }
                 None => String::new(),
             };
             Ok(Resolved {
@@ -2814,9 +2842,7 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
         }
         program_server::manifest::ModuleForm::Native => {
             let Some(entry) = module.entries.get(program_server::manifest::LAUNCH_ENTRY) else {
-                return Err(invalid(
-                    "a native module states no launch entry".to_owned(),
-                ));
+                return Err(invalid("a native module states no launch entry".to_owned()));
             };
             let Some(file) = files.next() else {
                 return Err(invalid("a native module carries no library".to_owned()));
@@ -2894,10 +2920,13 @@ impl HostAction for Install {
                         ))
                     })?;
                 let module = resolved(module)?;
-                let entry = ops::install(&self.device, operator, &key, module.as_ops()?)
-                    .map_err(|error| {
-                        executor::Error::Invalid(format!("installing {operator} for {key}: {error}"))
-                    })?;
+                let entry = ops::install(&self.device, operator, &key, module.as_ops()?).map_err(
+                    |error| {
+                        executor::Error::Invalid(format!(
+                            "installing {operator} for {key}: {error}"
+                        ))
+                    },
+                )?;
                 if let Some(entry) = entry {
                     entries.push(entry);
                 }
@@ -3079,9 +3108,9 @@ fn schedulers(
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
-        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?,
-    );
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(executor::batch::Executors::shared(
+        executors.iter().map(Arc::clone).collect(),
+    )?);
     let handle = engine::SchedulerHandle::over_batches(config, batches)?;
     Ok(vec![handle])
 }
@@ -3124,6 +3153,3 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         host: spec.host,
     })
 }
-
-
-
