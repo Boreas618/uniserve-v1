@@ -121,6 +121,9 @@ const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
 /// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
 const VAE_WIDTH: u32 = 32 * 64;
 
+/// The video VAE's spatial compression: 256 output pixels per 16 latent columns.
+const VAE_SPATIAL_COMPRESSION: u32 = 16;
+
 /// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
 /// `[rows, 8192]`).
 const VAE_MLP: u32 = 8192;
@@ -646,19 +649,35 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The seam between two decoded tiles, five voxels of overlap along the height.
+    // The seam between two decoded tiles - **every width the model can hand the operator**, on both
+    // axes, because both are compiled loop bounds rather than launch values.
+    //
+    // `decoding.rs`'s `ClipDecoder::new` builds one blend per overlap its tile grid can produce:
+    // `extent` starts at `video_vae::MINIMUM_OVERLAP` (64 output pixels) and grows by the alignment
+    // (`spatial_compression`, 16) while it is under `TILE_PIXELS` (256), for axes 2 (height) and 3
+    // (width). That is twelve widths on two axes per element type, and a seam only appears where a
+    // canvas is larger than one tile - which is why a row set written from the one-tile case held a
+    // single `extent 5`, a width this code has not built since the blend moved from latent voxels to
+    // output pixels. A 768 x 1344 clip decodes as 3 x 6 tiles and would have stopped on the first seam.
     for vae in VAES {
-        push(
-            "cross_fade",
-            ops::cross_fade::Descriptor {
-                dtype: vae,
-                extent: 5,
-                axis: 2,
-                block: ops::cross_fade::BLOCK,
-                pdl: PDL,
+        let mut extent = minimax_h3::video_vae::MINIMUM_OVERLAP;
+        while extent < minimax_h3::video_vae::TILE_PIXELS {
+            for axis in [2_u32, 3] {
+                push(
+                    "cross_fade",
+                    ops::cross_fade::Descriptor {
+                        dtype: vae,
+                        extent,
+                        axis,
+                        block: ops::cross_fade::BLOCK,
+                        pdl: PDL,
+                    }
+                    .to_string(),
+                );
             }
-            .to_string(),
-        );
+            // The step is the config's spatial compression (16): a seam widens by one alignment unit.
+            extent += VAE_SPATIAL_COMPRESSION;
+        }
     }
     // The video decoder's per-head normalization fused with its rotation - **no learned gain**, which
     // is what `affine_false` states and what makes this a different program from the DiT's row.
