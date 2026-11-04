@@ -3,6 +3,7 @@
 //! completions, and applies them in request-local dependency order; a diffusion
 //! request's results advance its media flow until it finishes.
 
+use crate::scheduler::completion::{BatchReport, CallCompletion};
 use super::*;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
@@ -23,11 +24,7 @@ impl Scheduler {
     /// records a failure intent, a running token request finishes with an
     /// error. `apply_result` releases queued completions in dependency order
     /// through `Inflight::take_ready_completions`.
-    pub(in crate::scheduler) fn queue_completion(
-        &mut self,
-        mut record: ipc::CallOutput,
-        media: Result<Option<Arc<SharedMedia>>, ipc::SharedMediaError>,
-    ) {
+    pub(in crate::scheduler) fn queue_completion(&mut self, mut record: CallCompletion) {
         let id = record.request_key.request_id;
         let call_id = record.call_id;
         let known = self.inflight.pending_calls.get(&id).is_some_and(|queue| {
@@ -53,7 +50,9 @@ impl Scheduler {
         // Output storage the executor could not claim fails the call rather
         // than dropping its completion, so request-local ordering still sees
         // the call return.
-        let media = match media {
+        // The claim moves into the pending completion, which keeps its storage
+        // alive while the result waits; the record keeps an empty claim.
+        let media = match std::mem::replace(&mut record.media, Ok(None)) {
             Ok(media) => media,
             Err(error) => {
                 // The client's message carries the failed step and its cause.
@@ -102,7 +101,7 @@ impl Scheduler {
         &mut self,
         call: Call,
         decode: Option<DecodeRange>,
-        record: ipc::CallOutput,
+        record: CallCompletion,
         media: Option<Arc<SharedMedia>>,
     ) {
         let id = record.request_key.request_id;
@@ -483,7 +482,7 @@ impl Scheduler {
     ///    `Inflight::take_ready_completions` releases it in request-local
     ///    dependency order, then reclaim resources and resolve the public
     ///    effects in lifecycle priority and arrival order.
-    pub(in crate::scheduler) fn apply_result(&mut self, report: BatchResult) {
+    pub(in crate::scheduler) fn apply_result(&mut self, report: BatchReport) {
         let result_batch_id = report.batch_id;
         // Aggregate timings by the stable public metric groups, one slot per
         // `ExecutionDomainStats::groups` entry. Multiple concrete calls in one
@@ -510,10 +509,10 @@ impl Scheduler {
         // trial applies nothing of the batch and fails as a whole, and its
         // requests continue on the previous world (`hand_back_requests`).
         let faulted: Vec<u64> = report
-            .results
+            .calls
             .iter()
-            .filter(|result| result.output.error_code == Some(ipc::ErrorCode::NumericalFault))
-            .map(|result| result.output.request_key.request_id.0)
+            .filter(|call| call.error_code == Some(ipc::ErrorCode::NumericalFault))
+            .map(|call| call.request_key.request_id.0)
             .collect();
         if !faulted.is_empty() {
             self.stats
@@ -535,8 +534,8 @@ impl Scheduler {
 
         // Consume each expected call identity exactly once while folding the
         // rank-local timing records into their scheduler domains.
-        for result in &report.results {
-            let record = &result.output;
+        for result in &report.calls {
+            let record = &result;
             let identity = (record.request_key, record.call_id);
             let removed = self
                 .inflight
@@ -591,9 +590,9 @@ impl Scheduler {
         if batch_complete {
             let succeeded = !invalid_result
                 && report
-                    .results
+                    .calls
                     .iter()
-                    .all(|result| result.output.status != ipc::CallStatus::Error);
+                    .all(|call| call.status != ipc::CallStatus::Error);
             if let Some(kv_offload) = self.kv_offload.as_mut() {
                 kv_offload.completed(result_batch_id, succeeded);
             }
@@ -608,8 +607,8 @@ impl Scheduler {
         // Publish domain and batch accounting before individual request state is
         // advanced, so every accepted completion contributes exactly once.
         let forward_stats = report.forward_stats;
-        for result in &report.results {
-            let record = &result.output;
+        for result in &report.calls {
+            let record = &result;
             if let Some(kind) = self
                 .inflight
                 .pending_calls
@@ -708,8 +707,8 @@ impl Scheduler {
         // is at the front of its request's queue, or independent media calls
         // whose input producers have resolved; applying one can make others
         // ready, so the loop repeats until none are.
-        for result in report.results {
-            self.queue_completion(result.output, result.media);
+        for result in report.calls {
+            self.queue_completion(result);
         }
 
         loop {
