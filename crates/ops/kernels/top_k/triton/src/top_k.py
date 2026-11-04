@@ -33,14 +33,16 @@ def _monotone(values):
     negative = (bits >> 31) == 1
     # Negatives invert and positives flip their sign bit, which is the standard
     # order-preserving map of IEEE floats onto unsigned integers.
-    return tl.where(negative, ~bits, bits | 0x80000000)
+    # `bits ^ 0xFFFFFFFF` rather than `~bits`: the interpreter `~` turns a uint32 into the Python
+    # integer -1 and refuses it, and the XOR is the same value on both.
+    return tl.where(negative, bits ^ 0xFFFFFFFF, bits | 0x80000000)
 
 
 @triton.jit
 def _value_of(keys):
     """Map order-preserving unsigned keys back to FP32 values."""
     sign = (keys >> 31) == 1
-    bits = tl.where(sign, keys ^ 0x80000000, ~keys)
+    bits = tl.where(sign, keys ^ 0x80000000, keys ^ 0xFFFFFFFF)
     return bits.to(tl.float32, bitcast=True)
 
 
