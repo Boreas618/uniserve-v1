@@ -225,13 +225,17 @@ def main() -> int:
         help="run through Triton's interpreter instead of a device",
     )
     arguments = parser.parse_args()
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     key = (
         f"dtype_{arguments.dtype}_width_{arguments.width}"
