@@ -599,3 +599,62 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
 }
+
+/// An executable program package: a program the main process runs as its own
+/// process, stored as it is (design section 5.1).
+const EXECUTABLE_MANIFEST: &str = r#"
+op = "sampler"
+backend = "process"
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "executable"
+
+[source]
+kind = "executable"
+files = ["bin/sampler"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"] } }
+"#;
+
+#[test]
+fn an_executable_program_is_installed_stored_and_resolved_as_it_is() {
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("sampler-process");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    std::fs::write(package.join("package.toml"), EXECUTABLE_MANIFEST).unwrap();
+    // A program is what its bytes say it is; this one only has to survive the
+    // round trip, so the test does not run it.
+    let program = b"#!/bin/sh\nexit 0\n".to_vec();
+    std::fs::write(package.join("bin/sampler"), &program).unwrap();
+
+    let witness = witness(
+        &package,
+        "sampler",
+        "process",
+        "dtype_bf16",
+        ToolchainConfig {
+            nvcc: None,
+            python: temporary.path().join("no-python"),
+            wasm: None,
+            max_jobs: 1,
+        },
+    );
+    assert_eq!(witness.progress[0].state, BuildState::Committed);
+    assert_eq!(witness.resolved.form, ModuleForm::Executable);
+    assert!(witness.resolved.metadata.is_none());
+    assert!(witness.resolved.entries.is_empty());
+    assert_eq!(
+        file_of(&witness.resolved, "bin/sampler"),
+        program,
+        "the module is the package's program, byte for byte"
+    );
+
+    witness.stop.store(true, Ordering::SeqCst);
+    witness.thread.join().unwrap();
+}
