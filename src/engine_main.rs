@@ -658,6 +658,13 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
+        // A drain is the epoch layer's, and it answers the daemon: the frontend admits nothing
+        // from the boundary the schedulers reached, and the facts of the requests in flight are
+        // kept for the `Serve` that resumes this process on another request address (§2.3).
+        let draining = match &command.kind {
+            Some(proto::process::command::Kind::Drain(drain)) => Some(drain.epoch),
+            _ => None,
+        };
         let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
             // Park, Promote, Drain, Pause, Serve and Shutdown are the epoch layer's: every scheduler
             // applies them at its own next boundary, and answers when it did (§2.5, §7.3 step 6).
@@ -667,6 +674,13 @@ impl MainProcess {
                     self.watchdog.stall_bound(),
                     "an engine command",
                 )?;
+            }
+            if let Some(epoch) = draining {
+                self.send_report(proto::process::Report {
+                    kind: Some(proto::process::report::Kind::Drained(
+                        proto::process::Drained { epoch },
+                    )),
+                });
             }
             return Ok(None);
         };
@@ -1303,10 +1317,29 @@ impl MainProcess {
     /// the schema, the status reaches the daemon through the epoch record the
     /// daemon itself reads back at `GET /admin/config` and through the log.
     fn report(&mut self, status: ProgramStatus) {
-        // The daemon reads an epoch's status back at `GET /admin/config`; the
-        // main process states it on the request interface (front's `Report`
-        // vocabulary, `crates/proto/src/process.proto`).
-        tracing::info!(?status, "a program-layer status is reported");
+        // §7.3's answers, in the vocabulary the daemon's epoch record reads: a precopy that
+        // finished, the switchover, the commit, the revert and the purge, each naming its
+        // generation, and a failure carrying the first error. The daemon needs no answer to any of
+        // them; it marks the epoch's state with what it is told, and the probation's rules are
+        // applied on these reports.
+        let Some(report) = report_of(&status) else {
+            tracing::debug!(?status, "a program-layer status needs no report");
+            return;
+        };
+        self.send_report(report);
+    }
+
+    /// States one report to the daemon (§7.3).
+    ///
+    /// A report is unasked, so a failure to state it costs the daemon's record and not this
+    /// process's service: it is logged, and the epoch's own transition has already happened.
+    fn send_report(&mut self, report: proto::process::Report) {
+        let upstream = proto::process::Upstream {
+            kind: Some(proto::process::upstream::Kind::Report(report)),
+        };
+        if let Err(error) = self.control.daemon_mut().send(&upstream) {
+            tracing::warn!(%error, "reporting this epoch's state to the daemon failed");
+        }
     }
 
     /// Stops every thread in dependency order and releases the owners (§2.4).
@@ -1396,6 +1429,62 @@ impl MainProcess {
             let _ = scheduler.revert_policy();
         }
     }
+}
+
+/// The report one program-layer status states (§7.3).
+///
+/// A status the daemon learns another way - none today - answers `None`, and the caller logs it
+/// instead of inventing a report.
+fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
+    use proto::process::report::Kind;
+
+    let kind = match status {
+        ProgramStatus::Precopied { generation } => {
+            Kind::Precopied(proto::process::Precopied {
+                generation: *generation,
+            })
+        }
+        ProgramStatus::PrecopyFailed { failure, .. } => {
+            Kind::PrecopyFailed(proto::process::PrecopyFailed {
+                reason: failure.reason(),
+            })
+        }
+        ProgramStatus::Switched { generation } => Kind::Switched(proto::process::Switched {
+            generation: *generation,
+        }),
+        ProgramStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
+        ProgramStatus::Reverted { reason, .. } => {
+            Kind::Reverted(proto::process::Reverted {
+                reason: reason.clone(),
+            })
+        }
+        ProgramStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
+            generation: *generation,
+        }),
+        // A policy that failed is reported with the backend and revision it came from, so the
+        // daemon's record takes the previous policy back (§4.4, §7.3).
+        ProgramStatus::PolicyReverted {
+            scheduler,
+            backend,
+            revision,
+            reason,
+            fatal,
+        } => Kind::PolicyReverted(proto::process::PolicyReverted {
+            scheduler: Some(*scheduler),
+            backend: backend.clone(),
+            revision: *revision,
+            reason: reason.clone(),
+            fatal: *fatal,
+        }),
+        // A probation failure is a fault the main process observed, and the revert that follows
+        // states the generation it left (§7.3 step 4).
+        ProgramStatus::Failed { failure, .. } => Kind::Fault(proto::process::Fault {
+            kind: "probation".to_owned(),
+            reason: failure.reason(),
+            device: 0,
+        }),
+    };
+    Some(proto::process::Report { kind: Some(kind) })
 }
 
 /// Polls one set of scheduler answers (§7.3 steps 2 and 3).
