@@ -81,6 +81,78 @@ def per_row(actual, expected):
     return np.max(np.abs(actual - expected) / scale, axis=1)
 
 
+def compare_delta(arguments, order, first):
+    """Split a stage's deficit into the residual stream and the block's update, per row.
+
+    A stage's state is its input plus the block's update, so the reference answers its own update
+    (`ref_n - ref_{n-1}`) and the dump answers ours. Their difference `D` is what the model failed to
+    add, and the direction of `D` says which of the two halves is short: a `D` along `ref_{n-1}` is a
+    residual that arrived short (the carry between layers), a `D` along the update is the block itself.
+    Layer `first` is reprinted as the calibration: its decomposition is the floor this measurement
+    carries, so a later stage's cosines are read against it and not against 1.
+    """
+    reference = arguments.reference
+    dump = arguments.dump
+    stems = [stem for stem in order if stem.startswith("hidden_")]
+    stages = []
+    for index, stem in enumerate(stems):
+        if index == 0 or "_" in stem[7:]:
+            continue
+        stages.append(stem)
+    if not stages:
+        return
+    target = first[:-4] if first and first.endswith(".npy") else first
+    chosen = [stem for stem in (stages[0], target) if stem in stages]
+    for stem in dict.fromkeys(chosen):
+        index = stages.index(stem)
+        previous = stages[index - 1]
+        before_ref = load(reference / f"{previous}.npy")
+        now_ref = load(reference / f"{stem}.npy")
+        before_our = load(dump / f"{previous}.npy")
+        now_our = load(dump / f"{stem}.npy")
+        if any(value is None for value in (before_ref, now_ref, before_our, now_our)):
+            continue
+        delta_ref = now_ref - before_ref
+        delta_our = now_our - before_our
+        deficit = delta_ref - delta_our
+        print()
+        print(f"delta {stem}: the update the model failed to add, per row "
+              f"(calibration is layer {stems[1] if len(stems) > 1 else stem})")
+        print(f"{'row':>4} {'|Δour|/|Δref|':>14} {'cos(Δour,Δref)':>15} "
+              f"{'|D|/|Δref|':>11} {'cos(D,state)':>13} {'cos(D,Δref)':>12}  reads as")
+        for row in range(now_ref.shape[0]):
+            reference_update, our_update = delta_ref[row], delta_our[row]
+            gap = deficit[row]
+            reference_norm = np.linalg.norm(reference_update)
+            our_norm = np.linalg.norm(our_update)
+            gap_norm = np.linalg.norm(gap)
+            if reference_norm == 0 or gap_norm == 0:
+                continue
+            # A row whose update is a rounding of its own state cannot be read this way: the ratio
+            # below is a quotient of two small numbers and its direction is noise.
+            if reference_norm < 0.01 * np.linalg.norm(before_ref[row]):
+                print(f"{row:>4} {'-':>14} {'-':>15} {'-':>11} {'-':>13} {'-':>12}  update below 1% of the state")
+                continue
+            cosine_update = float(np.dot(our_update, reference_update) / (our_norm * reference_norm)) if our_norm else 0.0
+            cosine_state = float(np.dot(gap, before_ref[row]) / (gap_norm * np.linalg.norm(before_ref[row])))
+            cosine_reference = float(np.dot(gap, reference_update) / (gap_norm * reference_norm))
+            # The unambiguous part is the update itself: a block that is short keeps the update's
+            # direction and loses length; a block that routed differently turns it. The deficit's
+            # own direction is printed as context and given no verdict, because a piece of state
+            # missing shows up in both terms of this decomposition and the tie is not information.
+            ratio = our_norm / reference_norm
+            if cosine_update < 0.9:
+                reading = "the update turned (routing or attention)"
+            elif ratio < 0.95:
+                reading = "the update is short (the block)"
+            elif ratio > 1.05:
+                reading = "the update is long (added twice?)"
+            else:
+                reading = "the update matches"
+            print(f"{row:>4} {our_norm / reference_norm:14.3f} {cosine_update:15.4f} "
+                  f"{gap_norm / reference_norm:11.3f} {cosine_state:13.4f} {cosine_reference:12.4f}  {reading}")
+
+
 def cut_prefix(path, measured):
     """The error of the boundary a cut's layer starts from, or `None` for a boundary file.
 
@@ -131,6 +203,11 @@ def main():
     parser.add_argument("--reference", required=True, type=pathlib.Path)
     parser.add_argument("--dump", required=True, type=pathlib.Path)
     parser.add_argument(
+        "--delta",
+        action="store_true",
+        help="decompose the first divergent stage's deficit into residual and update, per row",
+    )
+    parser.add_argument(
         "--floor",
         type=float,
         default=0.05,
@@ -159,6 +236,7 @@ def main():
     measured = {}
     lines = []
     uncorrelated = []
+    measured_order = []
     print(f"{'file':<16} {'shape':<12} {'rel':>10} {'rms':>10} {'increment':>10}  worst row")
     # One order for both: a cut the dump holds and the reference lacks still belongs where the walk
     # reaches it, or the table's "reads as the walk" promise breaks.
@@ -194,6 +272,7 @@ def main():
         increment = float("nan") if previous is None else rms - previous
         growth = 0.0 if math.isnan(increment) else increment
         measured[path.stem] = rms
+        measured_order.append(path.stem)
         previous = rms
         flag = ""
         if first is None and (rel > arguments.floor or rms > arguments.floor):
@@ -266,6 +345,9 @@ def main():
         f"largest increment: {largest[0]}, +{largest[1]:.3e} over the stage before it — the stage "
         "the error enters at"
     )
+
+    if arguments.delta:
+        compare_delta(arguments, measured_order, first)
 
     # The logits are compared as log-softmaxes as well, because that is what a token is chosen from.
     expected = load(arguments.reference / "logits.npy")
