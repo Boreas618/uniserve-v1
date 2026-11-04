@@ -176,7 +176,6 @@ impl Op for AudioActivation {
     ) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         let taps = u64::from(descriptor.kernel);
-        let ratio = u64::from(descriptor.ratio);
         let length = u64::from(args.length);
         if descriptor.kernel == 0 || descriptor.ratio == 0 || length == 0 {
             return Err(Error::argument(
@@ -220,10 +219,7 @@ impl Op for AudioActivation {
                 ));
             }
         }
-        for (name, view) in [
-            ("filter_up", args.filter_up),
-            ("filter_down", args.filter_down),
-        ] {
+        for view in [args.filter_up, args.filter_down] {
             view.require_shape(Self::NAME, Shape::new(&[1, 1, taps]))?;
         }
         for (name, view) in [("alpha", args.alpha), ("beta", args.beta)] {
