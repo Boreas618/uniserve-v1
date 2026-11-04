@@ -969,12 +969,31 @@ impl MainProcess {
                     "an engine command",
                 )?;
             }
-            if let Some(epoch) = draining {
-                self.send_report(proto::process::Report {
-                    kind: Some(proto::process::report::Kind::Drained(
-                        proto::process::Drained { epoch },
-                    )),
-                });
+            // Two of those commands have an answer the daemon waits for, and no scheduler can give
+            // it: a parked standby is promoted only after the process says it parked, and the
+            // frontend is switched only after it says it was promoted (proto process.proto's
+            // `Parked` and `Promoted`). The schedulers applying the command is half of it; the
+            // report is the epoch layer's and this is where the process has both facts in hand.
+            let report = match &command.kind {
+                Some(proto::process::command::Kind::Drain(_)) => draining.map(|epoch| {
+                    proto::process::report::Kind::Drained(proto::process::Drained { epoch })
+                }),
+                Some(proto::process::command::Kind::Park(_)) => {
+                    Some(proto::process::report::Kind::Parked(proto::process::Parked {
+                        generation: current,
+                    }))
+                }
+                Some(proto::process::command::Kind::Promote(_)) => {
+                    Some(proto::process::report::Kind::Promoted(
+                        proto::process::Promoted {
+                            generation: current,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(kind) = report {
+                self.send_report(proto::process::Report { kind: Some(kind) });
             }
             return Ok(None);
         };
