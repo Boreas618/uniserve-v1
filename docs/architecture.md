@@ -280,7 +280,7 @@ A worker's orderly close ends with a reset of its primary contexts before the pr
 ## Repository layout
 
 ```text
-crates/models/          the model families' request semantics: the family registry, the SenseNova, Bagel and DiffusionGemma checkpoint facts and prompt rules, the MiniMax-H3 video rules
+crates/models/rules/    the model families' request semantics: the family registry, the SenseNova, Bagel and DiffusionGemma checkpoint facts and prompt rules, the MiniMax-H3 video rules
 crates/proto/           the interfaces across builds (Protobuf): the process interface between daemons and engines, and the request vocabulary
 crates/ipc/             engine-to-worker messages, the channel, registration, launch descriptor
 crates/storage/         the Storage Server's protocol and client

@@ -1,0 +1,40 @@
+# The qk_norm_rope operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program normalizes and rotates every query and key head of `rows` tokens;
+# the token count is a launch value and the head geometry is the descriptor's.
+# `block` is the head width the program loads in one tile, so a descriptor's
+# block must cover `head_dim`.
+
+op = "qk_norm_rope"
+backend = "triton_rotated"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/qk_norm_rope.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false`.
+[kernel.descriptors]
+# The narrowed rotation's keys: a key names `rotated` only when the rotation is
+# narrower than the head, and such a key is this package's, not the full-width
+# package's beside it. A Triton program's parameters are its call's words in
+# order, so the two forms are two programs over one source.
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["56", "32", "24", "16", "8"], k_heads = ["56", "4", "8", "2", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"], rotated = ["96", "64"] }
+
+[parameters]

@@ -105,6 +105,7 @@ impl Op for LogitsGather {
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        // Rows are copied, not computed: two implementations move the same bytes.
         Tolerance::exact()
     }
 }
@@ -206,6 +207,8 @@ impl Op for VocabUnpad {
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        // A row's leading `vocabulary` columns are copied out of a wider row; no arithmetic, so no
+        // rounding to bound.
         Tolerance::exact()
     }
 }

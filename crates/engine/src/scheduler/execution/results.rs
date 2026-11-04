@@ -921,6 +921,20 @@ impl Scheduler {
                 // Apply accepted progress directly; the output decoder separately
                 // decides the user-visible prefix and stop-string boundary.
                 let advanced = record.status == CallStatus::Ok && call.advances_state();
+                if advanced {
+                    // The policy is told which phase ran and by how much, and
+                    // the watchdog's deadline for the request restarts.
+                    let request = scheduling::guest::RequestId(id.0);
+                    let now = scheduling::guest::Nanos(
+                        crate::clock::now_monotonic_us().saturating_mul(1_000),
+                    );
+                    self.recorder.record(views::advanced(
+                        request,
+                        views::call_phase_id(call_variant),
+                        mechanism::advanced_tokens(&call),
+                    ));
+                    self.watchdog.advanced(request, now);
+                }
                 let latest_token = if advanced {
                     call.token_output.clone()
                 } else {

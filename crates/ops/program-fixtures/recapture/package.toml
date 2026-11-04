@@ -18,16 +18,18 @@
 # does not implement (a non-FP32 accumulate, or an input and weight of different
 # element types) by name.
 #
-# `[toolchain] version` is the toolkit this fixture was written for. A host whose
-# nvcc is another build of the same CUDA version must set this line to its own
-# version, because a toolchain version change is a new revision (design 5.1).
+# `[toolchain] version` is empty on purpose: an empty version means any toolkit
+# this host has, so the fixture builds on whichever host the delivery test runs on
+# instead of failing for a patch release it does not care about (design 5.2). A
+# serving package declares the version its modules are validated against; a fixture
+# that proves a recapture is rebuilt from source on every host does not.
 
 op = "gemm"
 backend = "cublas_lt"
 
 [toolchain]
 kind = "nvcc"
-version = "13.0.48"
+version = ""
 packages = []
 
 [module]
