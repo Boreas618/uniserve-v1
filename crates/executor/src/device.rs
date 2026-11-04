@@ -358,7 +358,7 @@ impl Executor {
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
-                .map_err(|_| Error::State("the executor thread panicked".into()))?;
+                .map_err(|_| Error::State("the executor thread panicked"))?;
         }
         Ok(())
     }
@@ -588,7 +588,7 @@ impl Device {
             }
             Command::Discard(generation) => {
                 for named in &mut self.runners {
-                    named.runner.discard(*generation);
+                    named.runner.discard(*generation)?;
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
