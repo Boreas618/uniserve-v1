@@ -50,7 +50,7 @@ pub use copy::{
     memset_2d_d8, memset_2d_d32, memset_d8, memset_d16, memset_d32,
 };
 pub use device::{
-    DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
+    Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
 };
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
