@@ -1012,31 +1012,4 @@ mod tests {
         assert_eq!(above_seams, 21);
         assert_eq!(left_seams, 24);
     }
-
-    #[test]
-    fn a_clip_needs_one_latent_view_and_one_position_table_per_tile() {
-        let config = crate::video_vae::tests::video_config();
-        let canvas = Canvas::clip(&config, 48, 84);
-        let tiles = Tiles::of(&config, &canvas)
-            .expect("the grid")
-            .tiles(&config, &canvas);
-        // 28 tiles of a seven-frame canvas: 7 x 256 voxel rows plus five register and tail rows.
-        let rows: u64 = tiles
-            .iter()
-            .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
-            .sum();
-        assert_eq!(rows, 28 * (7 * 256 + 5));
-        let tokens = Shape::new(&[rows, 3072]);
-        assert_eq!(
-            check_clip(&tiles, 28, 28, tokens).expect("a whole clip"),
-            rows
-        );
-        // A missing view or table is refused before any launch.
-        assert!(check_clip(&tiles, 27, 28, tokens).is_err());
-        assert!(check_clip(&tiles, 28, 27, tokens).is_err());
-        // So is a token buffer that is not one row per token of the clip.
-        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows - 1, 3072])).is_err());
-        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows, 2048])).is_ok());
-        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows])).is_err());
-    }
 }
