@@ -38,6 +38,26 @@ pub struct Sparse {
 }
 
 impl Sparse {
+    /// Every checkpoint tensor one layer's sparse attention reads, as complete names.
+    ///
+    /// The gate compression's projection is the fourth of the fused matrix the query, key and value
+    /// come from (`attention.py:139`), so it is one more weight than the dense branch reads.
+    pub fn keys(index: u32) -> Vec<String> {
+        let prefix = format!("transformer_blocks.{index}.attn");
+        [
+            "norm_q.weight",
+            "norm_k.weight",
+            "to_q.weight",
+            "to_k.weight",
+            "to_v.weight",
+            "to_gate_compress.weight",
+            "to_out.0.weight",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}.{suffix}"))
+        .collect()
+    }
+
     /// Read layer `index`'s sparse attention of a DiT partition.
     ///
     #[allow(clippy::too_many_arguments)]
