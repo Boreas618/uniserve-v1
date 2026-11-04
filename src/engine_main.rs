@@ -247,6 +247,8 @@ struct ProcessInterface {
     /// `Precopy` while a claim is outstanding, and dropping it would lose the epoch's first
     /// generation.
     pending: std::collections::VecDeque<proto::process::Command>,
+    /// The daemon closed the interface: the epoch is over, and the process says so and goes.
+    closed: bool,
 }
 
 impl ProcessInterface {
@@ -295,6 +297,7 @@ impl ProcessInterface {
         Ok(Self {
             connection,
             pending: std::collections::VecDeque::new(),
+            closed: false,
         })
     }
 
@@ -357,7 +360,21 @@ impl ProcessInterface {
     ///
     /// Nothing waits here: a command that has not arrived is one the next serve pass looks for.
     fn take_command(&mut self) -> Result<Option<proto::process::Command>> {
-        while let Some(message) = self.connection.try_recv::<proto::process::Downstream>()? {
+        // The daemon owns this process's life: the interface closing is the end of the epoch and not
+        // an error, so it stops the loop by name instead of surfacing as a failure the daemon never
+        // sees. A process that ends silently on a closed interface is how a run reads as a lost
+        // engine with no side of its own in the log.
+        loop {
+            let message = match self.connection.try_recv::<proto::process::Downstream>() {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(proto::Error::Closed) => {
+                    tracing::info!("the daemon closed the process interface, so this process ends");
+                    self.closed = true;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
             match message.kind {
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
@@ -370,6 +387,11 @@ impl ProcessInterface {
             }
         }
         Ok(self.pending.pop_front())
+    }
+
+    /// Whether the daemon closed the interface, which ends this process.
+    const fn closed(&self) -> bool {
+        self.closed
     }
 
     /// Files what the daemon sent unasked.
@@ -519,6 +541,18 @@ pub(crate) struct MainProcess {
     /// own, one bucket per queue turn behind serving, and a model with many buckets warms for longer
     /// than the daemon waits for `Switched`.
     warming: Vec<(u32, Submission, u64)>,
+    /// How many switchovers this epoch has served (§7.3 step 3). The epoch's first one is what
+    /// installs a policy, so only it is checked for a policy that never arrived.
+    switchovers: u32,
+    /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
+    ///
+    /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
+    /// `note_policy_serves` never, raises nothing and answers `Ok(None)`; a scheduler with no policy
+    /// forms no batch, so the epoch would sit with nothing running while the daemon believes the
+    /// cut-over succeeded. The check asks each scheduler's policy slot, which answers within its own
+    /// command timeout, and reads the answer in the watchdog's stall bound rather than waiting.
+    policy_probe_at: Option<Instant>,
+    policy_missing_since: Option<Instant>,
     /// The generations the last precopy built and the switchover has not taken:
     /// one per device, in `executors` order. A revert drops them, because the
     /// generation they hold never serves.
@@ -734,6 +768,9 @@ impl MainProcess {
             programs,
             precopy: None,
             warming: Vec::new(),
+            switchovers: 0,
+            policy_probe_at: None,
+            policy_missing_since: None,
             prepared: Vec::new(),
             retired: Vec::new(),
             generations,
@@ -865,6 +902,11 @@ impl MainProcess {
                     return Ok(Some(failure));
                 }
             }
+            // The daemon owns this process's life: an interface it closed is the end of the epoch,
+            // not a failure to report to it, so the pass stops by name and the process exits cleanly.
+            if self.process.closed() {
+                self.stopping = true;
+            }
 
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
@@ -878,6 +920,9 @@ impl MainProcess {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_schedulers()? {
+                return Ok(Some(failure));
+            }
+            if let Some(failure) = self.advance_policy_check(&running)? {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_probation()? {
@@ -1329,22 +1374,26 @@ impl MainProcess {
             .iter()
             .all(|generation| generation.is_empty());
         let resolved;
+        let mut candidates = Candidates::new();
         let programs = if programs.is_empty() && never_installed {
-            resolved = match self.listed_programs() {
-                Ok(programs) => programs,
+            let (programs, listed) = match self.listed_programs() {
+                Ok(resolved) => resolved,
                 Err(failure) => return self.abandon_precopy(generation, failure, reply),
             };
             tracing::info!(
-                operators = resolved.len(),
+                operators = programs.len(),
+                alternative = listed.values().filter(|ordered| ordered.len() > 1).count(),
                 "the precopy named no kernel program: installing this host's built programs"
             );
+            candidates = listed;
+            resolved = programs;
             &resolved
         } else {
             programs
         };
 
-        let tasks = match self.admit_installs(programs, &BTreeMap::new()) {
-            Ok(tasks) => tasks,
+        let (tasks, unavailable) = match self.admit_installs(programs, &BTreeMap::new()) {
+            Ok(admitted) => admitted,
             Err(failure) => return self.abandon_precopy(generation, failure, reply),
         };
 
@@ -1353,6 +1402,10 @@ impl MainProcess {
             reply,
             policy: policy.clone(),
             programs: programs.clone(),
+            candidates,
+            tried: std::collections::BTreeSet::new(),
+            backends: BTreeMap::new(),
+            unavailable,
             learned: BTreeMap::new(),
             policy_requested: false,
             next: Vec::new(),
@@ -1386,10 +1439,12 @@ impl MainProcess {
     /// `(operator, backend)` and fills the package's own parameter defaults, so `arguments` only ever
     /// overrides a default that the package already states.
     ///
-    /// An operator built under two backends is one slot and takes one program, which is why the tie
-    /// is broken by name and logged: a deployment that wants a particular backend says so through
-    /// the daemon, which names it in the `Precopy`.
-    fn listed_programs(&self) -> std::result::Result<Programs, UpdateFailure> {
+    /// An operator built under more than one backend is one slot with several candidates, which is
+    /// why the answer carries the whole ordered list: the first is installed, and the walk moves to
+    /// the next one if the first cannot serve a descriptor it meets (`advance_candidate`). A
+    /// deployment that wants one particular backend says so through the daemon, which names it in
+    /// the `Precopy`, and then the walk does not choose at all.
+    fn listed_programs(&self) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         let listing = self.listing().map_err(invalid)?;
         let chosen = select_programs(&listing.packages, &self.targets);
@@ -1407,19 +1462,27 @@ impl MainProcess {
             "resolved this host's built programs for a precopy that named none"
         );
         let mut programs = Programs::new();
-        for (op, (backend, revision)) in chosen {
+        let mut candidates = Candidates::new();
+        for (op, ordered) in chosen {
+            let Some((backend, revision)) = ordered.first() else {
+                continue;
+            };
             programs.insert(
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot {
+                    op: op.clone(),
+                    phase: None,
+                },
                 Program {
-                    backend,
-                    revision,
+                    backend: backend.clone(),
+                    revision: *revision,
                     // The package's own defaults are the arguments the operator's modules were
                     // built with; the deployment overrides them by naming a program.
                     arguments: Default::default(),
                 },
             );
+            candidates.insert(op, ordered);
         }
-        Ok(programs)
+        Ok((programs, candidates))
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
@@ -1435,7 +1498,7 @@ impl MainProcess {
         &mut self,
         programs: &Programs,
         learned: &BTreeMap<String, Vec<String>>,
-    ) -> std::result::Result<Vec<Arc<HostTask<Install>>>, UpdateFailure> {
+    ) -> std::result::Result<(Vec<Arc<HostTask<Install>>>, UnavailableCell), UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         // The Program Server's listing, read at most once and only when a program's keys cannot be
         // taken from a generation that already launched it: the epoch's first generation has
@@ -1502,6 +1565,9 @@ impl MainProcess {
         }
 
         let mut tasks = Vec::with_capacity(self.executors.len());
+        // One cell shared by every device's load of this generation: the first structured refusal
+        // any of them meets is the one the walk answers with another candidate program.
+        let unavailable = UnavailableCell::default();
         for (index, executor) in self.executors.iter().enumerate() {
             let ordinal = executor.device();
             let device = platform::Device::new(ordinal)
@@ -1518,6 +1584,7 @@ impl MainProcess {
                     programs: requests.clone(),
                     descriptors: descriptors.clone(),
                 },
+                unavailable: Arc::clone(&unavailable),
             };
             match self.modules.admit(install) {
                 Ok(task) => tasks.push(task),
@@ -1526,8 +1593,109 @@ impl MainProcess {
                 }
             }
         }
-        Ok(tasks)
+        Ok((tasks, unavailable))
     }
+
+    /// Moves the generation on to the next program its operator may be filled by (§7.3 step 2).
+    ///
+    /// Each candidate this host built for the operator is tried once, in a stated order: the
+    /// candidate whose built modules cover the most of the keys learned so far first, then the
+    /// highest revision, then the backend's name - so two runs choose alike and a store with two
+    /// backends costs one extra install rather than a failed generation. When every candidate has
+    /// been tried the refusal names the operator, the descriptor it could not serve, and every
+    /// backend tried; it never falls back silently and never speaks generically.
+    ///
+    /// A program the daemon named is the deployment's choice and is not second-guessed here: with no
+    /// candidate list the walk answers [`Advance::Named`] and the refusal stands as it is.
+    fn advance_candidate(&mut self, precopy: &mut Precopy, refused: &Unavailable) -> Advance {
+        let op = refused.op().to_owned();
+        let Some(ordered) = precopy.candidates.get(&op).cloned() else {
+            return Advance::Named;
+        };
+        let Some((slot, current)) = precopy
+            .programs
+            .iter()
+            .find(|(slot, _)| slot.op == op)
+            .map(|(slot, program)| (slot.clone(), program.clone()))
+        else {
+            return Advance::Named;
+        };
+        precopy
+            .tried
+            .insert((current.backend.clone(), current.revision));
+        let tried = precopy.backends.entry(op.clone()).or_default();
+        if !tried.contains(&current.backend) {
+            tried.push(current.backend.clone());
+        }
+
+        let listing = match self.listing() {
+            Ok(listing) => listing,
+            Err(reason) => return Advance::Failed(reason),
+        };
+        let learned = precopy.learned.get(&op).cloned().unwrap_or_default();
+        let mut remaining: Vec<(usize, (String, u32))> = ordered
+            .into_iter()
+            .filter(|candidate| !precopy.tried.contains(candidate))
+            .map(|candidate| {
+                let program = Program {
+                    backend: candidate.0.clone(),
+                    revision: candidate.1,
+                    arguments: Default::default(),
+                };
+                let covers = built_keys(&listing, &op, &program, &self.targets)
+                    .iter()
+                    .filter(|key| learned.contains(key))
+                    .count();
+                (covers, candidate)
+            })
+            .collect();
+        // The stated order: coverage of the keys learned so far, then the highest revision, then the
+        // backend name. Coverage only orders; it never excludes a candidate.
+        remaining.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1 .1.cmp(&left.1 .1))
+                .then_with(|| left.1 .0.as_str().cmp(right.1 .0.as_str()))
+        });
+        let Some((covers, next)) = remaining.into_iter().next() else {
+            // Every candidate is spent: the refusal names the operator, what it could not serve and
+            // every backend that was tried, so the next reader knows what to install.
+            let backends = precopy.backends.get(&op).cloned().unwrap_or_default();
+            let descriptor = refused.descriptor().unwrap_or("the key it was asked for");
+            return Advance::Exhausted(format!(
+                "{op} has no program this host built that serves {descriptor}: every candidate was \
+                 tried (backends: {}), so this generation cannot be installed from this host's \
+                 store",
+                backends.join(", ")
+            ));
+        };
+        tracing::info!(
+            op = %op,
+            from = %current.backend,
+            to = %next.0,
+            revision = next.1,
+            covers,
+            learned = learned.len(),
+            "a program cannot serve this generation's shape: trying the operator's next candidate"
+        );
+        precopy.programs.insert(
+            slot,
+            Program {
+                backend: next.0.clone(),
+                revision: next.1,
+                arguments: Default::default(),
+            },
+        );
+        match self.admit_installs(&precopy.programs, &precopy.learned) {
+            Ok((tasks, unavailable)) => {
+                precopy.unavailable = unavailable;
+                Advance::Retry(tasks)
+            }
+            Err(failure) => Advance::Failed(failure.reason()),
+        }
+    }
+
     /// Reads the warmups the switchovers queued (§4.5): a finished one leaves the list, and one
     /// that failed reverts the generation it was warming.
     ///
@@ -1597,6 +1765,31 @@ impl MainProcess {
                         }
                         Some(Outcome::Success(entries)) => loaded.push((*entries).clone()),
                         Some(Outcome::Failed(error)) => {
+                            // A program the store refused for a shape of this generation is not
+                            // yet a failed generation: the operator may have another program this
+                            // host built, and the walk tries each once before it gives up.
+                            let refused = precopy
+                                .unavailable
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            if let Some(refused) = refused {
+                                match self.advance_candidate(&mut precopy, &refused) {
+                                    Advance::Retry(fresh) => {
+                                        precopy.stage = PrecopyStage::Modules(fresh);
+                                        self.precopy = Some(precopy);
+                                        return Ok(());
+                                    }
+                                    Advance::Exhausted(reason) | Advance::Failed(reason) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            UpdateFailure::Precopy { reason },
+                                            precopy.reply,
+                                        );
+                                    }
+                                    Advance::Named => {}
+                                }
+                            }
                             return self.abandon_precopy(
                                 generation,
                                 UpdateFailure::Precopy {
@@ -1689,7 +1882,10 @@ impl MainProcess {
                             precopy.learned.entry(operator).or_default().push(key);
                             let tasks =
                                 match self.admit_installs(&precopy.programs, &precopy.learned) {
-                                    Ok(tasks) => tasks,
+                                    Ok((tasks, unavailable)) => {
+                                        precopy.unavailable = unavailable;
+                                        tasks
+                                    }
                                     Err(failure) => {
                                         return self.abandon_precopy(
                                             generation,
@@ -1965,6 +2161,14 @@ impl MainProcess {
             self.open_admission()
                 .context("resuming for the epoch's first switchover")?;
         }
+        // The other silence of §7.3 step 3: a first switchover that installed no policy adopts
+        // nothing and says nothing, so this process asks the policy slots once and, if none serves,
+        // asks again one stall bound later before it names the failure. The check is queued here
+        // rather than run here, so the daemon's `Switched` is never delayed by it.
+        self.switchovers = self.switchovers.saturating_add(1);
+        if self.switchovers == 1 {
+            self.policy_probe_at = Some(Instant::now());
+        }
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -2124,6 +2328,69 @@ impl MainProcess {
         Ok(None)
     }
 
+    /// §7.3 step 3: a first switchover that installed no policy, said by name instead of waited for.
+    ///
+    /// A first switchover with no prepared candidate adopts no policy and answers `Ok(None)`; a
+    /// scheduler with no policy forms no batch, so the epoch sits with nothing running while the
+    /// daemon believes the cut-over succeeded - the same silence the missing startup report had.
+    /// The policy slot is asked whether one serves, and the answer is read rather than waited for:
+    /// a probe is due at once after the switchover and again one stall bound later, and the failure
+    /// is only spoken when no device has a job in flight, so a busy scheduler cannot be mistaken
+    /// for one that never adopted a policy.
+    fn advance_policy_check(&mut self, running: &[Running]) -> Result<Option<UpdateFailure>> {
+        let Some(due) = self.policy_probe_at else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now < due {
+            return Ok(None);
+        }
+        self.policy_probe_at = None;
+
+        let serving = self
+            .schedulers
+            .iter()
+            .filter(|scheduler| scheduler.policy_mut().running().is_some())
+            .count();
+        if serving == self.schedulers.len() {
+            if self.policy_missing_since.take().is_some() {
+                tracing::info!(serving, "the switchover's policy serves every scheduler");
+            }
+            return Ok(None);
+        }
+        if !running.is_empty() {
+            // A device is busy, so the slots' silence is not evidence: look again next pass.
+            self.policy_probe_at = Some(now + POLICY_PROBE_INTERVAL);
+            return Ok(None);
+        }
+        match self.policy_missing_since {
+            None => {
+                self.policy_missing_since = Some(now);
+                self.policy_probe_at = Some(now + self.watchdog.stall_bound());
+                tracing::warn!(
+                    serving,
+                    schedulers = self.schedulers.len(),
+                    "a switchover installed no policy on every scheduler; looking again in the watchdog's stall bound"
+                );
+                Ok(None)
+            }
+            Some(since) => {
+                self.policy_missing_since = None;
+                let failure = UpdateFailure::Policy {
+                    error: format!(
+                        "the epoch's first switchover installed no policy: {} of this node's {} \
+                         schedulers serve one after {}s, and a scheduler with no policy forms no \
+                         batch, so an admitted request cannot be planned",
+                        serving,
+                        self.schedulers.len(),
+                        since.elapsed().as_secs()
+                    ),
+                };
+                self.failure(failure)
+            }
+        }
+    }
+
     /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
     ///
     /// With no scheduler no batch is formed, so no job runs and no job can stall: the stall rule
@@ -2192,6 +2459,8 @@ impl MainProcess {
     /// generation and its nodes stayed through probation, so the revert is the
     /// reverse switchover and nothing has to be prepared again.
     fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<ProgramStatus> {
+        self.policy_probe_at = None;
+        self.policy_missing_since = None;
         // The phase before the call decides what a device does with the update's generation: a
         // generation that was prepared but never cut over never served, so nothing goes back and it
         // is discarded; a generation on probation served, and its reverse switchover runs. The
@@ -3125,6 +3394,26 @@ fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'s
     }
 }
 
+/// Every program this host may fill an operator with, by operator, in the order the walk tries them
+/// (§7.3 step 2): the highest revision first, ties by backend name.
+type Candidates = BTreeMap<String, Vec<(String, u32)>>;
+
+/// The first refusal the installs of one generation met, shared by the precopy and every device's
+/// load so the walk can answer it with the operator's next candidate program.
+type UnavailableCell = Arc<Mutex<Option<Unavailable>>>;
+
+/// What the walk does when a program cannot serve a shape of this generation (§7.3 step 2).
+enum Advance {
+    /// The operator's next candidate was chosen and its install admitted.
+    Retry(Vec<Arc<HostTask<Install>>>),
+    /// Every program this host built for the operator has been tried.
+    Exhausted(String),
+    /// The programs are the daemon's, so there is no candidate to move to.
+    Named,
+    /// The store could not be read, so no candidate can be chosen.
+    Failed(String),
+}
+
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 
@@ -3132,6 +3421,10 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
 /// seconds, so the poll costs a wake per tenth of a second for the length of the window.
 const PROBATION_POLL: Duration = Duration::from_millis(100);
+
+/// How often a device that is busy delays the question asked of the policy slots: a probe that finds
+/// a device running proves nothing about whether a policy serves, so it is asked again after this.
+const POLICY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
 /// pass that waited longer than this would be reporting what the next pass reports anyway.
@@ -3157,6 +3450,71 @@ struct Install {
     device: platform::Device,
     target: Target,
     request: PrepareRequest,
+    /// The Program Server's own refusal, when it named a program that cannot serve a shape of this
+    /// generation. The task fails with a message either way; this keeps the structured cause so the
+    /// walk can ask the operator's next candidate program instead of giving up on the generation.
+    unavailable: UnavailableCell,
+}
+
+/// A program that cannot serve a shape of this generation: the two refusals that mean "the walk may
+/// try the operator's next candidate program" rather than "this generation cannot be built".
+#[derive(Clone, Debug)]
+enum Unavailable {
+    /// The program is installed, and no module of it covers this descriptor key.
+    Descriptor {
+        op: String,
+        backend: String,
+        revision: u32,
+        descriptor: String,
+    },
+    /// No revision of the backend is installed for the operator.
+    Installed { op: String, backend: String },
+}
+
+impl Unavailable {
+    /// Reads a Program Server refusal, when it is one of the two the walk can answer.
+    fn of(error: &program_server::Error) -> Option<Self> {
+        match error {
+            program_server::Error::UnsupportedDescriptor {
+                op,
+                backend,
+                revision,
+                descriptor,
+            } => Some(Self::Descriptor {
+                op: op.clone(),
+                backend: backend.clone(),
+                revision: *revision,
+                descriptor: descriptor.clone(),
+            }),
+            program_server::Error::NotInstalled { op, backend } => Some(Self::Installed {
+                op: op.clone(),
+                backend: backend.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The operator whose program cannot serve the shape.
+    fn op(&self) -> &str {
+        match self {
+            Self::Descriptor { op, .. } | Self::Installed { op, .. } => op,
+        }
+    }
+
+    /// The backend the refusal names.
+    fn backend(&self) -> &str {
+        match self {
+            Self::Descriptor { backend, .. } | Self::Installed { backend, .. } => backend,
+        }
+    }
+
+    /// The descriptor the program could not serve, when the refusal named one.
+    fn descriptor(&self) -> Option<&str> {
+        match self {
+            Self::Descriptor { descriptor, .. } => Some(descriptor),
+            Self::Installed { .. } => None,
+        }
+    }
 }
 
 /// One module the Program Server resolved, held open while its kernel loads (`specs/worker.md`
@@ -3261,6 +3619,21 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
     }
 }
 
+impl Install {
+    /// Keeps the first structured refusal this device's load met.
+    fn note(&self, error: &program_server::Error) {
+        if let Some(unavailable) = Unavailable::of(error) {
+            let mut held = self
+                .unavailable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if held.is_none() {
+                *held = Some(unavailable);
+            }
+        }
+    }
+}
+
 impl HostAction for Install {
     type Output = Vec<KernelEntry>;
 
@@ -3278,6 +3651,7 @@ impl HostAction for Install {
                 );
             })
             .map_err(|error| {
+                self.note(&error);
                 executor::Error::Invalid(format!("building the new generation: {error}"))
             })?;
 
@@ -3312,6 +3686,7 @@ impl HostAction for Install {
                         },
                     )
                     .map_err(|error| {
+                        self.note(&error);
                         executor::Error::Invalid(format!(
                             "resolving {} for {key}: {error}",
                             chosen.slot.op
@@ -3350,8 +3725,18 @@ struct Precopy {
     /// The policy program the update installs.
     policy: Program,
     /// The kernel programs the update installs, by slot: kept so the discovery loop can admit the
-    /// installs again with a key it just learned.
+    /// installs again with a key it just learned, or with the operator's next candidate program.
     programs: Programs,
+    /// Every program this host may fill an operator with, when this generation's programs came from
+    /// the store's listing rather than from the daemon. Empty when the daemon named them: a named
+    /// program is the deployment's choice and the walk does not second-guess it.
+    candidates: Candidates,
+    /// The candidates this generation has already asked for. Each is tried once, and none again.
+    tried: std::collections::BTreeSet<(String, u32)>,
+    /// The backends tried for each operator, so a refusal names every one of them.
+    backends: BTreeMap<String, Vec<String>>,
+    /// The refusal the generation's installs met, shared with the device loads that found it.
+    unavailable: UnavailableCell,
     /// The descriptor keys the walk has taught this generation, by operator. The epoch's first
     /// generation has no serving generation to take them from (§7.3 step 2).
     learned: BTreeMap<String, Vec<String>>,
@@ -3406,10 +3791,13 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
     None
 }
 
-/// The descriptor keys `generation` holds for `operator`: what a precopy must
-/// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
-/// The program each operator of `packages` is installed from, by identity: the highest installed
-/// revision, ties broken by the backend's name so the choice is the same on every run.
+/// The programs each operator of `packages` may be installed from, in the order §7.3 step 2's walk
+/// tries them: the highest installed revision first, and among equal revisions the backend whose
+/// name sorts first, so the order is the same on every run.
+///
+/// Nothing here excludes a candidate. An operator built under two backends is one slot with two
+/// programs rather than one choice made before the walk, because whether a program can serve a
+/// descriptor is only known when the walk names the descriptor (`advance_candidate`).
 ///
 /// Two kinds of package are left out, and both would cost more than they buy:
 ///
@@ -3423,8 +3811,8 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 fn select_programs(
     packages: &[program_server::protocol::ListedPackage],
     targets: &[Target],
-) -> BTreeMap<String, (String, u32)> {
-    let mut chosen: BTreeMap<String, (String, u32)> = BTreeMap::new();
+) -> BTreeMap<String, Vec<(String, u32)>> {
+    let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
     for package in packages {
         if package.modules.is_empty() {
             tracing::debug!(
@@ -3455,27 +3843,32 @@ fn select_programs(
             continue;
         }
         let candidate = (package.backend.clone(), package.revision);
-        match chosen.get(&package.op) {
-            // The held program stays when it is the later revision, or the same revision under a
-            // backend that sorts first.
-            Some((backend, revision))
-                if *revision > candidate.1
-                    || (*revision == candidate.1 && backend.as_str() <= candidate.0.as_str()) => {}
-            _ => {
-                if let Some((backend, revision)) = chosen.get(&package.op) {
-                    tracing::info!(
-                        op = %package.op,
-                        taken = %candidate.0,
-                        revision = candidate.1,
-                        held = %backend,
-                        held_revision = revision,
-                        "an operator is built under two backends: the higher revision wins, ties by \
-                         backend name"
-                    );
-                }
-                chosen.insert(package.op.clone(), candidate);
+        let held = chosen.entry(package.op.clone()).or_default();
+        if let Some((backend, revision)) = held.last() {
+            if *backend == candidate.0 && *revision == candidate.1 {
+                continue;
+            }
+            if *revision != candidate.1 || backend.as_str() <= candidate.0.as_str() {
+                tracing::info!(
+                    op = %package.op,
+                    taken = %candidate.0,
+                    revision = candidate.1,
+                    held = %backend,
+                    held_revision = revision,
+                    "an operator is built under more than one backend: both are candidates, the \
+                     walk tries the one that can serve its descriptor"
+                );
             }
         }
+        held.push(candidate);
+    }
+    for candidates in chosen.values_mut() {
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+        });
     }
     chosen
 }
@@ -3677,7 +4070,7 @@ mod tests {
             .expect("the build implements operators")
     }
 
-    /// The later installation of an operator is the one a startup installs, whatever order the
+    /// The later installation of an operator is the one the walk tries first, whatever order the
     /// store lists them in.
     #[test]
     fn the_highest_revision_of_an_operator_is_chosen() {
@@ -3694,15 +4087,16 @@ mod tests {
         ] {
             let chosen = select_programs(&packages, &targets());
             assert_eq!(
-                chosen.get(op),
+                chosen.get(op).and_then(|ordered| ordered.first()),
                 Some(&("triton".to_owned(), 3)),
-                "the highest revision is the one installed"
+                "the highest revision is tried first"
             );
         }
     }
 
-    /// One operator is one slot and takes one program; when two backends hold the same revision the
-    /// choice is the backend that sorts first, so it repeats on every run.
+    /// When two backends hold the same revision, the one that sorts first is tried first - and the
+    /// other stays a candidate, so a program that cannot serve the walk's descriptor is answered
+    /// rather than fatal.
     #[test]
     fn a_tie_on_revision_is_broken_by_the_backend_name() {
         let op = implemented();
@@ -3713,9 +4107,14 @@ mod tests {
                 .collect::<Vec<_>>();
             let chosen = select_programs(&packages, &targets());
             assert_eq!(
-                chosen.get(op),
+                chosen.get(op).and_then(|ordered| ordered.first()),
                 Some(&("flashinfer".to_owned(), 2)),
-                "the same backend wins whatever order the store lists them in"
+                "the same backend is tried first whatever order the store lists them in"
+            );
+            assert_eq!(
+                chosen[op].len(),
+                2,
+                "and the other backend is still a candidate"
             );
         }
     }
@@ -3737,8 +4136,8 @@ mod tests {
         let chosen = select_programs(&packages, &targets());
         assert_eq!(chosen.len(), 1, "one operator can launch here: {chosen:?}");
         assert_eq!(
-            chosen.get(op),
-            Some(&("triton".to_owned(), 1)),
+            chosen[op],
+            vec![("triton".to_owned(), 1)],
             "the package with a module for this target, whatever the others claim"
         );
     }
