@@ -242,6 +242,15 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
         waiting.recv_timeout(Duration::from_millis(200)).is_err(),
         "a switchover for a later step does not apply at this one"
     );
+
+    // The boundary belongs to the stage that took it: a second one is refused
+    // with the waiting stage's name, so the first caller's answer is not lost.
+    let refused = answer(world.handle.commit_policy())
+        .expect_err("a stage waits for the boundary already claimed");
+    assert!(
+        refused.contains("switchover"),
+        "the refusal names the stage that owns the boundary: {refused}"
+    );
 }
 
 #[test]
