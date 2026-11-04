@@ -247,7 +247,7 @@ fn publish(loader: &mut WeightLoader<'_>, name: &str, values: &[f32]) -> Result<
 fn element(table: &Weight, index: usize) -> Weight {
     let address = table.view.ptr.address() + (index as u64) * 4;
     Weight {
-        backing: table.backing.clone(),
+        backing: table.backing,
         view: TensorView::new(DevicePtr::new(address), DType::F32, Shape::new(&[1])),
     }
 }
