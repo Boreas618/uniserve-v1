@@ -1395,6 +1395,10 @@ mod tests {
                         usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16)
                             .expect("a chunk size");
                     if size == 0 {
+                        // The trailer section ends with an empty line, which
+                        // is the last CRLF of the message.
+                        self.need(2).await;
+                        self.buffered.drain(..2);
                         break;
                     }
                     self.need(size + 2).await;
@@ -1614,6 +1618,116 @@ mod tests {
         tokio::spawn(serve_connection(io, app, CancellationToken::new()));
         let _ = registry;
         (TestClient::new(client), frames)
+    }
+
+    /// The successor serves the request the predecessor read ahead before it
+    /// stopped: those bytes are the successor's, not the socket's.
+    #[tokio::test]
+    async fn an_adopted_connection_serves_the_request_read_ahead() {
+        let (frames, produced) = mpsc::unbounded_channel();
+        let body = ResponseStream::start(
+            Box::new(TestSession {
+                frames: produced,
+                ended: false,
+            }),
+            false,
+        );
+        let (server, client) = pair();
+        let Either::Right(mut predecessor) = server else {
+            unreachable!("a socket pair is a Unix stream")
+        };
+        let mut client = TestClient::new(client);
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+        predecessor
+            .write_all(head)
+            .await
+            .expect("the predecessor's bytes");
+        let descriptor = predecessor
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a duplicate of the socket");
+        drop(frames);
+
+        let read_ahead = conn_head("GET /hello HTTP/1.1");
+        let http = handoff::Http {
+            keep_alive: true,
+            unwritten: Vec::new(),
+            read_ahead: read_ahead.clone().into_bytes(),
+            written: head.len() as u64,
+            frames: 0,
+            chunked: true,
+            content_length: None,
+        };
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "");
+        // The client sends nothing: these bytes came from the predecessor.
+        let ahead = client.read_response().await;
+        assert_eq!(ahead.body, "hello");
+        drop(client);
+        adopted
+            .await
+            .expect("the adopting task")
+            .expect("an adopted connection ends quietly");
+    }
+
+    /// An adopted response whose connection is not kept alive ends after its
+    /// terminator, and the successor writes nothing on the socket after that.
+    #[tokio::test]
+    async fn an_adopted_response_of_a_closed_connection_ends_after_its_terminator() {
+        let (frames, produced) = mpsc::unbounded_channel();
+        let body = ResponseStream::start(
+            Box::new(TestSession {
+                frames: produced,
+                ended: false,
+            }),
+            false,
+        );
+        let (server, client) = pair();
+        let Either::Right(mut predecessor) = server else {
+            unreachable!("a socket pair is a Unix stream")
+        };
+        let mut client = TestClient::new(client);
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        predecessor
+            .write_all(head)
+            .await
+            .expect("the predecessor's bytes");
+        let descriptor = predecessor
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a duplicate of the socket");
+        frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
+        drop(frames);
+
+        let http = handoff::Http {
+            keep_alive: false,
+            unwritten: Vec::new(),
+            read_ahead: Vec::new(),
+            written: head.len() as u64,
+            frames: 0,
+            chunked: true,
+            content_length: None,
+        };
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+
+        let response = client.read_response().await;
+        assert_eq!(response.body, "data: a\n\n");
+        // Nothing follows the terminator: the connection is over.
+        assert_eq!(client.read_to_end().await, "");
+        drop(client);
+        adopted
+            .await
+            .expect("the adopting task")
+            .expect("an adopted connection ends quietly");
+    }
+
+    /// One request head, as a pipelined request puts it in the connection's
+    /// buffer.
+    fn conn_head(request: &str) -> String {
+        format!("{request}\r\nHost: test\r\n\r\n")
     }
 
     /// One streamed response paused at a boundary and resumed by the
