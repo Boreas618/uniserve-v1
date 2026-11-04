@@ -610,9 +610,9 @@ struct Attachment {
     info: wire::EngineInfo,
 }
 
-/// Serves the daemon's requests on `stream` with `schedulers`, under `policy`
-/// read from `policies`, until the daemon commands a shutdown or closes the
-/// connection, then shuts every scheduler down.
+/// Serves the daemon's requests on `stream` with `schedulers` until the
+/// daemon commands a shutdown or closes the connection, then shuts every
+/// scheduler down.
 ///
 /// The connection has said hello and been welcomed, and the engine has
 /// reported itself ready; from here on it carries submissions, commands,
@@ -620,22 +620,13 @@ struct Attachment {
 /// engine reports itself failed and goes on answering each submission with
 /// an error.
 ///
-/// `policy` is the epoch's first policy, installed before the first
-/// submission (§7.3 steps 2 and 3). A daemon that owns the engine's process
-/// interface commands its epochs' policies there instead, and starts the
-/// engine with none (§[`run_engine`]); a caller that runs the schedulers
-/// itself has no process interface to command one, and an engine with no
-/// route instance places no request.
-///
 /// # Errors
 ///
-/// Fails when the connection fails, the event threads cannot start, or
-/// `policy` cannot be prepared or switched in.
+/// Fails when the connection fails or the event threads cannot start.
 pub fn serve_requests(
     stream: UnixStream,
     schedulers: Vec<SchedulerHandle>,
-    policy: PolicyProgram,
-    policies: Arc<dyn PolicySource + Send + Sync>,
+    policy: Option<EpochPolicy>,
 ) -> anyhow::Result<()> {
     let writer = stream
         .try_clone()
@@ -645,9 +636,26 @@ pub fn serve_requests(
         Connection::from_unix(writer)?,
         schedulers,
         None,
-        Some(policies),
-        Some(policy),
+        None,
+        policy,
     )
+}
+
+/// The policy an epoch starts with, when its owner installs it directly
+/// rather than through the process interface (§7.3).
+///
+/// Production installs an epoch's policy with the daemon's `Precopy` and
+/// `Switchover` commands, which the epoch's command thread applies. A caller
+/// that owns the engine's connection itself and sends no commands — the
+/// daemon library's in-process client is one — names the same installation
+/// here, and the engine serves its requests under it from the first one. The
+/// program's decisions are what the control thread routes by; the schedulers
+/// carry the policy their own installation gave them.
+pub struct EpochPolicy {
+    /// The program the route decisions follow, with its parameters.
+    pub program: PolicyProgram,
+    /// The module the program's decisions are instantiated from.
+    pub module: Arc<dyn PolicySource + Send + Sync>,
 }
 
 /// [`serve_requests`] over a connection read through `reader` and written
@@ -662,7 +670,7 @@ fn serve(
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
-    serving: Option<PolicyProgram>,
+    start: Option<EpochPolicy>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let count = schedulers.len();
@@ -696,19 +704,16 @@ fn serve(
         Ordering::Release,
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
-
-    // §7.3 steps 2 and 3 for an engine whose caller states the policy it
-    // serves: the route instance answers before the first submission, because
-    // nothing else installs one here. A daemon that commands its epochs'
-    // policies over the process interface states none, and its precopy does.
-    if let Some(program) = serving {
-        let source = policies
-            .as_ref()
-            .context("an engine serving a stated policy needs the source of its module")?;
+    // A caller that names the epoch's starting policy installs it before the
+    // first submission is read: the control thread's route instance answers
+    // from it, and without one every request is refused as unroutable.
+    if let Some(policy) = start {
         routing
-            .precopy_route(source.as_ref(), program)
-            .map_err(anyhow::Error::msg)?;
-        routing.switchover_route().map_err(anyhow::Error::msg)?;
+            .precopy_route(policy.module.as_ref(), policy.program)
+            .and_then(|()| routing.switchover_route())
+            .map_err(|reason| {
+                anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
+            })?;
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -2650,7 +2655,7 @@ fn precopy_failed(reason: impl Into<String>) -> proto::process::Report {
 ///
 /// A trait so the commands can be run against a double in a test, where no
 /// scheduler exists; the engine's implementation is [`Routing`].
-trait EpochPolicy {
+trait PolicyStages {
     /// §7.3 step 2: prepare `program`'s policy on the current state, on every
     /// scheduler and on the control thread, executing nothing.
     fn precopy(
@@ -2681,7 +2686,7 @@ trait EpochPolicy {
     fn purge(&self) -> Result<(), String>;
 }
 
-impl EpochPolicy for Routing {
+impl PolicyStages for Routing {
     fn precopy(
         &self,
         policies: &Arc<dyn PolicySource + Send + Sync>,
@@ -2806,7 +2811,7 @@ fn answer_stage(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Resu
 /// purge names the generation it means, and one this engine has already reached
 /// changes nothing.
 fn apply_process_command(
-    policy: &dyn EpochPolicy,
+    policy: &dyn PolicyStages,
     generations: &Mutex<Generations>,
     policies: Option<&Arc<dyn PolicySource + Send + Sync>>,
     command: proto::process::Command,
@@ -3138,7 +3143,7 @@ mod tests {
         }
     }
 
-    impl EpochPolicy for Recording {
+    impl PolicyStages for Recording {
         fn precopy(
             &self,
             _policies: &Arc<dyn PolicySource + Send + Sync>,

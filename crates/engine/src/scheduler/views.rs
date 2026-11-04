@@ -741,8 +741,19 @@ fn prefill_end(state: &RequestState) -> u32 {
 
 fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u32 {
     match scheduler.peek_next_call_variant(id) {
-        // A prefill or refill chunk is charged the chunk the policy sizes.
-        Some(CallKind::Forward(ForwardMode::Prefill)) | None => 0,
+        // A prompt chunk or a refill is charged the chunk the policy sizes; a
+        // structural write (a close cache, a feedback state, a block's commit,
+        // a publish) writes one position of its own and states it, because
+        // nothing is left to size.
+        Some(CallKind::Forward(ForwardMode::Prefill)) => u32::from(
+            scheduler
+                .num_scheduled_prompt_tokens(id)
+                .is_none_or(|count| count >= state.req.prompt_token_ids.len() as u32)
+                && scheduler
+                    .num_scheduled_images(id)
+                    .is_none_or(|count| count >= state.req.multimodal_inputs.images.len()),
+        ),
+        None => 0,
         Some(CallKind::Forward(ForwardMode::Decode)) => 1,
         Some(CallKind::Forward(ForwardMode::Verify)) => {
             let drafts = scheduler.verify_drafts(id, state.cache_visible_len).len();

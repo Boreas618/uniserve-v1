@@ -797,6 +797,55 @@ pub struct ProgramServer {
 /// the Program Server selected for it, which is what the epoch record keeps
 /// and what `Precopy` sends to the main processes.
 ///
+/// The step of the Program Server exchange the daemon is in.
+///
+/// The exchange waits twice in a way this crate cannot bound: the client opens
+/// its socket, and reads the answer a Program Server may never send, with no
+/// deadline (`crates/program-server/src/protocol.rs`: `Connection::connect` and
+/// `Connection::receive`). Whoever times the call out reads the step recorded
+/// here, so a deadline names the wait rather than the phase (§7.3 step 1).
+#[derive(Clone)]
+pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<PrepareStep>>);
+
+#[derive(Clone)]
+struct PrepareStep {
+    host: String,
+    what: &'static str,
+}
+
+impl Default for PrepareSteps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrepareSteps {
+    /// A record of an exchange that has not reached a Program Server yet.
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(PrepareStep {
+            host: String::new(),
+            what: "about to reach its first Program Server",
+        })))
+    }
+
+    /// Records that the exchange with `host` is waiting at `what`.
+    fn at(&self, host: &str, what: &'static str) {
+        let mut step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        step.host = host.to_owned();
+        step.what = what;
+    }
+
+    /// The wait the daemon was in, and the host it was in it with.
+    pub fn describe(&self) -> String {
+        let step = self.0.lock().unwrap_or_else(|broken| broken.into_inner());
+        if step.host.is_empty() {
+            step.what.to_owned()
+        } else {
+            format!("{} ({})", step.what, step.host)
+        }
+    }
+}
+
 /// # Errors
 ///
 /// Fails when a host has no Program Server in `servers`, when a Program
@@ -807,6 +856,7 @@ pub fn prepare_epoch(
     leader: &str,
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
+    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
     // A program is selected by its backend's name, so a deployment that left
     // one at `auto` has not said which program it means: refused here, by the
@@ -817,18 +867,30 @@ pub fn prepare_epoch(
         .iter()
         .find(|server| server.host == leader)
         .with_context(|| format!("no Program Server for the leader host {leader}"))?;
-    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors)?;
+    tracing::info!(
+        leader = %leader,
+        servers = servers.len(),
+        kernels = filled.kernels.len(),
+        policy = %filled.policy.backend,
+        "resolving the epoch's programs at its Program Servers"
+    );
+    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors, steps)?;
     for server in servers {
         if server.host == leader {
             continue;
         }
-        let selected = prepare_at(server, Selector::Fixed, filled, descriptors)?;
+        let selected = prepare_at(server, Selector::Fixed, filled, descriptors, steps)?;
         anyhow::ensure!(
             selected == pinned,
             "the Program Server of {} selected other programs than the leader's",
             server.host
         );
     }
+    tracing::info!(
+        kernels = pinned.kernels.len(),
+        policy = %pinned.policy.backend,
+        "the epoch's programs are resolved"
+    );
     Ok(pinned)
 }
 
@@ -849,6 +911,7 @@ fn prepare_at(
     selector: Selector,
     filled: &crate::epoch::FilledPrograms,
     descriptors: &[program_server::Descriptors],
+    steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::FilledPrograms> {
     let policy_slot = program_server::ProgramSlot::all(POLICY_SLOT);
     let mut requests = Vec::with_capacity(filled.kernels.len() + 1);
@@ -867,6 +930,15 @@ fn prepare_at(
         programs: requests,
         descriptors: descriptors.to_vec(),
     };
+    // Before the connect, not after it: a daemon that blocks opening the
+    // socket names the host it was reaching from this line alone, and the
+    // server it never reached logs nothing at all.
+    steps.at(&server.host, "opening its connection to a Program Server");
+    tracing::info!(
+        host = %server.host,
+        socket = %server.socket.display(),
+        "connecting to a Program Server"
+    );
     let mut client = program_server::Client::connect(&server.socket).with_context(|| {
         format!(
             "connecting to the Program Server of {} at {}",
@@ -874,17 +946,58 @@ fn prepare_at(
             server.socket.display()
         )
     })?;
+    tracing::info!(
+        host = %server.host,
+        socket = %server.socket.display(),
+        targets = ?server.targets,
+        programs = request.programs.len(),
+        "asking a Program Server to prepare the epoch's programs"
+    );
+    // A cold prepare builds every module it was asked for, which on this host
+    // is minutes per package; the server reports each step as it goes. At
+    // `debug` those steps were invisible in a deployment's log, so a prepare
+    // that was working looked exactly like one that had died. The three states
+    // that change what a reader waits for are at `info`, and `Queued` — one
+    // line per module before anything happens — stays at `debug`.
     let mut progress = |step: program_server::Progress| {
-        tracing::debug!(
-            host = %server.host,
-            module = %step.path,
-            state = ?step.state,
-            "preparing a program's module"
+        let building = matches!(
+            step.state,
+            program_server::BuildState::Building
+                | program_server::BuildState::Committed
+                | program_server::BuildState::Failed(_)
         );
+        if building {
+            tracing::info!(
+                host = %server.host,
+                module = %step.path,
+                state = ?step.state,
+                "preparing a program's module"
+            );
+        } else {
+            tracing::debug!(
+                host = %server.host,
+                module = %step.path,
+                state = ?step.state,
+                "a program's module is queued"
+            );
+        }
     };
+    steps.at(
+        &server.host,
+        "waiting for a Program Server's answer to the prepare",
+    );
     let prepared = client
         .prepare(&request, &mut progress)
         .with_context(|| format!("preparing the epoch's programs at {}", server.host))?;
+    steps.at(
+        &server.host,
+        "reading the programs a Program Server selected",
+    );
+    tracing::info!(
+        host = %server.host,
+        prepared = prepared.programs.len(),
+        "a Program Server answered"
+    );
     let mut kernels = BTreeMap::new();
     let mut policy = None;
     for chosen in prepared.programs {
@@ -1053,25 +1166,23 @@ impl<'a> ProgramSwitch<'a> {
         // names the generation each one prepared.
         generations.clear();
         for process in processes.iter() {
-            send(commands, process, command.clone())?;
-            let prepared =
-                await_report(
-                    commands,
-                    process,
-                    update,
-                    PRECOPY_TIMEOUT,
-                    |report| match report.kind.as_ref() {
-                        Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
-                        Some(report::Kind::PrecopyFailed(failed)) => {
-                            Some(Err(crate::epoch::Failure {
-                                kind: "precopy_failed".to_owned(),
-                                reason: failed.reason.clone(),
-                                device: None,
-                            }))
-                        }
-                        _ => None,
-                    },
-                );
+            send(commands, process, command.clone(), "Precopy")?;
+            let prepared = await_report(
+                commands,
+                process,
+                update,
+                PRECOPY_TIMEOUT,
+                "Precopy",
+                |report| match report.kind.as_ref() {
+                    Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
+                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                        kind: "precopy_failed".to_owned(),
+                        reason: failed.reason.clone(),
+                        device: None,
+                    })),
+                    _ => None,
+                },
+            );
             match prepared {
                 Ok(generation) => generations.push(generation),
                 Err(failure) => {
@@ -1104,12 +1215,14 @@ impl<'a> ProgramSwitch<'a> {
                         generation,
                     })),
                 },
+                "Switchover",
             )?;
             await_report(
                 self.commands,
                 &process,
                 &mut self.update,
                 COMMAND_TIMEOUT,
+                "Switchover",
                 |report| match report.kind.as_ref() {
                     Some(report::Kind::Switched(switched)) => {
                         Some(answered(report, switched.generation == generation))
@@ -1134,12 +1247,13 @@ impl<'a> ProgramSwitch<'a> {
         };
         let mut acknowledged = 0;
         for process in self.processes.iter() {
-            send(self.commands, process, command.clone())?;
+            send(self.commands, process, command.clone(), "Commit")?;
             await_report(
                 self.commands,
                 process,
                 &mut self.update,
                 COMMAND_TIMEOUT,
+                "Commit",
                 |report| {
                     matches!(report.kind.as_ref(), Some(report::Kind::Committed(_)))
                         .then_some(Ok(()))
@@ -1169,12 +1283,13 @@ impl<'a> ProgramSwitch<'a> {
         };
         let mut outcome = Ok(());
         for process in self.processes.iter() {
-            let answered = send(self.commands, process, command.clone()).and_then(|()| {
+            let answered = send(self.commands, process, command.clone(), "Revert").and_then(|()| {
                 await_report(
                     self.commands,
                     process,
                     &mut self.update,
                     COMMAND_TIMEOUT,
+                    "Revert",
                     |report| {
                         matches!(report.kind.as_ref(), Some(report::Kind::Reverted(_)))
                             .then_some(Ok(()))
@@ -1207,12 +1322,14 @@ impl<'a> ProgramSwitch<'a> {
                 process::Command {
                     kind: Some(command::Kind::Purge(process::Purge { generation })),
                 },
+                "Purge",
             )?;
             await_report(
                 self.commands,
                 &process,
                 &mut self.update,
                 COMMAND_TIMEOUT,
+                "Purge",
                 |report| {
                     matches!(report.kind.as_ref(), Some(report::Kind::Purged(_))).then_some(Ok(()))
                 },
@@ -1240,10 +1357,29 @@ fn send(
     commands: &crate::supervision::ProcessCommands,
     process: &EpochProcess,
     command: process::Command,
+    what: &str,
 ) -> Result<(), crate::epoch::Failure> {
-    commands
+    // The epoch's installation is the one sequence whose silence cannot be
+    // told from a stall: a log line here says which command a daemon was
+    // sending when nothing answered any more (§7.3 steps 2-6).
+    tracing::info!(
+        host = %process.host,
+        engine = process.engine,
+        command = what,
+        "sending a command to a main process"
+    );
+    let sent = commands
         .send(process.engine, command)
-        .map_err(|error| unanswerable(&process.host, error))
+        .map_err(|error| unanswerable(&process.host, error));
+    if sent.is_ok() {
+        tracing::info!(
+            host = %process.host,
+            engine = process.engine,
+            command = what,
+            "the command is sent"
+        );
+    }
+    sent
 }
 
 /// Reads the reports the main processes send until `matches` takes one from
@@ -1256,16 +1392,17 @@ fn await_report<T>(
     process: &EpochProcess,
     update: &mut crate::epoch::Update,
     timeout: Duration,
+    what: &str,
     matches: impl Fn(&process::Report) -> Option<Result<T, crate::epoch::Failure>>,
 ) -> Result<T, crate::epoch::Failure> {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(unanswered(process, timeout));
+            return Err(unanswered(process, timeout, what));
         }
         let Some((engine, report)) = commands.report(remaining) else {
-            return Err(unanswered(process, timeout));
+            return Err(unanswered(process, timeout, what));
         };
         if let Some(failure) = crate::epoch::Failure::of_report(&report) {
             update.fail(failure.clone());
@@ -1283,19 +1420,26 @@ fn await_report<T>(
             if let Err(failure) = &outcome {
                 update.fail(failure.clone());
             }
+            tracing::info!(
+                host = %process.host,
+                engine = process.engine,
+                command = what,
+                "a main process answered"
+            );
             return outcome;
         }
     }
 }
 
 /// The failure of a main process that did not answer within its time.
-fn unanswered(process: &EpochProcess, timeout: Duration) -> crate::epoch::Failure {
+fn unanswered(process: &EpochProcess, timeout: Duration, what: &str) -> crate::epoch::Failure {
     crate::epoch::Failure {
         kind: "timeout".to_owned(),
         reason: format!(
-            "the main process of {} (engine {}) did not answer within {} s",
+            "the main process of {} (engine {}) did not answer its {} within {} s",
             process.host,
             process.engine,
+            what,
             timeout.as_secs()
         ),
         device: None,

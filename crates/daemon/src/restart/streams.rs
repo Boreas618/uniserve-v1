@@ -190,6 +190,14 @@ impl Paused {
                     "pid": std::process::id(),
                     "pause_ms": pause_ms,
                     "frozen_at_ns": frozen.frozen_at_ns,
+                    // When the engine moved this response's stream to the
+                    // successor (design §7.5.1 step 4). The ownership window
+                    // runs from here to the successor's first new frame, which
+                    // its own `handoff adopted` record carries; it is null
+                    // when the successor took nothing over. This is where the
+                    // stream is no longer the predecessor's, which is what a
+                    // successor's death in that window costs.
+                    "engine_at_ns": taken.map(|adopted| adopted.at_ns),
                     "adopted": taken.is_some(),
                 })
             );
@@ -487,6 +495,51 @@ mod tests {
     use crate::model::ModelParameters;
     use crate::options::VideoJobOptions;
     use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
+
+    /// A pause that ends without answering its responses — the successor gave
+    /// up, or the takeover failed before it answered — gives the deployment
+    /// back: the daemon admits requests again rather than closing every
+    /// connection for a handover that did not happen, and no round is left
+    /// running for a response that registers later. A decided pause does not:
+    /// the predecessor is leaving, and its new requests are the successor's.
+    #[tokio::test]
+    async fn a_pause_dropped_without_a_decision_gives_the_deployment_back() {
+        let handoff = crate::http::handoff::Handoff::new();
+        assert!(handoff.pause().await.is_empty());
+        assert!(
+            !handoff.admissions().open(),
+            "the handover stopped admissions"
+        );
+        let undecided = Paused {
+            records: Vec::new(),
+            descriptors: Vec::new(),
+            frozen: Vec::new(),
+            handoff: Some(Arc::new(handoff.clone())),
+            decided: false,
+        };
+        drop(undecided);
+        assert!(
+            handoff.admissions().open(),
+            "the daemon admits requests again"
+        );
+        assert!(!handoff.pausing(), "no round is left running");
+
+        // The successor's answer was given: this process finishes its
+        // responses and leaves the deployment's new requests to the successor.
+        assert!(handoff.pause().await.is_empty());
+        let decided = Paused {
+            records: Vec::new(),
+            descriptors: Vec::new(),
+            frozen: Vec::new(),
+            handoff: Some(Arc::new(handoff.clone())),
+            decided: true,
+        };
+        drop(decided);
+        assert!(
+            !handoff.admissions().open(),
+            "a decided handover keeps them closed"
+        );
+    }
 
     /// §7.5.1's ownership rule, which no run reaches: the responses the
     /// successor reported taking are adopted — it writes the rest of them —

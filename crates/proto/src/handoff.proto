@@ -68,6 +68,12 @@ message Http {
   bool chunked = 6;
   // The response body's length, for a body the head declares one for.
   optional uint64 content_length = 7;
+  // Whether the response holds its head until its body produces its first
+  // output: a response answered as one document does, so that the status it
+  // states is its outcome. A successor that takes one over with `written` at
+  // zero holds the head the same way, because the bytes in `unwritten` are a
+  // status this process had not committed to.
+  bool head_held = 8;
 }
 
 // A chat completion streamed as server-sent events, stopped at an event
