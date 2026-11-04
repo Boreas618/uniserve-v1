@@ -32,7 +32,7 @@ use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
     MemAllocationProp, MemLocation, in_context, reserve_addresses,
 };
-use crate::vmm::HandleType;
+use crate::vmm::{HandleType, Protection};
 use crate::{DeviceId, Error, PinnedBuffer, PrimaryContext, Result, Stream, reclaim};
 
 const CU_MEM_ALLOC_GRANULARITY_RECOMMENDED: i32 = 1;
@@ -245,6 +245,48 @@ impl VirtualPool {
         {
             chunk.free = true;
         }
+    }
+
+    /// Changes what the pool's device and its peers may do with the block at
+    /// `address`, at its unchanged address (`cuMemSetAccess`): a parked
+    /// standby's blocks become read-only and become read-write again when it
+    /// is promoted, and a captured graph that addresses them stays valid.
+    pub(crate) fn protect(&self, address: u64, protection: Protection) -> Result<()> {
+        let Some(chunk) = self
+            .chunks
+            .iter()
+            .find(|chunk| self.address + chunk.offset == address)
+        else {
+            return Err(Error::invalid(format!(
+                "the pool on {} gave out no block at {address:#x}",
+                self.device
+            )));
+        };
+        if chunk.block.is_none() {
+            return Err(Error::invalid(
+                "a suspended pool's block has no storage to change the access of",
+            ));
+        }
+        let bytes = chunk.bytes;
+        let access: Vec<MemAccessDesc> = self
+            .access
+            .iter()
+            .map(|&id| MemAccessDesc {
+                location: MemLocation {
+                    kind: CU_MEM_LOCATION_TYPE_DEVICE,
+                    id,
+                },
+                flags: protection.flags(),
+            })
+            .collect();
+        in_context(self.context.raw(), |driver| {
+            // SAFETY: the range is mapped by this pool; the descriptors are live
+            // for the call.
+            driver.check(
+                unsafe { (driver.mem_set_access)(address, bytes, access.as_ptr(), access.len()) },
+                "cuMemSetAccess",
+            )
+        })
     }
 
     /// Creates `bytes` of physical storage and maps it at `offset`, readable

@@ -1,0 +1,34 @@
+# The rotary_factors operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program stores a block of scaled cosine and sine factors; the token count
+# is a launch value, so one module serves every sequence length.
+
+op = "rotary_factors"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/rotary_factors.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.
+[kernel.descriptors]
+dimensions = { dtype = ["fp32", "bf16", "fp16"], positions = ["i32", "i64"], columns = ["32", "64", "128"], block = ["256", "512", "1024"], scale = ["0x3f800000"], pdl = ["true", "false"] }
+
+[parameters]
