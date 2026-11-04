@@ -41,7 +41,7 @@ mod results;
 use super::*;
 use ipc::{BufferId, MediaCall};
 use scheduling::PolicyError;
-use scheduling::guest::Plan;
+use scheduling::guest::{Plan, Room};
 
 pub(super) use media::Occupancy;
 
@@ -386,7 +386,7 @@ impl Scheduler {
             return None;
         };
         self.step += 1;
-        let room = views::room(self, self.step);
+        let room = self.room();
         let live = self.live();
         // A resident request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4).
@@ -452,14 +452,25 @@ impl Scheduler {
         None
     }
 
+    /// This step's room.
+    ///
+    /// `views.rs` builds every fact; the two it cannot are open items of the
+    /// mechanism until the owning subsystem exposes them: the captured graph
+    /// tiers the build config states, and the pages an epoch's precopy claimed
+    /// (`warming::Warming::reserved`, which `views.rs` reads directly).
+    fn room(&self) -> Room {
+        let facts = views::room_facts(self, self.step);
+        views::room_view(facts)
+    }
+
     /// The mechanism's state at a batch boundary, owned, for the switch.
     fn trial_state(&self) -> policy::TrialState {
         policy::TrialState {
             snapshot: views::snapshot(self, self.step, self.recorder.recorded()),
-            room: views::room(self, self.step),
+            room: self.room(),
             shortage: views::shortage_now(self),
             arrival: None,
-            call: None,
+            call: views::placement(self),
             expert_load: views::expert_load_of(self),
         }
     }

@@ -7,18 +7,23 @@ use storage::manifest::cache::{Operation, Page, Prefix, Snapshot};
 #[derive(Default)]
 pub(super) struct Warming {
     leased: Vec<PageRef>,
-    reserved: Vec<Reserved>,
+    /// The pages this precopy claimed for the requests it resumes from a stored
+    /// cache, in claim order: `Room.warming` reads them through
+    /// [`Warming::reserved`].
+    pub(super) reserved: Vec<Reserved>,
     pub(super) prefill_tokens: Option<usize>,
 }
 
-struct Reserved {
-    page: Page,
-    reference: PageRef,
-    hash: u64,
-    tokens: Vec<u32>,
-    source: Arc<ipc::WorkerEndpoint>,
-    resume: proto::request::CacheResume,
-    published: bool,
+/// One claimed page of a precopy: the stored page, the request it serves, and
+/// where it goes.
+pub(super) struct Reserved {
+    pub(super) page: Page,
+    pub(super) reference: PageRef,
+    pub(super) hash: u64,
+    pub(super) tokens: Vec<u32>,
+    pub(super) source: Arc<ipc::WorkerEndpoint>,
+    pub(super) resume: proto::request::CacheResume,
+    pub(super) published: bool,
 }
 
 impl Warming {
