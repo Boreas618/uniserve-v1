@@ -477,3 +477,35 @@ fn every_package_names_an_operator_the_ops_crate_declares() {
         failures.join("\n")
     );
 }
+
+/// The three convolution packages are one source in three places, and the store builds
+/// each package from its own copy of its root, so a source shared by path is not
+/// available to them. Identity in bytes is the invariant that keeps them one program:
+/// the entry differs only by the package's `[kernel.entry]`, and the element types only
+/// by the build script's defines. A divergence would make one backend compute what the
+/// other two do not, which no per-package check could see.
+#[test]
+fn the_convolutions_are_one_source_in_three_packages() {
+    const CONVOLUTIONS: [&str; 3] = ["conv1d", "conv3d", "conv_transpose1d"];
+    const SHARED: [&str; 3] = [
+        "src/conv.cu",
+        "include/uniserve_conv.h",
+        "test/conv_check.py",
+    ];
+    for shared in SHARED {
+        let sources = CONVOLUTIONS.map(|op| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ops/kernels")
+                .join(op)
+                .join("cudnn")
+                .join(shared);
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("{shared} of {op} is not readable at {}: {error}", path.display())
+            })
+        });
+        assert!(
+            sources[0] == sources[1] && sources[1] == sources[2],
+            "{shared} differs between the three convolution packages"
+        );
+    }
+}
