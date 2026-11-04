@@ -830,12 +830,15 @@ mod tests {
 
         let first = walk();
         let extent = arena.used();
-        assert!(extent <= RESERVED, "a step cannot exceed the pool's range");
+        // The extent is the three reservations' own sizes: 8 x 4096 f32 words, 8 x 4096 bf16
+        // values and 8 x 1024 f32 words. Each size is a multiple of the arena's alignment, so the
+        // figures add up exactly and any extra allocation inside the step would show here.
         assert_eq!(
-            super::Plan { bytes: extent }.bytes(),
             extent,
-            "the plan the pool records is the extent the arena reached"
+            (8 * 4_096 * 4) + (8 * 4_096 * 2) + (8 * 1_024 * 4),
+            "a step reserved more than its three activations"
         );
+        assert!(extent <= RESERVED, "a step cannot exceed the pool's range");
 
         // The next replay starts from the region's first address, not from where the last ended.
         arena.reset();
