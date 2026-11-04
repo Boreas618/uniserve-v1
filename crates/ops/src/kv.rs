@@ -108,7 +108,9 @@ impl Op for KvWrite {
         let heads = u64::from(descriptor.heads);
         let head_dim = u64::from(descriptor.head_dim);
         let row = heads * head_dim;
-        let tokens = args.key.rows();
+        // The token count is the first extent of a `[tokens, heads, head_dim]` view; `rows()` is the
+        // product of every extent but the last and would count tokens times heads.
+        let tokens = args.key.shape.dim(0);
         // The cache is filled in the source's type. An FP8 cache needs the page's scale applied
         // first, which is `kv_quantize`'s job: allowing it here would write values that a reader
         // multiplies by a scale they never had applied, which is wrong by orders of magnitude

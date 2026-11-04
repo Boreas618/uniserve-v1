@@ -400,8 +400,15 @@ impl Op for Nvfp4Gemm {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The packed operands are exact and the contraction accumulates in FP32; the one rounding
         // is the epilogue's write. Two implementations of one variant differ only in the order the
-        // FP32 sum is formed, which the standard bound covers.
-        Tolerance::rounding(2, descriptor.accumulate, descriptor.output)
+        // FP32 sum is formed, which the standard bound covers — over a reduction of `k` terms, not
+        // of two: `k` is the contraction the program actually runs, and a bound with two terms in
+        // it was tighter than any correct kernel by the width of the reduction (programs measured
+        // one element outside it on a correct program).
+        Tolerance::rounding(
+            u64::from(descriptor.k),
+            descriptor.accumulate,
+            descriptor.output,
+        )
     }
 }
 

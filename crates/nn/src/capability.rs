@@ -612,6 +612,21 @@ pub trait Denoiser {
 
 /// A decoder that turns latents back into media.
 pub trait Decoder {
+    /// The tables a decode of `layout` reads, in [`Self::prepare_layout`]'s order.
+    ///
+    /// Every decoder table is layout-keyed: the copy blocks' offsets, the per-voxel rotary
+    /// positions and the packed row of each clip's voxel all follow from the layout's counts, not
+    /// from a request's seed or schedule. Deterministic for a layout, so the executor keys storage
+    /// by `(layout, name)` and shares one set between every request of that shape.
+    fn layout_tables(&self, layout: &Layout) -> Vec<StateTable>;
+
+    /// Write the host bytes of each table of `layout`, in [`Self::layout_tables`]' order.
+    ///
+    /// `out[i]` is `layout_tables(layout)[i]`'s bytes, row-major in its element type, and is
+    /// already the right length; the executor uploads it. Host bytes only: no allocation, no
+    /// synchronization and no read-back, so a decode captured after this call is capture-safe.
+    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(
         &self,

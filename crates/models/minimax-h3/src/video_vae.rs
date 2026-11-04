@@ -1115,6 +1115,25 @@ impl VideoDecoder {
 }
 
 impl Decoder for VideoDecoder {
+    fn layout_tables(&self, layout: &nn::capability::Layout) -> Vec<StateTable> {
+        // A layout whose extents contradict the checkpoint has no tables; `prepare_layout` refuses
+        // it rather than this method answering a table of the wrong shape.
+        self.tables(layout.video.height, layout.video.width)
+            .unwrap_or_default()
+    }
+
+    fn prepare_layout(
+        &self,
+        layout: &nn::capability::Layout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        self.table_bytes(layout.video.height, layout.video.width, out)
+            .map_err(|error| nn::Error::Shape {
+                owner: "VideoDecoder",
+                problem: error.to_string(),
+            })
+    }
+
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them

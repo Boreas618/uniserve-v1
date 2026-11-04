@@ -37,6 +37,7 @@ def spec(fields, parameters, target):
             "stage": "i32",
             "draw": "i32",
             "key": "i64",
+            "offset": "i64",
             "BLOCK": "constexpr",
             "NORMAL": "constexpr",
             "ROWS": "constexpr",

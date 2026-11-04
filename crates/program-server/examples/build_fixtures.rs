@@ -47,6 +47,10 @@ fn run() -> Result<(), String> {
     run_with(options)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the server's error is large by design; an example reports it once and stops"
+)]
 fn run_with(options: Options) -> Result<(), String> {
     let fixtures = options.fixtures()?;
     if fixtures.is_empty() {

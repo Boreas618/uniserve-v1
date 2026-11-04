@@ -16,6 +16,11 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The slice harness (`examples/qwen3_moe_slice.rs`) is the thing that owns runtime objects -- the
+# device, the allocator, the stream -- because a model may not. They are here, in a dev-dependency,
+# so the library's own dependency list stays `nn` and `ops`.
+platform = { path = "../../platform" }
+
 # The encoded-checkpoint test writes its own shards byte for byte (header JSON and payload), so it
 # needs a directory to write them in and nothing of the safetensors crate: the payload is padded to
 # the declared width, which is what lets the test declare a dtype the tensor does not have.

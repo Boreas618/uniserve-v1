@@ -350,9 +350,11 @@ pub struct GatedResidualDescriptor {
     /// Element type of the row indices.
     pub indices: DType,
     /// Elements per activation row.
+    ///
+    /// The kernel is compiled per variant, so this is a constant it holds: the count one launch
+    /// walks is `rows × width`, and `rows` arrives as the launch's last scalar because it changes
+    /// with the request.
     pub width: u32,
-    /// The elements one launch walks; `rows × width`, baked in like the kernel's own tile mask.
-    pub elements: u64,
     /// Elements between the gate rows the row indices select.
     pub gate_stride: u64,
 }
@@ -363,7 +365,6 @@ impl fmt::Display for GatedResidualDescriptor {
             .field("dtype", self.dtype)
             .field("indices", self.indices)
             .field("width", self.width)
-            .field("elements", self.elements)
             .field("gate_stride", self.gate_stride)
             .finish(formatter)
     }
@@ -423,16 +424,6 @@ impl Op for GatedResidual {
             .require_shape(Self::NAME, Shape::new(&[rows]))?;
         args.row_indices
             .require_row(Self::NAME, descriptor.indices, rows)?;
-        if rows * width != descriptor.elements {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the descriptor was compiled for {} elements, the views hold {}",
-                    descriptor.elements,
-                    rows * width
-                ),
-            ));
-        }
         if descriptor.gate_stride > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
@@ -449,9 +440,13 @@ impl Op for GatedResidual {
             .view(args.update)
             .view(args.gate)
             .view(args.row_indices)
-            .i32(descriptor.gate_stride as i32);
+            .i32(descriptor.gate_stride as i32)
+            // Appended rather than inserted, so every parameter before it keeps its offset: the
+            // row count is the one thing a request changes, and the kernel multiplies it by the
+            // width it was compiled for.
+            .u64(rows);
         kernel.launch(
-            LaunchGrid::covering(descriptor.elements, GATED_BLOCK)?,
+            LaunchGrid::covering(rows * width, GATED_BLOCK)?,
             &mut arguments,
             stream,
         )
@@ -467,5 +462,39 @@ impl Op for GatedResidual {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The gated product rounds, then the residual sum rounds: two roundings, no reduction.
         Tolerance::rounding(2, descriptor.dtype, descriptor.dtype)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key is what a package is compiled against, so a key must not move with the request.
+    #[test]
+    fn gated_residuals_key_holds_no_row_count() {
+        let descriptor = GatedResidualDescriptor {
+            dtype: DType::BF16,
+            indices: DType::I32,
+            width: 5376,
+            gate_stride: 32_256,
+        };
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_bf16_indices_i32_width_5376_gate_stride_32256"
+        );
+    }
+
+    #[test]
+    fn the_tolerance_counts_the_product_and_the_sum_and_nothing_else() {
+        let descriptor = GatedResidualDescriptor {
+            dtype: DType::BF16,
+            indices: DType::I32,
+            width: 5376,
+            gate_stride: 32_256,
+        };
+        assert_eq!(
+            GatedResidual::tolerance(&descriptor),
+            Tolerance::rounding(2, DType::BF16, DType::BF16)
+        );
     }
 }

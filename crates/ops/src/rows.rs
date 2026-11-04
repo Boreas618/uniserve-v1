@@ -168,9 +168,12 @@ impl Op for Rows {
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+        // The destination is what this operator writes, so the twin has to *be* the destination the
+        // comparison replaces: the new program writes the copy while the previous generation writes
+        // the real buffer, and a twin of the source instead would leave both programs writing the
+        // same buffer and compare a source with itself, which no run can fail.
         Args {
-            source: twins.shadow_of(args.source),
+            destination: twins.in_place(args.destination, stream),
             ..args
         }
     }
