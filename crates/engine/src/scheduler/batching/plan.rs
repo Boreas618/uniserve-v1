@@ -175,9 +175,12 @@ impl Scheduler {
                 );
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     // The request stays where it is for this step, and the pass
-                    // stays non-token behind it: named, because the rest of the
-                    // world cannot see a plan that named work it cannot build.
-                    tracing::debug!(
+                    // stays non-token behind it. A plan the mechanism cannot
+                    // build is a stall the rest of the world cannot see, so it
+                    // is named at `warn`: a policy that keeps asking for a
+                    // verification the cache has no room for would otherwise
+                    // park the request in silence.
+                    tracing::warn!(
                         request = id.0,
                         visible = cache_visible_len,
                         target = capacity_target,
@@ -197,7 +200,7 @@ impl Scheduler {
                     )
                 });
                 if planned.is_none() {
-                    tracing::debug!(
+                    tracing::warn!(
                         request = id.0,
                         drafts = drafts.len(),
                         proposals,
