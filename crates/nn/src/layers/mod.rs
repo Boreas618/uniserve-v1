@@ -36,6 +36,7 @@ mod patch;
 mod pool;
 mod position;
 mod residual;
+mod rgb;
 mod rope;
 mod rotate;
 mod rows;
@@ -67,6 +68,7 @@ pub use position::PositionInterpolate;
 pub use residual::{
     ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
+pub use rgb::RgbBytes;
 pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;
 pub use rows::Rows;

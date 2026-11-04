@@ -64,8 +64,8 @@ pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d,
     ConvGeometry, ConvTranspose1d, CrossFade, Embedding, FrameMoments, FrameNormPad, FramePad,
     GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
-    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, RmsNorm, Rotary, Rotate, Rotation, Sampler,
-    SamplerState, Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm,
+    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, RgbBytes, RmsNorm, Rotary, Rotate, Rotation,
+    Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm,
     ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables, Silu, Snake, SwiGlu,
     TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
