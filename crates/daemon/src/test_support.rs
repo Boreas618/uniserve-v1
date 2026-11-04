@@ -314,15 +314,30 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
     .unwrap()
 }
 
+/// How long a fixture's request may take to answer before it is a stall.
+///
+/// A handler that never answers, or a body that never ends, would otherwise
+/// hold the whole run open with nothing said: every step of a fixture is
+/// driven by the test and a simulated engine answers at once, so a wait that
+/// outlives this is a defect and must name itself.
+pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Sends `request` through `router` and returns the status, the headers, and
 /// the body parsed as JSON (`Null` for an empty body).
 pub(crate) async fn send(
     router: &Router,
     request: Request<Body>,
 ) -> (StatusCode, HeaderMap, serde_json::Value) {
-    let response = router.clone().oneshot(request).await.unwrap();
+    let waited = format!("{} {}", request.method(), request.uri());
+    let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
+        Ok(response) => response.unwrap(),
+        Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
+    };
     let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let bytes = match tokio::time::timeout(STALL, axum::body::to_bytes(body, usize::MAX)).await {
+        Ok(bytes) => bytes.unwrap(),
+        Err(_) => panic!("{waited}'s body did not end within {} s", STALL.as_secs()),
+    };
     let json = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
@@ -372,7 +387,7 @@ impl crate::updates::switch::Roster for Uncommanded {
         _launch: &crate::engine::launch::Launch,
     ) -> Result<crate::updates::switch::Spawned, String> {
         Ok(crate::updates::switch::Spawned {
-            generation: 1,
+            generation: _spawn.generation,
             pid: 1,
         })
     }
