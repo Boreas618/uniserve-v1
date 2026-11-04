@@ -29,6 +29,18 @@
 
 use crate::{Error, Result, VideoVaeConfig};
 
+/// The latent frames one clip decodes: seven for the checkpoint.
+///
+/// A clip's native output is the 17-frame body, the three frames the final clip drops and the
+/// five-frame tail — 25 frames — and the decoder emits `temporal_compression` frames per latent frame,
+/// so it reads `ceil(25 / 4) = 7` latent frames and trims the three it does not keep. The reference
+/// states the seven directly (`decoding.py`, `clip_input`); it is derived here so a checkpoint whose
+/// clip, drop or compression differs cannot silently decode the wrong span.
+pub fn decode_latents(config: &VideoVaeConfig) -> u32 {
+    let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
+    native.div_ceil(config.temporal_compression())
+}
+
 /// The latent raster of one decode call, and the token count it produces.
 ///
 /// One clip decodes `latent_frames` latent frames of `height` × `width` latent voxels. Every voxel is
@@ -48,10 +60,10 @@ pub struct Canvas {
 }
 
 impl Canvas {
-    /// The canvas of one clip of `config`: 7 latent frames at the given latent extents.
+    /// The canvas of one clip of `config`: [`decode_latents`] latent frames at the given latent extents.
     pub fn clip(config: &VideoVaeConfig, height: u32, width: u32) -> Self {
         Self {
-            frames: config.clip_latents() + config.token_drop.div_ceil(config.clip_latents()),
+            frames: decode_latents(config),
             height,
             width,
             registers: config.decoder_num_register_tokens,
@@ -488,6 +500,21 @@ pub(crate) mod tests {
                     + u64::from(tile.canvas.tail)
             );
         }
+    }
+
+    #[test]
+    fn a_clip_decodes_seven_latent_frames_into_twenty_five() {
+        let config = video_config();
+        assert_eq!(decode_latents(&config), 7);
+        assert_eq!(config.temporal_compression(), 4);
+        // The decode emits 28 frames and the splice keeps 25 of them: 25 = 17 + 3 + 5.
+        let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
+        assert_eq!(native, 25);
+        assert_eq!(decode_latents(&config) * config.temporal_compression() - native, 3);
+        let canvas = Canvas::clip(&config, 16, 16);
+        assert_eq!(canvas.frames, 7);
+        assert_eq!(canvas.frames_out(&config), 28);
+        assert_eq!(canvas.rows(), 7 * 256 + 5);
     }
 
     #[test]
