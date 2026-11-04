@@ -797,11 +797,17 @@ fn added_token(tokenizer: &serde_json::Value, content: &str) -> Option<u32> {
 ///
 /// This model understands a prompt and generates tokens, and it encodes no vision features and
 /// denoises no latents, so the served feature is `GenerationFeatures::UNDERSTANDING` and every
-/// capacity is zero. The two nonzero figures are the Qwen3 profile's own
-/// (`crates/frontend/src/model/generation.rs`, its `ModelParameters::Qwen3` arm:
+/// **capacity** is zero: `max_latent_units`, `latent_bytes_per_unit`, `max_vae_grid_tokens`,
+/// `max_vit_grid_tokens`, `max_latent_feature_bytes`, `max_vision_feature_bytes`,
+/// `commit_marker_tokens` and `encoder_cache_entries`. A capacity of zero declares no capacity at
+/// all, which is what a model that encodes and denoises nothing has.
+///
+/// The two nonzero figures are **lower bounds that must be at least one**, not capacities, and they
+/// are the Qwen3 profile's own (`crates/frontend/src/model/generation.rs`, its `Qwen3` arm:
 /// `GenerationLimits { latent_downsample: 1, max_cfg_branches: 1, ..Default::default() }`):
-/// a zero downsample is a divisor and a zero branch count admits no request at all, so the model
-/// that has no media still states both as one.
+/// `latent_downsample` is a divisor, so zero would divide a pixel grid by it, and
+/// `max_cfg_branches` counts the branches a request may run, so one branch is the minimum a
+/// deployment admits rather than a media fact about this model.
 fn understanding_limits() -> GenerationLimits {
     GenerationLimits {
         features: GenerationFeatures::UNDERSTANDING,
