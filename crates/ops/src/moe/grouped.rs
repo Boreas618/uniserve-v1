@@ -646,10 +646,12 @@ pub struct GatherGemmNvfp4Args {
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[experts, 2]` f32: the reciprocals of each expert's tensor scales, one **per projection** in
-    /// the fused reading order — column 0 is the value half (up), column 1 the gate half. A
-    /// checkpoint carries one tensor scale per projection, so the two columns are generally
-    /// different numbers and a program may not use one for both.
+    /// `[2, experts]` f32, contiguous: the reciprocals of each expert's tensor scales, one **per
+    /// projection** in the fused reading order — row 0 is the value half (up), row 1 the gate half. A
+    /// checkpoint carries two separate per-expert scalar tables, and the product's kernel reads each
+    /// as its own array of `experts` floats, so the two halves are two *rows* here and not an
+    /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
+    /// `array[expert]`.
     pub global_scale: TensorView,
     /// `[tokens, top]` i32: the experts each token's routes selected.
     pub ids: TensorView,
@@ -709,8 +711,10 @@ pub struct GatherNvfp4Call {
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
     pub scales: *const c_void,
-    /// `[experts, 2]` f32: the reciprocals of the experts' tensor scales, per projection.
+    /// `[experts]` f32: the reciprocals of the experts' tensor scales for the value (up) projection.
     pub global_scale: *const c_void,
+    /// `[experts]` f32: the same for the gate projection.
+    pub global_scale_gate: *const c_void,
     /// `[tokens, top]` i32: the experts each token's routes selected.
     pub ids: *const i32,
     /// `[tiles]` i32: the expert a tile's rows belong to.
@@ -755,6 +759,7 @@ pub struct GatherNvfp4Call {
 pub struct GatherNvfp4CallLayout {
     pub size: usize,
     pub global_scale: usize,
+    pub global_scale_gate: usize,
     pub workspace: usize,
     pub workspace_bytes: usize,
     pub dtype: usize,
@@ -764,8 +769,9 @@ pub struct GatherNvfp4CallLayout {
 impl GatherNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
-        size: 696,
+        size: 704,
         global_scale: 24,
+        global_scale_gate: 32,
         workspace: 88,
         workspace_bytes: 96,
         dtype: 184,
@@ -940,13 +946,27 @@ impl GatherGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts, 2]))?;
+            .require_shape(Self::NAME, Shape::new(&[2, experts]))?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected f32 tensor scales, found {}",
                     args.global_scale.dtype
+                ),
+            ));
+        }
+        // The kernel reads each projection's table as `experts` consecutive floats, so the two rows
+        // must be packed: a `[2, experts]` view with any other step would hand it one projection's
+        // scales for both.
+        if args.global_scale.strides.get(0) != experts || args.global_scale.strides.last() != 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the tensor scales step {}/{}, and the product reads each projection's table as \
+                     {experts} consecutive f32: the operand must be packed `[2, {experts}]`",
+                    args.global_scale.strides.get(0),
+                    args.global_scale.strides.last()
                 ),
             ));
         }
@@ -1005,6 +1025,11 @@ impl Op for GatherGemmNvfp4 {
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
+            // The gate half's row: the two tables are consecutive `experts` floats, so the second
+            // row is the first address plus the row stride the operand is validated for.
+            global_scale_gate: (address(args.global_scale.ptr)
+                + 4 * args.global_scale.strides.get(0)) as usize
+                as *const c_void,
             ids: address(args.ids.ptr) as usize as *const i32,
             tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
             tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
@@ -1233,9 +1258,9 @@ pub struct RouteGemmNvfp4Args {
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale, one **per projection** —
-    /// this product fuses a single projection, so the table has one column and the shape still says
-    /// which half of a two-projection stack it is.
+    /// `[experts]` f32: the reciprocal of each expert's tensor scale, one **per projection** — this
+    /// product fuses a single projection, so the table is one array of `experts` floats, the shape a
+    /// reader that indexes `array[expert]` takes.
     pub global_scale: TensorView,
     /// `[routes]` i32: the expert each row belongs to.
     pub ids: TensorView,
@@ -1332,7 +1357,13 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts, 1]))?;
+            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+        if args.global_scale.strides.last() != 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                "the tensor scales must be one packed f32 per expert",
+            ));
+        }
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1437,7 +1468,7 @@ mod nvfp4_launch_tests {
             hidden: table(DType::BF16, &[3, 2048]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
-            global_scale: table(DType::F32, &[128, 2]),
+            global_scale: table(DType::F32, &[2, 128]),
             ids: table(DType::I32, &[3, 8]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
@@ -1505,11 +1536,13 @@ mod nvfp4_call_layout_tests {
     /// `static_assert`s are the other half of.
     #[test]
     fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
-        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 696);
+        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 704);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 8);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 16);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 24);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 32);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, ids), 40);
         assert_eq!(
             std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
             72
