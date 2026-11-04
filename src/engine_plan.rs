@@ -208,10 +208,11 @@ impl EpochPlan {
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
     /// `snapshot` is the state group's snapshot (`CachePlan::state_snapshot_bytes`, design 4.5),
-    /// which the scratch pool has to hold beside the shadow region. Both are stated as **one**
-    /// figure: the pool is reserved once at construction, and a second reservation of the same pool
-    /// kind is a no-op the allocator refuses, so splitting them would surface at the shadow pair's
-    /// first mapping rather than where the figure was planned.
+    /// which the scratch pool has to hold beside the shadow region. The **reservation** is one
+    /// figure - the pool is reserved once at construction, and a second reservation of the same
+    /// pool kind is a no-op the allocator refuses - and the storage states both tenants' shares, so
+    /// the paired forward's twins take `shadow` and `Snapshot::allocate` keeps the rest:
+    /// `shadow + snapshot == scratch`, and the order the two take their bytes in does not matter.
     pub(crate) fn graph(
         &self,
         device: DeviceId,
