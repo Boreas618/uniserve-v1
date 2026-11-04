@@ -656,7 +656,7 @@ impl Scheduler {
         // it, which is what lets one plan both admit and run a request (§4.4).
         // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_admission(&plan, &live) {
+        if let Err(error) = mechanism::validate_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.admit_plan(&plan);
@@ -684,12 +684,11 @@ impl Scheduler {
     /// not a decision the mechanism makes.
     #[cfg(debug_assertions)]
     fn assert_policy_in_sync(&self) {
-        type Guest = scheduling::guest::RequestId;
-        #[allow(non_snake_case)]
-        fn guest(id: u64) -> Guest {
-            Guest(id)
-        }
-        let held: std::collections::BTreeSet<Guest> = self
+        // The policy's ids and the mechanism's name the same request; the two
+        // newtypes are the interface's, so the sets are compared in the
+        // interface's.
+        let guest = |id: u64| scheduling::guest::RequestId(id);
+        let held: std::collections::BTreeSet<scheduling::guest::RequestId> = self
             .waiting
             .iter()
             .map(|state| guest(state.req.request_id.0))
