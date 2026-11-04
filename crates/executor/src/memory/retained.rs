@@ -543,9 +543,11 @@ impl Retained {
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
-        // A weight is retained HOST storage (`host_retainable`), which a rank maps as host memory
-        // registered with the device; only a device allocation is imported through the VMM, and a
-        // memfd handed to that path is not a CUDA shareable handle.
+        // A weight is published as a DEVICE block (`Storage::retainable`) and imported by its
+        // shareable handle, so a kernel reads it at a device address. The host branch is what a
+        // record published before that change still needs, and what the page pool and the link
+        // scratch use: host storage is mapped and registered with the device, never handed to the
+        // VMM import - a memfd is not a CUDA shareable handle.
         let storage = match record.placement {
             ::storage::Placement::Host { .. } => {
                 Storage::import_host(descriptor, record.bytes as usize, device)?
@@ -1067,23 +1069,31 @@ impl crate::memory::weights::WeightStorage for Retained {
         }
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let (staging, descriptor) = Storage::host_retainable(device, allocation)?;
-        // SAFETY: the staging storage holds at least `bytes.len()` writable bytes
-        // and the source slice is that long; the server imports the mapping when
-        // the record below is published.
+        // A weight is published as a DEVICE block: the record names a `cuMemCreate` allocation,
+        // which is what a reader imports by its shareable handle, and kernels then address the
+        // weight in device memory without a copy at read time. The allocation is the publisher's,
+        // outside the rank's pools (4.1): `platform::Budget` never sees it, and it outlives this
+        // process because the Storage Server holds its record.
+        let (staging, descriptor) = Storage::retainable(device, allocation, &[])?;
+        let stream = platform::Stream::new(device)?;
+        // SAFETY: the staging storage holds `allocation` writable device bytes and the source
+        // slice is at most that long; the copy is synchronized before the record is published, so
+        // the server's readers never see a half-written weight.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                staging.address() as *mut u8,
+            platform::memcpy_async(
+                staging.address(),
+                bytes.as_ptr() as u64,
                 bytes.len(),
-            );
+                &stream,
+            )?;
         }
+        stream.synchronize()?;
         // The allocation is a whole number of the driver's granules, so the record
         // states the allocation's length: the server imports exactly that. The
         // tensor states the weight's true length, and the tail of the last granule
         // is never read.
         let record = ::storage::StorageRecord {
-            placement: Placement::Host { numa_node: None },
+            placement: Placement::Device { gpu },
             segment: None,
             bytes: staging.bytes() as u64,
             fabric: None,
