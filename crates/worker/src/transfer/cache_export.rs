@@ -18,8 +18,8 @@
 
 use std::sync::Arc;
 
-use platform::{CopyBatch, SourceOrder};
 use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
+use platform::{CopyBatch, SourceOrder};
 
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};

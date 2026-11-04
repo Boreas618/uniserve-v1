@@ -264,6 +264,72 @@ pub struct CacheGroupTransfer {
     pub tensors: Vec<TensorTransfer>,
 }
 
+/// A per-unit state page's snapshot rows (design 4.5): the checkpoint blocks of
+/// the units an export carries, in the order the cache plan lays its
+/// checkpoints out.
+///
+/// A model that keeps state per unit - the checkpoints a batched forward
+/// announces - stores them in a group of their own, in cells of the pool's
+/// field storages. The rows here are that group's blocks, raw: a reader
+/// scatters them into the cells of its own units of the same page, so the
+/// destination validates `rows` and `width` against its own page before it
+/// writes anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateTransfer {
+    /// The rank whose layers these rows hold: a state page is a page of one
+    /// rank's own checkpoint planes.
+    pub rank: u32,
+    /// The row of the page these rows start at, which is the sum of the rows of
+    /// every rank before it: a page is the ranks' rows in rank order.
+    pub first_row: u32,
+    /// Blocks these rows hold, which is the destination's row count for the
+    /// same rank.
+    pub rows: u32,
+    /// Bytes one block holds: the pool's plane bytes.
+    pub width: u64,
+    /// The raw rows, `[rows, width]`, as one published tensor.
+    pub data: TensorTransfer,
+}
+
+impl StateTransfer {
+    /// Validates the row geometry and the published tensor's shape against it.
+    fn validate(&self) -> ValidationResult<()> {
+        let Self {
+            rank: _,
+            first_row,
+            rows,
+            width,
+            data,
+        } = self;
+        ensure_valid!(
+            *rows > 0 && *width > 0 && data.shape == [u64::from(*rows), *width],
+            "cache state transfer geometry is invalid"
+        );
+        ensure_valid!(
+            first_row.checked_add(*rows).is_some(),
+            "cache state transfer rows overflow their page"
+        );
+        data.validate()?;
+        Ok(())
+    }
+}
+
+/// Validates a whole state page: one entry per rank, contiguous in rank order.
+fn validate_state(state: &[StateTransfer]) -> ValidationResult<()> {
+    let mut row = 0_u32;
+    for entry in state {
+        entry.validate()?;
+        ensure_valid!(
+            entry.first_row == row,
+            "cache state page rows are not contiguous in rank order"
+        );
+        row = row
+            .checked_add(entry.rows)
+            .ok_or_else(|| invalid_message!("cache state page rows overflow"))?;
+    }
+    Ok(())
+}
+
 impl CacheGroupTransfer {
     /// Validates the carried interval and the raw K/V/scale geometry.
     fn validate(&self, base_extent: u32, exported_extent: u32) -> ValidationResult<()> {
@@ -364,6 +430,10 @@ pub struct CacheTransfer {
     pub exported_extent: u32,
     /// Compute precision used when reading quantized source pages.
     pub compute_dtype: String,
+    /// The state page the export carries, when the model keeps state per unit
+    /// (design 4.5): one entry per publishing rank, in rank order. Empty for a
+    /// model whose pages are its whole cache.
+    pub state: Vec<StateTransfer>,
 }
 
 impl CacheTransfer {
@@ -378,6 +448,7 @@ impl CacheTransfer {
             base_extent,
             exported_extent,
             compute_dtype,
+            state,
         } = self;
         source.validate()?;
         if let Some(base) = base {
@@ -400,18 +471,26 @@ impl CacheTransfer {
         for group in groups {
             group.validate(*base_extent, *exported_extent)?;
         }
+        validate_state(state)?;
         Ok(())
     }
 
-    /// Iterates over every group's published tensors in group order.
+    /// Iterates over every published tensor: the groups' in group order, then
+    /// the state page's when the transfer carries one.
     pub fn tensors(&self) -> impl Iterator<Item = &TensorTransfer> {
-        self.groups.iter().flat_map(|group| &group.tensors)
+        self.groups
+            .iter()
+            .flat_map(|group| &group.tensors)
+            .chain(self.state.iter().map(|state| &state.data))
     }
 
-    /// Iterates mutably over every group's published tensors in group order,
-    /// for rebinding or pruning their locators.
+    /// Iterates mutably over every published tensor, in the same order, for
+    /// rebinding or pruning their locators.
     pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
-        self.groups.iter_mut().flat_map(|group| &mut group.tensors)
+        self.groups
+            .iter_mut()
+            .flat_map(|group| &mut group.tensors)
+            .chain(self.state.iter_mut().map(|state| &mut state.data))
     }
 
     /// Merge reports for one immutable export without exposing a partial update.
