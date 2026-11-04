@@ -174,6 +174,6 @@ mod tests {
         assert!(graphs.buckets(1).is_empty());
         assert!(graphs.using("rms_norm", 1).is_empty());
         assert!(graphs.generations().is_empty());
-        assert_eq!(graphs.purge(1), 0);
+        assert!(graphs.purge(1).is_empty());
     }
 }

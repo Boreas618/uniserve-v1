@@ -28,7 +28,9 @@ use crate::arena::{Pools, PoolMetrics, StreamId};
 use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken};
 use crate::captured::Captured;
 use crate::graph::Graphs;
-use crate::plan::{Bucket, Buckets, Shape, Variant};
+use crate::plan::{Bucket, Buckets, Shape};
+#[cfg(test)]
+use crate::plan::Variant;
 use crate::runner::{Runner, RunnerId};
 use crate::{Error, Result};
 
@@ -694,9 +696,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
-        // Which buckets a changed operator forces to change, and whether the change can be a
-        // rebind (same launch structure) or must be a recapture, is decided from the two
-        // generations' kernels and each bucket's node table (4.5).
+        // Which (operator, key) pairs changed between the serving generation and `next` (7.3
+        // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
+        // its bucket as it is.
         let mut changed: Vec<(&'static str, String)> = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
             let same = next
@@ -707,14 +709,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 changed.push((operator, key.to_owned()));
             }
         }
-        // A launch the old generation does not have is a change too: it has nothing to compare
-        // against, so a rebind of its bucket cannot be right and the bucket is recaptured.
+        // A launch `next` adds is a change too: its bucket has nothing to compare it against, and
+        // only a recapture can serve it (4.5).
         for (operator, key, _) in next.iter() {
             if !self.generation.contains(operator, key) {
                 changed.push((operator, key.to_owned()));
             }
         }
+        // Every changed operator's buckets are prepared once. Whether a bucket is rebound or
+        // recaptured is not decided here: it is a fact about the walk's launch structure against
+        // the captured graph, and only the walk can establish it (4.5's rebind condition).
         let mut jobs = Vec::new();
+        let mut buckets: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
         for (operator, key) in changed {
             for bucket in self.graphs.using(operator, self.generation.number()) {
                 // The paired forward runs first: a difference beyond the operator's tolerance
@@ -726,40 +732,45 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     bucket,
                     generation: next.number(),
                 });
-                let captured = self
-                    .graphs
-                    .captured(bucket, self.generation.number())
-                    .ok_or_else(|| {
-                        Error::Invariant("a bucket vanished from the graph table".into())
-                    })?;
-                let rebindable = captured.launches(operator) > 0
-                    && captured
-                        .kernels()
-                        .iter()
-                        .all(|kernel| kernel.metadata().is_some());
-                if rebindable {
-                    jobs.push(Job::Rebind {
-                        runner: self.id,
-                        bucket,
-                        generation: next.number(),
-                    });
-                } else {
-                    jobs.push(Job::Capture {
-                        runner: self.id,
-                        bucket,
-                        generation: next.number(),
-                    });
-                }
+                buckets.insert(bucket);
             }
+        }
+        for bucket in buckets {
+            jobs.push(Job::Rebind {
+                runner: self.id,
+                bucket,
+                generation: next.number(),
+            });
         }
         self.next = Some(Arc::clone(next));
         Ok(Jobs::new(jobs))
     }
 
     fn revert(&mut self, generation: u64) {
-        // The prepared generation never serves: its graphs go, and with them the kernels they
-        // held. The old generation's graphs, its arena plans and its sampler regions stay exactly
-        // as they were, so a reverted update cannot disturb a batch in flight.
+        // A revert after the switchover is the switchover reversed (7.3 step 4): the generation
+        // kept for a revert serves again and the failed one takes its place as the kept
+        // generation, so its graphs and kernels live until `purge` releases them after the last
+        // batch that used them.
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.number() == generation)
+        {
+            let serving = self.previous.take();
+            if let Some(serving) = serving {
+                let failed = std::mem::replace(&mut self.generation, serving);
+                self.previous = Some(failed);
+                tracing::info!(
+                    generation,
+                    serving = self.generation.number(),
+                    "reverted the switched-over generation; the kept one serves again"
+                );
+                return;
+            }
+        }
+        // A prepared generation that never took over: its graphs go, and with them the kernels
+        // they held. The serving generation's graphs, arena plans and sampler regions stay
+        // exactly as they were, so an abandoned update cannot disturb a batch in flight.
         let dropped = self.graphs.purge(generation);
         let dropped_count = dropped.len();
         if self.next.as_ref().map(|next| next.number()) == Some(generation) {
@@ -776,16 +787,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // From the next batch on, the prepared generation serves; the old one stays for a revert
         // (7.3 step 4). A generation that was not prepared here is a generation of kernels only,
         // and is taken as the serving one unchanged.
-        let prepared = self
-            .next
-            .take()
-            .filter(|next| next.number() == generation)
-            .unwrap_or_else(|| {
-                Arc::new(
-                    self.generation
-                        .replace(generation, std::iter::empty::<ops::KernelEntry>()),
-                )
-            });
+        let prepared = self.next.take().filter(|next| next.number() == generation);
+        let prepared = prepared.unwrap_or_else(|| {
+            // A generation this runner never prepared: the daemon and the executor disagree on
+            // what was precopied. The switchover still happens - the generation's kernels are the
+            // ones the caller named - but the report says the buckets must be captured again.
+            tracing::warn!(
+                generation,
+                "switched to a generation this runner did not prepare; its buckets have no graphs"
+            );
+            Arc::new(
+                self.generation
+                    .replace(generation, std::iter::empty::<ops::KernelEntry>()),
+            )
+        });
         self.previous = Some(std::mem::replace(&mut self.generation, prepared));
     }
 
@@ -807,7 +822,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         for bucket in &dropped {
             let released_bucket = self
                 .pool()
-                .and_then(|mut pools| pools.release_bucket(StreamId(0), *bucket));
+                .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket));
             match released_bucket {
                 Ok(bytes) => released += bytes,
                 // A pool that cannot shrink keeps the bytes mapped until the executor closes;
@@ -887,6 +902,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
         &self.stream
     }
 
+    /// The pool stream this runner's graphs are planned and replayed on.
+    ///
+    /// A graph pool is per stream (4.5), and two runners on one device fork their own streams, so
+    /// the identity is the stream's own handle rather than a position in a list the executor
+    /// keeps elsewhere.
+    fn stream_id(&self) -> StreamId {
+        StreamId(self.stream.raw())
+    }
+
     /// The device the runner computes on.
     pub fn device(&self) -> DeviceId {
         self.device
@@ -897,13 +921,30 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// (4.5). The forward executes nothing while it is captured.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
+        let walked = self.walk_capture(bucket, &kernels)?;
+        let held = hold_kernels(&kernels, &walked.nodes)?;
+        let captured = Captured::new(walked.template, walked.nodes, held)?;
+        self.graphs.insert(bucket, generation, captured);
+        Ok(())
+    }
+
+    /// Captures `bucket`'s forward with `kernels` and answers the throwaway template with its
+    /// per-launch node table. Nothing the template launches executes.
+    fn walk_capture(
+        &mut self,
+        bucket: Bucket,
+        kernels: &Arc<ops::Generation>,
+    ) -> Result<Walked> {
         let stream = self.stream.clone();
-        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(&stream, platform::CaptureMode::Relaxed)?));
+        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(
+            &stream,
+            platform::CaptureMode::Relaxed,
+        )?));
         let mut recording = Recording::new(Arc::clone(&capture));
-        // The model's forward runs with the generation being captured and the bucket's arena, so
-        // every operator launch becomes a node of the template and is reported to `recording`.
+        // The forward runs with the generation being walked and the bucket's arena, so every
+        // operator launch becomes a node of the template and is reported to `recording`.
         ops::capture::set_sink(Some(&mut recording));
-        let walked = self.walk(bucket, &kernels);
+        let walked = self.walk(bucket, kernels);
         ops::capture::set_sink(None);
         let nodes = recording.nodes;
         if let Some(failure) = recording.failure {
@@ -915,24 +956,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let template = capture.end()?;
-
-        // The graph holds the kernels it launches, so none unloads while it can replay; purge
-        // releases them after the last batch that used this generation (7.3).
-        let mut held: Vec<Arc<ops::Kernel>> = Vec::new();
-        for (operator, key, _) in &nodes {
-            let kernel = kernels.kernel(operator, key)?;
-            if !held.iter().any(|existing| Arc::ptr_eq(existing, kernel)) {
-                held.push(Arc::clone(kernel));
-            }
-        }
-        let captured = Captured::new(template, nodes, held)?;
-        self.graphs.insert(bucket, generation, captured);
-        Ok(())
+        Ok(Walked { template, nodes })
     }
 
-    /// Rebinds one bucket from the next generation's precopy walk: captures the forward with the
-    /// new kernels on a scratch stream, reads each changed launch's parameters from that
-    /// throwaway template, and sets them on the live executable (4.5). Nothing is launched.
+    /// Prepares one bucket for the next generation from its precopy walk: rebinds the live
+    /// executable when the launch structure is unchanged, and recaptures the bucket when it is not
+    /// (4.5).
+    ///
+    /// The walk captures the forward with the new kernels on the runner's stream and launches
+    /// nothing, so the parameters of every launch are what the model computed for this bucket's
+    /// arguments. A rebind sets them on the live executable's nodes; a structure change discards
+    /// the live executable and instantiates the walk's template instead, because
+    /// `cuGraphExecKernelNodeSetParams` cannot add or remove a node.
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
         let current = self.generation.number();
@@ -941,32 +976,29 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "no graph of bucket {bucket} in generation {current}"
             )));
         }
-        let stream = self.stream.clone();
-        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(&stream, platform::CaptureMode::Relaxed)?));
-        let mut recording = Recording::new(Arc::clone(&capture));
-        ops::capture::set_sink(Some(&mut recording));
-        let walked = self.walk(bucket, &kernels);
-        ops::capture::set_sink(None);
-        let nodes = recording.nodes;
-        if let Some(failure) = recording.failure {
-            return Err(failure.into());
-        }
-        walked?;
-        let capture = Arc::try_unwrap(capture)
-            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let template = capture.end()?;
-
+        let walked = self.walk_capture(bucket, &kernels)?;
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
+        if !served.same_structure(&walked.nodes) {
+            // The launch structure changed: the bucket is recaptured from the walk's template,
+            // which already carries the new kernels and their arguments.
+            let held = hold_kernels(&kernels, &walked.nodes)?;
+            let recaptured = Captured::new(walked.template, walked.nodes, held)?;
+            self.graphs.insert(bucket, generation, recaptured);
+            tracing::info!(
+                bucket = %bucket,
+                generation,
+                "the launch structure changed; recaptured the bucket instead of rebinding it"
+            );
+            return Ok(());
+        }
         // The walk's launches are the same ones, in the same order, as the live graph's: pair
         // them, read each node's parameters from the template, and set them on the executable.
         let mut launch_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
         let mut applied = 0usize;
-        for (operator, _, walk_nodes) in &nodes {
+        for (operator, _, walk_nodes) in &walked.nodes {
             let ordinal = launch_of.entry(*operator).or_insert(0);
             // A capture adds both kernel nodes and (for example) the empty nodes that carry a
             // dependency; only kernel nodes have launch parameters to carry over.
@@ -975,7 +1007,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 if node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(template.kernel_node_params(node)?);
+                params.push(walked.template.kernel_node_params(node)?);
             }
             applied += served.rebind_launch(operator, *ordinal, &params)?;
             *ordinal += 1;
@@ -1057,7 +1089,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         self.upload(bucket)?;
-        let base = self.pool()?.base(StreamId(0))?;
+        let base = self.pool()?.base(self.stream_id())?;
         let arena = nn::Arena::new(
             ops::DevicePtr::new(base.address()),
             self.pool()?.reserved(),
@@ -1300,9 +1332,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 self.stage_warm(bucket)?;
             }
         }
-        let first = self.pool()?.begin(StreamId(0), bucket)?;
+        let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload(bucket)?;
-        let base = self.pool()?.base(StreamId(0))?;
+        let base = self.pool()?.base(self.stream_id())?;
         let arena = nn::Arena::new(
             ops::DevicePtr::new(base.address()),
             self.pool()?.reserved(),
@@ -1330,7 +1362,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Ok(())
         })?;
         if first {
-            self.pool()?.record(StreamId(0), bucket, arena.used())?;
+            self.pool()?.record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
     }
@@ -1426,6 +1458,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
 /// per-launch table. The sink must own its data (`ops::capture` keeps a thread-local pointer), so
 /// it holds the capture behind an `Arc`: the capture outlives every report, and it is taken back
 /// after the sink is removed.
+/// One walk's capture: the template graph a rebind reads parameters from, or a recapture
+/// instantiates, and the nodes each operator launch added.
+struct Walked {
+    template: platform::Graph,
+    nodes: crate::captured::Nodes,
+}
+
+/// Every kernel a walk's launches reference, so a graph built from it keeps them loaded (4.5).
+fn hold_kernels(
+    kernels: &Arc<ops::Generation>,
+    nodes: &crate::captured::Nodes,
+) -> Result<Vec<Arc<ops::Kernel>>> {
+    let mut held: Vec<Arc<ops::Kernel>> = Vec::new();
+    for (operator, key, _) in nodes {
+        let kernel = kernels.kernel(operator, key)?;
+        if !held.iter().any(|existing| Arc::ptr_eq(existing, kernel)) {
+            held.push(Arc::clone(kernel));
+        }
+    }
+    Ok(held)
+}
+
 struct Recording {
     capture: Arc<std::sync::Mutex<platform::Capture>>,
     nodes: crate::captured::Nodes,

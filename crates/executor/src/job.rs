@@ -52,6 +52,10 @@ pub(crate) struct Entry {
 }
 
 /// One command the device executor performs.
+///
+/// A command is cloneable so a multi-job command can be put back at the tail with the jobs it
+/// still has (4.5's interleaving); every payload is shared, not copied.
+#[derive(Clone)]
 pub(crate) enum Command {
     /// Serve one batch: stage it, choose its bucket, replay its graph.
     Batch(Batch),
@@ -440,8 +444,8 @@ mod tests {
         assert_eq!(entry.kind, JobKind::Batch);
         assert!(queue.watchdog_is_running());
 
-        queue.complete(entry, Ok(()));
-        assert!(matches!(submission.outcome(), Some(Outcome::Success(()))));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
+        assert!(matches!(submission.outcome(), Some(Outcome::Success(_))));
         assert!(queue.in_flight().is_empty());
     }
 
@@ -460,12 +464,12 @@ mod tests {
 
         let entry = queue.next(Some(Duration::from_millis(10))).expect("first");
         assert_eq!(entry.kind, JobKind::Batch);
-        queue.complete(entry, Ok(()));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
         let entry = queue.next(Some(Duration::from_millis(10))).expect("second");
         assert_eq!(entry.kind, JobKind::Purge);
         queue.complete(entry, Err(Error::State("the purge failed".into())));
 
-        assert!(matches!(first.outcome(), Some(Outcome::Success(()))));
+        assert!(matches!(first.outcome(), Some(Outcome::Success(_))));
         assert!(matches!(second.outcome(), Some(Outcome::Failed(_))));
     }
 
@@ -503,8 +507,14 @@ mod tests {
         // The device loop, as the executor performs it: one job of a multi-job command per turn.
         let mut order = Vec::new();
         while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
-            match entry.command {
-                Command::Steps { generation, mut jobs } => {
+            // The job list is taken out of the command the loop owns; the entry stays whole for
+            // the completion call below.
+            let command = entry.command.clone();
+            match command {
+                Command::Steps {
+                    generation,
+                    mut jobs,
+                } => {
                     order.push("capture");
                     jobs.remove(0);
                     if jobs.is_empty() {
@@ -585,7 +595,7 @@ mod tests {
             .expect("the wait");
         assert_eq!(entry.id, id);
         assert_eq!(entry.kind, JobKind::After);
-        queue.complete(entry, Ok(()));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
 
         // The pool has no deferred work under this job, which is not a failure of the wait.
         assert!(!events.owns(id));

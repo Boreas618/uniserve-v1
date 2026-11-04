@@ -17,7 +17,6 @@
 //! buckets a changed operator uses, and switchover and purge are submissions of their own so they
 //! land on a batch boundary (7.3).
 
-use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
