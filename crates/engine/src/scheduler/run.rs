@@ -98,16 +98,16 @@ impl Scheduler {
     ///
     /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn new(
-        executor: Box<dyn Executor>,
+        submissions: super::submission::Submissions,
         special_tokens: SpecialTokenIds,
         mut config: SchedulerConfig,
         model_dtype: crate::ModelDtype,
         generation_limits: crate::GenerationLimits,
     ) -> anyhow::Result<Self> {
-        let info = executor.info().runtime_info()?;
+        let info = submissions.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
         let latent_dtype = worker_float_dtype(Some(model_dtype));
-        let media_storage = executor
+        let media_storage = submissions
             .info()
             .workers
             .iter()
@@ -120,7 +120,7 @@ impl Scheduler {
             .map(|(id, worker)| {
                 // The ranks back the results of the components the engine
                 // placed on them, not a component list a rank reports.
-                let components = executor
+                let components = submissions
                     .info()
                     .placements
                     .get(id)
@@ -130,7 +130,7 @@ impl Scheduler {
                     id.clone(),
                     MediaStorage::new(
                         worker.request_slots as usize,
-                        &executor.info().rank_buffer_bytes(id),
+                        &submissions.info().rank_buffer_bytes(id),
                         &components,
                         &info.media_components,
                     ),
@@ -199,7 +199,7 @@ impl Scheduler {
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
         Ok(Self {
-            executor: submission::Submissions::new(executor),
+            executor: submissions,
             inflight: inflight::Inflight::new(),
             placement: placement::Placement::default(),
             storage: allocation::Storage {

@@ -1194,6 +1194,55 @@ impl SchedulerHandle {
         Ok(scheduler)
     }
 
+    /// Starts one scheduler thread over the executor crate's batch path — the
+    /// in-process submission path of §2.4 — and returns its handle.
+    ///
+    /// No worker group is launched: the pool's capabilities come from what the
+    /// executor reports (`Batches::inventory`), the batches go to `batches`
+    /// itself, and the threads, the command channel and the handle's surface are
+    /// exactly what [`Self::start`] gives. The scheduler decides nothing until a
+    /// policy serves it: the daemon's first `Precopy` and `Switchover` install
+    /// one (§7.3), and until then a step forms no batch.
+    ///
+    /// Fails when the config names more than one rank, when the executor reports
+    /// no pool or pools that disagree about a component, when a pool serves fewer
+    /// request rows than `max_running_requests` running requests need, or when
+    /// the scheduler's thread cannot be started.
+    pub fn over_batches(
+        config: EngineConfig,
+        batches: Arc<dyn Batches>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one handle is one scheduler thread, but the config states {} ranks: start one \
+             handle per rank",
+            config.data_parallel_size
+        );
+        let info = crate::executor::ExecutorInfo::from_inventory(batches.inventory())?;
+        let runtime = info.runtime_info()?;
+        Self::check_rows(&runtime, config.max_running_requests)?;
+        let tokens = config.control_tokens();
+        let scheduler = Scheduler::new(
+            crate::scheduler::submissions_over(Arc::clone(&batches))?,
+            tokens,
+            Self::scheduler_config(&config),
+            config.worker_process.dtype,
+            config.generation_limits.clone(),
+        )?;
+        let scheduler = Self::configured(scheduler, &config)?;
+        let mut handle = Self::spawn(
+            scheduler,
+            config.worker_process.model.clone(),
+            CommandWaker::noop(),
+        )?;
+        handle.batches = Some(batches);
+        // The serving path's warm-up is the serving path's: it runs once the
+        // epoch's first policy serves, on a thread of its own, and startup does
+        // not wait for it.
+        crate::warmup::after_serving(&handle, &config);
+        Ok(handle)
+    }
+
     /// Runs a scheduler over an executor supplied by a higher composition
     /// layer, such as the CPU simulation backend.
     ///
@@ -1249,7 +1298,7 @@ impl SchedulerHandle {
     ) -> anyhow::Result<Self> {
         let tokens = config.control_tokens();
         let scheduler = Scheduler::new(
-            executor,
+            crate::scheduler::submissions(executor),
             tokens,
             Self::scheduler_config(&config),
             config.worker_process.dtype,
