@@ -21,6 +21,7 @@
 //! fails the epoch, and when a purge may run.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use ipc::UpdateFailure;
 
@@ -99,6 +100,9 @@ pub struct HotUpdate {
     /// Batches submitted and not completed, by the generation their kernels
     /// belong to: what the purge of a generation waits for.
     in_flight: BTreeMap<u64, usize>,
+    /// When probation began, for the rollback threshold of `update_config`
+    /// (§7.3 step 4).
+    probation_started: Option<Instant>,
     /// The first error that failed an update; the daemon marks the update
     /// unavailable with it until forced (§7.3 step 4).
     failure: Option<UpdateFailure>,
@@ -116,6 +120,7 @@ impl HotUpdate {
             previous: None,
             purging: None,
             in_flight: BTreeMap::new(),
+            probation_started: None,
             failure: None,
             failed_generation: None,
         }
@@ -151,9 +156,7 @@ impl HotUpdate {
     /// refused, so a replayed command cannot move time backwards.
     pub fn begin_precopy(&mut self, generation: u64) -> Result<()> {
         if self.phase.updating() {
-            return Err(Error::State(
-                "a program-layer update is already in flight",
-            ));
+            return Err(Error::State("a program-layer update is already in flight"));
         }
         if generation <= self.current {
             return Err(Error::Invalid(format!(
@@ -195,9 +198,9 @@ impl HotUpdate {
         }
     }
 
-    /// §7.3 step 3: the update cuts over at a batch boundary. The generation
-    /// serving until now is kept for probation and revert.
-    pub fn switchover(&mut self, generation: u64) -> Result<()> {
+    /// §7.3 step 3: the update cuts over at a batch boundary, at `now`. The
+    /// generation serving until now is kept for probation and revert.
+    pub fn switchover(&mut self, generation: u64, now: Instant) -> Result<()> {
         match self.phase {
             Phase::Precopied {
                 generation: expected,
@@ -205,9 +208,23 @@ impl HotUpdate {
                 self.previous = Some(self.current);
                 self.current = generation;
                 self.phase = Phase::Probation { generation };
+                self.probation_started = Some(now);
                 Ok(())
             }
             phase => Err(unexpected(phase)),
+        }
+    }
+
+    /// Whether probation has run past the update's rollback threshold, which is
+    /// one of §7.3 step 4's automatic-revert conditions. The threshold comes
+    /// from `update_config.rollback`; the phase rules live here, and the control
+    /// thread only polls this.
+    pub fn probation_expired(&self, now: Instant, threshold: Duration) -> bool {
+        match (self.phase, self.probation_started) {
+            (Phase::Probation { .. }, Some(started)) => {
+                now.saturating_duration_since(started) >= threshold
+            }
+            _ => false,
         }
     }
 
@@ -219,6 +236,7 @@ impl HotUpdate {
                 generation: expected,
             } if expected == generation => {
                 self.phase = Phase::Serving;
+                self.probation_started = None;
                 self.failure = None;
                 Ok(())
             }
@@ -242,16 +260,24 @@ impl HotUpdate {
                 self.failure = Some(failure);
                 self.failed_generation = Some(generation);
                 self.phase = Phase::Serving;
+                self.probation_started = None;
                 Ok(())
             }
             Phase::Precopied {
                 generation: expected,
             } if expected == generation => {
-                // Reverting before the switchover changes nothing serving; the
-                // prepared generation is simply not switched to.
+                // Reverting before the switchover changes nothing serving, but
+                // the prepared generation has graphs and kernels on the
+                // executors: it is recorded for a purge like a reverted one.
                 self.failure = Some(failure);
                 self.failed_generation = Some(generation);
                 self.phase = Phase::Serving;
+                // An earlier purge may still be pending; the daemon's purge of
+                // this generation follows its last batch, and there is none to
+                // wait for because it never served.
+                if self.purging.is_none() {
+                    self.purging = Some(generation);
+                }
                 Ok(())
             }
             phase => Err(unexpected(phase)),
@@ -265,9 +291,9 @@ impl HotUpdate {
         if self.phase.updating() {
             return Err(Error::State("cannot purge while an update is in flight"));
         }
-        if generation >= self.current {
+        if generation == self.current {
             return Err(Error::Invalid(format!(
-                "generation {generation} is not older than the serving generation {}",
+                "the serving generation {} cannot be purged",
                 self.current
             )));
         }
@@ -296,7 +322,9 @@ impl HotUpdate {
             return Err(Error::State("no such purge is pending"));
         }
         if self.purge_due() != Some(generation) {
-            return Err(Error::State("a batch of the purged generation is in flight"));
+            return Err(Error::State(
+                "a batch of the purged generation is in flight",
+            ));
         }
         self.purging = None;
         if self.previous == Some(generation) {
@@ -389,7 +417,7 @@ mod tests {
         assert_eq!(update.phase(), Phase::Precopying { generation: 8 });
         update.precopied(8).expect("precopy finished");
         assert_eq!(update.phase(), Phase::Precopied { generation: 8 });
-        update.switchover(8).expect("switchover");
+        update.switchover(8, Instant::now()).expect("switchover");
         assert_eq!(update.phase(), Phase::Probation { generation: 8 });
         assert_eq!(update.current(), 8);
         assert_eq!(update.previous(), Some(7));
@@ -417,7 +445,7 @@ mod tests {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         update.precopied(8).expect("precopy finished");
-        update.switchover(8).expect("switchover");
+        update.switchover(8, Instant::now()).expect("switchover");
         assert_eq!(update.action(&stall()), Action::Revert);
         update.revert(8, stall()).expect("revert");
         assert_eq!(update.phase(), Phase::Serving);
@@ -439,7 +467,7 @@ mod tests {
         assert!(update.begin_precopy(9).is_err());
         update.precopied(8).expect("precopy finished");
         assert!(update.begin_precopy(9).is_err());
-        update.switchover(8).expect("switchover");
+        update.switchover(8, Instant::now()).expect("switchover");
         assert!(update.begin_precopy(9).is_err());
     }
 
@@ -455,7 +483,7 @@ mod tests {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         assert!(update.precopied(9).is_err());
-        assert!(update.switchover(8).is_err());
+        assert!(update.switchover(8, Instant::now()).is_err());
         assert!(update.commit(8).is_err());
     }
 
@@ -464,10 +492,12 @@ mod tests {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         update.precopied(8).expect("precopy finished");
-        update.switchover(8).expect("switchover");
+        update.switchover(8, Instant::now()).expect("switchover");
         update.commit(8).expect("commit");
         update.batch_started(7);
-        update.request_purge(7).expect("the daemon asks for the old purge");
+        update
+            .request_purge(7)
+            .expect("the daemon asks for the old purge");
         assert_eq!(update.purge_due(), None);
         update.batch_finished(7);
         assert_eq!(update.purge_due(), Some(7));
@@ -480,7 +510,54 @@ mod tests {
     fn a_purge_of_the_serving_generation_is_refused() {
         let mut update = update();
         assert!(update.request_purge(7).is_err());
-        assert!(update.request_purge(8).is_err());
+        // A generation that is not the serving one may be purged, even one
+        // newer than it: a reverted update's generation is exactly that.
+        assert!(update.request_purge(8).is_ok());
+    }
+
+    #[test]
+    fn a_reverted_generation_is_purged_after_the_last_batch_of_its_kind() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.switchover(8, Instant::now()).expect("switchover");
+        update.revert(8, stall()).expect("revert");
+        assert_eq!(update.current(), 7);
+        assert_eq!(update.previous(), Some(8));
+        update.batch_started(8);
+        update
+            .request_purge(8)
+            .expect("the reverted generation is purged");
+        assert_eq!(update.purge_due(), None);
+        update.batch_finished(8);
+        assert_eq!(update.purge_due(), Some(8));
+        update.purged(8).expect("purged");
+        assert_eq!(update.previous(), None);
+    }
+
+    #[test]
+    fn a_generation_aborted_before_switchover_is_purged() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.revert(8, precopy_failure()).expect("abort");
+        assert_eq!(update.current(), 7);
+        assert_eq!(update.purge_due(), Some(8));
+        update.purged(8).expect("purged");
+    }
+
+    #[test]
+    fn probation_expires_at_the_rollback_threshold() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        let started = Instant::now();
+        update.switchover(8, started).expect("switchover");
+        let threshold = Duration::from_secs(60);
+        assert!(!update.probation_expired(started + Duration::from_secs(59), threshold));
+        assert!(update.probation_expired(started + threshold, threshold));
+        update.commit(8).expect("commit");
+        assert!(!update.probation_expired(started + threshold, threshold));
     }
 
     #[test]
