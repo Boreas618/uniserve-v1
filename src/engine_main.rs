@@ -1320,6 +1320,24 @@ impl MainProcess {
             if package.modules.is_empty() {
                 continue;
             }
+            // Only modules built for one of this launch's targets count: `prepare` would otherwise
+            // *build* the package for this host, and a resolution that turns a startup into a build
+            // of every operator in the store spends the precopy's twenty-minute clock on work the
+            // first token does not need. An operator whose module targets do not cover this host
+            // stays missing, and the walk names it - the honest answer for a host the store was not
+            // built for.
+            if !package
+                .modules
+                .iter()
+                .any(|module| self.targets.contains(&module.target))
+            {
+                tracing::debug!(
+                    op = %package.op,
+                    backend = %package.backend,
+                    "the store holds this operator for another target: not installed"
+                );
+                continue;
+            }
             // The store may hold operators this binary does not implement - another model's, or one
             // whose row an older build lacked. Installing one would refuse the whole precopy in
             // `admit_installs`, which is the wrong answer for a program this process cannot launch
