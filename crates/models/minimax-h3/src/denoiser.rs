@@ -1307,6 +1307,13 @@ pub struct Denoiser {
     /// rather than in one of their own because `nn` has no condition-encoder capability -
     /// `EncoderInputs` takes a token batch, and these take pixels and samples.
     encoders: Option<ConditionEncoders>,
+    /// The packed row bound this deployment was loaded for.
+    ///
+    /// The stack's dense attention is compiled with it as its key bound (`nn`'s `DenseDescriptor`
+    /// carries `max_kv_len`), so a request wider than this has no module to launch: the bound is
+    /// consumed here, at load, and a layout or a request beyond it is refused by name rather than
+    /// discovered at the first layer.
+    rows: u32,
     /// This rank's position in the sequence shard and the shard's degree.
     rank: u32,
     shard: u32,
@@ -1942,6 +1949,8 @@ impl Denoiser {
     /// this deployment's own numbers - the checkpoint's element type and the schedule's group count -
     /// so the plan and the forward read one configuration.
     pub fn denoise_arena(&self, layout: &Layout) -> Result<Vec<crate::decoding::Buffer>> {
+        let rows = self.bound(layout)?;
+        let _ = rows;
         denoise_arena(
             &self.config,
             &self.rules.arrangement,
@@ -1949,6 +1958,24 @@ impl Denoiser {
             self.transformer.dtype(),
             layout,
         )
+    }
+
+    /// Refuse a layout whose packed rows exceed the bound this deployment was loaded for.
+    ///
+    /// The stack's dense attention is compiled with that bound as `nn`'s `DenseDescriptor.max_kv_len`
+    /// and refuses a longer key run at its own launch, so a wider layout has no module at all: the
+    /// refusal belongs where a layout first meets the deployment, not at the first layer of a
+    /// capture that then has to be thrown away.
+    fn bound(&self, layout: &Layout) -> Result<u32> {
+        let tokens = packed_rows(&self.config, &self.rules.arrangement, layout)?;
+        if tokens > self.rows {
+            return Err(Error::config(format!(
+                "this denoiser was loaded for {} packed rows and {} is a layout beyond it; the \
+                 attention is compiled for the bound, so no module would launch",
+                self.rows, tokens
+            )));
+        }
+        Ok(tokens)
     }
 
     /// Refine one request's conditioning: the text encoder's features into the DiT's width.
@@ -2504,6 +2531,15 @@ impl Denoiser {
         let height = video.shape.dim(2);
         let width = video.shape.dim(3);
         let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
+        // The same bound `denoise_arena` checks, at the one other place a request reaches this block:
+        // a request wider than the deployment was loaded for has no attention module to run.
+        if tokens > u64::from(self.rows) {
+            return Err(Error::config(format!(
+                "this denoiser was loaded for {} packed rows and the request has {tokens}; the \
+                 attention is compiled for the bound",
+                self.rows
+            )));
+        }
         let hidden_size = u64::from(self.config.transformer.hidden_size);
         let dtype = cond.text.dtype;
         let arena = f.arena();
@@ -2807,11 +2843,26 @@ impl Denoiser {
                 .blocks
                 .contains(crate::partition::Component::LatentEncoder),
             encoders: None,
+            rows,
             // The denoiser's own rank, not the text encoder's: the two shards are independent, and
             // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
             rank: partition.sequence_rank as u32,
             shard: partition.ulysses_degree as u32,
         })
+    }
+
+    /// Every checkpoint tensor this block's partition reads, as complete names.
+    ///
+    /// The refiner's, the stack's and the AdaLN cache's, in the order `load` reads them. The
+    /// condition encoders are **not** here: they are the `latent_encoder` component's, loaded from
+    /// their own checkpoint directories (`vae`, `audio_vae`) and answered by their own `keys`, even
+    /// though this block holds them once a deployment places them.
+    pub fn keys(config: &DenoiserConfig) -> Vec<String> {
+        let transformer = &config.transformer;
+        let mut keys = crate::conditioning::TokenRefiner::keys(transformer);
+        keys.extend(Transformer::keys(transformer, config.attention));
+        keys.extend(crate::modulation::AdaLnCache::keys(transformer));
+        keys
     }
 
     /// The checkpoint this denoiser evaluates.
