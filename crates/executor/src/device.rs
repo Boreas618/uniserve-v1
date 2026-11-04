@@ -97,7 +97,10 @@ pub struct GraphStorage {
 }
 
 impl Executor {
-    /// Starts the device thread, which owns `runners`, `streams` and the arena their graphs use.
+    /// Starts the device thread, which owns the runners and the arena their graphs use.
+    ///
+    /// The graph storage arrives as [`GraphStorage`]: the engine sizes it, the executor reserves it
+    /// on the device's thread and hands the one `Pools` set to every runner that issues here.
     ///
     /// From this call on the calling thread issues no device work for this device: everything
     /// reaches the device through [`Executor::submit`], the program-layer calls, and the storage
@@ -163,6 +166,16 @@ impl Executor {
         let (submission, _) = Submission::pending(id);
         self.queue
             .submit(Command::Batch(batch), &submission, JobKind::Batch, None)?;
+        Ok(submission)
+    }
+
+    /// Runs one shadow batch: the paired forwards of `batch.generation`'s changed operators
+    /// against the serving generation (7.3 step 2).
+    pub fn shadow(&self, batch: Batch) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::Shadow(batch), &submission, JobKind::Shadow, None)?;
         Ok(submission)
     }
 
@@ -443,6 +456,13 @@ impl Device {
                     jobs.extend(jobs_of(named.id, named.runner.warmup()?));
                 }
                 self.steps(entry, None, jobs)
+            }
+            Command::Shadow(batch) => {
+                let runner = self.runner_of(phase_of(batch))?;
+                let jobs = self.runner_mut(runner)?.runner.shadow(batch.clone())?;
+                // A shadow batch is a set of independent paired forwards, one per changed operator:
+                // they interleave with serving batches like a precopy's steps (7.3 step 2).
+                self.steps(entry, Some(batch.generation), jobs_of(runner, jobs))
             }
             Command::Precopy(next) => {
                 let mut jobs = Vec::new();

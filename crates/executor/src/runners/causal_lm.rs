@@ -685,6 +685,37 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }]))
     }
 
+    fn shadow(&mut self, batch: Batch) -> Result<Jobs> {
+        let shape = batch.shape;
+        batch.columns.check(&shape)?;
+        let bucket = self.bucket_for(&shape)?;
+        self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // The operators whose kernel differs between the serving generation and the one the batch
+        // names are the ones the paired forwards compare (7.3 step 2).
+        let mut jobs = Vec::new();
+        for (operator, key, kernel) in self.generation.iter() {
+            let same = self
+                .generation_named(batch.generation)
+                .map(|next| {
+                    next.kernel(operator, key)
+                        .map(|candidate| Arc::ptr_eq(candidate, kernel))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if same {
+                continue;
+            }
+            jobs.push(Job::Shadow {
+                runner: self.id,
+                operator,
+                key: key.to_owned(),
+                bucket,
+                generation: batch.generation,
+            });
+        }
+        Ok(Jobs::new(jobs))
+    }
+
     fn warmup(&mut self) -> Result<Jobs> {
         let generation = self.generation.number();
         let mut jobs = Vec::new();

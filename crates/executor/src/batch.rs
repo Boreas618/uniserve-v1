@@ -356,6 +356,25 @@ impl std::fmt::Debug for Job {
     }
 }
 
+/// What a scheduling mechanism asks of the executor that serves it (4.4, 4.5, 7.3).
+///
+/// The scheduler thread builds a step's batch and hands it here: `submit` serves it on the device
+/// of the batch's phase, and `shadow` runs the same batch's paired forwards against the generation
+/// it names without serving it. The main process implements this once over its per-device
+/// executors; [`crate::device::Executor`] keeps the same two calls as inherent methods, so a
+/// mechanism with a single device needs no router.
+pub trait Batches: Send + Sync {
+    /// Serves one batch: stage its inputs, choose its bucket, replay its graph.
+    fn submit(&self, batch: Batch) -> Result<Submission>;
+
+    /// Runs one shadow batch (7.3 step 2): the paired forwards of `batch.generation`'s changed
+    /// operators against the serving generation's kernels, compared by each operator's tolerance.
+    ///
+    /// A shadow batch never writes resident memory and never serves a request; its failure is the
+    /// update's, which the main process reports as `PrecopyFailed`.
+    fn shadow(&self, batch: Batch) -> Result<Submission>;
+}
+
 /// What the device executor is doing, as the control thread's stall report and probe name it (2.4).
 ///
 /// A batch is one command even when it becomes several jobs: the stall report names the batch the
@@ -368,7 +387,8 @@ pub enum JobKind {
     Replay,
     /// A capture of one bucket (warmup or a recapture of the update's generation).
     Capture,
-    /// A bucket's kernel rebind.
+    /// A bucket's rebind - or its recapture, when the walk shows the launch structure changed
+    /// (4.5).
     Rebind,
     /// A paired forward of one changed operator (7.3).
     Shadow,

@@ -66,6 +66,9 @@ pub(crate) enum Command {
     Steps { generation: Option<u64>, jobs: Vec<Job> },
     /// Prepare the next generation (7.3 step 2).
     Precopy(Arc<Generation>),
+    /// Run one shadow batch: the paired forwards a scheduler's `shadow` pass built against the
+    /// next generation (7.3 step 2, `crate::batch::Batches`).
+    Shadow(Batch),
     /// Switch the serving generation at a batch boundary (7.3 step 3).
     Switchover(u64),
     /// Discard the update prepared for a generation, keeping the serving one (7.3 step 4).
@@ -393,6 +396,7 @@ pub(crate) fn kind_of(command: &Command) -> JobKind {
         Command::Batch(_) => JobKind::Batch,
         Command::Warmup => JobKind::Warmup,
         Command::Precopy(_) => JobKind::Precopy,
+        Command::Shadow(_) => JobKind::Shadow,
         Command::Steps { .. } => JobKind::Precopy,
         Command::Switchover(_) => JobKind::Switchover,
         Command::Revert(_) => JobKind::Revert,
