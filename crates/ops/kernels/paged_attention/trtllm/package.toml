@@ -33,7 +33,7 @@ architectures = ["sm_100a", "sm_100f"]
 
 # `phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`.
 [kernel.descriptors]
-dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "fp16"], kv = ["bf16", "fp16", "f8e4m3"], out = ["bf16", "fp16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], len = ["40960"] }
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16", "f8e4m3"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], len = ["40960"] }
 
 [parameters]
 # The trtllm-gen artifact: the pin its manifest is hashed by.
