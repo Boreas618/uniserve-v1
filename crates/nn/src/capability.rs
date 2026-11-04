@@ -476,12 +476,27 @@ pub enum MediaRole {
 pub struct MediaInput {
     /// Where the piece anchors, which decides where its rows sit in the packed conditioning.
     pub role: MediaRole,
+    /// The packed rows the layout reserves for the piece's visual condition, as the request's own
+    /// layout counted them: one row per `1×2×2` patch of its latent baked.
+    ///
+    /// The conditioner checks the encoder's output against this rather than recomputing it. The
+    /// packing that the request was laid out under is the one statement of the arithmetic; a second
+    /// statement in the encoder's caller is how two counts of one thing drift apart.
+    pub rows: u32,
+    /// The packed rows the layout reserves for the piece's soundtrack, in the same sense.
+    pub audio_rows: u32,
     /// `[channels, frames, height, width]` pixels, in the encoder's own channel order and
     /// normalisation, when the condition is visual. One frame for a still, which is one latent
     /// frame.
     pub pixels: Option<TensorView>,
     /// Samples in the encoder's shape, when the condition carries a soundtrack.
     pub audio: Option<TensorView>,
+    /// The condition's anchoring draw: `[channels, frames, height, width]` at the piece's own latent
+    /// raster, FP32, when the piece is visual.
+    ///
+    /// The runner owns it, as it owns every draw of the request's noise stream - and it is drawn at
+    /// latent resolution, so the conditioner patchifies it rather than reading rows.
+    pub noise: Option<TensorView>,
 }
 
 /// What a denoiser conditions on at a step.
