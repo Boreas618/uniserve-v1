@@ -37,6 +37,10 @@ pub const MAX_AXES: usize = 4;
 /// compact frequency `j` rotates by the coordinate of axis `j % 3` while `j < 24 * 3`, and axis 0
 /// takes every remaining frequency (`uniserve/nn/rope.py::_interleaved_axes`). Each axis therefore
 /// receives exactly its section width and keeps frequencies from the whole spectrum.
+/// The table rows one bilinear sample reads: four, the corners of one cell.
+pub const POSITION_TAPS: u64 = 4;
+
+/// The M-RoPE cut of a head's rotation: one width per axis, interleaved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Mrope {
     widths: [u32; 3],
