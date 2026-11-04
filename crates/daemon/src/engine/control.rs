@@ -901,13 +901,34 @@ fn prepare_at(
         programs = request.programs.len(),
         "asking a Program Server to prepare the epoch's programs"
     );
+    // A cold prepare builds every module it was asked for, which on this host
+    // is minutes per package; the server reports each step as it goes. At
+    // `debug` those steps were invisible in a deployment's log, so a prepare
+    // that was working looked exactly like one that had died. The three states
+    // that change what a reader waits for are at `info`, and `Queued` — one
+    // line per module before anything happens — stays at `debug`.
     let mut progress = |step: program_server::Progress| {
-        tracing::debug!(
-            host = %server.host,
-            module = %step.path,
-            state = ?step.state,
-            "preparing a program's module"
+        let building = matches!(
+            step.state,
+            program_server::BuildState::Building
+                | program_server::BuildState::Committed
+                | program_server::BuildState::Failed(_)
         );
+        if building {
+            tracing::info!(
+                host = %server.host,
+                module = %step.path,
+                state = ?step.state,
+                "preparing a program's module"
+            );
+        } else {
+            tracing::debug!(
+                host = %server.host,
+                module = %step.path,
+                state = ?step.state,
+                "a program's module is queued"
+            );
+        }
     };
     let prepared = client
         .prepare(&request, &mut progress)
