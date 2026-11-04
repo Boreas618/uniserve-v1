@@ -212,11 +212,14 @@ impl<'a> Forward<'a> {
             let kernel = self.kernels.op::<O>(descriptor)?;
             return O::launch(kernel, descriptor, args, self.stream).map_err(Error::from);
         };
+        // Record the bound the pair is compared with before resolving either kernel, so a harness
+        // reads it even when one of the two generations lacks this descriptor.
+        let mut twins = shadow.twins.borrow_mut();
+        twins.set_tolerance(O::tolerance(descriptor));
         let current = self.kernels.op::<O>(descriptor)?;
         let previous = shadow.previous.op::<O>(descriptor)?;
         // Redirect the call's outputs into the twins and let the new program write them; the
         // previous program then writes the real outputs, which the forward continues on.
-        let mut twins = shadow.twins.borrow_mut();
         let redirected = O::shadow(args, &mut twins, self.stream);
         O::launch(current, descriptor, redirected, self.stream).map_err(Error::from)?;
         drop(twins);
