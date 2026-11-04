@@ -483,14 +483,17 @@ impl Leader {
             config.program_server.clone(),
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
+        // The epoch's build config: every main process of it reads these bytes.
+        let build = crate::epoch::BuildConfig::of(config);
         let clients =
             futures::future::join_all(specs.into_iter().enumerate().map(|(index, mut spec)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
+                let build = build.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::worlds::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
-                    let client = starting.start(spec.clone(), sink)?;
+                    let client = starting.start(spec.clone(), &build, sink)?;
                     spec.world = client.world();
                     Ok::<_, anyhow::Error>((client, spec, observer))
                 })
@@ -1249,10 +1252,7 @@ impl Leader {
     /// Server's default socket on that host (§5.1, §6.3). The targets are the
     /// Program Server's own: the daemon does not query the devices of another
     /// host to name them.
-    fn program_servers(
-        &self,
-        config: &ServeConfig,
-    ) -> Vec<crate::engine::control::ProgramServer> {
+    fn program_servers(&self, config: &ServeConfig) -> Vec<crate::engine::control::ProgramServer> {
         let socket = config
             .program_server
             .clone()
@@ -1292,9 +1292,12 @@ impl Leader {
             .clone()
             .or_else(|| servers.first().map(|server| server.host.clone()))
             .or_else(|| {
-                self.replicas()
-                    .first()
-                    .and_then(|replica| replica.control.get().map(|control| control.host().to_owned()))
+                self.replicas().first().and_then(|replica| {
+                    replica
+                        .control
+                        .get()
+                        .map(|control| control.host().to_owned())
+                })
             })
             .unwrap_or_default()
     }
@@ -1582,8 +1585,10 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let client =
-            Arc::new(tokio::task::spawn_blocking(move || control.start(spec, sink)).await??);
+        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let client = Arc::new(
+            tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
+        );
         reload_adapters(self, &client).await;
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
