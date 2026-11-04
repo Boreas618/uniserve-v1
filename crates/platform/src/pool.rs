@@ -18,11 +18,21 @@
 //! reservation; [`VirtualPool::restore`] maps new physical storage at the
 //! same addresses and copies the contents back. Nothing may read or write
 //! the pool between the two.
+//!
+//! A pool made for an [`crate::Allocator`] belongs to one of the allocator's
+//! pools and books every new mapping against the device's budget before the
+//! storage is created ([`crate::Budget`]). The blocks it maps are
+//! [`crate::allocator::Block`]s, which the allocator's buffers export as POSIX
+//! descriptors.
 
+use std::sync::Arc;
+
+use crate::allocator::{Block, Budget, PoolKind};
 use crate::driver::{
     CU_MEM_ACCESS_FLAGS_PROT_READWRITE, CU_MEM_LOCATION_TYPE_DEVICE, MemAccessDesc,
     MemAllocationProp, MemLocation, in_context, reserve_addresses,
 };
+use crate::vmm::HandleType;
 use crate::{DeviceId, Error, PinnedBuffer, PrimaryContext, Result, Stream, reclaim};
 
 const CU_MEM_ALLOC_GRANULARITY_RECOMMENDED: i32 = 1;
@@ -32,10 +42,17 @@ struct Chunk {
     offset: u64,
     bytes: usize,
     /// The physical allocation mapped there; `None` while suspended.
-    handle: Option<u64>,
+    block: Option<Arc<Block>>,
     /// The chunk's contents while suspended.
     saved: Option<PinnedBuffer>,
     free: bool,
+}
+
+/// The pool's kind and the budget every new mapping is booked against before
+/// its storage is created.
+struct Booking {
+    kind: PoolKind,
+    budget: Arc<dyn Budget>,
 }
 
 /// Device storage at stable addresses; see the module documentation.
@@ -51,11 +68,13 @@ pub struct VirtualPool {
     /// The shareable handle type of every chunk ([`crate::HandleType::probe`]):
     /// NCCL registers a captured collective's buffers with its peers by
     /// exporting them, a fabric handle to a peer on another host.
-    handle_type: i32,
+    handle_type: HandleType,
     /// The bytes of the reservation given out so far.
     used: usize,
     chunks: Vec<Chunk>,
     suspended: bool,
+    /// Set for an allocator's pools, whose mappings are booked.
+    booking: Option<Booking>,
 }
 
 impl VirtualPool {
@@ -66,6 +85,29 @@ impl VirtualPool {
     ///
     /// Fails when the driver cannot reserve the range.
     pub fn reserve(device: DeviceId, bytes: usize) -> Result<Self> {
+        let handle_type = HandleType::probe(device)?;
+        Self::with_handle_type(device, bytes, handle_type, None)
+    }
+
+    /// Reserves `bytes` of virtual addresses on `device` for one of an
+    /// allocator's pools: every block it maps uses `handle_type` handles and is
+    /// booked against `budget` as `kind` before its storage is created.
+    pub(crate) fn with_budget(
+        device: DeviceId,
+        bytes: usize,
+        handle_type: HandleType,
+        kind: PoolKind,
+        budget: Arc<dyn Budget>,
+    ) -> Result<Self> {
+        Self::with_handle_type(device, bytes, handle_type, Some(Booking { kind, budget }))
+    }
+
+    fn with_handle_type(
+        device: DeviceId,
+        bytes: usize,
+        handle_type: HandleType,
+        booking: Option<Booking>,
+    ) -> Result<Self> {
         let context = PrimaryContext::retain(device)?;
         let ordinal = device.handle()?;
         let mut access = vec![ordinal];
@@ -74,9 +116,8 @@ impl VirtualPool {
                 access.push(peer.handle()?);
             }
         }
-        let handle_type = crate::HandleType::probe(device)?.raw();
         let (address, reserved, granularity) = in_context(context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, handle_type);
+            let properties = MemAllocationProp::device(ordinal, handle_type.raw());
             let mut granularity = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
@@ -106,6 +147,7 @@ impl VirtualPool {
             used: 0,
             chunks: Vec::new(),
             suspended: false,
+            booking,
         })
     }
 
@@ -113,10 +155,25 @@ impl VirtualPool {
         self.device
     }
 
-    /// The bytes of physical storage the pool maps, or would map once
-    /// restored.
+    /// The bytes of physical storage the pool maps now: every block whose
+    /// storage is mapped, and so exactly what its budget has booked for it.
     pub fn mapped_bytes(&self) -> usize {
-        self.chunks.iter().map(|chunk| chunk.bytes).sum()
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.block.is_some())
+            .map(|chunk| chunk.bytes)
+            .sum()
+    }
+
+    /// Books the pool's current total, after its storage changed. The storage
+    /// exists or is gone already, so a refusal cannot undo the change; the
+    /// caller reports the failure of the operation that made it.
+    fn rebook(&self) {
+        if let Some(booking) = &self.booking {
+            let _ = booking
+                .budget
+                .book(self.device, booking.kind, self.mapped_bytes() as u64);
+        }
     }
 
     /// Whether `address` lies in the pool's reservation.
@@ -133,8 +190,15 @@ impl VirtualPool {
     /// # Errors
     ///
     /// Fails while the pool is suspended, when the reservation is
-    /// exhausted, and when the driver cannot allocate or map the storage.
+    /// exhausted, when the driver cannot allocate or map the storage, and
+    /// when the pool's budget refuses the new total (nothing is mapped then).
     pub fn allocate(&mut self, bytes: usize) -> Result<u64> {
+        Ok(self.allocate_block(bytes)?.0)
+    }
+
+    /// [`Self::allocate`], also answering with the block it gave out, so that a
+    /// buffer can export it.
+    pub(crate) fn allocate_block(&mut self, bytes: usize) -> Result<(u64, Arc<Block>)> {
         if self.suspended {
             return Err(Error::invalid("a suspended pool gives out no storage"));
         }
@@ -145,7 +209,11 @@ impl VirtualPool {
             .find(|chunk| chunk.free && chunk.bytes == bytes)
         {
             chunk.free = false;
-            return Ok(self.address + chunk.offset);
+            let block = chunk
+                .block
+                .clone()
+                .ok_or_else(|| Error::invalid("a suspended chunk cannot be given out"))?;
+            return Ok((self.address + chunk.offset, block));
         }
         if self.reserved - self.used < bytes {
             return Err(Error::invalid(format!(
@@ -154,16 +222,16 @@ impl VirtualPool {
             )));
         }
         let offset = self.used as u64;
-        let handle = self.map(offset, bytes)?;
+        let block = self.map(offset, bytes)?;
         self.used += bytes;
         self.chunks.push(Chunk {
             offset,
             bytes,
-            handle: Some(handle),
+            block: Some(Arc::clone(&block)),
             saved: None,
             free: false,
         });
-        Ok(self.address + offset)
+        Ok((self.address + offset, block))
     }
 
     /// Returns the chunk at `address` to the pool, which keeps it mapped
@@ -180,12 +248,18 @@ impl VirtualPool {
     }
 
     /// Creates `bytes` of physical storage and maps it at `offset`, readable
-    /// and writable by the pool's device and its peers. Returns its handle.
-    fn map(&self, offset: u64, bytes: usize) -> Result<u64> {
+    /// and writable by the pool's device and its peers, booking it against the
+    /// pool's budget first when the pool has one. Returns the block.
+    fn map(&self, offset: u64, bytes: usize) -> Result<Arc<Block>> {
+        if let Some(booking) = &self.booking {
+            let total = self.mapped_bytes() as u64 + bytes as u64;
+            // The booking comes first: a refusal must leave nothing mapped.
+            booking.budget.book(self.device, booking.kind, total)?;
+        }
         let ordinal = self.device.handle()?;
         let address = self.address + offset;
-        in_context(self.context.raw(), |driver| {
-            let properties = MemAllocationProp::device(ordinal, self.handle_type);
+        let mapped = in_context(self.context.raw(), |driver| {
+            let properties = MemAllocationProp::device(ordinal, self.handle_type.raw());
             let mut handle = 0;
             driver.check(
                 // SAFETY: the driver reads the local properties and writes one
@@ -227,7 +301,27 @@ impl VirtualPool {
                 return Err(error);
             }
             Ok(handle)
-        })
+        });
+
+        match mapped {
+            Ok(handle) => Ok(Arc::new(Block::new(
+                handle,
+                bytes,
+                self.handle_type,
+                self.context.clone(),
+            ))),
+            Err(error) => {
+                // Nothing stayed mapped, so the pool's total is what it was
+                // before the booking; restoring it must not mask the failure.
+                if let Some(booking) = &self.booking {
+                    let _ =
+                        booking
+                            .budget
+                            .book(self.device, booking.kind, self.mapped_bytes() as u64);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Copies every chunk's contents to page-locked host storage and releases
@@ -245,23 +339,19 @@ impl VirtualPool {
             return Ok(());
         }
         let stream = Stream::new(self.device)?;
-        for chunk in &mut self.chunks {
-            let Some(handle) = chunk.handle else {
+        for index in 0..self.chunks.len() {
+            let Some(block) = self.chunks[index].block.clone() else {
                 continue;
             };
-            let saved = PinnedBuffer::new(self.device, chunk.bytes)?;
-            let address = self.address + chunk.offset;
+            let bytes = self.chunks[index].bytes;
+            let address = self.address + self.chunks[index].offset;
+            let saved = PinnedBuffer::new(self.device, bytes)?;
             in_context(self.context.raw(), |driver| {
                 // SAFETY: the chunk is mapped and idle; the host buffer is
                 // live and as long as the chunk.
                 driver.check(
                     unsafe {
-                        (driver.memcpy_async)(
-                            saved.address(),
-                            address,
-                            chunk.bytes,
-                            stream.handle(),
-                        )
+                        (driver.memcpy_async)(saved.address(), address, bytes, stream.handle())
                     },
                     "cuMemcpyAsync",
                 )
@@ -271,14 +361,17 @@ impl VirtualPool {
                 driver.check(
                     // SAFETY: the chunk was mapped by this pool and nothing
                     // addresses it while the pool is suspended.
-                    unsafe { (driver.mem_unmap)(address, chunk.bytes) },
+                    unsafe { (driver.mem_unmap)(address, bytes) },
                     "cuMemUnmap",
                 )?;
                 // SAFETY: the handle is this pool's reference.
-                driver.check(unsafe { (driver.mem_release)(handle) }, "cuMemRelease")
+                driver.check(unsafe { (driver.mem_release)(block.raw()) }, "cuMemRelease")
             })?;
-            chunk.handle = None;
-            chunk.saved = Some(saved);
+            self.chunks[index].block = None;
+            self.chunks[index].saved = Some(saved);
+            // The device maps this storage no longer, so its budget must stop
+            // counting it: an over-count would refuse an allocation that fits.
+            self.rebook();
         }
         self.suspended = true;
         Ok(())
@@ -298,12 +391,12 @@ impl VirtualPool {
         }
         let stream = Stream::new(self.device)?;
         for index in 0..self.chunks.len() {
-            if self.chunks[index].handle.is_some() {
+            if self.chunks[index].block.is_some() {
                 continue;
             }
             let (offset, bytes) = (self.chunks[index].offset, self.chunks[index].bytes);
-            let handle = self.map(offset, bytes)?;
-            self.chunks[index].handle = Some(handle);
+            let block = self.map(offset, bytes)?;
+            self.chunks[index].block = Some(block);
             if let Some(saved) = self.chunks[index].saved.take() {
                 let address = self.address + offset;
                 in_context(self.context.raw(), |driver| {
@@ -327,20 +420,26 @@ impl VirtualPool {
 impl Drop for VirtualPool {
     fn drop(&mut self) {
         let context = self.context.clone();
+        let device = self.device;
+        let release = self
+            .booking
+            .as_ref()
+            .map(|booking| (booking.kind, Arc::clone(&booking.budget)));
         let (address, reserved) = (self.address, self.reserved);
         let mapped: Vec<(u64, usize, u64)> = self
             .chunks
             .iter()
             .filter_map(|chunk| {
                 chunk
-                    .handle
-                    .map(|handle| (address + chunk.offset, chunk.bytes, handle))
+                    .block
+                    .as_ref()
+                    .map(|block| (address + chunk.offset, chunk.bytes, block.raw()))
             })
             .collect();
         // The owner destroyed every graph that addresses the pool and
         // drained the streams they ran on.
         reclaim::defer(move || {
-            in_context(context.raw(), |driver| {
+            let outcome = in_context(context.raw(), |driver| {
                 let mut outcome = Ok(());
                 for (chunk, bytes, handle) in mapped {
                     // SAFETY: each chunk was mapped by this pool.
@@ -353,7 +452,14 @@ impl Drop for VirtualPool {
                 // SAFETY: the range was reserved by this pool.
                 let status = unsafe { (driver.mem_address_free)(address, reserved) };
                 outcome.and(driver.check(status, "cuMemAddressFree"))
-            })
+            });
+            // The pool's storage is gone, so the device's budget stops counting
+            // it. Releasing the last of a deployment's pools may outlive its
+            // ledger client, hence best effort.
+            if let Some((kind, budget)) = release {
+                let _ = budget.book(device, kind, 0);
+            }
+            outcome
         });
     }
 }

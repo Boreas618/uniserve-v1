@@ -334,7 +334,8 @@ pub(crate) mod tests {
     use std::sync::Mutex;
 
     use crate::{
-        Capture, Device, DeviceAllocation, Function, Graph, LaunchConfig, Library, Result, Stream,
+        Capture, CaptureMode, Device, DeviceAllocation, Function, Graph, LaunchConfig, Library,
+        Result, Stream,
     };
 
     /// CUPTI is process-wide: its device tests run one at a time.
@@ -386,7 +387,7 @@ pub(crate) mod tests {
         issue: impl FnOnce(&Stream) -> Result<()>,
         record: impl FnOnce(Graph) -> Result<T>,
     ) -> Result<T> {
-        let capture = Capture::begin(stream)?;
+        let capture = Capture::begin(stream, CaptureMode::Relaxed)?;
         issue(stream)?;
         record(capture.end()?)
     }

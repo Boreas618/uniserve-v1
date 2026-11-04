@@ -27,6 +27,7 @@
 //! Releasing storage never synchronizes on the dropping thread; see
 //! [`reclaim`].
 
+mod allocator;
 mod context;
 mod copy;
 mod cublas;
@@ -50,6 +51,7 @@ mod stream;
 mod tensormap;
 mod vmm;
 
+pub use allocator::{Allocator, Budget, Buffer, PoolKind};
 pub use context::{DeviceGuard, PrimaryContext};
 pub use copy::{
     CopyBatch, Pitched, PitchedBatch, SourceOrder, Strided, StridedCopy, memcpy_async,
@@ -65,11 +67,12 @@ pub use device::{
 pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
-pub use graph::{Capture, Graph, GraphExec, GraphNode, KernelNodeParams};
+pub use graph::{Capture, CaptureMode, Graph, GraphExec, GraphNode, KernelNodeParams};
 pub use launch::{Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig};
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
+pub use nccl::{Communicator, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};

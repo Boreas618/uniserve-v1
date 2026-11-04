@@ -1,6 +1,6 @@
 //! Behavior against a real driver. These tests need a CUDA device and use a
 //! few megabytes of storage on device 0; run them with
-//! `cargo test -p cuda -- --ignored`.
+//! `cargo test -p platform --test it -- --ignored --test-threads=1`.
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
@@ -12,15 +12,15 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use platform::{
-    Capture, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation, DeviceAttribute,
-    DeviceId, Error, Event, EventFlags, FunctionAttribute, HandleType, Interleave,
+    Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
+    DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, HandleType, Interleave,
     KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill, PeerMapping, PinnedBuffer,
     PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided,
     StridedCopy, Swizzle, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
     memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
-const DEVICE: DeviceId = DeviceId(0);
+pub(crate) const DEVICE: DeviceId = DeviceId(0);
 
 /// Serializes the tests of this binary.
 ///
@@ -32,11 +32,11 @@ const DEVICE: DeviceId = DeviceId(0);
 /// test may use the driver meanwhile, so every test takes this lock first.
 static DRIVER: Mutex<()> = Mutex::new(());
 
-fn exclusive_driver() -> MutexGuard<'static, ()> {
+pub(crate) fn exclusive_driver() -> MutexGuard<'static, ()> {
     DRIVER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn read(buffer: &PinnedBuffer) -> Vec<u8> {
+pub(crate) fn read(buffer: &PinnedBuffer) -> Vec<u8> {
     // SAFETY: callers synchronize the stream that wrote the buffer first.
     unsafe { buffer.as_slice() }.to_vec()
 }
@@ -532,7 +532,7 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
     let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
 
-    let capture = Capture::begin(&stream).unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::Active);
 
     let mut batch = CopyBatch::new(SourceOrder::Stream);
@@ -567,7 +567,7 @@ fn graph_executables_launch_on_another_stream() {
     let host = PinnedBuffer::new(DEVICE, 256).unwrap();
 
     // The captured work fills the allocation with 7.
-    let capture = Capture::begin(&source).unwrap();
+    let capture = Capture::begin(&source, CaptureMode::Relaxed).unwrap();
     // SAFETY: the fill lies inside the allocation.
     unsafe { memset_d8(device.address(), 7, 256, &source) }.unwrap();
     let launched = capture.end().unwrap().instantiate().unwrap();
@@ -604,7 +604,7 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
     // SAFETY: the ranges lie inside the pool's chunks.
     unsafe { memset_d8(first, 5, 256, &stream) }.unwrap();
     stream.synchronize().unwrap();
-    let capture = Capture::begin(&stream).unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     // SAFETY: the range lies inside the pool's chunk.
     unsafe { memset_d8(second, 9, 256, &stream) }.unwrap();
     let fill = capture.end().unwrap().instantiate().unwrap();
@@ -966,7 +966,7 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     }
     stream.synchronize().unwrap();
     source.protect(Protection::ReadOnly).unwrap();
-    let capture = Capture::begin(&stream).unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     // SAFETY: the copy borrows allocations that outlive the executable.
     unsafe { memcpy_async(host.address(), active.address(), bytes, &stream) }.unwrap();
     let read_back = capture.end().unwrap().instantiate().unwrap();
@@ -1071,9 +1071,12 @@ const KERNELS: &str = "\
 
 /// The words of `buffer`, read after the writing stream was synchronized.
 fn words(buffer: &PinnedBuffer) -> Vec<u32> {
-    read(buffer)
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    let bytes = read(buffer);
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect()
 }
 
@@ -1220,10 +1223,11 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
         // SAFETY: as above.
         unsafe { memcpy_async(host.address(), storage.address(), 4 * 28, &stream) }.unwrap();
         stream.synchronize().unwrap();
-        for (block, record) in words(&host).chunks_exact(7).enumerate() {
+        let observed = words(&host);
+        for (block, record) in observed.as_chunks::<7>().0.iter().enumerate() {
             let block = block as u32;
             assert_eq!(
-                record,
+                *record,
                 [block % 2, block / 2, 0, 0, 0, 0, 0],
                 "block {block} of a clustered launch"
             );
@@ -1245,7 +1249,7 @@ fn capture_records_the_node_of_each_launch() {
     let host = PinnedBuffer::new(DEVICE, 32).unwrap();
     let mut out = storage.address();
 
-    let mut capture = Capture::begin(&stream).unwrap();
+    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     assert!(capture.record().unwrap().is_empty(), "no operation yet");
 
     let mut first = 7u32;
@@ -1302,7 +1306,7 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
     let host = PinnedBuffer::new(DEVICE, 32).unwrap();
     let mut out = storage.address();
 
-    let mut capture = Capture::begin(&stream).unwrap();
+    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     let mut value = 7u32;
     let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
     write
@@ -1366,7 +1370,7 @@ fn recapture_builds_an_executable_of_the_new_capture() {
     let host = PinnedBuffer::new(DEVICE, 32).unwrap();
     let mut out = storage.address();
 
-    let mut capture = Capture::begin(&stream).unwrap();
+    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     let mut one = 1u32;
     let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut one).cast()];
     write
@@ -1381,7 +1385,7 @@ fn recapture_builds_an_executable_of_the_new_capture() {
     let before_exec = before.instantiate().unwrap();
     assert_eq!(before.node_count().unwrap(), 1);
 
-    let mut capture = Capture::begin(&stream).unwrap();
+    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
     let mut two = 2u32;
     let mut three = 3u32;
     for value in [&mut two, &mut three] {

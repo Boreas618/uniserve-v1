@@ -524,7 +524,8 @@ pub(crate) mod tests {
 
         use super::super::*;
         use crate::{
-            Capture, DeviceAllocation, DeviceId, Event, EventFlags, GraphExec, memset_d32,
+            Capture, CaptureMode, DeviceAllocation, DeviceId, Event, EventFlags, GraphExec,
+            memset_d32,
         };
 
         const FILL_BYTES: usize = 1 << 30;
@@ -562,7 +563,7 @@ pub(crate) mod tests {
             stream: &Stream,
             count: usize,
         ) -> Result<GraphExec> {
-            let capture = Capture::begin(stream)?;
+            let capture = Capture::begin(stream, CaptureMode::Relaxed)?;
             fill(storage, stream, count)?;
             capture.end()?.instantiate()
         }
