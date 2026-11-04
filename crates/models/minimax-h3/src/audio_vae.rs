@@ -1121,7 +1121,8 @@ impl<'a, 'b> Binder<'a, 'b> {
     pub(crate) fn normalized(&mut self, parameter: &str) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Normalized { value, gain } => {
-                Ok(self.loader.weight_norm(parameter, &value, &gain)?)
+                let weight = self.loader.weight_norm(parameter, &value, &gain)?;
+                self.declared(weight, parameter)
             }
             other => Err(Error::checkpoint(format!(
                 "{parameter}: the parameter is not weight-normalized: {other:?}"
@@ -1129,13 +1130,32 @@ impl<'a, 'b> Binder<'a, 'b> {
         }
     }
 
+    /// A weight as the audio VAE's declared arithmetic requires it: FP32.
+    ///
+    /// The two audio VAEs compute in FP32 - the alias-free resample's Kaiser-sinc filters, the SnakeBeta
+    /// exponentials and the seven stages' transposed convolutions are all stated in it - and the loader
+    /// converts nothing by default, so a checkpoint whose audio weights are stored in a narrower type
+    /// would reach an operator whose activations are FP32 with weights that are not. That mismatch is
+    /// refused here, at the loading boundary, naming the parameter and the representation it is in.
+    fn declared(&self, weight: Weight, parameter: &str) -> Result<Weight> {
+        if weight.dtype() != DType::F32 {
+            return Err(Error::checkpoint(format!(
+                "{parameter}: the audio VAE computes in FP32 and this weight is {}; the checkpoint's \
+                 audio weights must be converted at load rather than mixed with FP32 activations",
+                weight.dtype()
+            )));
+        }
+        Ok(weight)
+    }
+
     /// One tensor, read at `shape`.
     pub(crate) fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Region(tensor) => {
-                Ok(self
-                    .loader
-                    .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?)
+                let weight =
+                    self.loader
+                        .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?;
+                self.declared(weight, parameter)
             }
             other => Err(Error::checkpoint(format!(
                 "{parameter}: the parameter is not one tensor: {other:?}"
@@ -1151,9 +1171,10 @@ impl<'a, 'b> Binder<'a, 'b> {
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Region(tensor) => {
-                Ok(self
-                    .loader
-                    .load(&WeightRequest::region(tensor, offset, Shape::new(shape)))?)
+                let weight =
+                    self.loader
+                        .load(&WeightRequest::region(tensor, offset, Shape::new(shape)))?;
+                self.declared(weight, parameter)
             }
             other => Err(Error::checkpoint(format!(
                 "{parameter}: the parameter is not one tensor: {other:?}"
