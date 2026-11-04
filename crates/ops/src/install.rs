@@ -108,6 +108,7 @@ const OPERATORS: &[&str] = &[
     <crate::replicate_pad::ReplicatePad as Op>::NAME,
     <crate::audio_resample::AudioResample as Op>::NAME,
     <crate::resize::AntialiasedResizeUint8 as Op>::NAME,
+    <crate::snake::Snake as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
