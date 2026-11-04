@@ -24,7 +24,7 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchColumns, Job, Jobs};
+use crate::batch::{Batch, BatchColumns, BatchOutput, Job, Jobs, SampledToken};
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape, Variant};
@@ -147,6 +147,22 @@ impl Staging {
     }
 
     /// The shape staged by the last [`Staging::stage`].
+    /// The row indices a token is sampled for, in batch order (4.4's sampling rows).
+    pub fn logits_rows(&self, rows: usize) -> Vec<u32> {
+        self.columns
+            .as_ref()
+            .map(|columns| columns.logits_rows.iter().copied().take(rows).collect())
+            .unwrap_or_default()
+    }
+
+    /// The batch's calls, which name the request each row belongs to.
+    pub fn calls(&self) -> &[crate::batch::BatchCall] {
+        self.columns
+            .as_ref()
+            .map(|columns| columns.calls.as_slice())
+            .unwrap_or_default()
+    }
+
     pub fn staged(&self) -> Option<Shape> {
         self.staged
     }
@@ -436,7 +452,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
     }
 
-    fn serve(&mut self, job: &Job) -> Result<()> {
+    fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
         match job {
             Job::Replay {
                 bucket, generation, ..
@@ -638,6 +654,22 @@ impl<M: CausalLm> CausalLmRunner<M> {
         Err(Error::Invariant(format!(
             "the runner holds no generation {number}"
         )))
+    }
+
+    /// Reads the bucket's sampled token ids back and names the call each belongs to (4.4).
+    ///
+    /// The bucket's sampler writes one `u32` per sampling row; the staged columns name those rows
+    /// (`logits_rows`) and the call each row belongs to, so the output preserves the mechanism's
+    /// request order. A bucket that samples nothing has no sampler buffer and answers empty.
+    fn read_sampled(&mut self, bucket: Bucket) -> Result<BatchOutput> {
+        let Some(sampler) = self.samplers.get_mut(&bucket) else {
+            return Ok(BatchOutput::default());
+        };
+        self.stream.synchronize()?;
+        sampler.read_back(&self.stream)?;
+        let rows = self.staging.staged().map_or(0, |shape| shape.rows as usize);
+        let sampling_rows = self.staging.logits_rows(rows);
+        sampler.output(&sampling_rows, self.staging.calls())
     }
 
     /// Walks one bucket's forward under the active capture with `generation`'s kernels.

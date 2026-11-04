@@ -25,7 +25,9 @@ use ipc::PhaseId;
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::batch::{Batch, Job, JobKind, Submission, SubmissionId, SubmissionState};
+use crate::batch::{
+    Batch, BatchOutput, Job, JobKind, Submission, SubmissionId, SubmissionState,
+};
 use crate::completion::Outcome;
 use crate::stream::events::{EventPool, JobId};
 use crate::stream::recorded;
@@ -218,7 +220,9 @@ impl JobQueue {
     }
 
     /// Reports that `entry` ended with `result`, and completes the submission that waited on it.
-    pub(crate) fn complete(&self, entry: Entry, result: Result<()>) {
+    ///
+    /// A serving command hands over the step's output; every other command's output is empty.
+    pub(crate) fn complete(&self, entry: Entry, result: Result<BatchOutput>) {
         {
             let mut state = lock(&self.state);
             state.current = None;
@@ -231,7 +235,7 @@ impl JobQueue {
         }
         if let Some(submission) = entry.submission {
             let outcome = match result {
-                Ok(()) => Outcome::Success(()),
+                Ok(output) => Outcome::Success(output),
                 Err(error) => Outcome::Failed(Arc::new(error)),
             };
             submission.finish(outcome);

@@ -66,7 +66,7 @@ pub trait Runner: Send {
     /// the executor, alternating with serving batches", and only the runner owns the model and the
     /// arena that a capture, a replay or a rebind needs. The executor cannot perform those jobs
     /// itself, so the runner that returned them performs them here.
-    fn serve(&mut self, job: &crate::batch::Job) -> Result<()>;
+    fn serve(&mut self, job: &crate::batch::Job) -> Result<crate::batch::BatchOutput>;
 }
 
 /// One runner the device executor owns: its name, the phases it serves, and the runner itself.
