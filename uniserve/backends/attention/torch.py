@@ -1,5 +1,7 @@
 """Portable SDPA over dense, variable-length, paged and segmented inputs."""
 
+import threading
+
 import torch
 from torch.nn import functional as F
 
@@ -48,6 +50,51 @@ def _device_origin(table, row: int):
     return table.start_page[row] * table.block_size
 
 
+# Grow-only scratch for paged gathers. A serving call may not release device
+# storage: the worker watches each serving call's driver calls, and a release
+# (or unmap) makes the host wait for the device. So the gather's tensors and
+# dequantization temporaries come from buffers that live for the process's
+# lifetime; a role's buffer is replaced only by a larger one, and the
+# replaced buffer stays referenced so its storage is never returned. The keys
+# name the device, the stream and the role, since a buffer shared across
+# streams would race; on one stream the next write is ordered after this
+# call's reads.
+_SCRATCH: dict[tuple[object, ...], torch.Tensor] = {}
+_RETIRED: list[torch.Tensor] = []
+_SLOTS: dict[tuple[object, ...], int] = {}
+_SCRATCH_LOCK = threading.RLock()
+
+
+def _scratch(key, numel, dtype, device):
+    """Return a scratch buffer of at least ``numel`` elements for ``key``.
+
+    A growing role replaces its buffer with a larger one and keeps the old
+    buffer referenced, so no device storage is released during a call.
+    """
+    with _SCRATCH_LOCK:
+        buffer = _SCRATCH.get(key)
+        if buffer is not None and buffer.numel() >= numel:
+            return buffer
+        replacement = torch.empty(numel, dtype=dtype, device=device)
+        _SCRATCH[key] = replacement
+        if buffer is not None:
+            _RETIRED.append(buffer)
+        return replacement
+
+
+def _gathered(key, numel, dtype, device):
+    """Return the next of two result buffers for ``key``.
+
+    A row's keys and values are live together, and a following row's gathers
+    write after this row's reader was submitted on the same stream, so two
+    alternating buffers per stream never overwrite a live result.
+    """
+    with _SCRATCH_LOCK:
+        slot = _SLOTS.get(key, 0)
+        _SLOTS[key] = 1 - slot
+    return _scratch((*key, dtype, "value", slot), numel, dtype, device)
+
+
 def _paged(value, table, length):
     """Gather one sequence's live prefix pages.
 
@@ -67,29 +114,92 @@ def _paged(value, table, length):
         )
 
     count = (length + value.shape[1] - 1) // value.shape[1]
-    if table.numel() < count:
-        # ``PagedInput`` validates that its rows' tables cover their keys when
-        # it is built from blocks. A table that is still short here belongs
-        # to a graph bucket's padding sequence, whose table is cleared (page
-        # zero, the sentinel unit's valid storage) and whose queries read
-        # disposable values that are discarded.
-        table = torch.nn.functional.pad(table, (0, count - table.numel()))
+    block, heads, dim = value.shape[1:]
+    width = block * heads * dim
 
-    indices = table[:count].to(device=value.device, dtype=torch.int64)
+    if not value.is_cuda:
+        # Host tensors have no serving stream to key scratch by: keep the
+        # ordinary allocation path.
+        if table.numel() < count:
+            # ``PagedInput`` validates that its rows' tables cover their keys
+            # when it is built from blocks. A table that is still short here
+            # belongs to a graph bucket's padding sequence, whose table is
+            # cleared (page zero, the sentinel unit's valid storage) and
+            # whose queries read disposable values that are discarded.
+            table = torch.nn.functional.pad(table, (0, count - table.numel()))
+        indices = table[:count].to(device=value.device, dtype=torch.int64)
+        if isinstance(value, QuantizedTensor):
+            if value.quantizer.format != "fp8" or value.quantizer.axis != 0:
+                raise ValueError(
+                    "paged SDPA requires dense or per-block FP8 state"
+                )
+            fields = value.buffers()
+            encoded = (
+                fields["values"]
+                .view(torch.uint8)
+                .index_select(0, indices)
+                .view(torch.float8_e4m3fn)
+            )
+            scales = fields["scale"].index_select(0, indices)
+            gathered = (encoded.float() * scales).to(value.dtype)
+        else:
+            gathered = value.index_select(0, indices)
+        return gathered.flatten(0, 1)[:length]
+
     if isinstance(value, QuantizedTensor):
         if value.quantizer.format != "fp8" or value.quantizer.axis != 0:
             raise ValueError("paged SDPA requires dense or per-block FP8 state")
+
+    stream = torch.cuda.current_stream(value.device).cuda_stream
+    key = (value.device.index, stream)
+
+    indices = _scratch(
+        (*key, torch.int64, "indices"), count, torch.int64, value.device
+    )[:count]
+    short = min(table.numel(), count)
+    indices[:short].copy_(table[:short])
+    if short < count:
+        # A short table belongs to a graph bucket's padding sequence, whose
+        # table is cleared (page zero, the sentinel unit's valid storage) and
+        # whose queries read disposable values that are discarded.
+        indices[short:].zero_()
+
+    shape = (count, block, heads, dim)
+    if isinstance(value, QuantizedTensor):
         fields = value.buffers()
-        encoded = (
-            fields["values"]
-            .view(torch.uint8)
-            .index_select(0, indices)
-            .view(torch.float8_e4m3fn)
+        encoded = _scratch(
+            (*key, torch.uint8, "encoded"),
+            count * width,
+            torch.uint8,
+            value.device,
+        )[: count * width].view(shape)
+        torch.index_select(
+            fields["values"].view(torch.uint8), 0, indices, out=encoded
         )
-        scales = fields["scale"].index_select(0, indices)
-        gathered = (encoded.float() * scales).to(value.dtype)
+        scales = _scratch(
+            (*key, torch.float32, "scales"), count, torch.float32, value.device
+        )[:count].view(count, 1, 1, 1)
+        torch.index_select(fields["scale"], 0, indices, out=scales)
+        floating = _scratch(
+            (*key, torch.float32, "float"),
+            count * width,
+            torch.float32,
+            value.device,
+        )[: count * width].view(shape)
+        # Decode to float32, apply the block scales in place, and re-encode
+        # into the logical dtype: the same values as one fused expression,
+        # without allocating its temporaries per call.
+        floating.copy_(encoded.view(torch.float8_e4m3fn))
+        floating.mul_(scales)
+        gathered = _gathered(key, count * width, value.dtype, value.device)[
+            : count * width
+        ].view(shape)
+        gathered.copy_(floating)
     else:
-        gathered = value.index_select(0, indices)
+        gathered = _gathered(key, count * width, value.dtype, value.device)[
+            : count * width
+        ].view(shape)
+        torch.index_select(value, 0, indices, out=gathered)
     return gathered.flatten(0, 1)[:length]
 
 
