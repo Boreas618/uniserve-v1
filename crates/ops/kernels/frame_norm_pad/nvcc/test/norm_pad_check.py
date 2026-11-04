@@ -353,14 +353,14 @@ def run(options):
     )
     error = (out - expected).abs()
     allowed = declared_bound() * expected.abs()
-    violations = int((error > allowed).sum())
+    violations = int((~(error <= allowed)).sum())
     identical = int((out.reshape(-1).view(torch.int32) == expected.reshape(-1).view(torch.int32)).sum())
     print(
         f"channels {channels} groups {groups} frames {frames} {height}x{width} -> "
         f"{out_frames}x{out_rows}x{out_columns}, branch {branch}, "
         f"{'reflect' if options.reflect else 'replicate'}"
         f"{', channels last' if options.channels_last else ''}: "
-        f"max |error| {error.max().item():.3e}, rtol {declared_bound():.3e}, "
+        f"max |error| {torch.nan_to_num(error).max().item():.3e}, rtol {declared_bound():.3e}, "
         f"{identical} of {error.numel()} bit-identical"
     )
     if violations:

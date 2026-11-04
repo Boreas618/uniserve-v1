@@ -121,7 +121,8 @@ def main() -> int:
             f"windows {windows}, max |out - exact| = {difference:.3e} "
             f"allowed {allowed:.3e}"
         )
-        if difference > allowed:
+        # A difference that is not a number is never inside a bound.
+        if not difference <= allowed:
             failures += 1
     return 1 if failures else 0
 
