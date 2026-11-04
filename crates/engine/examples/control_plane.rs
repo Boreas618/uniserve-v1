@@ -48,13 +48,18 @@ fn main() -> anyhow::Result<()> {
         .install_policy(program, &engine::PolicyBytes::new(module))
         .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))?;
 
+    // Prefix reuse is a world setting (`EngineConfig::prefix_cache`), off in a
+    // scheduler built by hand: the `reuse` scenario is about the pages a second
+    // request reads, so it is turned on as a deployment turns it on.
+    sched.set_prefix_reuse(true);
+
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
     let handle = SchedulerHandle::spawn(sched, "sim-model", CommandWaker::noop())?;
 
     let mut rxs: HashMap<RequestId, (String, engine::EventRx)> = HashMap::new();
     let mut next_id = 1u64;
-    let mut mk = |constraint: GenerationConstraint, generated: Vec<u32>| {
+    let mut mk = |constraint: GenerationConstraint, generated: Vec<u32>, prompt: Vec<u32>| {
         let id = RequestId(next_id);
         next_id += 1;
         let policy = ImageGenerationConfig {
@@ -72,7 +77,7 @@ fn main() -> anyhow::Result<()> {
             }],
             sample_feedback_continuation: true,
         };
-        let prompt_token_ids = vec![1, 2, 3, 4, 5];
+        let prompt_token_ids = prompt;
 
         let image = ImageParams {
             steps: 6,
@@ -128,14 +133,14 @@ fn main() -> anyhow::Result<()> {
     let wants = |kind: &str| wanted.as_deref().is_none_or(|only| only == kind || only == "all");
     if wants("text") {
         for _ in 0..3 {
-            let (id, request) = mk(GenerationConstraint::UndOnly, Vec::new())?;
+            let (id, request) = mk(GenerationConstraint::UndOnly, Vec::new(), vec![1, 2, 3, 4, 5])?;
             let rx = handle.submit(request)?;
             rxs.insert(id, ("text".to_string(), rx));
         }
     }
     if wants("image") {
         for _ in 0..2 {
-            let (id, request) = mk(GenerationConstraint::GenOnly, Vec::new())?;
+            let (id, request) = mk(GenerationConstraint::GenOnly, Vec::new(), vec![1, 2, 3, 4, 5])?;
             let rx = handle.submit(request)?;
             rxs.insert(id, ("image".to_string(), rx));
         }
@@ -143,8 +148,42 @@ fn main() -> anyhow::Result<()> {
     // A request that resumes a generation: its prompt continues the tokens it
     // carries, so its context is prefilled from `prompt + carried` and its
     // budget, penalties and stop rules continue from the carried token count.
+    // Two requests over one 600-token prompt, the second submitted only after
+    // the first finished: it should read the pages the first stored, up to the
+    // last boundary that leaves a token to compute. Submitted together, the
+    // second arrives before the first's pages are published and reads nothing,
+    // which says nothing about reuse.
+    // The reuse scenario is sequential, so it runs only when it is the one named:
+    // `all` is the concurrent world.
+    if wanted.as_deref() == Some("reuse") {
+        let prompt: Vec<u32> = (0..600).map(|index| 2_000 + index % 500).collect();
+        for id in 1..=2 {
+            let (_, request) = mk(GenerationConstraint::UndOnly, Vec::new(), prompt.clone())?;
+            let mut rx = handle.submit(request)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut finished = false;
+            while !finished && std::time::Instant::now() < deadline {
+                match rx.try_recv() {
+                    Ok(event) if event.is_terminal() => finished = true,
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            anyhow::ensure!(finished, "reuse request {id} did not finish");
+        }
+        let stats = handle.stats();
+        println!(
+            "prefix: query_tokens={} hit_tokens={} pages_stored={}",
+            stats.prefix.query_tokens.load(std::sync::atomic::Ordering::Relaxed),
+            stats.prefix.hit_tokens.load(std::sync::atomic::Ordering::Relaxed),
+            stats.prefix_cache.pages_stored.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        handle.shutdown();
+        println!("\nRUST SIM CONTROL-PLANE: PASS");
+        std::process::exit(0);
+    }
     if wants("migrated") {
-        let (id, request) = mk(GenerationConstraint::UndOnly, vec![1_500, 1_501])?;
+        let (id, request) = mk(GenerationConstraint::UndOnly, vec![1_500, 1_501], vec![1, 2, 3, 4, 5])?;
         let rx = handle.submit(request)?;
         rxs.insert(id, ("migrated".to_string(), rx));
     }
@@ -181,7 +220,8 @@ fn main() -> anyhow::Result<()> {
         thread::sleep(Duration::from_millis(2));
     }
 
-    let general = &handle.stats().general;
+    let stats = handle.stats();
+    let general = &stats.general;
     println!(
         "events={watched} steps={} running={} in_flight={} dead={} failure={:?}",
         general.steps.load(std::sync::atomic::Ordering::Relaxed),
