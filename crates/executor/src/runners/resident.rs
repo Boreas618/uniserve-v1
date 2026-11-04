@@ -21,7 +21,6 @@ use platform::{Buffer, PoolKind, Stream};
 use crate::arena::Pools;
 
 use super::causal_lm::KvProvider;
-use crate::memory::allocation::ElementType;
 use crate::memory::prefix_cache::{LayerPlanes, PrefixCache};
 use crate::{Error, Result};
 
@@ -328,7 +327,7 @@ impl std::fmt::Debug for ResidentCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::memory::allocation::ElementType;
 
     /// The storage element types a plane can hold and whether they are kernel operand types.
     #[test]
