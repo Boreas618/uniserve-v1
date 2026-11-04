@@ -285,8 +285,12 @@ impl HotUpdate {
     }
 
     /// §7.3 step 6: the daemon asks for `generation`'s purge. It runs once no
-    /// batch that used its kernels is in flight; a purge asked for a
-    /// generation that never served, or twice, is refused.
+    /// batch that used its kernels is in flight.
+    ///
+    /// Only the generation a switchover or a revert replaced is purged: any
+    /// other number names a generation this process never held, and releasing
+    /// it would report a purge of nothing. A second purge while one is pending
+    /// is refused too, and so is any purge while an update is in flight.
     pub fn request_purge(&mut self, generation: u64) -> Result<()> {
         if self.phase.updating() {
             return Err(Error::State("cannot purge while an update is in flight"));
@@ -295,6 +299,14 @@ impl HotUpdate {
             return Err(Error::Invalid(format!(
                 "the serving generation {} cannot be purged",
                 self.current
+            )));
+        }
+        // Only the generation a switchover or a revert replaced is ever purged
+        // (§7.3 step 6): any other number names a generation this process never
+        // held, and releasing it would report a purge of nothing.
+        if self.previous != Some(generation) {
+            return Err(Error::Invalid(format!(
+                "generation {generation} is not the one this update replaced"
             )));
         }
         if self.purging.is_some() {
@@ -510,9 +522,26 @@ mod tests {
     fn a_purge_of_the_serving_generation_is_refused() {
         let mut update = update();
         assert!(update.request_purge(7).is_err());
-        // A generation that is not the serving one may be purged, even one
-        // newer than it: a reverted update's generation is exactly that.
-        assert!(update.request_purge(8).is_ok());
+    }
+
+    #[test]
+    fn a_purge_of_a_generation_this_update_never_replaced_is_refused() {
+        let mut update = update();
+        // Nothing has been switched over or reverted yet, so nothing is old:
+        // a number the state machine never held names no storage to release.
+        let error = update
+            .request_purge(9)
+            .expect_err("there is no replaced generation to purge");
+        assert!(matches!(error, Error::Invalid(_)), "{error:?}");
+        // Nor is one after a completed update, when only the serving one is left.
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.switchover(8, Instant::now()).expect("switchover");
+        update.commit(8).expect("commit");
+        update.request_purge(7).expect("the switchover's generation");
+        assert_eq!(update.purge_due(), Some(7));
+        update.purged(7).expect("purged");
+        assert!(update.request_purge(7).is_err());
     }
 
     #[test]
@@ -563,11 +592,20 @@ mod tests {
     #[test]
     fn a_purge_cannot_be_requested_twice_or_finished_early() {
         let mut update = update();
-        update.request_purge(6).expect("a stale generation");
-        assert!(update.request_purge(5).is_err());
-        assert!(update.purged(6).is_err());
-        assert_eq!(update.purge_due(), Some(6));
-        update.purged(6).expect("purged");
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.switchover(8, Instant::now()).expect("switchover");
+        update.commit(8).expect("commit");
+        update.batch_started(7);
+        update
+            .request_purge(7)
+            .expect("the generation the switchover replaced");
+        assert!(update.request_purge(7).is_err(), "its purge is pending");
+        assert!(update.purged(7).is_err(), "its last batch is in flight");
+        assert_eq!(update.purge_due(), None);
+        update.batch_finished(7);
+        assert_eq!(update.purge_due(), Some(7));
+        update.purged(7).expect("purged");
     }
 
     #[test]
