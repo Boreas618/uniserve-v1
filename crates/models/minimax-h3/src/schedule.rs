@@ -547,7 +547,7 @@ mod tests {
                     .block_span(modality, block)
                     .expect("a block's span");
                 assert_eq!(
-                    start, nodes[block as usize] as u32,
+                    start, nodes[block as usize],
                     "block {block} starts at its node"
                 );
                 assert_eq!(
