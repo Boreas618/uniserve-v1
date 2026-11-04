@@ -1125,12 +1125,13 @@ fn main() {
     // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
     //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
     // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
-    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles`,
-    //   `vsa_zero_padding` and `vsa_compose_gated_rows` are above, because their geometry is the
-    //   checkpoint's.
-    // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`: declared and
-    //   unused by this model — the layers that call them are the Qwen3 slice's and the sampler's,
-    //   whose widths live in the other fixture.
+    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles` and
+    //   `vsa_zero_padding` are above, because their geometry is the checkpoint's.
+    // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`,
+    //   `vsa_compose_gated_rows`: declared, and nothing in either model's code calls them yet, so
+    //   there is no geometry to key. They are named here rather than left to be found: the first two
+    //   belong to the sampler's chain and the Qwen3 slice, the two residuals to a stream that folds
+    //   its normalization in one launch, and the composition to the VSA chain's last step.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
