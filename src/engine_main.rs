@@ -311,6 +311,11 @@ impl ProcessInterface {
         tracing::info!(
             nodes = welcome.nodes.len(),
             build = %welcome.build,
+            // The engine number this link claims, so this process's line and the daemon's
+            // "a process connected engine=N" are matched by a number rather than by their order in
+            // the log - which is the confusion that cost a run.
+            engine,
+            interface = "process",
             "connected to the deployment's process interface"
         );
         Ok(Self {
