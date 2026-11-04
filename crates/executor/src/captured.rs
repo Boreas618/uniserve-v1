@@ -36,7 +36,11 @@ pub struct Captured {
     /// The executable the stream launches.
     exec: GraphExec,
     /// The graph the executable was instantiated from; its nodes are the handles a rebind sets.
-    template: Graph,
+    ///
+    /// Shared, because a rebind builds the prepared generation's executable from this same graph
+    /// rather than capturing one again: the structure a bucket was captured with is the structure
+    /// every later program of that bucket has while it can be rebound (4.5).
+    template: Arc<Graph>,
     /// The nodes of each operator launch, in capture order.
     nodes: Nodes,
     /// Every kernel the graph calls, so it stays loaded while the graph can be replayed.
@@ -51,13 +55,28 @@ impl Captured {
     /// `nodes` is the capture's per-launch node table and `kernels` every kernel the forward
     /// launched; both are the caller's record of the capture it just made.
     pub fn new(template: Graph, nodes: Nodes, kernels: Vec<Arc<Kernel>>) -> Result<Self> {
+        Self::from_template(Arc::new(template), nodes, kernels)
+    }
+
+    /// The same, from a template this generation shares with the one it replaces: the executable is
+    /// instantiated from `template` and its nodes are then set from the walk's parameters.
+    ///
+    /// This is 4.5's rebind: a bucket whose launch structure is unchanged does not need a second
+    /// capture, only a second executable and the parameters of the program it is being prepared for.
+    /// The generation being replaced keeps its own executable, which probation and a revert need
+    /// (7.3 step 4).
+    pub fn from_template(
+        template: Arc<Graph>,
+        nodes: Nodes,
+        kernels: Vec<Arc<Kernel>>,
+    ) -> Result<Self> {
         let exec = template.instantiate()?;
         Self::with_executable(template, exec, nodes, kernels)
     }
 
     /// The same, from an executable the caller instantiated itself.
     pub fn with_executable(
-        template: Graph,
+        template: Arc<Graph>,
         exec: GraphExec,
         nodes: Nodes,
         kernels: Vec<Arc<Kernel>>,
@@ -97,6 +116,11 @@ impl Captured {
     /// The template graph the executable was instantiated from.
     pub fn template(&self) -> &Graph {
         &self.template
+    }
+
+    /// The template, shared: what a rebind instantiates the prepared generation's executable from.
+    pub fn shared_template(&self) -> Arc<Graph> {
+        Arc::clone(&self.template)
     }
 
     /// The per-launch node table.

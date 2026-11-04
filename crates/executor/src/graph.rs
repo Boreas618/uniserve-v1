@@ -49,28 +49,66 @@ impl Graphs {
         self.captured.get(&(bucket, generation))
     }
 
-    /// The smallest captured bucket of `generation` that holds `shape`, with the number of the
-    /// generation it belongs to.
+    /// `bucket`'s graph for `generation`, or, when that generation prepared none, the newest
+    /// generation older than it that did.
     ///
-    /// A shape no captured bucket of the generation holds is an error: the design forbids serving
-    /// it from any other graph and forbids an eager fallback (4.5). The caller plans buckets so
-    /// that it does not happen; the error names the shape so the plan and the batch can be
-    /// compared.
-    pub fn select(&self, shape: &Shape, generation: u64) -> Result<(Bucket, &Captured)> {
-        let mut best: Option<(Bucket, &Captured)> = None;
-        for (&(bucket, captured_generation), captured) in &self.captured {
-            if captured_generation != generation || !bucket.holds(shape) {
+    /// A bucket is prepared for a new generation only when an operator it launches changed, so a
+    /// bucket that launches none of them has no graph of the new generation and, by construction,
+    /// runs exactly the programs it ran in the last generation that named it - the same
+    /// `Arc<Kernel>`s, whose keys moved nowhere (8). It is also what keeps an update that changes
+    /// only the scheduling policy, and so prepares no bucket at all, from stopping serving at the
+    /// switchover.
+    pub fn captured_for(&self, bucket: Bucket, generation: u64) -> Option<(u64, &Captured)> {
+        let mut newest: Option<(u64, &Captured)> = None;
+        for (&(held, captured_generation), captured) in &self.captured {
+            if held != bucket || captured_generation > generation {
                 continue;
             }
-            if best.is_none_or(|(smallest, _)| bucket < smallest) {
-                best = Some((bucket, captured));
+            if newest.is_none_or(|(generation, _)| captured_generation > generation) {
+                newest = Some((captured_generation, captured));
             }
         }
-        best.ok_or_else(|| {
-            Error::Invariant(format!(
-                "no captured bucket of generation {generation} holds {shape}"
-            ))
-        })
+        newest
+    }
+
+    /// The smallest captured bucket that holds `shape` and belongs to `generation`, or, when that
+    /// generation prepared none, to the newest generation older than it that did.
+    ///
+    /// The fallback is the program-layer update's own rule rather than a convenience: a bucket is
+    /// prepared for a new generation only when an operator it launches changed, so a bucket that
+    /// launches none of them has no graph of the new generation and, by construction, runs exactly
+    /// the programs it ran in the last generation that named it - the same `Arc<Kernel>`s, whose
+    /// keys moved nowhere (8). It is also what keeps an update that changes only the scheduling
+    /// policy, and so prepares no bucket at all, from stopping serving at the switchover.
+    ///
+    /// A shape no generation's bucket holds is an error: the design forbids serving it from another
+    /// bucket and forbids planning a new one during serving (4.5). The error names the shape so the
+    /// plan and the batch can be compared.
+    pub fn select(&self, shape: &Shape, generation: u64) -> Result<(Bucket, &Captured)> {
+        let mut best: Option<(Bucket, u64, &Captured)> = None;
+        for (&(bucket, captured_generation), captured) in &self.captured {
+            if captured_generation > generation || !bucket.holds(shape) {
+                continue;
+            }
+            let better = match best {
+                // The newest generation that holds the shape wins; within it, the smallest bucket.
+                None => true,
+                Some((smallest, newest, _)) => {
+                    captured_generation > newest
+                        || (captured_generation == newest && bucket < smallest)
+                }
+            };
+            if better {
+                best = Some((bucket, captured_generation, captured));
+            }
+        }
+        best.map(|(bucket, _, captured)| (bucket, captured))
+            .ok_or_else(|| {
+                Error::Invariant(format!(
+                    "no captured bucket of generation {generation} or of a generation it replaces \
+                     holds {shape}"
+                ))
+            })
     }
 
     /// The buckets of `generation` whose graph launches `operator`, in bucket order.
