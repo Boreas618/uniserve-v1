@@ -35,6 +35,7 @@ pub mod shadow;
 pub mod blocking;
 pub mod capacity;
 pub mod completion;
+pub mod control;
 pub mod config;
 pub mod error;
 pub mod host;
