@@ -133,8 +133,10 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
     }
     # The checkpoint's own representation is the serving default, and the
     # quantization preset retires: either flag stated here would change what
-    # the check set confirms.
+    # the check set confirms. No worker executable is pinned either, so a
+    # deployment launched with --executable runs the new build end to end.
     for name, server in raw["servers"].items():
+        assert "--worker-executable" not in server["command"], name
         for value in server["command"]:
             assert not value.startswith("dtype="), name
             assert not value.startswith("quantization_config."), name
