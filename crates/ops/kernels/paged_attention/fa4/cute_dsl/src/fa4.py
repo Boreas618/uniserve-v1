@@ -23,7 +23,9 @@ set here on its own objects:
 
 Everything else — tiles, pipes, whether the schedule is persistent, whether the
 cluster is two CTAs — the vendor's selection decides, from the descriptor's geometry
-and the representative problem the package's parameters state. That representative
+and the representative problem the package's parameters state. ``compile_selection``
+is that mechanism on its own, so a second operator over FA4 (a dense or a sparse
+attention pass) states only its ``request`` and its tensors. That representative
 problem is the one the compiled configuration is chosen for: a call with a very
 different batch or query length would run a configuration chosen for another shape,
 so the package's parameters are the caller's declaration of the shapes it serves.
@@ -53,6 +55,64 @@ def _interface():
     forward.__annotations__["aux_data"] = cutlass.Constexpr
     forward.__annotations__["max_seqlen_q"] = cutlass.Int32
     return interface
+
+
+def compile_selection(request, target):
+    """Compile what FlashAttention's interface selects for one call, to C.
+
+    ``request`` is called once, inside ``FakeTensorMode``, with the vendor's
+    interface module and must make exactly one ``_flash_attn_fwd`` call. The
+    kernel that call selects is compiled the plain CuTe DSL way — pointers and
+    scalars, no TVM-FFI — and handed back for ``export_to_c``.
+
+    This is the whole of what a caller needs from the vendor's glue: the
+    selection (tiles, pipes, schedule, cluster) is the vendor's, and the two
+    arguments a C module cannot take are set on the vendor's own objects first.
+    """
+    import flash_attn.cute.flash_fwd_sm100 as kernels
+    import flash_attn.cute.interface as interface
+
+    forward = kernels.FlashAttentionForwardSm100.__call__
+    forward.__annotations__["aux_data"] = cutlass.Constexpr
+    forward.__annotations__["max_seqlen_q"] = cutlass.Int32
+
+    captured = []
+    real_compile = cute.compile
+
+    class Capturing:
+        """The cute module, with only ``compile`` replaced."""
+
+        @staticmethod
+        def compile(function, *args, **options):
+            options.pop("options", None)
+            captured.append((function, args))
+            return None
+
+        def __getattr__(self, name):
+            return getattr(cute, name)
+
+    original = interface.cute
+    interface.cute = Capturing()
+    try:
+        with FakeTensorMode():
+            request(interface)
+    finally:
+        interface.cute = original
+    if len(captured) != 1:
+        raise SystemExit(f"the selection compiled {len(captured)} kernels; expected one")
+    function, arguments = captured[0]
+    # The stream is the caller's at run time; the compile describes a fake one.
+    arguments = [one for one in arguments if "Stream" not in type(one).__name__]
+    # Scalars are runtime words of the module, not Python constants.
+    arguments = [
+        cutlass.Float32(one)
+        if isinstance(one, float)
+        else cutlass.Int32(one)
+        if isinstance(one, int) and not isinstance(one, bool)
+        else one
+        for one in arguments
+    ]
+    return real_compile(function, *arguments, stream=cute.runtime.make_fake_stream())
 
 
 class PrefillCompiler:
@@ -96,63 +156,30 @@ class PrefillCompiler:
             "seqused_k": torch.empty(batch, dtype=torch.int32, device=device),
         }
 
+    def request(self, interface):
+        """The one call whose configuration this compilation keeps."""
+        tensors = self.tensors()
+        interface._flash_attn_fwd(
+            tensors["q"],
+            tensors["k"],
+            tensors["v"],
+            cu_seqlens_q=tensors["cu_seqlens_q"],
+            page_table=tensors["page_table"],
+            seqused_k=tensors["seqused_k"],
+            max_seqlen_q=self.query_len,
+            max_seqlen_k=self.pages_per_seq * self.page,
+            softmax_scale=self.head_dim**-0.5,
+            causal=self.causal,
+            # No window: FA4 reads a window size as a distance, so an absent
+            # window is the absence of both bounds.
+            window_size_left=None,
+            window_size_right=None,
+            _arch=cute_arch(self.target),
+        )
+
     def __call__(self):
         """Compile the configuration the vendor selects, exported to C."""
-        interface = _interface()
-        captured = []
-        real_compile = cute.compile
-
-        class Capturing:
-            """The cute module, with only ``compile`` replaced."""
-
-            @staticmethod
-            def compile(function, *args, **options):
-                options.pop("options", None)
-                captured.append((function, args))
-                return None
-
-            def __getattr__(self, name):
-                return getattr(cute, name)
-
-        original = interface.cute
-        interface.cute = Capturing()
-        try:
-            with FakeTensorMode():
-                tensors = self.tensors()
-                interface._flash_attn_fwd(
-                    tensors["q"],
-                    tensors["k"],
-                    tensors["v"],
-                    cu_seqlens_q=tensors["cu_seqlens_q"],
-                    page_table=tensors["page_table"],
-                    seqused_k=tensors["seqused_k"],
-                    max_seqlen_q=self.query_len,
-                    max_seqlen_k=self.pages_per_seq * self.page,
-                    softmax_scale=self.head_dim**-0.5,
-                    causal=self.causal,
-                    # No window: FA4 reads a window size as a distance, so an
-                    # absent window is the absence of both bounds.
-                    window_size_left=None,
-                    window_size_right=None,
-                    _arch=cute_arch(self.target),
-                )
-        finally:
-            interface.cute = original
-        if len(captured) != 1:
-            raise SystemExit(f"FA4 compiled {len(captured)} kernels for this geometry; expected one")
-        function, arguments = captured[0]
-        # The stream is the caller's at run time; the compile describes a fake one.
-        arguments = [one for one in arguments if "Stream" not in type(one).__name__]
-        # Scalars are runtime words of the module, not Python constants.
-        arguments = [
-            cutlass.Float32(one)
-            if isinstance(one, float)
-            else cutlass.Int32(one)
-            if isinstance(one, int) and not isinstance(one, bool)
-            else one
-            for one in arguments
-        ]
-        return real_compile(function, *arguments, stream=cute.runtime.make_fake_stream())
+        return compile_selection(self.request, self.target)
 
 
 def cute_arch(target):
