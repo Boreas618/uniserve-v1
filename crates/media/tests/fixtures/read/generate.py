@@ -216,12 +216,63 @@ def video_cases() -> None:
         check=True,
         env=ENVIRONMENT,
     )
+    # A reference video that carries a soundtrack: its audio is decoded from
+    # the same file the frames come from.
+    soundtrack = os.path.join(directory, "soundtrack.mp4")
+    subprocess.run(
+        [
+            FFMPEG,
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=32x24:rate=10:duration=1.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1.5",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "10",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "144k",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-shortest",
+            soundtrack,
+        ],
+        check=True,
+        env=ENVIRONMENT,
+    )
+    # Five frames at the model's 10 fps hold half a second, 22050 native
+    # samples, which resample to 8000 at the model's 16 kHz.
+    audio_plan = (44100, 0, 22050, 8000, 16000)
+    audio = reference_audio(soundtrack, *audio_plan)
+    with open(os.path.join(directory, "soundtrack.audio"), "wb") as file:
+        file.write(audio)
+    with open(os.path.join(directory, "soundtrack.audio.txt"), "w", encoding="ascii") as file:
+        file.write(" ".join(str(value) for value in audio_plan) + "\n")
+
     cases = [
-        # (name, frame_rate, canvas, frames, start_frame)
-        ("scaled", 8, (16, 12), 3, 2),
-        ("native", 10, (32, 24), 5, 0),
+        # (name, source, frame_rate, canvas, frames, start_frame)
+        ("scaled", path, 8, (16, 12), 3, 2),
+        ("native", path, 10, (32, 24), 5, 0),
+        ("soundtrack", soundtrack, 10, (32, 24), 5, 0),
     ]
-    for name, frame_rate, (width, height), frames, start_frame in cases:
+    for name, source, frame_rate, (width, height), frames, start_frame in cases:
         filters = (
             f"fps={frame_rate},trim=start_frame={start_frame},"
             f"scale={width}:{height}:flags=lanczos,setsar=1"
@@ -232,7 +283,7 @@ def video_cases() -> None:
                 "-v",
                 "error",
                 "-i",
-                path,
+                source,
                 "-map",
                 "0:v:0",
                 "-an",
@@ -254,7 +305,7 @@ def video_cases() -> None:
         write(
             "video",
             name,
-            f"{name} {os.path.basename(path)} {frame_rate} {width} {height} {frames} {start_frame}",
+            f"{name} {os.path.basename(source)} {frame_rate} {width} {height} {frames} {start_frame}",
             expected,
         )
 
