@@ -691,6 +691,12 @@ impl PolicySlot {
     /// prepared: §7.3's policy for a fresh epoch, whose precopy ran before any
     /// policy served.
     pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
+        // The epoch's first policy serves under the trial its precopy ran, so
+        // those calls are the epoch's policy's, counted as an adopted
+        // candidate's are (§12): a counter that dropped them would report an
+        // epoch whose first policy never called the guest.
+        let mut cost = Cost::default();
+        cost.trial(candidate.calls);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -701,7 +707,7 @@ impl PolicySlot {
             candidate: None,
             pending: None,
             state: candidate.state,
-            cost: Cost::default(),
+            cost,
         }
     }
 
@@ -1137,6 +1143,10 @@ impl RoutePolicy {
     /// The route instance an epoch's first switchover installs from the
     /// candidate its precopy prepared.
     pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
+        // Its trial's calls are the epoch's policy's, as a scheduler's first
+        // policy counts them (§12).
+        let mut cost = Cost::default();
+        cost.trial(candidate.calls);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -1146,7 +1156,7 @@ impl RoutePolicy {
             previous: None,
             candidate: None,
             state: candidate.state,
-            cost: Cost::default(),
+            cost,
         }
     }
 
