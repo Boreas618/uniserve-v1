@@ -1380,8 +1380,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 let _ = batch;
                 let stream = self.stream.clone();
                 // The batch's columns are uploaded here, on the device thread, before the graph
-                // reads them: `submit` stages on the scheduler's thread and issues nothing, and a
-                // replay that skipped this would serve the pose the bucket was captured with.
+                // reads them: the scheduler hands over a `Batch` and the device thread stages and
+                // uploads it, so a replay that skipped the upload would serve the pose the bucket
+                // was captured with.
                 self.upload(*bucket)?;
                 let captured = self.graphs.captured(*bucket, *generation).ok_or_else(|| {
                     Error::Invariant(format!(
