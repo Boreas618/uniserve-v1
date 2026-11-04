@@ -7,11 +7,11 @@
 //! operator rotates in FP32 and rounds once, which is the recipe the checkpoint's model was trained
 //! with; the frequencies are computed by the loading boundary, not here (specs/worker.md 9).
 
+use ops::TensorView;
 use ops::rope::{
     FactorsArgs, FactorsDescriptor, QkNormRope, QkNormRopeArgs, QkNormRopeDescriptor,
     RotaryFactors, Rotation,
 };
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -124,8 +124,8 @@ impl Rotary {
             cosine,
             sine,
         };
-        let kernel = f.kernels().op::<RotaryFactors>(&descriptor)?;
-        RotaryFactors::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<RotaryFactors>(&descriptor, args)
     }
 
     /// Normalize and rotate `query` and `key` into `q_out` and `k_out`.
@@ -215,7 +215,7 @@ impl Rotary {
             q_out,
             k_out,
         };
-        let kernel = f.kernels().op::<QkNormRope>(&descriptor)?;
-        QkNormRope::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<QkNormRope>(&descriptor, args)
     }
 }

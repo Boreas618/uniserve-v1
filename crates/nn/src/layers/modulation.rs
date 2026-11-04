@@ -9,7 +9,7 @@
 
 use ops::descriptor::Float;
 use ops::modulation::{self, ModulatedRmsNorm as ModulatedRmsNormOp};
-use ops::{DType, Op, TensorView};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -165,7 +165,7 @@ impl ModulatedRmsNorm {
             output_scale,
             retain: retained,
         };
-        let kernel = f.kernels().op::<ModulatedRmsNormOp>(&descriptor)?;
-        ModulatedRmsNormOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<ModulatedRmsNormOp>(&descriptor, args)
     }
 }

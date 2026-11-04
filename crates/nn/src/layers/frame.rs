@@ -7,9 +7,9 @@
 //! each frame once. Statistics stay FP32 whatever the activations' element type is; the padding is
 //! replication or reflection, the video VAE's two modes.
 
+use ops::TensorView;
 use ops::descriptor::Float;
 use ops::frame::{self, FrameNormPad as NormPadOp};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -54,8 +54,8 @@ impl FramePad {
             left,
             front,
         };
-        let kernel = f.kernels().op::<frame::FramePad>(&descriptor)?;
-        frame::FramePad::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<frame::FramePad>(&descriptor, args)
     }
 }
 
@@ -92,8 +92,8 @@ impl FrameMoments {
             rstd,
             groups: self.groups,
         };
-        let kernel = f.kernels().op::<frame::FrameMoments>(&descriptor)?;
-        frame::FrameMoments::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<frame::FrameMoments>(&descriptor, args)
     }
 }
 
@@ -208,7 +208,7 @@ impl FrameNormPad {
             front,
             reflect: self.reflect,
         };
-        let kernel = f.kernels().op::<NormPadOp>(&descriptor)?;
-        NormPadOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<NormPadOp>(&descriptor, args)
     }
 }

@@ -315,8 +315,8 @@ impl Sampler {
             extras: state.extras,
             out: candidates.shaped,
         };
-        let kernel = f.kernels().op::<LogitsShape>(&shape)?;
-        LogitsShape::launch(kernel, &shape, args, f.stream)?;
+
+        f.operate::<LogitsShape>(&shape, args)?;
 
         // 2. The candidate set: the `width` largest, then the row's own thresholds.
         let top = TopKDescriptor {
@@ -331,8 +331,8 @@ impl Sampler {
             values: candidates.values,
             ids: candidates.ids,
         };
-        let kernel = f.kernels().op::<TopK>(&top)?;
-        TopK::launch(kernel, &top, args, f.stream)?;
+
+        f.operate::<TopK>(&top, args)?;
 
         let filter = FilterDescriptor {
             width: self.width,
@@ -345,8 +345,8 @@ impl Sampler {
             parameters: state.parameters,
             valid: candidates.valid,
         };
-        let kernel = f.kernels().op::<FilterCandidates>(&filter)?;
-        FilterCandidates::launch(kernel, &filter, args, f.stream)?;
+
+        f.operate::<FilterCandidates>(&filter, args)?;
 
         // 3. The candidates' distribution, then one draw per row.
         let softmax = SoftmaxDescriptor {
@@ -359,8 +359,8 @@ impl Sampler {
             x: candidates.values,
             out: candidates.probabilities,
         };
-        let kernel = f.kernels().op::<Softmax>(&softmax)?;
-        Softmax::launch(kernel, &softmax, args, f.stream)?;
+
+        f.operate::<Softmax>(&softmax, args)?;
 
         let draw = InverseCdfDescriptor {
             width: self.width,
@@ -374,8 +374,8 @@ impl Sampler {
             draws,
             tokens: samples.tokens,
         };
-        let kernel = f.kernels().op::<InverseCdf>(&draw)?;
-        InverseCdf::launch(kernel, &draw, args, f.stream)?;
+
+        f.operate::<InverseCdf>(&draw, args)?;
 
         // 4. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
         if let Some(logprobabilities) = samples.logprobabilities {
@@ -390,8 +390,8 @@ impl Sampler {
                 x: candidates.shaped,
                 out: logprobs,
             };
-            let kernel = f.kernels().op::<LogSoftmax>(&softmax)?;
-            LogSoftmax::launch(kernel, &softmax, args, f.stream)?;
+
+            f.operate::<LogSoftmax>(&softmax, args)?;
 
             let gather = LogprobDescriptor {
                 columns: self.vocabulary,
@@ -403,8 +403,8 @@ impl Sampler {
                 tokens: samples.tokens,
                 out: logprobabilities,
             };
-            let kernel = f.kernels().op::<LogprobGather>(&gather)?;
-            LogprobGather::launch(kernel, &gather, args, f.stream)?;
+
+            f.operate::<LogprobGather>(&gather, args)?;
         }
 
         Ok(())
@@ -429,8 +429,8 @@ impl Sampler {
             pdl: launch::PDL,
         };
         let args = ArgMaxArgs { values, out };
-        let kernel = f.kernels().op::<ArgMax>(&descriptor)?;
-        ArgMax::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<ArgMax>(&descriptor, args)
     }
 
     /// The bound the sampled tokens' distributions are compared with: the shaping and filtering

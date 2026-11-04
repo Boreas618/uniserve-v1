@@ -12,7 +12,7 @@ use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite};
-use ops::{Op, PhaseKind, TensorView};
+use ops::{PhaseKind, TensorView};
 
 use crate::capability::{KvView, TokenBatch};
 use crate::error::{Error, Result};
@@ -325,8 +325,8 @@ impl Attention {
             window_left: self.window.map_or(-1, |window| window as i32),
             causal: self.causal,
         };
-        let kernel = f.kernels().op::<DenseAttention>(&descriptor)?;
-        DenseAttention::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<DenseAttention>(&descriptor, args)
     }
 
     /// Video Sparse Attention: `query [query_tiles · block, heads, head_dim]`,
@@ -390,8 +390,8 @@ impl Attention {
             out,
             scale: self.scale,
         };
-        let kernel = f.kernels().op::<SparseAttention>(&descriptor)?;
-        SparseAttention::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<SparseAttention>(&descriptor, args)
     }
 
     /// The elements between consecutive rows of the query a sparse call reads.
@@ -488,8 +488,8 @@ impl Attention {
             key_initialized: planes.key_initialized,
             value_initialized: planes.value_initialized,
         };
-        let kernel = f.kernels().op::<KvWrite>(&descriptor)?;
-        KvWrite::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<KvWrite>(&descriptor, args)
     }
 
     /// Read the cache and write this batch's attended output.
@@ -592,8 +592,8 @@ impl Attention {
             window_left: self.window.map_or(-1, |window| window as i32),
             causal: self.causal,
         };
-        let kernel = f.kernels().op::<PagedAttention>(&descriptor)?;
-        PagedAttention::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<PagedAttention>(&descriptor, args)
     }
 }
 

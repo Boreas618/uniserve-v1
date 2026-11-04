@@ -9,10 +9,10 @@
 //! The layers own the learned parameters and the epsilon; the residual, the block's update and the
 //! output are the caller's views, because the residual stream is shared by every layer of a block.
 
+use ops::TensorView;
 use ops::residual::{
     self, ScaledResidualLayerNorm as LayerNormOp, ScaledResidualRmsNorm as RmsNormOp,
 };
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -98,8 +98,8 @@ impl WeightedRmsNorm {
             eps: self.eps,
             partials,
         };
-        let kernel = f.kernels().op::<residual::WeightedRmsNorm>(&descriptor)?;
-        residual::WeightedRmsNorm::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<residual::WeightedRmsNorm>(&descriptor, args)
     }
 }
 
@@ -139,8 +139,8 @@ impl ScaledResidual {
             update_bias: self.bias.as_ref().map(Weight::view),
             scale: self.scale.view(),
         };
-        let kernel = f.kernels().op::<residual::ScaledResidual>(&descriptor)?;
-        residual::ScaledResidual::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<residual::ScaledResidual>(&descriptor, args)
     }
 }
 
@@ -232,8 +232,8 @@ impl ScaledResidualRmsNorm {
             eps: self.eps,
             partials,
         };
-        let kernel = f.kernels().op::<RmsNormOp>(&descriptor)?;
-        RmsNormOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<RmsNormOp>(&descriptor, args)
     }
 }
 
@@ -326,7 +326,7 @@ impl ScaledResidualLayerNorm {
             eps: self.eps,
             partials,
         };
-        let kernel = f.kernels().op::<LayerNormOp>(&descriptor)?;
-        LayerNormOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<LayerNormOp>(&descriptor, args)
     }
 }

@@ -7,8 +7,8 @@
 //! gathers the rows whose logits the batch asks for before calling the head, so the head reads a
 //! `[rows, hidden]` view and a graph replays over a fixed row count.
 
+use ops::TensorView;
 use ops::logits::{self, GatherDescriptor, LogitsGather, UnpadDescriptor, VocabUnpad};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -174,8 +174,8 @@ impl ParallelLMHead {
             pdl: crate::layers::launch::PDL,
         };
         let args = logits::UnpadArgs { gathered, out };
-        let kernel = f.kernels().op::<VocabUnpad>(&descriptor)?;
-        VocabUnpad::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<VocabUnpad>(&descriptor, args)
     }
 
     /// The offset of this rank's shard in the gathered vocabulary; 0 for an unsharded head.
@@ -218,6 +218,6 @@ pub fn gather_rows(
         pdl: crate::layers::launch::PDL,
     };
     let args = logits::GatherArgs { hidden, rows, out };
-    let kernel = f.kernels().op::<LogitsGather>(&descriptor)?;
-    LogitsGather::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+    f.operate::<LogitsGather>(&descriptor, args)
 }

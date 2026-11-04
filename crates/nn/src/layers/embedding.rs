@@ -5,8 +5,8 @@
 //! all-reduces the result when it has a group (specs/worker.md 9, "词嵌入"): the sum over ranks is
 //! the token's embedding.
 
+use ops::TensorView;
 use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -110,8 +110,8 @@ impl Embedding {
             weight: self.weight.view(),
             out,
         };
-        let kernel = f.kernels().op::<EmbeddingOp>(&descriptor)?;
-        EmbeddingOp::launch(kernel, &descriptor, args, f.stream)?;
+
+        f.operate::<EmbeddingOp>(&descriptor, args)?;
         if self.is_sharded() {
             let group = f.group.ok_or_else(|| {
                 Error::Unsupported(

@@ -336,8 +336,8 @@ impl Moe {
             ids,
             weights,
         };
-        let kernel = f.kernels().op::<TopkSoftmax>(&routing)?;
-        TopkSoftmax::launch(kernel, &routing, args, f.stream)?;
+
+        f.operate::<TopkSoftmax>(&routing, args)?;
 
         // 2. Logical ids become weight rows.
         let local_ids = match &self.map {
@@ -352,8 +352,8 @@ impl Moe {
                     map: map.view(),
                     out: mapped,
                 };
-                let kernel = f.kernels().op::<ExpertGather>(&descriptor)?;
-                ExpertGather::launch(kernel, &descriptor, args, f.stream)?;
+
+                f.operate::<ExpertGather>(&descriptor, args)?;
                 mapped
             }
             None => ids,
@@ -386,8 +386,8 @@ impl Moe {
             num_non_exiting_tiles,
             local_offset: 0,
         };
-        let kernel = f.kernels().op::<MoeSort>(&sort)?;
-        MoeSort::launch(kernel, &sort, args, f.stream)?;
+
+        f.operate::<MoeSort>(&sort, args)?;
 
         // 4. FC1: the gated product of each permuted row, then FC2.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
@@ -411,8 +411,8 @@ impl Moe {
             num_non_exiting_tiles,
             out: gated,
         };
-        let kernel = f.kernels().op::<GatherGemm>(&first)?;
-        GatherGemm::launch(kernel, &first, args, f.stream)?;
+
+        f.operate::<GatherGemm>(&first, args)?;
 
         let products = arena.tensor(hidden.dtype, Shape::new(&[tokens * top, hidden_width]))?;
         let second = RouteGemmDescriptor {
@@ -434,8 +434,8 @@ impl Moe {
             num_non_exiting_tiles,
             out: products,
         };
-        let kernel = f.kernels().op::<RouteGemm>(&second)?;
-        RouteGemm::launch(kernel, &second, args, f.stream)?;
+
+        f.operate::<RouteGemm>(&second, args)?;
 
         // 5. Sum the routes back in FP32 and round once to the hidden dtype.
         let combine = combine::Descriptor {
@@ -452,8 +452,8 @@ impl Moe {
             scales: weights,
             out,
         };
-        let kernel = f.kernels().op::<MoeUnpermute>(&combine)?;
-        MoeUnpermute::launch(kernel, &combine, args, f.stream).map_err(Error::from)
+
+        f.operate::<MoeUnpermute>(&combine, args)
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over an expert-parallel group.
@@ -572,8 +572,8 @@ impl Moe {
             ids,
             weights,
         };
-        let kernel = f.kernels().op::<TopkSoftmax>(&routing)?;
-        TopkSoftmax::launch(kernel, &routing, args, f.stream)?;
+
+        f.operate::<TopkSoftmax>(&routing, args)?;
 
         // 2. Logical ids become weight rows before anything leaves the rank, so a peer sorts by the
         //    same physical order the weights are stacked in.
@@ -589,8 +589,8 @@ impl Moe {
                     map: map.view(),
                     out: mapped,
                 };
-                let kernel = f.kernels().op::<ExpertGather>(&descriptor)?;
-                ExpertGather::launch(kernel, &descriptor, args, f.stream)?;
+
+                f.operate::<ExpertGather>(&descriptor, args)?;
                 mapped
             }
             None => ids,
@@ -618,8 +618,8 @@ impl Moe {
             counts: exchange.counts,
             ranks: exchange.ranks,
         };
-        let kernel = f.kernels().op::<ExpertExchange>(&dispatch)?;
-        ExpertExchange::launch(kernel, &dispatch, args, f.stream)?;
+
+        f.operate::<ExpertExchange>(&dispatch, args)?;
 
         // 4. The rows this rank was sent, grouped by its own experts.
         let tiles = ops::moe::max_tiles(received, top, local, u64::from(self.tile));
@@ -648,8 +648,8 @@ impl Moe {
             num_non_exiting_tiles,
             local_offset: self.local_offset,
         };
-        let kernel = f.kernels().op::<MoeSort>(&sort)?;
-        MoeSort::launch(kernel, &sort, args, f.stream)?;
+
+        f.operate::<MoeSort>(&sort, args)?;
 
         // 5. FC1 and FC2 over the received rows, with this rank's experts.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
@@ -673,8 +673,8 @@ impl Moe {
             num_non_exiting_tiles,
             out: gated,
         };
-        let kernel = f.kernels().op::<GatherGemm>(&first)?;
-        GatherGemm::launch(kernel, &first, args, f.stream)?;
+
+        f.operate::<GatherGemm>(&first, args)?;
 
         let products = arena.tensor(hidden.dtype, Shape::new(&[received * top, hidden_width]))?;
         let second = RouteGemmDescriptor {
@@ -696,8 +696,8 @@ impl Moe {
             num_non_exiting_tiles,
             out: products,
         };
-        let kernel = f.kernels().op::<RouteGemm>(&second)?;
-        RouteGemm::launch(kernel, &second, args, f.stream)?;
+
+        f.operate::<RouteGemm>(&second, args)?;
 
         // 6. Each received row's routes summed with their FP32 weights, in receive order.
         let combined = arena.tensor(hidden.dtype, Shape::new(&[received, hidden_width]))?;
@@ -715,8 +715,8 @@ impl Moe {
             scales: exchange.weights,
             out: combined,
         };
-        let kernel = f.kernels().op::<MoeUnpermute>(&combine_descriptor)?;
-        MoeUnpermute::launch(kernel, &combine_descriptor, args, f.stream)?;
+
+        f.operate::<MoeUnpermute>(&combine_descriptor, args)?;
 
         // 7. Combine: the ranks' partial sums for this rank's tokens, rounded once to `out`.
         let combine_exchange = exchange_descriptor(Mode::Combine);
@@ -731,8 +731,8 @@ impl Moe {
             counts: exchange.counts,
             ranks: exchange.ranks,
         };
-        let kernel = f.kernels().op::<ExpertExchange>(&combine_exchange)?;
-        ExpertExchange::launch(kernel, &combine_exchange, args, f.stream).map_err(Error::from)
+
+        f.operate::<ExpertExchange>(&combine_exchange, args)
     }
 
     /// The bound the combined rows' implementations may differ by.

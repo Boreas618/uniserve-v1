@@ -6,8 +6,8 @@
 //! (specs/worker.md 4.2), so it is checked against the weight at construction and against the input
 //! at every call.
 
+use ops::TensorView;
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -140,7 +140,7 @@ impl Linear {
             out,
             alpha: 1.0,
         };
-        let kernel = f.kernels().op::<Gemm>(&descriptor)?;
-        Gemm::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<Gemm>(&descriptor, args)
     }
 }

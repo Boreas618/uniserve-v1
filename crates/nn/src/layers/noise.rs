@@ -5,8 +5,8 @@
 //! "Philox"; `ops::noise`). The layer holds only the element type and the tile; the key is the
 //! caller's, because the executor computes it from the request seed and the phase.
 
+use ops::TensorView;
 use ops::noise::{self, PhiloxNoise as NoiseOp};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -50,7 +50,7 @@ impl Noise {
             stage,
             draw,
         };
-        let kernel = f.kernels().op::<NoiseOp>(&descriptor)?;
-        NoiseOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<NoiseOp>(&descriptor, args)
     }
 }
