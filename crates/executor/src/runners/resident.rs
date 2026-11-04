@@ -12,7 +12,7 @@
 //! captured graph can address. The column is allocated when the provider is built, for the largest
 //! bucket, so a step allocates nothing (4.5).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nn::KvPlanes;
 use ops::{DType, DevicePtr, Shape, Strides, TensorView};
@@ -27,7 +27,10 @@ use crate::{Error, Result};
 
 /// The resident cache as a runner reads it.
 pub struct ResidentCache {
-    cache: Arc<PrefixCache>,
+    /// The pool. A provider only reads it, but the storage owners mutate it (installs, released
+    /// slots, applied transfers) while a batch may be gathering its table, so the share is behind
+    /// the owners' one lock rather than an unsynchronized `Arc`.
+    cache: Arc<Mutex<PrefixCache>>,
     /// One gather column per attention group, `[rows, width]` i32, carved when the device's pools
     /// are attached (the executor creates them, so they cannot be had at construction).
     tables: Vec<Table>,
@@ -88,15 +91,24 @@ impl ResidentCache {
     ///
     /// `rows` is the bucket's row count, padding included: every captured graph addresses a table
     /// of exactly that height, so the gather column is allocated once, here, and never grows.
-    pub fn new(cache: Arc<PrefixCache>, rows: u32) -> Result<Self> {
-        let groups = cache.groups();
+    pub fn new(cache: Arc<Mutex<PrefixCache>>, rows: u32) -> Result<Self> {
+        let groups = {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.groups()
+        };
         if groups == 0 {
             return Err(Error::Invalid(
                 "the resident cache has no attention group".into(),
             ));
         }
-        let first = cache.layer_planes(0, 0)?;
-        let (_, _, width) = cache.unit_tables();
+        let (first, width) = {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cache.layer_planes(0, 0)?, cache.unit_tables().2)
+        };
         Ok(Self {
             cache,
             tables: Vec::new(),
@@ -109,7 +121,7 @@ impl ResidentCache {
     }
 
     /// The pool behind the provider, for a caller that also drives its imports and exports.
-    pub fn cache(&self) -> &Arc<PrefixCache> {
+    pub fn cache(&self) -> &Arc<Mutex<PrefixCache>> {
         &self.cache
     }
 
@@ -137,7 +149,13 @@ impl ResidentCache {
                 slots.len()
             )));
         }
-        let (pooled, pool_rows, width) = self.cache.unit_tables();
+        let (pooled, pool_rows, width) = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.unit_tables()
+        };
         if width != table.width {
             return Err(Error::Invariant(format!(
                 "group {group}'s table is {} pages wide and was sized {}",
@@ -259,7 +277,11 @@ impl KvProvider for ResidentCache {
     }
 
     fn planes(&self, group: usize) -> Result<Vec<KvPlanes>> {
-        let layers = self.cache.layers(group);
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layers = cache.layers(group);
         if layers == 0 {
             return Err(Error::Invalid(format!(
                 "attention group {group} has no layer"
@@ -267,7 +289,7 @@ impl KvProvider for ResidentCache {
         }
         let mut planes = Vec::with_capacity(layers);
         for layer in 0..layers {
-            planes.push(planes_of(&self.cache.layer_planes(group, layer)?)?);
+            planes.push(planes_of(&cache.layer_planes(group, layer)?)?);
         }
         Ok(planes)
     }

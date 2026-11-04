@@ -626,6 +626,62 @@ pub struct CausalLmRunner<M: CausalLm> {
     seed: std::cell::Cell<u64>,
 }
 
+/// One model object shared by the runners of every device a rank serves.
+///
+/// A rank's runners must all read the same weights, and a model is not copyable (it holds the
+/// checkpoint's mapped tensors), so the engine gives each device's runner a share of the one model
+/// it loaded. Delegation keeps the model type out of the executor: a runner is generic over
+/// `nn::CausalLm`, and this is that trait over a shared object.
+pub struct Shared<M>(Arc<M>);
+
+impl<M> Shared<M> {
+    /// The shared model.
+    pub fn new(model: Arc<M>) -> Self {
+        Self(model)
+    }
+
+    /// The model behind the share.
+    pub fn model(&self) -> &M {
+        &self.0
+    }
+}
+
+impl<M> Clone for Shared<M> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<M: CausalLm> CausalLm for Shared<M> {
+    fn embed_input_ids(
+        &self,
+        f: &nn::Forward,
+        ids: ops::TensorView,
+        out: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.embed_input_ids(f, ids, out)
+    }
+
+    fn forward(
+        &self,
+        f: &nn::Forward,
+        batch: &nn::TokenBatch,
+        cache: &nn::KvView<'_>,
+        hidden: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.forward(f, batch, cache, hidden)
+    }
+
+    fn logits(
+        &self,
+        f: &nn::Forward,
+        hidden: ops::TensorView,
+        out: ops::TensorView,
+    ) -> nn::Result<()> {
+        self.0.logits(f, hidden, out)
+    }
+}
+
 impl<M: CausalLm> CausalLmRunner<M> {
     /// A runner for the block's phases on `device`, serving `generation`.
     ///
