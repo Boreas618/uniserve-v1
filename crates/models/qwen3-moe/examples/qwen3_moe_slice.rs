@@ -533,7 +533,15 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let seq_lens = upload_i32(&stream, &arena, &seq_lens)?;
     let query_offsets = upload_i32(&stream, &arena, &query_offsets)?;
     let logits_rows = upload_i32(&stream, &arena, &logits_rows)?;
-    let block_tables = upload_i32(&stream, &arena, &block_table)?;
+    // The page table is `[sequences, pages]`, not a flat list: `paged_attention` addresses row
+    // `sequence` of it, and a one-dimensional view is refused as "expected 2 axes, found 1" before the
+    // launch. One sequence here, so the extent that matters is the row.
+    let block_tables = upload_shaped_i32(
+        &stream,
+        &arena,
+        Shape::new(&[1, u64::try_from(pages_per_row).unwrap_or(1)]),
+        &block_table,
+    )?;
     let batch = TokenBatch {
         positions,
         slot_mapping,
@@ -1054,6 +1062,33 @@ impl RetainedWeights for DeviceWeights {
 }
 
 /// Upload `values` as an `i32` arena tensor.
+fn upload_shaped_i32(
+    stream: &platform::Stream,
+    arena: &Arena,
+    shape: Shape,
+    values: &[i32],
+) -> Result<ops::TensorView> {
+    let tensor = arena.tensor(DType::I32, shape)?;
+    if tensor.shape.numel() != u64::try_from(values.len()).unwrap_or(u64::MAX) {
+        return Err(Failure::message(format!(
+            "{} values for the extents {:?}",
+            values.len(),
+            shape.dims()
+        )));
+    }
+    // SAFETY: `values` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            tensor.ptr.address(),
+            values.as_ptr() as u64,
+            std::mem::size_of_val(values),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(tensor)
+}
+
 fn upload_i32(stream: &platform::Stream, arena: &Arena, values: &[i32]) -> Result<ops::TensorView> {
     let tensor = arena.tensor(DType::I32, Shape::new(&[values.len() as u64]))?;
     // SAFETY: `values` outlives the copy, which completes before the wait below.
