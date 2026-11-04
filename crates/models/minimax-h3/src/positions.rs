@@ -140,9 +140,16 @@ impl Mrope {
 
 /// The vision tower's 2-D rotary embedding: half of each head by the patch row, half by its column.
 ///
-/// The reference builds one `RotaryEmbedding` of `head_dim / 2` and calls it with two coordinates
-/// per patch, so each axis owns `head_dim / 4` frequencies of the compact table and the row
-/// frequencies come first (`uniserve/models/qwen3_vl/vision.py`).
+/// The reference builds one `RotaryEmbedding` of `head_dim / 2` **without sections** and calls it
+/// with two coordinates per patch (`uniserve/models/qwen3_vl/vision.py`), so the embedding
+/// evaluates the whole `head_dim / 4`-frequency spectrum at each coordinate:
+/// `cos[p, a · (head_dim / 4) + f] = cos(coordinate(a) · inv_freq(f))`
+/// (`uniserve/nn/rope.py::RotaryEmbedding._factors` over a `[patches, 2]` position). Each axis
+/// therefore repeats the same frequency band rather than owning a distinct one, which is why a
+/// sectioned `rotary_factors` call cannot produce these tables: its `sections` give every axis its
+/// own band (the contiguous cut) or interleave one band per axis (`_interleaved_axes`), and neither
+/// is this arrangement. The tables are therefore computed here, on the host, in the reference's
+/// FP32 formulas, and reach the device as the encoder layout's `cosine`/`sine`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VisionRotary {
     head_dim: u32,
@@ -165,12 +172,9 @@ impl VisionRotary {
         self.head_dim
     }
 
-    /// The rotated elements each axis owns, in axis order: 2 sections, row then column.
-    ///
-    /// This is the `sections` a sectioned rotation states; the cut is contiguous, which is the
-    /// reference's factor order (row frequencies, then column frequencies).
-    pub const fn sections(self) -> [u32; 2] {
-        [self.head_dim / 2, self.head_dim / 2]
+    /// The compact frequencies one axis repeats: `head_dim / 4`.
+    pub const fn per_axis(self) -> u32 {
+        self.head_dim / 4
     }
 
     /// The FP32 factors of `coordinates`, written into `cosine` and `sine`.
@@ -424,9 +428,10 @@ pub fn rotary_coordinates(height: u32, width: u32, merge: u32) -> Result<Vec<[i6
 /// `linspace`), and likewise for columns. Each patch blends its four neighbouring table rows with
 /// FP32 bilinear weights (`uniserve/nn/vision/position.py::PositionEmbedding.interpolate`).
 ///
-/// Returns, per merged row, the four table row indices of the top-left, top-right, bottom-left and
-/// bottom-right neighbours, and their weights. A device kernel blends the table's rows with these
-/// (`ops::position::Interpolate`); the tables are one image's, so they are per image block.
+/// Returns, per patch row (in merge-block order), the four table row indices of the top-left,
+/// top-right, bottom-left and bottom-right neighbours and their weights. A device kernel blends the
+/// table's rows with these (`ops::position::Interpolate`); the tables are one image's, so they are
+/// per image block.
 pub fn position_samples(
     side: u32,
     height: u32,
@@ -729,7 +734,7 @@ mod tests {
     #[test]
     fn vision_rotary_pairs_rows_then_columns() {
         let rotary = VisionRotary::new(72).expect("head width");
-        assert_eq!(rotary.sections(), [36, 36]);
+        assert_eq!(rotary.per_axis(), 18);
         let frequencies = inverse_frequencies(36, 10_000.0).expect("frequencies");
         // One patch at (0, 0) and one at (0, 2).
         let coordinates = [[0, 0], [0, 2]];

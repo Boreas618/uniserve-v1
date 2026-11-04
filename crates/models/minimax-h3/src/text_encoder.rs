@@ -6,7 +6,7 @@
 //! checkpoint's final normalization is not part of H3's conditioning path (`network.norm =
 //! Identity`). The tower's merged tokens replace the prompt's image and video placeholder tokens,
 //! and the three DeepStack feature tables are added to the residual stream after the block each was
-//! merged from (`uniserve/models/transformer.py::_traverse`).
+//! merged from (`uniserve/models/transformer.py::_traverse`, lines 408-419).
 //!
 //! ## The layer recurrence
 //!
@@ -793,8 +793,33 @@ impl TextEncoder {
         let plan = self.plan(inputs.batch.num_tokens, &grids)?;
         self.check(&inputs, &out, &plan)?;
 
-        let buffers = Buffers::new(f.arena(), &plan, self.dtype)?;
+        let mut buffers = Buffers::new(f.arena(), &plan, self.dtype)?;
         let hidden = out.hidden;
+
+        // The diagnosis of specs/worker.md 10 asks for two values the runner cannot otherwise
+        // reach: the tower's residual stream after its last block and the merged feature table.
+        // Both arrive as borrowed views, are used in place of the arena's own buffers, and change
+        // no number; a serving call passes none.
+        let diagnostics = inputs.diagnostics;
+        if !diagnostics.is_empty() && diagnostics.len() != 2 {
+            return Err(invalid_input(format!(
+                "{} diagnostic views, [vision_hidden, merged] or none expected",
+                diagnostics.len()
+            )));
+        }
+        let vision_hidden = diagnostics.first().copied();
+        if let Some(merged) = diagnostics.get(1).copied() {
+            if merged.rows() != u64::from(plan.merged) || merged.last() != u64::from(plan.hidden) {
+                return Err(invalid_input(format!(
+                    "the diagnostic feature table is {} rows of {}, [{}, {}] expected",
+                    merged.rows(),
+                    merged.last(),
+                    plan.merged,
+                    plan.hidden
+                )));
+            }
+            buffers.features = merged;
+        }
 
         // 1. The vision tower, one call per image, in prompt order: the k-th placeholder of the
         //    prompt takes the k-th merged row, and an image's placeholders are one run.
@@ -803,7 +828,15 @@ impl TextEncoder {
         let mut deepstack = Vec::with_capacity(self.deepstack_layers.len());
         for image in inputs.images {
             let geometry = Geometry::of(&self.config.vision, image.grid_shape)?;
-            let tower = self.tower.buffers(f.arena(), geometry.patches)?;
+            let mut tower = self.tower.buffers(f.arena(), geometry.patches)?;
+            if let Some(stream) = vision_hidden {
+                tower = tower.with_stream(stream).map_err(|error| {
+                    invalid_input(format!(
+                        "the diagnostic stream of the {:?} image: {error}",
+                        image.grid_shape
+                    ))
+                })?;
+            }
             let rows = u64::from(geometry.merged);
             for table in 0..self.tower.deepstack_features() {
                 deepstack.push(Buffers::rows_of(
