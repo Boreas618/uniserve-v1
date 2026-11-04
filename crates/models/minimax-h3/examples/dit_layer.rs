@@ -286,14 +286,14 @@ fn configuration(args: &Args) -> Result<(minimax_h3::config::DenoiserConfig, Par
 fn stage_weights(args: &Args) -> Result<()> {
     let (denoiser, partition) = configuration(args)?;
     let config = &denoiser.transformer;
-    let checkpoint = Checkpoint::open(&args.root)?;
-    let dit = checkpoint.component(args.dit.directory())?;
 
+    // The name level first, and from the index alone: this half runs on a host that holds the
+    // export's metadata and none of its tensors, which is the only check such a host can answer.
+    let index = index_names(&args.root, args.dit)?;
     let asked: Vec<String> = Transformer::keys(config, denoiser.attention)
         .into_iter()
         .chain(AdaLnCache::keys(config))
         .collect();
-    let index: Vec<String> = dit.names().map(str::to_owned).collect();
     let missing: Vec<&String> = asked.iter().filter(|name| !index.contains(name)).collect();
     let unread: Vec<&String> = index.iter().filter(|name| !asked.contains(name)).collect();
     println!(
@@ -306,8 +306,8 @@ fn stage_weights(args: &Args) -> Result<()> {
     for name in &missing {
         println!("  missing {name}");
     }
-    // The index holds every layer of the export while this load holds `--layers`; the unread names
-    // are therefore reported as a count and the layers above the loaded ones are named in full.
+    // The index holds every layer of the export while this load holds `--layers`, so the unread
+    // names of the layers above the loaded ones are counted rather than listed.
     let beyond: Vec<&&String> = unread
         .iter()
         .filter(|name| !name.starts_with("transformer_blocks."))
@@ -315,7 +315,25 @@ fn stage_weights(args: &Args) -> Result<()> {
     for name in &beyond {
         println!("  unread {name}");
     }
+    if !missing.is_empty() {
+        return Err(Failure::message(format!(
+            "{} tensors the stack asks for are not in the export's index; the first is `{}`",
+            missing.len(),
+            missing[0]
+        )));
+    }
 
+    // The tensor level: the same load the device path performs, into a store that checks each
+    // tensor's element type and shape as the loader hands it over, so a transposed or truncated
+    // weight names itself instead of surfacing as a wrong number.
+    let checkpoint = match Checkpoint::open(&args.root) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            println!("tensors: not read ({error})");
+            return Ok(());
+        }
+    };
+    let dit = checkpoint.component(args.dit.directory())?;
     let mut store = HostWeights::default();
     let rows = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?.rows_bound()?;
     {
@@ -347,6 +365,42 @@ fn stage_weights(args: &Args) -> Result<()> {
         println!("  {dtype}: {count} tensors, {bytes} bytes");
     }
     Ok(())
+}
+
+/// The export's index, as the set of tensor names one network of it declares.
+///
+/// Read as the JSON it is rather than through `Checkpoint::open`, because opening a checkpoint
+/// validates that every file it maps is present: a host that holds an export's metadata and none of
+/// its tensors can still answer whether a name is there.
+fn index_names(root: &Path, dit: Dit) -> Result<Vec<String>> {
+    let directory = root.join(dit.directory());
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".index.json"))
+        })
+        .collect();
+    files.sort();
+    let path = files.first().ok_or_else(|| {
+        Failure::message(format!(
+            "{} holds no `*.index.json`: nothing states which tensors the network has",
+            directory.display()
+        ))
+    })?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+    let document: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+    let map = document
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| Failure::message(format!("{}: no `weight_map` object", path.display())))?;
+    Ok(map.keys().cloned().collect())
 }
 
 /// Stage 2: one stack layer's arithmetic on a device.
