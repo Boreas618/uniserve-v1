@@ -528,8 +528,16 @@ impl platform::Budget for NoLimit {
 }
 
 impl RetainedWeights for DeviceWeights {
-    fn retained(&mut self, _key: &WeightKey) -> nn::Result<Option<Backing>> {
-        Ok(None)
+    fn retained(&mut self, key: &WeightKey) -> nn::Result<Option<Backing>> {
+        // The region a key was already published under, which is how the loader avoids decoding
+        // and publishing a weight twice: `nn::HostStore` answers the same question the same way,
+        // and the two stores must agree or the pool is charged for a region the measurement never
+        // counted (the run at `575a17576` stopped one block short of exactly that).
+        Ok(self
+            .published
+            .iter()
+            .find(|(asked, _)| asked == key)
+            .map(|(_, backing)| *backing))
     }
 
     fn publish(
