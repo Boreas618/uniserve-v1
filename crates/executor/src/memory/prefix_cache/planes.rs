@@ -992,6 +992,24 @@ impl CachePlanes {
         Ok(())
     }
 
+    /// The units this pool holds, the sentinel included.
+    pub(crate) fn units(&self) -> u32 {
+        self.num_units
+    }
+
+    /// The whole value storage of `field`, cell-major: `columns * units` planes of
+    /// `CachePlan::plane_bytes` bytes, the shape the block copy reads.
+    pub(crate) fn value_storage(&self, field: usize) -> Result<&Arc<Storage>> {
+        self.values
+            .get(field)
+            .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
+    }
+
+    /// The device the planes live on, or `None` for a host pool.
+    pub(crate) fn device_of(&self) -> Option<DeviceId> {
+        self.device
+    }
+
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
     }
