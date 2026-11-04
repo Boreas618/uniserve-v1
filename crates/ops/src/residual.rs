@@ -171,7 +171,7 @@ pub struct ScaledResidualRmsNormArgs {
     pub update: TensorView,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
     pub update_bias: Option<TensorView>,
-    /// `[columns]`: the residual's per-channel scale.
+    /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
     pub scale: TensorView,
     /// `[columns]`: the normalization's learned scale.
     pub weight: TensorView,
@@ -231,10 +231,11 @@ impl Op for ScaledResidualRmsNorm {
                 ));
             }
         };
-        for view in [&args.scale, &args.weight] {
-            view.require_shape(Self::NAME, Shape::new(&[columns]))?;
-            view.require_row(Self::NAME, descriptor.dtype, columns)?;
-        }
+        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
+        args.weight
+            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.weight
+            .require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out.require_shape(Self::NAME, args.hidden.shape)?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, columns)?;
@@ -257,7 +258,7 @@ impl Op for ScaledResidualRmsNorm {
         if let Some(partials) = partials {
             arguments.view(partials);
         }
-        arguments.f32(args.eps);
+        arguments.f32(args.eps).u32(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -318,7 +319,7 @@ pub struct ScaledResidualLayerNormArgs {
     pub update: TensorView,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
     pub update_bias: Option<TensorView>,
-    /// `[columns]`: the residual's per-channel scale.
+    /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
     pub scale: TensorView,
     /// `[columns]`: the normalization's learned scale.
     pub weight: TensorView,
@@ -380,7 +381,8 @@ impl Op for ScaledResidualLayerNorm {
                 ));
             }
         };
-        for view in [&args.scale, &args.weight, &args.bias] {
+        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
+        for view in [&args.weight, &args.bias] {
             view.require_shape(Self::NAME, Shape::new(&[columns]))?;
             view.require_row(Self::NAME, descriptor.dtype, columns)?;
         }
@@ -407,7 +409,7 @@ impl Op for ScaledResidualLayerNorm {
         if let Some(partials) = partials {
             arguments.view(partials);
         }
-        arguments.f32(args.eps);
+        arguments.f32(args.eps).u32(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -468,7 +470,7 @@ pub struct ScaledResidualArgs {
     pub update: TensorView,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
     pub update_bias: Option<TensorView>,
-    /// `[columns]`: the residual's per-channel scale.
+    /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
     pub scale: TensorView,
 }
 
@@ -524,10 +526,7 @@ impl Op for ScaledResidual {
                 ));
             }
         };
-        args.scale
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
-        args.scale
-            .require_row(Self::NAME, descriptor.dtype, columns)?;
+        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
         let elements = args.hidden.shape.numel();
         if elements > i32::MAX as u64 {
             return Err(Error::argument(
@@ -542,7 +541,8 @@ impl Op for ScaledResidual {
             .view(args.update)
             .view(bias.unwrap_or(args.update))
             .view(args.scale)
-            .i32(elements as i32);
+            .i32(elements as i32)
+            .u32(width);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,
@@ -578,6 +578,35 @@ fn check_descriptor(operator: &'static str, columns: u32, tile: u32) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// A per-channel scale, or one factor for every channel: `[columns]` or `[1]`.
+///
+/// A diffusion solver's step rewrites its residual stream with one device scalar per
+/// `(layout, step)`, and a `[columns]` view would have to be materialized per step, which is a
+/// per-step upload. So a scale of one element is the broadcast form: the kernel indexes it by
+/// `element % scale_width`, which is the column for `[columns]` and index 0 for `[1]`. The width
+/// travels as a launch argument, so both forms are the same program and neither moves a key.
+fn scale_width(
+    operator: &'static str,
+    scale: &TensorView,
+    dtype: DType,
+    columns: u64,
+) -> Result<u32> {
+    let width = scale.shape.numel();
+    if scale.shape.rank() != 1 || (width != 1 && width != columns) {
+        return Err(Error::argument(
+            operator,
+            format!(
+                "expected a scale of {columns} channels or one broadcast factor, found {} \
+                 elements in {} dimensions",
+                width,
+                scale.shape.rank()
+            ),
+        ));
+    }
+    scale.require_row(operator, dtype, width)?;
+    Ok(width as u32)
 }
 
 /// Check an optional magnitude buffer against the descriptor's flag and the row count.
@@ -805,5 +834,51 @@ mod scaled_add_tests {
         let expected = 2.0 * DType::BF16.unit_roundoff() as f32 + DType::F32.unit_roundoff() as f32;
         assert_eq!(bound.rtol, expected);
         assert_eq!(bound.atol, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use crate::DevicePtr;
+
+    fn scale(shape: Shape) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::BF16, shape)
+    }
+
+    #[test]
+    fn one_factor_is_a_scale_and_so_is_a_whole_row() {
+        assert_eq!(
+            scale_width("scaled_residual", &scale(Shape::new(&[1])), DType::BF16, 64).unwrap(),
+            1,
+            "one element is the broadcast form a per-step table hands over"
+        );
+        assert_eq!(
+            scale_width(
+                "scaled_residual",
+                &scale(Shape::new(&[64])),
+                DType::BF16,
+                64
+            )
+            .unwrap(),
+            64,
+            "a whole row is the per-channel form"
+        );
+    }
+
+    #[test]
+    fn a_scale_of_any_other_width_is_refused_rather_than_read_past_its_end() {
+        for width in [2_u64, 63, 65] {
+            assert!(
+                scale_width(
+                    "scaled_residual",
+                    &scale(Shape::new(&[width])),
+                    DType::BF16,
+                    64
+                )
+                .is_err(),
+                "a {width} element scale is neither one factor nor a row"
+            );
+        }
     }
 }
