@@ -81,6 +81,10 @@ pub struct Batch {
     pub generation: u64,
 }
 
+/// The commit table's own definition, so a producer outside this crate writes its rows against
+/// the columns and modes the kernels read instead of a copy of them.
+pub use ops::commit;
+
 /// The host columns of one batch, in the layout the phase's kernels read.
 ///
 /// The mechanism writes these from the request state it owns; the executor stages them into the

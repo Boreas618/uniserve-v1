@@ -13,10 +13,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::{CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor};
+use engine::{
+    CommandSender, GenerationConstraint, GenerationRequest, PolicyBytes, PolicyProgram,
+    PolicySource, SimEngine, SimExecutor,
+};
+use ipc::{ImageParams, SamplingParams};
 use scheduling::guest::decision::{Plan, Work};
+use scheduling::guest::Nanos;
 use scheduling::guest::limits::Limits;
 use scheduling::guest::view::{ExpertLoad, ExpertOrder};
+use scheduling::guest::RequestId;
 use scheduling::guest::wire::Call;
 use scheduling::guest::PhaseId;
 
@@ -350,4 +356,81 @@ fn an_invalid_expert_order_fails_the_policy() {
         report.reason
     );
     assert_eq!(world.serving_order().placement, vec![1, 0]);
+}
+
+/// A policy that admits `admit` and gives it no work, with `timeout` as its
+/// starvation deadline: §4.4's sixth failure is a resident request the policy
+/// never advanced.
+fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
+    Toy {
+        limits: Limits {
+            timeout,
+            ..Toy::idle().limits
+        },
+        plan: Plan {
+            admit,
+            ..Plan::default()
+        },
+        // Distinct from the previous program's, so the revert is visible.
+        experts: ExpertOrder {
+            placement: vec![0, 1],
+        },
+        ..Toy::idle()
+    }
+}
+
+/// A text request of `prompt` prompt tokens that generates up to `tokens`.
+fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
+    GenerationRequest {
+        request_id: ipc::RequestId(id),
+        prompt_token_ids: vec![7; prompt],
+        multimodal_inputs: Default::default(),
+        negative_prompt_token_ids: Vec::new(),
+        constraint: GenerationConstraint::UndOnly,
+        sampling: SamplingParams::default(),
+        image: ImageParams::default(),
+        max_images: 1,
+        max_und_tokens: tokens,
+        include_stop_token: false,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        cache: Default::default(),
+        image_generation: Default::default(),
+        readout: Vec::new(),
+        generated_token_ids: Vec::new(),
+        adapter: 0,
+        generated_images: Vec::new(),
+        trajectory: Default::default(),
+    }
+}
+
+#[test]
+fn a_starved_request_fails_the_policy() {
+    // One millisecond of starvation: the request is admitted by the plan and
+    // never given work, and §4.4's watchdog is the mechanism's, not the
+    // policy's, so a policy that answers every call correctly still fails.
+    let world = World::with_previous(
+        Toy::idle(),
+        starving(vec![RequestId(1)], Nanos(1_000_000)),
+    );
+    let mut events = world
+        .handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+    let report = world.failed();
+    assert!(
+        report.reason.to_lowercase().contains("starv")
+            && report.reason.contains('1'),
+        "the reason names the starved request: {}",
+        report.reason
+    );
+    // The program that serves on is the one before the starved one.
+    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    // The starved request is still the epoch's: the revert moves the policy,
+    // not the request, and the previous program may now serve it.
+    assert!(
+        !events.try_recv().is_ok_and(|event| event.is_terminal()),
+        "the request was not ended by the policy's failure"
+    );
 }

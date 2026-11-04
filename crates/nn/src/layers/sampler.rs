@@ -8,10 +8,18 @@
 //! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
 //! shaped                           → log_softmax   → logprobs [rows, vocabulary] f32  (when asked)
 //! shaped                           → top_k          → values [rows, width] f32, ids [rows, width] i32
-//! values                           → filter_candidates → values (dropped = -inf), valid [rows]
-//! values                           → softmax        → probabilities [rows, width] f32
+//! values + ids                     → filter_candidates → values (dropped = -inf), valid [rows]
+//! values + ids                     → candidate_order → the same rows in ascending token id
+//! ordered values                   → softmax        → probabilities [rows, width] f32
 //! probabilities + draws            → inverse_cdf    → tokens [rows]
 //! logprobs + tokens                → logprob_gather → logp [rows] f32                    (when asked)
+//! ```
+//!
+//! A greedy row takes the second of two launch sequences instead, and only its first step:
+//!
+//! ```text
+//! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
+//! shaped                           → argmax         → tokens [rows]                     (the id is the column)
 //! ```
 //!
 //! The order of the arena reservations below is that sequence, so a captured bucket's plan is
@@ -22,9 +30,18 @@
 //!
 //! The layer never generates randomness. `draws` is `[rows]` f32 in `[0, 1)`, computed by the
 //! executor from the request's seed and the token position it is sampling (Philox, addressed per
-//! element), so a restored or replayed step draws the same number. A row without a positive
-//! temperature is sampled by the same path with a draw of `0`, which selects its largest candidate —
-//! the greedy token — without a second code path.
+//! element), so a restored or replayed step draws the same number.
+//!
+//! ## Greedy rows
+//!
+//! A row whose temperature is zero is **not** a draw: it is [`Self::argmax`]'s row. The shaper
+//! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
+//! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
+//! temperature of each row is a request parameter, so the executor knows which rows are greedy and
+//! routes them: `argmax` over the row's logits for those, this path's draw for the rest. No draw can
+//! replace that step, because the draw path's candidates are sorted by token id before the CDF (the
+//! step the reference takes at `uniserve/sampling/top_k.py:307-314`), so a draw of zero selects the
+//! lowest token id rather than the largest logit.
 //!
 //! ## Rows that cannot be sampled
 //!
@@ -38,10 +55,10 @@
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
-    ArgMax, ArgMaxArgs, ArgMaxDescriptor, FilterArgs, FilterCandidates, FilterDescriptor,
-    InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
-    LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather,
-    PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
+    ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
+    FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
+    LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
+    OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
 };
 use ops::{DType, Op, Shape, TensorView};
 
@@ -57,7 +74,7 @@ pub struct SamplerState {
     /// `[slots, vocabulary]` i32: how many times each slot has already seen each token.
     pub counts: TensorView,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
-    /// frequency and presence in [`ops::logits::PARAMETER_COLUMNS`] order.
+    /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
     pub parameters: TensorView,
     /// `[rows]` i32: the slot each row belongs to.
     pub slots: TensorView,
@@ -74,8 +91,12 @@ pub struct Candidates {
     pub values: TensorView,
     /// `[rows, width]` i32 the vocabulary ids of the candidates.
     pub ids: TensorView,
-    /// `[rows, width]` f32 the candidates' probabilities after filtering.
+    /// `[rows, width]` f32 the candidates' probabilities, in the reference's token order.
     pub probabilities: TensorView,
+    /// `[rows, width]` f32 the filtered candidates in ascending token id order.
+    pub ordered_values: TensorView,
+    /// `[rows, width]` i32 the ids of `ordered_values`, in the same order.
+    pub ordered_ids: TensorView,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
     pub valid: TensorView,
 }
@@ -88,6 +109,8 @@ impl Candidates {
             values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
             ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             probabilities: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
         })
     }
@@ -181,6 +204,12 @@ impl Sampler {
     /// `logits` is `[rows, vocabulary]` in the head's output dtype; `draws` is `[rows]` f32 in
     /// `[0, 1)` from the executor. The step's working set comes from the forward's arena, so the
     /// call is inside a captured bucket's plan.
+    ///
+    /// The candidates reach [`InverseCdf`] in ascending token id order: [`TopK`] writes them by
+    /// descending logit, [`FilterCandidates`] preserves that, and [`CandidateOrder`] permutes both
+    /// the values and the ids into token order, which is what makes a fixed draw select the same
+    /// token as the reference's (`uniserve/sampling/top_k.py:307-314`). Greedy rows do not go through
+    /// this method at all — see [`Self::greedy`].
     pub fn forward(
         &self,
         f: &Forward,
@@ -191,6 +220,158 @@ impl Sampler {
     ) -> Result<()> {
         let vocabulary = u64::from(self.vocabulary);
         let width = u64::from(self.width);
+        let rows = self.check(logits, state, samples)?;
+        draws
+            .require_shape("Sampler", Shape::new(&[rows]))
+            .map_err(Error::from)?;
+        if draws.dtype != DType::F32 {
+            return Err(Error::shape(
+                "Sampler",
+                format!("expected f32 draws, found {}", draws.dtype),
+            ));
+        }
+
+        let arena = f.arena();
+        let candidates = Candidates::reserve(arena, rows, vocabulary, width)?;
+
+        // 1. Penalties and temperature.
+        let shape = ShapeDescriptor {
+            dtype: logits.dtype,
+            vocabulary: self.vocabulary,
+            block: self.block,
+            extras: self.extras,
+            divide: true,
+            pdl: launch::PDL,
+        };
+        let args = ShapeArgs {
+            logits,
+            counts: state.counts,
+            slots: state.slots,
+            parameters: state.parameters,
+            extras: state.extras,
+            out: candidates.shaped,
+        };
+
+        f.operate::<LogitsShape>(&shape, args)?;
+
+        // 2. The candidate set: the `width` largest, then the row's own thresholds.
+        let top = TopKDescriptor {
+            dtype: DType::F32,
+            vocabulary: self.vocabulary,
+            width: self.width,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        };
+        let args = TopKArgs {
+            logits: candidates.shaped,
+            values: candidates.values,
+            ids: candidates.ids,
+        };
+
+        f.operate::<TopK>(&top, args)?;
+
+        let filter = FilterDescriptor {
+            width: self.width,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        };
+        let args = FilterArgs {
+            values: candidates.values,
+            ids: candidates.ids,
+            parameters: state.parameters,
+            valid: candidates.valid,
+        };
+
+        f.operate::<FilterCandidates>(&filter, args)?;
+
+        // 3. Token order, because the draw must not depend on the order the top-k program kept the
+        // candidates in: the reference reorders them by token id before its inverse CDF
+        // (`uniserve/sampling/top_k.py:307-314`), and a fixed draw selects the same token only when
+        // the columns mean the same thing on both sides.
+        let order = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        };
+        let args = OrderArgs {
+            values: candidates.values,
+            ids: candidates.ids,
+            ordered_values: candidates.ordered_values,
+            ordered_ids: candidates.ordered_ids,
+        };
+
+        f.operate::<CandidateOrder>(&order, args)?;
+
+        // 4. The candidates' distribution, then one draw per row.
+        let softmax = SoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: self.width,
+            tile: launch::row_tile(self.width),
+            pdl: launch::PDL,
+        };
+        let args = SoftmaxArgs {
+            x: candidates.ordered_values,
+            out: candidates.probabilities,
+        };
+
+        f.operate::<Softmax>(&softmax, args)?;
+
+        let draw = InverseCdfDescriptor {
+            width: self.width,
+            ids: DType::I32,
+            tokens: self.tokens,
+            pdl: launch::PDL,
+        };
+        let args = InverseCdfArgs {
+            probabilities: candidates.probabilities,
+            ids: candidates.ordered_ids,
+            draws,
+            tokens: samples.tokens,
+        };
+
+        f.operate::<InverseCdf>(&draw, args)?;
+
+        // 5. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
+        if let Some(logprobabilities) = samples.logprobabilities {
+            let softmax = LogSoftmaxDescriptor {
+                dtype: DType::F32,
+                columns: self.vocabulary,
+                tile: self.block,
+                pdl: launch::PDL,
+            };
+            let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
+            let args = LogSoftmaxArgs {
+                x: candidates.shaped,
+                out: logprobs,
+            };
+
+            f.operate::<LogSoftmax>(&softmax, args)?;
+
+            let gather = LogprobDescriptor {
+                columns: self.vocabulary,
+                ids: self.tokens,
+                pdl: launch::PDL,
+            };
+            let args = LogprobArgs {
+                logprobabilities: logprobs,
+                tokens: samples.tokens,
+                out: logprobabilities,
+            };
+
+            f.operate::<LogprobGather>(&gather, args)?;
+        }
+
+        Ok(())
+    }
+
+    /// What both sampling paths read: the logit rows, the request state, and the outputs.
+    ///
+    /// [`Self::forward`] calls this and then checks its draws; [`Self::greedy`] calls it and launches.
+    /// It is private because the two paths are the whole of this layer's interface — a caller does not
+    /// choose a half-step — but it is one method so the two paths cannot disagree about what a valid
+    /// step is.
+    fn check(&self, logits: TensorView, state: &SamplerState, samples: &Samples) -> Result<u64> {
+        let vocabulary = u64::from(self.vocabulary);
         logits
             .require_row("Sampler", logits.dtype, vocabulary)
             .map_err(Error::from)?;
@@ -208,15 +389,6 @@ impl Sampler {
                     "{} logits are not a shape the shaper reads: f32, bf16 or f16",
                     logits.dtype
                 ),
-            ));
-        }
-        draws
-            .require_shape("Sampler", Shape::new(&[rows]))
-            .map_err(Error::from)?;
-        if draws.dtype != DType::F32 {
-            return Err(Error::shape(
-                "Sampler",
-                format!("expected f32 draws, found {}", draws.dtype),
             ));
         }
         if samples.tokens.dtype != self.tokens {
@@ -275,7 +447,14 @@ impl Sampler {
             ));
         }
         match (self.extras, state.extras) {
-            (0, None) | (_, Some(_)) => {}
+            (0, None) => {}
+            (0, Some(_)) => {
+                return Err(Error::shape(
+                    "Sampler",
+                    "the sampler reads no extra tokens and the state carries some".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {}
             (extras, None) => {
                 return Err(Error::shape(
                     "Sampler",
@@ -283,22 +462,71 @@ impl Sampler {
                 ));
             }
         }
-        if let Some(extras) = state.extras {
-            extras
+        if let Some(extra) = state.extras {
+            extra
                 .require_shape("Sampler", Shape::new(&[rows, u64::from(self.extras)]))
                 .map_err(Error::from)?;
-            if extras.dtype != DType::I32 {
+            if extra.dtype != DType::I32 {
                 return Err(Error::shape(
                     "Sampler",
-                    format!("expected i32 extra tokens, found {}", extras.dtype),
+                    format!("expected i32 extra tokens, found {}", extra.dtype),
                 ));
             }
         }
 
-        let arena = f.arena();
-        let candidates = Candidates::reserve(arena, rows, vocabulary, width)?;
+        Ok(rows)
+    }
 
-        // 1. Penalties and temperature.
+    /// Put each row's candidates in ascending token id order, ready for the draw.
+    ///
+    /// `values` and `ids` are `[rows, width]` and are left untouched; the two ordered views receive
+    /// the permutation. This is the step between filtering and the draw: `inverse_cdf` inverts a
+    /// cumulative distribution in the order it is given, and the reference orders candidates by token
+    /// id first so that a draw does not depend on the order the top-k program produced
+    /// (`uniserve/sampling/top_k.py:307-314`).
+    pub fn order_candidates(
+        &self,
+        f: &Forward,
+        values: TensorView,
+        ids: TensorView,
+        ordered_values: TensorView,
+        ordered_ids: TensorView,
+    ) -> Result<()> {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: ids.dtype,
+            pdl: launch::PDL,
+        };
+        let args = OrderArgs {
+            values,
+            ids,
+            ordered_values,
+            ordered_ids,
+        };
+
+        f.operate::<CandidateOrder>(&descriptor, args)
+    }
+
+    /// Take each row's largest shaped logit as its token, and report its log-probability when
+    /// `samples` carries one.
+    ///
+    /// This is the reference's greedy step (`torch.max` over the shaped row, `uniserve/sampling/
+    /// greedy.py`), for the rows whose temperature is zero. It runs the same shaper as [`Self::forward`]
+    /// and nothing else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
+    /// rather than a branch inside `forward`, because the executor's buckets are homogeneous in the
+    /// path their rows take and a bucket's captured plan is one of the two.
+    pub fn greedy(
+        &self,
+        f: &Forward,
+        logits: TensorView,
+        state: &SamplerState,
+        samples: &Samples,
+    ) -> Result<()> {
+        let rows = self.check(logits, state, samples)?;
+        let vocabulary = u64::from(self.vocabulary);
+        let arena = f.arena();
+        let shaped = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
+
         let shape = ShapeDescriptor {
             dtype: logits.dtype,
             vocabulary: self.vocabulary,
@@ -313,71 +541,25 @@ impl Sampler {
             slots: state.slots,
             parameters: state.parameters,
             extras: state.extras,
-            out: candidates.shaped,
+            out: shaped,
         };
 
         f.operate::<LogitsShape>(&shape, args)?;
 
-        // 2. The candidate set: the `width` largest, then the row's own thresholds.
-        let top = TopKDescriptor {
+        // The column of a dense vocabulary row is the token id, so the index is the token.
+        let argmax = ArgMaxDescriptor {
             dtype: DType::F32,
-            vocabulary: self.vocabulary,
-            width: self.width,
-            ids: DType::I32,
+            width: self.vocabulary,
+            ids: self.tokens,
             pdl: launch::PDL,
         };
-        let args = TopKArgs {
-            logits: candidates.shaped,
-            values: candidates.values,
-            ids: candidates.ids,
+        let args = ArgMaxArgs {
+            values: shaped,
+            out: samples.tokens,
         };
 
-        f.operate::<TopK>(&top, args)?;
+        f.operate::<ArgMax>(&argmax, args)?;
 
-        let filter = FilterDescriptor {
-            width: self.width,
-            ids: DType::I32,
-            pdl: launch::PDL,
-        };
-        let args = FilterArgs {
-            values: candidates.values,
-            ids: candidates.ids,
-            parameters: state.parameters,
-            valid: candidates.valid,
-        };
-
-        f.operate::<FilterCandidates>(&filter, args)?;
-
-        // 3. The candidates' distribution, then one draw per row.
-        let softmax = SoftmaxDescriptor {
-            dtype: DType::F32,
-            columns: self.width,
-            tile: launch::row_tile(self.width),
-            pdl: launch::PDL,
-        };
-        let args = SoftmaxArgs {
-            x: candidates.values,
-            out: candidates.probabilities,
-        };
-
-        f.operate::<Softmax>(&softmax, args)?;
-
-        let draw = InverseCdfDescriptor {
-            width: self.width,
-            ids: DType::I32,
-            tokens: self.tokens,
-            pdl: launch::PDL,
-        };
-        let args = InverseCdfArgs {
-            probabilities: candidates.probabilities,
-            ids: candidates.ids,
-            draws,
-            tokens: samples.tokens,
-        };
-
-        f.operate::<InverseCdf>(&draw, args)?;
-
-        // 4. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
         if let Some(logprobabilities) = samples.logprobabilities {
             let softmax = LogSoftmaxDescriptor {
                 dtype: DType::F32,
@@ -387,7 +569,7 @@ impl Sampler {
             };
             let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
             let args = LogSoftmaxArgs {
-                x: candidates.shaped,
+                x: shaped,
                 out: logprobs,
             };
 
@@ -410,29 +592,6 @@ impl Sampler {
         Ok(())
     }
 
-    /// The greedy token of each row of `values`: the index of the largest candidate.
-    ///
-    /// A row without a positive temperature is sampled through the same draw path with a draw of
-    /// zero, which selects its first candidate; this call is for diagnostics and for a caller that
-    /// wants the index rather than the token.
-    pub fn argmax(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
-        let rows = values.rows();
-        values
-            .require_row("Sampler", values.dtype, u64::from(self.width))
-            .map_err(Error::from)?;
-        out.require_shape("Sampler", Shape::new(&[rows]))
-            .map_err(Error::from)?;
-        let descriptor = ArgMaxDescriptor {
-            dtype: values.dtype,
-            width: self.width,
-            ids: DType::I32,
-            pdl: launch::PDL,
-        };
-        let args = ArgMaxArgs { values, out };
-
-        f.operate::<ArgMax>(&descriptor, args)
-    }
-
     /// The bound the sampled tokens' distributions are compared with: the shaping and filtering
     /// steps round FP32 values a few times, while a chosen token is exact.
     pub fn tolerance(&self) -> ops::Tolerance {
@@ -451,6 +610,16 @@ impl Sampler {
 mod tests {
     use super::*;
     use ops::DevicePtr;
+
+    /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
+    fn view(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
+    }
+
+    /// The state's own rows — the slot counts, the slot ids and the extra tokens — are integers.
+    fn ints(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(shape))
+    }
 
     #[test]
     fn a_step_is_built_for_a_vocabulary_and_a_candidate_width() {
@@ -478,6 +647,8 @@ mod tests {
             candidates.values,
             candidates.ids,
             candidates.probabilities,
+            candidates.ordered_values,
+            candidates.ordered_ids,
             candidates.valid,
             samples.tokens,
             samples.logprobabilities.unwrap(),
@@ -492,6 +663,8 @@ mod tests {
         assert_eq!(candidates.shaped.shape.dims(), &[rows, 1_024]);
         assert_eq!(candidates.values.shape.dims(), &[rows, 32]);
         assert_eq!(candidates.ids.dtype, DType::I32);
+        assert_eq!(candidates.ordered_values.shape.dims(), &[rows, 32]);
+        assert_eq!(candidates.ordered_ids.dtype, DType::I32);
         assert_eq!(candidates.valid.shape.dims(), &[rows]);
         assert_eq!(samples.tokens.shape.dims(), &[rows]);
         // Without log-probabilities the step reserves neither the row of log-probabilities nor the
@@ -513,5 +686,122 @@ mod tests {
         );
         assert!(bound.allows(1.0, 1.0 + 1.0e-7));
         assert!(!bound.allows(1.0, 1.0 + 1.0e-3));
+    }
+
+    /// The refusals a caller meets before either path launches. `check` is the one body both paths
+    /// run, so a request it accepts is one both paths accept and a request it refuses names the
+    /// argument, not the path — which is the point of the tests being here rather than nowhere: the
+    /// paths themselves need a live device, and this is the half of them a host can hold to account.
+    #[test]
+    fn a_step_refuses_the_state_it_cannot_read() {
+        let sampler = Sampler::new(1_024, 4, 64, 2).unwrap();
+        let state = |extras: bool| SamplerState {
+            counts: ints(&[4, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: ints(&[2]),
+            extras: extras.then(|| ints(&[2, 2])),
+        };
+        let samples = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            logprobabilities: Some(TensorView::new(
+                DevicePtr::new(0x2000),
+                DType::F32,
+                Shape::new(&[2]),
+            )),
+        };
+        sampler
+            .check(view(&[2, 1_024]), &state(true), &samples)
+            .expect("a step whose state is its own");
+
+        // A row of the wrong width, a step with no rows, and a logit type the shaper cannot read.
+        for (logits, named) in [
+            (view(&[2, 512]), "1024"),
+            (view(&[0, 1_024]), "one row"),
+            (
+                TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[2, 1_024])),
+                "f32, bf16 or f16",
+            ),
+        ] {
+            let text = format!(
+                "{}",
+                sampler.check(logits, &state(true), &samples).unwrap_err()
+            );
+            assert!(text.contains(named), "{text}");
+        }
+
+        // The request state: a row of parameters too narrow, counts that are not one row per slot,
+        // and the two ways the extra columns and the sampler's declaration can disagree.
+        let narrow = SamplerState {
+            counts: ints(&[4, 1_024]),
+            parameters: view(&[2, 4]),
+            slots: ints(&[2]),
+            extras: Some(ints(&[2, 2])),
+        };
+        assert!(sampler.check(view(&[2, 1_024]), &narrow, &samples).is_err());
+        let miscounted = SamplerState {
+            counts: ints(&[3, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: ints(&[2]),
+            extras: Some(ints(&[2, 2])),
+        };
+        let text = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &miscounted, &samples)
+                .unwrap_err()
+        );
+        assert!(text.contains('3') && text.contains('4'), "{text}");
+        let absent = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &state(false), &samples)
+                .unwrap_err()
+        );
+        assert!(absent.contains('2'), "{absent}");
+
+        // And the sampler that reads no extra tokens refuses a state that carries them, rather than
+        // demanding a zero-width view of them.
+        let plain = Sampler::new(1_024, 4, 64, 0).unwrap();
+        let text = format!(
+            "{}",
+            plain
+                .check(view(&[2, 1_024]), &state(true), &samples)
+                .unwrap_err()
+        );
+        assert!(text.contains("no extra tokens"), "{text}");
+    }
+
+    /// A greedy step reads no draws, so the state a greedy caller must supply is exactly the state a
+    /// draw caller must supply: what it leaves out is the uniform draw, nothing else.
+    #[test]
+    fn a_greedy_step_needs_no_draws_to_be_a_valid_step() {
+        let sampler = Sampler::new(1_024, 4, 64, 0).unwrap();
+        let state = SamplerState {
+            counts: ints(&[4, 1_024]),
+            parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
+            slots: ints(&[2]),
+            extras: None,
+        };
+        let samples = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            logprobabilities: None,
+        };
+        assert_eq!(
+            sampler.check(view(&[2, 1_024]), &state, &samples).unwrap(),
+            2
+        );
+        // The tokens a greedy step writes are whatever type the sampler declares, and a step whose
+        // output is a different one is refused by name rather than launched into a wrong view.
+        let narrow = Samples {
+            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[2])),
+            logprobabilities: None,
+        };
+        let text = format!(
+            "{}",
+            sampler
+                .check(view(&[2, 1_024]), &state, &narrow)
+                .unwrap_err()
+        );
+        assert!(text.contains("i32"), "{text}");
     }
 }
