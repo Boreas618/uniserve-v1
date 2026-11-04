@@ -250,7 +250,7 @@ async fn serve_deployment(
 ) -> Result<()> {
     let name = config.served_model_name().to_owned();
     let options = config.daemon_options();
-    let daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
+    let mut daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
         .await
         .context("the daemon's start did not complete")?
         .context("failed to start the deployment's daemon")?;
@@ -259,12 +259,27 @@ async fn serve_deployment(
         .context("a deployment of one node leads")?
         .to_owned();
     let retire = Arc::new(AtomicBool::new(false));
+    let epoch_records = Arc::new(crate::epoch::Epochs::new());
+    let (updates, awake) = daemon
+        .updates(Arc::clone(&epoch_records), name.clone())
+        .context("the leader's daemon serves no epoch layer")?;
+    Daemon::advance_epochs(Arc::clone(&updates), awake)
+        .context("starting the epoch layer's thread")?;
     let served = async {
+        // The daemon's channel down to the main processes, which the epoch's
+        // first program switch commands through.
+        let commands = daemon.commands();
         let engine = tokio::select! {
-            engine = Leader::start(config, stated, address) => Arc::new(engine?),
+            engine = Leader::start(config, stated, address, commands.as_ref(), updates) => {
+                Arc::new(engine?)
+            }
             () = token.cancelled() => return Ok(()),
         };
-        let admin = Admin::new(token.clone(), Arc::clone(&retire));
+        let admin = Admin::with_epochs(
+            token.clone(),
+            Arc::clone(&retire),
+            Arc::clone(&epoch_records),
+        );
         admin.record("deployment", format!("serving {name}"));
         admin.watch(&engine);
         let jobs = Arc::new(VideoJobs::new(
