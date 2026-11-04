@@ -6,6 +6,8 @@
 //! drain commands, take one nonblocking scheduling step, and park in the
 //! executor only when the step made no progress.
 
+use std::sync::Arc;
+
 use super::*;
 use ipc::{ForwardMode, MediaCall};
 
@@ -234,6 +236,7 @@ impl Scheduler {
             policy: None,
             policy_report: None,
             serving: tokio::sync::watch::Sender::new(false),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             expert_load: None,
             expert_order: None,
             expert_asked: None,
@@ -263,6 +266,20 @@ impl Scheduler {
             failure: Arc::default(),
             stats,
         })
+    }
+
+    /// The generation the epoch serves, which the batches of a step carry: the
+    /// number the control thread's switchover arm last wrote here (§7.3).
+    ///
+    /// Read once per step, never per batch, so a switchover between two batches
+    /// of one step cannot split them across generations.
+    pub(super) fn serving_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The serving generation's cell, for the handle that writes it.
+    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.generation)
     }
 
     /// A receiver for [`Self::note_policy_serves`], for whoever waits until a

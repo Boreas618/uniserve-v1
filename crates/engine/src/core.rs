@@ -554,6 +554,11 @@ pub struct SchedulerHandle {
     next_id: Arc<AtomicU64>,
     /// Set once a policy instance actually serves (§7.3); see `wait_serving`.
     serving: tokio::sync::watch::Receiver<bool>,
+    /// The generation each of this scheduler's batches is stamped with: the
+    /// number the control thread's switchover arm last wrote (§7.3). One cell
+    /// per rank, shared with the scheduler thread and the in-process submission
+    /// path, which reads it once per step.
+    generation: Arc<std::sync::atomic::AtomicU64>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -1090,6 +1095,7 @@ impl SchedulerHandle {
         let failure = scheduler.failure_handle();
         // Taken before the scheduler moves onto its thread.
         let serving = scheduler.serving_receiver();
+        let generation = scheduler.generation_handle();
         let trial = scheduler.on_trial();
 
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -1120,6 +1126,7 @@ impl SchedulerHandle {
             batches: None,
             next_id: Arc::new(AtomicU64::new(1)),
             serving,
+            generation,
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -1135,6 +1142,27 @@ impl SchedulerHandle {
             failure: Arc::clone(&self.failure),
             commands: self.commands.clone(),
         }
+    }
+
+    /// The generation this scheduler's batches carry: the one the epoch last
+    /// switched to and has not purged (§7.3).
+    ///
+    /// The cell is shared with the scheduler thread, which reads it once per
+    /// step; the control thread's switchover arm writes it while it holds the
+    /// generations' lock, so a step never mixes two generations.
+    pub fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    /// Records the serving generation, from the control thread's switchover arm.
+    pub(crate) fn set_generation(&self, generation: u64) {
+        self.generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The generation serving now.
+    pub fn serving_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Blocks until a policy instance actually serves this scheduler, or the

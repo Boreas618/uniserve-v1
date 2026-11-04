@@ -498,6 +498,10 @@ pub struct Scheduler {
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.
     policy_prepared: Option<policy::Candidate>,
+    /// The generation this scheduler's batches are stamped with (§7.3): the one
+    /// the epoch last switched to, written by the control thread's switchover
+    /// arm while it holds the generations' lock, read once per step.
+    generation: Arc<std::sync::atomic::AtomicU64>,
     /// Set once a policy instance actually serves this scheduler (§7.3).
     ///
     /// Before the epoch's first switchover the mechanism decides nothing — a
