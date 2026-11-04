@@ -15,7 +15,7 @@ libloading.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-cuda.workspace = true
+platform.workspace = true
 
 [lints]
 workspace = true

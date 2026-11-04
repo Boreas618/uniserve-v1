@@ -1,9 +1,10 @@
-//! Device ordinals, attributes, identity and storage information.
+//! Devices, their ordinals, attributes, identity and storage information.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::driver::driver;
-use crate::{DeviceGuard, Result};
+use crate::{DeviceGuard, PrimaryContext, Result, Stream};
 
 /// A CUDA device ordinal as numbered by the driver in this process (after
 /// `CUDA_VISIBLE_DEVICES`). The same ordinal names the device in DLPack.
@@ -59,6 +60,97 @@ impl fmt::Display for DeviceUuid {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+/// A device this process uses: its ordinal, its compute capability, its
+/// multiprocessor count and total storage, and a retained reference to its
+/// primary context.
+///
+/// Cloning shares the retained context; the last handle releases the driver's
+/// reference. Everything in this crate that creates a driver object takes a
+/// `&Device`, so a caller never passes an ordinal whose context this process
+/// did not retain, and the retention outlives every object made through it.
+#[derive(Clone)]
+pub struct Device {
+    id: DeviceId,
+    /// (major, minor) of the compute capability, fixed for the device.
+    architecture: (i32, i32),
+    /// Streaming multiprocessors, which size every launch's grid.
+    multiprocessors: i32,
+    /// Total storage of the device, which the allocator's pools are cut from.
+    total_memory: u64,
+    context: Arc<PrimaryContext>,
+}
+
+impl Device {
+    /// Retains `id`'s primary context and reads the device's fixed attributes.
+    pub fn new(id: DeviceId) -> Result<Self> {
+        let context = PrimaryContext::retain(id)?;
+        let architecture = (
+            id.attribute(DeviceAttribute::ComputeCapabilityMajor)?,
+            id.attribute(DeviceAttribute::ComputeCapabilityMinor)?,
+        );
+        let multiprocessors = id.attribute(DeviceAttribute::MultiprocessorCount)?;
+        let total_memory = id.memory_info()?.total;
+
+        Ok(Self {
+            id,
+            architecture,
+            multiprocessors,
+            total_memory,
+            context: Arc::new(context),
+        })
+    }
+
+    /// The number of devices visible to this process.
+    pub fn count() -> Result<i32> {
+        DeviceId::count()
+    }
+
+    pub fn id(&self) -> DeviceId {
+        self.id
+    }
+
+    /// The compute capability as (major, minor), such as (10, 0) for sm_100.
+    pub fn architecture(&self) -> (i32, i32) {
+        self.architecture
+    }
+
+    pub fn multiprocessor_count(&self) -> i32 {
+        self.multiprocessors
+    }
+
+    /// Total storage of the device in bytes, as of the first use.
+    pub fn total_memory(&self) -> u64 {
+        self.total_memory
+    }
+
+    /// Free and total storage now, queried in this device's primary context.
+    pub fn memory_info(&self) -> Result<MemoryInfo> {
+        self.id.memory_info()
+    }
+
+    /// The device's UUID, the same identity NVML reports for it.
+    pub fn uuid(&self) -> Result<DeviceUuid> {
+        self.id.uuid()
+    }
+
+    /// Whether this device can directly address storage resident on `peer`.
+    pub fn can_access_peer(&self, peer: DeviceId) -> Result<bool> {
+        self.id.can_access_peer(peer)
+    }
+
+    /// Makes this device's primary context current on the calling thread until
+    /// the guard drops, for driver calls that need a current context on a fresh
+    /// host thread.
+    pub fn enter(&self) -> Result<DeviceGuard> {
+        self.context.enter()
+    }
+
+    /// Creates a new non-blocking stream on this device.
+    pub fn stream(&self) -> Result<Stream> {
+        Stream::new(self.id)
     }
 }
 

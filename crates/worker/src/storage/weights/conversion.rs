@@ -12,7 +12,7 @@ use std::sync::Arc;
 use ::storage::manifest::{self, Conversion, Copy, Encoding, Field, Manifest, Space};
 use ::storage::protocol::{Access, Priority, Region, Span};
 use ::storage::{Key, Placement, StorageRecord, TensorRecord};
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use sha2::{Digest, Sha256};
 use tvm_ffi::Any;
 
@@ -100,7 +100,7 @@ impl<'a> Conversions<'a> {
                 // SAFETY: this operation owns the complete allocation and
                 // synchronizes its only writer before another user sees it.
                 unsafe {
-                    cuda::memset_d8(
+                    platform::memset_d8(
                         destination.storage.address(),
                         0,
                         destination.storage.bytes(),

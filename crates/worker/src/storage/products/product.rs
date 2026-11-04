@@ -5,7 +5,7 @@ use crate::ffi::{DType, MemoryKind};
 use crate::storage::allocation::StorageView;
 use crate::transfer::{ReadRef, Retirement};
 use crate::{BufferBinding, Error, Result};
-use cuda::Event;
+use platform::Event;
 use ipc::{BufferId, DimBound, TensorRef};
 use std::collections::HashMap;
 use std::ops::{Deref, Range};

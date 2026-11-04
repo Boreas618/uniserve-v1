@@ -25,7 +25,7 @@
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::{Arc, Mutex};
 
-use cuda::{DeviceId, VirtualPool};
+use platform::{DeviceId, VirtualPool};
 
 use crate::{Error, Result, lock};
 
