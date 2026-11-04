@@ -2361,6 +2361,24 @@ mod tests {
         Stack::of(&video_config()).expect("the fixture's stack")
     }
 
+    /// The encoder names only its own tensors, and each of them once.
+    ///
+    /// Two properties the checkpoint makes a load depend on: a name asked twice would be read twice
+    /// and reported twice by a missing-name check, and a name outside the encoder's own two prefixes
+    /// would be the decoder's or the post-quant convolution's - a different component's tensors in
+    /// the same export, which this encoder must never read.
+    #[test]
+    fn keys_name_only_the_encoder_and_once_each() {
+        let keys = VideoEncoder::keys(&video_config()).expect("the encoder's names");
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
+        assert!(
+            keys.iter()
+                .all(|key| key.starts_with("encoder.") || key.starts_with("quant_conv.")),
+            "a key lies outside the encoder's own tensors"
+        );
+    }
+
     #[test]
     fn the_conditioning_plan_is_one_tile_per_run_not_one_per_tile() {
         // A condition's plan is the pass's, so nothing in it scales with the tile grid: the two
