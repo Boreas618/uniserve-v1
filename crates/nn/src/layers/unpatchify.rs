@@ -65,6 +65,17 @@ impl UnpatchifyVideo {
     /// extents are the launch's — a clip's length and canvas are the request's — and they are read
     /// from `out`, which the caller already sized: `out.dim(1) / temporal` frames, and likewise for
     /// the rows and columns. Spare token rows past the grid are never read.
+    /// The descriptor one unpatchify launches: the element type, stated once for every tile of a
+    /// canvas. The extents are launch values, so a walk with a configuration states this program.
+    pub fn descriptor(&self) -> unpatchify::Descriptor {
+        unpatchify::Descriptor {
+            dtype: self.dtype,
+            affine: false,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     pub fn forward(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
         let shape = out.shape;
         if shape.rank() != 4 || shape.dim(0) != u64::from(self.channels) {
@@ -112,12 +123,7 @@ impl UnpatchifyVideo {
                 ),
             ));
         }
-        let descriptor = unpatchify::Descriptor {
-            dtype: self.dtype,
-            affine: false,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor();
         let narrow = |name: &'static str, value: u64| {
             u32::try_from(value).map_err(|_| {
                 Error::shape(
