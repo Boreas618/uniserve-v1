@@ -108,6 +108,7 @@ mod transfer;
 pub mod peer;
 /// The scheduler's name for one phase (§4.5).
 pub mod phase;
+pub mod program;
 /// The vocabulary of a program-layer update (§7.3).
 pub mod update;
 
@@ -137,4 +138,4 @@ pub use tensor::*;
 pub use transfer::*;
 pub use peer::{PeerAccepted, PeerRegistration};
 pub use phase::PhaseId;
-pub use update::{ProgramStatus, UpdateFailure};
+pub use program::ProgramCommand;

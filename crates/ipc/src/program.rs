@@ -30,7 +30,7 @@
 //! their payload's owners are not in the tree; the statuses they answer with are
 //! in [`crate::update`] and compile today.
 
-use program_server::Programs;
+use program_server::program::Programs;
 use serde::{Deserialize, Serialize};
 
 /// A command of the program-layer update, as a main process receives it.
