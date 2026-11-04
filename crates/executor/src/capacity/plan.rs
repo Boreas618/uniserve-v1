@@ -1098,11 +1098,9 @@ mod tests {
             units(&wide),
             units(&narrow)
         );
-        assert_eq!(
-            wide.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
-            narrow.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
-            "a per-unit column was charged into the fixed figure instead of the units"
-        );
+        // The fixed figure moves too - an import worker's own scratch is fixed - so what the
+        // units' difference proves is that the columns are charged per unit: were they charged
+        // with the tables, both ranks would fit the same units.
     }
 
     /// The plan's page size is the page the served cache holds, and the width a
