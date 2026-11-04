@@ -179,6 +179,19 @@ impl Resample {
 /// The activation's length is unchanged; the operator that runs it fuses the five passes (pad,
 /// transposed depthwise convolution, crop, SnakeBeta, pad, depthwise convolution) into one program
 /// (specs/worker.md 9, the BigVGAN row).
+///
+/// The passes, exactly (`autoencoder_kl_minimax_h3_audio.py`, `MiniMaxH3AudioActivation1d`):
+///
+/// 1. replicate-pad the track by [`Resample::pad`] on each side;
+/// 2. `ratio` times a depthwise transposed convolution of stride `ratio` with the Kaiser-sinc
+///    upsampling filter (`cutoff 0.5/ratio`, `half_width 0.6/ratio`) — the `ratio` factor is part of
+///    the result, not of the length, and a program that drops it is off by that factor;
+/// 3. crop [`Resample::pad_left`] from the front and [`Resample::pad_right`] from the end;
+/// 4. the activation itself: `x + (exp(beta) + 1e-9)^-1 * sin(exp(alpha) * x)^2` per channel, with
+///    `alpha` and `beta` stored in log space (the DAC encoder's `Snake` is the same formula with a
+///    single `alpha` and no exponentiation, which is why the two are not one layer);
+/// 5. replicate-pad by [`Resample::downsample_padding`] and run a depthwise convolution of stride
+///    `ratio` with the same Kaiser-sinc filter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Activation {
     /// The upsampling factor of both passes.
