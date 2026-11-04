@@ -98,7 +98,7 @@ fn load_with(
 
     // The vocabulary shard: rows are contiguous in a `[vocabulary, hidden]` table.
     let (first, rows) = partition.vocabulary_shard(config.vocab_size);
-    let padded = padded_vocabulary(rows);
+    let padded = partition.padded_vocabulary_shard(config.vocab_size);
     if padded != rows {
         return Err(Error::Unsupported(format!(
             "a vocabulary shard of {rows} rows needs {padded} padded rows; the checkpoint's rows \
@@ -307,14 +307,6 @@ fn as_u64(count: usize, what: &str) -> Result<u64> {
 /// A count as a `u32` extent.
 fn as_u32(count: usize, what: &str) -> Result<u32> {
     u32::try_from(count).map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
-}
-
-/// The vocabulary shard's width rounded up to the head's matmul alignment.
-///
-/// The head computes a whole number of tiles per rank; the slice's vocabulary (151936) is already a
-/// multiple of it, so no padding rows are stored.
-fn padded_vocabulary(rows: usize) -> usize {
-    rows.next_multiple_of(8)
 }
 
 /// The checkpoint tensor of every model parameter, by the model's path.
