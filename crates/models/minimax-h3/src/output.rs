@@ -30,7 +30,7 @@ use nn::layers::{CrossFade, RgbBytes};
 use nn::{DType, Forward, TensorView, Weight};
 
 use crate::config::CLIP_FRAMES;
-use crate::decoding::{CLIP_OUTPUT_FRAMES, OVERLAP_FRAMES};
+use crate::decoding::{Buffer, CLIP_OUTPUT_FRAMES, OVERLAP_FRAMES};
 use crate::{Error, Result};
 
 /// The per-channel standard deviations the video decoder's RGB is normalized by, in red, green, blue
@@ -399,6 +399,37 @@ impl Raster {
     }
 }
 
+/// The blend's scratch for one clip: a clip raster in the decoded element type.
+///
+/// [`VideoPostprocessor::forward`] fades a clip against its predecessor's tail into a buffer of the
+/// clip's own shape, because the fade's destination cannot be the source it reads; that buffer is the
+/// only thing the splice reserves, and it is named here so the executor sizes the arena from
+/// arithmetic rather than from the module's own guess. A clip with no predecessor reserves nothing.
+pub fn splice_arena(
+    config: &crate::VideoVaeConfig,
+    canvas: &crate::video_vae::Canvas,
+    dtype: DType,
+) -> Result<Vec<Buffer>> {
+    let element = match dtype {
+        DType::F16 => "f16",
+        DType::F32 => "f32",
+        other => {
+            return Err(Error::config(format!(
+                "the splice blends in f16 or f32 decoded precision, not {other}"
+            )));
+        }
+    };
+    let (height, width) = canvas.pixels(config);
+    Ok(vec![Buffer {
+        name: "blended",
+        element,
+        elements: u64::from(Rgb::CHANNELS)
+            * u64::from(crate::decoding::CLIP_OUTPUT_FRAMES)
+            * u64::from(height)
+            * u64::from(width),
+    }])
+}
+
 /// The whole timeline of `clips` clips: how many frames it writes.
 pub fn timeline_frames(clips: &[Splice]) -> Result<u32> {
     if clips.is_empty() {
@@ -448,6 +479,30 @@ mod tests {
             }
         };
         assert!(RgbBytes::new(DType::F16, 2, two, constants(PIXEL_STD)).is_err());
+    }
+
+    #[test]
+    fn the_splices_scratch_is_one_clip_raster() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
+        let (height, width) = canvas.pixels(&config);
+        let buffers = splice_arena(&config, &canvas, DType::F16).expect("the scratch");
+        assert_eq!(
+            buffers.len(),
+            1,
+            "the fade's destination is the only reservation"
+        );
+        // The blend writes one clip, so the scratch is the clip's raster: channels, the decoder's
+        // frames, and the canvas's pixels - the same extent `forward` reserves.
+        assert_eq!(
+            buffers[0].elements,
+            u64::from(Rgb::CHANNELS)
+                * u64::from(CLIP_OUTPUT_FRAMES)
+                * u64::from(height)
+                * u64::from(width)
+        );
+        assert_eq!(buffers[0].element, "f16");
+        assert!(splice_arena(&config, &canvas, DType::BF16).is_err());
     }
 
     #[test]
