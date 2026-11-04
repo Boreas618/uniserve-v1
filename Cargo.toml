@@ -1,13 +1,22 @@
+# The workspace's root package is the `uniserve` executable: every UniServe
+# process is one of its commands, each a module under `src/`. The libraries
+# are the members under `crates/`, a crate per process boundary or interface
+# (`specs/worker.md` §3).
 [workspace]
 resolver = "3"
 members = [
     "crates/platform",
     "crates/daemon",
     "crates/engine",
+    "crates/frontend",
     "crates/ipc",
     "crates/manager",
+    "crates/media",
     "crates/models",
+    "crates/models/qwen3-moe",
     "crates/nixl",
+    "crates/nn",
+    "crates/ops",
     "crates/program-server",
     "crates/proto",
     "crates/scheduling",
@@ -16,9 +25,40 @@ members = [
     "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",
-    "crates/uniserve",
     "crates/worker",
 ]
+
+[package]
+name = "uniserve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+daemon.workspace = true
+engine.workspace = true
+libc.workspace = true
+libloading.workspace = true
+mimalloc.workspace = true
+program-server.workspace = true
+storage.workspace = true
+storage-server.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["mm"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 
 [workspace.package]
 version = "2.0.0"
@@ -31,8 +71,13 @@ readme = "README.md"
 platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
+frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
+media = { path = "crates/media" }
 models = { path = "crates/models" }
+nn = { path = "crates/nn" }
+ops = { path = "crates/ops" }
+qwen3-moe = { path = "crates/models/qwen3-moe" }
 nixl = { path = "crates/nixl" }
 program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }

@@ -22,7 +22,7 @@ use tracing::{Level, debug, trace};
 use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
 use crate::output::events::{FinishReason, GeneratedImage, PromptInfo, StopReason};
 use crate::output::text::error::Error;
-use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
+use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
 
 /// Request-neutral options for incremental text decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,16 +144,27 @@ struct ArDecode {
     stop: Option<(String, usize)>,
 }
 
-/// Per-request decoding state for [`decoded_text_event_stream`].
-struct DecodeState<'a> {
-    decoder: IncrementalDecoder<'a>,
+/// One generation stream's decoding state, advanced one engine event at a
+/// time.
+///
+/// The stream keeps everything a successor process needs to go on with it
+/// (`decode` and `resume`, design §7.5.1): the incremental decoder's window and
+/// published text, the stop strings not matched yet, the prompt metadata, and
+/// the token awaiting its logprobs.
+pub(crate) struct DecodeStream {
+    request_id: String,
+    tokenizer: DynTokenizer,
+    prompt_token_ids: Vec<u32>,
+    prompt_logprobs_requested: bool,
+    generated_logprobs_requested: bool,
+    decoder: IncrementalDecoder,
     /// Decode options; matched stop strings are removed from `stop_strings`.
     options: TextDecodeOptions,
     /// Prompt logprob positions received so far.
     prompt_positions: Vec<PositionLogprobs>,
     /// `(queued_at, scheduled_at)` of the engine's scheduling event.
     scheduled: Option<(f64, f64)>,
-    /// Whether `DecodedTextEvent::Start` has been yielded.
+    /// Whether `DecodedTextEvent::Start` has been emitted.
     started: bool,
     /// Generated token awaiting its `TokenLogprobs` event when generated
     /// logprobs are requested.
@@ -162,62 +173,379 @@ struct DecodeState<'a> {
     output_tokens: usize,
 }
 
-impl DecodeState<'_> {
-    /// Emits start metadata once scheduling and any requested prompt scores are complete.
+/// The decoded events one engine event produced, and whether it ended the
+/// stream.
+pub(crate) struct Decoded {
+    /// The events, in order.
+    pub(crate) events: Vec<DecodedTextEvent>,
+    /// Whether the stream ended: no later event reaches this decoder.
+    pub(crate) ended: bool,
+}
+
+impl Decoded {
+    fn new(events: Vec<DecodedTextEvent>) -> Self {
+        Self {
+            events,
+            ended: false,
+        }
+    }
+
+    fn ended(events: Vec<DecodedTextEvent>) -> Self {
+        Self {
+            events,
+            ended: true,
+        }
+    }
+}
+
+impl DecodeStream {
+    /// A decoder for one generation request, before any engine event.
     ///
-    /// Idempotent: does nothing after `Start` has been yielded or while a
-    /// prerequisite is missing. The handlers of generated output check
-    /// `started` afterwards to reject output that arrives too early.
-    async fn emit_start_if_ready(
-        &mut self,
-        request_id: &str,
-        tokenizer: &HuggingFaceTokenizer,
-        prompt_token_ids: &[u32],
+    /// # Errors
+    ///
+    /// Fails with [`Error::EmptyPromptTokenIds`] when the prompt is empty.
+    pub(crate) fn new(
+        request_id: String,
+        tokenizer: DynTokenizer,
+        prompt_token_ids: Vec<u32>,
         prompt_logprobs_requested: bool,
-        y: &mut TryYielder<DecodedTextEvent, Error>,
-    ) -> Result<(), Error> {
+        generated_logprobs_requested: bool,
+        decode_options: TextDecodeOptions,
+    ) -> Result<Self, Error> {
+        if prompt_token_ids.is_empty() {
+            return Err(Error::EmptyPromptTokenIds { request_id });
+        }
+        let decoder = tokenizer.create_decode_stream(
+            &prompt_token_ids,
+            decode_options.skip_special_tokens,
+            stop_string_holdback_bytes(&decode_options),
+        );
+        Ok(Self {
+            request_id,
+            tokenizer,
+            prompt_token_ids,
+            prompt_logprobs_requested,
+            generated_logprobs_requested,
+            decoder,
+            options: decode_options,
+            prompt_positions: Vec::new(),
+            scheduled: None,
+            started: false,
+            pending_token: None,
+            output_tokens: 0,
+        })
+    }
+
+    /// The request's identifier.
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// The prompt's token identifiers.
+    pub(crate) fn prompt_token_ids(&self) -> &[u32] {
+        &self.prompt_token_ids
+    }
+
+    /// Whether the prompt log-probabilities are requested.
+    pub(crate) fn prompt_logprobs_requested(&self) -> bool {
+        self.prompt_logprobs_requested
+    }
+
+    /// Whether generated-token log-probabilities are requested.
+    pub(crate) fn generated_logprobs_requested(&self) -> bool {
+        self.generated_logprobs_requested
+    }
+
+    /// The decode options, with the stop strings not matched yet.
+    pub(crate) fn options(&self) -> &TextDecodeOptions {
+        &self.options
+    }
+
+    /// Generated text tokens the decoder consumed so far.
+    pub(crate) fn output_tokens(&self) -> usize {
+        self.output_tokens
+    }
+
+    /// Emits start metadata once scheduling and any requested prompt scores
+    /// are complete.
+    fn start_event(&mut self, prompt_token_ids: &[u32]) -> Result<Option<DecodedTextEvent>, Error> {
         // The first prompt token has no left context to score, so prompt
         // logprobs cover every position after it (see `DecodedPromptLogprobs`).
-        let prompt_ready =
-            !prompt_logprobs_requested || self.prompt_positions.len() == prompt_token_ids.len() - 1;
+        let prompt_ready = !self.prompt_logprobs_requested
+            || self.prompt_positions.len() + 1 == prompt_token_ids.len();
         let Some((queued_at, scheduled_at)) = self.scheduled else {
-            return Ok(());
+            return Ok(None);
         };
         if self.started || !prompt_ready {
-            return Ok(());
+            return Ok(None);
         }
-        let logprobs = prompt_logprobs_requested
+        let logprobs = self
+            .prompt_logprobs_requested
             .then(|| {
                 decode_prompt_logprobs(
-                    request_id,
-                    tokenizer,
+                    &self.request_id,
+                    self.tokenizer.as_ref(),
                     prompt_token_ids,
                     &self.prompt_positions,
                     self.options.skip_special_tokens,
                 )
             })
             .transpose()?;
-        y.yield_ok(DecodedTextEvent::Start {
+        self.started = true;
+        Ok(Some(DecodedTextEvent::Start {
             prompt: PromptInfo {
                 token_ids: Arc::from(prompt_token_ids),
                 logprobs,
             },
             queued_at,
             scheduled_at,
-        })
-        .await;
-        self.started = true;
-        Ok(())
+        }))
     }
 
-    /// Fails unless `Start` has been yielded and no generated token awaits
-    /// its logprobs, the state every event after `Start` requires.
-    fn ensure_output_ready(&self, request_id: &str, event: &str) -> Result<(), Error> {
+    /// Fails unless `Start` has been emitted and no generated token awaits its
+    /// logprobs, the state every event after `Start` requires.
+    fn ensure_output_ready(&self, event: &str) -> Result<(), Error> {
         if self.started && self.pending_token.is_none() {
             Ok(())
         } else {
             Err(Error::MalformedOutput {
-                request_id: request_id.to_owned(),
+                request_id: self.request_id.clone(),
+                message: format!("{event} arrived before output metadata was complete"),
+            })
+        }
+    }
+
+    /// Pushes one engine event and returns the decoded events it produced.
+    ///
+    /// `raw_stream` is the request's stream: a token that completes a stop
+    /// string cancels generation at the tokens received so far and acknowledges
+    /// the tokens otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`decoded_text_event_stream`] documents.
+    pub(crate) fn push(
+        &mut self,
+        event: Event,
+        raw_stream: &mut RequestEvents,
+    ) -> Result<Decoded, Error> {
+        let prompt_token_ids = self.prompt_token_ids.clone();
+        let prompt_tokens = prompt_token_ids.len();
+        let mut events = Vec::new();
+        match event {
+            // Scheduling metadata may arrive before prompt logprobs; start is
+            // emitted only after both prerequisites are complete.
+            Event::Scheduled {
+                queued_at,
+                scheduled_at,
+            } => {
+                self.scheduled = Some((queued_at, scheduled_at));
+                if let Some(start) = self.start_event(&prompt_token_ids)? {
+                    events.push(start);
+                }
+            }
+            Event::PromptLogprobs { positions } => {
+                if !self.prompt_logprobs_requested {
+                    return Err(Error::MalformedOutput {
+                        request_id: self.request_id.clone(),
+                        message: "engine returned unrequested prompt logprobs".to_string(),
+                    });
+                }
+                self.prompt_positions.extend(positions);
+                if self.prompt_positions.len() >= prompt_tokens {
+                    return Err(Error::MalformedOutput {
+                        request_id: self.request_id.clone(),
+                        message: "engine returned too many prompt logprob positions".to_string(),
+                    });
+                }
+                if let Some(start) = self.start_event(&prompt_token_ids)? {
+                    events.push(start);
+                }
+            }
+            // Generated logprobs, when requested, defer decoding until the
+            // matching TokenLogprobs event validates the token identity.
+            Event::TextToken { id, .. } => {
+                if let Some(start) = self.start_event(&prompt_token_ids)? {
+                    events.push(start);
+                }
+                self.ensure_output_ready_from(&events, "a generated token")?;
+                if self.generated_logprobs_requested {
+                    self.pending_token = Some(id);
+                } else if self.consume_tokens(
+                    &prompt_token_ids,
+                    &[id],
+                    Vec::new(),
+                    raw_stream,
+                    &mut events,
+                )? {
+                    return Ok(Decoded::ended(events));
+                }
+            }
+            // Tokens committed together, such as a block-diffusion canvas,
+            // carry no logprobs and decode as one update.
+            Event::TextTokens { ids } => {
+                if let Some(start) = self.start_event(&prompt_token_ids)? {
+                    events.push(start);
+                }
+                self.ensure_output_ready_from(&events, "a block of committed tokens")?;
+                if self.generated_logprobs_requested {
+                    return Err(Error::MalformedOutput {
+                        request_id: self.request_id.clone(),
+                        message: "engine emitted committed tokens without their requested logprobs"
+                            .to_string(),
+                    });
+                }
+                if self.consume_tokens(&prompt_token_ids, &ids, Vec::new(), raw_stream, &mut events)? {
+                    return Ok(Decoded::ended(events));
+                }
+            }
+            Event::TokenLogprobs { id, candidates } => {
+                let pending = self
+                    .pending_token
+                    .take()
+                    .ok_or_else(|| Error::MalformedOutput {
+                        request_id: self.request_id.clone(),
+                        message: "engine returned token logprobs without a pending token"
+                            .to_string(),
+                    })?;
+                // The event protocol lists the sampled token as the first candidate.
+                if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
+                    return Err(Error::MalformedOutput {
+                        request_id: self.request_id.clone(),
+                        message: "token logprobs do not match the emitted token".to_string(),
+                    });
+                }
+                if self.consume_tokens(
+                    &prompt_token_ids,
+                    &[id],
+                    vec![PositionLogprobs {
+                        entries: candidates,
+                    }],
+                    raw_stream,
+                    &mut events,
+                )? {
+                    return Ok(Decoded::ended(events));
+                }
+            }
+            Event::ImageBegin { .. } => {
+                self.ensure_output_ready_from(&events, "an image start")?;
+                events.push(DecodedTextEvent::Image(ImageEvent::Begin));
+            }
+            Event::ImageStep { image_id, .. } => {
+                self.ensure_output_ready_from(&events, "an image step")?;
+                events.push(DecodedTextEvent::Image(ImageEvent::Step { image_id }));
+            }
+            // A commit marks the image's entry into the model context; the
+            // completed image follows it.
+            Event::ImageCommit { .. } => {
+                self.ensure_output_ready_from(&events, "an image commit")?;
+            }
+            Event::ImageDone {
+                image_id,
+                height,
+                width,
+                bytes,
+                pixels_png_b64,
+                ..
+            } => {
+                // Published at once, after the text decoded before it: the
+                // request may generate for long before its next text token,
+                // such as a whole next image, which opens with a control
+                // token and publishes no text.
+                self.ensure_output_ready_from(&events, "a completed image")?;
+                events.push(DecodedTextEvent::Image(ImageEvent::Done(GeneratedImage {
+                    image_id,
+                    width,
+                    height,
+                    bytes,
+                    png_base64: pixels_png_b64,
+                })));
+            }
+            // A terminal event flushes decoder holdback only after every pending
+            // token/logprob pair and all prompt metadata have resolved.
+            Event::Finished {
+                reason,
+                stop_reason,
+                completion_tokens,
+                images,
+                ..
+            } => {
+                if let Some(start) = self.start_event(&prompt_token_ids)? {
+                    events.push(start);
+                }
+                self.ensure_output_ready_from(&events, "the terminal event")?;
+                let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
+                    events.push(DecodedTextEvent::Failed {
+                        message: "engine execution failed".to_owned(),
+                    });
+                    return Ok(Decoded::ended(events));
+                };
+
+                // Release the decoder's holdback untruncated: a stop-string
+                // match would have ended the stream in `consume_tokens`.
+                let (last_chunk, text) = self.decoder.flush(None)?;
+                debug!(
+                    ?reason,
+                    output_tokens = self.output_tokens,
+                    "request finished with decoded text"
+                );
+                if tracing::enabled!(Level::TRACE) {
+                    trace!(full_text = text, "terminal decoded text");
+                }
+
+                events.push(DecodedTextEvent::TextDelta {
+                    delta: last_chunk.unwrap_or_default(),
+                    token_ids: Vec::new(),
+                    logprobs: None,
+                });
+                events.push(DecodedTextEvent::Done(Finished {
+                    reason,
+                    prompt_tokens,
+                    output_tokens: completion_tokens,
+                    images,
+                }));
+                return Ok(Decoded::ended(events));
+            }
+            Event::Rejected { kind, message } => {
+                events.push(DecodedTextEvent::Rejected { kind, message });
+                return Ok(Decoded::ended(events));
+            }
+            Event::Error { message } | Event::ArtifactUnavailable { message } => {
+                events.push(DecodedTextEvent::Failed { message });
+                return Ok(Decoded::ended(events));
+            }
+            // A request's events migrate with it (`crate::migration`), which
+            // carries a migratable end over to the next engine and keeps the
+            // control tokens a migration submits again.
+            Event::Migratable { .. } | Event::ControlToken { .. } => {
+                return Err(Error::MalformedOutput {
+                    request_id: self.request_id.clone(),
+                    message: "a migration's event reached the decoder".to_string(),
+                });
+            }
+            // Media artifacts belong to diffusion requests, and readout
+            // answers to readout requests, which other consumers collect.
+            Event::Artifact(_) | Event::MediaProgress { .. } | Event::Readout { .. } => {
+                return Err(Error::MalformedOutput {
+                    request_id: self.request_id.clone(),
+                    message: "a generation request received a media or readout event".to_string(),
+                });
+            }
+        }
+        Ok(Decoded::new(events))
+    }
+
+    /// Fails unless `Start` is emitted (by `start_event` or earlier) and no
+    /// generated token awaits its logprobs.
+    fn ensure_output_ready_from(&self, events: &[DecodedTextEvent], event: &str) -> Result<(), Error> {
+        let starting = events
+            .iter()
+            .any(|event| matches!(event, DecodedTextEvent::Start { .. }));
+        if (self.started || starting) && self.pending_token.is_none() {
+            Ok(())
+        } else {
+            Err(Error::MalformedOutput {
+                request_id: self.request_id.clone(),
                 message: format!("{event} arrived before output metadata was complete"),
             })
         }
@@ -225,25 +553,25 @@ impl DecodeState<'_> {
 
     /// Decodes committed tokens in order and applies stop-string holdback.
     ///
-    /// `token_ids` are the tokens of one engine output event and `positions`
-    /// their requested logprobs, if any. Returns `true` when a token completed
-    /// a stop string. In that case the engine has been told to stop at the
-    /// tokens received so far, the decoder has been flushed and truncated at
-    /// the match, and the final `TextDelta`, covering the tokens through the
-    /// matching one, and `Done` have been yielded, so the caller must end the
-    /// stream. Otherwise the tokens are acknowledged to the engine and
-    /// yielded as one `TextDelta`.
-    async fn consume_tokens(
+    /// Returns `true` when a token completed a stop string; the decoder has
+    /// then been flushed and truncated at the match and the final `TextDelta`
+    /// and `Done` are pushed, so the caller must end the stream.
+    fn consume_tokens(
         &mut self,
-        tokenizer: &HuggingFaceTokenizer,
-        prompt_tokens: usize,
+        prompt_token_ids: &[u32],
         token_ids: &[u32],
         positions: Vec<PositionLogprobs>,
         raw_stream: &mut RequestEvents,
-        y: &mut TryYielder<DecodedTextEvent, Error>,
+        events: &mut Vec<DecodedTextEvent>,
     ) -> Result<bool, Error> {
         let decoded_logprobs = (!positions.is_empty())
-            .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
+            .then(|| {
+                decode_logprobs(
+                    self.tokenizer.as_ref(),
+                    &positions,
+                    self.options.skip_special_tokens,
+                )
+            })
             .transpose()?;
 
         let mut delta = String::new();
@@ -273,29 +601,139 @@ impl DecodeState<'_> {
             // `last_chunk` is the not-yet-emitted remainder of the truncated
             // text.
             let (last_chunk, _) = self.decoder.flush(truncate_to)?;
-            y.yield_ok(DecodedTextEvent::TextDelta {
+            events.push(DecodedTextEvent::TextDelta {
                 delta: delta + last_chunk.unwrap_or_default().as_str(),
                 token_ids: token_ids[..=index].to_vec(),
                 logprobs: decoded_logprobs,
-            })
-            .await;
-            y.yield_ok(DecodedTextEvent::Done(Finished {
+            });
+            events.push(DecodedTextEvent::Done(Finished {
                 reason: FinishReason::Stop(Some(StopReason::String(stop_string))),
-                prompt_tokens,
+                prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
                 images: 0,
-            }))
-            .await;
+            }));
             return Ok(true);
         }
         raw_stream.acknowledge_consumed_prefix();
-        y.yield_ok(DecodedTextEvent::TextDelta {
+        events.push(DecodedTextEvent::TextDelta {
             delta,
             token_ids: token_ids.to_vec(),
             logprobs: decoded_logprobs,
-        })
-        .await;
+        });
         Ok(false)
+    }
+
+    /// The decoder's state, for a successor process (design §7.5.1).
+    pub(crate) fn state(&self) -> proto::handoff::Decode {
+        use proto::handoff;
+        let decoder = self.decoder.state();
+        handoff::Decode {
+            decoder: Some(handoff::IncrementalDecode {
+                ids: decoder.ids,
+                prefix: decoder.prefix,
+                prefix_index: decoder.prefix_index as u64,
+                cumulative_output: decoder.cumulative_output,
+                output_index: decoder.output_index as u64,
+                prompt_seeded: decoder.prompt_seeded,
+                pending_since_emit: decoder.pending_since_emit as u64,
+                skip_special_tokens: decoder.skip_special_tokens,
+                min_bytes_to_buffer: decoder.min_bytes_to_buffer as u64,
+            }),
+            stop_strings: self.options.stop_strings.clone().unwrap_or_default(),
+            prompt_positions: self
+                .prompt_positions
+                .iter()
+                .map(|position| handoff::PositionLogprobs {
+                    entries: position
+                        .entries
+                        .iter()
+                        .map(|entry| handoff::TokenLogprob {
+                            token_id: entry.token_id,
+                            logprob: entry.logprob,
+                            rank: entry.rank,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            queued_at: self.scheduled.map(|(queued_at, _)| queued_at),
+            scheduled_at: self.scheduled.map(|(_, scheduled_at)| scheduled_at),
+            started: self.started,
+            pending_token: self.pending_token,
+            output_tokens: self.output_tokens as u64,
+        }
+    }
+
+    /// Continues the stream `state` describes, on `tokenizer`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::EmptyPromptTokenIds`] when the state names no prompt.
+    pub(crate) fn resume(
+        request_id: String,
+        tokenizer: DynTokenizer,
+        prompt_token_ids: Vec<u32>,
+        prompt_logprobs_requested: bool,
+        generated_logprobs_requested: bool,
+        options: TextDecodeOptions,
+        state: &proto::handoff::Decode,
+    ) -> Result<Self, Error> {
+        if prompt_token_ids.is_empty() {
+            return Err(Error::EmptyPromptTokenIds { request_id });
+        }
+        let decoder = match &state.decoder {
+            Some(decoder) => IncrementalDecoder::resume(
+                crate::tokenizer::IncrementalDecodeState {
+                    ids: decoder.ids.clone(),
+                    prefix: decoder.prefix.clone(),
+                    prefix_index: decoder.prefix_index as usize,
+                    cumulative_output: decoder.cumulative_output.clone(),
+                    output_index: decoder.output_index as usize,
+                    prompt_seeded: decoder.prompt_seeded,
+                    pending_since_emit: decoder.pending_since_emit as usize,
+                    skip_special_tokens: decoder.skip_special_tokens,
+                    min_bytes_to_buffer: decoder.min_bytes_to_buffer as usize,
+                },
+                Arc::clone(&tokenizer),
+            ),
+            None => tokenizer.create_decode_stream(
+                &prompt_token_ids,
+                options.skip_special_tokens,
+                stop_string_holdback_bytes(&options),
+            ),
+        };
+        let mut options = options;
+        options.stop_strings = (!state.stop_strings.is_empty()).then(|| state.stop_strings.clone());
+        Ok(Self {
+            request_id,
+            tokenizer,
+            prompt_token_ids,
+            prompt_logprobs_requested,
+            generated_logprobs_requested,
+            decoder,
+            options,
+            prompt_positions: state
+                .prompt_positions
+                .iter()
+                .map(|position| PositionLogprobs {
+                    entries: position
+                        .entries
+                        .iter()
+                        .map(|entry| proto::request::TokenLogprob {
+                            token_id: entry.token_id,
+                            logprob: entry.logprob,
+                            rank: entry.rank,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            scheduled: match (state.queued_at, state.scheduled_at) {
+                (Some(queued_at), Some(scheduled_at)) => Some((queued_at, scheduled_at)),
+                _ => None,
+            },
+            started: state.started,
+            pending_token: state.pending_token,
+            output_tokens: state.output_tokens as usize,
+        })
     }
 }
 
@@ -305,7 +743,7 @@ impl DecodeState<'_> {
 /// (`output_tokens` counts the tokens before this one). A matched stop
 /// string is removed from `options.stop_strings`.
 fn decode_one_token(
-    decoder: &mut IncrementalDecoder<'_>,
+    decoder: &mut IncrementalDecoder,
     token_id: u32,
     output_tokens: usize,
     options: &mut TextDecodeOptions,
@@ -355,289 +793,26 @@ pub async fn decoded_text_event_stream(
     decode_options: TextDecodeOptions,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::output::text::Result<()> {
-    // The prompt seeds incremental decoding and supplies the expected prompt-
-    // logprob cardinality before any generated token can be accepted.
-    if prompt_token_ids.is_empty() {
-        return Err(Error::EmptyPromptTokenIds {
-            request_id: request_id.clone(),
-        });
-    }
-    let prompt_tokens = prompt_token_ids.len();
-    let decoder = tokenizer.create_decode_stream(
-        &prompt_token_ids,
-        decode_options.skip_special_tokens,
-        stop_string_holdback_bytes(&decode_options),
-    );
-    let mut state = DecodeState {
-        decoder,
-        options: decode_options,
-        prompt_positions: Vec::new(),
-        scheduled: None,
-        started: false,
-        pending_token: None,
-        output_tokens: 0,
-    };
-
-    // Engine events form an ordered protocol: scheduling and optional prompt
-    // metadata establish Start, then each token is paired with optional logprobs.
-    while let Some(event) = raw_stream.next().await {
-        match event {
-            // Scheduling metadata may arrive before prompt logprobs; start is
-            // emitted only after both prerequisites are complete.
-            Event::Scheduled {
-                queued_at,
-                scheduled_at,
-            } => {
-                state.scheduled = Some((queued_at, scheduled_at));
-                state
-                    .emit_start_if_ready(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        prompt_logprobs_requested,
-                        &mut y,
-                    )
-                    .await?;
-            }
-            Event::PromptLogprobs { positions } => {
-                if !prompt_logprobs_requested {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine returned unrequested prompt logprobs".to_string(),
-                    });
-                }
-                state.prompt_positions.extend(positions);
-                if state.prompt_positions.len() >= prompt_tokens {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine returned too many prompt logprob positions".to_string(),
-                    });
-                }
-                state
-                    .emit_start_if_ready(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        prompt_logprobs_requested,
-                        &mut y,
-                    )
-                    .await?;
-            }
-            // Generated logprobs, when requested, defer decoding until the
-            // matching TokenLogprobs event validates the token identity.
-            Event::TextToken { id, .. } => {
-                state
-                    .emit_start_if_ready(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        prompt_logprobs_requested,
-                        &mut y,
-                    )
-                    .await?;
-                state.ensure_output_ready(&request_id, "a generated token")?;
-                if generated_logprobs_requested {
-                    state.pending_token = Some(id);
-                } else if state
-                    .consume_tokens(
-                        tokenizer.as_ref(),
-                        prompt_tokens,
-                        &[id],
-                        Vec::new(),
-                        &mut raw_stream,
-                        &mut y,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-            }
-            // Tokens committed together, such as a block-diffusion canvas,
-            // carry no logprobs and decode as one update.
-            Event::TextTokens { ids } => {
-                state
-                    .emit_start_if_ready(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        prompt_logprobs_requested,
-                        &mut y,
-                    )
-                    .await?;
-                state.ensure_output_ready(&request_id, "a block of committed tokens")?;
-                if generated_logprobs_requested {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine emitted committed tokens without their requested logprobs"
-                            .to_string(),
-                    });
-                }
-                if state
-                    .consume_tokens(
-                        tokenizer.as_ref(),
-                        prompt_tokens,
-                        &ids,
-                        Vec::new(),
-                        &mut raw_stream,
-                        &mut y,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-            }
-            Event::TokenLogprobs { id, candidates } => {
-                let pending = state
-                    .pending_token
-                    .take()
-                    .ok_or_else(|| Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine returned token logprobs without a pending token"
-                            .to_string(),
-                    })?;
-                // The event protocol lists the sampled token as the first candidate.
-                if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
-                    return Err(Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "token logprobs do not match the emitted token".to_string(),
-                    });
-                }
-                if state
-                    .consume_tokens(
-                        tokenizer.as_ref(),
-                        prompt_tokens,
-                        &[id],
-                        vec![PositionLogprobs {
-                            entries: candidates,
-                        }],
-                        &mut raw_stream,
-                        &mut y,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-            }
-            Event::ImageBegin { .. } => {
-                state.ensure_output_ready(&request_id, "an image start")?;
-                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Begin)).await;
-            }
-            Event::ImageStep { image_id, .. } => {
-                state.ensure_output_ready(&request_id, "an image step")?;
-                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Step { image_id }))
-                    .await;
-            }
-            // A commit marks the image's entry into the model context; the
-            // completed image follows it.
-            Event::ImageCommit { .. } => {
-                state.ensure_output_ready(&request_id, "an image commit")?;
-            }
-            Event::ImageDone {
-                image_id,
-                height,
-                width,
-                bytes,
-                pixels_png_b64,
-                ..
-            } => {
-                // Published at once, after the text decoded before it: the
-                // request may generate for long before its next text token,
-                // such as a whole next image, which opens with a control
-                // token and publishes no text.
-                state.ensure_output_ready(&request_id, "a completed image")?;
-                y.yield_ok(DecodedTextEvent::Image(ImageEvent::Done(GeneratedImage {
-                    image_id,
-                    width,
-                    height,
-                    bytes,
-                    png_base64: pixels_png_b64,
-                })))
-                .await;
-            }
-            // A terminal event flushes decoder holdback only after every pending
-            // token/logprob pair and all prompt metadata have resolved.
-            Event::Finished {
-                reason,
-                stop_reason,
-                completion_tokens,
-                images,
-                ..
-            } => {
-                state
-                    .emit_start_if_ready(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        prompt_logprobs_requested,
-                        &mut y,
-                    )
-                    .await?;
-                state.ensure_output_ready(&request_id, "the terminal event")?;
-                let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
-                    y.yield_ok(DecodedTextEvent::Failed {
-                        message: "engine execution failed".to_owned(),
-                    })
-                    .await;
-                    return Ok(());
-                };
-
-                // Release the decoder's holdback untruncated: a stop-string
-                // match would have ended the stream in `consume_tokens`.
-                let (last_chunk, text) = state.decoder.flush(None)?;
-                debug!(
-                    ?reason,
-                    output_tokens = state.output_tokens,
-                    "request finished with decoded text"
-                );
-                if tracing::enabled!(Level::TRACE) {
-                    trace!(full_text = text, "terminal decoded text");
-                }
-
-                y.yield_ok(DecodedTextEvent::TextDelta {
-                    delta: last_chunk.unwrap_or_default(),
-                    token_ids: Vec::new(),
-                    logprobs: None,
-                })
-                .await;
-                y.yield_ok(DecodedTextEvent::Done(Finished {
-                    reason,
-                    prompt_tokens,
-                    output_tokens: completion_tokens,
-                    images,
-                }))
-                .await;
-                return Ok(());
-            }
-            Event::Rejected { kind, message } => {
-                y.yield_ok(DecodedTextEvent::Rejected { kind, message })
-                    .await;
-                return Ok(());
-            }
-            Event::Error { message } | Event::ArtifactUnavailable { message } => {
-                y.yield_ok(DecodedTextEvent::Failed { message }).await;
-                return Ok(());
-            }
-            // A request's events migrate with it (`crate::migration`), which
-            // carries a migratable end over to the next engine and keeps the
-            // control tokens a migration submits again.
-            Event::Migratable { .. } | Event::ControlToken { .. } => {
-                return Err(Error::MalformedOutput {
-                    request_id: request_id.clone(),
-                    message: "a migration's event reached the decoder".to_string(),
-                });
-            }
-            // Media artifacts belong to diffusion requests, and readout
-            // answers to readout requests, which other consumers collect.
-            Event::Artifact(_) | Event::MediaProgress { .. } | Event::Readout { .. } => {
-                return Err(Error::MalformedOutput {
-                    request_id: request_id.clone(),
-                    message: "a generation request received a media or readout event".to_string(),
-                });
-            }
+    let request = request_id.clone();
+    let mut stream = DecodeStream::new(
+        request_id,
+        tokenizer,
+        prompt_token_ids,
+        prompt_logprobs_requested,
+        generated_logprobs_requested,
+        decode_options,
+    )?;
+    while let Some(event) = raw_stream.recv().await {
+        let decoded = stream.push(event, &mut raw_stream)?;
+        for event in decoded.events {
+            y.yield_ok(event).await;
+        }
+        if decoded.ended {
+            return Ok(());
         }
     }
 
-    Err(Error::StreamClosedBeforeTerminalOutput { request_id })
+    Err(Error::StreamClosedBeforeTerminalOutput { request_id: request })
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.

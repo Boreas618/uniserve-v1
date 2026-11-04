@@ -40,4 +40,14 @@ impl ReasoningParser for Qwen3ReasoningParser {
     fn finish(&mut self) -> ReasoningDelta {
         self.inner.finish()
     }
+
+    /// The delimited state machine's state.
+    fn state(&self) -> Option<proto::handoff::Reasoning> {
+        Some(self.inner.state())
+    }
+
+    /// Restores the delimited state machine's state.
+    fn resume(&mut self, state: &proto::handoff::Reasoning) {
+        self.inner.resume(state);
+    }
 }

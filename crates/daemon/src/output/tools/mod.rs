@@ -15,6 +15,8 @@ mod json;
 mod test_utils;
 mod utils;
 
+use proto::handoff;
+
 pub use error::{Result, ToolParserError};
 pub use gemma4::Gemma4ToolParser;
 pub use json::Qwen25ToolParser;
@@ -47,6 +49,15 @@ pub trait ToolParser: Send {
     /// Resets parser state and returns the buffered input that no emitted
     /// output represents.
     fn reset(&mut self) -> String;
+
+    /// The parser's state for the process that goes on writing the response
+    /// after a handoff (design §7.5.1 step 3). `None` when this parser has no
+    /// state to continue from: a successor ends the response.
+    fn state(&self) -> Option<handoff::tool_stage::Parser>;
+
+    /// Takes over the state `state`, which belongs to a parser of this kind
+    /// (`state` is the value this parser's [`Self::state`] returned).
+    fn resume(&mut self, state: &handoff::tool_stage::Parser);
 
     #[cfg(test)]
     /// Parses one incremental text chunk.
