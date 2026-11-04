@@ -81,6 +81,38 @@ pub(crate) fn slot_mapping(
     Some(slots)
 }
 
+/// The batch's `[rows + 1]` packed query offsets: row `r` holds query tokens
+/// `offsets[r]..offsets[r + 1]` of the packed token columns.
+///
+/// `query_lens` is one row's query length per row, in row order. `None` when a
+/// length or the total does not fit the column's `i32`, which a batch of this
+/// size cannot address.
+pub(crate) fn query_offsets(query_lens: &[u32]) -> Option<Vec<i32>> {
+    let mut offsets = Vec::with_capacity(query_lens.len() + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for len in query_lens {
+        total = total.checked_add(*len)?;
+        offsets.push(i32::try_from(total).ok()?);
+    }
+    Some(offsets)
+}
+
+/// The absolute positions of the query tokens a call evaluates: its first
+/// token's logical position, then one per token of the call.
+///
+/// A call's query interval is contiguous in its request's sequence, which is
+/// what `Call.coordinates.logical_position` and its input tokens state.
+pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
+    let first = u32::try_from(call.coordinates.logical_position).ok()?;
+    let tokens = u32::try_from(call.input_token_ids.len()).ok()?;
+    let mut positions = Vec::with_capacity(call.input_token_ids.len());
+    for offset in 0..tokens {
+        positions.push(i32::try_from(first.checked_add(offset)?).ok()?);
+    }
+    Some(positions)
+}
+
 /// One entry per forward row: the row whose hidden state the row's logits come
 /// from, or -1 when the row produces no logits.
 ///
@@ -101,7 +133,7 @@ pub(crate) fn slot_mapping(
 /// `None` when the calls and the spans disagree, when the spans are not the
 /// contiguous row order of one batch, or when a sampling prefill has no row —
 /// a batch must not ask a kernel to sample a row it does not have.
-pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i64>> {
+pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i32>> {
     if calls.len() != rows.len() {
         return None;
     }
@@ -112,7 +144,7 @@ pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Ve
         }
         total = usize::try_from(span.end).ok()?;
     }
-    let mut logits = vec![-1i64; total];
+    let mut logits = vec![-1i32; total];
     for (call, span) in calls.iter().zip(rows) {
         if call.consumer_slots.is_empty() {
             continue;
@@ -122,11 +154,11 @@ pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Ve
         match call.kind {
             ipc::CallKind::Forward(ipc::ForwardMode::Prefill) => {
                 let last = end.checked_sub(1).filter(|last| *last >= start)?;
-                logits[last] = i64::try_from(last).ok()?;
+                logits[last] = i32::try_from(last).ok()?;
             }
             ipc::CallKind::Forward(ipc::ForwardMode::Decode | ipc::ForwardMode::Verify) => {
                 for row in start..end {
-                    logits[row] = i64::try_from(row).ok()?;
+                    logits[row] = i32::try_from(row).ok()?;
                 }
             }
             _ => {}
@@ -261,5 +293,28 @@ mod tests {
         assert_eq!(logits_rows(&calls, &[1..2, 2..3]), None);
         // A sampling prefill with no row.
         assert_eq!(logits_rows(&calls, &[0..0, 0..1]), None);
+    }
+
+    fn token_call(positions: &[u32], logical_position: u32) -> ipc::Call {
+        let mut call = call(prefill(), true);
+        call.coordinates.logical_position = logical_position;
+        call.input_token_ids = positions.to_vec();
+        call
+    }
+
+    #[test]
+    fn query_offsets_pack_the_rows_of_the_batch() {
+        assert_eq!(query_offsets(&[2, 1, 3]), Some(vec![0, 2, 3, 6]));
+        assert_eq!(query_offsets(&[]), Some(vec![0]));
+        // A total the column cannot address.
+        assert_eq!(query_offsets(&[u32::MAX, 1]), None);
+    }
+
+    #[test]
+    fn positions_are_the_call_s_query_interval() {
+        assert_eq!(positions(&token_call(&[0; 3], 12)), Some(vec![12, 13, 14]));
+        assert_eq!(positions(&token_call(&[], 12)), Some(Vec::new()));
+        // A position past the column's range.
+        assert_eq!(positions(&token_call(&[0; 2], u32::MAX)), None);
     }
 }
