@@ -72,6 +72,23 @@ pub(crate) struct Application {
 pub(crate) const FRONTEND: &str = "frontend";
 
 impl Application {
+    /// The arguments a frontend is started with, from the ones the daemon was
+    /// started with: the same file, flags and `--set` assignments, with the
+    /// `serve` subcommand replaced by `frontend` (§7.5, §7.7).
+    ///
+    /// The deployment has one parser, and the frontend command resolves the
+    /// same arguments `serve` does, so what the daemon resolved is what the
+    /// frontend resolves; nothing is re-stated as a second command line.
+    pub(crate) fn arguments(argv: &[String]) -> Vec<String> {
+        let mut arguments = argv.to_vec();
+        if let Some(subcommand) = arguments.first_mut()
+            && subcommand == "serve"
+        {
+            *subcommand = "frontend".to_owned();
+        }
+        arguments
+    }
+
     /// The frontend of the node running `executable` with `arguments` and
     /// `environment`, started through `requests` and commanded through
     /// `commands`.
@@ -267,6 +284,39 @@ mod tests {
         assert_eq!(fixture.application.start().expect("the launch"), 41);
         assert_eq!(fixture.application.pid(), Some(41));
         assert!(!fixture.application.paused());
+    }
+
+    #[test]
+    fn the_frontend_is_started_with_the_deployments_own_arguments() {
+        let argv: Vec<String> = [
+            "serve",
+            "/models/qwen3",
+            "--port",
+            "8000",
+            "--set",
+            "kv_cache_config.host_gib=32",
+        ]
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect();
+        assert_eq!(
+            Application::arguments(&argv),
+            [
+                "frontend",
+                "/models/qwen3",
+                "--port",
+                "8000",
+                "--set",
+                "kv_cache_config.host_gib=32",
+            ]
+        );
+        // Whatever the daemon was started as is handed on unchanged when it is
+        // not the `serve` subcommand; the frontend's own parser decides.
+        let other: Vec<String> = ["frontend", "--port", "8001"]
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        assert_eq!(Application::arguments(&other), other);
     }
 
     #[test]
