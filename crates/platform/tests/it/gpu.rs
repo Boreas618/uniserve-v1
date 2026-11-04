@@ -1539,10 +1539,12 @@ fn kernel_node_params_read_back_what_a_capture_recorded() {
     let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
 
     let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    // The write kernel stores at `threadIdx.x`, so one block of eight threads
+    // fills the eight words of the allocation.
     write
         .launch_ex(
             &stream,
-            &LaunchConfig::new([2, 1, 1], [4, 1, 1]),
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
             &mut parameters,
         )
         .unwrap();
@@ -1552,8 +1554,8 @@ fn kernel_node_params_read_back_what_a_capture_recorded() {
 
     assert_eq!(node.kind().unwrap(), GraphNodeKind::Kernel);
     let read = graph.kernel_node_params(&node).unwrap();
-    assert_eq!(read.grid, [2, 1, 1], "the grid the launch carried");
-    assert_eq!(read.block, [4, 1, 1], "the block the launch carried");
+    assert_eq!(read.grid, [1, 1, 1], "the grid the launch carried");
+    assert_eq!(read.block, [8, 1, 1], "the block the launch carried");
     assert_eq!(read.shared_memory, 0);
     assert_eq!(read.parameters.len(), 2, "the kernel takes two parameters");
     assert_eq!(
@@ -2188,6 +2190,7 @@ fn a_channels_last_convolution_matches_the_definition_of_a_conv3d() {
         dims: dims.iter().map(|&dim| dim as i64).collect(),
         strides,
         dtype,
+        byte_alignment: 16,
     };
     let convolution = Convolution::new(
         tensor(x_dims, x_strides, DataType::F32),
@@ -2224,4 +2227,98 @@ fn the_sticky_error_probe_answers_from_another_thread() {
         !poisoned,
         "a healthy context must not read as sticky from a thread that has not entered it"
     );
+}
+
+/// One rank of [`two_ranks_exchange_blocks_and_reduce_across_their_group`],
+/// run on its own thread as design 2.4 gives every device one.
+///
+/// Rank `r` sends block `j` of two `u32` elements as `[100·j + 10·r, + 1]`, so
+/// both the block's owner and the sender are visible in what each rank reads
+/// back after the exchange.
+fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
+    let device = DeviceId(rank);
+    let world = Communicator::init(device, 2, rank, &id).map_err(|error| error.to_string())?;
+    let group = world
+        .split(&[0, 1], rank)
+        .map_err(|error| error.to_string())?
+        .ok_or("both ranks are in the group")?;
+    assert_eq!((group.rank(), group.size()), (rank, 2));
+
+    let stream = Stream::new(device).map_err(|error| error.to_string())?;
+    let send = DeviceAllocation::linear(device, 16).map_err(|error| error.to_string())?;
+    let recv = DeviceAllocation::linear(device, 16).map_err(|error| error.to_string())?;
+    let host = PinnedBuffer::new(device, 16).map_err(|error| error.to_string())?;
+
+    let mut pattern = [[0u8; 4]; 4];
+    for (element, chunk) in pattern.iter_mut().enumerate() {
+        let value = 100 * (element / 2) as u32 + 10 * rank as u32 + (element % 2) as u32;
+        *chunk = value.to_ne_bytes();
+    }
+    // SAFETY: the host array is live and the stream is synchronized below.
+    unsafe {
+        memcpy_async(send.address(), pattern.as_ptr() as u64, 16, &stream)
+            .map_err(|error| error.to_string())?;
+        memset_d32(recv.address(), 0, 4, &stream).map_err(|error| error.to_string())?;
+    }
+
+    // Design 4.3's shape: the group is reached through a shared reference.
+    let send_range = DeviceRange::new(DevicePtr::from_address(send.address()), 16);
+    let recv_range = DeviceRange::new(DevicePtr::from_address(recv.address()), 16);
+    group
+        .all_to_all(&stream, send_range, recv_range, 2, DataType::U32)
+        .map_err(|error| error.to_string())?;
+    // Sum the exchanged window across the group, in place.
+    group
+        .all_reduce(
+            &stream,
+            recv_range,
+            recv_range,
+            4,
+            DataType::U32,
+            ReduceOp::Sum,
+        )
+        .map_err(|error| error.to_string())?;
+    // SAFETY: the copy fills the pinned buffer and the stream is synchronized.
+    unsafe { memcpy_async(host.address(), recv.address(), 16, &stream) }
+        .map_err(|error| error.to_string())?;
+    stream.synchronize().map_err(|error| error.to_string())?;
+
+    // Rank r read `[100·r, 100·r + 1, 100·r + 10, 100·r + 11]`; summed over
+    // two ranks that is the same on both, and wrong block order, a wrong
+    // per-peer count or a single rank's data all give a different line.
+    let words: Vec<u32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_ne_bytes(*word))
+        .collect();
+    assert_eq!(words, [100, 102, 120, 122], "rank {rank}");
+
+    group.destroy().map_err(|error| error.to_string())?;
+    world.destroy().map_err(|error| error.to_string())
+}
+
+/// Two ranks in one process, one thread per device (design 2.4): the shape the
+/// executor runs a world plan in, and the only test here that would catch a
+/// collective's per-peer count being confused with a buffer's element count.
+#[test]
+#[ignore = "requires two CUDA devices and NCCL"]
+fn two_ranks_exchange_blocks_and_reduce_across_their_group() {
+    let _driver = exclusive_driver();
+    let devices = Device::count().unwrap();
+    if devices < 2 {
+        eprintln!("two-rank test: {devices} device(s) here, and the exchange needs two");
+        return;
+    }
+    let id = UniqueId::new().unwrap();
+    let ranks: Vec<_> = (0..2)
+        .map(|rank| std::thread::spawn(move || two_rank_half(rank, id)))
+        .collect();
+    for (rank, handle) in ranks.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("rank {rank}: {error}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 }
