@@ -264,6 +264,57 @@ fn prepare_selects_the_latest_revision_of_a_backend() {
 }
 
 #[test]
+fn prepare_refuses_descriptors_of_an_operator_no_program_fills() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    installed(&configuration.package_root, 1);
+    let server = ProgramServer::open(&configuration).unwrap();
+    let request = PrepareRequest {
+        targets: vec![Target::new("sm_100a")],
+        programs: vec![ProgramRequest {
+            slot: ProgramSlot::all("rms_norm"),
+            selector: Selector::Latest {
+                backend: "triton".into(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: vec![Descriptors {
+            op: "paged_attention".into(),
+            keys: vec!["dtype_bf16".into()],
+        }],
+    };
+
+    assert!(matches!(
+        server.prepare(&request, &mut |_| {}),
+        Err(Error::Protocol(_))
+    ));
+}
+
+#[test]
+fn resolve_refuses_a_target_the_package_does_not_build_for() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    installed(&configuration.package_root, 1);
+    let server = ProgramServer::open(&configuration).unwrap();
+    let program = Program {
+        backend: "triton".into(),
+        revision: 1,
+        arguments: toml::Table::new(),
+    };
+
+    match server.resolve(
+        "rms_norm",
+        &program,
+        &Target::new("sm_90a"),
+        "dtype_bf16",
+        &mut |_| {},
+    ) {
+        Err(Error::Build { target, .. }) => assert_eq!(target, "sm_90a"),
+        other => panic!("unexpected answer {other:?}"),
+    }
+}
+
+#[test]
 fn resolve_refuses_a_descriptor_the_program_does_not_cover() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path(), None);

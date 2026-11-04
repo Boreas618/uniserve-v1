@@ -197,6 +197,41 @@ fn a_manifest_of_an_unknown_source_kind_is_refused() {
 }
 
 #[test]
+fn a_package_may_carry_one_file_per_descriptor() {
+    let text = r#"
+op = "paged_attention"
+backend = "trtllm-gen"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0"
+
+[module]
+form = "native"
+entry = "uniserve_paged_attention_launch"
+
+[source]
+kind = "cubin"
+files = ["cubin/{descriptor}.cubin", "cubin/{descriptor}.json"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"], head_dim = ["128"] } }
+"#;
+    let root = package(text, &[]);
+    let manifest = Manifest::load(root.path()).expect("a per-descriptor package");
+
+    assert!(manifest.source.per_descriptor());
+    assert_eq!(
+        manifest.source.files_for("dtype_bf16_head_dim_128"),
+        [
+            "cubin/dtype_bf16_head_dim_128.cubin",
+            "cubin/dtype_bf16_head_dim_128.json"
+        ]
+    );
+}
+
+#[test]
 fn a_package_missing_its_manifest_is_refused() {
     let root: PathBuf = tempfile::tempdir().unwrap().keep();
     assert!(Manifest::load(Path::new(&root)).is_err());

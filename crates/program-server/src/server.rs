@@ -392,6 +392,18 @@ impl ProgramServer {
             });
         }
 
+        // Asking for the descriptors of an operator no program fills would
+        // silently leave the epoch without its modules; it is the request's
+        // inconsistency, not a missing build.
+        for descriptors in &request.descriptors {
+            if !chosen.iter().any(|chosen| chosen.slot.op == descriptors.op) {
+                return Err(Error::Protocol(format!(
+                    "prepare asks for the descriptors of {} and no program fills it",
+                    descriptors.op
+                )));
+            }
+        }
+
         let mut builds: Vec<(ModulePath, Receiver<BuildState>)> = Vec::new();
         let mut failures: Vec<Error> = Vec::new();
         for chosen in &chosen {
@@ -489,6 +501,25 @@ impl ProgramServer {
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
         let package = self.package(op, program)?;
+        if !package
+            .manifest
+            .kernel
+            .architectures
+            .iter()
+            .any(|architecture| architecture == target.as_str())
+        {
+            return Err(Error::Build {
+                op: op.to_owned(),
+                backend: program.backend.clone(),
+                revision: program.revision,
+                target: target.to_string(),
+                descriptor: descriptor.to_owned(),
+                message: format!(
+                    "the package builds for {:?}",
+                    package.manifest.kernel.architectures
+                ),
+            });
+        }
         if !package.manifest.kernel.descriptors.covers(descriptor) {
             return Err(Error::UnsupportedDescriptor {
                 op: op.to_owned(),

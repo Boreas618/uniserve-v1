@@ -155,7 +155,11 @@ pub struct ModuleSpec {
 #[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     pub kind: SourceKind,
-    /// The source files, relative to the package root.
+    /// The source files, relative to the package root. An entry may hold the
+    /// placeholder `{descriptor}`, which a build replaces with the descriptor
+    /// key of the module it builds: a package that carries one vendored cubin
+    /// and one metadata JSON per descriptor names them
+    /// `cubin/{descriptor}.cubin` and `cubin/{descriptor}.json`.
     pub files: Vec<String>,
     /// The compile script, for a source kind the Program Server drives with a
     /// Python script; relative to the package root.
@@ -166,6 +170,28 @@ pub struct SourceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
 }
+
+impl SourceSpec {
+    /// The files of one module's build: the declared files with the
+    /// descriptor placeholder replaced by `key`.
+    pub fn files_for(&self, key: &str) -> Vec<String> {
+        self.files
+            .iter()
+            .map(|file| file.replace(DESCRIPTOR_PLACEHOLDER, key))
+            .collect()
+    }
+
+    /// Whether the declared files are per descriptor.
+    pub fn per_descriptor(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.contains(DESCRIPTOR_PLACEHOLDER))
+    }
+}
+
+/// The placeholder a source file's name may hold for a module's descriptor
+/// key.
+pub const DESCRIPTOR_PLACEHOLDER: &str = "{descriptor}";
 
 /// The descriptors a package covers (design section 4.2 and 5.2).
 ///
@@ -326,6 +352,9 @@ impl Manifest {
             .files
             .iter()
             .chain(self.tuning.iter())
+            // A file named per descriptor (`cubin/{descriptor}.cubin`) is
+            // checked when that descriptor is built.
+            .filter(|file| !file.contains(DESCRIPTOR_PLACEHOLDER))
             .filter(|file| !root.join(file).is_file())
             .collect();
         if !missing.is_empty() {
