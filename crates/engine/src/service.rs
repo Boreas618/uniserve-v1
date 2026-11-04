@@ -437,9 +437,9 @@ impl Routing {
     /// because a step submits one batch per (phase, component). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
     /// depth, and `policy_fuel` and `policy_calls` are the instances' own
-    /// figures, summed by [`policy_usage`] (§12). The device's counters and the allocators' figures are
-    /// not this thread's: they come with the executor's `counters()` and the
-    /// allocators' reports.
+    /// figures, summed by [`policy_usage`] (§12). The device's counters and the
+    /// allocators' figures are not this thread's: they come with the executor's
+    /// `counters()` and the allocators' reports.
     fn metrics(&self) -> wire::Metrics {
         let mut metrics = wire::Metrics::default();
         let mut reported: Vec<Option<PolicyUsage>> = Vec::with_capacity(self.slots.len());
@@ -449,7 +449,9 @@ impl Routing {
                 .progress()
                 .recv_timeout(std::time::Duration::from_millis(200))
                 .ok();
-            metrics.steps = metrics.steps.max(progress.as_ref().map_or(0, |progress| progress.step));
+            metrics.steps = metrics
+                .steps
+                .max(progress.as_ref().map_or(0, |progress| progress.step));
             // A scheduler that did not answer this tick, and one that has no
             // policy yet, states no cost: the frame undercounts that rank's
             // cumulative figure until the rank answers again.
@@ -2866,9 +2868,7 @@ fn apply_process_command(
             if already {
                 {
                     let mut generations = crate::lock(generations);
-                    generations.previous = generations
-                        .serving
-                        .replace((generation, key));
+                    generations.previous = generations.serving.replace((generation, key));
                 }
                 policy.record_generation(generation);
                 return Some(switched(generation));
@@ -2893,9 +2893,7 @@ fn apply_process_command(
             let mut generations = crate::lock(generations);
             match policy.switchover(generation) {
                 Ok(()) => {
-                    generations.previous = generations
-                        .serving
-                        .replace((generation, key));
+                    generations.previous = generations.serving.replace((generation, key));
                     generations.candidate = None;
                     Some(switched(generation))
                 }
@@ -3294,7 +3292,10 @@ mod tests {
             Kind::Precopied(precopied) => precopied.generation,
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         };
-        assert!(matches!(answered(run(switchover(prepared))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(prepared))),
+            Kind::Switched(_)
+        ));
         match answered(run(purge(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_purge");
@@ -3325,7 +3326,10 @@ mod tests {
             Kind::Precopied(precopied) => precopied.generation,
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         };
-        assert!(matches!(answered(run(switchover(first))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(first))),
+            Kind::Switched(_)
+        ));
         // The next program is a generation of its own.
         let next = proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
@@ -3345,7 +3349,10 @@ mod tests {
             other => panic!("a new program is answered by Precopied, not {other:?}"),
         };
         assert_ne!(second, first, "another program is another generation");
-        assert!(matches!(answered(run(switchover(second))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(switchover(second))),
+            Kind::Switched(_)
+        ));
 
         // Purging the generation before the serving one drops its module, and
         // its number is never handed out again: an old switchover cannot
@@ -3354,7 +3361,9 @@ mod tests {
         assert!(matches!(answered(run(purge(first))), Kind::Purged(_)));
         assert_eq!(policy.calls().len(), calls + 1, "the module was dropped");
         match answered(run(switchover(first))) {
-            Kind::Fault(fault) => assert!(fault.reason.contains("not prepared"), "{}", fault.reason),
+            Kind::Fault(fault) => {
+                assert!(fault.reason.contains("not prepared"), "{}", fault.reason)
+            }
             other => panic!("a forgotten generation is answered by Fault, not {other:?}"),
         }
         // Preparing that program again takes a fresh number, never the old one.
@@ -3494,7 +3503,11 @@ mod tests {
         match answered(run(switchover(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_switchover");
-                assert!(fault.reason.contains("switchover failed"), "{}", fault.reason);
+                assert!(
+                    fault.reason.contains("switchover failed"),
+                    "{}",
+                    fault.reason
+                );
             }
             other => panic!("a failed switchover is answered by Fault, not {other:?}"),
         }
