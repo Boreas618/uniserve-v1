@@ -825,6 +825,11 @@ impl<'a> ProgramSwitch<'a> {
         &self.generations
     }
 
+    /// The main processes the switch commands, in the generations' order.
+    pub fn processes(&self) -> &[EpochProcess] {
+        &self.processes
+    }
+
     /// Prepares the next program generation in every main process: the kernel
     /// programs and the scheduling program, resolved and loaded, the policy
     /// instantiated and trialled, the graphs rebound or recaptured and the

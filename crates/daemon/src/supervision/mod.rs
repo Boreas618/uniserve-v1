@@ -93,6 +93,27 @@ impl std::fmt::Debug for ProcessCommands {
 }
 
 impl ProcessCommands {
+    /// The two ends of the daemon's command channel: the daemon's, and the
+    /// service's — the commands it drains each round, and the reports it
+    /// fills.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn channel() -> (
+        Self,
+        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
+    ) {
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            },
+            commands_rx,
+            reports,
+        )
+    }
+
     /// Sends `command` to engine `engine`'s main process.
     ///
     /// # Errors
