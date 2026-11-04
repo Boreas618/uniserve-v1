@@ -107,6 +107,9 @@ struct Args {
     /// deployment's statement - one conversion at load, printed, and carried in the case so the
     /// reference half loads at the same width.
     dtype: Option<String>,
+    /// The resident pool's size in MiB, when the run states it: the measured published total of a
+    /// previous run, rather than the index's sum plus a bound.
+    pool_mib: Option<u64>,
 }
 
 impl Args {
@@ -116,6 +119,7 @@ impl Args {
         let mut device = 0;
         let mut store = None;
         let mut out = PathBuf::from("artifacts/h3-stage4");
+        let mut pool_mib = None;
         let mut prompt = None;
         let mut prompt_ids = None;
         let mut dtype = None;
@@ -168,6 +172,15 @@ impl Args {
                     dtype = Some(arguments.next().ok_or_else(|| {
                         Failure("--dtype needs `auto` or an element type".into())
                     })?);
+                }
+                "--pool-mib" => {
+                    pool_mib = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| Failure("--pool-mib needs a size in MiB".into()))?
+                            .parse::<u64>()
+                            .map_err(|error| Failure(format!("--pool-mib: {error}")))?,
+                    );
                 }
                 "--prompt" => {
                     prompt = Some(
@@ -228,6 +241,7 @@ impl Args {
             prompt,
             prompt_ids,
             dtype,
+            pool_mib,
         })
     }
 }
@@ -789,6 +803,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
     let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
+    let pool_mib = args.pool_mib;
 
     // 0. The page's directory, emptied first. A stage that stops before its forward - in the loader,
     //    in the pool, in a launch - leaves no page rather than the previous run's: an old
@@ -835,17 +850,37 @@ fn stage_encode(args: &Args) -> Result<()> {
         u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
     let mut resident_keys = TextEncoder::keys(text);
     resident_keys.extend(VisionTower::keys(&text.vision));
-    let mut needed = load::resident_bytes(source, &resident_keys, granularity);
+    let index = load::resident_bytes(source, &resident_keys, granularity);
     // The tower builds its residual coefficient as ones of its own width (`vision::ones`), which the
     // loader publishes like a weight: one block of the pool, and it is not in the index.
     let constant = u64::from(text.vision.hidden_size) * u64::from(dtype.bits()) / 8;
-    needed += constant.max(1).next_multiple_of(granularity.max(1));
+    // The index's sum is a **lower bound**, and the run at `3be779b6e` measured by how much: the
+    // components name 902 keys and publish 1013 regions (a weight-normed tensor publishes its gain
+    // and its magnitude, and a loaded component adds constants the index does not hold), and a pool
+    // sized by the sum alone came 46 MiB short inside a publish. The regions are a property of the
+    // load, not of the key list, so the reservation adds a bound over the excess - one block for
+    // each of the regions the excess could be - and the pool's own published total is printed after
+    // a successful load so the next size can be a measurement instead of a bound:
+    // `--pool-mib` states it.
+    const REGION_EXCESS: u64 = 128;
+    let mut needed = index
+        + constant.max(1).next_multiple_of(granularity.max(1))
+        + granularity.max(1) * REGION_EXCESS;
+    if let Some(mib) = pool_mib {
+        needed = mib.saturating_mul(1 << 20);
+    }
     println!(
-        "weights: {} tensors, {} MiB of the index plus {} MiB of constants, {} MiB blocks",
+        "weights: {} tensors, {} MiB of the index plus {} MiB of constants and {} MiB of region \
+         excess, {} MiB blocks{}",
         resident_keys.len(),
-        needed / (1 << 20),
+        index / (1 << 20),
         constant / (1 << 20),
-        granularity
+        granularity.max(1) * REGION_EXCESS / (1 << 20),
+        granularity,
+        match pool_mib {
+            Some(mib) => format!(", reserved at --pool-mib {mib}"),
+            None => String::new(),
+        }
     );
     let mut weights = DeviceWeights::new(&device, needed)?;
     let encoder = {
@@ -858,6 +893,15 @@ fn stage_encode(args: &Args) -> Result<()> {
         "loaded: text encoder at {}, {} requested",
         encoder.dtype(),
         dtype
+    );
+    // What the load actually published, beside what was reserved: the region count is the number the
+    // key list cannot state (a weight-normed tensor publishes two, and a constant publishes one the
+    // index does not hold), so it is the measurement that sizes the next run's `--pool-mib`.
+    println!(
+        "pool: {} weight regions published, {} MiB of {} MiB reserved",
+        weights.buffers.len(),
+        weights.bytes >> 20,
+        needed >> 20
     );
 
     // 3. The arena. The encoder's own temporaries are reserved inside the forward, so this region
