@@ -407,6 +407,9 @@ message ChatChunks {
   // Body frames produced, and whether the terminal `[DONE]` event is written.
   uint64 frames = 6;
   bool done = 7;
+  // The response's `created` timestamp, in seconds since the UNIX epoch,
+  // which every chunk repeats.
+  uint64 created = 9;
 }
 
 // What a non-streaming chat completion collected from the request's events.
