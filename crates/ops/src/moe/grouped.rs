@@ -275,14 +275,6 @@ impl Op for GatherGemm {
             .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!("expected i32 route ids, found {}", args.ids.dtype),
-            ));
-        }
         for view in [
             &args.tile_to_expert,
             &args.tile_to_limit,
@@ -295,7 +287,7 @@ impl Op for GatherGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         // The sort pads its permuted rows up to whole tiles, so the map holds at least one row per
         // route and exactly the rows the product writes.
@@ -425,7 +417,7 @@ impl Op for RouteGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         if rows != args.permuted_to_expanded.numel() {
             return Err(Error::argument(
@@ -665,8 +657,6 @@ pub struct GatherGemmNvfp4Args {
     /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
     /// `array[expert]`.
     pub global_scale: TensorView,
-    /// `[tokens, top]` i32: the experts each token's routes selected.
-    pub ids: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -732,8 +722,6 @@ pub struct GatherNvfp4Call {
     pub global_scale: *const c_void,
     /// `[experts]` f32: the same for the gate projection.
     pub global_scale_gate: *const c_void,
-    /// `[tokens, top]` i32: the experts each token's routes selected.
-    pub ids: *const i32,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: *const i32,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -788,15 +776,15 @@ pub struct GatherNvfp4CallLayout {
 impl GatherNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
-        size: 720,
+        size: 712,
         hidden_scale: 8,
         hidden_token_scale: 16,
         global_scale: 40,
         global_scale_gate: 48,
-        workspace: 104,
-        workspace_bytes: 112,
-        dtype: 200,
-        error: 208,
+        workspace: 96,
+        workspace_bytes: 104,
+        dtype: 192,
+        error: 200,
     };
 }
 
@@ -822,8 +810,6 @@ pub struct RouteNvfp4Call {
     pub scales: *const c_void,
     /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale.
     pub global_scale: *const c_void,
-    /// `[routes]` i32: the expert each row belongs to.
-    pub ids: *const i32,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: *const i32,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -865,8 +851,8 @@ impl RouteNvfp4Call {
         hidden_scale: 8,
         hidden_token_scale: 16,
         global_scale: 40,
-        workspace: 96,
-        workspace_bytes: 104,
+        workspace: 88,
+        workspace_bytes: 96,
         dtype: 176,
         error: 184,
     };
@@ -1052,25 +1038,22 @@ impl GatherGemmNvfp4 {
             ));
         }
         // `routes` is the permuted row count -- the output's rows, which the sort pads to whole tiles
-        // -- while the activations are the caller's *token* rows and `ids` holds one row of routes per
-        // token. The program gathers through `permuted_to_expanded`, as the dense product does, so
-        // checking the activations against the permuted count would refuse every launch whose sort
-        // pads anything.
+        // -- while the activations are the caller's *token* rows. The product gathers through
+        // `permuted_to_expanded`, so checking the activations against the permuted count would
+        // refuse every launch whose sort pads anything. Neither artifact launch reads a per-route
+        // expert id: the routing is the sort's, and the product takes the tile maps the sort
+        // computed.
         let tokens = args.hidden.rows();
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
-        for (name, view) in [
-            ("ids", args.ids),
-            ("permuted_to_expanded", args.permuted_to_expanded),
-        ] {
-            if view.dtype != DType::I32 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!("expected i32 {name}, found {}", view.dtype),
-                ));
-            }
+        if args.permuted_to_expanded.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected i32 permuted rows, found {}",
+                    args.permuted_to_expanded.dtype
+                ),
+            ));
         }
         args.hidden
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
@@ -1113,7 +1096,6 @@ impl Op for GatherGemmNvfp4 {
             global_scale_gate: (address(args.global_scale.ptr)
                 + 4 * args.global_scale.strides.get(0)) as usize
                 as *const c_void,
-            ids: address(args.ids.ptr) as usize as *const i32,
             tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
             tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
             permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
@@ -1352,8 +1334,6 @@ pub struct RouteGemmNvfp4Args {
     /// product fuses a single projection, so the table is one array of `experts` floats, the shape a
     /// reader that indexes `array[expert]` takes.
     pub global_scale: TensorView,
-    /// `[routes]` i32: the expert each row belongs to.
-    pub ids: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
     /// `[tiles]` i32: the local row limit of that tile.
@@ -1506,17 +1486,16 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-        for (name, view) in [
-            ("ids", args.ids),
-            ("permuted_to_expanded", args.permuted_to_expanded),
-        ] {
-            view.require_shape(Self::NAME, Shape::new(&[routes]))?;
-            if view.dtype != DType::I32 {
-                return Err(Error::argument(
-                    Self::NAME,
-                    format!("expected i32 {name}, found {}", view.dtype),
-                ));
-            }
+        args.permuted_to_expanded
+            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+        if args.permuted_to_expanded.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected i32 permuted rows, found {}",
+                    args.permuted_to_expanded.dtype
+                ),
+            ));
         }
 
         check_workspace(Self::NAME, args.workspace)?;
@@ -1527,7 +1506,6 @@ impl Op for RouteGemmNvfp4 {
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
-            ids: address(args.ids.ptr) as usize as *const i32,
             tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
             tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
             permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
@@ -1606,7 +1584,6 @@ mod nvfp4_launch_tests {
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
             global_scale: table(DType::F32, &[2, 128]),
-            ids: table(DType::I32, &[3, 8]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
             permuted_to_expanded: table(DType::I32, &[32]),
@@ -1619,13 +1596,12 @@ mod nvfp4_launch_tests {
     #[test]
     fn the_activations_are_the_token_rows_and_the_output_the_permuted_ones() {
         // Builder01's M963: `routes` (the output's rows) is the sort's padded count and is never the
-        // activation count. The invariant is `ids = [tokens, top]`, `hidden = [tokens, hidden]` and
+        // activation count. The invariant is `hidden = [tokens, hidden]` and
         // `permuted_to_expanded = [routes]`, which is what the program gathers through.
         let descriptor = fc1();
         let args = fc1_args();
         assert_eq!(args.hidden.rows(), 3);
         assert_eq!(args.out.rows(), 32);
-        assert_eq!(args.ids.shape.dims(), &[3, 8]);
         assert_eq!(args.permuted_to_expanded.shape.dims()[0], 32);
         // The scales cover one block per output row along the contraction, not one row's worth.
         assert_eq!(args.scales.shape.dims(), &[128, 1536, 128]);
@@ -1673,29 +1649,54 @@ mod nvfp4_call_layout_tests {
     /// `static_assert`s are the other half of.
     #[test]
     fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
-        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 720);
+        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 712);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 8);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 16);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 24);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, ids), 56);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden_scale), 8);
         assert_eq!(
-            std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
+            std::mem::offset_of!(GatherNvfp4Call, hidden_token_scale),
+            16
+        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 24);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 32);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 40);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_expert), 56);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_limit), 64);
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, permuted_to_expanded),
             72
         );
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace), 88);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace_bytes), 96);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 184);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 192);
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
+            80
+        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, out), 88);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace), 96);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace_bytes), 104);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 192);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 200);
 
-        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 688);
+        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 696);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden), 0);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_scale), 8);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 32);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_token_scale), 16);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, weights), 24);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, scales), 32);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 40);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_expert), 48);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, tile_to_limit), 56);
+        assert_eq!(
+            std::mem::offset_of!(RouteNvfp4Call, permuted_to_expanded),
+            64
+        );
+        assert_eq!(
+            std::mem::offset_of!(RouteNvfp4Call, num_non_exiting_tiles),
+            72
+        );
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, out), 80);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace), 88);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace_bytes), 96);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 168);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 176);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 176);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 184);
     }
 }

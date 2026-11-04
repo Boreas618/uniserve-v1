@@ -16,6 +16,14 @@ than composed arithmetic:
 * ``cvt.rn.satfinite.e2m1x2.f32`` rounds a pair of values to E2M1 codes packed
   into one byte, lower column in the lower nibble.
 
+Encoding is two-level micro-scaling. A row is first brought into the block format's range by a
+factor the row itself determines -- ``token_scale = amax(row) * global_scale`` -- and each
+sixteen-element block then carries an E4M3 scale relative to that factor. The product that reads
+the encoding multiplies both, so this kernel writes the factor beside the values and the scales.
+That is why one program owns a whole row: the factor is a reduction over the row, and every block
+of the row is scaled against it, so a program owning a fragment of a row could not state it. A
+program walks its row twice -- once for the row's amax, once to encode -- for the same reason.
+
 A block whose E4M3 scale rounds to zero encodes to zeros: the reciprocal of a
 zero scale is not a number, and the vendor encoder multiplies by zero there.
 
@@ -119,6 +127,7 @@ def _nvfp4_quantize_kernel(
     scales_ptr,
     rows,
     global_scale,
+    token_scale_ptr,
     COLUMNS: tl.constexpr,
     BLOCK: tl.constexpr,
     SCALE_COLUMNS: tl.constexpr,
@@ -126,78 +135,86 @@ def _nvfp4_quantize_kernel(
     PADDED_COLUMNS: tl.constexpr,
     PADDED_TILE: tl.constexpr,
 ):
-    """Encode one program's whole K16 blocks of one row.
+    """Encode one row: its per-token factor, its packed values and its E4M3 block scales.
 
     ``input`` is ``[rows, COLUMNS]`` with contiguous rows, ``values``
-    ``[rows, COLUMNS / 2]`` bytes and ``scales`` bytes in the descriptor's
-    layout — ``[rows, SCALE_COLUMNS]`` linear, or ``[padded_rows,
-    PADDED_COLUMNS]`` swizzled. ``global_scale`` is the address of a one-element
-    FP32 tensor holding the reciprocal of the matrix's FP32 tensor scale.
+    ``[rows, COLUMNS / 2]`` bytes, ``token_scale`` ``[rows]`` f32 and ``scales`` bytes in the
+    descriptor's layout -- ``[rows, SCALE_COLUMNS]`` linear, or ``[padded_rows, PADDED_COLUMNS]``
+    swizzled. ``global_scale`` is the address of a one-element FP32 tensor holding the reciprocal
+    of the matrix's FP32 tensor scale.
     """
     # The tensor scale is a device operand: the loader publishes a calibrated
     # checkpoint's value as one FP32 word, and every program reads it from there,
     # so the number the kernel scales by is the checkpoint's and not a host copy.
     global_scale = tl.load(global_scale).to(tl.float32)
 
-    # Each program owns one row's run of BLOCK elements, a whole number of K16
-    # blocks, so a block never crosses a row.
     chunks = COLUMNS // BLOCK
-    program = tl.program_id(0)
-    row = (program // chunks).to(tl.int64)
-    chunk = program % chunks
+    row = tl.program_id(0)
 
-    # One scalar read of the matrix's global scale, shared by every block of this program; the
-    # broadcast is what a scalar parameter did before it became an address.
-    global_scale = tl.load(global_scale)
+    # Pass one: the row's amax. The per-token factor is the row's own dequantization
+    # factor, `amax * global_scale`, which is what the reference encoder publishes;
+    # the encode multiplier is its approximate reciprocal, as the reference's
+    # `reciprocal_approximate_ftz` is, so the bytes agree with it.
+    # One-element vectors rather than scalars: the value is loop-carried, and a Triton loop's
+    # carried variable needs a shape it can unify across iterations.
+    row_amax = tl.zeros([1], tl.float32)
+    for chunk in range(chunks):
+        columns = chunk * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(input_ptr + row * COLUMNS + columns).to(tl.float32)
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(values).reshape([BLOCK])))
 
-    columns = chunk * BLOCK + tl.arange(0, BLOCK)
-    values = tl.load(input_ptr + row * COLUMNS + columns).to(tl.float32)
+    token_scale = row_amax * global_scale
+    tl.store(token_scale_ptr + row + tl.arange(0, 1), token_scale)
+    ## The encode multiplier is the approximate reciprocal of the row's factor, as the reference
+    ## encoder's `reciprocal_approximate_ftz` is: the bytes agree with it, not merely the values.
+    encode = _rcp_approx(token_scale)
+    inverse_encode = _rcp_approx(encode)
 
-    blocks = tl.reshape(values, [BLOCK // 16, 16])
-    amax = tl.max(tl.abs(blocks), axis=1)
+    # Pass two: each block's E4M3 scale relative to the row's factor, and its codes.
+    sixth = _rcp_approx(tl.full([1], 6.0, tl.float32))
+    for chunk in range(chunks):
+        columns = chunk * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(input_ptr + row * COLUMNS + columns).to(tl.float32)
 
-    # The block scale: amax / 6, in the global scale's domain, rounded to E4M3.
-    sixth = _rcp_approx(tl.full([BLOCK // 16], 6.0, tl.float32))
-    scale_bytes = _e4m3_byte(global_scale * (amax * sixth))
-    decoded = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    inverse_global = _rcp_approx(tl.zeros_like(amax) + global_scale)
-    output_scale = tl.where(
-        decoded != 0.0, _rcp_approx(decoded * inverse_global), 0.0
-    )
+        blocks = tl.reshape(values, [BLOCK // 16, 16])
+        amax = tl.max(tl.abs(blocks), axis=1)
 
-    scaled = blocks * output_scale[:, None]
-    even, odd = tl.split(tl.reshape(scaled, [BLOCK // 2, 2]))
-    packed = _e2m1_pair(even, odd)
+        scale_bytes = _e4m3_byte(encode * (amax * sixth))
+        decoded = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        output_scale = tl.where(
+            decoded != 0.0, _rcp_approx(decoded * inverse_encode), 0.0
+        )
 
-    value_columns = chunk * (BLOCK // 2) + tl.arange(0, BLOCK // 2)
-    tl.store(values_ptr + row * (COLUMNS // 2) + value_columns, packed)
+        scaled = blocks * output_scale[:, None]
+        even, odd = tl.split(tl.reshape(scaled, [BLOCK // 2, 2]))
+        packed = _e2m1_pair(even, odd)
 
-    scale_columns = chunk * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
-    destination = row * SCALE_COLUMNS + scale_columns
-    if SWIZZLED:
-        destination = _swizzled_offset(row, scale_columns, PADDED_COLUMNS)
-    tl.store(scales_ptr + destination, scale_bytes)
+        value_columns = chunk * (BLOCK // 2) + tl.arange(0, BLOCK // 2)
+        tl.store(values_ptr + row * (COLUMNS // 2) + value_columns, packed)
+
+        scale_columns = chunk * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
+        destination = row * SCALE_COLUMNS + scale_columns
+        if SWIZZLED:
+            destination = _swizzled_offset(row, scale_columns, PADDED_COLUMNS)
+        tl.store(scales_ptr + destination, scale_bytes)
 
     if SWIZZLED:
         # The tensor's padding is zeros, as the reference encoder writes it. Each
         # program owns one row block of it: the last chunk of a row writes that
-        # row's padding columns, and the first programs of the grid write the
-        # padding rows, a whole padded row each.
+        # row's padding columns, and the programs write the padding rows, a whole
+        # padded row each.
         padded_rows = tl.cdiv(rows, SWIZZLE_ROWS) * SWIZZLE_ROWS
         padding_columns = tl.arange(0, SWIZZLE_COLUMNS)
-        if chunk == chunks - 1:
-            extra = SCALE_COLUMNS + padding_columns
-            keep = extra < PADDED_COLUMNS
-            tl.store(
-                scales_ptr + _swizzled_offset(row, extra, PADDED_COLUMNS),
-                tl.zeros([SWIZZLE_COLUMNS], tl.uint8),
-                mask=keep,
-            )
-        # One padded row per program, repeated until every padding row is written:
-        # a program's own row block starts after the matrix's rows.
+        extra = SCALE_COLUMNS + padding_columns
+        keep = extra < PADDED_COLUMNS
+        tl.store(
+            scales_ptr + _swizzled_offset(row, extra, PADDED_COLUMNS),
+            tl.zeros([SWIZZLE_COLUMNS], tl.uint8),
+            mask=keep,
+        )
         padded = tl.arange(0, PADDED_TILE)
         keep_column = padded < PADDED_COLUMNS
-        padding_row = rows + program
+        padding_row = rows + row
         programs = tl.num_programs(0)
         while padding_row < padded_rows:
             tl.store(

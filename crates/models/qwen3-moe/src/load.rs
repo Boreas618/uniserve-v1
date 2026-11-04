@@ -87,6 +87,23 @@ fn load_with(
 ) -> Result<Qwen3Moe> {
     let config = Config::read(root)?;
     partition.validate(&config)?;
+    // The plan reserves the encoded step's buffers from this option, so a deployment that names the
+    // wrong encoding would size an arena its own step writes past. The checkpoint decides it, and
+    // the loader is where the two meet.
+    let encoded = matches!(quantization, Quantization::Nvfp4(_))
+        && config.num_experts > 0
+        && config.has_sparse_layers();
+    if options.experts_encoded != encoded {
+        return Err(Error::Config(format!(
+            "the options say the experts are {} and the checkpoint's experts are {}",
+            if options.experts_encoded {
+                "encoded"
+            } else {
+                "dense"
+            },
+            if encoded { "encoded" } else { "dense" }
+        )));
+    }
     let sources = sources(&config);
 
     let hidden = as_u64(config.hidden_size, "hidden_size")?;
@@ -98,7 +115,7 @@ fn load_with(
 
     // The vocabulary shard: rows are contiguous in a `[vocabulary, hidden]` table.
     let (first, rows) = partition.vocabulary_shard(config.vocab_size);
-    let padded = padded_vocabulary(rows);
+    let padded = partition.padded_vocabulary_shard(config.vocab_size);
     if padded != rows {
         return Err(Error::Unsupported(format!(
             "a vocabulary shard of {rows} rows needs {padded} padded rows; the checkpoint's rows \
@@ -307,14 +324,6 @@ fn as_u64(count: usize, what: &str) -> Result<u64> {
 /// A count as a `u32` extent.
 fn as_u32(count: usize, what: &str) -> Result<u32> {
     u32::try_from(count).map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
-}
-
-/// The vocabulary shard's width rounded up to the head's matmul alignment.
-///
-/// The head computes a whole number of tiles per rank; the slice's vocabulary (151936) is already a
-/// multiple of it, so no padding rows are stored.
-fn padded_vocabulary(rows: usize) -> usize {
-    rows.next_multiple_of(8)
 }
 
 /// The checkpoint tensor of every model parameter, by the model's path.
@@ -675,8 +684,15 @@ fn activation(activation: Activation) -> Result<MoeActivation> {
 ///
 /// The table is `[head_dim / 2]` FP32 inverse frequencies: `1 / theta^(2i / head_dim)` for the
 /// plain recipe, and transformers' YaRN interpolation for a yarn checkpoint
-/// (`_compute_yarn_parameters`: a linear ramp between the extrapolated and the interpolated
-/// frequency at the correction range `beta_fast`/`beta_slow`). The multiplier is 1 for the plain
+/// (`_compute_yarn_parameters`). The correction range `beta_fast`/`beta_slow` splits the pairs: the
+/// pairs below it keep their extrapolated frequency and the ones above it are interpolated by the
+/// extension factor, with a linear ramp between — the high frequencies (a pair at index 0 has
+/// period 2π tokens) are the ones that must not move.
+///
+/// The extension factor is `max_position_embeddings / original_max_position_embeddings` when the
+/// checkpoint declares the length it was fitted to, which is the reference's own rule: the declared
+/// `factor` is only consulted by recipes that do not carry that field, so for a yarn checkpoint
+/// that carries it the ratio is what the table is built from. The multiplier is 1 for the plain
 /// recipe and the recipe's attention factor squared for yarn: the reference multiplies the cosine
 /// and sine factors by it (`uniserve/nn/rope.py`), so a product of two rotated vectors carries the
 /// square.
@@ -705,10 +721,18 @@ pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
         ));
     };
 
-    let factor = f64::from(yarn.factor);
+    // The length the recipe was fitted to, which is both the window the correction range is
+    // measured over and the denominator of the extension factor the reference derives.
+    let fitted = yarn.original_max_position_embeddings as f64;
+    if !(fitted.is_finite() && fitted > 0.0) {
+        return Err(Error::Config(format!(
+            "an original context length of {fitted} is not a window"
+        )));
+    }
+    let factor = config.max_position_embeddings as f64 / fitted;
     if !(factor.is_finite() && factor > 0.0) {
         return Err(Error::Config(format!(
-            "a yarn factor of {factor} is not a positive extension"
+            "an extension factor of {factor} is not a positive extension"
         )));
     }
     let (low, high) = correction_range(
@@ -716,25 +740,29 @@ pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
         f64::from(yarn.beta_slow),
         dim as f64,
         base,
-        config.max_position_embeddings as f64,
+        fitted,
     );
     let interpolation: Vec<f64> = extrapolation.iter().map(|value| value / factor).collect();
     let frequencies: Vec<f32> = (0..half)
         .map(|index| {
+            // The ramp is 1 above the correction range, where the pairs are interpolated, and 0
+            // below it, where they keep their extrapolated frequency.
             let ramp = if low == high {
                 f64::from(index as f64 >= high)
             } else {
                 ((index as f64 - low) / (high - low)).clamp(0.0, 1.0)
             };
-            (interpolation[index] * (1.0 - ramp) + extrapolation[index] * ramp) as f32
+            (interpolation[index] * ramp + extrapolation[index] * (1.0 - ramp)) as f32
         })
         .collect();
 
     let mscale = f64::from(yarn.mscale.unwrap_or(1.0));
-    let attention = match (yarn.attention_factor, yarn.mscale_all_dim) {
-        (Some(factor), _) => f64::from(factor),
-        (None, Some(all)) => yarn_mscale(factor, mscale) / yarn_mscale(factor, f64::from(all)),
-        (None, None) => yarn_mscale(factor, mscale),
+    let attention = match (yarn.attention_factor, yarn.mscale, yarn.mscale_all_dim) {
+        (Some(declared), ..) => f64::from(declared),
+        (None, Some(_), Some(all)) => {
+            yarn_mscale(factor, mscale) / yarn_mscale(factor, f64::from(all))
+        }
+        (None, ..) => yarn_mscale(factor, mscale),
     };
     let attention = attention as f32;
     Ok((frequencies, attention * attention))
@@ -891,12 +919,16 @@ mod tests {
         });
         let (frequencies, scale) = rotary_recipe(&config).unwrap();
         let plain = rotary_recipe(&config_without_yarn()).unwrap().0;
-        // The lowest frequencies are interpolated: a fourth of the plain table's first entry.
-        assert!((frequencies[0] - plain[0] / 4.0).abs() < 1e-6);
-        // The highest are kept as they were.
-        assert!((frequencies[63] - plain[63]).abs() < 1e-9);
-        // attention_factor = 0.1 · ln(4) + 1, squared into the score multiplier.
-        let expected = (0.1 * 4.0_f32.ln() + 1.0).powi(2);
+        // The extension factor is the extended length over the length the recipe was fitted to:
+        // 40960 / 4096 = 10, which is what the pairs above the correction range are divided by.
+        // The fastest pair (a period of 2π tokens) must not move: interpolating it is what would
+        // make the table wrong, and it is the direction a swapped ramp gets wrong.
+        assert_eq!(frequencies[0], plain[0]);
+        assert!((frequencies[63] - plain[63] / 10.0).abs() < 1e-9);
+        // Every pair is between the extrapolated and the interpolated value, and the table falls.
+        assert!(frequencies.windows(2).all(|pair| pair[0] > pair[1]));
+        // attention_factor = 0.1 · ln(10) + 1, squared into the score multiplier.
+        let expected = (0.1 * 10.0_f32.ln() + 1.0).powi(2);
         assert!((scale - expected).abs() < 1e-6);
     }
 

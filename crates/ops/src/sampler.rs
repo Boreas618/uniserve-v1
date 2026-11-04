@@ -203,8 +203,13 @@ pub struct TopKDescriptor {
     /// Element type of the input logits.
     pub dtype: DType,
     /// The vocabulary width of a row.
+    ///
+    /// A launch size, not a compilation: the program walks the row at runtime
+    /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so neither this nor `width` enters
+    /// the key. A key that named them would demand a module per vocabulary the deployment happens
+    /// to serve, and a manifest would have to declare every one of them.
     pub vocabulary: u32,
-    /// How many candidates a row keeps.
+    /// How many candidates a row keeps; a launch size for the same reason as `vocabulary`.
     pub width: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
@@ -214,10 +219,10 @@ pub struct TopKDescriptor {
 
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `vocabulary` and `width` are absent on purpose: the program takes both as runtime scalars,
+        // so one module serves every vocabulary and every candidate count.
         Key::new()
             .field("dtype", self.dtype)
-            .field("vocabulary", self.vocabulary)
-            .field("width", self.width)
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)

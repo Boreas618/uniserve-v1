@@ -433,7 +433,13 @@ impl Op for Softmax {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The denominator is a sum of `columns` positive terms accumulated in FP32; every output is
-        // one term over that sum.
+        // one term over that sum. One expression of the weight is a share of a maximum of one, so
+        // the bound is over the whole row.
+        //
+        // The relative bound holds while every term stays in FP32's normal range: a row whose
+        // values spread more than about 87 nats underflows its smaller terms into subnormals,
+        // where the grid is absolute and far coarser than `gamma`. A vocabulary-wide row of real
+        // logits does not reach that spread.
         Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype)
     }
 }
