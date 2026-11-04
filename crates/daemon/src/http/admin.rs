@@ -102,10 +102,6 @@ pub(crate) struct Admin {
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
     handed_over: AtomicBool,
-    /// The epochs the deployment executes and the processes this node's
-    /// daemon manages, which `GET /admin/config` reports and a configuration
-    /// change is routed by (`crate::epoch`).
-    epochs: crate::epoch::Epochs,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -132,15 +128,15 @@ impl Admin {
             shutdown,
             retire,
             handed_over: AtomicBool::new(false),
-            epochs: crate::epoch::Epochs::new(),
         })
     }
 
-    /// The epochs the deployment executes and the processes this node's
-    /// daemon manages, which the configuration routes changes by and
-    /// `GET /admin/config` reports.
-    pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
-        &self.epochs
+    /// The number of the operation that runs, which is the number an update it
+    /// starts carries; 0 when none runs.
+    fn running_number(&self) -> u64 {
+        locked(&self.running)
+            .as_ref()
+            .map_or(0, |operation| operation.id)
     }
 
     /// The event log and the operations' record, for the successor of a hot
@@ -507,7 +503,7 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     // configuration and its worlds: `EpochRecord`s are the daemon's record
     // of what it executes, not the engine's (`crate::epoch`).
     if let Some(object) = body.as_object_mut() {
-        let report = state.admin.epochs().report();
+        let report = state.leader.epochs().report();
         object.insert("epochs".to_owned(), report["epochs"].clone());
         object.insert("processes".to_owned(), report["processes"].clone());
     }
@@ -635,22 +631,29 @@ async fn commit(State(state): State<AdminState>) -> Response {
         // main processes', and the epoch keeps no previous generation
         // afterwards (§7.3 steps 5-6). Only when no program-layer update is in
         // flight does the configuration's own commit run.
-        if let Some(program) = admin.epochs().program_update() {
-            let outcome = admin.epochs().commit_programs();
-            if let Ok(true) = outcome {
-                program_phase(&admin, Phase::Committed, program.epoch, &program.update);
-                program_phase(&admin, Phase::Purged, program.epoch, &program.update);
-                return Ok(json!({
-                    "change": "program",
-                    "epoch": program.epoch,
-                    "state": "committed",
-                }));
-            }
-            if let Err(error) = outcome {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{error:#}"),
-                ));
+        let number = admin.running_number();
+        let epochs = leader.epochs();
+        let probation = epochs
+            .program_update()
+            .filter(|program| program.update.number == number);
+        if let Some(program) = probation {
+            match leader.commit_programs(number).await {
+                Ok(true) => {
+                    program_phase(&admin, &epochs, Phase::Committed, program.epoch, &program.update);
+                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    return Ok(json!({
+                        "change": "program",
+                        "epoch": program.epoch,
+                        "state": "committed",
+                    }));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err((
+                        update_status(&error),
+                        format!("{:#}", anyhow::Error::from(error)),
+                    ));
+                }
             }
         }
         leader.commit().await.map_err(|error| {
@@ -666,9 +669,14 @@ async fn commit(State(state): State<AdminState>) -> Response {
 /// Reports one phase of a program-layer update on the event log: the phase,
 /// the update and the epoch it moves, the change it is, the generation that
 /// executes and the programs it carries (`data`).
-fn program_phase(admin: &Arc<Admin>, phase: Phase, epoch: u64, update: &crate::epoch::Update) {
-    let generation = admin
-        .epochs()
+fn program_phase(
+    admin: &Arc<Admin>,
+    epochs: &crate::epoch::Epochs,
+    phase: Phase,
+    epoch: u64,
+    update: &crate::epoch::Update,
+) {
+    let generation = epochs
         .get(epoch)
         .map(|record| record.generation)
         .map_or(serde_json::Value::Null, serde_json::Value::from);
@@ -736,22 +744,29 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         // A program-layer probation returns to the generation before it first,
         // with the reason the operator gave (§7.3 step 5); the configuration's
         // own rollback runs only when no program-layer update is in flight.
-        if let Some(program) = admin.epochs().program_update() {
-            let outcome = admin.epochs().revert_programs(&reason);
-            if let Ok(true) = outcome {
-                program_phase(&admin, Phase::Reverted, program.epoch, &program.update);
-                program_phase(&admin, Phase::Purged, program.epoch, &program.update);
-                return Ok(json!({
-                    "change": "program",
-                    "epoch": program.epoch,
-                    "state": "reverted",
-                }));
-            }
-            if let Err(error) = outcome {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{error:#}"),
-                ));
+        let number = admin.running_number();
+        let epochs = leader.epochs();
+        let probation = epochs
+            .program_update()
+            .filter(|program| program.update.number == number);
+        if let Some(program) = probation {
+            match leader.rollback_programs(number, &reason).await {
+                Ok(true) => {
+                    program_phase(&admin, &epochs, Phase::Reverted, program.epoch, &program.update);
+                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    return Ok(json!({
+                        "change": "program",
+                        "epoch": program.epoch,
+                        "state": "reverted",
+                    }));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err((
+                        update_status(&error),
+                        format!("{:#}", anyhow::Error::from(error)),
+                    ));
+                }
             }
         }
         leader.rollback(reason).await.map_err(|error| {
