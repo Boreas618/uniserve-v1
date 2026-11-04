@@ -250,6 +250,11 @@ struct State {
     inherited: Vec<InheritedPart>,
 }
 
+/// A key's bytes as hex, for the names a record and a refusal state.
+fn hex_key(key: &[u8; 32]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// One part of a predecessor world's segment that a worker maps.
 struct InheritedPart {
     key: Key,
@@ -1067,7 +1072,7 @@ impl crate::memory::weights::WeightStorage for Retained {
         }
         // The store rounds a weight's true length up to the granule the import needs; a length that
         // is not such a multiple would be refused by the driver, so it is refused here by name.
-        let granularity = self.granularity(device)?;
+        let granularity = platform::HandleType::Descriptor.granularity(device)?;
         if allocation < bytes.len() || !allocation.is_multiple_of(granularity) {
             return Err(Error::Invariant(format!(
                 "a weight of {} bytes cannot be retained in an allocation of {allocation} bytes, \
@@ -1142,6 +1147,94 @@ impl crate::memory::weights::WeightStorage for Retained {
 }
 
 impl Retained {
+    /// Publishes a page of the state a model keeps per unit under `key` (design 4.5, 8): the
+    /// publisher allocates the exportable device block, `write` fills it with the page's blocks in
+    /// the layout the destination scatters, and the record names that allocation, so a reader maps
+    /// the same bytes by handle instead of copying them.
+    ///
+    /// The caller owns the page's cells: `rows` blocks of `width` bytes is what the record states.
+    /// A page is published once per generation per unit, before the generation is published as
+    /// serving, and never inside a step.
+    pub(crate) fn store_state(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+        rows: u32,
+        width: u64,
+        write: impl FnOnce(&Arc<Storage>, &platform::Stream) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = u64::from(rows) * width;
+        if bytes == 0 {
+            return Err(Error::Invalid("a state page holds no block".into()));
+        }
+        let granularity = platform::HandleType::Descriptor.granularity(device)?;
+        // The record states the allocation, which the driver sizes in whole granules: a reader
+        // imports that many bytes and reads the page's own within them.
+        let allocation = usize::try_from(bytes.div_ceil(granularity as u64) * granularity as u64)
+            .map_err(|_| {
+            Error::Invalid("a state page is larger than this host can map".into())
+        })?;
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let (staging, descriptor) = Storage::retainable(device, allocation, &[])?;
+        let stream = platform::Stream::new(device)?;
+        write(&staging, &stream)?;
+        // The reader maps what the publisher wrote, so the copy is complete before the record is
+        // published: a half-written page would be read as a valid one.
+        stream.synchronize()?;
+        let record = ::storage::StorageRecord {
+            placement: Placement::Device { gpu },
+            segment: None,
+            bytes: staging.bytes() as u64,
+            fabric: None,
+        };
+        let tensor = ::storage::TensorRecord {
+            key: Key(*key),
+            name: format!("state-{}", hex_key(key)),
+            storage: 0,
+            offset: 0,
+            dtype: "uint8".into(),
+            shape: vec![u64::from(rows), width],
+            strides: vec![width, 1],
+            access: Access::ReadOnly,
+        };
+        state
+            .client
+            .put(
+                vec![tensor],
+                &[(record, std::os::fd::AsFd::as_fd(&descriptor))],
+            )
+            .map_err(|error| storage_error("publishing a state page", error))?;
+        Ok(())
+    }
+
+    /// The state page retained under `key`, mapped read-only by handle, when the scope holds one.
+    ///
+    /// The caller checks the shape against its own page: the storage is `rows * width` bytes
+    /// rounded up to the granule the driver allocated, so a page that disagrees is refused by
+    /// whoever knows what it expected rather than silently read.
+    pub(crate) fn state_page(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+        rows: u32,
+        width: u64,
+    ) -> Result<Option<Arc<Storage>>> {
+        let bytes = u64::from(rows) * width;
+        let Some(storage) = self.weight(device, Key(*key))? else {
+            return Ok(None);
+        };
+        if (storage.bytes() as u64) < bytes {
+            return Err(Error::Interface(format!(
+                "the state page retained under {} holds {} bytes, and its stated {rows} rows of \
+                 {width} bytes are {bytes}",
+                hex_key(key),
+                storage.bytes()
+            )));
+        }
+        Ok(Some(storage))
+    }
+
     /// Takes the parts of a segmented storage: as
     /// [`ExclusiveStorage::exclusive`] takes whole ones, except that a
     /// standby leaves a part its predecessor gave back absent, and that the

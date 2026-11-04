@@ -51,6 +51,16 @@ impl Variant {
         }
     }
 
+    /// Whether a bucket of this variant picks each row's token by taking the largest candidate
+    /// rather than by drawing one (4.4's greedy path).
+    ///
+    /// A greedy request states temperature zero, whose shaping divides by one, so the row's largest
+    /// candidate *is* its token. No draw can produce it - the draw runs in token-id order - so the
+    /// two are separate launch sequences and a bucket is homogeneous in which one it takes.
+    pub const fn greedy(self) -> bool {
+        matches!(self, Self::DecodeGreedy)
+    }
+
     /// Whether a bucket of this variant samples a token for each of its sampling rows (4.4).
     ///
     /// A prefill bucket samples only on the batch that ends a prompt, which the mechanism says by
