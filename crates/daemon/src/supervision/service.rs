@@ -632,9 +632,7 @@ pub(crate) fn run_leader(
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
                             tracing::info!(engine, build = %hello.build, frontend, "a process connected");
-                            if frontend
-                                && let Some(frontend_greetings) = &frontend_greetings
-                            {
+                            if frontend && let Some(frontend_greetings) = &frontend_greetings {
                                 let _ = frontend_greetings.send(engine);
                             }
                             // The epoch layer binds this connection to the

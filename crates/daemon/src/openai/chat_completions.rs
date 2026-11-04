@@ -23,8 +23,8 @@ use std::result::Result;
 use std::sync::Arc;
 
 use asynk_strim_attr::{TryYielder, try_stream};
-use axum::extract::State;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::sse::Event;
@@ -40,11 +40,11 @@ use thiserror_ext::AsReport as _;
 use tracing::{debug, error, trace};
 use tracing_futures::Instrument as _;
 
+use crate::http::handoff::Handoff;
 use crate::input::chat::{
     ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
 };
 use crate::input::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
-use crate::http::handoff::Handoff;
 use crate::leader::Leader;
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
@@ -165,11 +165,9 @@ async fn chat_completions(
         // pauses it at its next engine event boundary (design §7.5.1).
         let registration = handoff.register();
         let stream = crate::http::stream::ResponseStream::start(Box::new(run), true);
-        let Some(body) = crate::http::stream::HandedBody::new(
-            stream,
-            Some(registration),
-            request_id.clone(),
-        ) else {
+        let Some(body) =
+            crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
+        else {
             return ApiError::server_error("the response cannot be handed over".to_string())
                 .into_response();
         };
@@ -233,12 +231,11 @@ async fn chat_completions(
         // pauses it at its next engine event boundary and the successor
         // collects the rest (design §7.5.1).
         let registration = handoff.register();
-        let stream = crate::http::stream::ResponseStream::start(Box::new(run), false);
-        let Some(body) = crate::http::stream::HandedBody::new(
-            stream,
-            Some(registration),
-            request_id.clone(),
-        ) else {
+        // The head waits for the document: one status, which is the outcome.
+        let stream = crate::http::stream::ResponseStream::start_held(Box::new(run), false);
+        let Some(body) =
+            crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
+        else {
             return ApiError::server_error("the response cannot be handed over".to_string())
                 .into_response();
         };
@@ -558,7 +555,8 @@ impl ChatCollector {
             RequestOutput::ImageDone(image) => {
                 self.image_step_counts.entry(image.image_id).or_default();
                 self.completed_image_ids.push(image.image_id);
-                self.images.push(image_content_part(image.png_base64.clone()));
+                self.images
+                    .push(image_content_part(image.png_base64.clone()));
             }
             RequestOutput::Finished { reason, usage } => {
                 self.finished = Some((reason.clone(), usage.clone()));
@@ -635,17 +633,22 @@ impl ChatCollector {
                         block: Some(handoff::assistant_block::Block::Reasoning(text.clone())),
                     },
                     AssistantContentBlock::ToolCall(call) => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::ToolCall(handoff::ToolCall {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        })),
+                        block: Some(handoff::assistant_block::Block::ToolCall(
+                            handoff::ToolCall {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            },
+                        )),
                     },
                 })
                 .collect(),
             prompt_token_ids: self.prompt_token_ids.clone(),
-            prompt_logprobs: None,
-            logprobs: None,
+            // The logprobs the response already collected are the response:
+            // the collector concatenated them as each update carried them, and
+            // no later update repeats an earlier position (§7.5.1 step 3).
+            prompt_logprobs: self.prompt_logprobs.as_ref().map(handoff_prompt_logprobs),
+            logprobs: self.logprobs.as_ref().map(handoff_logprobs),
             token_ids: self.token_ids.clone(),
             images: self
                 .images
@@ -704,6 +707,8 @@ impl ChatCollector {
         }
         self.message = message;
         self.prompt_token_ids.clone_from(&state.prompt_token_ids);
+        self.prompt_logprobs = state.prompt_logprobs.as_ref().map(decoded_prompt_logprobs);
+        self.logprobs = state.logprobs.as_ref().map(decoded_logprobs);
         self.token_ids.clone_from(&state.token_ids);
         self.images = state
             .images
@@ -718,6 +723,78 @@ impl ChatCollector {
             .collect();
         self.completed_image_ids = (0..state.images.len() as u32).collect();
         self.finished = None;
+    }
+}
+
+/// The generated-token logprobs a handoff carries (§7.5.1 step 3).
+fn handoff_logprobs(logprobs: &DecodedLogprobs) -> handoff::DecodedLogprobs {
+    handoff::DecodedLogprobs {
+        positions: logprobs.positions.iter().map(handoff_position).collect(),
+    }
+}
+
+/// One position's decoded candidates, as the handoff carries them.
+fn handoff_position(position: &DecodedPositionLogprobs) -> handoff::DecodedPositionLogprobs {
+    handoff::DecodedPositionLogprobs {
+        entries: position
+            .entries
+            .iter()
+            .map(|entry| handoff::DecodedTokenLogprob {
+                token_id: entry.token_id,
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                rank: entry.rank,
+            })
+            .collect(),
+    }
+}
+
+/// The prompt logprobs a handoff carries, as [`handoff_logprobs`].
+fn handoff_prompt_logprobs(logprobs: &DecodedPromptLogprobs) -> handoff::DecodedPromptLogprobs {
+    handoff::DecodedPromptLogprobs {
+        first_token_id: logprobs.first_token_id,
+        first_token: logprobs.first_token.clone(),
+        scored_positions: logprobs
+            .scored_positions
+            .iter()
+            .map(handoff_position)
+            .collect(),
+    }
+}
+
+/// The generated-token logprobs a collector resumes with.
+fn decoded_logprobs(state: &handoff::DecodedLogprobs) -> DecodedLogprobs {
+    DecodedLogprobs {
+        positions: state.positions.iter().map(decoded_position).collect(),
+    }
+}
+
+/// One position's decoded candidates, as a resumed collector holds them.
+fn decoded_position(position: &handoff::DecodedPositionLogprobs) -> DecodedPositionLogprobs {
+    DecodedPositionLogprobs {
+        entries: position
+            .entries
+            .iter()
+            .map(|entry| DecodedTokenLogprob {
+                token_id: entry.token_id,
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                rank: entry.rank,
+            })
+            .collect(),
+    }
+}
+
+/// The prompt logprobs a collector resumes with.
+fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPromptLogprobs {
+    DecodedPromptLogprobs {
+        first_token_id: state.first_token_id,
+        first_token: state.first_token.clone(),
+        scored_positions: state
+            .scored_positions
+            .iter()
+            .map(decoded_position)
+            .collect(),
     }
 }
 
@@ -825,8 +902,11 @@ impl ChatStreamEmitter {
         let mut chunks = Vec::new();
         match output {
             RequestOutput::Accepted(prompt) => {
-                let mut chunk =
-                    start_chunk(&self.context.request_id, &self.context.response_model, self.created);
+                let mut chunk = start_chunk(
+                    &self.context.request_id,
+                    &self.context.response_model,
+                    self.created,
+                );
                 if self.context.return_token_ids {
                     chunk.prompt_token_ids = Some(prompt.token_ids.to_vec());
                 }
@@ -875,9 +955,11 @@ impl ChatStreamEmitter {
                 if let Some(pending_chunk) = self.pending_chunk.as_mut() {
                     pending_chunk.logprobs = openai_logprobs;
                     pending_chunk.token_ids = openai_token_ids.cloned();
-                    if let Some(chunk) =
-                        pending_chunk.take_chunk(&self.context.request_id, &self.context.response_model, self.created)
-                    {
+                    if let Some(chunk) = pending_chunk.take_chunk(
+                        &self.context.request_id,
+                        &self.context.response_model,
+                        self.created,
+                    ) {
                         chunks.push(chunk);
                     }
                 } else if let Some(logprobs) = openai_logprobs {
@@ -891,8 +973,8 @@ impl ChatStreamEmitter {
             }
             RequestOutput::ReasoningDelta { text: delta } => {
                 let kind = AssistantBlockKind::Reasoning;
-                let include_delta =
-                    self.context.include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
+                let include_delta = self.context.include_reasoning
+                    || !matches!(kind, AssistantBlockKind::Reasoning);
                 if include_delta {
                     if let Some(pending_chunk) = self.pending_chunk.as_mut() {
                         pending_chunk.push_block_delta(kind, delta.clone());
@@ -1899,8 +1981,8 @@ mod tests {
     use super::ChatCollector;
     use super::ChatResponseContext;
     use super::ChatStreamEmitter;
-    use super::chat_response;
     use super::chat_completion_chunk_stream;
+    use super::chat_response;
     use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
     use crate::output::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
@@ -2070,7 +2152,10 @@ mod tests {
                 "a handoff after {split} outputs writes different chunks"
             );
         }
-        assert!(handable > 0, "no position in the response can be handed over");
+        assert!(
+            handable > 0,
+            "no position in the response can be handed over"
+        );
     }
 
     /// The collected one-body response continues where a handoff left it: a
@@ -2098,8 +2183,12 @@ mod tests {
             uninterrupted.push(output).expect("a collected output");
         }
         let expected = serde_json::to_value(
-            chat_response(uninterrupted.collected().expect("the response"), &context, 7)
-                .expect("a response"),
+            chat_response(
+                uninterrupted.collected().expect("the response"),
+                &context,
+                7,
+            )
+            .expect("a response"),
         )
         .expect("the response serializes");
 
@@ -2120,7 +2209,10 @@ mod tests {
                     .expect("a response"),
             )
             .expect("the response serializes");
-            assert_eq!(response, expected, "a handoff after {split} outputs differs");
+            assert_eq!(
+                response, expected,
+                "a handoff after {split} outputs differs"
+            );
         }
     }
 
