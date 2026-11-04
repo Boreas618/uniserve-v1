@@ -175,6 +175,12 @@ impl Scheduler {
                 };
                 let _ = answer.send(progress);
             }
+            Command::PublishExpertLoad { load } => {
+                self.set_expert_load(load);
+            }
+            Command::TakeExpertOrder(answer) => {
+                let _ = answer.send(self.take_expert_order());
+            }
             Command::DescribePolicyState { ranks, answer } => {
                 // The state is the mechanism's, not the serving policy's: an
                 // epoch's first precopy instantiates the epoch's policy on the
