@@ -808,7 +808,7 @@ fn stage_encode(args: &Args) -> Result<()> {
         u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
     let mut resident_keys = TextEncoder::keys(text);
     resident_keys.extend(VisionTower::keys(&text.vision));
-    let mut needed = load::resident_bytes(&source, &resident_keys, granularity);
+    let mut needed = load::resident_bytes(source, &resident_keys, granularity);
     // The tower builds its residual coefficient as ones of its own width (`vision::ones`), which the
     // loader publishes like a weight: one block of the pool, and it is not in the index.
     let constant = u64::from(text.vision.hidden_size) * u64::from(dtype.bits()) / 8;
