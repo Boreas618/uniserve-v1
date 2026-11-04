@@ -858,6 +858,23 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
     let (model, loaded) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
+    // What the model holds, by representation, beside what the index declares: a loader that fell
+    // back to a full-precision path for a packed tensor still prints the declaration and still reads
+    // as "NVFP4 ran", so the pair is the measurement and a mismatch is a refusal.
+    println!(
+        "loaded: the index declares {packed} packed and {kept} kept in their own dtype; the model \
+         holds {} packed and {} full precision",
+        weights.packed, weights.dense,
+    );
+    if weights.packed != packed {
+        return Err(Failure::message(format!(
+            "the index declares {packed} tensors as packed E2M1 and the model holds {}: the loader \
+             did not bring {} of them through the representation the checkpoint declares, and a run \
+             at that model would measure a fallback and call it NVFP4",
+            weights.packed,
+            packed.saturating_sub(weights.packed)
+        )));
+    }
     if loaded != declared {
         return Err(Failure::message(format!(
             "the checkpoint declared {declared:?} before the load and {loaded:?} during it: a \
@@ -2773,6 +2790,10 @@ struct DeviceWeights {
     pools: platform::Allocator,
     buffers: Vec<platform::Buffer>,
     bytes: u64,
+    /// Weights published as packed E2M1, which is what an NVFP4 checkpoint's projections arrive as.
+    packed: usize,
+    /// Weights published in a full-precision element type.
+    dense: usize,
 }
 
 impl DeviceWeights {
@@ -2812,6 +2833,8 @@ impl DeviceWeights {
             pools,
             buffers: Vec::new(),
             bytes: 0,
+            packed: 0,
+            dense: 0,
         })
     }
 
@@ -2868,6 +2891,15 @@ impl RetainedWeights for DeviceWeights {
         self.bytes += bytes.len() as u64;
         self.buffers.push(buffer);
         let _ = key;
+        // What arrived, by the type it arrived in: a packed projection is published as the packed
+        // E2M1 bytes the programs read, and everything kept is published full precision. A loader
+        // that fell back would show up here as a packed tensor that never arrived packed, which is
+        // the one thing the checkpoint's own index cannot tell a run.
+        match dtype {
+            DType::U8 => self.packed += 1,
+            DType::BF16 | DType::F16 | DType::F32 => self.dense += 1,
+            _ => {}
+        }
         Ok(backing)
     }
 }
