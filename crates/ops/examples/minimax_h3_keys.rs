@@ -360,6 +360,17 @@ fn main() {
         }
         .to_string(),
     );
+    // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
+    // is a launch value, so the key holds only the element type and the block.
+    push(
+        "pcm_interleave",
+        ops::pcm::Descriptor {
+            dtype: DType::F32,
+            block: ops::pcm::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     push(
         "philox_noise",
         NoiseDescriptor {
