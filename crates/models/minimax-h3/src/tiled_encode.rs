@@ -118,6 +118,12 @@ impl Plan {
 #[derive(Clone, Copy, Debug)]
 pub struct Scene<'a> {
     /// Tile `i`'s pixels, `[1, in_channels, frames, tile_height, tile_width]`, in plan order.
+    ///
+    /// Each view is **packed**: `nn::layers::FramePad` pads a frame's rows in place of the source's
+    /// own, so it requires a frame's rows to be contiguous in the view it reads, and a tile cut from a
+    /// wider raster has the raster's row stride instead of the tile's width. A caller whose raster is
+    /// one buffer therefore copies each tile's block out first (one tile is a few megabytes against the
+    /// encoder's set); a caller that uploads tiles as separate buffers passes them as they are.
     pub pixels: &'a [TensorView],
     /// The run's stitched latents, `[channels, frames, run_rows, latent_columns]`.
     pub blended: TensorView,
