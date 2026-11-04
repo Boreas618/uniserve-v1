@@ -28,7 +28,9 @@ mod call;
 mod plan;
 
 use super::*;
+use crate::scheduler::views;
 use ipc::{ForwardMode, MediaCall, TransferMode};
+use scheduling::guest::{PhaseId, PhaseKind, Plan};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
 /// a worker stages per call: canvas rows across its token-denoising calls,
@@ -46,23 +48,39 @@ fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
 }
 
 impl Scheduler {
-    /// Assembles one scheduling-step batch in priority order.
+    /// Executes one step's plan (design §4.4).
     ///
-    /// Each request contributes at most one call, prefill chunks consume only
-    /// the remaining token budget, and first dispatch carries typed admission.
+    /// The plan's work, in the policy's order, becomes this step's calls: the
+    /// order of the work list is the decision, and the mechanism plans each
+    /// named phase of the named request, clipping it to its own hard limits
+    /// (the pass's rows, the request's storage, the transfer capacity). A
+    /// request the plan refills gets a refill chunk after the planned work,
+    /// which is a prefill call that writes the draft cache.
     ///
-    /// Returns the pass's batches, empty when nothing can be scheduled or call
-    /// preparation failed; most preparation failures latch engine-fatal.
-    pub(super) fn assemble(&mut self) -> Vec<ExecutionBatch> {
-        let ids = self.assembly_order();
-        let kind = self.select_batch_kind(&ids);
-        let batches = self.assemble_batch(&ids, kind);
-        if batches.is_empty() && !self.fatal && kind == Some(BatchKind::Prefill) {
-            // A blocked prefill pass must not prevent already-ready decode work
-            // from using the execution slot.
-            return self.assemble_batch(&ids, Some(BatchKind::Decode));
-        }
-        batches
+    /// A request whose call does not fit this step keeps nothing: the work that
+    /// does not fit waits for the next step, as a plan over the free storage
+    /// does.
+    pub(super) fn assemble_plan(&mut self, plan: &Plan) -> Vec<ExecutionBatch> {
+        let refill = views::phase_id(PhaseKind::Refill);
+        let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = plan
+            .work
+            .iter()
+            .map(|work| {
+                (
+                    RequestId(work.request.0),
+                    work.phase,
+                    Some(work.tokens),
+                )
+            })
+            .collect();
+        work.extend(plan.refill.iter().map(|request| {
+            (
+                RequestId(request.0),
+                refill,
+                None,
+            )
+        }));
+        self.assemble_batch(&work)
     }
 
     /// Charges actual token work, including each CFG branch of a denoising step.
@@ -181,17 +199,16 @@ impl Scheduler {
         Some(buffer_allocations)
     }
 
-    /// Selects compatible call kinds of one batch kind within the pass's token
-    /// and sequence budgets.
+    /// Selects compatible call kinds within the step's token and sequence
+    /// budgets, in the plan's order.
     ///
-    /// Walks `ids` in assembly order until `max_batch` calls are selected or
-    /// the token budget is spent. Every selected call is registered in flight
-    /// before this returns. A failed call preparation returns no batches; most
-    /// such failures latch engine-fatal first.
-    pub(super) fn assemble_batch(
+    /// Walks the plan's work until `max_batch` calls are selected or the token
+    /// budget is spent. Every selected call is registered in flight before this
+    /// returns. A failed call preparation returns no batches; most such
+    /// failures latch engine-fatal first.
+    fn assemble_batch(
         &mut self,
-        ids: &[RequestId],
-        pass_kind: Option<BatchKind>,
+        work: &[(RequestId, PhaseId, Option<u32>)],
     ) -> Vec<ExecutionBatch> {
         // One batch per call kind: a batch is one numerical call on one
         // component, so a rank receives it as a single homogeneous group. The
@@ -220,13 +237,20 @@ impl Scheduler {
         // selects.
         let mut image_occupancy: Option<super::execution::Occupancy> = None;
         let mut selected = 0usize;
-        for id in ids.iter().copied() {
+        for (id, phase, wanted) in work.iter().copied() {
+            let id = id;
             if selected >= self.config.max_batch {
                 break;
             }
             if budget == 0 {
                 break;
             }
+            // The phase names the call kind this entry runs. A phase this epoch
+            // has no call for runs nothing.
+            let Some(kind) = views::phase_kind(phase).and_then(views::phase_call) else {
+                continue;
+            };
+            let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
             if !self.can_schedule_next(id) {
                 continue;
             }
@@ -238,40 +262,30 @@ impl Scheduler {
             if cancelled {
                 continue;
             }
-            let next_type = self.peek_next_call_variant(id);
-            // A decoding request whose draft cache is missing takes a refill
-            // chunk, a prefill, from the budget a prefill pass leaves.
-            let refill = pass_kind != Some(BatchKind::Decode) && self.refill_due(id);
-            // The batch kind check rejects only a prefill call in a decode
-            // pass or the reverse; `BatchKind::Media` calls pass.
-            if !refill
-                && let (Some(target), Some(call_variant)) = (pass_kind, next_type)
-                && {
-                    let candidate_kind = batch_kind(call_variant);
-                    matches!(candidate_kind, BatchKind::Prefill | BatchKind::Decode)
-                        && candidate_kind != target
-                }
-            {
-                continue;
-            }
             // The denoiser is held exclusively: a request holds it while one
             // of its denoising calls is in flight, so denoising steps of
             // different requests are never in flight together, in any pass.
             // Between two steps of one request, another request may take it.
-            if next_type == Some(CallKind::Media(MediaCall::Denoising))
+            if kind == CallKind::Media(MediaCall::Denoising)
                 && (self.inflight.denoiser_held_by_other(id)
                     || !self.guidance_prefix_is_schedulable(id))
             {
                 continue;
             }
-            // Build one call when its exact resident resources fit.
-            let writes_prefix =
-                refill || next_type.is_some_and(|kind| batch_kind(kind) == BatchKind::Prefill);
-            let call_budget = if writes_prefix {
+            // Build one call when its exact resident resources fit. A prefill
+            // chunk draws on the prefill budget a warming epoch bounds, and its
+            // size is the plan's: the mechanism clips it only to what is left.
+            let writes_prefix = batch_kind(kind) == BatchKind::Prefill;
+            let mut call_budget = if writes_prefix {
                 budget.min(prefill_budget)
             } else {
                 budget
             };
+            if writes_prefix {
+                if let Some(tokens) = wanted {
+                    call_budget = call_budget.min(tokens as usize);
+                }
+            }
             if call_budget == 0 {
                 continue;
             }
@@ -281,6 +295,11 @@ impl Scheduler {
                 self.next_generation_call(id, call_budget, rows_left)
             };
             if let Some(mut call) = planned {
+                if call.kind != kind {
+                    // The request's state moved past the phase the plan named:
+                    // the plan is executed as far as the state allows.
+                    continue;
+                }
                 // A context prefill plans within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
@@ -509,126 +528,6 @@ impl Scheduler {
             batches.push(self.finish_generation_batch(batch, submit_at));
         }
         batches
-    }
-
-    /// Chooses the highest-priority batch kind that has schedulable work.
-    ///
-    /// A ready readout selects a decode pass first: one pass answers
-    /// the readout and releases its prefix cache. Otherwise prefill wins while fewer
-    /// than `PREFILL_WINDOW_CREDITS` batches carrying `BatchKind::Prefill`
-    /// calls await their results; past that window, ready decode work takes
-    /// the pass, and prefill runs only when no decode is ready.
-    ///
-    /// A generating block's canvas steps are decode work under this window,
-    /// not ahead of it: a block's next step is ready again as soon as the
-    /// step before it is submitted, so a prompt ordered behind every ready
-    /// step would wait until the running blocks stop instead of joining
-    /// their canvas batches.
-    ///
-    /// `BatchKind::Media` readiness never selects a batch kind: with only such
-    /// work ready this returns `None`, and `assemble_batch` then applies no
-    /// batch kind filter.
-    pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
-        let mut readout_ready = false;
-        let mut decode_ready = false;
-        let mut prefill_ready = false;
-        for id in ids.iter().copied() {
-            let Some(state) = self.running.get(&id) else {
-                continue;
-            };
-            if state.terminal_intent.is_terminal() {
-                continue;
-            }
-            let Some(call_type) = self.peek_next_call_variant(id) else {
-                continue;
-            };
-            let kind = batch_kind(call_type);
-            if kind == BatchKind::Media || !self.can_schedule_next(id) {
-                continue;
-            }
-            // A refill of a missing draft cache is prefill work.
-            if self.refill_due(id) {
-                prefill_ready = true;
-            }
-            match kind {
-                BatchKind::Decode if state.req.is_readout() => readout_ready = true,
-                BatchKind::Decode => decode_ready = true,
-                BatchKind::Prefill => prefill_ready = true,
-                BatchKind::Media => {}
-            }
-        }
-        let prefill_window_open = self
-            .inflight
-            .pending_batches
-            .values()
-            .filter(|batch| batch.prefill)
-            .count()
-            < PREFILL_WINDOW_CREDITS;
-        if readout_ready {
-            Some(BatchKind::Decode)
-        } else if prefill_ready && prefill_window_open {
-            Some(BatchKind::Prefill)
-        } else if decode_ready {
-            Some(BatchKind::Decode)
-        } else if prefill_ready {
-            Some(BatchKind::Prefill)
-        } else {
-            None
-        }
-    }
-
-    /// Returns running requests in batch-assembly order: by
-    /// `assembly_priority`, then by admission order within a priority.
-    pub(super) fn assembly_order(&self) -> Vec<RequestId> {
-        let mut ids: Vec<(usize, RequestId)> = self
-            .running_order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, id)| self.running.contains_key(id).then_some((index, *id)))
-            .collect();
-        ids.sort_by_key(|(idx, id)| (self.assembly_priority(*id), *idx));
-        ids.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// Returns the scheduling priority used during batch assembly; lower
-    /// values are assembled first.
-    ///
-    /// Context ingestion (encoders and prefill) comes first; then token decode,
-    /// verification and canvas denoising, image decoding, and cache installation;
-    /// then denoising and the video and audio media calls; and last latent
-    /// preparation, tensor transfers, cache export, and requests with no
-    /// next call.
-    pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
-        match self.peek_next_call_variant(id) {
-            Some(
-                CallKind::Media(MediaCall::TextEncoding)
-                | CallKind::Media(MediaCall::VisionEncoding)
-                | CallKind::Media(MediaCall::LatentEncoding)
-                | CallKind::Forward(ForwardMode::Prefill),
-            ) => 0,
-            Some(
-                CallKind::Forward(
-                    ForwardMode::Decode | ForwardMode::Verify | ForwardMode::TokenDenoising,
-                )
-                | CallKind::Media(MediaCall::ImageDecoding)
-                | CallKind::Transfer(TransferMode::CacheInstall),
-            ) => 1,
-            Some(CallKind::Media(
-                MediaCall::MediaReading
-                | MediaCall::Denoising
-                | MediaCall::VideoDecoding
-                | MediaCall::AudioDecoding
-                | MediaCall::VideoEncoding
-                | MediaCall::AudioEncoding
-                | MediaCall::Muxing,
-            )) => 2,
-            Some(
-                CallKind::Media(MediaCall::LatentPreparation)
-                | CallKind::Transfer(TransferMode::Tensor)
-                | CallKind::Transfer(TransferMode::CacheExport),
-            )
-            | None => 3,
-        }
     }
 
     /// Determines the next call kind without mutating request or resource state.
