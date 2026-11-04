@@ -61,8 +61,10 @@ pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
     Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d,
-    Embedding, LayerNorm, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, Sampler, SamplerState,
-    Samples, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, gather_rows,
+    Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation, LayerNorm, Linear,
+    ModulatedRmsNorm, Moe, Noise, PackedSwiGlu, ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler,
+    SamplerState, Samples, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, SwiGlu,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;

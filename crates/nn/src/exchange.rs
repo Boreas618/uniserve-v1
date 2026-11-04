@@ -112,8 +112,11 @@ mod tests {
     fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> ExchangeViews {
         let (states, ids, weights, counts) = views(ranks, capacity, hidden, top);
         ExchangeViews {
-            // The transport is opaque and never dereferenced by these tests.
-            transport: unsafe { ExchangeTransport::from_handle(core::ptr::null_mut()) },
+            transport: {
+                // SAFETY: the transport is opaque and never dereferenced by these tests; the null
+                // handle only stands in for a value the executor would build.
+                unsafe { ExchangeTransport::from_handle(core::ptr::null_mut()) }
+            },
             ranks,
             capacity,
             states,

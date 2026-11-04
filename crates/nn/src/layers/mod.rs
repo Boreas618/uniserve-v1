@@ -18,25 +18,38 @@
 //! constants are declared once, in [`launch`], so the step that reads them from a program changes
 //! one module.
 
+mod activation;
 mod attention;
 mod conv;
 mod embedding;
 mod exchange;
+mod frame;
 mod head;
 mod linear;
+mod modulation;
 mod moe;
+mod noise;
 mod norm;
+mod residual;
 mod rope;
 mod sampler;
 
+pub use activation::{GatedActivation, PackedSwiGlu, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
+pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
 pub use linear::Linear;
+pub use modulation::ModulatedRmsNorm;
 pub use moe::Moe;
+pub use noise::Noise;
 pub use norm::{LayerNorm, RmsNorm};
+pub use ops::rope::Rotation;
+pub use residual::{
+    ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
+};
 pub use rope::Rotary;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 
