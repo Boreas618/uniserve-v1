@@ -32,7 +32,6 @@ struct uniserve_gather_gemm_nvfp4_call {
   const void* scales;
   const void* global_scale;
   const void* global_scale_gate;
-  const int32_t* ids;
   const int32_t* tile_to_expert;
   const int32_t* tile_to_limit;
   const int32_t* permuted_to_expanded;
@@ -58,12 +57,12 @@ static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, hidden_scale) == 8);
 static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, hidden_token_scale) == 16);
 static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, global_scale) == 40);
 static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, global_scale_gate) == 48);
-static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, num_non_exiting_tiles) == 88);
-static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, workspace) == 104);
-static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, workspace_bytes) == 112);
-static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, dtype) == 200);
-static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, error) == 208);
-static_assert(sizeof(uniserve_gather_gemm_nvfp4_call) == 720);
+static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, num_non_exiting_tiles) == 80);
+static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, workspace) == 96);
+static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, workspace_bytes) == 104);
+static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, dtype) == 192);
+static_assert(offsetof(uniserve_gather_gemm_nvfp4_call, error) == 200);
+static_assert(sizeof(uniserve_gather_gemm_nvfp4_call) == 712);
 
 // The operator crate's `DType::as_i64()` numbering, for the types this entry names.
 constexpr int64_t uniserve_dtype_bf16 = 3;
