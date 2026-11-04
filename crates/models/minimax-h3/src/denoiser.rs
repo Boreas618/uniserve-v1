@@ -1734,6 +1734,10 @@ pub fn denoise_arena(
         out: u64,
     ) {
         push(plan, &format!("{name}.normed"), element, rows * hidden);
+        // The floor of the head is FP32 (`transformer.py:404-421`), so the normalised rows are
+        // widened before the projection reads them. A stack whose own element type is already FP32
+        // reads them in place and leaves this buffer untouched; the plan sizes for the widening.
+        push(plan, &format!("{name}.wide"), "f32", rows * hidden);
         if student {
             push(plan, &format!("{name}.head"), element, out * hidden);
             push(plan, &format!("{name}.head_bias"), element, out);
@@ -1746,6 +1750,9 @@ pub fn denoise_arena(
     // sequence.
     push(&mut plan, "packed", element, tokens * hidden);
     push(&mut plan, "patched", element, video_rows * patches);
+    // The two input projections are FP32 too (`transformer.py:366-372`), so each reads a widened
+    // copy of its own rows - 96 columns for the video's and 32 for the audio's.
+    push(&mut plan, "patched.wide", "f32", video_rows * patches);
     push(&mut plan, "video.projected", element, video_rows * hidden);
     if let Some((audio_rows, _)) = audio {
         push(&mut plan, "audio.projected", element, audio_rows * hidden);
