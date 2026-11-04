@@ -291,19 +291,24 @@ impl Api {
         if status == STATUS_SUCCESS {
             return Ok(());
         }
+        Err(Error::Cudnn {
+            call,
+            code: status,
+            message: self.last_error(),
+        })
+    }
+
+    /// The library's text for the last call that failed.
+    fn last_error(&self) -> String {
         let mut message = [0 as c_char; 256];
         // SAFETY: the library writes at most `message.len()` bytes; the
         // buffer outlives the call.
         unsafe { (self.get_last_error)(message.as_mut_ptr(), message.len()) };
         // SAFETY: the library fills the buffer with a NUL-terminated string.
-        let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+        unsafe { CStr::from_ptr(message.as_ptr()) }
             .to_str()
-            .unwrap_or("non-UTF-8 cuDNN error");
-        Err(Error::Cudnn {
-            call,
-            code: status,
-            message: text.to_owned(),
-        })
+            .unwrap_or("non-UTF-8 cuDNN error")
+            .to_owned()
     }
 
     /// Sets one attribute from `values`, whose C type the caller names.
@@ -1659,6 +1664,7 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        steps.extend(self.fill_variants(&mode_b, listed_b));
         let exhaustive = stage!(
             "engine heuristic: mode B, read up to eight configurations and their numerical notes",
             self.configs(&graph, 8, HEURISTIC_MODE_B, false)
@@ -1742,6 +1748,117 @@ impl Cudnn {
         );
         drop((plan, x, w, y));
         steps
+    }
+
+    /// The four readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
+    /// wants of the array it is handed, all four against the same finalized
+    /// `heuristic` descriptor, so the only difference between them is the
+    /// request.
+    ///
+    /// A diagnostic: it decides nothing and changes nothing. Each line says
+    /// the status, the element count the library answered, and how many slots
+    /// hold a handle afterwards, because those three separate the readings —
+    /// a list that is written but not counted looks like a list that was left
+    /// empty from the caller's side.
+    fn fill_variants(
+        &self,
+        heuristic: &Descriptor,
+        listed: usize,
+    ) -> Vec<(String, Option<String>)> {
+        let mut steps = Vec::new();
+        // (name, requestedElementCount, descriptors created, initial count)
+        let variants: [(&str, i64, usize, i64); 4] = [
+            (
+                "1 as the code reads it now: requested = the list's length, count starts at 0",
+                listed as i64,
+                listed.max(1),
+                0,
+            ),
+            (
+                "2 the same request with the count initialised to the list's length",
+                listed as i64,
+                listed.max(1),
+                listed as i64,
+            ),
+            (
+                "3 no count query first: created MAX_ENGINE_CONFIGS descriptors, requested that many",
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                0,
+            ),
+            (
+                "4 requested larger than the list: list + MAX_ENGINE_CONFIGS",
+                (listed + MAX_ENGINE_CONFIGS) as i64,
+                listed + MAX_ENGINE_CONFIGS,
+                0,
+            ),
+        ];
+        for (name, requested, created, initial) in variants {
+            match self.fill_once(heuristic, requested, created, initial) {
+                Ok(line) => steps.push((format!("engine heuristic fill {name}: {line}"), None)),
+                Err(error) => steps.push((
+                    format!("engine heuristic fill {name}"),
+                    Some(error.to_string()),
+                )),
+            }
+        }
+        steps
+    }
+
+    /// One fill of the heuristic's results with the array and the initial
+    /// element count a variant names.
+    ///
+    /// Answers with the status and what the array holds afterwards; handles the
+    /// library writes that are not the ones created here are destroyed, so a
+    /// library that replaces the array does not leak through the probe.
+    fn fill_once(
+        &self,
+        heuristic: &Descriptor,
+        requested: i64,
+        created: usize,
+        initial: i64,
+    ) -> Result<String> {
+        let mut ours = Vec::with_capacity(created);
+        for _ in 0..created {
+            ours.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
+        }
+        let mine: Vec<Handle> = ours.iter().map(|descriptor| descriptor.raw).collect();
+        let mut handles: Vec<Handle> = mine.clone();
+        let mut written = initial;
+        // SAFETY: every slot holds a descriptor this module created with
+        // `cudnnBackendCreateDescriptor`, which is what the call fills, and
+        // both the array and the slots outlive it.
+        let status = unsafe {
+            (self.api.backend_get_attribute)(
+                heuristic.raw,
+                ATTR_ENGINEHEUR_RESULTS,
+                TYPE_BACKEND_DESCRIPTOR,
+                requested,
+                &mut written,
+                handles.as_mut_ptr().cast(),
+            )
+        };
+        let mut replaced = 0usize;
+        for handle in &handles {
+            if handle.is_null() || mine.contains(handle) {
+                continue;
+            }
+            replaced += 1;
+            // SAFETY: a handle the library wrote into a slot of ours is a
+            // descriptor it created and handed over; destroyed once here.
+            unsafe { (self.api.backend_destroy_descriptor)(*handle) };
+        }
+        let held = handles.iter().filter(|handle| !handle.is_null()).count();
+        let line = format!(
+            "status {status}{}, wrote {written}, {held} of {} slots hold a handle, {replaced} of them new",
+            if status == STATUS_SUCCESS {
+                String::new()
+            } else {
+                format!(" ({})", self.api.last_error())
+            },
+            handles.len()
+        );
+        Ok(line)
     }
 
     /// The engine heuristic descriptor of `graph` in `mode`, finalized.
