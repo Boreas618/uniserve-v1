@@ -33,7 +33,7 @@
 //! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
-use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
+use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, VideoRequest};
 use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
 use crate::attention::{Factors, Visible};
@@ -125,7 +125,7 @@ impl Layouts {
         let elements: u64 = conditions
             .iter()
             .map(|condition| {
-                let visual = condition.frame.map_or(0, |frame| {
+                condition.frame.map_or(0, |frame| {
                     let frames = if frame.num_frames <= 1 {
                         1
                     } else {
@@ -140,8 +140,7 @@ impl Layouts {
                         }
                         Err(_) => 0,
                     }
-                });
-                visual
+                })
             })
             .sum();
         elements as u32
@@ -940,6 +939,88 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
     })
 }
 
+/// The condition latents a request's conditions encode to, and their noise draws.
+///
+/// Both are the runner's: the VAE encoders produce the latents and the request's Philox stream
+/// produces the draws, so the model reads views it allocated nothing for and writes only the prefix
+/// source it was given. A condition with pixels contributes one latent view and, if it carries a
+/// soundtrack, one audio view after it; an audio-only reference contributes its audio view alone.
+pub struct ConditionLatents<'a> {
+    /// Each condition's latents, in request order and in the order above.
+    pub latents: &'a [TensorView],
+    /// One draw per visual condition, in packed order: `[channels, frames, height, width]` in the
+    /// prefix source's dtype, which is the dtype the anchoring and the projection work in.
+    pub noise: &'a [TensorView],
+}
+
+/// The level a visual condition is anchored at: `t z + (1 - t) noise` with `t` this
+/// (`uniserve/models/minimax_h3/denoiser.py:102`).
+pub const VISUAL_CONDITION_TIME: f32 = 0.999;
+
+/// A request's condition latents, each condition's visual view and its audio view.
+struct ConditionViews {
+    pairs: Vec<(Option<TensorView>, Option<TensorView>)>,
+}
+
+impl ConditionViews {
+    /// Pair the request's flat view list with its conditions: each condition contributes its
+    /// visual latents when it has pixels and its audio latents when it has samples, in that order,
+    /// which is the order the reference's `latents` tuple holds them
+    /// (`uniserve/models/minimax_h3/denoiser.py:553-561`).
+    fn new(conditions: &[packing::Condition], views: &[TensorView]) -> Result<Self> {
+        let mut offered = views.iter();
+        let mut pairs = Vec::with_capacity(conditions.len());
+        let missing = || Error::config("a condition's latents were not offered".to_owned());
+        for condition in conditions {
+            let visual = if condition.frame.is_some() {
+                Some(*offered.next().ok_or_else(missing)?)
+            } else {
+                None
+            };
+            let audio = if condition.audio_samples > 0 {
+                Some(*offered.next().ok_or_else(missing)?)
+            } else {
+                None
+            };
+            pairs.push((visual, audio));
+        }
+        if offered.next().is_some() {
+            return Err(Error::config(format!(
+                "{} condition latents were offered for {} conditions",
+                views.len(),
+                conditions.len()
+            )));
+        }
+        Ok(Self { pairs })
+    }
+
+    /// One condition's visual and audio latents, in request order.
+    fn of(&self, condition: u32) -> (Option<TensorView>, Option<TensorView>) {
+        self.pairs[condition as usize]
+    }
+}
+
+/// `rows` rows of `source` starting at `start`, addressed by the same layout.
+///
+/// The prefix source is one contiguous `[rows, columns]` buffer, so a condition's rows are a view
+/// of it rather than a copy into it.
+fn row_range(source: TensorView, start: u32, rows: u64) -> Result<TensorView> {
+    let columns = source.shape.dim(1);
+    if u64::from(start) + rows > source.shape.dim(0) {
+        return Err(Error::config(format!(
+            "rows {start}..{} past the prefix source's {}",
+            u64::from(start) + rows,
+            source.shape.dim(0)
+        )));
+    }
+    Ok(TensorView::with_strides(
+        source.offset_elements(u64::from(start) * columns),
+        source.dtype,
+        Shape::new(&[rows, columns]),
+        nn::Strides::new(&[columns, 1]),
+    ))
+}
+
 /// Round `value` up to the next multiple of `unit`.
 fn round_up(value: u32, unit: u32) -> u32 {
     value.div_ceil(unit) * unit
@@ -1285,6 +1366,135 @@ impl Denoiser {
         let total = u32::try_from(text.shape.dim(0))
             .map_err(|_| Error::checkpoint("a conditioning row count above u32::MAX".to_owned()))?;
         self.refiner.forward(f, source, &documents, total, text)
+    }
+
+    /// Project a request's conditions into its prefix source.
+    ///
+    /// The source is the compact prefix buffer - the prompt's rows, then one row per packed
+    /// condition row, then the zero row - which `Layouts::table_specs`' `prefix_index` addresses
+    /// directly ([`crate::packing::DensePacking::zero_row`]). The conditions' rows start at the
+    /// layout's text capacity, in packed order, audio before video within a segment
+    /// ([`crate::packing::condition_segments`]).
+    ///
+    /// A visual condition is anchored as `t z + (1 - t) noise` at `t = VISUAL_CONDITION_TIME` and
+    /// projected by the layer that projects the generated rows of its modality; an audio reference
+    /// is projected unchanged (`uniserve/models/minimax_h3/denoiser.py:510-532`). The anchoring's
+    /// sum is FP32 and stores the working dtype once, so what the DiT gathers is what the reference
+    /// rounds.
+    ///
+    /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
+    /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
+    pub fn encode_conditions(
+        &self,
+        f: &Forward,
+        request: &VideoRequest<'_>,
+        layout: Layout,
+        conditions: ConditionLatents<'_>,
+        out: TensorView,
+    ) -> Result<()> {
+        let canvas = canvas_of_latents(&layout)?;
+        let declared = conditions_of(request);
+        let segments = packing::condition_segments(&declared, &canvas)?;
+        // The source is sized by the layout the runner laid the request out under, so a buffer of
+        // another size is refused here rather than read past its rows below.
+        let packing = self.rules.packing_of(&layout)?;
+        let hidden = u64::from(self.config.transformer.hidden_size);
+        let rows = u64::from(packing.text_rows + packing.condition_rows + 1);
+        if out.shape.rank() != 2 || out.shape.dim(0) != rows || out.shape.dim(1) != hidden {
+            return Err(Error::config(format!(
+                "the H3 prefix source is [{rows}, {hidden}] rows for this layout, got {:?}",
+                out.shape.dims()
+            )));
+        }
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let video_channels = u64::from(self.config.transformer.video_channels);
+        let audio_channels = u64::from(self.config.transformer.audio_channels);
+        let width = video_channels * 4;
+        let views = ConditionViews::new(&declared, conditions.latents)?;
+        let mut draws = conditions.noise.iter();
+        let mut row = packing.text_rows;
+        for segment in &segments {
+            let (visual_view, audio_view) = views.of(segment.condition);
+            // Audio rows lead their segment in the packed order.
+            if segment.audio_rows() > 0 {
+                let audio = audio_view.ok_or_else(|| {
+                    Error::config(format!(
+                        "condition {} carries {} audio rows and no latents were offered",
+                        segment.condition,
+                        segment.audio_rows()
+                    ))
+                })?;
+                let count = u64::from(segment.audio_rows());
+                if audio.shape.dims() != [count, audio_channels] {
+                    return Err(Error::config(format!(
+                        "condition {}'s audio latents are [{count}, {audio_channels}], got {:?}",
+                        segment.condition,
+                        audio.shape.dims()
+                    )));
+                }
+                self.transformer
+                    .project_audio(f, audio, row_range(out, row, count)?)?;
+                row += segment.audio_rows();
+            }
+            let Some(visual) = segment.visual else {
+                continue;
+            };
+            let clean = visual_view.ok_or_else(|| {
+                Error::config(format!(
+                    "condition {} carries {} visual rows and no latents were offered",
+                    segment.condition,
+                    visual.rows()
+                ))
+            })?;
+            let count = u64::from(visual.rows());
+            if clean.shape.dims() != [count, width] {
+                return Err(Error::config(format!(
+                    "condition {}'s visual latents are [{count}, {width}], got {:?}",
+                    segment.condition,
+                    clean.shape.dims()
+                )));
+            }
+            let (frames, height, columns) = (
+                u64::from(visual.frames),
+                u64::from(visual.raster.height),
+                u64::from(visual.raster.width),
+            );
+            let draw = draws.next().ok_or_else(|| {
+                Error::config(format!(
+                    "condition {} is visual and the runner offered no draw for it",
+                    segment.condition
+                ))
+            })?;
+            if draw.shape.dims() != [video_channels, frames, height, columns] {
+                return Err(Error::config(format!(
+                    "condition {}'s draw is [{video_channels}, {frames}, {height}, {columns}], \
+                     got {:?}",
+                    segment.condition,
+                    draw.shape.dims()
+                )));
+            }
+            // The draw becomes packed rows, then the anchoring mixes the condition's latents in
+            // at the conditioning level: `target = (1 - t) target + t clean`.
+            let anchor = f.arena().tensor(out.dtype, Shape::new(&[count, width]))?;
+            nn::layers::Patch::new(video_channels, height, columns)?
+                .forward(f, *draw, anchor, frames)
+                .map_err(Error::from)?;
+            nn::layers::ScaledAdd
+                .forward(
+                    f,
+                    anchor,
+                    clean,
+                    VISUAL_CONDITION_TIME,
+                    1.0 - VISUAL_CONDITION_TIME,
+                )
+                .map_err(Error::from)?;
+            self.transformer
+                .project(f, anchor, row_range(out, row, count)?)?;
+            row += visual.rows();
+        }
+        Ok(())
     }
 
     /// One denoising step: the latents in, the model's velocity, and the schedule's update.
@@ -1931,6 +2141,120 @@ mod tests {
         assert_eq!(layout.audio.unwrap().frames, 178);
         assert_eq!(layout.text_rows, 128);
         assert_eq!(layout.condition_rows, 64);
+    }
+
+    /// A request carrying one keyframe, one clip reference with a soundtrack, and one audio
+    /// reference: the three ways a condition can arrive.
+    fn conditioned() -> VideoRequest<'static> {
+        const SHAPES: [nn::capability::ConditionShape; 3] = [
+            nn::capability::ConditionShape {
+                role: ConditionRole::FirstFrame,
+                frames: 1,
+                height: 480,
+                width: 832,
+                audio_samples: 0,
+            },
+            nn::capability::ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 12,
+                height: 480,
+                width: 832,
+                audio_samples: 24_000,
+            },
+            nn::capability::ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 0,
+                height: 0,
+                width: 0,
+                audio_samples: 24_000,
+            },
+        ];
+        VideoRequest {
+            task: nn::capability::VideoTask::ReferenceToVideoAudio,
+            first_frames: 1,
+            references: 2,
+            text_tokens: 15,
+            conditions: &SHAPES,
+            ..request(121, 832, 480)
+        }
+    }
+
+    #[test]
+    fn a_condition_arrives_as_the_packing_reads_it() {
+        // The request states a role and an encoded raster; the packing wants a canvas and a frame
+        // count. A reference without pixels is an audio reference and has no frame.
+        let conditions = conditions_of(&conditioned());
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(conditions[0].role, packing::Role::FirstFrame);
+        let frame = conditions[0].frame.expect("a keyframe carries its pixels");
+        assert_eq!((frame.canvas.width, frame.canvas.height), (832, 480));
+        // A canvas is the short edge and the exact aspect, as `canvas_of` reduces one.
+        assert_eq!(frame.canvas.short_edge, 480);
+        assert_eq!(frame.canvas.aspect, (26, 15));
+        assert_eq!(frame.num_frames, 1);
+        assert_eq!(conditions[1].role, packing::Role::Reference);
+        assert_eq!(
+            conditions[1].frame.expect("a clip has pixels").num_frames,
+            12
+        );
+        assert_eq!(conditions[1].audio_samples, 24_000);
+        assert!(
+            conditions[2].frame.is_none(),
+            "an audio reference has no pixels"
+        );
+        assert_eq!(conditions[2].audio_samples, 24_000);
+    }
+
+    #[test]
+    fn an_audio_reference_draws_no_noise() {
+        // The request's stream holds one draw per *visual* condition: the reference conditions an
+        // audio reference at its posterior's mean, and counting its rows would shift the video's
+        // draw and change the video without failing anything (`denoiser.py:452-461`).
+        let rule = layouts();
+        let conditions = conditions_of(&conditioned());
+        let channels = u64::from(rule.config.transformer.video_channels);
+        let visual: u64 = conditions
+            .iter()
+            .filter_map(|condition| condition.frame)
+            .map(|frame| {
+                let raster = packing::latent_raster(&frame.canvas).unwrap();
+                let frames = if frame.num_frames <= 1 {
+                    1
+                } else {
+                    packing::video_latent_frames(frame.num_frames).unwrap()
+                };
+                u64::from(frames) * u64::from(raster.height) * u64::from(raster.width) * channels
+            })
+            .sum();
+        assert_eq!(
+            u64::from(rule.condition_elements(&conditions, &canvas_of_raster(832, 480).unwrap())),
+            visual
+        );
+    }
+
+    #[test]
+    fn each_condition_s_latents_are_paired_with_it_in_request_order() {
+        // A condition contributes its visual latents when it has pixels and its audio latents when
+        // it has samples, in that order; the packed order is another thing, so a view handed to the
+        // wrong condition would project one condition's media into another's rows.
+        let conditions = conditions_of(&conditioned());
+        let views: Vec<TensorView> = (0..5)
+            .map(|index| {
+                TensorView::with_strides(
+                    nn::DevicePtr::new(index * 4096),
+                    DType::BF16,
+                    Shape::new(&[1, 1]),
+                    nn::Strides::new(&[1, 1]),
+                )
+            })
+            .collect();
+        let paired = ConditionViews::new(&conditions, &views).unwrap();
+        assert!(paired.of(0).0.is_some() && paired.of(0).1.is_none());
+        assert!(paired.of(1).0.is_some() && paired.of(1).1.is_some());
+        assert!(paired.of(2).0.is_none() && paired.of(2).1.is_some());
+        // Every expected view is required, and one too many is refused rather than dropped.
+        assert!(ConditionViews::new(&conditions, &views[..3]).is_err());
+        assert!(ConditionViews::new(&conditions, &views).is_err());
     }
 
     #[test]
