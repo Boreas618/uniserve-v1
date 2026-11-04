@@ -2,19 +2,21 @@
 //!
 //!     cargo run -p minimax-h3 --example check_encoder_keys -- <pipeline root>
 //!
-//! The text encoder and the vision tower ask their tensors by name, and a name that the checkpoint
-//! spells differently is the one defect a load cannot report usefully: it surfaces as a read error
-//! inside a layer, after the weights before it have already been read. This example asks both
-//! components for their complete name list and compares it with the export's own
-//! `model.safetensors.index.json`, so the answer is three numbers before any weight is touched:
+//! The text encoder, the vision tower it builds inside itself, and the video VAE encoder ask their
+//! tensors by name, and a name the checkpoint spells differently is the one defect a load cannot
+//! report usefully: it surfaces as a read error inside a layer, after the weights before it have
+//! already been read. This example asks each component for its complete name list and compares it
+//! with the export's own index files, so the answer is three numbers before any weight is touched:
 //!
-//!   * **asked** - what the components read (`TextEncoder::keys`, `VisionTower::keys`);
+//!   * **asked** - what the component reads (`TextEncoder::keys`, `VisionTower::keys`,
+//!     `VideoEncoder::keys`);
 //!   * **missing** - asked, and the index does not hold it: a load would fail;
-//!   * **unread** - in the index, and neither component asks for it: either a tensor these two do
-//!     not read (a head, a projection the tower drops) or a name the walk spells differently.
+//!   * **unread** - in the index, and the component does not ask for it: either a tensor it does
+//!     not read by design (an unretained layer, an unused head) or a name the walk spells
+//!     differently.
 //!
-//! It opens no tensor and needs no device: the index is metadata, so this runs where the shards are
-//! not fetched. Unlike `inspect_checkpoint` it needs no contract, only the two config sidecars.
+//! It opens no tensor and needs no device: the indexes are metadata, so this runs where the shards
+//! are not fetched. Unlike `inspect_checkpoint` it needs no contract, only the config sidecars.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -35,41 +37,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sidecars = Sidecars::read(&root, None, &layout)?;
     let config = Config::normalize(&layout, &sidecars)?;
 
-    let index = index_names(&root.join("text_encoder"))?;
-    println!(
-        "index: {} tensors under {}",
-        index.len(),
-        root.join("text_encoder").display()
-    );
-
+    // The language stack and the tower share one export directory and one index; the video VAE
+    // encoder has its own.
+    let text_index = index_names(&root.join("text_encoder"))?;
+    let vae_index = index_names(&root.join("vae"))?;
     let text = TextEncoder::keys(&config.text_encoder);
     let tower = VisionTower::keys(&config.text_encoder.vision);
-    let mut unread: BTreeSet<&str> = index.iter().map(String::as_str).collect();
+    let video = VideoEncoder::keys(&config.video_vae)?;
+
     let mut failed = false;
-    for (name, keys) in [("text encoder", &text), ("vision tower", &tower)] {
-        let missing: Vec<&str> = keys
-            .iter()
-            .map(String::as_str)
-            .filter(|key| !index.contains(*key))
-            .collect();
-        for key in keys {
-            unread.remove(key.as_str());
-        }
-        println!("{name}: {} asked, {} missing", keys.len(), missing.len());
-        for key in missing.iter().take(12) {
-            println!("  missing  {key}");
-        }
-        failed |= !missing.is_empty();
-    }
-    println!("unread: {} of the index's tensors", unread.len());
-    for key in unread.iter().take(12) {
-        println!("  unread   {key}");
-    }
+    report(
+        "text encoder",
+        &text,
+        &text_index,
+        &[&text, &tower],
+        &mut failed,
+    );
+    report(
+        "vision tower",
+        &tower,
+        &text_index,
+        &[&text, &tower],
+        &mut failed,
+    );
+    report(
+        "video VAE encoder",
+        &video,
+        &vae_index,
+        &[&video],
+        &mut failed,
+    );
 
     if failed {
-        return Err("a name the encoders read is not in the checkpoint".into());
+        return Err("a name a component reads is not in the checkpoint".into());
     }
     Ok(())
+}
+
+/// Print one component's answer, and remember whether it asked for a name the index lacks.
+///
+/// `partners` are the other key lists that read the same index: a tensor a partner asks for is
+/// accounted for even when this component does not read it, so each component is reported without
+/// the other's tensors looking unexplained.
+fn report(
+    name: &str,
+    keys: &[String],
+    index: &BTreeSet<String>,
+    partners: &[&Vec<String>],
+    failed: &mut bool,
+) {
+    let missing: Vec<&str> = keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !index.contains(*key))
+        .collect();
+    let mut unread: BTreeSet<&str> = index.iter().map(String::as_str).collect();
+    for list in partners {
+        for key in list.iter() {
+            unread.remove(key.as_str());
+        }
+    }
+    println!(
+        "{name}: {} asked, {} missing, index {} tensors",
+        keys.len(),
+        missing.len(),
+        index.len()
+    );
+    for key in missing.iter().take(12) {
+        println!("  missing  {key}");
+    }
+    println!("  unread   {} of them", unread.len());
+    for key in unread.iter().take(12) {
+        println!("    unread   {key}");
+    }
+    *failed |= !missing.is_empty();
 }
 
 /// Every tensor name the checkpoint's index lists for one component directory.
