@@ -50,6 +50,8 @@ pub(crate) struct Entry {
 pub(crate) enum Command {
     /// Serve one batch: stage it, choose its bucket, replay its graph.
     Batch(Batch),
+    /// Capture every bucket of the serving generation (warmup).
+    Warmup,
     /// Prepare the next generation (7.3 step 2).
     Precopy(Arc<Generation>),
     /// Switch the serving generation at a batch boundary (7.3 step 3).
@@ -305,6 +307,19 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
                 bucket: *bucket,
                 generation: *generation,
             },
+            Job::Shadow {
+                operator,
+                key,
+                bucket,
+                generation,
+                ..
+            } => Job::Shadow {
+                runner,
+                operator,
+                key: key.clone(),
+                bucket: *bucket,
+                generation: *generation,
+            },
             Job::Rebind {
                 bucket, generation, ..
             } => Job::Rebind {
@@ -323,6 +338,7 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
 pub(crate) fn kind_of(command: &Command) -> JobKind {
     match command {
         Command::Batch(_) => JobKind::Batch,
+        Command::Warmup => JobKind::Warmup,
         Command::Precopy(_) => JobKind::Precopy,
         Command::Switchover(_) => JobKind::Switchover,
         Command::Purge(_) => JobKind::Purge,

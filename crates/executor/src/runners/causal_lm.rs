@@ -321,23 +321,56 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }]))
     }
 
+    fn warmup(&mut self) -> Result<Jobs> {
+        let generation = self.generation.number();
+        let mut jobs = Vec::new();
+        // Largest first, so the smaller captures reuse the larger ones' pool blocks
+        // (`specs/replaceable-processes.md` 9.3).
+        for bucket in self.buckets.capture_order().copied().collect::<Vec<_>>() {
+            if self.graphs.captured(bucket, generation).is_none() {
+                jobs.push(Job::Capture {
+                    runner: self.id,
+                    bucket,
+                    generation,
+                });
+            }
+        }
+        Ok(Jobs::new(jobs))
+    }
+
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
         // Which buckets a changed operator forces to change, and whether the change can be a
         // rebind (same launch structure) or must be a recapture, is decided from the two
         // generations' kernels and each bucket's node table (4.5).
-        let mut changed: Vec<&'static str> = Vec::new();
+        let mut changed: Vec<(&'static str, String)> = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
             let same = next
                 .kernel(operator, key)
                 .map(|candidate| Arc::ptr_eq(candidate, kernel))
                 .unwrap_or(false);
-            if !same && !changed.contains(&operator) {
-                changed.push(operator);
+            if !same {
+                changed.push((operator, key.to_owned()));
+            }
+        }
+        // A launch the old generation does not have is a change too: it has nothing to compare
+        // against, so a rebind of its bucket cannot be right and the bucket is recaptured.
+        for (operator, key, _) in next.iter() {
+            if !self.generation.contains(operator, key) {
+                changed.push((operator, key.to_owned()));
             }
         }
         let mut jobs = Vec::new();
-        for operator in changed {
+        for (operator, key) in changed {
             for bucket in self.graphs.using(operator, self.generation.number()) {
+                // The paired forward runs first: a difference beyond the operator's tolerance
+                // fails the precopy before anything is rebound or recaptured (7.3).
+                jobs.push(Job::Shadow {
+                    runner: self.id,
+                    operator,
+                    key: key.clone(),
+                    bucket,
+                    generation: next.number(),
+                });
                 let captured = self
                     .graphs
                     .captured(bucket, self.generation.number())
@@ -416,6 +449,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 self.replay(captured)
             }
             Job::Capture { bucket, generation } => self.capture(*bucket, *generation),
+            Job::Shadow {
+                operator,
+                key,
+                bucket,
+                generation,
+            } => self.shadow(*operator, key, *bucket, *generation),
             Job::Rebind { bucket, generation } => self.rebind(*bucket, *generation),
             Job::Issue { .. } | Job::After { .. } => Err(Error::Invariant(
                 "the device queue performs its own jobs".into(),
@@ -497,8 +536,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut applied = 0usize;
         for (operator, _, walk_nodes) in &nodes {
             let ordinal = launch_of.entry(*operator).or_insert(0);
+            // A capture adds both kernel nodes and (for example) the empty nodes that carry a
+            // dependency; only kernel nodes have launch parameters to carry over.
             let mut params = Vec::with_capacity(walk_nodes.len());
             for node in walk_nodes {
+                if node.kind()? != platform::GraphNodeKind::Kernel {
+                    continue;
+                }
                 params.push(template.kernel_node_params(node)?);
             }
             applied += served.rebind_launch(operator, *ordinal, &params)?;
@@ -506,6 +550,78 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         tracing::debug!(bucket = %bucket, applied, "rebound a bucket for a new generation");
         Ok(())
+    }
+
+    /// Runs the paired forward of one changed operator and compares its two results (7.3).
+    ///
+    /// The old kernel writes the real outputs and the new one its twins; the forward continues on
+    /// the old kernel's result, so the difference of one operator cannot accumulate. The paired
+    /// forward runs without a graph, on the runner's stream, so it touches no captured bucket, and
+    /// its KV goes to scratch pages: nothing a serving request reads is written.
+    fn shadow(
+        &mut self,
+        operator: &'static str,
+        key: &str,
+        bucket: Bucket,
+        generation: u64,
+    ) -> Result<()> {
+        let next = self.generation_named(generation)?;
+        let previous = if self.generation.number() == generation {
+            self.previous.clone()
+        } else {
+            Some(Arc::clone(&self.generation))
+        }
+        .ok_or_else(|| {
+            Error::Invariant(
+                "shadow execution needs the generation being replaced kept beside the new one"
+                    .into(),
+            )
+        })?;
+        let mut harness = self.shadow.take().ok_or_else(|| {
+            Error::State(
+                "the runner has no shadow harness: it is allocated when the runner is bound".into(),
+            )
+        })?;
+        harness.reset();
+        let stream = self.stream.clone();
+        let walked = self.walk_paired(bucket, &next, &previous, operator, key, harness.twins());
+        // The operator's tolerance is the one its paired forward recorded: `Forward::operate`
+        // calls `O::tolerance(descriptor)` when it shadows, and the harness compares with it.
+        let compared = walked.and_then(|()| {
+            let tolerance = harness.tolerance().ok_or_else(|| {
+                Error::Invariant(format!(
+                    "the paired forward of {operator} recorded no tolerance: was it shadowed?"
+                ))
+            })?;
+            harness.compare(&stream, tolerance)
+        });
+        // The harness stays with the runner whatever the outcome: its failure is the precopy's,
+        // which the calling device command reports.
+        harness.reset();
+        self.shadow = Some(harness);
+        compared.map(|_| ())
+    }
+
+    /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
+    /// and `next`'s on the twins (7.3).
+    ///
+    /// The model's `Forward::operate` does the branch, for every layer alike: with the shadow
+    /// field set it calls `O::shadow`, launches the new kernel into the twins and the old one into
+    /// the real outputs; every other operator launches from `next` only.
+    fn walk_paired(
+        &mut self,
+        _bucket: Bucket,
+        _next: &Arc<Generation>,
+        _previous: &Arc<Generation>,
+        _operator: &'static str,
+        _key: &str,
+        _twins: &mut ops::Twins,
+    ) -> Result<()> {
+        Err(Error::State(
+            "the paired forward needs nn::Forward::operate (exec-work M169/M159): the model's \
+             layers call it, and the runner only sets the forward's shadow field"
+                .into(),
+        ))
     }
 
     /// The generation with `number`: the serving one, the prepared one, or the old one probation
