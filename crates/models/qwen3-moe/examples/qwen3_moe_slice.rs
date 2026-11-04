@@ -97,6 +97,7 @@ struct Args {
     device: u32,
     layer: usize,
     tokens: String,
+    resident: u64,
 }
 
 /// The four stages of the run.
@@ -116,6 +117,7 @@ impl Args {
         let mut device = 0;
         let mut layer = 0;
         let mut tokens = String::new();
+        let mut resident = 0;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -153,6 +155,13 @@ impl Args {
                     })?;
                 }
                 "--tokens" => tokens = value("--tokens")?,
+                "--resident" => {
+                    let gib = value("--resident")?;
+                    let size: u64 = gib.parse().map_err(|_| {
+                        Failure::message(format!("--resident takes whole GiB, not `{gib}`"))
+                    })?;
+                    resident = size << 30;
+                }
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
@@ -174,6 +183,7 @@ impl Args {
             device,
             layer,
             tokens,
+            resident,
         })
     }
 }
@@ -349,7 +359,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary.
-    let mut weights = DeviceWeights::new(&device)?;
+    let mut weights = DeviceWeights::new(&device, args.resident)?;
     let model = {
         let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
         qwen3_moe::load(
@@ -485,7 +495,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     let needed = needed_keys(&store_root, Stage::Decode)?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
-    let mut weights = DeviceWeights::new(&device)?;
+    let mut weights = DeviceWeights::new(&device, args.resident)?;
     let model = {
         let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
         qwen3_moe::load(
@@ -818,12 +828,11 @@ fn install(
         .as_deref()
         .and_then(|bytes| json_field(&String::from_utf8_lossy(bytes), "name"))
         .or_else(|| json_field(&launch, "name"))
-        .ok_or_else(|| {
-            Failure::message(format!(
-                "{}: neither metadata.json nor launch.json names a kernel entry",
-                directory.display()
-            ))
-        })?;
+        // A native package's entry is the packaging convention -- `entries = { launch =
+        // "uniserve_<operator>" }` in every package manifest in the tree -- and a store assembled
+        // without `launch.json` beside the library still names it by its operator. `ops::install`
+        // resolves the symbol and refuses with the name when the library does not export it.
+        .unwrap_or_else(|| format!("uniserve_{operator}"));
     let cubin = directory.join("module.cubin");
     if cubin.is_file() {
         let image = std::fs::read(&cubin)
@@ -896,9 +905,38 @@ struct DeviceWeights {
 }
 
 impl DeviceWeights {
-    fn new(device: &platform::Device) -> Result<Self> {
+    /// An allocator whose resident pool is reserved and can hold `requested` bytes.
+    ///
+    /// The pool must be reserved before the loader publishes a weight into it, and its size is the
+    /// checkpoint's own: the model keeps every parameter on the device for the run, so the region is
+    /// the largest thing this harness reserves. The sizes are tried in descending order because the
+    /// driver refuses a reservation larger than what the device can still map, and the model's own
+    /// total is not known before the weights are read.
+    fn new(device: &platform::Device, requested: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
-        let pools = platform::Allocator::new(device, budget)?;
+        let mut pools = platform::Allocator::new(device, budget)?;
+        let mut wanted = requested.max(72 << 30);
+        let mut reserved = None;
+        while wanted >= (8 << 30) {
+            if pools
+                .reserve(
+                    platform::PoolKind::Resident,
+                    usize::try_from(wanted).unwrap_or(usize::MAX),
+                )
+                .is_ok()
+            {
+                reserved = Some(wanted);
+                break;
+            }
+            wanted /= 2;
+        }
+        let reserved = reserved.ok_or_else(|| {
+            Failure::message(
+                "the driver refused every resident reservation from 72 GiB down to 8 GiB: the \
+                 model's weights cannot be held on this device",
+            )
+        })?;
+        println!("resident pool: {} GiB reserved", reserved >> 30);
         Ok(Self {
             pools,
             buffers: Vec::new(),
