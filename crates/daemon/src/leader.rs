@@ -2074,14 +2074,27 @@ impl Replica {
         let generation = epochs.next_generation(crate::engine::control::ENGINE_GROUP, 0);
         // The standby executes the serving engine's world: it maps that world's
         // weights and its KV cache read-only, ready to be promoted into the same
-        // scope (§2.5). The engine's own account of its cache segments is what a
-        // successor maps, so the standby is told exactly what the serving engine
-        // holds — a standby with no segments maps none, and each of its rank
-        // groups would keep a standby of its own, a third copy of the device
-        // storage.
+        // scope (§2.5). What a successor maps is the cache the serving engine
+        // holds **now**, not the segments it started with: a cache that grew or
+        // was resized since the launch would hand the standby units that are
+        // shorter than the ones it will be promoted into, and the failure would
+        // surface at promotion rather than here. `DescribeCache` is the same
+        // account the epoch switch's target is built from.
+        let segments = match serving.describe_cache().await {
+            Ok(segments) => segments,
+            Err(reason) => {
+                // No standby is better than one that maps the wrong units: the
+                // loss path relaunches the engine instead (`Replica::recover`).
+                warn!(
+                    model = %self.model_name,
+                    "the standby was not started: the serving engine did not describe its cache: {reason}"
+                );
+                return Ok(());
+            }
+        };
         spec.predecessor = Some(wire::Predecessor {
             world: spec.world,
-            segments: serving.info().segments.clone(),
+            segments,
         });
         let build = crate::epoch::BuildConfig::of(&locked(&self.config));
         let sink = stats_sink(
