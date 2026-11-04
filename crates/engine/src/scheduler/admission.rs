@@ -18,7 +18,7 @@
 //! its route.
 
 use super::*;
-use crate::kv_cache::PrefixScope;
+use crate::kv_cache::{KvOffloadManager, PrefixScope};
 use ipc::ForwardMode;
 
 /// One product a video request reserves: its declared name, the component
@@ -1402,33 +1402,12 @@ impl Scheduler {
                 // continuing another world's state reads none: the host's
                 // pages are keyed by the world that serves.
                 let mut host_tokens = 0;
-                if let Some(kv_offload) = self.kv_offload.as_mut()
-                    && let Some(step) = kv_offload.step(&target.0)
-                    && head.req.cache.read
-                    && head.req.cache.state_seeds.is_empty()
-                    && !head.has_context_images()
-                {
-                    // Reusable pages leave one prompt token to compute, as
-                    // in the device cache.
-                    let limit = n.saturating_sub(1) / step * step;
-                    if limit > cached_tokens {
-                        let keys = kv_offload.page_keys(
-                            &target.0,
-                            &head.req.prompt_token_ids,
-                            head.req.cache.isolation_key,
-                            limit,
-                        );
-                        match kv_offload.admission(
-                            head.req.request_id,
-                            &target.0,
-                            &keys,
-                            cached_tokens,
-                            limit,
-                        ) {
-                            Some(boundary) => host_tokens = boundary - cached_tokens,
-                            None => break,
-                        }
-                    }
+                match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n) {
+                    HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
+                    // The host is looking up this request's pages: the head
+                    // waits for the pins.
+                    HostHit::Pending => break,
+                    HostHit::Nothing => {}
                 }
                 // The two facts of the hit that no view can compute, recorded
                 // where admission measured them.
@@ -1501,7 +1480,7 @@ impl Scheduler {
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
     /// `None` when the runtime has no prefix cache or no prefill worker is ready.
-    fn prefill_target(
+    pub(super) fn prefill_target(
         &self,
         state: &RequestState,
     ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
@@ -1765,6 +1744,59 @@ pub(super) struct AdmissionReservation {
     source: ipc::WorkerEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
+}
+
+/// What the host KV cache says about a request's prompt beyond its device hit.
+pub(super) enum HostHit {
+    /// Nothing to look for: no host cache serves that worker, the request
+    /// reads another world's pages or continues context images, or its prompt
+    /// is on the device already.
+    Nothing,
+    /// The host serves the prompt up to this token boundary.
+    Serving(usize),
+    /// The host is looking the pages up, and the request waits for the pins.
+    Pending,
+}
+
+/// Starts the host KV cache looking for the pages a request can reuse beyond
+/// the device hit it already has, up to `limit` tokens of its prompt.
+///
+/// Admission asks for the boundary it needs; a plan's `prefetch` asks again
+/// later, and the answer grows as host pages arrive. Reusable pages leave one
+/// prompt token to compute, as in the device cache.
+pub(super) fn host_prefix(
+    kv_offload: &mut Option<KvOffloadManager>,
+    state: &RequestState,
+    target: &(crate::WorkerGroupId, String),
+    device_hit: usize,
+    limit: usize,
+) -> HostHit {
+    let Some(kv_offload) = kv_offload.as_mut() else {
+        return HostHit::Nothing;
+    };
+    let Some(step) = kv_offload.step(&target.0) else {
+        return HostHit::Nothing;
+    };
+    if !state.req.cache.read
+        || !state.req.cache.state_seeds.is_empty()
+        || state.has_context_images()
+    {
+        return HostHit::Nothing;
+    }
+    let limit = limit.min(state.req.prompt_token_ids.len().saturating_sub(1)) / step * step;
+    if limit <= device_hit {
+        return HostHit::Nothing;
+    }
+    let keys = kv_offload.page_keys(
+        &target.0,
+        &state.req.prompt_token_ids,
+        state.req.cache.isolation_key,
+        limit,
+    );
+    match kv_offload.admission(state.req.request_id, &target.0, &keys, device_hit, limit) {
+        Some(boundary) => HostHit::Serving(boundary),
+        None => HostHit::Pending,
+    }
 }
 
 /// Acquires the longest prefix every cache group can reuse and records cache
