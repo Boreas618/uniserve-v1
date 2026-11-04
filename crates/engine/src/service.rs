@@ -2524,7 +2524,12 @@ fn handle_process_commands(
     stop: &AtomicBool,
 ) {
     let Some(commands) = crate::worker::processes::take_commands() else {
-        // Another thread of this process runs them.
+        // One reader per process: a `ProcessLink` of this process already
+        // hands the daemon's commands out, and two readers would split them.
+        tracing::info!(
+            "the daemon's process commands are read elsewhere in this process: this serving path \
+             runs none of them"
+        );
         return;
     };
     while !stop.load(Ordering::Acquire) {
