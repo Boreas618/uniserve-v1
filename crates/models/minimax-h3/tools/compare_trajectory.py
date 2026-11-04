@@ -42,7 +42,9 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from dump_tables import load  # noqa: E402  (the container reader beside this script)
+from dump_tables import (
+    load,  # noqa: E402  (the container reader beside this script)
+)
 
 # The modalities the sampler keeps a trajectory for. A task without audio writes the video's
 # alone, so a missing audio pair is not a missing pair.
