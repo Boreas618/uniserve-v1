@@ -18,14 +18,23 @@
 //!
 //! ## Precision
 //!
-//! The decoder declares one element type — the checkpoint's own representation, FP16 for the dense
-//! `quality` checkpoint (specs/worker.md 1). Every parameter it reads is converted to that type once
-//! at the loading boundary, including the RMSNorm weights and the channel scales, because the fused
-//! residual and normalization operators carry one element type for the rows, the parameters and the
-//! residual together. The reference instead keeps those parameters FP32 and promotes the residual
-//! stream to FP32 (torch's autocast does not reach them); the reference measures that family of
-//! difference at 1.0e-3 relative L2 against an FP32 decode, inside the tolerance口径 of specs/worker.md 1,
-//! and quality is confirmed by viewing (specs/worker.md 10), not by bit equality.
+//! The decoder declares one element type, read from the checkpoint's own projection rather than stated
+//! here (`dtype = "auto"` converts nothing): every parameter it reads, the register table, the zero row
+//! and every activation and scratch buffer hold it. The reference instead keeps the normalization
+//! parameters and the channel scales in FP32 and promotes the residual stream to FP32, which `torch`'s
+//! autocast does not reach; the reference measures that family of difference at a **relative L2 of
+//! 1.007e-3 against its own float32 decode** (one rounding in the gating) and 1.015e-3 with one
+//! rounding per operation, on a seeded seven-latent-frame clip at 768x1344 tiled as the checkpoint
+//! specifies (`uniserve/models/minimax_h3/video_vae.py:438-445`). That is the number this declaration
+//! is measured against, and quality is confirmed by viewing (specs/worker.md 10), not by bit equality.
+//!
+//! Three of the reference's operators before the transformer - the latent denormalisation, the
+//! one-by-one post-quantization convolution and the input projection - are all affine over the latent
+//! channel axis with no nonlinearity between them, so they are composed into **one** affine at the
+//! loading boundary ([`folded_input`]). It is the only place in this module where two or more reference
+//! operators become one, and the block-diagonal numeric comparison with today's implementation records
+//! it as a declared composition rather than a difference (design 10: the comparison is a diagnosis,
+//! never an acceptance gate).
 
 use crate::config::AttentionKind;
 use crate::{Error, Result, VideoVaeConfig};
@@ -366,8 +375,11 @@ pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
 /// rotary call; the frequency table here is the raw inverse frequencies, so the angle comes out as
 /// `2π · position · frequency` with the `2π` folded into the table the runner uploads.
 fn axis(index: u32, size: u32) -> f32 {
-    let centre = (f64::from(index) + 0.5) / f64::from(size);
-    (std::f64::consts::TAU * (2.0 * centre - 1.0)) as f32
+    // The reference's own arithmetic: the cell centre and the `2π` turn are both float32
+    // (`video_vae.py:583-600`, whose meshgrid is float32 and whose caller multiplies by `2π` in the
+    // same type), so one rounding stands between the reference and this table rather than two.
+    let centre = (index as f32 + 0.5) / size as f32;
+    std::f32::consts::TAU * (2.0 * centre - 1.0)
 }
 
 /// The tile extent of the checkpoint's decoder, in output pixels.
@@ -506,6 +518,10 @@ pub struct VideoDecoder {
     /// Query heads per token.
     heads: u64,
     attention: Attention,
+    /// The checkpoint's own element type for this decoder: the type its weights are stored in and the
+    /// type every activation and scratch buffer holds. The design's `dtype = "auto"` converts nothing,
+    /// so this is read from the checkpoint rather than stated.
+    dtype: DType,
 }
 
 /// The packed row of every latent voxel one clip's decode reads, in clip-then-raster order.
@@ -665,12 +681,81 @@ fn positions_table(config: &VideoVaeConfig, latent_height: u32, latent_width: u3
         .map_err(|_| Error::config("a tile taller than a table bound".to_owned()))
 }
 
+/// The decoder's first affine, read from the checkpoint and composed at load.
+///
+/// Reads the three reference steps - the latent statistics, the one-by-one post-quantization
+/// convolution and the projection onto the transformer's width - and answers the composed
+/// `[width, latent_channels]` weight and `[width]` bias, encoded in `dtype`. See
+/// [`fold_input_affine`] for the algebra; this only reads the checkpoint's own bytes, so nothing rounds
+/// on the way in, and rounds once on the way out.
+///
+/// The answer is `(width, weight bytes, bias bytes)`. A checkpoint whose extents disagree with the
+/// sidecar's latent channel count is refused here rather than read past.
+pub fn folded_input(
+    checkpoint: &nn::Checkpoint,
+    config: &VideoVaeConfig,
+) -> Result<(u64, DType, Vec<u8>, Vec<u8>)> {
+    let latent = u64::from(config.latent_channels);
+    let read = |name: &str| -> Result<nn::checkpoint::HostTensor> {
+        checkpoint.read(name).map_err(|error| {
+            Error::checkpoint(format!("the decoder's first affine reads {name}: {error}"))
+        })
+    };
+    let projection = read("decoder.proj_in.weight")?;
+    // The design's `dtype = "auto"` converts nothing, so the block computes in the type the checkpoint
+    // stores its decoder in, which is the projection's: the reference reads `input.weight.dtype` for
+    // exactly this.
+    let dtype = projection.dtype;
+    let projection_bias = read("decoder.proj_in.bias")?;
+    let post_quant = read("post_quant_conv.weight")?;
+    let post_quant_bias = read("post_quant_conv.bias")?;
+    let width = projection.shape.dim(0);
+    if projection.shape.rank() != 2 || projection.shape.dim(1) != latent {
+        return Err(Error::checkpoint(format!(
+            "the decoder projects {:?} onto {width} channels and the sidecar states {latent} latent \
+             channels",
+            projection.shape.dims()
+        )));
+    }
+    for (name, tensor, expected) in [
+        ("decoder.proj_in.bias", &projection_bias, width),
+        ("post_quant_conv.weight", &post_quant, latent * latent),
+        ("post_quant_conv.bias", &post_quant_bias, latent),
+    ] {
+        if tensor.shape.numel() != expected {
+            return Err(Error::checkpoint(format!(
+                "{name} holds {} elements, {expected} expected",
+                tensor.shape.numel()
+            )));
+        }
+    }
+    let values = |tensor: &nn::checkpoint::HostTensor, name: &str| {
+        crate::transformer::host_f32(tensor.dtype, &tensor.bytes, name)
+    };
+    let (weight, bias) = fold_input_affine(
+        &values(&projection, "decoder.proj_in.weight")?,
+        &values(&projection_bias, "decoder.proj_in.bias")?,
+        &values(&post_quant, "post_quant_conv.weight")?,
+        &values(&post_quant_bias, "post_quant_conv.bias")?,
+        &config.latents_mean,
+        &config.latents_std,
+    )?;
+    Ok((
+        width,
+        dtype,
+        crate::transformer::host_bytes(dtype, &weight)?,
+        crate::transformer::host_bytes(dtype, &bias)?,
+    ))
+}
+
 impl VideoDecoder {
     /// Read the 36 layers and the head of the checkpoint's decoder.
     pub fn load(
         config: &VideoVaeConfig,
         canvas: Canvas,
         attention: AttentionKind,
+        dtype: DType,
+        input: Linear,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
@@ -685,19 +770,12 @@ impl VideoDecoder {
             * config.spatial_compression();
         let epsilon = config.decoder_norm_eps;
 
-        let input = linear(
-            loader,
-            "decoder.proj_in",
-            u64::from(config.latent_channels),
-            u64::from(width),
-            true,
-        )?;
         let registers = read(
             loader,
             "decoder.register_tokens",
             &[u64::from(canvas.registers), u64::from(width)],
         )?;
-        let zero_row = zeroes(loader, "video_vae.zero_row", DType::F16, u64::from(width))?;
+        let zero_row = zeroes(loader, "video_vae.zero_row", dtype, u64::from(width))?;
         if canvas.tail == 0 {
             return Err(Error::config(
                 "the decoder canvas has the trailing zero row".to_owned(),
@@ -821,6 +899,7 @@ impl VideoDecoder {
         Ok(Self {
             canvas,
             packing: attention,
+            dtype,
             stitch,
             width,
             input,
@@ -832,7 +911,7 @@ impl VideoDecoder {
             norm,
             output,
             rotary,
-            place: Rows::new(DType::F16, u64::from(width))?,
+            place: Rows::new(dtype, u64::from(width))?,
             voxel_rows: indices(loader, "video_vae.voxel_rows", 0, canvas.voxels() as u32)?,
             attention: Attention::dense(
                 head,
@@ -1014,8 +1093,8 @@ impl VideoDecoder {
             )));
         }
 
-        let stream = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let projected = f.arena().tensor(DType::F16, Shape::new(&[voxels, width]))?;
+        let stream = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let projected = f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?;
         self.input.forward(f, latents, projected)?;
         self.place
             .replace(f, stream, projected, self.voxel_rows.view())?;
@@ -1031,16 +1110,16 @@ impl VideoDecoder {
         self.rotary.factors(f, positions, cosine, sine)?;
 
         let (head, heads) = (self.head, self.heads);
-        let normalized = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let query = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let key = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let value = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let rotated_query = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let rotated_key = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let attended = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let update = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
-        let gate_up = f.arena().tensor(DType::F16, Shape::new(&[rows, 2 * ffn]))?;
-        let gated = f.arena().tensor(DType::F16, Shape::new(&[rows, ffn]))?;
+        let normalized = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let query = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let key = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let value = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let rotated_query = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let rotated_key = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let attended = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let update = f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?;
+        let gate_up = f.arena().tensor(self.dtype, Shape::new(&[rows, 2 * ffn]))?;
+        let gated = f.arena().tensor(self.dtype, Shape::new(&[rows, ffn]))?;
         let hidden = stream;
         let per_head = |view: TensorView| view.reshape(Shape::new(&[rows, heads, head]));
 
@@ -1163,50 +1242,103 @@ impl Decoder for VideoDecoder {
     }
 }
 
-/// Fold the latent statistics into the projection that follows them.
+/// The decoder's whole first affine, composed at the loading boundary.
 ///
-/// The decoder's first step restores a latent channel (`value · std + mean`) and then applies the
-/// checkpoint's one-by-one post-quantization convolution. The two compose into one affine:
-/// `W · (std ⊙ x + mean) + b`, i.e. a weight whose input column `i` is scaled by `std[i]` and a bias
-/// shifted by `W · mean`. Folding them at the loading boundary keeps one element type and one
-/// operator, with the checkpoint's own rounding of the stored result.
+/// The reference decodes a clip in three steps before its transformer: it restores each latent channel
+/// (`s ⊙ x + m`), runs the checkpoint's one-by-one post-quantization convolution, and projects the
+/// latent channels onto the transformer's width. There is no nonlinearity between them, so the three
+/// are one affine:
 ///
-/// `weight` is `[out, in]` row-major, `bias` is `[out]`, and `std`/`mean` are `[in]`. The result is the
-/// folded `(weight, bias)`; a checkpoint whose extents disagree is refused rather than read past.
-pub fn fold_statistics(
-    weight: &[f32],
-    bias: &[f32],
-    std: &[f32],
+/// ```text
+/// z = Wpi · (Wpq · (s ⊙ x + m) + bpq) + bpi
+///   = (Wpi · Wpq · diag(s)) · x + (Wpi · (Wpq · m + bpq) + bpi)
+/// ```
+///
+/// Composing them here is what the crate does for every other affine the checkpoint states as two
+/// operators (`adaln_proj`, the student heads): one element type, one operator, one rounding, and the
+/// host product paid once at load. The product is `[width, latent_channels]` from two matrices no wider
+/// than the latent's channels.
+///
+/// `wpi` is `[width, latent]` row-major, `wpq` is `[latent, latent]`, `bpi` is `[width]`, `bpq`, `mean`
+/// and `std` are `[latent]`. The result is the folded `(weight, bias)`; a checkpoint whose extents
+/// disagree is refused rather than read past.
+pub fn fold_input_affine(
+    wpi: &[f32],
+    bpi: &[f32],
+    wpq: &[f32],
+    bpq: &[f32],
     mean: &[f32],
+    std: &[f32],
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let out = bias.len();
-    if out == 0 || mean.len() != std.len() || mean.is_empty() {
+    let latent = mean.len();
+    let width = bpi.len();
+    if latent == 0 || width == 0 {
         return Err(Error::config(
-            "the latent statistics and the projection's channels disagree".to_owned(),
+            "the decoder's first affine needs a width and a latent channel count".to_owned(),
         ));
     }
-    let channels = mean.len();
-    if weight.len() != out * channels {
+    if std.len() != latent || bpq.len() != latent {
         return Err(Error::config(format!(
-            "a {}-element projection for {out} outputs of {channels} inputs",
-            weight.len()
+            "the decoder's first affine has {latent} latent channels, {} deviations and {} post-quant \
+             biases",
+            std.len(),
+            bpq.len()
         )));
     }
-    if std.iter().any(|value| !value.is_finite()) || mean.iter().any(|value| !value.is_finite()) {
-        return Err(Error::config(
-            "the latent statistics are not finite".to_owned(),
-        ));
+    if wpi.len() != width * latent || wpq.len() != latent * latent {
+        return Err(Error::config(format!(
+            "the decoder's first affine reads a {}-element projection and a {}-element post-quant \
+             convolution for {width} outputs of {latent} inputs",
+            wpi.len(),
+            wpq.len()
+        )));
     }
-    let mut folded = weight.to_vec();
-    let mut shift = bias.to_vec();
-    for channel in 0..channels {
-        for (output, shift_output) in shift.iter_mut().enumerate().take(out) {
-            let at = output * channels + channel;
-            folded[at] = weight[at] * std[channel];
-            *shift_output += weight[at] * mean[channel];
+    for (name, values) in [("mean", mean), ("deviation", std), ("post-quant bias", bpq)] {
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::config(format!(
+                "the decoder's latent {name} is not finite"
+            )));
         }
     }
-    Ok((folded, shift))
+    // `post-quant` scaled by the deviations, so the composition needs no separate diagonal: the
+    // statistics enter as the post-quantization matrix's input columns.
+    let mut scaled = wpq.to_vec();
+    for row in 0..latent {
+        for column in 0..latent {
+            scaled[row * latent + column] *= std[column];
+        }
+    }
+    // The projection of the scaled matrix: one pass per output row over the latent channels.
+    let mut weight = vec![0.0_f32; width * latent];
+    for row in 0..width {
+        let source = &wpi[row * latent..][..latent];
+        for column in 0..latent {
+            let mut sum = 0.0_f32;
+            for inner in 0..latent {
+                sum += source[inner] * scaled[inner * latent + column];
+            }
+            weight[row * latent + column] = sum;
+        }
+    }
+    // The bias: the post-quantization convolution's shift of the restored mean, projected.
+    let mut shifted = vec![0.0_f32; latent];
+    for row in 0..latent {
+        let mut sum = bpq[row];
+        for column in 0..latent {
+            sum += wpq[row * latent + column] * mean[column];
+        }
+        shifted[row] = sum;
+    }
+    let mut bias = vec![0.0_f32; width];
+    for row in 0..width {
+        let source = &wpi[row * latent..][..latent];
+        let mut sum = bpi[row];
+        for inner in 0..latent {
+            sum += source[inner] * shifted[inner];
+        }
+        bias[row] = sum;
+    }
+    Ok((weight, bias))
 }
 
 #[cfg(test)]
@@ -1423,33 +1555,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_latent_statistics_fold_into_the_projection_that_follows() {
-        // Two outputs of two inputs: the identity, with the statistics of channels 1 and 2.
-        let weight = [1.0, 0.0, 0.0, 1.0];
-        let bias = [0.5, -0.5];
-        let std = [2.0, 3.0];
-        let mean = [10.0, 20.0];
-        let (folded, shift) = fold_statistics(&weight, &bias, &std, &mean).expect("the fold");
-        assert_eq!(folded, vec![2.0, 0.0, 0.0, 3.0]);
-        assert_eq!(shift, vec![10.5, 19.5]);
-        // The fold restores what the two steps compute separately: `W (std x + mean) + b`.
-        let latent = [0.25f32, -0.5];
-        let restored = [latent[0] * std[0] + mean[0], latent[1] * std[1] + mean[1]];
-        for output in 0..2 {
-            let separate = weight[output * 2] * restored[0]
-                + weight[output * 2 + 1] * restored[1]
-                + bias[output];
-            let together =
-                folded[output * 2] * latent[0] + folded[output * 2 + 1] * latent[1] + shift[output];
-            assert!(
-                (separate - together).abs() < 1e-5,
-                "{separate} vs {together}"
+    fn the_three_first_steps_are_one_affine() {
+        // Two outputs of two latent channels: the projection is the identity, the post-quantization
+        // convolution scales each channel, and the statistics are the two-step restore. The composed
+        // affine must agree with the three reference steps applied one after another.
+        let wpi = vec![1.0, 0.0, 0.0, 1.0];
+        let bpi = vec![0.0, 0.0];
+        let wpq = vec![2.0, 0.0, 0.0, 3.0];
+        let bpq = vec![0.5, 0.5];
+        let std = vec![2.0, 4.0];
+        let mean = vec![1.0, -1.0];
+        let (weight, bias) =
+            fold_input_affine(&wpi, &bpi, &wpq, &bpq, &mean, &std).expect("the fold");
+        // `Wpq · diag(std)`: the statistics enter as the post-quantization matrix's input columns.
+        assert_eq!(weight, vec![4.0, 0.0, 0.0, 12.0]);
+        // `bpi + Wpi · (Wpq · mean + bpq)`.
+        assert_eq!(bias, vec![2.5, -2.5]);
+        // And it is the same function: the three steps on one latent.
+        for (x0, x1) in [(0.0, 0.0), (1.0, -2.0), (0.25, 3.5)] {
+            let restored = [x0 * std[0] + mean[0], x1 * std[1] + mean[1]];
+            let posted = [wpq[0] * restored[0] + bpq[0], wpq[3] * restored[1] + bpq[1]];
+            let (z0, z1) = (wpi[0] * posted[0] + bpi[0], wpi[3] * posted[1] + bpi[1]);
+            let (f0, f1) = (
+                weight[0] * x0 + weight[1] * x1 + bias[0],
+                weight[2] * x0 + weight[3] * x1 + bias[1],
             );
+            assert!((z0 - f0).abs() < 1e-6 && (z1 - f1).abs() < 1e-6);
         }
-        // A projection of the wrong extent, or non-finite statistics, is refused.
-        assert!(fold_statistics(&weight, &bias, &[2.0], &mean).is_err());
-        assert!(fold_statistics(&weight[..3], &bias, &std, &mean).is_err());
-        assert!(fold_statistics(&weight, &bias, &[f32::NAN, 3.0], &mean).is_err());
+        // Extents that disagree are refused rather than read past.
+        assert!(fold_input_affine(&wpi, &bpi, &wpq, &bpq, &[0.0], &std).is_err());
+        assert!(fold_input_affine(&wpi, &bpi, &wpq, &bpq, &mean, &[1.0]).is_err());
+        assert!(fold_input_affine(&wpi[..3], &bpi, &wpq, &bpq, &mean, &std).is_err());
+        assert!(fold_input_affine(&wpi, &bpi, &wpq, &bpq, &mean, &[f32::NAN, 1.0]).is_err());
     }
 
     #[test]
@@ -1525,8 +1662,11 @@ pub(crate) mod tests {
         ];
         for (row, values) in expected.iter().enumerate() {
             for (channel, value) in values.iter().enumerate() {
-                let want = (turn * value) as f32;
-                let got = table[channel * rows + row];
+                // The value the table must carry: the cell centre times one turn. The arithmetic is
+                // float32, so the assertion is the semantic value within a float32 step rather than a
+                // bit pattern, which is what makes it survive an equivalent implementation.
+                let want = turn * value;
+                let got = f64::from(table[channel * rows + row]);
                 assert!(
                     (got - want).abs() < 1e-5,
                     "row {row} axis {channel}: {got} vs {want}"
