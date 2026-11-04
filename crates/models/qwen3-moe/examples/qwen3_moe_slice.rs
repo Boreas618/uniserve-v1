@@ -595,9 +595,24 @@ fn stage_weights(args: &Args) -> Result<()> {
     let config = Config::read(&args.checkpoint)?;
     let mut store = HostWeights::default();
     {
-        let (model, _) = load_declared(&args.checkpoint, &checkpoint, &mut store)?;
+        let (model, declared) = load_declared(&args.checkpoint, &checkpoint, &mut store)?;
+        // The same pair the decode run prints, and it needs no device and no store: a checkpoint's
+        // load can be audited on the machine that holds it, which is the only place an NVFP4 export
+        // exists.
+        let (packed, kept) = representation_counts(&args.checkpoint);
+        let published = store
+            .by_dtype
+            .get(&DType::U8.to_string())
+            .map_or((0, 0), |entry| *entry);
+        let dense = store
+            .by_dtype
+            .iter()
+            .filter(|(dtype, _)| dtype.as_str() != DType::U8.to_string())
+            .map(|(_, (count, _))| *count)
+            .sum::<usize>();
+        check_representation(packed, kept, published.0, published.1, dense)?;
         println!(
-            "loaded: {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
+            "loaded: {declared:?}, {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
             config.num_hidden_layers,
             config.hidden_size,
             config.num_experts,
@@ -906,30 +921,13 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // What the model holds, by representation, beside what the index declares: a loader that fell
     // back to a full-precision path for a packed tensor still prints the declaration and still reads
     // as "NVFP4 ran", so the pair is the measurement and a mismatch is a refusal.
-    // The counts are in two units and saying so is part of the measurement: the index counts tensors
-    // and the loader publishes stacks, because an encoded expert block fuses everything the router
-    // names into one publish per projection pair. So the equivalence is stated by the model and not
-    // inferred here - what this line can refuse is a load that brought *nothing* through the
-    // representation, which is the fallback that would otherwise read as NVFP4 having run.
-    println!(
-        "loaded: the index declares {packed} packed tensors and {kept} kept in their own dtype; the \
-         loader published {} packed weight(s) ({} bytes of E2M1) and {} full precision",
-        weights.packed, weights.packed_bytes, weights.dense,
-    );
-    if packed > 0 && weights.packed == 0 {
-        return Err(Failure::message(format!(
-            "the checkpoint declares {packed} packed E2M1 tensor(s) and the loader published none: \
-             every one of them arrived in a full-precision path, and a run at that model would \
-             measure a fallback and call it NVFP4"
-        )));
-    }
-    if packed == 0 && weights.packed > 0 {
-        return Err(Failure::message(format!(
-            "the checkpoint declares nothing packed and the loader published {} packed weight(s): \
-             the model holds a representation the checkpoint did not state",
-            weights.packed
-        )));
-    }
+    check_representation(
+        packed,
+        kept,
+        weights.packed,
+        weights.packed_bytes,
+        weights.dense,
+    )?;
     if loaded != declared {
         return Err(Failure::message(format!(
             "the checkpoint declared {declared:?} before the load and {loaded:?} during it: a \
@@ -2078,6 +2076,42 @@ fn slot_for(position: u64, page_size: u64, block_table: &[i32]) -> Result<u64> {
     Ok(page
         .saturating_mul(page_size)
         .saturating_add(position % page_size))
+}
+
+/// Print what the loader brought through each representation, and refuse a load that contradicts the
+/// checkpoint's declaration.
+///
+/// The two numbers are in different units and the line says so: the index counts tensors and the
+/// loader publishes stacks, because an encoded expert block fuses every expert the router names into
+/// one publish per projection pair. What can be refused without the model's own structure is a load
+/// that brought *nothing* through the representation the checkpoint declares, which is the fallback
+/// that would otherwise read as NVFP4 having run.
+fn check_representation(
+    declared_packed: usize,
+    declared_kept: usize,
+    packed: usize,
+    packed_bytes: u64,
+    dense: usize,
+) -> Result<()> {
+    println!(
+        "representation: the index declares {declared_packed} packed tensors and {declared_kept} kept \
+         in their own dtype; the loader published {packed} packed weight(s) ({packed_bytes} bytes of \
+         E2M1) and {dense} full precision",
+    );
+    if declared_packed > 0 && packed == 0 {
+        return Err(Failure::message(format!(
+            "the checkpoint declares {declared_packed} packed E2M1 tensor(s) and the loader published \
+             none: every one of them arrived in a full-precision path, and a run at that model would \
+             measure a fallback and call it NVFP4"
+        )));
+    }
+    if declared_packed == 0 && packed > 0 {
+        return Err(Failure::message(format!(
+            "the checkpoint declares nothing packed and the loader published {packed} packed \
+             weight(s): the model holds a representation the checkpoint did not state"
+        )));
+    }
+    Ok(())
 }
 
 /// How many of a checkpoint's tensors are packed and how many kept in their own dtype.
