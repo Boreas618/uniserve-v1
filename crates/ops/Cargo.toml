@@ -6,11 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# `ops` depends only on the CUDA boundary: it loads and launches the modules it is handed and knows
-# no model, no layer and no runtime object (specs/worker.md 3, 4.2).
+# `ops` depends only on the CUDA boundary and on `serde` for the one value the epoch record carries
+# as data (the phase): it loads and launches the modules it is handed and knows no model, no layer
+# and no runtime object (specs/worker.md 3, 4.2).
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 platform = { path = "../platform" }
-serde.workspace = true
 thiserror.workspace = true
 
 [lints]
