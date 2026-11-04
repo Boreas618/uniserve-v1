@@ -39,6 +39,15 @@ impl CopyBlock {
     /// The destination's strides are passed rather than read off its view: a caller may address a
     /// region of a larger raster whose view it built row-major, and the strides are what say where
     /// each element lands. Both views must be four-axis and hold the same extents.
+    /// The descriptor one strided-to-packed copy takes: the element type alone. The extents and the
+    /// strides travel with the call.
+    pub fn descriptor_of(dtype: ops::DType) -> copy_block::Descriptor {
+        copy_block::Descriptor {
+            source: dtype,
+            out: dtype,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -58,10 +67,7 @@ impl CopyBlock {
                 ));
             }
         }
-        let descriptor = copy_block::Descriptor {
-            source: self.dtype,
-            out: self.dtype,
-        };
+        let descriptor = Self::descriptor_of(self.dtype);
         f.operate::<CopyBlockOp>(
             &descriptor,
             copy_block::Args {
