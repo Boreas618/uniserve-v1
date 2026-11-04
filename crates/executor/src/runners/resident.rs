@@ -28,8 +28,13 @@ use crate::{Error, Result};
 /// The resident cache as a runner reads it.
 pub struct ResidentCache {
     cache: Arc<PrefixCache>,
-    /// One gather column per attention group, `[rows, width]` i32.
+    /// One gather column per attention group, `[rows, width]` i32, carved when the device's pools
+    /// are attached (the executor creates them, so they cannot be had at construction).
     tables: Vec<Table>,
+    /// The rows the columns are sized for: the largest bucket's.
+    rows: u32,
+    /// The pages a row of the pooled table holds (`unit_tables`' width).
+    width: u32,
     groups: usize,
     page_size: u32,
     dtype: DType,
@@ -48,7 +53,7 @@ struct Table {
 
 impl Table {
     /// Allocates `rows x width` i32 for one group from the device's pools.
-    fn new(pools: &std::sync::Mutex<Pools>, rows: u32, width: u32) -> Result<Self> {
+    fn new(pools: &mut Pools, rows: u32, width: u32) -> Result<Self> {
         if rows == 0 || width == 0 {
             return Err(Error::Invalid(
                 "a block table needs at least one row and one page".into(),
@@ -56,9 +61,6 @@ impl Table {
         }
         let bytes = usize::try_from(u64::from(rows) * u64::from(width) * 4)
             .map_err(|_| Error::Resource("a block table is larger than memory".into()))?;
-        let mut pools = pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(Self {
             buffer: pools.allocate(PoolKind::Resident, bytes as u64)?,
             rows,
@@ -86,11 +88,7 @@ impl ResidentCache {
     ///
     /// `rows` is the bucket's row count, padding included: every captured graph addresses a table
     /// of exactly that height, so the gather column is allocated once, here, and never grows.
-    pub fn new(
-        cache: Arc<PrefixCache>,
-        pools: &std::sync::Mutex<Pools>,
-        rows: u32,
-    ) -> Result<Self> {
+    pub fn new(cache: Arc<PrefixCache>, rows: u32) -> Result<Self> {
         let groups = cache.groups();
         if groups == 0 {
             return Err(Error::Invalid(
@@ -99,13 +97,11 @@ impl ResidentCache {
         }
         let first = cache.layer_planes(0, 0)?;
         let (_, _, width) = cache.unit_tables();
-        let mut tables = Vec::with_capacity(groups);
-        for _ in 0..groups {
-            tables.push(Table::new(pools, rows, width)?);
-        }
         Ok(Self {
             cache,
-            tables,
+            tables: Vec::new(),
+            rows,
+            width,
             groups,
             page_size: first.block_size,
             dtype: first.dtype,
@@ -123,6 +119,13 @@ impl ResidentCache {
     /// attention kernel never reads past a row's `seq_lens`, so such a row is never dereferenced
     /// (the pool's tables reserve slot 0, which is why `-1` and not `0` is the absent row).
     fn gather(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<TensorView> {
+        if self.tables.is_empty() {
+            return Err(Error::State(
+                "the cache provider has no gather columns: the executor attaches the device's \
+                 pools before the first capture"
+                    .into(),
+            ));
+        }
         let table = self
             .tables
             .get(group)
@@ -217,6 +220,23 @@ fn view_of(view: &crate::memory::allocation::StorageView) -> Result<TensorView> 
 }
 
 impl KvProvider for ResidentCache {
+    fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) -> Result<()> {
+        if !self.tables.is_empty() {
+            return Ok(());
+        }
+        let mut tables = Vec::with_capacity(self.groups);
+        {
+            let mut locked = pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for _ in 0..self.groups {
+                tables.push(Table::new(&mut locked, self.rows, self.width)?);
+            }
+        }
+        self.tables = tables;
+        Ok(())
+    }
+
     fn groups(&self) -> usize {
         self.groups
     }

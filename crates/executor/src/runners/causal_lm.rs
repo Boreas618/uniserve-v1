@@ -519,6 +519,16 @@ impl Sampling {
 /// reads it. `scratch` answers a page set of the paired forward's own, whose pages are never a
 /// serving request's (7.3).
 pub trait KvProvider: Send + Sync {
+    /// Gives the provider the device's one pool set, before its first gather.
+    ///
+    /// The runner's provider gathers block tables into columns of its own, and those columns are
+    /// carved from the device's allocator (4.1); the device actor creates that allocator, so it is
+    /// handed over here rather than at construction. A provider that maps nothing may ignore it.
+    fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<crate::arena::Pools>>) -> Result<()> {
+        let _ = pools;
+        Ok(())
+    }
+
     /// How many attention groups the model's layers index.
     fn groups(&self) -> usize;
 
@@ -611,7 +621,7 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// The sampling draws a step writes, in the runner's own buffer.
     draws: Vec<f32>,
     /// Where the batch's KV views come from: the resident cache, and a paired forward's scratch.
-    kv: Arc<dyn KvProvider>,
+    kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
 }
@@ -630,7 +640,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         device: DeviceId,
         stream: platform::Stream,
         geometry: Geometry,
-        kv: Arc<dyn KvProvider>,
+        kv: Box<dyn KvProvider>,
         seed: u64,
     ) -> Result<Self> {
         let mut staging = Staging::new();
@@ -910,7 +920,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
-        self.pools = Some(pools);
+        self.pools = Some(Arc::clone(&pools));
+        if let Err(error) = self.kv.attach_pools(pools) {
+            tracing::warn!(%error, "the cache provider took no pools; a gathered table will fail");
+        }
     }
 
     fn attach_shadow(&mut self, shadow: crate::shadow::Shadow) {
