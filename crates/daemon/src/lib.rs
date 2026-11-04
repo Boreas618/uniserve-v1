@@ -42,9 +42,14 @@ pub mod options;
 pub mod output;
 pub mod profiling;
 pub mod restart;
+pub mod standby;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
+// The epoch layer lands beside `worlds`, which commit C deletes; nothing drives
+// the switch until the update layer that owns it lands too.
+#[allow(dead_code, reason = "the switch lands before the update layer that drives it")]
+pub(crate) mod updates;
 pub mod worlds;
 
 // The application layer's lowest modules are `crates/frontend`'s while the
