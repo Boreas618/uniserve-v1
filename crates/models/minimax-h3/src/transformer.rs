@@ -119,13 +119,15 @@ impl Layer {
                 loader,
             )?,
             // The checkpoint fuses the feed-forward's value half first and its gate half second.
+            // `projection` appends the `.weight` itself: a name that already ends in it asks the
+            // checkpoint for `…weight.weight`, which is the name the index does not hold.
             gate_up: projection(
                 loader,
-                &format!("{prefix}.ff.net.0.proj.weight"),
+                &format!("{prefix}.ff.net.0.proj"),
                 2 * ffn,
                 hidden,
             )?,
-            down: projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?,
+            down: projection(loader, &format!("{prefix}.ff.net.2"), hidden, ffn)?,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             eps: config.norm_eps,
         })
