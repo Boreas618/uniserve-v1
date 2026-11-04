@@ -63,7 +63,6 @@ const OPERATORS: &[&str] = &[
     <crate::frame::FrameNormPad as Op>::NAME,
     <crate::gemm::Gemm as Op>::NAME,
     <crate::kv::KvWrite as Op>::NAME,
-    <crate::kv::KvQuantize as Op>::NAME,
     <crate::kv::KvWriteScaled as Op>::NAME,
     <crate::logits::LogitsGather as Op>::NAME,
     <crate::logits::VocabUnpad as Op>::NAME,

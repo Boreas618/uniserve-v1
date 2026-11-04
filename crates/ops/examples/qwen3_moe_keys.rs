@@ -32,8 +32,7 @@
 //! accounted for between the two fixtures and these lines:
 //!
 //! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,
-//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8`, `kv_quantize` and
-//!   `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
+//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8` and `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
 //!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
 //!   key here would be a guess about an artifact nobody has opened.
 //! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),

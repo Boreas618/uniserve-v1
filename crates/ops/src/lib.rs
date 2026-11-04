@@ -31,7 +31,6 @@
 //! | [`rope::RotaryFactors`] | `rotary_factors` | [`rope`] |
 //! | [`rope::QkNormRope`] | `qk_norm_rope` | [`rope`] |
 //! | [`kv::KvWrite`] | `kv_write` | [`kv`] |
-//! | [`kv::KvQuantize`] | `kv_quantize` | [`kv`] |
 //! | [`kv::KvWriteScaled`] | `kv_write_scaled` | [`kv`] |
 //!
 //! Logits and sampling:
