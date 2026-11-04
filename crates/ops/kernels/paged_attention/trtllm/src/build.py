@@ -161,6 +161,8 @@ def matching_kernels(header, fields, target):
     page size, mask, phase and architecture family, so the filter is the
     descriptor's values, not a guess.
     """
+    if fields["window"] != "false":
+        raise SystemExit("the trtllm package is compiled without an attention window")
     families = FAMILIES.get(target)
     if families is None:
         raise SystemExit(f"{target} names no trtllm-gen architecture family")
@@ -170,8 +172,13 @@ def matching_kernels(header, fields, target):
     prefix = f"Q{query}Kv{key_value}O{out_type}" if query != key_value else f"Qkv{query}O{out_type}"
     head = f"H{fields['head_dim']}"
     page = f"P{fields['page']}"
-    mask = "Causal" if fields["mask"] == "causal" else "Dense"
     decode = fields["phase"] == "decode"
+    # The artifact's generation kernels are named causally whatever mask a call
+    # asks for: with one query token per request, a dense and a causal mask
+    # cover the same keys, which is why the vendor's own launcher hands its
+    # generation kernels a causal mask either way. The prefill's mask does pick
+    # the name, since its tiles see whole queries.
+    mask = "Causal" if decode or fields["mask"] == "causal" else "Dense"
     kept = []
     for line in header.splitlines():
         if not line.startswith("{ DATA_TYPE_"):
@@ -194,7 +201,9 @@ def matching_kernels(header, fields, target):
         # sliding-window ones only serve a window the descriptor does not have.
         if "SkipsSoftmax" in name:
             continue
-        if "SlidingOrChunked" in name and fields["window"] == "false":
+        # A window is its own trade: the sliding kernels read a window size the
+        # operator's call states, and this package does not serve one.
+        if "SlidingOrChunked" in name:
             continue
         kept.append(name)
     if not kept:
