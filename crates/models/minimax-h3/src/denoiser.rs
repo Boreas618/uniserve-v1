@@ -114,22 +114,36 @@ impl Layouts {
     /// The elements the request's condition draws occupy, in request order.
     ///
     /// A condition's noise is drawn at latent resolution - patched afterwards, so its packed rows
-    /// overcount by four - and its audio rows are already channel-major elements.
-    pub fn condition_elements(&self, conditions: &[packing::Condition], canvas: &Canvas) -> u32 {
-        let Ok(segments) = packing::condition_segments(conditions, canvas) else {
-            return 0;
-        };
+    /// overcount by four - and its audio rows are already channel-major elements. The count is
+    /// computed from the conditions themselves, not from a packing, so it is total: every condition
+    /// whose raster and frame count are ones the packing would accept contributes exactly its
+    /// elements, and one it would refuse contributes none. A refused condition never reaches here -
+    /// the runner lays the request out, and that packing is the same function of the same values -
+    /// so a served request's offsets are exact.
+    pub fn condition_elements(&self, conditions: &[packing::Condition], _canvas: &Canvas) -> u32 {
         let channels = u64::from(self.config.transformer.video_channels);
-        let elements: u64 = segments
+        let elements: u64 = conditions
             .iter()
-            .map(|segment| {
-                let visual = segment.visual.map_or(0, |visual| {
-                    u64::from(visual.frames)
-                        * u64::from(visual.raster.height)
-                        * u64::from(visual.raster.width)
-                        * channels
+            .map(|condition| {
+                let visual = condition.frame.map_or(0, |frame| {
+                    let frames = if frame.num_frames <= 1 {
+                        1
+                    } else {
+                        packing::video_latent_frames(frame.num_frames).unwrap_or(0)
+                    };
+                    match packing::latent_raster(&frame.canvas) {
+                        Ok(raster) => {
+                            u64::from(frames)
+                                * u64::from(raster.height)
+                                * u64::from(raster.width)
+                                * channels
+                        }
+                        Err(_) => 0,
+                    }
                 });
-                visual + u64::from(segment.audio_rows())
+                let audio = u64::from(crate::config::AUDIO_CHANNELS)
+                    * u64::from(condition.audio_samples.div_ceil(crate::config::AUDIO_HOP));
+                visual + audio
             })
             .sum();
         elements as u32
@@ -138,34 +152,40 @@ impl Layouts {
     /// The largest packed row count any layout of this deployment reaches.
     ///
     /// The attention allocates its scratch per packed row at load, so `rows` must bound every layout
-    /// the deployment can be asked for - and the two packings differ: the sparse one pads to whole
-    /// tiles, so it is the larger number for the same frame count (46848 against 38080 at the
-    /// released canvases). Taking the maximum of both is the only safe bound when a checkpoint's
-    /// attention kind is not the only thing a capture may be built for.
+    /// the deployment can be asked for. Only the packing the checkpoint's attention kind reads is
+    /// such a bound: a dense deployment is sized by the dense packing, and taking the sparse one as
+    /// well would over-size its attention by a quarter for requests it cannot receive. The two
+    /// differ because the sparse packing pads to whole tiles (46848 against 38080 at the released
+    /// canvases).
     pub fn rows_bound(&self) -> Result<u32> {
         let mut bound = 0;
+        let sparse = matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        );
         for canvas in self.config.offered_canvases() {
             let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
             while frames <= MAX_FRAMES {
-                if let Ok(packing) = packing::dense_packing(
+                if sparse {
+                    let tile = self.config.attention.capacity_rows();
+                    if let Ok(segment) = packing::segment_packing(
+                        frames,
+                        canvas,
+                        self.arrangement.text_rows,
+                        self.arrangement.condition_rows,
+                        tile,
+                        tile,
+                    ) {
+                        bound = bound.max(segment.extent.padded_tokens);
+                    }
+                } else if let Ok(dense) = packing::dense_packing(
                     frames,
                     canvas,
                     self.arrangement.text_rows,
                     self.arrangement.condition_rows,
                     self.arrangement.shard,
                 ) {
-                    bound = bound.max(packing.padded_tokens);
-                }
-                let tile = self.config.attention.capacity_rows();
-                if let Ok(segment) = packing::segment_packing(
-                    frames,
-                    canvas,
-                    self.arrangement.text_rows,
-                    self.arrangement.condition_rows,
-                    tile,
-                    tile,
-                ) {
-                    bound = bound.max(segment.extent.padded_tokens);
+                    bound = bound.max(dense.padded_tokens);
                 }
                 frames += crate::CLIP_FRAMES;
             }
@@ -250,7 +270,9 @@ impl Layouts {
         condition_elements: u32,
     ) -> Result<Layout> {
         let raster = packing::latent_raster(canvas)?;
-        let frames = packing::video_latent_frames(packing.video_rows / raster.patch_rows())?;
+        // The packing's video rows are latent frames of raster patch rows, so the division recovers
+        // the latent frame count directly: it is not a generated count and must not be snapped.
+        let frames = packing.video_rows / raster.patch_rows();
         Ok(Layout {
             video: LatentShape {
                 channels: self.config.transformer.video_channels,
@@ -325,16 +347,17 @@ impl Layouts {
                 shape: Shape::new(&[video]),
             },
             // One sequence over the whole shard: every query row sees the used key rows and no
-            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows.
+            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows, and
+            // a single run is named by its two ends - a start and a stop - not by every row.
             StateTable {
                 name: "cu_seq_lens_k",
                 dtype: DType::I32,
-                shape: Shape::new(&[rows + 1]),
+                shape: Shape::new(&[2]),
             },
             StateTable {
                 name: "cu_seq_lens_q",
                 dtype: DType::I32,
-                shape: Shape::new(&[rows + 1]),
+                shape: Shape::new(&[2]),
             },
             StateTable {
                 name: "groups",
@@ -1228,6 +1251,47 @@ mod tests {
     }
 
     #[test]
+    fn a_dense_deployment_bounds_its_rows_by_its_own_packing() {
+        let dense = layouts().rows_bound().unwrap();
+        // The same deployment read as sparse pads every layout to whole tiles, which is larger for
+        // every canvas; a dense checkpoint never captures one of those, so its bound must be below.
+        let mut sparse = layouts();
+        sparse.config.attention = AttentionKind::sparse(64, 0.8, None).unwrap();
+        assert!(dense < sparse.rows_bound().unwrap(), "{dense}");
+        // And it still bounds the largest dense layout the deployment offers.
+        let (_, packing) = layouts().layout(&request(107, 1344, 768)).unwrap();
+        assert!(dense >= packing.padded_tokens);
+    }
+
+    #[test]
+    fn a_still_condition_draws_its_latent_elements_and_nothing_more() {
+        let conditions = [packing::Condition {
+            role: packing::Role::FirstFrame,
+            frame: Some(packing::Frame {
+                canvas: crate::config::Canvas {
+                    short_edge: 768,
+                    aspect: (16, 9),
+                    width: 1344,
+                    height: 768,
+                },
+                num_frames: 1,
+            }),
+            audio_samples: 0,
+        }];
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (16, 9),
+            width: 1344,
+            height: 768,
+        };
+        // One latent frame of the canvas' raster, 24 channels wide: the video's stream starts here.
+        assert_eq!(
+            layouts().condition_elements(&conditions, &canvas),
+            48 * 84 * 24
+        );
+    }
+
+    #[test]
     fn a_request_snaps_to_a_legal_frame_count_and_raster() {
         let rule = layouts();
         let (layout, packing) = rule.layout(&request(100, 1344, 768)).unwrap();
@@ -1236,9 +1300,9 @@ mod tests {
         assert_eq!(packing.video_rows, 32 * 42 * 24);
         assert_eq!(layout.video.frames, 32);
         assert_eq!((layout.video.height, layout.video.width), (48, 84));
-        // Four stereo rows per audio latent step.
-        assert_eq!(packing.audio_rows, 4 * 179);
-        assert_eq!(layout.audio.unwrap().frames, 179);
+        // Two rows of 32 channels per audio latent step, and 107 frames at 24 fps are 178 steps.
+        assert_eq!(packing.audio_rows, 2 * 178);
+        assert_eq!(layout.audio.unwrap().frames, 178);
         assert_eq!(layout.text_rows, 128);
         assert_eq!(layout.condition_rows, 64);
     }
@@ -1267,11 +1331,25 @@ mod tests {
         // Every table but the step covers one row per packed row.
         let rows = u64::from(packing.padded_tokens);
         for table in &tables {
-            if table.name == "step" {
-                assert_eq!(table.shape.dims(), &[1]);
-                continue;
+            match table.name {
+                "step" => {
+                    assert_eq!(table.shape.dims(), &[1]);
+                }
+                // The audio table is addressed by audio row and names the packed row it occupies,
+                // so its length is the audio rows rather than every packed row.
+                "audio_indices" => assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows)),
+                // The dense visibility table names both ends of the used row run, so it carries one
+                // more entry than there are packed rows.
+                "cu_seq_lens_k" | "cu_seq_lens_q" => assert_eq!(table.shape.dims(), &[2]),
+                // The rotation reads the coordinates axis-major, so the axes lead.
+                "position_ids" => assert_eq!(table.shape.dims(), &[3, rows]),
+                // The video indices name the packed row of every video row, and video rows are
+                // patched: four voxels to a row.
+                "video_indices" => {
+                    assert_eq!(table.shape.dim(0), u64::from(packing.video_rows));
+                }
+                _ => assert_eq!(table.shape.dim(0), rows, "{}", table.name),
             }
-            assert_eq!(table.shape.dim(0), rows, "{}", table.name);
         }
         // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
         assert_eq!(tables[5].shape.dims(), &[3, rows]);
@@ -1280,7 +1358,8 @@ mod tests {
     #[test]
     fn the_state_bytes_fill_the_tables_the_layout_names() {
         let rule = layouts();
-        let request = request(121, 1344, 768);
+        let mut request = request(121, 1344, 768);
+        request.text_tokens = 12;
         let (layout, _) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let mut out: Vec<Vec<u8>> = tables
@@ -1292,27 +1371,36 @@ mod tests {
         rule.write_state(&request, &layout, &mut out).unwrap();
         // A prompt of 12 rows is text, so every write index points into the text rows and every
         // generated row takes the prefix's zero row.
-        let prefix: Vec<i32> = decode_i32(&out[6]);
+        let at = |name: &str| {
+            tables
+                .iter()
+                .position(|table| table.name == name)
+                .expect("the layout names the table")
+        };
+        let prefix: Vec<i32> = decode_i32(&out[at("prefix_index")]);
         assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
+        // The prefix segment is packed after the generated rows, so the prompt's twelve rows sit at
+        // `prefix_start()` and each points at its own source row.
+        let first = rule.packing_of(&layout).unwrap().prefix_start() as usize;
         assert!(
-            prefix[..12]
+            prefix[first..first + 12]
                 .iter()
                 .enumerate()
                 .all(|(row, column)| *column == row as i32)
         );
-        // The modulation index of the first text row is `3 * video_group + text`.
-        let indices = decode_i32(&out[4]);
-        assert_eq!(indices[0], 1);
+        // The first packed row is a generated video row, so it takes the video timestep.
+        let indices = decode_i32(&out[at("modulation_indices")]);
+        assert_eq!(indices[0], packing::Group::Video as i32);
     }
 
     #[test]
     fn a_raster_off_the_grid_snaps_up_to_it() {
         let rule = layouts();
-        // 1340x770 is not a multiple of 32: the request renders the next legal raster, so two
+        // 1340x770 is not a multiple of 32: the request renders the next legal raster up, so two
         // requests either side of a multiple share one layout rather than each carrying its own.
         let (layout, _) = rule.layout(&request(121, 1340, 770)).unwrap();
-        assert_eq!((layout.video.height, layout.video.width), (48, 84));
-        assert_eq!(layout.video.height * 16, 768);
+        assert_eq!((layout.video.height, layout.video.width), (50, 84));
+        assert_eq!(layout.video.height * 16, 800);
         assert_eq!(layout.video.width * 16, 1344);
     }
 
@@ -1323,9 +1411,9 @@ mod tests {
         // 24 latent frames is not a frame count a request snaps to: no rounding produces 5n + 2 = 24.
         layout.video.frames = 24;
         assert!(rule.packing_of(&layout).is_err());
-        // A prefix capacity that is not a whole attention unit is not this deployment's either.
+        // A prefix that holds no text row is not a layout this deployment packs either.
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
-        layout.text_rows = 100;
+        layout.text_rows = 0;
         assert!(rule.packing_of(&layout).is_err());
     }
 
@@ -1339,7 +1427,7 @@ mod tests {
         let dense_packing = rule.packing_of(&dense).unwrap();
         assert!(bound >= dense_packing.padded_tokens);
         let segment = packing::segment_packing(
-            121,
+            124,
             &Canvas {
                 short_edge: 768,
                 aspect: (7, 4),
@@ -1386,8 +1474,8 @@ mod tests {
         // 121 frames snap to 124, which is 37 latent frames of 48x84 at 24 channels.
         assert_eq!(layout.video.frames, 37);
         assert_eq!(bare.audio, 37 * 48 * 84 * 24);
-        // One condition of two latent frames at a 48x84 raster carries two stereo channels per
-        // latent step: its rows are patched, and its element count weights each modality by its own
+        // A 22-frame reference is one clip, which the VAE encodes to seven latent frames of the
+        // 48x84 raster; its rows are patched, and its element count weights each modality by its own
         // channel count.
         let conditions = [packing::Condition {
             role: packing::Role::Reference,
@@ -1398,14 +1486,14 @@ mod tests {
                     width: 1344,
                     height: 768,
                 },
-                num_frames: 2,
+                num_frames: 22,
             }),
             audio_samples: 0,
         }];
         let one = rule.noise_offsets(&layout, &conditions).unwrap();
-        // A condition's noise is its latent volume times the channels, not its packed rows: two
+        // A condition's noise is its latent volume times the channels, not its packed rows: seven
         // latent frames of 48x84 at 24 channels, and no audio.
-        let expected = 2 * 48 * 84 * 24;
+        let expected = 7 * 48 * 84 * 24;
         assert_eq!(one.condition, expected);
         assert_eq!(one.video, one.condition);
         assert_eq!(one.audio, one.video + bare.audio);
