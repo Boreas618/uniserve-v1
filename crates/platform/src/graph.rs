@@ -127,6 +127,16 @@ impl Graph {
     }
 
     /// Every node of the graph.
+    ///
+    /// **The order is the driver's, and `cuGraphGetNodes` does not specify
+    /// one.** Do not map an operation onto a range of indices here: a graph
+    /// captured from two launches may list them in either order, and the order
+    /// can differ between the capture that made it and a later read.
+    ///
+    /// An owner that needs the nodes *one operation* added, in the order they
+    /// can execute, calls [`Capture::record`] after issuing that operation:
+    /// the capture knows which nodes are new, and returns them in order. That
+    /// is the record a rebind is issued against.
     pub fn nodes(&self) -> Result<Vec<GraphNode>> {
         let handles = self.node_handles()?;
         Ok(handles
