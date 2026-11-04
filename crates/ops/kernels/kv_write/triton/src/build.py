@@ -13,7 +13,7 @@ import _compile
 import kv_write as kernels
 
 #: Element types the keys, the values and the cache share here.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 
 def spec(fields, parameters, target):

@@ -10,7 +10,7 @@ import _compile
 import logits_shape as kernels
 
 #: The input logits' dtype; the shaped logits are FP32 in every case.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 #: The largest column tile a program holds in registers in one step.
 LANES = 4096

@@ -29,6 +29,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["fp32", "bf16", "fp16"], positions = ["i32", "i64"], columns = ["32", "64", "128"], block = ["256", "512", "1024"], scale = ["0x3f800000"], pdl = ["true", "false"] }
+dimensions = { dtype = ["f32", "bf16", "fp16"], positions = ["i32", "i64"], columns = ["32", "64", "128"], block = ["256", "512", "1024"], scale = ["0x3f800000"], pdl = ["true", "false"] }
 
 [parameters]

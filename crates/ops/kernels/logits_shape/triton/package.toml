@@ -30,6 +30,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_vocabulary_151936_block_262144_extras_0_divide_true_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], vocabulary = ["151936", "152064", "248320", "2048"], block = ["262144", "4096", "8192", "2048"], extras = ["0", "8", "16", "64"], divide = ["true", "false"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "fp16", "f32"], vocabulary = ["151936", "152064", "248320", "2048"], block = ["262144", "4096", "8192", "2048"], extras = ["0", "8", "16", "64"], divide = ["true", "false"], pdl = ["true", "false"] }
 
 [parameters]
