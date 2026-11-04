@@ -190,7 +190,8 @@ impl Op for MoeSort {
         let tiles = super::max_tiles(tokens, top, local, tile);
         let permuted = super::max_permuted_rows(tokens, top, local, tile);
 
-        args.ids.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.scales
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         if args.ids.dtype != DType::I32 {
@@ -306,7 +307,10 @@ mod tests {
             std::mem::offset_of!(Call, tile_to_expert),
             layout.tile_to_expert
         );
-        assert_eq!(std::mem::offset_of!(Call, tile_to_limit), layout.tile_to_limit);
+        assert_eq!(
+            std::mem::offset_of!(Call, tile_to_limit),
+            layout.tile_to_limit
+        );
         assert_eq!(
             std::mem::offset_of!(Call, expanded_to_permuted),
             layout.expanded_to_permuted
@@ -326,10 +330,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Call, tokens), layout.tokens);
         assert_eq!(std::mem::offset_of!(Call, top), layout.top);
         assert_eq!(std::mem::offset_of!(Call, experts), layout.experts);
-        assert_eq!(std::mem::offset_of!(Call, local_experts), layout.local_experts);
-        assert_eq!(std::mem::offset_of!(Call, local_offset), layout.local_offset);
+        assert_eq!(
+            std::mem::offset_of!(Call, local_experts),
+            layout.local_experts
+        );
+        assert_eq!(
+            std::mem::offset_of!(Call, local_offset),
+            layout.local_offset
+        );
         assert_eq!(std::mem::offset_of!(Call, tile_tokens), layout.tile_tokens);
-        assert_eq!(std::mem::offset_of!(Call, scales_dtype), layout.scales_dtype);
+        assert_eq!(
+            std::mem::offset_of!(Call, scales_dtype),
+            layout.scales_dtype
+        );
         assert_eq!(std::mem::offset_of!(Call, error), layout.error);
     }
 
@@ -342,6 +355,9 @@ mod tests {
         // 1024 tokens, top 8 = 8192 routes over 128 experts at 128 rows per tile: one full expert
         // set (128 tiles of 64 rows) is the floor, the bound is (8192 + 127·128)/128 = 191.
         assert_eq!(super::super::max_tiles(1024, 8, 128, 128), 191);
-        assert_eq!(super::super::max_permuted_rows(1024, 8, 128, 128), 191 * 128);
+        assert_eq!(
+            super::super::max_permuted_rows(1024, 8, 128, 128),
+            191 * 128
+        );
     }
 }

@@ -65,6 +65,10 @@
 //! region the executor allocates from its scratch pool and zeroes before its first use: trtllm-gen
 //! keeps its multi-CTA reduction counters there across launches.
 
+pub mod sparse;
+
+pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
+
 use std::ffi::c_void;
 use std::fmt;
 
@@ -586,26 +590,26 @@ impl Op for PagedAttention {
             page_table: address(args.page_table.ptr) as usize as *const i32,
             seq_lens: address(args.seq_lens.ptr) as usize as *const i32,
             cum_seq_lens_q,
-            batch: to_i64(batch)?,
-            tokens: to_i64(tokens)?,
-            max_q_len: to_i64(max_q_len)?,
-            max_kv_len: to_i64(max_kv_len)?,
-            num_pages: to_i64(args.key.shape.dim(0))?,
-            page_size: to_i64(page_size)?,
-            q_heads: to_i64(q_heads)?,
-            kv_heads: to_i64(kv_heads)?,
-            head_dim: to_i64(head_dim)?,
-            q_stride_tokens: to_i64(row_stride(&args.query))?,
-            q_stride_heads: to_i64(head_stride(&args.query))?,
-            kv_stride_page: to_i64(args.key.strides.get(0))?,
-            kv_stride_tokens: to_i64(args.key.strides.get(1))?,
-            kv_stride_heads: to_i64(args.key.strides.get(2))?,
-            o_stride_tokens: to_i64(row_stride(&args.out))?,
-            o_stride_heads: to_i64(head_stride(&args.out))?,
+            batch: to_i64(Self::NAME, batch)?,
+            tokens: to_i64(Self::NAME, tokens)?,
+            max_q_len: to_i64(Self::NAME, max_q_len)?,
+            max_kv_len: to_i64(Self::NAME, max_kv_len)?,
+            num_pages: to_i64(Self::NAME, args.key.shape.dim(0))?,
+            page_size: to_i64(Self::NAME, page_size)?,
+            q_heads: to_i64(Self::NAME, q_heads)?,
+            kv_heads: to_i64(Self::NAME, kv_heads)?,
+            head_dim: to_i64(Self::NAME, head_dim)?,
+            q_stride_tokens: to_i64(Self::NAME, row_stride(&args.query))?,
+            q_stride_heads: to_i64(Self::NAME, head_stride(&args.query))?,
+            kv_stride_page: to_i64(Self::NAME, args.key.strides.get(0))?,
+            kv_stride_tokens: to_i64(Self::NAME, args.key.strides.get(1))?,
+            kv_stride_heads: to_i64(Self::NAME, args.key.strides.get(2))?,
+            o_stride_tokens: to_i64(Self::NAME, row_stride(&args.out))?,
+            o_stride_heads: to_i64(Self::NAME, head_stride(&args.out))?,
             scale: f64::from(args.scale),
             window_left: i64::from(args.window_left),
             causal,
-            workspace_bytes: to_i64(args.workspace.numel())?,
+            workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
             dtype_query: descriptor.query.as_i64(),
             dtype_key_value: descriptor.key_value.as_i64(),
             dtype_output: descriptor.output.as_i64(),
@@ -639,7 +643,7 @@ impl Op for PagedAttention {
 }
 
 /// The elements between consecutive rows of a view.
-fn row_stride(view: &TensorView) -> u64 {
+pub(super) fn row_stride(view: &TensorView) -> u64 {
     if view.strides.rank() >= 2 {
         view.strides.get(view.strides.rank() - 2)
     } else {
@@ -648,7 +652,7 @@ fn row_stride(view: &TensorView) -> u64 {
 }
 
 /// The elements between consecutive heads of a `[rows, heads, dim]` view.
-fn head_stride(view: &TensorView) -> u64 {
+pub(super) fn head_stride(view: &TensorView) -> u64 {
     if view.strides.rank() >= 2 {
         view.strides.get(view.strides.rank() - 2 + 1)
     } else {
@@ -656,13 +660,13 @@ fn head_stride(view: &TensorView) -> u64 {
     }
 }
 
-fn address(pointer: DevicePtr) -> u64 {
+pub(super) fn address(pointer: DevicePtr) -> u64 {
     platform::address(pointer)
 }
 
-fn to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| Error::argument(PagedAttention::NAME, "an extent above i64::MAX"))
+/// An extent as the ABI's `i64`, or an argument error naming `operator`.
+pub(super) fn to_i64(operator: &'static str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::argument(operator, "an extent above i64::MAX"))
 }
 
 #[cfg(test)]
