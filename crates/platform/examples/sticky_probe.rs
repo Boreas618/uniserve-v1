@@ -52,13 +52,16 @@ fn run() -> Result<(), Error> {
     // `parameters` holds the one address the kernel takes; the storage it
     // points at is meant to be invalid, since the error is what this probe
     // observes.
-    kernel
-        .launch_ex(
-            &stream,
-            &LaunchConfig::new([1, 1, 1], [1, 1, 1]),
-            &mut parameters,
-        )
-        .expect("the launch is accepted; the fault is asynchronous");
+    if let Err(error) = kernel.launch_ex(
+        &stream,
+        &LaunchConfig::new([1, 1, 1], [1, 1, 1]),
+        &mut parameters,
+    ) {
+        // The launch is expected to be accepted — the fault is asynchronous —
+        // but a refusal is still an observation worth printing.
+        println!("the launch itself was refused: {error}");
+        return Ok(());
+    }
 
     // Synchronizing surfaces the fault, and from then on the context is
     // poisoned. A clean answer here means the store did not fault.
