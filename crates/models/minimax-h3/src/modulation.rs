@@ -316,17 +316,20 @@ impl Projections {
         config: &crate::config::TransformerConfig,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        // **The cache's weights are read as FP32 at every deployment, and its tables follow them.**
-        // The reference casts the activation to the weight's type and takes the tables' type from
-        // the product (`adaln_cache.py:128, 141-145`), so at the released BF16 stack its tables are
-        // BF16. Ours cannot be: our product has one element type for both operands, so a BF16 weight
-        // would meet an FP32 activation and cuBLASLt has no such pair - the first projection of the
-        // forward, found on device. Pinning these weights to FP32 keeps one type on both sides of
-        // every launch of the cache, at the price of the tables being FP32 where the reference's are
-        // the checkpoint's type: one declared deviation, and it is the tables' representation, not
-        // the arithmetic - the projection is a sum of products of the same numbers.
-        let mut loader = loader.with_precision(Some(DType::F32))?;
-        let loader = &mut loader;
+        // **The element type of each tensor is pinned by the reference, not by the deployment.**
+        // Its loading table fixes the timestep pair at FP32 and the modulation projections at BF16
+        // whatever the preset (`weights.py:186-224`), and it casts the activation to the weight's
+        // type before each product (`adaln_cache.py:128`). Our product has one element type for both
+        // operands, so the activation and the tables must agree with the weights on both sides - and
+        // the run's first stop was exactly this: an FP32 activation against whatever type the
+        // deployment's loader happened to publish.
+        //
+        // The timestep pair is read at the reference's own type. The modulation pair is read at FP32
+        // too, which is **a declared deviation**: the reference holds those weights and their tables
+        // in BF16 at the released preset, and reaching that needs the activation of the first pair
+        // converted from FP32 to BF16 before the second pair reads it - one convert, which no
+        // operator here has yet. FP32 with one type throughout is the same arithmetic in a wider
+        // type; a BF16 activation meeting an FP32 weight would be a pair no library computes.
         let hidden = u64::from(config.hidden_size);
         let time_dim = u64::from(config.time_dim);
         let time_hidden = u64::from(config.time_hidden_dim);
@@ -340,11 +343,13 @@ impl Projections {
                         &format!("{prefix}.weight"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
                         time_dim,
+                        DType::F32,
                     )?,
                     vector(
                         loader,
                         &format!("{prefix}.bias"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
+                        DType::F32,
                     )?,
                 ))
             })
@@ -356,8 +361,14 @@ impl Projections {
                     "time_embedder.linear_1.weight",
                     time_hidden,
                     frequency,
+                    DType::F32,
                 )?,
-                vector(loader, "time_embedder.linear_1.bias", time_hidden)?,
+                vector(
+                    loader,
+                    "time_embedder.linear_1.bias",
+                    time_hidden,
+                    DType::F32,
+                )?,
             ),
             second: (
                 matrix(
@@ -365,13 +376,20 @@ impl Projections {
                     "time_embedder.linear_2.weight",
                     time_dim,
                     time_hidden,
+                    DType::F32,
                 )?,
-                vector(loader, "time_embedder.linear_2.bias", time_dim)?,
+                vector(loader, "time_embedder.linear_2.bias", time_dim, DType::F32)?,
             ),
             layers,
             output: (
-                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim)?,
-                vector(loader, "norm_out.linear.bias", 2 * hidden)?,
+                matrix(
+                    loader,
+                    "norm_out.linear.weight",
+                    2 * hidden,
+                    time_dim,
+                    DType::F32,
+                )?,
+                vector(loader, "norm_out.linear.bias", 2 * hidden, DType::F32)?,
             ),
             frequency_dim: config.frequency_dim,
             time_hidden_dim: config.time_hidden_dim,
@@ -525,17 +543,19 @@ fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
 }
 
 /// A `[rows, columns]` checkpoint weight.
-fn matrix(loader: &mut WeightLoader<'_>, name: &str, rows: u64, columns: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[rows, columns]),
-    ))?)
+fn matrix(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    rows: u64,
+    columns: u64,
+    dtype: DType,
+) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows, columns])).pinned(dtype))?)
 }
 
 /// A `[rows]` checkpoint weight.
-fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])))?)
+fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64, dtype: DType) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])).pinned(dtype))?)
 }
 
 #[cfg(test)]
