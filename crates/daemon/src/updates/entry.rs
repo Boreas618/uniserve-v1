@@ -96,36 +96,6 @@ const LEDGER_READ: Duration = Duration::from_secs(10);
 /// start, the probed components and whether PC sampling was enabled before
 /// the capture (`profiling_config.graph_pc_sampling`), and takes a new
 /// world.
-/// The LAUNCH generation of the main process that serves `world`: the number
-/// `Drain`, `Stop` and `Purge` address, and never the epoch record's
-/// `generation`, which is the MODEL generation the main process numbers for
-/// the programs it executes.
-///
-/// The row naming the epoch is the surest one. The daemon records an epoch on
-/// a row when that process reports `Drained`, so a process it launched for a
-/// switch carries none; its row is then the one that *serves*, there being one
-/// such main process at a time, and the highest of them if a replacement
-/// lingers above a parked predecessor.
-fn serving_process_generation(
-    processes: &[crate::epoch::ManagedProcess],
-    world: u64,
-) -> Option<u64> {
-    let main_processes = processes
-        .iter()
-        .filter(|process| process.role == crate::epoch::Role::MainProcess);
-    let named = main_processes
-        .clone()
-        .filter(|process| process.epoch == Some(world))
-        .map(|process| process.generation)
-        .max();
-    named.or_else(|| {
-        main_processes
-            .filter(|process| process.state == crate::epoch::ProcessState::Serving)
-            .map(|process| process.generation)
-            .max()
-    })
-}
-
 fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
     let mut switched = comparable(served);
     if let (Some(served), Some(target)) = (switched.profiling.as_mut(), target.profiling.as_ref()) {
@@ -533,26 +503,29 @@ impl Leader {
         let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
             UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
         })?;
-        // The previous epoch's processes are addressed by their LAUNCH
-        // generation — `Drain`, `Stop` and `Purge` take it — never by the
-        // record's `generation`, which is the model generation the main
-        // process numbers for its programs (`epoch.rs`, `ManagedProcess`). The
-        // number is therefore read from the process table, which the node's
-        // daemon filled when it launched that process.
-        let previous_generation = serving_process_generation(&epochs.processes(), serving.world)
-            .ok_or_else(|| {
-                UpdateError::Refused(format!(
-                    "the serving epoch {} has no main process in the process table, so there is \
-                     no generation to drain it from",
-                    serving.world
-                ))
-            })?;
         // The deployment's argv comes from its leader node's control: the
         // arguments an engine process of this daemon starts with are the
         // same for every host (the daemon's sockets travel with them).
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
         let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
+        // The previous epoch's processes are addressed by their LAUNCH
+        // generation — `Drain`, `Stop` and `Purge` take it — never by the
+        // record's `generation`, which is the model generation the main process
+        // numbers for its programs (`EpochRecord`, `ManagedProcess`). The
+        // authority for that number is the client itself: it is the engine this
+        // daemon started or adopted, so it is the process those commands must
+        // reach. The process table is no substitute — it holds no row for the
+        // epoch the daemon started with (that child is `EngineControl`'s, not
+        // the roster's) and can hold a lingering replacement above the one that
+        // serves.
+        let previous_generation = serving_client.engine().ok_or_else(|| {
+            UpdateError::Refused(format!(
+                "the main process serving epoch {} has no launch generation: this daemon neither \
+                 started nor adopted it",
+                serving.world
+            ))
+        })?;
         // One number for the whole deployment: every rank's counter is
         // advanced, and the highest is the generation each child of the epoch
         // is spawned at, so none collides with a rank's standby (§2.5). A dry
@@ -978,53 +951,6 @@ mod tests {
         ] {
             assert!(!switches_probes_only(&served, &spec(world)));
         }
-    }
-
-    fn process(
-        role: crate::epoch::Role,
-        epoch: Option<u64>,
-        generation: u64,
-        state: crate::epoch::ProcessState,
-    ) -> crate::epoch::ManagedProcess {
-        crate::epoch::ManagedProcess {
-            role,
-            group: crate::engine::control::ENGINE_GROUP.to_owned(),
-            rank: 0,
-            pid: None,
-            epoch,
-            build: String::new(),
-            generation,
-            state,
-        }
-    }
-
-    /// The generation the previous epoch's processes are addressed at is the
-    /// process row's launch generation, never the epoch record's model
-    /// generation: with the two equal the mistake is invisible.
-    #[test]
-    fn the_previous_epoch_is_addressed_at_its_processs_launch_generation() {
-        use crate::epoch::{ProcessState, Role};
-
-        // A row that names the epoch, beside the frontend that serves too.
-        let rows = [
-            process(Role::Frontend, None, 3, ProcessState::Serving),
-            process(Role::MainProcess, Some(7), 12, ProcessState::Serving),
-        ];
-        assert_eq!(serving_process_generation(&rows, 7), Some(12));
-
-        // A process the daemon launched for a switch names no epoch — only a
-        // `Drained` report records one — so the row that serves is the epoch's,
-        // and a parked standby beside it is not.
-        let rows = [
-            process(Role::MainProcess, None, 40, ProcessState::Serving),
-            process(Role::MainProcess, None, 41, ProcessState::Parked),
-            process(Role::Frontend, None, 42, ProcessState::Serving),
-        ];
-        assert_eq!(serving_process_generation(&rows, 30), Some(40));
-
-        // No main process serves: there is nothing to drain.
-        let rows = [process(Role::MainProcess, None, 40, ProcessState::Parked)];
-        assert_eq!(serving_process_generation(&rows, 30), None);
     }
 
     #[test]
