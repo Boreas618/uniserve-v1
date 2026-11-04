@@ -95,8 +95,15 @@ impl StreamHandoff {
 pub(crate) struct Adopted {
     /// The request's identity, as the deployment named it.
     pub(crate) request_id: String,
-    /// When the successor took the response over, as `CLOCK_MONOTONIC`
-    /// nanoseconds: the predecessor's pause ends here.
+    /// When the successor took the response's engine stream over, as
+    /// `CLOCK_MONOTONIC` nanoseconds: the predecessor's pause ends here.
+    ///
+    /// This is the moment the engine serves the request to the successor, not
+    /// the moment the successor writes the response's next event. §7.5.1
+    /// measures a response's pause as the time between those two, and this
+    /// record stops at the first of them (§12 leaves the pause unmeasured);
+    /// the successor's serving path would have to record the second, which it
+    /// cannot do before it has written the first body frame.
     pub(crate) at_ns: u64,
     /// When the predecessor stopped the socket, as `CLOCK_MONOTONIC`
     /// nanoseconds.
@@ -136,8 +143,11 @@ impl Paused {
     ///
     /// Also writes the predecessor's handoff records — one `handoff stream`
     /// line per response it froze, with the successor's process id and the
-    /// pause the successor measured, and one `handoff streams adopted` line
-    /// after the last of them — which the deployment's restart test parses.
+    /// time to the successor's takeover of the response's engine stream, and
+    /// one `handoff streams adopted` line after the last of them — which the
+    /// deployment's restart test parses. That time is a lower bound of the
+    /// pause §7.5.1 defines: the successor has not written anything yet when
+    /// it reports ([`Adopted::at_ns`]).
     pub(crate) fn decide(self, adopted: &[Taken], successor_pid: u32) {
         let decided_at = crate::http::handoff::now_ns();
         for frozen in self.frozen {
@@ -399,10 +409,13 @@ fn take_over(
     })
 }
 
-/// Records that a successor wrote the first frame of each adopted response.
+/// Records that a successor took each adopted response's engine stream over.
 ///
-/// The record is one log line whose message is `handoff adopted ` and one
-/// JSON object, which the deployment's restart test parses.
+/// The record is one log line whose message is `handoff adopted ` and one JSON
+/// object, which the deployment's restart test parses. Its `pause_ms` runs from
+/// the predecessor's freeze to that takeover, so it understates the pause
+/// §7.5.1 defines by the time the successor needs to write the response's next
+/// event — see [`Adopted::at_ns`].
 pub(crate) fn adopted(adopted: &[Adopted]) {
     for response in adopted {
         info!(
