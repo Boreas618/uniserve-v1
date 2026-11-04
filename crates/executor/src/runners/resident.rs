@@ -334,14 +334,15 @@ impl KvProvider for ResidentCache {
     /// the leased prefix's copies are issued on the batch's stream.
     ///
     /// The order is the only order that is correct. A destination is a unit of *this* cache, so it
-    /// is taken first - `recycle` prepares it for a new owner, which is what makes a page whose
-    /// previous request left stale bytes safe to write. The copies come second, and they read the
-    /// sources the mechanism still leases: the copy is issued on the batch's stream, so the forward
-    /// that reads the destinations runs after it by stream order and takes no barrier.
+    /// is taken first - `reset_units` clears the previous owner's values and flags, which is what
+    /// makes the page new - and the copies come second. They read the sources the mechanism still
+    /// leases, and they are issued on the batch's stream, so the forward that reads the destinations
+    /// runs after them by stream order and takes no barrier.
     ///
-    /// A unit or group this cache does not hold is refused **by name**: the scheduler's allocation
-    /// named a page this pool does not have, and a deployment's reader needs the unit, the group and
-    /// the pool's size, not the fact that a seam existed.
+    /// Three things are refused **by name**, because a reader of the deployment's log needs the unit
+    /// and the reason rather than the fact that a seam existed: a unit outside the pool's range, a
+    /// group this pool does not hold, and a copy whose destination this allocation did not name
+    /// (a destination the cache never took is not a destination).
     fn apply_cache_units(
         &mut self,
         units: &[ipc::CacheUnitAllocation],
@@ -357,33 +358,46 @@ impl KvProvider for ResidentCache {
         let groups = cache.groups();
         for allocation in units {
             let group = allocation.group_id as usize;
+            if group >= groups {
+                return Err(Error::Invalid(format!(
+                    "the mechanism allocated units of cache group {group}, but this pool has \
+                     {groups} group(s)"
+                )));
+            }
             let pages = cache.pages(group).map_err(|error| {
                 Error::Invalid(format!(
-                    "the mechanism allocated units of cache group {group}, but this pool has \
-                     {groups} group(s): {error}"
+                    "the mechanism allocated units of cache group {group}, which this pool \
+                     cannot describe: {error}"
                 ))
             })?;
-            let held = |unit: ipc::UnitId| -> Result<()> {
+            let held = |unit: ipc::UnitId, what: &str| -> Result<()> {
+                // Unit zero is the block tables' sentinel, so a page is one of `1..pages`.
                 if unit.0 == 0 || unit.0 >= pages {
                     return Err(Error::Invalid(format!(
-                        "the mechanism named cache unit {} of group {group}, outside the pool's \
-                         {pages} units (unit 0 is the block tables' sentinel)",
-                        unit.0
+                        "the mechanism named cache unit {} of group {group} as {what}, outside \
+                         the pool's {} units (unit 0 is the block tables' sentinel)",
+                        unit.0, pages
                     )));
                 }
                 Ok(())
             };
             for &unit in &allocation.unit_ids {
-                held(unit)?;
+                held(unit, "a new unit")?;
             }
             for &(source, destination) in &allocation.copies {
-                held(source)?;
-                held(destination)?;
+                held(source, "a copy's source")?;
+                held(destination, "a copy's destination")?;
+                if !allocation.unit_ids.contains(&destination) {
+                    return Err(Error::Invalid(format!(
+                        "the mechanism copies into cache unit {} of group {group}, which this \
+                         allocation did not name among the units it acquired",
+                        destination.0
+                    )));
+                }
             }
-            // The new units become this cache's pages, then the copies that fill them.
-            let column = cache.bind_units(Some(stream))?;
+            // The units are this cache's before anything is written into them.
             let acquired: Vec<u32> = allocation.unit_ids.iter().map(|unit| unit.0).collect();
-            cache.recycle(&acquired, &column, stream)?;
+            cache.reset_units(&acquired, stream)?;
             cache.copy_units(&allocation.copies, stream)?;
         }
         Ok(())
