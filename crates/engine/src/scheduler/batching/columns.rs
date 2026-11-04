@@ -27,6 +27,14 @@
 //!   from the call;
 //! - **page_size** and **max_kv_len**: the cache's geometry.
 //!
+//! Three counts, one per column family, and every column follows exactly one
+//! of them: a token column is as long as the batch's tokens, a row column as
+//! long as its rows — the sequences, so a verification of three candidates is
+//! one call and three rows — and the commit table as long as its calls. Their
+//! single statement is [`executor::batch::BatchColumns`]' own documentation,
+//! which the executor's `check` and its staging both read: compare a column
+//! with the wrong one of the three and a legitimate batch is refused.
+//!
 //! - **commit**: the eight columns `ops::commit::column` names, one row per
 //!   call: how the step advances the slot's device state. A decode advances by
 //!   its sampled token; a prefill that samples installs its token at the host

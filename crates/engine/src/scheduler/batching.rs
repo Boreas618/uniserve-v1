@@ -643,16 +643,28 @@ impl Scheduler {
     /// a call whose request state is gone. Such a batch is not servable, which
     /// is what its `None` says; it is never filled with plausible values.
     fn attach_columns(&self, batch: &mut ExecutionBatch) {
+        // A batch that leaves without columns is dropped: the calls it names are
+        // never submitted and the step serves nothing. Nothing downstream can
+        // tell that from a step the policy planned empty, so each refusal names
+        // itself at debug level (`RUST_LOG=engine::scheduler::batching=debug`),
+        // which is the one way a world that dispatches nothing says why.
         let Some(cache) = self.storage.cache() else {
+            tracing::debug!("a batch is dropped: this scheduler holds no cache to address");
             return;
         };
         let Some(group) = cache.coordinator.groups().first() else {
+            tracing::debug!("a batch is dropped: the cache coordinator states no group");
             return;
         };
         let (Ok(block_size), Ok(units_per_page)) = (
             u32::try_from(group.block_size),
             u32::try_from(group.units_per_page),
         ) else {
+            tracing::debug!(
+                "a batch is dropped: the page geometry {}, {} does not fit u32",
+                group.block_size,
+                group.units_per_page
+            );
             return;
         };
         let page = slots::PageGeometry {
@@ -663,6 +675,10 @@ impl Scheduler {
         // from the launch, since a KV view's shape must not move per batch.
         let max_kv_len = self.executor.info().max_model_len;
         if max_kv_len == 0 {
+            tracing::debug!(
+                "a batch is dropped: the executor states no model length, so a KV view has no \
+                 static bound to be shaped to"
+            );
             return;
         }
         let mut inputs = Vec::with_capacity(batch.requests.len());
@@ -670,6 +686,10 @@ impl Scheduler {
         let mut draws = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
+                tracing::debug!(
+                    "a batch is dropped: {:?} names a request this scheduler is not running",
+                    call.request_key.request_id
+                );
                 return;
             };
             // A decode's rows embed the token the request's own state continues
@@ -698,6 +718,14 @@ impl Scheduler {
             page,
             max_kv_len,
         );
+        if batch.columns.is_none() {
+            tracing::debug!(
+                "a batch is dropped: the fill refuses {} calls over {} tokens at page {} ({max_kv_len} tokens of model)",
+                batch.requests.len(),
+                batch.requests.iter().map(|(call, _)| call.input_token_ids.len()).sum::<usize>(),
+                block_size,
+            );
+        }
     }
 
     /// Determines the next call kind without mutating request or resource state.
