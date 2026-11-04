@@ -2200,12 +2200,25 @@ impl MainProcess {
                 // that has stood past twice the watchdog's stall bound is failed here by name,
                 // saying what never answered. Serving keeps what it had; the update does not.
                 if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
+                    // The arm holds two waits, and naming the wrong one costs a run: a policy build
+                    // that never answers is not a device that never answered, and the previous
+                    // message said the device either way. The policy is the narrower of the two, so
+                    // it is asked first.
+                    let policy = matches!(
+                        poll_answers(&precopy.policies),
+                        Some(StageFailure::Pending)
+                    );
+                    let cause = if policy {
+                        "a scheduler's policy build never answered"
+                    } else {
+                        "this node's devices never answered their preparation"
+                    };
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
                             reason: format!(
-                                "this node's device never answered its preparation after {}s \
-                                 ({pending}): the device thread is the one to look at",
+                                "{cause} after {}s ({pending}): the wait named there is the one \
+                                 to look at",
                                 precopy.since.elapsed().as_secs()
                             ),
                         },
