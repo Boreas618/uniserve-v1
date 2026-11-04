@@ -17,8 +17,8 @@ pub mod pinned_pool;
 pub mod prefix_cache;
 pub mod products;
 pub mod request_slots;
-pub mod weights;
 pub mod retained;
+pub mod weights;
 
 pub use latent::LatentPlan;
 pub use prefix_cache::block_tables::{
@@ -90,6 +90,62 @@ pub struct MemoryRequest<'a> {
     pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
     /// The pool's completion events.
     pub events: Arc<crate::stream::EventPool>,
+}
+
+/// What the main process hands [`open_memory`]: the parts only the deployment
+/// knows, beside the plan the capacity negotiation resolved.
+///
+/// Everything the plan carries is read from it - the slot count, the entry
+/// bytes of a product, the relay depth, the import workers - so a caller does
+/// not repeat a figure the plan already states.
+pub struct OpenMemory<'a> {
+    /// The plan [`capacity::token_plan`](crate::capacity::token_plan) resolved.
+    pub plan: &'a crate::capacity::Plan,
+    /// The deployed blocks' slot fields, from the model.
+    pub slots: &'a [self::request_slots::SlotField],
+    /// The rank's device, or `None` for a host-only rank.
+    pub device: Option<platform::DeviceId>,
+    /// The device's stream the owners' resets run on.
+    pub stream: Option<&'a Stream>,
+    /// The block-table width the batch plan holds.
+    pub width: u32,
+    /// The devices the product store's arenas live on.
+    pub devices: Vec<crate::memory::allocation::MemoryKind>,
+    /// The conversion program the import path launches.
+    pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
+    /// The pool's completion events.
+    pub events: Arc<crate::stream::EventPool>,
+}
+
+/// Build every resident owner the plan sized: the cache planes and block
+/// tables, the latent pages, the product store, the request slots, the buffer
+/// pool and the page-locked blocks.
+///
+/// This is the epoch's budget becoming real: each owner is booked against the
+/// device's allowance as it is mapped, so the first `mapped <= budget` reading
+/// after warmup counts every byte the plan charged. `storage` stays the main
+/// process's client; `sleep` and `wake` are the only calls that reach the
+/// ledger.
+pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Memory> {
+    let plan = request.plan;
+    let info = &plan.info;
+    Memory::new(
+        MemoryRequest {
+            plan,
+            slots: request.slots,
+            device: request.device,
+            stream: request.stream,
+            width: request.width,
+            request_pool_size: info.request_slots,
+            devices: request.devices,
+            max_feature_bytes: u64::from(info.encoder_entry_bytes),
+            relay_depth: plan.arena.relay_depth,
+            import_capacity: info.max_unresolved_calls as usize,
+            conversion: request.conversion,
+            events: request.events,
+        },
+        storage,
+    )
 }
 
 impl Memory {
