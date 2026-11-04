@@ -545,8 +545,34 @@ pub(crate) struct MainProcess {
     /// reach the scheduler that serves it, and the command names the request, not the rank.
     streams: Vec<(u64, usize, engine::EventRx)>,
     /// Whether this process admits and executes: a drain parks every scheduler, and only the
-    /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2).
+    /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2). A process that
+    /// has not reached its first switchover admits nothing whatever the daemon has said: the epoch's
+    /// first generation holds no kernel and no capture until the daemon's precopy fills it and the
+    /// switchover warms it, and a batch admitted before then would reach a graph that does not
+    /// exist. The boundary is necessary and not sufficient: the warmup queues one capture per
+    /// device and runs them behind serving batches, so admission is owed to it as well
+    /// ([`Self::open_admission`]).
     serving: bool,
+    /// Whether the epoch's first switchover has happened: the boundary the first batch is served
+    /// at (§4.5, §7.3 step 3).
+    boundary: bool,
+    /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
+    pending_serve: bool,
+    /// Whether admission is owed to the warmup: the switchover that opens the epoch queues one
+    /// capture per device and does not wait for them, so a batch admitted the moment the boundary
+    /// opened could be planned into a bucket whose capture has not run - a replay finds no graph of
+    /// it and answers an invariant error that names a capture bug. The epoch opens serving when the
+    /// last submission finishes (`advance_warmup`), and a `Drain` drops what was owed (§4.5).
+    admission_owed: bool,
+    /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
+    /// worker's row count includes the guidance prefix, which is not a request.
+    max_running_requests: u32,
+    /// Whether this process was launched as the epoch's standby (§2.5): it admits nothing until
+    /// the daemon promotes it *and* the epoch reaches its boundary.
+    standby: bool,
+    /// Whether a promoted standby has been promoted: a standby that has not been stays silent
+    /// through the boundary, and one that has follows the rule of any other process.
+    promoted: bool,
     /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
@@ -598,6 +624,16 @@ impl MainProcess {
             );
         }
         let epoch = handshake(&mut control, launch)?;
+        // §7.3 step 1: the daemon's launch path blocks until this process states what it is, and it
+        // sends the epoch's first program-layer command only once it has. `Starting` goes out
+        // before the model load, which is minutes long, so the daemon's log and the caller's show a
+        // process that is alive rather than one that vanished after the storage claim; the
+        // `Ready`/`Standby` at the end of `start` is what lets the epoch begin.
+        announce(
+            &mut control,
+            proto::request::wire::EngineState::Starting,
+            None,
+        )?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
@@ -622,7 +658,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory) = plan
+        let (model, mut memory, inventory) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -655,7 +691,10 @@ impl MainProcess {
             .devices()
             .first()
             .context("this rank serves no device")?;
-        let scratch = plan.graph(device)?.scratch;
+        // Only the scratch figure is read here: the device thread starts before any batch and the
+        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
+        // and `open_memory` opens it, so this call states none.
+        let scratch = plan.graph(device, 0)?.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
@@ -681,7 +720,7 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
+        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
 
         let mut process = Self {
             control,
@@ -703,10 +742,18 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
-            // The epoch serves from the end of `start` until the daemon drains it, unless the
-            // launcher started it as a standby: that one parks itself here, before it can admit
-            // anything, and the `Promote` that follows resumes it (2.5, 7.4).
-            serving: !launch.standby,
+            // Nothing is admitted until the epoch's first switchover, which is the boundary the
+            // first batch is served at: before it the generation holds no kernel and no capture, so
+            // a batch would find no graph. A standby parks itself here as well, and the `Promote`
+            // that follows does not lift the boundary either (2.5, 7.4).
+            serving: false,
+            boundary: false,
+            pending_serve: false,
+            admission_owed: false,
+            max_running_requests: u32::try_from(build.max_running_requests.get())
+                .unwrap_or(u32::MAX),
+            standby: launch.standby,
+            promoted: false,
             parked: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
@@ -715,6 +762,15 @@ impl MainProcess {
         if launch.standby {
             process.park_standby()?;
         }
+        // What the daemon waits for before the epoch's first `Precopy`: a process started beside a
+        // serving one is `Standby`, and one launched to serve is `Ready`. Waiting to be ready until
+        // this process had a policy would be waiting for the command that waits for it.
+        let state = if launch.standby {
+            proto::request::wire::EngineState::Standby
+        } else {
+            proto::request::wire::EngineState::Ready
+        };
+        process.announce(state)?;
         Ok(process)
     }
 
@@ -1001,6 +1057,9 @@ impl MainProcess {
                             proto::request::RejectionKind::Overloaded,
                             if self.paused {
                                 "the frontend's admissions are held".to_owned()
+                            } else if !self.boundary {
+                                "the epoch is starting and has reached no batch boundary yet"
+                                    .to_owned()
                             } else {
                                 "the epoch is drained and serves nothing".to_owned()
                             },
@@ -1104,8 +1163,17 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
-                    self.resume_schedulers()
+                    self.promoted = true;
+                    // A promoted standby admits on the same rule as any other process: once the
+                    // generation it will serve has been warmed (§4.5).
+                    self.open_admission()
                         .context("promoting this process in place")?;
+                    if !self.boundary {
+                        // A promoted standby serves only once the switchover that fills its
+                        // generation has happened, the same rule a fresh process follows.
+                        self.serving = false;
+                        self.pending_serve = true;
+                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Promoted(
                             proto::process::Promoted {
@@ -1172,6 +1240,16 @@ impl MainProcess {
         reply: Option<u32>,
         reverted_by: Option<String>,
     ) -> Result<Option<ProgramStatus>> {
+        // §7.3's stages are the epoch's steps, and a step that never arrives is the failure this
+        // line is for: it names the command and the generation, so a log that stops after "claimed
+        // the deployment's storage" says which step the process is waiting for.
+        tracing::info!(
+            stage = program_stage(&command),
+            boundary = self.boundary,
+            serving = self.serving,
+            warming = self.warming.len(),
+            "a program-layer command arrived"
+        );
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
@@ -1463,7 +1541,7 @@ impl MainProcess {
             match submission.outcome() {
                 None => pending.push((device, submission, generation)),
                 Some(Outcome::Success(_)) => {
-                    tracing::debug!(device, generation, "a generation's warmup finished");
+                    tracing::info!(device, generation, "a generation's warmup finished");
                 }
                 Some(outcome) => {
                     self.warming = pending;
@@ -1486,6 +1564,12 @@ impl MainProcess {
             }
         }
         self.warming = pending;
+        if self.warming.is_empty() && self.admission_owed {
+            // The last capture of the epoch's warmup has run, so every bucket a batch can be planned
+            // into exists. A warmup that failed returns above and its revert clears what was owed.
+            self.open_admission()
+                .context("opening admission after the warmup")?;
+        }
         Ok(None)
     }
 
@@ -1855,6 +1939,32 @@ impl MainProcess {
             }
         }
 
+        tracing::info!(
+            generation,
+            devices = self.executors.len(),
+            queued = self.warming.len(),
+            "the switchover queued the epoch's warmup and set the boundary"
+        );
+        // The boundary the first batch is served at (§4.5): every device serves this generation
+        // and its buckets are warming behind the batches that follow. A `Serve` that arrived while
+        // the generation was still being filled is honoured now.
+        self.boundary = true;
+        // An epoch admits once this boundary is behind it and nothing has parked it since: a
+        // non-standby process was launched to serve, a standby only after the daemon promoted it,
+        // and a drained one waits for the `Serve` that names the epoch again. The start of an epoch
+        // carries no `Serve` - the daemon tells the frontend where requests go and the process was
+        // launched serving - so the boundary itself is what opens admission.
+        let admitted = self.pending_serve || self.parked.is_none();
+        if admitted && (self.promoted || !self.standby) {
+            // Admission is the end of the warmup, not the boundary: the buckets the epoch serves
+            // are the ones the warmup captures, and a batch admitted before the last of them has
+            // run and been captured would be planned into a bucket with no graph. So the answer to
+            // the daemon leaves `Switched` inside its window and the opening happens in
+            // `advance_warmup`, which is what honours an early `Serve` when a drain parked the
+            // schedulers first - a process that never parked resumes nothing and simply admits.
+            self.open_admission()
+                .context("resuming for the epoch's first switchover")?;
+        }
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -1940,12 +2050,47 @@ impl MainProcess {
     /// command is the one this process bound at launch: the daemon names it so that the frontend
     /// submits to the right place, not so that a process moves its socket.
     fn resume(&mut self, serve: proto::process::Serve) -> Result<()> {
-        if self.parked.is_some() {
-            self.resume_schedulers()
-                .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+        if !self.boundary {
+            // The daemon has said the epoch serves; the process cannot admit until its first
+            // generation is filled and warmed. The request waits in the frontend, which retries the
+            // submission it was refused.
+            self.pending_serve = true;
+            return Ok(());
         }
-        self.serving = true;
-        Ok(())
+        // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
+        // owed rather than refused: admission opens when the last submission finishes, the same way
+        // it does at a switchover (§4.5).
+        self.open_admission()
+            .with_context(|| format!("resuming epoch {}", serve.epoch))
+    }
+
+    /// Opens admission, or owes it to the warmup (§4.5).
+    ///
+    /// A bucket is served only after its capture has run: a replay reads the captures of the
+    /// generation serving, and a bucket captured by no one is an invariant error at the first batch
+    /// rather than a capture that is slow. `warmup` queues one capture of every bucket per device
+    /// and returns at once - it runs one bucket per queue turn behind serving, which for a model
+    /// with many buckets is minutes - so the switchover answers the daemon and leaves the opening
+    /// here. A `Drain` clears what was owed, because the epoch it was owed to is no longer serving.
+    fn open_admission(&mut self) -> Result<()> {
+        if !self.warming.is_empty() {
+            tracing::info!(
+                warming = self.warming.len(),
+                "admission is owed to the warmup, which has not finished"
+            );
+            self.admission_owed = true;
+            return Ok(());
+        }
+        tracing::info!(
+            boundary = self.boundary,
+            pending_serve = self.pending_serve,
+            "opening admission"
+        );
+        self.admission_owed = false;
+        // An early `Serve` is honoured here rather than at its arrival: this is the pass that
+        // admits, so the request waiting in the frontend is exactly what it was waiting for.
+        self.pending_serve = false;
+        self.resume_schedulers()
     }
 
     /// §7.3 step 4: an update left on probation past the window the launch file states is
@@ -2018,6 +2163,9 @@ impl MainProcess {
         }
         self.parked = Some(parked);
         self.serving = false;
+        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
+        // owed to nothing: the `Serve` that names the epoch again opens the next one.
+        self.admission_owed = false;
         Ok(())
     }
 
@@ -2059,7 +2207,8 @@ impl MainProcess {
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
-        if !self.retired.is_empty() {
+        let kept = !self.retired.is_empty();
+        if kept {
             self.generations = std::mem::take(&mut self.retired);
         }
         self.prepared.clear();
@@ -2068,6 +2217,15 @@ impl MainProcess {
         // stopped describing serving, and a failure read from a stale entry would revert an update
         // that is over.
         self.warming.clear();
+        // What the update's warmup still owed is owed no longer. An epoch that kept the generation
+        // which served before it goes on serving, and that generation's buckets are captured - a
+        // cancelled warmup of the update's is nothing to wait for. A revert of the epoch's first
+        // switchover keeps nothing, and its end is the report rather than an admission.
+        let owed = std::mem::take(&mut self.admission_owed);
+        if owed && kept && self.boundary && (self.promoted || !self.standby) {
+            self.resume_schedulers()
+                .context("resuming the generation a revert went back to")?;
+        }
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
@@ -2529,6 +2687,111 @@ impl MainProcess {
     ///
     /// A report is unasked, so a failure to state it costs the daemon's record and not this
     /// process's service: it is logged, and the epoch's own transition has already happened.
+    /// States what this process is on the request interface (§7.3 step 1).
+    ///
+    /// The daemon's launch path waits for `Ready` (or `Standby`, for a process started beside a
+    /// serving one) and records the info it carries for the epoch. Nothing else on either side moves
+    /// before it: the first `Precopy` carries the scheduling policy and the first `Switchover` fills
+    /// the generation, so a process that waited to be ready until it had a policy would wait for the
+    /// command that waits for it - the deadlock the caller's stuck run shows.
+    fn announce(&mut self, state: proto::request::wire::EngineState) -> Result<()> {
+        let info = match state {
+            proto::request::wire::EngineState::Ready
+            | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
+            _ => None,
+        };
+        tracing::info!(
+            state = ?state,
+            schedulers = self.schedulers.len(),
+            devices = self.executors.len(),
+            "stating what this process is to the daemon"
+        );
+        announce(&mut self.control, state, info)
+    }
+
+    /// What the daemon records of this process: the limits every request is checked against, the
+    /// batch the workers were started for, and the KV cache segments a successor on the same
+    /// devices maps (§7.3 step 1).
+    ///
+    /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
+    /// each scheduler describes for itself: a successor needs what the workers hold now, not what
+    /// this process planned.
+    fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
+        let first = self
+            .schedulers
+            .first()
+            .context("this process runs no scheduler, so it states no engine info")?;
+        let info = first.info();
+        let mut segments = Vec::new();
+        for scheduler in &self.schedulers {
+            // A group that cannot describe its cache is reported with what the others stated rather
+            // than failing the start: the segments are what a *successor* maps, and a successor that
+            // finds one missing refuses by name, while a process that refused to state what it is
+            // over this would hang the epoch before its first policy - the deadlock this report
+            // exists to end.
+            let groups = match scheduler
+                .describe_cache()
+                .recv_timeout(self.watchdog.stall_bound())
+            {
+                Ok(Ok(groups)) => groups,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "a worker group did not describe its cache");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a scheduler did not describe its cache in time");
+                    continue;
+                }
+            };
+            segments.extend(groups.into_iter().map(|group| {
+                proto::request::wire::CacheSegments {
+                    worker_group: group.worker_group,
+                    segments: group
+                        .segments
+                        .into_iter()
+                        .map(|segment| proto::request::wire::CacheSegment {
+                            world: segment.world,
+                            ordinal: segment.ordinal,
+                            units: segment.units,
+                        })
+                        .collect(),
+                    held: group.held,
+                    units: group.units,
+                    scratch: group.scratch,
+                }
+            }));
+        }
+        Ok(proto::request::wire::EngineInfo {
+            limits: Some((&first.generation_limits()).into()),
+            video_denoiser: info
+                .video_denoiser
+                .as_ref()
+                .map(|denoiser| denoiser.description.clone())
+                .unwrap_or_default(),
+            latent_encoding_units: first.media_units(ipc::MediaCall::LatentEncoding).unwrap_or(0),
+            schedulers: u32::try_from(self.schedulers.len()).unwrap_or(u32::MAX),
+            capacity: Some(proto::request::wire::BatchCapacity {
+                max_batch: info.max_batch_calls,
+                max_num_batched_tokens: u64::from(info.max_batch_tokens),
+                // The launch's own figure, not the worker's row count: the rows include the
+                // guidance prefix, which is not a request.
+                max_running_requests: self.max_running_requests,
+            }),
+            segments,
+            prefix_seeds: info.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
+                cache
+                    .seeds()
+                    .into_iter()
+                    .zip(&cache.groups)
+                    .filter_map(|(seed, group)| {
+                        (!matches!(group.kind, ipc::CacheGroupKind::Draft)).then_some(seed)
+                    })
+                    .collect()
+            }),
+            latent_seed: first.latent_seed(),
+        })
+    }
+
     fn send_report(&mut self, report: proto::process::Report) {
         if let Err(error) = self.process.report(report) {
             tracing::warn!(%error, "reporting this epoch's state to the daemon failed");
@@ -2801,11 +3064,42 @@ const EPOCH_LIFECYCLE: &str =
     "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
 
+/// States a main process's state on the request interface (§7.3 step 1).
+fn announce(
+    control: &mut Control,
+    state: proto::request::wire::EngineState,
+    info: Option<proto::request::wire::EngineInfo>,
+) -> Result<()> {
+    control
+        .daemon_mut()
+        .send(&proto::request::wire::FromEngine {
+            kind: Some(proto::request::wire::from_engine::Kind::State(
+                proto::request::wire::State {
+                    state: state as i32,
+                    info,
+                    error: String::new(),
+                },
+            )),
+        })
+        .context("stating what this process is to the daemon")
+}
+
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
 const LEDGERS: &str =
     "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
+
+/// The §7.3 stage a program-layer command belongs to, for the log line each one leaves.
+fn program_stage(command: &ProgramCommand) -> &'static str {
+    match command {
+        ProgramCommand::Precopy { .. } => "precopy",
+        ProgramCommand::Switchover { .. } => "switchover",
+        ProgramCommand::Commit { .. } => "commit",
+        ProgramCommand::Revert { .. } => "revert",
+        ProgramCommand::Purge { .. } => "purge",
+    }
+}
 
 /// The name of an engine command, for a log line about one this epoch does not serve.
 fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'static str {
@@ -3270,6 +3564,7 @@ fn schedulers(
     memory: &Memory,
     model: &qwen3_moe::Qwen3Moe,
     executors: &[Arc<Executor>],
+    rank: &ipc::WorkerInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -3284,9 +3579,28 @@ fn schedulers(
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(executor::batch::Executors::shared(
-        executors.iter().map(Arc::clone).collect(),
-    )?);
+    // The scheduler plans against a description of the pool, and this process is the one pool it
+    // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
+    // holds, not what it was launched for), and its longest sequence is the model's bound. The
+    // inventory is the executor's to hold and the boot's to state, because neither number can be
+    // derived from a batch (4.4).
+    let inventory = executor::batch::Inventory {
+        group: launch.group.clone(),
+        ranks: vec![rank.clone()],
+        placement: executor::batch::Placement {
+            queue_depth: plan.queue_depth(),
+            ranks: plan.world_size(),
+            components: engine::WorkerGroupConfig::single_component(
+                ipc::DEFAULT_COMPONENT,
+                plan.world_size(),
+            ),
+        },
+        max_model_len: plan.max_kv_len(model)?,
+    };
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
+        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+            .stating(vec![inventory]),
+    );
     let handle = engine::SchedulerHandle::over_batches(config, batches)?;
     Ok(vec![handle])
 }
