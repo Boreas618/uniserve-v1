@@ -109,6 +109,7 @@ const ATTR_ENGINEHEUR_MODE: i32 = 200;
 const ATTR_ENGINEHEUR_OPERATION_GRAPH: i32 = 201;
 const ATTR_ENGINEHEUR_RESULTS: i32 = 202;
 const ATTR_ENGINECFG_ENGINE: i32 = 300;
+const ATTR_EXECUTION_PLAN_HANDLE: i32 = 400;
 const ATTR_EXECUTION_PLAN_ENGINE_CONFIG: i32 = 401;
 const ATTR_EXECUTION_PLAN_WORKSPACE_SIZE: i32 = 402;
 const ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA: i32 = 700;
@@ -123,6 +124,7 @@ const ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC: i32 = 708;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_W: i32 = 709;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
+const ATTR_OPERATIONGRAPH_HANDLE: i32 = 800;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
@@ -134,6 +136,7 @@ const ATTR_VARIANT_PACK_WORKSPACE: i32 = 1003;
 const ATTR_ENGINE_GLOBAL_INDEX: i32 = 1301;
 
 /// `cudnnBackendAttributeType_t`: the C type of each attribute's value.
+const TYPE_HANDLE: i32 = 0;
 const TYPE_DATA_TYPE: i32 = 1;
 const TYPE_INT64: i32 = 3;
 const TYPE_FLOAT: i32 = 4;
@@ -783,12 +786,30 @@ struct Operation {
 }
 
 impl Operation {
+    /// The whole operation: its three tensors, its convolution description,
+    /// the operation itself, and the graph that holds it.
     fn describe(api: &'static Api, convolution: &Convolution) -> Result<Self> {
         let x = Self::tensor(api, &convolution.x, UID_X)?;
         let w = Self::tensor(api, &convolution.w, UID_W)?;
         let y = Self::tensor(api, &convolution.y, UID_Y)?;
+        let kernel = Self::convolution(api, convolution)?;
+        let forward = Self::forward(api, convolution, &kernel, &x, &w, &y)?;
+        let graph = Self::graph(api, &forward, None)?;
+        Ok(Self {
+            graph,
+            _forward: forward,
+            _convolution: kernel,
+            _x: x,
+            _w: w,
+            _y: y,
+        })
+    }
 
-        let descriptor = Descriptor::create(api, DESCRIPTOR_CONVOLUTION)?;
+    /// The convolution description: compute type, mode, spatial rank, the
+    /// padding on both sides of each spatial dimension, the filter's strides
+    /// and its dilations.
+    fn convolution(api: &'static Api, convolution: &Convolution) -> Result<Descriptor> {
+        let kernel = Descriptor::create(api, DESCRIPTOR_CONVOLUTION)?;
         let compute = convolution.compute.cudnn();
         let mode = CROSS_CORRELATION;
         let spatial = convolution.rank() as i64;
@@ -800,70 +821,78 @@ impl Operation {
         let lower = convolution.lower_padding().to_vec();
         let upper = convolution.upper_padding();
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_COMP_TYPE,
             TYPE_DATA_TYPE,
             &compute,
             call,
         )?;
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_CONV_MODE,
             TYPE_CONVOLUTION_MODE,
             &mode,
             call,
         )?;
         api.set_one(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_SPATIAL_DIMS,
             TYPE_INT64,
             &spatial,
             call,
         )?;
-        // A symmetric padding: the padding before and after each spatial
-        // dimension are the convolution layer's own, so the output keeps the
-        // input's shape under stride one.
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_PRE_PADDINGS,
             TYPE_INT64,
             &lower,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_POST_PADDINGS,
             TYPE_INT64,
             &upper,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_FILTER_STRIDES,
             TYPE_INT64,
             &convolution.stride,
             call,
         )?;
         api.set(
-            &descriptor,
+            &kernel,
             ATTR_CONVOLUTION_DILATIONS,
             TYPE_INT64,
             &convolution.dilation,
             call,
         )?;
-        api.finalize(&descriptor, "cudnnBackendFinalize")?;
+        api.finalize(&kernel, "cudnnBackendFinalize")?;
+        Ok(kernel)
+    }
 
-        // `y = alpha · op(x, w) + beta · y`: FP32 scalars, the scale type of
-        // an FP32 convolution.
+    /// The operation itself: the four descriptors and the two scalars of
+    /// `y = alpha · op(x, w) + beta · y`, as FP32 — the scale type of an FP32
+    /// convolution.
+    fn forward(
+        api: &'static Api,
+        convolution: &Convolution,
+        kernel: &Descriptor,
+        x: &Descriptor,
+        w: &Descriptor,
+        y: &Descriptor,
+    ) -> Result<Descriptor> {
         let (alpha, beta) = (1.0f32, 0.0f32);
-        let (op, attributes) = match convolution.kind {
+        let (operation, attributes) = match convolution.kind {
             ConvolutionKind::Forward => (
                 DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD,
                 [
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &descriptor),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w),
-                    (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, kernel),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_X, x),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_W, w),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, y),
                 ],
             ),
             // Backward data: `dx` is the layer's output, `dy` its input, and
@@ -872,14 +901,14 @@ impl Operation {
             ConvolutionKind::Transposed => (
                 DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA,
                 [
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &descriptor),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &y),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w),
-                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &x),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, kernel),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, y),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, w),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, x),
                 ],
             ),
         };
-        let forward = Descriptor::create(api, op)?;
+        let forward = Descriptor::create(api, operation)?;
         let (alpha_attribute, beta_attribute) = match convolution.kind {
             ConvolutionKind::Forward => (
                 ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
@@ -890,6 +919,7 @@ impl Operation {
                 ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA,
             ),
         };
+        let call = "cudnnBackendSetAttribute";
         api.set_one(&forward, alpha_attribute, TYPE_FLOAT, &alpha, call)?;
         api.set_one(&forward, beta_attribute, TYPE_FLOAT, &beta, call)?;
         for (attribute, tensor) in attributes {
@@ -902,25 +932,40 @@ impl Operation {
             )?;
         }
         api.finalize(&forward, "cudnnBackendFinalize")?;
+        Ok(forward)
+    }
 
+    /// The operation graph of one operation.
+    ///
+    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`,
+    /// which 9.8 stopped requiring: a plan is built without it, and
+    /// [`Cudnn::probe`] tries it to tell a library that still wants it from a
+    /// description cuDNN refuses.
+    fn graph(
+        api: &'static Api,
+        operation: &Descriptor,
+        handle: Option<&Handle>,
+    ) -> Result<Descriptor> {
         let graph = Descriptor::create(api, DESCRIPTOR_OPERATION_GRAPH)?;
+        let call = "cudnnBackendSetAttribute";
+        if let Some(handle) = handle {
+            api.set_one(
+                &graph,
+                ATTR_OPERATIONGRAPH_HANDLE,
+                TYPE_HANDLE,
+                handle,
+                call,
+            )?;
+        }
         api.set_one(
             &graph,
             ATTR_OPERATIONGRAPH_OPS,
             TYPE_BACKEND_DESCRIPTOR,
-            &forward.raw,
+            &operation.raw,
             call,
         )?;
         api.finalize(&graph, "cudnnBackendFinalize")?;
-
-        Ok(Self {
-            graph,
-            _forward: forward,
-            _convolution: descriptor,
-            _x: x,
-            _w: w,
-            _y: y,
-        })
+        Ok(graph)
     }
 
     fn tensor(api: &'static Api, tensor: &Tensor, uid: i64) -> Result<Descriptor> {
@@ -1153,34 +1198,12 @@ impl Cudnn {
         let chosen = configs.swap_remove(position);
         let recorded = self.global_index(&chosen)?;
 
-        let plan = Descriptor::create(self.api, DESCRIPTOR_EXECUTION_PLAN)?;
-        self.api.set_one(
-            &plan,
-            ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
-            TYPE_BACKEND_DESCRIPTOR,
-            &chosen.raw,
-            "cudnnBackendSetAttribute",
-        )?;
-        self.api.finalize(&plan, "cudnnBackendFinalize")?;
-        let mut workspace_bytes = 0i64;
-        self.api.get(
-            &plan,
-            ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
-            TYPE_INT64,
-            std::slice::from_mut(&mut workspace_bytes),
-            "cudnnBackendGetAttribute",
-        )?;
-        if workspace_bytes < 0 {
-            return Err(Error::invalid(format!(
-                "cuDNN reports a negative workspace of {workspace_bytes} bytes for engine {}",
-                recorded.global_index
-            )));
-        }
+        let (plan, workspace_bytes) = self.execution_plan(&chosen, None)?;
 
         Ok(ConvolutionPlan {
             plan,
             engine: recorded,
-            workspace_bytes: workspace_bytes as usize,
+            workspace_bytes,
             bytes: convolution.bytes(),
             device: self.device,
             _config: chosen,
@@ -1298,29 +1321,198 @@ impl Cudnn {
         )
     }
 
-    /// The engine configurations cuDNN's heuristic proposes for `operation`,
-    /// best first: descriptors this module created for the library to fill,
-    /// so it owns and destroys them.
-    fn configs(&self, operation: &Operation, limit: usize) -> Result<Vec<Descriptor>> {
-        let heuristic = Descriptor::create(self.api, DESCRIPTOR_ENGINE_HEURISTIC)?;
+    /// The execution plan of `config`.
+    ///
+    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_EXECUTION_PLAN_HANDLE`,
+    /// which 9.8 stopped requiring: a plan is built without it, and
+    /// [`Cudnn::probe`] tries it.
+    fn execution_plan(
+        &self,
+        config: &Descriptor,
+        handle: Option<&Handle>,
+    ) -> Result<(Descriptor, usize)> {
+        let plan = Descriptor::create(self.api, DESCRIPTOR_EXECUTION_PLAN)?;
+        let call = "cudnnBackendSetAttribute";
+        if let Some(handle) = handle {
+            self.api
+                .set_one(&plan, ATTR_EXECUTION_PLAN_HANDLE, TYPE_HANDLE, handle, call)?;
+        }
+        self.api.set_one(
+            &plan,
+            ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+            TYPE_BACKEND_DESCRIPTOR,
+            &config.raw,
+            call,
+        )?;
+        self.api.finalize(&plan, "cudnnBackendFinalize")?;
+        let mut workspace_bytes = 0i64;
+        self.api.get(
+            &plan,
+            ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+            TYPE_INT64,
+            std::slice::from_mut(&mut workspace_bytes),
+            "cudnnBackendGetAttribute",
+        )?;
+        if workspace_bytes < 0 {
+            return Err(Error::invalid(format!(
+                "cuDNN reports a negative workspace of {workspace_bytes} bytes"
+            )));
+        }
+        Ok((plan, workspace_bytes as usize))
+    }
+
+    /// Builds `convolution` the way [`Cudnn::plan`] does, one descriptor and
+    /// one heuristically chosen plan at a time, and answers for each step
+    /// whether cuDNN accepted it: the message beside the first `Some` is what
+    /// cuDNN refused, and the steps after it were not run.
+    ///
+    /// It also tries the two deprecated handle attributes that cuDNN 9.8
+    /// stopped requiring, one on the operation graph and one on the execution
+    /// plan, so a single run separates a library that still requires them
+    /// from a description cuDNN refuses. This is a diagnostic for a shape a
+    /// device refuses — a plan's own error names the call but not the
+    /// descriptor — and never a second way to build plans.
+    pub fn probe(&self, convolution: &Convolution) -> Vec<(String, Option<String>)> {
+        let mut steps: Vec<(String, Option<String>)> = Vec::new();
+        macro_rules! stage {
+            ($name:expr, $call:expr) => {
+                match $call {
+                    Ok(value) => {
+                        steps.push((String::from($name), None));
+                        value
+                    }
+                    Err(error) => {
+                        steps.push((String::from($name), Some(error.to_string())));
+                        return steps;
+                    }
+                }
+            };
+        }
+
+        let device = stage!("the device and its context", Device::new(self.device));
+        let _context = stage!("entering the device's context", device.enter());
+        stage!("the convolution's own checks", convolution.check());
+
+        let x = stage!(
+            "tensor x: type, dimensions, strides, unique id, finalize",
+            Operation::tensor(self.api, &convolution.x, UID_X)
+        );
+        let w = stage!(
+            "tensor w: type, dimensions, strides, unique id, finalize",
+            Operation::tensor(self.api, &convolution.w, UID_W)
+        );
+        let y = stage!(
+            "tensor y: type, dimensions, strides, unique id, finalize",
+            Operation::tensor(self.api, &convolution.y, UID_Y)
+        );
+        let kernel = stage!(
+            "convolution: compute type, mode, spatial dims, pre and post paddings, filter strides, dilations, finalize",
+            Operation::convolution(self.api, convolution)
+        );
+        let forward = stage!(
+            "operation: alpha, beta, conv desc, x, w, y, finalize",
+            Operation::forward(self.api, convolution, &kernel, &x, &w, &y)
+        );
+        let graph = stage!(
+            "operation graph: ops, finalize",
+            Operation::graph(self.api, &forward, None)
+        );
+        stage!(
+            "operation graph with the deprecated handle attribute, finalize",
+            Operation::graph(self.api, &forward, Some(&self.handle)).map(|_| ())
+        );
+
+        let heuristic = stage!(
+            "engine heuristic: mode A, operation graph, finalize",
+            Self::heuristic(self.api, &graph)
+        );
+        let available = stage!(
+            "engine heuristic: count the configurations",
+            self.api
+                .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
+        );
+        if available == 0 {
+            steps.push((
+                String::from("engine heuristic: cuDNN proposes no engine for this convolution"),
+                Some(String::from("no configuration")),
+            ));
+            return steps;
+        }
+        let config = stage!(
+            "engine heuristic: read the first configuration",
+            Self::first_config(self.api, &heuristic, available)
+        );
+        stage!(
+            "engine configuration: read the engine's global index",
+            self.global_index(&config)
+        );
+        let (plan, workspace_bytes) = stage!(
+            "execution plan: engine config, finalize, read the workspace size",
+            self.execution_plan(&config, None)
+        );
+        steps.push((
+            format!("execution plan: {workspace_bytes} bytes of workspace"),
+            None,
+        ));
+        let _ = stage!(
+            "execution plan with the deprecated handle attribute, finalize",
+            self.execution_plan(&config, Some(&self.handle))
+        );
+        drop((plan, x, w, y));
+        steps
+    }
+
+    /// The engine heuristic descriptor of `graph` in mode A, finalized.
+    fn heuristic(api: &'static Api, graph: &Descriptor) -> Result<Descriptor> {
+        let heuristic = Descriptor::create(api, DESCRIPTOR_ENGINE_HEURISTIC)?;
         let mode = HEURISTIC_MODE_A;
         let call = "cudnnBackendSetAttribute";
-        self.api.set_one(
+        api.set_one(
             &heuristic,
             ATTR_ENGINEHEUR_OPERATION_GRAPH,
             TYPE_BACKEND_DESCRIPTOR,
-            &operation.graph.raw,
+            &graph.raw,
             call,
         )?;
-        self.api.set_one(
+        api.set_one(
             &heuristic,
             ATTR_ENGINEHEUR_MODE,
             TYPE_HEUR_MODE,
             &mode,
             call,
         )?;
-        self.api.finalize(&heuristic, "cudnnBackendFinalize")?;
+        api.finalize(&heuristic, "cudnnBackendFinalize")?;
+        Ok(heuristic)
+    }
 
+    /// The first configuration the heuristic proposed.
+    fn first_config(
+        api: &'static Api,
+        heuristic: &Descriptor,
+        available: usize,
+    ) -> Result<Descriptor> {
+        let config = Descriptor::create(api, DESCRIPTOR_ENGINE_CONFIG)?;
+        let mut handles = [config.raw];
+        let written = api.get(
+            heuristic,
+            ATTR_ENGINEHEUR_RESULTS,
+            TYPE_BACKEND_DESCRIPTOR,
+            &mut handles,
+            "cudnnBackendGetAttribute",
+        )?;
+        if written == 0 || handles[0].is_null() {
+            return Err(Error::invalid(format!(
+                "cuDNN proposed {available} engine configurations and filled none"
+            )));
+        }
+        Ok(config)
+    }
+
+    /// The engine configurations cuDNN's heuristic proposes for `operation`,
+    /// best first: descriptors this module created for the library to fill,
+    /// so it owns and destroys them.
+    fn configs(&self, operation: &Operation, limit: usize) -> Result<Vec<Descriptor>> {
+        let heuristic = Self::heuristic(self.api, &operation.graph)?;
         let available =
             self.api
                 .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)?;
