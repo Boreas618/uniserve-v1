@@ -358,7 +358,7 @@ impl Executor {
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
-                .map_err(|_| Error::State("the executor thread panicked".into()))?;
+                .map_err(|_| Error::State("the executor thread panicked"))?;
         }
         Ok(())
     }
