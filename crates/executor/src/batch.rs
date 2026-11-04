@@ -63,16 +63,24 @@ pub struct CallOutput {
     /// them. A call whose rows sampled nothing (a prefill chunk that ends no prompt, a padded row)
     /// has none, which is not the same as a failure.
     pub tokens: Vec<u32>,
-    /// The slot's trajectory position the commit table advanced: a denoising trajectory's next
-    /// step, and for a text decode the number of tokens the call's slot has committed.
+    /// The slot's committed count for a text call; a latent trajectory reports its own step here
+    /// once `ops::commit` gains a per-slot step column, and until then this field is the commit
+    /// count for every call kind.
+    ///
+    /// It is read from the commit table's sampling position, which a text slot advances once per
+    /// committed token and a latent slot advances once per denoising step.
     pub step_index: u32,
     /// The cache extent execution initialized, rejected speculative positions included: the slot's
     /// logical position after the commit.
     pub cache_computed_len: u32,
     /// The accepted prefix a successor may read: the slot's sampling position after the commit.
     pub cache_visible_len: u32,
-    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`]: empty when
-    /// the step produced none, which is a state and not a placeholder.
+    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`].
+    ///
+    /// Empty unless the deployment planned logprob buckets (4.5): producing them costs a
+    /// full-vocabulary softmax on every sampling step and its `[rows, vocabulary]` buffer, so a
+    /// deployment that serves without clients asking for them plans the plain buckets and every
+    /// call reports this empty. **Empty means "not planned", never "zero".**
     pub token_logprobs: Vec<f32>,
     /// Ranked log-probabilities for each scored prompt position, in input order.
     pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
