@@ -511,10 +511,26 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 at(&format!("units.{unit}.convs.1.bias")),
                 format!("{base}.{unit}.block.3.bias"),
             );
+            // Each residual unit's two Snakes carry one frequency per channel.
+            for (side, slot) in [("0", 0), ("1", 2)] {
+                region(
+                    &mut sources,
+                    at(&format!("units.{unit}.snakes.{side}.alpha")),
+                    format!("{base}.{unit}.block.{slot}.alpha"),
+                );
+            }
         }
         normalized(&mut sources, at("widen.weight"), format!("{base}.5"));
         region(&mut sources, at("widen.bias"), format!("{base}.5.bias"));
+        // The stage's own Snake sits between the last unit and the widening convolution.
+        region(&mut sources, at("snake.alpha"), format!("{base}.4.alpha"));
     }
+    // The network ends with a Snake and the output convolution.
+    region(
+        &mut sources,
+        "output_snake.alpha".to_owned(),
+        format!("encoder.block.{}.alpha", stack.rates.len() + 1),
+    );
     let last = stack.rates.len() + 2;
     normalized(
         &mut sources,
@@ -721,9 +737,10 @@ mod tests {
     fn the_audio_encoder_table_names_every_parameter() {
         let table = audio_sources(&crate::audio_vae::tests::audio_config())
             .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one, the output pair, the projection's twenty-two and
-        // the mean convolution's pair.
-        assert_eq!(table.len(), 3 + 5 * 21 + 3 + 22);
+        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
+        // the widening convolution and one for the stage's Snake — the output Snake and its pair, the
+        // projection's twenty-two and the mean convolution's pair.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22 + 2);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
@@ -733,6 +750,9 @@ mod tests {
             "stages.0.units.0.convs.0.weight",
             "stages.4.units.2.convs.1.bias",
             "stages.4.widen.weight",
+            "stages.4.units.2.snakes.0.alpha",
+            "stages.4.snake.alpha",
+            "output_snake.alpha",
             "output.weight",
             "projection.qkv.weight",
             "projection.qkv.bias",
