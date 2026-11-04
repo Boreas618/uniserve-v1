@@ -17,6 +17,11 @@ a failure is actionable without reading the tool.
 
 It is a diagnosis, not a gate on the branch: run it before a device run, and read what it prints.
 
+Scope: the **dense** DiT of the export at `--root`. The sparse family (`vsa_*`) is not checked,
+because the sparse deployment is a different export (the distilled student) and its constants are that
+checkpoint's, not this one's; running this tool against a pipeline root that holds a sparse DiT would
+make it a one-line extension of `expectations`.
+
 Two things it deliberately does not do:
   * it does not enumerate tensor names - `Denoiser::keys` is that check, and `load` refuses on it;
   * it does not know about operators whose key carries no shape (`gemm`, `patch`,
