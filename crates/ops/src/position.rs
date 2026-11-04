@@ -15,12 +15,17 @@
 //! out[j] = Σ_{t < 4} weight[j, t] · table[indices[j, t]]
 //! ```
 //!
-//! Bilinear, `align_corners = false`: for an output coordinate `y` the source coordinate is
-//! `src = (y + 0.5) · in_side / out_side - 0.5`, the two neighbour indices are `floor(src)` and
-//! `floor(src) + 1` clamped to `[0, in_side)`, and the weights are the distances the coordinate sits
-//! between them — so a corner point clamps to the edge rather than reading outside the table. The
-//! host's index pairs and weights are the tables the caller uploads, one per grid; the program
-//! multiplies in FP32 and rounds once into the output's dtype.
+//! **Which resampling rule this is, the program does not know.** Corner alignment or half-pixel
+//! alignment, edge clamping or edge extension — those are the caller's convention, and each tower has
+//! its own: H3's vision tower resamples with corner alignment and a clamped last sample
+//! (`uniserve/nn/vision/position.py:167-200`, `torch.linspace(0, extent - 1, size)` with
+//! `upper = (lower + 1).clamp(max = extent - 1)`), which is *not* the `align_corners = false` rule
+//! any one framework defaults to. So the caller computes the four tap indices and four f32 weights
+//! for every output point, once per grid, and the program applies them: no alignment rule, no
+//! clamping, no division by a side — a shared operator must not bake one caller's convention in.
+//!
+//! The program multiplies in FP32 and rounds once into the output's dtype. The weights of one output
+//! point are the caller's normalization too: a clamped point is not a uniform four-way average.
 //!
 //! The tolerance is a four-tap weighted sum in FP32: four products and their accumulation, so the
 //! bound is [`Tolerance::dot`] over four terms with the output's own rounding.
@@ -44,10 +49,12 @@ pub struct Descriptor {
     pub dtype: DType,
     /// Elements per row, the table's feature width.
     pub channels: u32,
-    /// Points per side of the table's grid (it is square: the reference's vision grid is).
+    /// Points per side of the learned table's grid: square, because the checkpoint's table is.
     pub in_side: u32,
-    /// Points per side of the target grid.
-    pub out_side: u32,
+    /// Points per row of the target grid.
+    pub out_rows: u32,
+    /// Points per column of the target grid.
+    pub out_columns: u32,
     /// Elements one thread block handles.
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
@@ -60,7 +67,8 @@ impl fmt::Display for Descriptor {
             .field("dtype", self.dtype)
             .field("channels", self.channels)
             .field("in_side", self.in_side)
-            .field("out_side", self.out_side)
+            .field("out_rows", self.out_rows)
+            .field("out_columns", self.out_columns)
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -72,11 +80,11 @@ impl fmt::Display for Descriptor {
 pub struct Args {
     /// `[in_side · in_side, channels]` the learned table.
     pub table: TensorView,
-    /// `[out_side · out_side, 4]` i32 tap indices into the table's points.
+    /// `[out_rows · out_columns, 4]` i32 tap indices into the table's points.
     pub indices: TensorView,
-    /// `[out_side · out_side, 4]` FP32 tap weights, row-normalized by the caller.
+    /// `[out_rows · out_columns, 4]` FP32 tap weights, normalized by the caller.
     pub weights: TensorView,
-    /// `[out_side · out_side, channels]` the resampled table.
+    /// `[out_rows · out_columns, channels]` the resampled table.
     pub out: TensorView,
 }
 
@@ -96,7 +104,9 @@ impl Op for PositionInterpolate {
         stream: &Stream,
     ) -> Result<()> {
         let channels = u64::from(descriptor.channels);
-        let points = u64::from(descriptor.out_side) * u64::from(descriptor.out_side);
+        // The target grid is rectangular: a canvas of any aspect ratio is patches, and its rows and
+        // columns are independent.
+        let points = u64::from(descriptor.out_rows) * u64::from(descriptor.out_columns);
 
         args.table.require_shape(
             Self::NAME,
@@ -195,8 +205,9 @@ mod tests {
         Descriptor {
             dtype: DType::BF16,
             channels: 1280,
-            in_side: 24,
-            out_side: 32,
+            in_side: 48,
+            out_rows: 24,
+            out_columns: 40,
             block: 1024,
             pdl: false,
         }
@@ -206,13 +217,13 @@ mod tests {
     fn the_key_states_both_grids_because_the_tables_depend_on_them() {
         assert_eq!(
             descriptor().to_string(),
-            "dtype_bf16_channels_1280_in_side_24_out_side_32_block_1024_pdl_false"
+            "dtype_bf16_channels_1280_in_side_48_out_rows_24_out_columns_40_block_1024_pdl_false"
         );
         // The resample of another grid is another compilation: its index and weight tables differ.
         assert_ne!(
             descriptor().to_string(),
             Descriptor {
-                out_side: 40,
+                out_columns: 80,
                 ..descriptor()
             }
             .to_string()
