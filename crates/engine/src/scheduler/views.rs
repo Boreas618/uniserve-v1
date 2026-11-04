@@ -895,19 +895,33 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             &facts,
         ));
     }
+    let mut seen = HashSet::new();
     for id in &scheduler.running_order {
-        let Some(state) = scheduler.running.get(id) else {
+        if !seen.insert(*id) {
             continue;
-        };
+        }
         let facts = recorded.get(id).copied().unwrap_or(empty);
-        views.push(request(scheduler, state, Standing::Resident, &facts));
+        if let Some(state) = scheduler.running.get(id) {
+            views.push(request(scheduler, state, Standing::Resident, &facts));
+        } else if let Some(flow) = scheduler.running_media.get(id) {
+            // A media request keeps no arrival time of its own once it runs.
+            views.push(diffusion_request(
+                &flow.request,
+                Standing::Resident,
+                0.0,
+                &facts,
+            ));
+        }
     }
+    // A media request the admission order does not name still exists.
     for id in scheduler.running_media.keys() {
         let Some(flow) = scheduler.running_media.get(id) else {
             continue;
         };
+        if !seen.insert(*id) {
+            continue;
+        }
         let facts = recorded.get(id).copied().unwrap_or(empty);
-        // A media request keeps no arrival time of its own once it runs.
         views.push(diffusion_request(
             &flow.request,
             Standing::Resident,
