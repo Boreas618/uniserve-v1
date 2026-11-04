@@ -600,3 +600,45 @@ fn an_exported_block_follows_the_storage_a_restore_maps() {
         "after the restore the block exports the storage the restore mapped"
     );
 }
+
+/// A block is given out read-write whatever its last holder asked the device
+/// for: the pool puts the access back when it hands the block on.
+///
+/// A read-only block handed on would fault the next holder's first write, and a
+/// device fault is a sticky error that kills the process rather than failing the
+/// call — so if the pool ever stops restoring the access, the fill below is what
+/// this test does to itself.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_block_is_given_out_read_write_whatever_its_last_holder_asked_for() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(8 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Resident, 8 << 20).unwrap();
+    let stream = device.stream().unwrap();
+
+    let parked = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    let address = parked.address();
+    allocator
+        .set_protection(&parked, platform::Protection::ReadOnly)
+        .unwrap();
+    allocator.free(parked);
+
+    let again = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    assert_eq!(
+        again.address(),
+        address,
+        "the freed block comes back at its address"
+    );
+    // SAFETY: a block from `allocate` is read-write, which is the invariant
+    // under test; the range lies inside the block.
+    unsafe { platform::memset_d8(address, 0x5b, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    let host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the block is mapped and holds the bytes; the host buffer is as
+    // long as the copy.
+    unsafe { platform::memcpy_async(host.address(), address, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x5b; 16]);
+}

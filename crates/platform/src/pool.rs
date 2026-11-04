@@ -45,6 +45,11 @@ struct Chunk {
     block: Option<Arc<Block>>,
     /// The chunk's contents while suspended.
     saved: Option<PinnedBuffer>,
+    /// What the chunk's device and peers may do with it now. A block is given
+    /// out read-write; a holder may park it read-only with
+    /// [`VirtualPool::protect`], and the pool puts it back before handing it to
+    /// the next holder.
+    protection: Protection,
     free: bool,
 }
 
@@ -212,12 +217,23 @@ impl VirtualPool {
             return Err(Error::invalid("a suspended pool gives out no storage"));
         }
         let bytes = bytes.max(1).next_multiple_of(self.granularity);
-        if let Some(chunk) = self
+        if let Some(index) = self
             .chunks
-            .iter_mut()
-            .find(|chunk| chunk.free && chunk.bytes == bytes)
+            .iter()
+            .position(|chunk| chunk.free && chunk.bytes == bytes)
         {
-            chunk.free = false;
+            // A block is a block from the pool's point of view: the next holder
+            // gets it read-write whatever the last one asked the device for.
+            // A read-only block handed on would fault the new holder's first
+            // write, and a device fault is a sticky error that kills the
+            // process rather than failing the call.
+            if self.chunks[index].protection != Protection::ReadWrite {
+                let offset = self.chunks[index].offset;
+                self.set_access(offset, bytes, Protection::ReadWrite)?;
+                self.chunks[index].protection = Protection::ReadWrite;
+            }
+            self.chunks[index].free = false;
+            let chunk = &self.chunks[index];
             let block = chunk
                 .block
                 .clone()
@@ -244,6 +260,7 @@ impl VirtualPool {
             bytes,
             block: Some(Arc::clone(&block)),
             saved: None,
+            protection: Protection::ReadWrite,
             free: false,
         });
         Ok((self.address + offset, block))
@@ -274,7 +291,7 @@ impl VirtualPool {
     /// `address`, at its unchanged address (`cuMemSetAccess`): a parked
     /// standby's blocks become read-only and become read-write again when it
     /// is promoted, and a captured graph that addresses them stays valid.
-    pub(crate) fn protect(&self, address: u64, protection: Protection) -> Result<()> {
+    pub(crate) fn protect(&mut self, address: u64, protection: Protection) -> Result<()> {
         let Some(chunk) = self
             .chunks
             .iter()
@@ -290,7 +307,22 @@ impl VirtualPool {
                 "a suspended pool's block has no storage to change the access of",
             ));
         }
-        let bytes = chunk.bytes;
+        let (offset, bytes) = (chunk.offset, chunk.bytes);
+        self.set_access(offset, bytes, protection)?;
+        if let Some(chunk) = self
+            .chunks
+            .iter_mut()
+            .find(|chunk| self.address + chunk.offset == address)
+        {
+            chunk.protection = protection;
+        }
+        Ok(())
+    }
+
+    /// What the pool's device and its peers may do with the chunk at `offset`
+    /// (`cuMemSetAccess`), at its unchanged address.
+    fn set_access(&self, offset: u64, bytes: usize, protection: Protection) -> Result<()> {
+        let address = self.address + offset;
         let access: Vec<MemAccessDesc> = self
             .access
             .iter()
@@ -477,6 +509,7 @@ impl VirtualPool {
             };
             // The chunk keeps the block it had, so every buffer handed out
             // before the suspension names the storage this restore created.
+            self.chunks[index].protection = Protection::ReadWrite;
             match self.chunks[index].block.clone() {
                 Some(block) => block.remap(handle),
                 None => {
@@ -486,6 +519,7 @@ impl VirtualPool {
                         self.handle_type,
                         self.context.clone(),
                     )));
+                    self.chunks[index].protection = Protection::ReadWrite;
                 }
             }
             mapped.push(index);
