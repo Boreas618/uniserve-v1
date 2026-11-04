@@ -349,6 +349,11 @@ impl Arguments {
         Ok(&mut self.parameters)
     }
 
+    /// Whether a signature entry is one of the two scratch addresses the compiler appends.
+    fn is_scratch(name: &str) -> bool {
+        matches!(name, "global_scratch" | "profile_scratch")
+    }
+
     /// Refuse a parameter list that disagrees with the program's own signature.
     ///
     /// The driver reads one value per parameter at the address it is handed, so a list that is short,
@@ -360,8 +365,16 @@ impl Arguments {
             return Ok(());
         };
         // The global and the profile scratch address follow the kernel's own parameters whatever the
-        // scratch sizes are, so a module's signature is two parameters short of what it takes.
+        // scratch sizes are. A module built with Triton's own metadata records them in the signature
+        // (as the last two entries); one built without records only the kernel's own parameters. Both
+        // are one list to the operator, so the two the signature already names are not counted twice.
         let scratch = 2;
+        let named = metadata
+            .signature
+            .iter()
+            .filter(|parameter| Self::is_scratch(&parameter.name))
+            .count();
+        let scratch = scratch - named.min(scratch);
         let expected = metadata.signature.len() + scratch;
         let supplied = self.kinds.len();
         if expected != supplied {
@@ -849,6 +862,24 @@ mod tests {
         // The program's two parameters, then the global and the profile scratch address Triton's
         // launcher appends and its PTX declares whatever their size is.
         assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_signature_that_names_its_scratch_is_not_counted_twice() {
+        // Triton's own metadata records the two scratch addresses as the last two entries; the
+        // operator packs them itself, so a module of three parameters plus its two scratch words
+        // takes five and packs five. Counting the named ones again refused every such module.
+        let module = metadata(
+            r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
+        );
+        let mut arguments = Arguments::new();
+        arguments.pointer(DevicePtr::new(0x1000)).u32(7);
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+        let mut long = Arguments::new();
+        long.pointer(DevicePtr::new(0x1000)).u32(7).u32(1);
+        let error = long.parameters(Some(&module)).unwrap_err().to_string();
+        assert!(error.contains("takes 4 parameters"), "{error}");
+        assert!(error.contains("packed 3"), "{error}");
     }
 
     #[test]
