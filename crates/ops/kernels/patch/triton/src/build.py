@@ -41,6 +41,9 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "BLOCK": "constexpr",
         },
+        # This package fills the patching direction only; the inverse is
+        # `unpatchify_video`, which has its own descriptor and package. The module
+        # declares no mode, so none is passed.
         "constexprs": {"BLOCK": block},
         "options": {
             "num_warps": warps_of(block),

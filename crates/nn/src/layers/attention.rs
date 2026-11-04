@@ -121,6 +121,14 @@ impl Attention {
         self.max_kv_len
     }
 
+    /// Whether this attention masks each query to its own past.
+    ///
+    /// The paged backend is always causal; the dense and FP32 backends state it at construction
+    /// and it is part of their descriptor, because a causal mask and a dense one are two programs.
+    pub const fn causal(&self) -> bool {
+        self.causal
+    }
+
     /// Dense attention over a packed sequence: the language encoder, a cross-attention, the video
     /// block's attention without the cache.
     ///
@@ -151,21 +159,25 @@ impl Attention {
 
     /// The FP32 dense attention of the `ref2va` audio encoder and the sparse compression branch:
     /// the same call, with cuBLASLt SGEMM and a softmax kernel inside the package.
+    ///
+    /// The FP32 paths read a whole sequence at once, so their mask is dense and carries no history
+    /// window; `causal` states the mask the model's attention declares, and the two are different
+    /// programs. The audio encoder's attention is causal.
     pub fn fp32(
         head_dim: u32,
         q_heads: u32,
         kv_heads: u32,
         max_seq_len: u32,
+        causal: bool,
         scale: f32,
     ) -> Result<Self> {
-        // The FP32 paths read a whole sequence at once, so their mask is dense.
         Self::dense_of(
             AttentionBackend::Fp32,
             head_dim,
             q_heads,
             kv_heads,
             max_seq_len,
-            false,
+            causal,
             None,
             scale,
         )
@@ -778,9 +790,18 @@ mod tests {
         let encoder = Attention::dense(128, 32, 4, 8_192, true, None, 0.088).unwrap();
         assert_eq!(encoder.backend(), AttentionBackend::Dense);
         assert_eq!(encoder.max_kv_len(), 8_192);
-        // The FP32 paths read a whole sequence at once: dense mask, no window.
-        let audio = Attention::fp32(64, 8, 8, 4_096, 0.125).unwrap();
+        assert!(encoder.causal());
+        // The FP32 paths read a whole sequence at once: dense mask, no window. The audio encoder's
+        // attention is causal and the sparse compression branch's is not, so the flag is the
+        // model's to state, and the two are different descriptors.
+        let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
         assert_eq!(audio.backend(), AttentionBackend::Fp32);
+        assert!(audio.causal());
+        assert!(
+            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
+                .unwrap()
+                .causal()
+        );
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());

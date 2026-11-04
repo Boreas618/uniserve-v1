@@ -75,6 +75,17 @@ pub struct SamplerState {
     pub counts: TensorView,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
     /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
+    ///
+    /// That order is the operators' and the executor writes it. The reference's own table
+    /// (`uniserve/sampling/top_k.py:41-43`) is `temperature, top-p, min-p, typical-p, repetition,
+    /// frequency, presence, top-k`, so it agrees on the four columns this layer's shaper reads
+    /// (0, 4, 5, 6) and differs on the three its cutoffs read: our 1 is the top-k width where the
+    /// reference's 1 is the nucleus threshold, our 2 is that threshold where its 2 is min-p, and our
+    /// 3 is min-p where its 3 is typical-p. Aligning ours to it would therefore turn a top-k width
+    /// into a nucleus threshold and a nucleus threshold into a min-p threshold on every request,
+    /// which no shape check can see. This doc and `Sampler::check` are the only two places in this
+    /// crate that know the count, and the check uses the constant, so a column added to the
+    /// operators needs nothing here.
     pub parameters: TensorView,
     /// `[rows]` i32: the slot each row belongs to.
     pub slots: TensorView,
