@@ -64,3 +64,45 @@ pub enum Applied {
     /// A new world executes on trial.
     World(serde_json::Value),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The API's spelling of the two continuation modes is the wire the
+    /// operator sends; `keep` is the default when the field is absent.
+    #[test]
+    fn in_flight_is_snake_case_and_defaults_to_keep() {
+        assert_eq!(serde_json::to_value(InFlight::Keep).unwrap(), "keep");
+        assert_eq!(
+            serde_json::to_value(InFlight::Recompute).unwrap(),
+            "recompute"
+        );
+        assert_eq!(
+            serde_json::from_str::<InFlight>("\"recompute\"").unwrap(),
+            InFlight::Recompute
+        );
+        assert_eq!(InFlight::default(), InFlight::Keep);
+    }
+
+    /// `apply` reads the operator's request: the target configuration, the
+    /// overrides, how in-flight requests continue, a dry run and `force`.
+    #[test]
+    fn an_apply_request_reads_the_operators_body() {
+        let request: ApplyRequest = serde_json::from_value(serde_json::json!({
+            "replica": 2,
+            "config": "[scheduler]\n",
+            "set": ["worker_config.executable=/opt/b"],
+            "in_flight": "recompute",
+            "dry_run": true,
+            "force": true
+        }))
+        .expect("the request's shape");
+        assert_eq!(request.replica, Some(2));
+        assert_eq!(request.config.as_deref(), Some("[scheduler]\n"));
+        assert_eq!(request.set, vec!["worker_config.executable=/opt/b"]);
+        assert_eq!(request.in_flight, InFlight::Recompute);
+        assert!(request.dry_run);
+        assert!(request.force);
+    }
+}
