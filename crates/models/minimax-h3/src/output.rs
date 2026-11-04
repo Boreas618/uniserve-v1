@@ -210,9 +210,15 @@ mod tests {
         // The ends clamp: a value past the range does not wrap.
         assert_eq!(rgb.quantize([4.0, 4.0, 4.0]), [255, 255, 255]);
         assert_eq!(rgb.quantize([-4.0, -4.0, -4.0]), [0, 0, 0]);
-        // Every channel restores with its own constant: 1.0 is white.
-        assert_eq!(rgb.quantize([1.0, 1.0, 1.0]), [255, 255, 255]);
-        assert_eq!(rgb.quantize([-1.0, -1.0, -1.0]), [0, 0, 0]);
+        // A normalized value is a multiple of the channel's standard deviation above its mean, so 1.0
+        // restores the mean plus one standard deviation, not white.
+        assert_eq!(rgb.quantize([1.0, 1.0, 1.0]), [182, 173, 161]);
+        assert_eq!(rgb.quantize([-1.0, -1.0, -1.0]), [65, 59, 46]);
+        // White and black are the values that de-normalize to the ends of the range.
+        let white = [0usize, 1, 2].map(|channel| (1.0 - PIXEL_MEAN[channel]) / PIXEL_STD[channel]);
+        let black = [0usize, 1, 2].map(|channel| -PIXEL_MEAN[channel] / PIXEL_STD[channel]);
+        assert_eq!(rgb.quantize(white), [255, 255, 255]);
+        assert_eq!(rgb.quantize(black), [0, 0, 0]);
     }
 
     #[test]
