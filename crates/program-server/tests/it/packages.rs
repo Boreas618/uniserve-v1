@@ -554,7 +554,14 @@ fn a_family_of_operators_shares_one_check() {
         ("triton/test/softmax_check.py", &["softmax", "log_softmax"]),
         (
             "triton/test/sampling_check.py",
-            &["logits_gather", "vocab_unpad", "logits_shape"],
+            &[
+                "logits_gather",
+                "vocab_unpad",
+                "logits_shape",
+                "filter_candidates",
+                "inverse_cdf",
+                "argmax",
+            ],
         ),
     ];
     for (shared, operators) in FAMILIES {
