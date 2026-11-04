@@ -29,14 +29,26 @@
 //! silently dropped: each is called at its moment, validated, and handed to the
 //! owner that performs it.
 //!
-//! - `warm(room)` names the pages a precopy warms, in order. Warming is the KV
-//!   storage client's act — the mechanism issues the loads in the policy's order
-//!   — and the storage client is today the interim host-page gap, so no
-//!   executor is wired here yet. The owner is the KV storage client.
+//! - `warm(room)` names the pages a precopy warms, in order. The decision is
+//!   taken once per precopy, validated against the pages the epoch claims
+//!   ([`validate_warm`]), and kept on the candidate (`Candidate::warm`), which
+//!   is where the owner reads it. What it needs to be executed is a
+//!   page-addressed act the mechanism does not have: `KvOffloadManager` admits
+//!   a *request's* prefix (`admission(request, worker, keys, device, limit,
+//!   min_deepening)`) and reports arrival per request, and no host page report
+//!   reaches the engine at all — `views::pages` states `on_host: false` for
+//!   every page, so no `PageId` is a live host page (`views.rs` names the open
+//!   item with `front`). Issuing loads through that client would load a
+//!   request's prefix, in an order the policy did not choose, and nothing would
+//!   tell the mechanism the load arrived; that is the fabricated client the
+//!   mechanism may not have. The owner is the storage side's host page report,
+//!   and the acceptance is: the pages a `Warming` entry names become `on_host`,
+//!   and a `warm` order that names them is performed in the policy's order.
 //! - `experts(load)` answers a placement of experts on ranks, which the
 //!   executor's world setup applies (§7.6), not the scheduler. The owner is the
-//!   executor's edge, reached through the world setup; the load itself is
-//!   deferred by ruling.
+//!   executor's edge — `Executor::commit_experts` is the method that retains an
+//!   order — reached by whoever takes the order (`CommandSender::take_expert_order`);
+//!   the load itself is deferred by ruling.
 
 use std::collections::{BTreeMap, BTreeSet};
 

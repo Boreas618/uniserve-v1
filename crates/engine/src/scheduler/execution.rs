@@ -775,8 +775,10 @@ impl Scheduler {
     }
 
     /// The expert placement the policy last answered, taken by the point that
-    /// applies it: the executor's world setup (§7.6). Taking it once is the
-    /// handoff, so a placement is applied once.
+    /// applies it: the executor's world setup (§7.6), which commits it with
+    /// `Executor::commit_experts` — the executor's own method for retaining an
+    /// expert order. Taking it once is the handoff, so a placement is applied
+    /// once; the mechanism keeps no second copy.
     pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
         self.expert_order.take()
     }

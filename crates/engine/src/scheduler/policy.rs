@@ -475,6 +475,21 @@ pub struct Candidate {
     /// knowledge starts from, which the mechanism seeds the recorder with when
     /// the candidate starts serving (§4.4).
     state: Snapshot,
+    /// The pages the candidate asked to warm, in its own order (§4.4's warming
+    /// row). The decision is taken and validated here and performed by the KV
+    /// storage client, which serves no page-addressed load yet; keeping it on
+    /// the candidate is what distinguishes "the policy decided" from "the
+    /// mechanism dropped it" — see `mechanism.rs`'s "Validated and deferred".
+    warm: Vec<scheduling::guest::PageId>,
+}
+
+impl Candidate {
+    /// The pages the candidate asked to warm, in its own order — the decision
+    /// §4.4's warming row calls for, waiting on the storage client that
+    /// performs it.
+    pub fn warm(&self) -> &[scheduling::guest::PageId] {
+        &self.warm
+    }
 }
 
 /// What an epoch's policy has cost so far, in the two counters `Metrics`
@@ -866,6 +881,10 @@ impl PolicySlot {
         let pages = instance.warm(&room)?;
         calls += 1;
         validators.warm(&pages)?;
+        tracing::debug!(
+            pages = pages.len(),
+            "the precopy policy named the pages to warm, in its order"
+        );
         if let Some(load) = &expert_load {
             let order = instance.experts(load)?;
             calls += 1;
@@ -878,6 +897,10 @@ impl PolicySlot {
             instance,
             calls,
             state: init.state,
+            // A route-only precopy asks no warming decision: the room it has
+            // is the routing one, and warming belongs to the precopy that
+            // prepares a serving policy.
+            warm: Vec::new(),
         })
     }
 
@@ -1230,6 +1253,10 @@ impl RoutePolicy {
             instance,
             calls,
             state: init.state,
+            // A route-only precopy asks no warming decision: the room it has
+            // is the routing one, and warming belongs to the precopy that
+            // prepares a serving policy.
+            warm: Vec::new(),
         })
     }
 
