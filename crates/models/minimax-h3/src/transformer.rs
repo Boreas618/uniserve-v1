@@ -533,6 +533,11 @@ impl Transformer {
         let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
             Error::Unsupported("this H3 partition has no audio input projection".to_owned())
         })?;
+        // The audio input projection is FP32 in the reference like the video's, and the widening that
+        // would feed it is refused here until `scaled_add` enumerates `columns = 32`: the store holds
+        // a module for 96 and 5376 columns and none for the audio width, and a launch with no module
+        // is a hard failure at bind, which is worse than the rounding this leaves in place. The one
+        // line to restore is `let rows = self.wide(f, rows)?;` above this call.
         Ok(audio.forward(f, rows, out)?)
     }
 
@@ -581,7 +586,11 @@ impl Transformer {
         let dtype = hidden.dtype;
         let normalized = arena.tensor(dtype, hidden.shape)?;
         norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        self.project_head(f, normalized, modality, block, step, out)
+        // The final modulation is the checkpoint's own type (`modulation.py:62-75` multiplies the
+        // BF16 norm by the BF16 table), and the projection that follows is FP32 - so the widening is
+        // here, between them, and not inside the norm.
+        let wide = self.wide(f, normalized)?;
+        self.project_head(f, wide, modality, block, step, out)
     }
 }
 
@@ -753,9 +762,31 @@ impl Transformer {
         &self.config
     }
 
+    /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
+    ///
+    /// The reference builds all four of the transformer's end projections as FP32 parameters
+    /// (`transformer.py:366-372`, `:404-421`) and its `Linear` casts the activation up before the
+    /// product, so the projection reads FP32 whatever the stack's own element type is. The
+    /// checkpoint's weights need no conversion: a BF16 value is exactly representable in FP32, so a
+    /// product of FP32 inputs against them is the same arithmetic as against widened FP32 weights -
+    /// widening changes no value and the accumulation is FP32 either way. What the copy buys is the
+    /// input's rounding, which is the last place the stack's element type would otherwise reach the
+    /// prediction.
+    fn wide(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
+        if source.dtype == nn::DType::F32 {
+            return Ok(source);
+        }
+        let out = f.arena().tensor(nn::DType::F32, source.shape)?;
+        // `target <- 1 * source + 0 * target`: a widening, and the zero beta means the target is
+        // never read, so an uninitialised buffer is the right operand.
+        nn::layers::ScaledAdd.forward(f, out, source, 1.0, 0.0)?;
+        Ok(out)
+    }
+
     /// Project one modality's packed rows into the hidden width.
     pub fn project(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
-        Ok(self.proj_in.forward(f, rows, out)?)
+        let wide = self.wide(f, rows)?;
+        Ok(self.proj_in.forward(f, wide, out)?)
     }
 
     /// Project one modality's hidden rows back to its velocity at one evaluation.
