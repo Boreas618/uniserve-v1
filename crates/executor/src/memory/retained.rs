@@ -28,8 +28,8 @@ use ipc::StorageLaunch;
 use platform::{DeviceId, Protection};
 use sha2::{Digest, Sha256};
 
-use crate::memory::allocation::Storage;
 use crate::memory::allocation::Backing;
+use crate::memory::allocation::Storage;
 use crate::{Error, Result, lock};
 
 /// One exclusive device storage an owner needs.
@@ -213,7 +213,7 @@ impl ExclusiveStorage for LocalStorage {
 /// The worker's connection to its host's Storage Server, shared by the
 /// owners that take storage and the capacity planning that counts it. Only
 /// the control thread calls it.
-pub(crate) struct Retained {
+pub struct Retained {
     scope: Scope,
     /// The world the worker belongs to, which creates its exclusive
     /// storages.
