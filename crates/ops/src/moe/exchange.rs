@@ -135,7 +135,9 @@ pub struct ExchangeArgs {
     pub transport: ExchangeTransport,
     /// Live rows this rank sends at dispatch, or the capacity it expects at combine.
     pub tokens: u32,
-    /// Dispatch: `[tokens, hidden]` states to send. Combine: `[max_tokens, hidden]` received partials.
+    /// Dispatch: `[tokens, hidden]` states to send. Combine: `[received, hidden]` the rank's own
+    /// combined rows, one per row it received at dispatch, in the order dispatch packed them
+    /// (`received ≤ ranks · max_tokens`); the package maps each row to its owner's slot.
     pub state: TensorView,
     /// Dispatch: `[tokens, top]` i32 expert ids. Empty at combine.
     pub ids: TensorView,
@@ -333,8 +335,18 @@ impl Op for ExpertExchange {
             }
             Mode::Combine => {
                 let tokens = u64::from(args.tokens);
+                let received = args.state.rows();
+                if received == 0 || received > ranks * max_tokens {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        format!(
+                            "the combine passes {received} partial rows; a rank receives between 1 \
+                             and {ranks} · {max_tokens}"
+                        ),
+                    ));
+                }
                 args.state
-                    .require_shape(Self::NAME, Shape::new(&[max_tokens, hidden]))?;
+                    .require_shape(Self::NAME, Shape::new(&[received, hidden]))?;
                 args.state
                     .require_row(Self::NAME, descriptor.dtype, hidden)?;
                 args.out
