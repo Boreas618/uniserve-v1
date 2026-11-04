@@ -1718,6 +1718,28 @@ impl MainProcess {
             operators = chosen.len(),
             "resolved this host's built programs for a precopy that named none"
         );
+        // What this host's store supplies, against what this build implements: the difference is
+        // the fact an operator needs, because it names the package nobody built (an operator whose
+        // module has no package cannot be supplied by the deployment either), and it is bounded -
+        // an operator the deployment never launches may be in it, which is why the line states the
+        // count rather than claiming these are needed.
+        let supplied: std::collections::BTreeSet<&str> = chosen
+            .keys()
+            .filter_map(|op| ops::operator_name(op))
+            .collect();
+        let missing: Vec<&str> = ops::operators()
+            .iter()
+            .copied()
+            .filter(|operator| !supplied.contains(operator))
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                supplied = supplied.len(),
+                implemented = ops::operators().len(),
+                missing = ?missing,
+                "this host's store supplies fewer operators than the build implements"
+            );
+        }
         let mut programs = Programs::new();
         let mut candidates = Candidates::new();
         for (op, ordered) in chosen {
