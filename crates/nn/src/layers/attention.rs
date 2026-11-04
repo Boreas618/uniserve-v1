@@ -18,7 +18,7 @@ use ops::{DType, PhaseKind, Shape, TensorView};
 use crate::capability::{KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::launch::{PDL, kv_tile};
+use crate::layers::launch::{kv_tile, PDL};
 
 /// Which implementation reads the keys and values.
 ///
@@ -477,7 +477,7 @@ impl Attention {
         }
         let planes = cache.planes(group, layer)?;
         self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, cache, group, query, out, workspace)
+        self.attend(f, batch, cache, group, layer, query, out, workspace)
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
@@ -729,6 +729,7 @@ impl Attention {
         batch: &TokenBatch,
         cache: &KvView<'_>,
         group: usize,
+        layer: usize,
         query: TensorView,
         out: TensorView,
         workspace: TensorView,
@@ -736,7 +737,10 @@ impl Attention {
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
-        let planes = cache.planes(group, 0)?;
+        // The planes this layer reads are its own: every layer of a group keeps its keys and values
+        // apart, and a reader that took the group's first layer would attend over another layer's
+        // cache — layer 0's, which is right by accident, or an unwritten plane.
+        let planes = cache.planes(group, layer)?;
         let group_view = cache.group(group)?;
         if group_view.page_size != self.page_size || batch.page_size != self.page_size {
             return Err(Error::shape(
@@ -856,11 +860,9 @@ mod tests {
         let table = |dtype: DType, shape: &[u64]| {
             TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
         };
-        assert!(
-            attention
-                .check_page_table(table(DType::I32, &[15, 4]), 15)
-                .is_ok()
-        );
+        assert!(attention
+            .check_page_table(table(DType::I32, &[15, 4]), 15)
+            .is_ok());
         // A table built as a vector: the shape a harness gets wrong, named with the batch's own
         // sequence count rather than as the operator's axis count.
         let error = attention
@@ -871,16 +873,12 @@ mod tests {
             "{error}"
         );
         // Another batch's table, and pages that are not whole i32 words.
-        assert!(
-            attention
-                .check_page_table(table(DType::I32, &[8, 4]), 15)
-                .is_err()
-        );
-        assert!(
-            attention
-                .check_page_table(table(DType::BF16, &[15, 4]), 15)
-                .is_err()
-        );
+        assert!(attention
+            .check_page_table(table(DType::I32, &[8, 4]), 15)
+            .is_err());
+        assert!(attention
+            .check_page_table(table(DType::BF16, &[15, 4]), 15)
+            .is_err());
     }
 
     #[test]
@@ -919,11 +917,9 @@ mod tests {
         let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
         assert_eq!(audio.backend(), AttentionBackend::Fp32);
         assert!(audio.causal());
-        assert!(
-            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
-                .unwrap()
-                .causal()
-        );
+        assert!(!Attention::fp32(64, 8, 8, 4_096, false, 0.125)
+            .unwrap()
+            .causal());
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
