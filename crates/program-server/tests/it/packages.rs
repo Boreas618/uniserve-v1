@@ -562,6 +562,7 @@ fn a_family_of_operators_shares_one_check() {
                 "inverse_cdf",
                 "argmax",
                 "logprob_gather",
+                "top_k",
             ],
         ),
     ];
