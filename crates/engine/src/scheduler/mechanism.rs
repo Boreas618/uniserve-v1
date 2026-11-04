@@ -361,8 +361,14 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
     // on one component, so the graph tier bounds the group, not the step.
     let mut groups: Vec<((u32, PhaseKind), u64)> = Vec::new();
 
+    // A request the plan admits is resident for the work the same plan gives
+    // it: the step applies admission before the work, which is what lets one
+    // plan both admit and run a request (§4.4). The trial runs the same check
+    // on one state and never applies anything, so it reads the plan's own
+    // admission as the residency the live step will have made.
+    let admitted: BTreeSet<RequestId> = plan.admit.iter().copied().collect();
     for work in &plan.work {
-        validate_work_entry(work, live)?;
+        validate_work_entry(work, live, &admitted)?;
         if !seen.insert(work.request) {
             return Err(invalid(
                 Call::Dispatch,
@@ -421,9 +427,13 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
     Ok(())
 }
 
-fn validate_work_entry(work: &Work, live: &Live<'_>) -> Result<(), PolicyError> {
+fn validate_work_entry(
+    work: &Work,
+    live: &Live<'_>,
+    admitted: &BTreeSet<RequestId>,
+) -> Result<(), PolicyError> {
     let request = live.request(work.request)?;
-    if request.state != RequestState::Resident {
+    if request.state != RequestState::Resident && !admitted.contains(&work.request) {
         return Err(invalid(
             Call::Dispatch,
             format!("{} is not resident", work.request.0),
@@ -1781,6 +1791,33 @@ mod tests {
             need: 1,
         };
         validate_victims(&entries, &[Victim::Encoding(EncodingId(7))], &live).expect("an entry");
+    }
+
+    #[test]
+    fn a_plan_may_run_what_it_admits() {
+        // §4.4: the step applies admission before the work, so one plan may both
+        // admit a request and give it work. The trial checks the same rule on
+        // one state and applies nothing, so it reads the plan's own admission as
+        // the residency the live step will have made; without that, a mid-flight
+        // install whose first plan admits and runs a request could never pass
+        // probation.
+        let queued = request(1, RequestState::Queued);
+        let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
+        let work = Work {
+            request: RequestId(1),
+            phase: PhaseId(0),
+            tokens: 4,
+        };
+        let admitting = Plan {
+            admit: vec![RequestId(1)],
+            ..plan(vec![work.clone()])
+        };
+        validate_plan(&admitting, &room(), &live).expect("a plan may run what it admits");
+        // The same work without the admission names a request that is not
+        // running, which stays a refused decision.
+        let refused = plan(vec![work]);
+        let error = validate_plan(&refused, &room(), &live).expect_err("not resident");
+        assert!(format!("{error}").contains("not resident"));
     }
 
     #[test]
