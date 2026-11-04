@@ -193,6 +193,20 @@ impl Plan {
     }
 }
 
+/// The M-RoPE cut of one head: the checkpoint's widths, in rotated elements, interleaved.
+///
+/// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`
+/// (`text_encoder/config.json`, `rope_scaling`). The widths count *frequencies*, and the rotary
+/// operator counts *rotated elements*, so each is doubled; the interleaved cut is the only one the
+/// reference implements for sectioned positions - `uniserve/nn/rope.py:280-284` assigns every
+/// compact frequency the axis `_interleaved_axes` gives it (`j % 3` while `j < widths[a] * 3`),
+/// and the contiguous cut is a different coordinate assignment.
+fn sections_of(config: &TextEncoderConfig) -> Result<Sections> {
+    let mrope = Mrope::new(config.mrope_sections, config.head_dim)?;
+    let widths = mrope.widths().map(|width| width * 2);
+    Ok(Sections::new(&widths)?.interleaved())
+}
+
 /// The widths one tensor-parallel rank of the text stack holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Rank {
@@ -450,11 +464,7 @@ impl Layer {
             Shape::new(&[hidden, u64::from(rank.query)]),
             u64::from(config.query_width()),
         )?;
-        // The M-RoPE sections cut the head into one band per axis; the operator counts rotated
-        // elements, so each axis's frequency width is doubled.
-        let mrope = Mrope::new(config.mrope_sections, config.head_dim)?;
-        let widths = mrope.widths().map(|width| width * 2);
-        let sections = Sections::new(&widths)?;
+        let sections = sections_of(config)?;
         Ok(Self {
             input_norm: normalization(loader, &format!("{name}.input_layernorm"), hidden, config)?,
             query: Linear::new(query, None, WeightOrder::NxK).map_err(Error::from)?,
@@ -690,9 +700,7 @@ impl TextEncoder {
                 )));
             }
         }
-        let mrope = Mrope::new(config.mrope_sections, config.head_dim)?;
-        let widths = mrope.widths().map(|width| width * 2);
-        let sections = Sections::new(&widths)?;
+        let sections = sections_of(config)?;
         Ok(Self {
             config: config.clone(),
             partition: *partition,
@@ -1601,6 +1609,31 @@ mod tests {
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
         crate::config::tests_support::released_config().text_encoder
+    }
+
+    #[test]
+    fn the_mrope_cut_is_interleaved_and_agrees_with_the_host_rule() {
+        let config = config();
+        let sections = sections_of(&config).expect("the checkpoint's sections");
+        assert!(sections.is_interleaved());
+        assert_eq!(sections.axes(), 3);
+        // The checkpoint's widths count frequencies; the operator's count rotated elements.
+        let widths = Mrope::new(config.mrope_sections, config.head_dim)
+            .expect("sections")
+            .widths()
+            .map(|width| width * 2);
+        assert_eq!(sections.widths(), widths);
+        assert_eq!(
+            u64::from(widths.iter().sum::<u32>()),
+            u64::from(config.head_dim)
+        );
+        // The device's assignment (`ops::rope::interleaved_axes`, the kernel's rule) is the host's
+        // (`positions::Mrope::frequency_axes`, the tables the diagnosis compares).
+        let host = Mrope::new(config.mrope_sections, config.head_dim)
+            .expect("sections")
+            .frequency_axes();
+        assert_eq!(ops::rope::interleaved_axes(&widths), host);
+        assert_eq!(host.len(), (config.head_dim / 2) as usize);
     }
 
     #[test]
