@@ -11,6 +11,8 @@
 
 use super::AssistantEvent;
 use crate::output::RequestOutput;
+use proto::handoff;
+
 use crate::output::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantToolCall, Error, Result,
 };
@@ -65,6 +67,49 @@ impl StructuredEventState {
             open_tool_call: None,
             next_tool_call_index: 0,
         }
+    }
+
+    /// The assembly's state, for the process that goes on writing the
+    /// response after a handoff (design §7.5.1 step 3): which blocks closed,
+    /// which one is open and how, and the next tool-call ordinal.
+    pub(crate) fn state(&self) -> handoff::Assembly {
+        handoff::Assembly {
+            completed_blocks: self.num_completed_blocks as u64,
+            text_block: self.open_text_block.as_ref().map(|block| handoff::OpenTextBlock {
+                index: block.index as u64,
+                reasoning: block.kind == AssistantBlockKind::Reasoning,
+                text: block.text.clone(),
+            }),
+            tool_call: self.open_tool_call.as_ref().map(|call| handoff::OpenToolCall {
+                index: call.index as u64,
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            }),
+            next_tool_call_index: self.next_tool_call_index as u64,
+            ..Default::default()
+        }
+    }
+
+    /// Takes over `state` of a response's assembly.
+    pub(crate) fn resume(&mut self, state: &handoff::Assembly) {
+        self.num_completed_blocks = state.completed_blocks as usize;
+        self.open_text_block = state.text_block.as_ref().map(|block| OpenTextBlock {
+            index: block.index as usize,
+            kind: if block.reasoning {
+                AssistantBlockKind::Reasoning
+            } else {
+                AssistantBlockKind::Text
+            },
+            text: block.text.clone(),
+        });
+        self.open_tool_call = state.tool_call.as_ref().map(|call| OpenToolCall {
+            index: call.index as usize,
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+        self.next_tool_call_index = state.next_tool_call_index as usize;
     }
 
     /// Frames one parsed assistant event as public events.

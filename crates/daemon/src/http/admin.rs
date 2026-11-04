@@ -101,6 +101,10 @@ pub(crate) struct Admin {
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
     handed_over: AtomicBool,
+    /// The epochs the deployment executes and the processes this node's
+    /// daemon manages, which `GET /admin/config` reports and a configuration
+    /// change is routed by (`crate::epoch`).
+    epochs: crate::epoch::Epochs,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -127,7 +131,15 @@ impl Admin {
             shutdown,
             retire,
             handed_over: AtomicBool::new(false),
+            epochs: crate::epoch::Epochs::new(),
         })
+    }
+
+    /// The epochs the deployment executes and the processes this node's
+    /// daemon manages, which the configuration routes changes by and
+    /// `GET /admin/config` reports.
+    pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
+        &self.epochs
     }
 
     /// The event log and the operations' record, for the successor of a hot
@@ -489,7 +501,16 @@ struct ConfigBody {
 /// rollback marked unavailable and every item of the GPUs' storage ledgers
 /// (`Leader::config_status`).
 async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    Json(state.leader.config_status().await)
+    let mut body = state.leader.config_status().await;
+    // The epochs and the processes this daemon manages sit beside the
+    // configuration and its worlds: `EpochRecord`s are the daemon's record
+    // of what it executes, not the engine's (`crate::epoch`).
+    if let Some(object) = body.as_object_mut() {
+        let report = state.admin.epochs().report();
+        object.insert("epochs".to_owned(), report["epochs"].clone());
+        object.insert("processes".to_owned(), report["processes"].clone());
+    }
+    Json(body)
 }
 
 /// `PUT /admin/config`: changes the deployment to a configuration
