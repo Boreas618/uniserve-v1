@@ -159,7 +159,7 @@ fn generation_limits(tree: &toml::Table) -> anyhow::Result<Option<GenerationLimi
 /// `host_bytes` the deployment states the size outright, and the ratio stands as
 /// the share it is expected to be.
 fn host_cache(tree: &toml::Table) -> anyhow::Result<Option<HostCacheSize>> {
-    let ratio: Option<f64> = value(tree, "kv_cache_config.host_ratio")?;
+    let ratio = ratio(tree, "kv_cache_config.host_ratio")?;
     let host_bytes: Option<u64> = value(tree, "kv_cache_config.host_bytes")?;
     match (ratio, host_bytes) {
         (None, None) => Ok(None),
@@ -168,6 +168,22 @@ fn host_cache(tree: &toml::Table) -> anyhow::Result<Option<HostCacheSize>> {
             host_bytes,
         })),
     }
+}
+
+/// A ratio the file states as a real number or as a whole one: a host cache of
+/// twice the device's is natural to write as `2`, and the value is the number
+/// either way.
+fn ratio(tree: &toml::Table, path: &str) -> anyhow::Result<Option<f64>> {
+    let Some(found) = dotted(tree, path) else {
+        return Ok(None);
+    };
+    if let Some(number) = found.as_float() {
+        return Ok(Some(number));
+    }
+    if let Some(whole) = found.as_integer() {
+        return Ok(Some(whole as f64));
+    }
+    anyhow::bail!("the launch file's `{path}` is a number")
 }
 
 /// The captured graph sizes, ascending and once each: the file states them per
@@ -327,6 +343,18 @@ max_latent_units = 1024
         assert!(
             message.contains("scheduling.max_batch"),
             "the refusal names the key: {message}"
+        );
+    }
+
+    #[test]
+    fn a_whole_ratio_is_the_number_it_states() {
+        let facts = parse("[kv_cache_config]\nhost_ratio = 2\n").expect("a whole ratio is a ratio");
+        assert_eq!(
+            facts.host_cache,
+            Some(HostCacheSize {
+                ratio: 2.0,
+                host_bytes: None,
+            })
         );
     }
 
