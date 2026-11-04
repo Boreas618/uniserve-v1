@@ -655,8 +655,8 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
         .expect("the prepared generation is rebound");
     graphs.insert(prepared_bucket, 2, rebound);
 
-    // The commit: generation 1 is purged.
-    let released = graphs.purge(1);
+    // The commit: generation 1 is purged while generation 2 serves.
+    let released = graphs.purge(1, 2);
     assert!(
         released.contains(&prepared_bucket),
         "the bucket generation 2 replaced kept its generation-1 capture, which nothing serves from"
@@ -702,5 +702,103 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
         words(&stream, prepared_buffer.address()),
         vec![WALKED; WORDS],
         "after the commit the prepared bucket runs the generation it switched over to"
+    );
+}
+
+/// A reverted update releases its whole capture set - the case a commit's rule cannot see.
+///
+/// After a revert the failed generation sits **above** the serving one, so nothing supersedes it and
+/// a rule written for a commit releases nothing: the executables, their nodes and the arena regions
+/// they address stay for the process's life, one set per reverted update, until the graph pool
+/// refuses a capture. The purge takes the serving generation into account, and this measures the
+/// object lifetime that follows: generation 2's `Graph` has no holder once the purge ran, and
+/// generation 1's still has.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_revert_releases_the_whole_capture_set_of_the_failed_generation() {
+    let device = Device::new(DEVICE).expect("a CUDA device");
+    let mut allocator =
+        Allocator::new(&device, Arc::new(Allowance::default())).expect("an allocator");
+    allocator
+        .reserve(PoolKind::Graph, 1 << 20)
+        .expect("reserve the graph pool");
+    let stream = Stream::new(DEVICE).expect("a stream");
+    let image = std::fs::read(cubin()).expect("the compiled probe kernels");
+    let kernel = |symbol: &str| -> Arc<Kernel> {
+        Arc::new(
+            Kernel::load_cubin(&device, &image, CubinMetadata::named(symbol))
+                .unwrap_or_else(|error| panic!("loading {symbol}: {error}")),
+        )
+    };
+    let arena = nn::Arena::new(DevicePtr::new(0), 0);
+    let descriptor = ProbeDescriptor {
+        words: WORDS as u32,
+    };
+    let key = descriptor::key(&descriptor);
+    let bucket = Bucket::decode(WORDS as u32, Variant::DecodeGreedy);
+    let buffer = allocator
+        .allocate(PoolKind::Graph, BYTES)
+        .expect("the bucket's activation");
+    let data = TensorView::new(
+        DevicePtr::new(buffer.address()),
+        DType::I32,
+        Shape::new(&[WORDS as u64]),
+    );
+    // One capture per generation, each kept as an `Arc` so its lifetime is observable.
+    let capture_generation = |generation: u64, symbol: &str, value: u32| {
+        let (template, nodes) = capture(
+            &stream,
+            &Generation::new(
+                generation,
+                [KernelEntry::keyed(
+                    Probe::NAME,
+                    key.clone(),
+                    kernel(symbol),
+                )],
+            ),
+            &arena,
+            &descriptor,
+            ProbeArgs {
+                data,
+                count: WORDS as u32,
+                value,
+            },
+        );
+        let template = Arc::new(template);
+        let captured = Captured::from_template(Arc::clone(&template), nodes, vec![kernel(symbol)])
+            .expect("a captured bucket");
+        (template, captured)
+    };
+    let (serving_graph, serving) = capture_generation(1, "probe_exact", CAPTURED);
+    let (failed_graph, failed) = capture_generation(2, "probe_wrong", CAPTURED);
+    let mut graphs = Graphs::new();
+    graphs.insert(bucket, 1, serving);
+    graphs.insert(bucket, 2, failed);
+
+    // Served generation 1, reverted from 2: the purge names the failed generation and the one that
+    // serves.
+    let released = graphs.purge(2, 1);
+    assert_eq!(
+        released,
+        vec![bucket],
+        "the purge did not name the bucket whose capture it released"
+    );
+    assert!(
+        graphs.captured(bucket, 2).is_none(),
+        "the failed generation's capture is still in the table: every reverted update leaks a \
+         whole capture set until the graph pool refuses a capture"
+    );
+    assert!(
+        graphs.captured(bucket, 1).is_some(),
+        "the purge took the serving generation's capture"
+    );
+    assert!(
+        Arc::downgrade(&failed_graph).upgrade().is_none(),
+        "generation 2's graph still has a holder after the purge: its executable, nodes and arena \
+         regions outlive the update that was abandoned"
+    );
+    assert!(
+        Arc::downgrade(&serving_graph).upgrade().is_some(),
+        "generation 1's graph lost its holder, which is what a purge must never do"
     );
 }

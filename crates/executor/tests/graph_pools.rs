@@ -296,7 +296,8 @@ fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
     // The serving generation's batch finished last, so its purge runs while generation 2 is still
     // waiting to switch over.
     assert_eq!(
-        graphs.purge(1),
+        // The serving generation is 2: generation 1 is what the commit retires.
+        graphs.purge(1, 2),
         vec![bucket],
         "the purge did not name the generation it released"
     );

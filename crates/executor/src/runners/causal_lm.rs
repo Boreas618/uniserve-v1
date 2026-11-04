@@ -816,6 +816,41 @@ impl Sampling {
     }
 }
 
+/// The refusal a provider that cannot install a batch's block tables gives, over the tables alone.
+///
+/// A batch whose slots have no pages yet carries none, and no provider needs anything for it; one
+/// whose slots do carry tables needs them written into the pooled table before the gather reads it.
+/// A provider that dropped them would gather the slot's previous pages, so the non-empty case is
+/// refused by name until the provider holds a cache.
+fn install_block_tables_unavailable(tables: &[ipc::BlockTable]) -> Result<()> {
+    match tables.first() {
+        None => Ok(()),
+        Some(table) => Err(Error::Invalid(format!(
+            "this runner holds no cache to install request slot {}'s row of group {} into, and a \
+             gather would read whatever that row held before: the cache provider is the device \
+             executor's, attached before the first capture",
+            table.request_pool_idx, table.group_id
+        ))),
+    }
+}
+
+/// The refusal a provider that cannot apply a batch's cache units gives, over the allocation alone.
+///
+/// A batch that reads a fresh prefix carries none, and no provider needs anything for it; one that
+/// reuses a cached prefix carries the copies that put the prefix in its own pages, and a provider
+/// that dropped them would serve the wrong tokens. So the empty case is served by everyone and the
+/// non-empty one is refused by name until the provider holds a cache.
+fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<()> {
+    if units.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(
+        "this runner's cache provider does not apply a batch's cache units, so a request reusing a \
+         cached prefix would read pages that were never copied"
+            .into(),
+    ))
+}
+
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
 ///
 /// The cache is the memory owner's (8's resident pages and its block tables); the runner only
@@ -830,6 +865,52 @@ pub trait KvProvider: Send + Sync {
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<crate::arena::Pools>>) -> Result<()> {
         let _ = pools;
         Ok(())
+    }
+
+    /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
+    /// batch's forward reads them.
+    ///
+    /// Two things happen here and nowhere else: the units the mechanism acquired for the request's
+    /// slot become the cache's own (an imported unit's flags say it holds bytes, so a later read
+    /// does not treat it as unwritten), and every `(source, destination)` pair is copied - the
+    /// request reuses a leased prefix, and a destination that still held an older page would serve
+    /// the wrong tokens. The source's lease is the mechanism's and runs to completion; the copy
+    /// reads it and never writes it.
+    ///
+    /// Issuing on the batch's stream is what orders the copy before the graph: the forward that
+    /// reads those pages runs on the same stream afterwards, so no barrier is needed and none is
+    /// taken (a barrier here would serialize the batch's own work).
+    ///
+    /// A provider that holds no cache refuses an allocation rather than dropping it: a batch whose
+    /// prefix copies were dropped serves the wrong pages, and a silent drop is the one failure this
+    /// seam must not have.
+    fn apply_cache_units(
+        &mut self,
+        units: &[ipc::CacheUnitAllocation],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        apply_cache_units_unavailable(units)
+    }
+
+    /// Installs the batch's slot rows into the cache's pooled table, on the batch's stream.
+    ///
+    /// The gather [`Self::block_table`] performs later copies **row `slot` of the pooled table** for
+    /// every request slot the batch names. That row is the only place a request's pages live for the
+    /// gather, and nothing else writes it: a batch whose rows are not installed gathers whatever the
+    /// slot held before - zeros, or another request's pages - and the graph then runs clean against
+    /// the wrong memory. It is the one failure that looks like a model defect rather than a cache
+    /// one, so a provider that holds no cache refuses a table rather than dropping it.
+    ///
+    /// It is issued before [`Self::apply_cache_units`]: the row must exist before the graph reads it,
+    /// and the acquired units are this cache's before anything is copied into them.
+    fn install_block_tables(
+        &mut self,
+        tables: &[ipc::BlockTable],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        install_block_tables_unavailable(tables)
     }
 
     /// How many attention groups the model's layers index.
@@ -1103,11 +1184,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
-        // The upload and the device views are staged by the executor's stream work, then the
-        // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
-        // and platform's allocator are published, the staging is as far as this path can go; the
-        // replay job is what the executor performs once they are.
-        let _ = &self.model;
+        // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
+        // pooled table, so the row must state the request's own pages before the replay, and the
+        // table states where the row begins (`start_page`) and how far it runs.
+        self.kv.install_block_tables(&batch.block_tables, &self.stream)?;
+        // Then what the mechanism allocated for this batch's pages, on the same stream: the units
+        // must be this cache's before anything is copied into them, and the copies must be in place
+        // when the graph reads those pages. A batch that cannot be applied is refused at submit -
+        // the same place, and with the same kind of error, as any other batch this device cannot
+        // serve.
+        self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
+        // The columns are staged here, on the submitting thread; everything that touches the
+        // device is the replay job, which this executor's device thread performs in `serve`: the
+        // staged columns are uploaded, the bucket's graph is launched - the smallest captured
+        // bucket holding this shape - and the sampled tokens are read back, all before `submit`
+        // returns its output (4.5, 2.4: one thread issues to the streams).
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -1302,8 +1393,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
         // A prepared generation that never took over: its graphs go, and with them the kernels
         // they held. The serving generation's graphs, arena plans and sampler regions stay
-        // exactly as they were, so an abandoned update cannot disturb a batch in flight.
-        let dropped = self.graphs.purge(generation);
+        // exactly as they were, so an abandoned update cannot disturb a batch in flight. This is
+        // `discard`, not `purge`: an abandoned generation is one nobody serves from, so its whole
+        // set goes whatever its number is beside the serving one.
+        let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
         if self.next.as_ref().map(|next| next.number()) == Some(generation) {
             self.next = None;
@@ -1403,7 +1496,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // region released under a live executable would be reused by the next generation's
         // capture while the old graph still addressed it. Exactly this generation's graphs go - a
         // released generation may be numbered either side of the serving one.
-        let dropped = self.graphs.purge(generation);
+        let dropped = self.graphs.purge(generation, self.generation.number());
         let dropped_count = dropped.len();
         let mut released = 0u64;
         // Both generations' graphs can address one bucket's plan: the pool records a plan per
@@ -2468,6 +2561,59 @@ pub fn calls_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
+    /// prefix passes through every provider, and one that reuses a leased one is refused by name by
+    /// a provider that holds no cache. The non-empty refusal is the state until the resident cache
+    /// applies the copies; what matters here is that it can never be a silent pass.
+    #[test]
+    fn a_provider_without_a_cache_serves_an_empty_allocation_and_refuses_a_prefix_copy() {
+        assert!(
+            apply_cache_units_unavailable(&[]).is_ok(),
+            "a batch reading a fresh prefix was refused"
+        );
+        let allocation = vec![ipc::CacheUnitAllocation {
+            request_pool_idx: 0,
+            group_id: 0,
+            unit_ids: vec![ipc::UnitId(7)],
+            copies: vec![(ipc::UnitId(3), ipc::UnitId(7))],
+        }];
+        let error = apply_cache_units_unavailable(&allocation)
+            .expect_err("a prefix copy was dropped without a word");
+        assert!(
+            error.to_string().contains("never copied"),
+            "the refusal does not say what would go wrong: {error}"
+        );
+    }
+
+    /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise
+    /// read whatever the row held - another request's pages, or zeros - and the graph would run clean
+    /// against the wrong memory.
+    #[test]
+    fn a_provider_without_a_cache_serves_a_batch_with_no_tables_and_refuses_a_slot_row() {
+        assert!(
+            install_block_tables_unavailable(&[]).is_ok(),
+            "a batch whose slots have no pages was refused"
+        );
+        let tables = vec![ipc::BlockTable {
+            request_pool_idx: 3,
+            group_id: 1,
+            start_page: 0,
+            unit_ids: vec![ipc::UnitId(11), ipc::UnitId(12)],
+            allocated_tokens: 256,
+        }];
+        let error = install_block_tables_unavailable(&tables)
+            .expect_err("a slot row was dropped without a word");
+        let message = error.to_string();
+        assert!(
+            message.contains("slot 3") && message.contains("group 1"),
+            "the refusal does not name the row: {message}"
+        );
+        assert!(
+            message.contains("would read whatever that row held"),
+            "the refusal does not say what would go wrong: {message}"
+        );
+    }
 
     /// A mechanism commit table of one row per call, column-major `[COMMIT_FIELDS][rows]`: the one
     /// column a fixture states is the row's destination slot, and the rest keep zero.
