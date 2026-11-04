@@ -69,6 +69,10 @@ pub enum Applied {
     /// The epoch layer's switch runs on trial: the target's main processes
     /// serve while the previous epoch is parked (§7.4).
     Epoch(serde_json::Value),
+    /// The program layer's update runs on trial inside the serving epoch: its
+    /// processes switched to the target's programs and are on probation
+    /// (§7.2, §7.3).
+    Program(serde_json::Value),
 }
 
 #[cfg(test)]
