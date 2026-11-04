@@ -506,32 +506,36 @@ pub struct VideoDecoder {
 /// The decoder has one token per **latent voxel** - the VAE's patch is `1 x 2 x 2` latent cells and the
 /// transformer reads one token per cell - so this table is four times longer than the denoiser's row
 /// table: each voxel names the packed row of the `2 x 2` patch it lies in, which is what the gather into
-/// the clip's latent rows reads.
+/// the clip's latent rows reads. The extents are a layout's latent ones, so the table is keyed by the
+/// layout and not by the request.
 fn voxel_rows(
     config: &VideoVaeConfig,
     attention: AttentionKind,
-    num_frames: u32,
-    canvas: &crate::config::Canvas,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
 ) -> Result<Vec<u32>> {
-    let raster = crate::packing::latent_raster(canvas)?;
-    let order = crate::packing::video_order(attention, num_frames, canvas)?;
+    let raster = crate::packing::LatentRaster {
+        height: latent_height,
+        width: latent_width,
+    };
+    let order = crate::packing::video_order_of(attention, latent_frames, raster)?;
     let mut packed_of_raster = vec![0_u32; order.len()];
     for (packed, raster_row) in order.iter().enumerate() {
         packed_of_raster[*raster_row as usize] = u32::try_from(packed)
             .map_err(|_| Error::config("a packed row wider than a table entry".to_owned()))?;
     }
     let tokens = u64::from(raster.patch_rows());
-    let clip = clip_canvas(config, canvas);
-    let frames = crate::packing::video_latent_frames(num_frames)?;
-    let clips = (frames - crate::CLIP_LATENTS) / crate::CLIP_FRAMES;
+    let clip = Canvas::clip(config, latent_height, latent_width);
+    let clips = u64::from(latent_frames - crate::CLIP_LATENTS) / u64::from(crate::CLIP_FRAMES);
     let side = u64::from(crate::packing::PATCH_SIDE);
-    let columns = u64::from(raster.width) / side;
-    let mut rows = Vec::with_capacity((u64::from(clips) * clip.voxels()) as usize);
-    for clip_index in 0..u64::from(clips) {
+    let columns = u64::from(latent_width) / side;
+    let mut rows = Vec::with_capacity((clips * clip.voxels()) as usize);
+    for clip_index in 0..clips {
         let start = clip_index * u64::from(crate::CLIP_LATENTS) * tokens;
         for frame in 0..u64::from(clip.frames) {
-            for height in 0..u64::from(raster.height) {
-                for column in 0..u64::from(raster.width) {
+            for height in 0..u64::from(latent_height) {
+                for column in 0..u64::from(latent_width) {
                     let patch = start + frame * tokens + (height / side) * columns + column / side;
                     rows.push(packed_of_raster[patch as usize]);
                 }
@@ -541,20 +545,12 @@ fn voxel_rows(
     Ok(rows)
 }
 
-/// The token canvas of one clip of `canvas`: seven latent frames of its latent raster.
-///
-/// The configuration's canvas is in output pixels; a tile's and a clip's canvas are in latent cells.
-fn clip_canvas(config: &VideoVaeConfig, canvas: &crate::config::Canvas) -> Canvas {
-    let ratio = config.spatial_compression();
-    Canvas::clip(config, canvas.height / ratio, canvas.width / ratio)
-}
-
 /// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
 ///
 /// The grid's tiles are uniform where the canvas is at least one tile wide, so this is the checkpoint's
 /// tile; a canvas narrower than one is its own largest tile.
-fn largest_tile(config: &VideoVaeConfig, canvas: &crate::config::Canvas) -> Result<Canvas> {
-    let clip = clip_canvas(config, canvas);
+fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) -> Result<Canvas> {
+    let clip = Canvas::clip(config, latent_height, latent_width);
     let tiles = Tiles::of(config, &clip)?.tiles(config, &clip);
     tiles
         .iter()
@@ -563,9 +559,102 @@ fn largest_tile(config: &VideoVaeConfig, canvas: &crate::config::Canvas) -> Resu
         .ok_or_else(|| Error::config("a canvas with no tile has no position table".to_owned()))
 }
 
+/// The tables one layout's decode reads, keyed by its latent extents.
+///
+/// These are the model's arithmetic and they are keyed by the **layout**: the rotary positions of the
+/// largest tile of the latent raster (every other tile's are a slice of them, because the tiles are
+/// uniform), and the rows one clip gathers its voxels by. `attention` is the packed order of the
+/// denoiser whose latents this decoder reconstructs, which is a property of the deployment and not of a
+/// request.
+pub(crate) fn table_specs(
+    config: &VideoVaeConfig,
+    attention: AttentionKind,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
+) -> Result<Vec<StateTable>> {
+    let positions = u64::from(positions_table(config, latent_height, latent_width)?);
+    let rows = voxel_rows(
+        config,
+        attention,
+        latent_frames,
+        latent_height,
+        latent_width,
+    )?;
+    Ok(vec![
+        StateTable {
+            name: "video_positions",
+            dtype: DType::F32,
+            shape: Shape::new(&[3, positions]),
+        },
+        StateTable {
+            name: "video_clip_rows",
+            dtype: DType::I32,
+            shape: Shape::new(&[rows.len() as u64]),
+        },
+    ])
+}
+
+/// Write the host bytes of [`table_specs`], in its order, checking every buffer's length.
+pub(crate) fn table_bytes_into(
+    config: &VideoVaeConfig,
+    attention: AttentionKind,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    let tables = table_specs(
+        config,
+        attention,
+        latent_frames,
+        latent_height,
+        latent_width,
+    )?;
+    if out.len() != tables.len() {
+        return Err(Error::config(format!(
+            "{} tables are read and {} buffers given",
+            tables.len(),
+            out.len()
+        )));
+    }
+    let values = positions(&largest_tile(config, latent_height, latent_width)?)?;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    out[0] = bytes;
+    let rows = voxel_rows(
+        config,
+        attention,
+        latent_frames,
+        latent_height,
+        latent_width,
+    )?;
+    let mut bytes = Vec::with_capacity(rows.len() * 4);
+    for row in rows {
+        let row = i32::try_from(row).map_err(|_| {
+            Error::config(format!("the packed row {row} does not fit a table entry"))
+        })?;
+        bytes.extend_from_slice(&row.to_le_bytes());
+    }
+    out[1] = bytes;
+    for (buffer, table) in out.iter().zip(&tables) {
+        let expected = table.shape.numel() as usize * (table.dtype.bits() as usize / 8);
+        if buffer.len() != expected {
+            return Err(Error::config(format!(
+                "{} is {} bytes and the table needs {expected}",
+                table.name,
+                buffer.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rows of the largest tile's position table, the extent every tile's positions are a slice of.
-fn positions_table(config: &VideoVaeConfig, canvas: &crate::config::Canvas) -> Result<u32> {
-    u32::try_from(largest_tile(config, canvas)?.rows())
+fn positions_table(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) -> Result<u32> {
+    u32::try_from(largest_tile(config, latent_height, latent_width)?.rows())
         .map_err(|_| Error::config("a tile taller than a table bound".to_owned()))
 }
 
@@ -808,76 +897,63 @@ fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Wei
 }
 
 impl VideoDecoder {
-    /// The tables one request's decode reads, in [`Self::table_bytes`]'s order.
-    ///
-    /// Both are the model's arithmetic and both are keyed by the request's layout: the rotary
-    /// positions of the largest tile of `canvas` (every other tile's are a slice of them, because the
-    /// tiles are uniform), and the rows one clip gathers its voxels by. The packed order is the
-    /// denoiser's, so `attention` and `num_frames` come from the request.
+    /// The tables one layout's decode reads, in [`table_bytes_into`]' order.
     pub fn tables(
         &self,
-        canvas: &crate::config::Canvas,
-        num_frames: u32,
         attention: AttentionKind,
+        latent_frames: u32,
+        latent_height: u32,
+        latent_width: u32,
     ) -> Result<Vec<StateTable>> {
-        let positions = u64::from(positions_table(&self.config, canvas)?);
-        let rows = voxel_rows(&self.config, attention, num_frames, canvas)?;
-        Ok(vec![
-            StateTable {
-                name: "video_positions",
-                dtype: DType::F32,
-                shape: Shape::new(&[3, positions]),
-            },
-            StateTable {
-                name: "video_clip_rows",
-                dtype: DType::I32,
-                shape: Shape::new(&[rows.len() as u64]),
-            },
-        ])
+        table_specs(
+            &self.config,
+            attention,
+            latent_frames,
+            latent_height,
+            latent_width,
+        )
     }
 
     /// Write the host bytes of each table of [`Self::tables`], in the same order.
     pub fn table_bytes(
         &self,
-        canvas: &crate::config::Canvas,
-        num_frames: u32,
+        attention: AttentionKind,
+        latent_frames: u32,
+        latent_height: u32,
+        latent_width: u32,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        table_bytes_into(
+            &self.config,
+            attention,
+            latent_frames,
+            latent_height,
+            latent_width,
+            out,
+        )
+    }
+
+    /// The layout's tables, keyed by the extents the layout states.
+    ///
+    /// This is the shape the capability protocol asks for; a request's own state is none of it.
+    pub fn layout_tables(
+        &self,
+        layout: &nn::capability::Layout,
+        attention: AttentionKind,
+    ) -> Result<Vec<StateTable>> {
+        let video = layout.video;
+        self.tables(attention, video.frames, video.height, video.width)
+    }
+
+    /// Write the layout's table bytes, in [`Self::layout_tables`]' order.
+    pub fn prepare_layout(
+        &self,
+        layout: &nn::capability::Layout,
         attention: AttentionKind,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
-        let tables = self.tables(canvas, num_frames, attention)?;
-        if out.len() != tables.len() {
-            return Err(Error::config(format!(
-                "{} tables are read and {} buffers given",
-                tables.len(),
-                out.len()
-            )));
-        }
-        let values = positions(&largest_tile(&self.config, canvas)?)?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        out[0] = bytes;
-        let rows = voxel_rows(&self.config, attention, num_frames, canvas)?;
-        let mut bytes = Vec::with_capacity(rows.len() * 4);
-        for row in rows {
-            let row = i32::try_from(row).map_err(|_| {
-                Error::config(format!("the packed row {row} does not fit a table entry"))
-            })?;
-            bytes.extend_from_slice(&row.to_le_bytes());
-        }
-        out[1] = bytes;
-        for (buffer, table) in out.iter().zip(&tables) {
-            let expected = table.shape.numel() as usize * (table.dtype.bits() as usize / 8);
-            if buffer.len() != expected {
-                return Err(Error::config(format!(
-                    "{} is {} bytes and the table needs {expected}",
-                    table.name,
-                    buffer.len()
-                )));
-            }
-        }
-        Ok(())
+        let video = layout.video;
+        self.table_bytes(attention, video.frames, video.height, video.width, out)
     }
 
     /// Decode one clip's latent rows into the pixel block of every token.
@@ -1073,16 +1149,23 @@ pub(crate) mod tests {
             width: 1344,
             height: 768,
         };
-        let frames = 124;
+        // The layout's own extents: the canvas over the spatial compression, and the latent frame count
+        // the request's frames encode to.
+        let raster = crate::packing::latent_raster(&canvas).expect("raster");
+        let latent_frames = crate::packing::video_latent_frames(1).expect("frames");
         // One entry per latent voxel of one clip, and the values are the packed rows of the patches
         // those voxels lie in - not the voxel indices, which is the factor of the patch area apart.
-        let rows = voxel_rows(&config, AttentionKind::Dense, frames, &canvas).expect("rows");
-        let clip = clip_canvas(&config, &canvas);
-        let clips = (crate::packing::video_latent_frames(frames).expect("frames")
-            - crate::CLIP_LATENTS)
-            / crate::CLIP_FRAMES;
+        let rows = voxel_rows(
+            &config,
+            AttentionKind::Dense,
+            latent_frames,
+            raster.height,
+            raster.width,
+        )
+        .expect("rows");
+        let clip = Canvas::clip(&config, raster.height, raster.width);
+        let clips = (latent_frames - crate::CLIP_LATENTS) / crate::CLIP_FRAMES;
         assert_eq!(rows.len() as u64, u64::from(clips) * clip.voxels());
-        let raster = crate::packing::latent_raster(&canvas).expect("raster");
         let side = u64::from(crate::packing::PATCH_SIDE);
         let columns = u64::from(raster.width) / side;
         let per_frame = u64::from(raster.patch_rows());
@@ -1103,14 +1186,14 @@ pub(crate) mod tests {
             );
         }
         // Every value is a row of the packed sequence the denoiser writes.
-        let packed = crate::packing::video_order(AttentionKind::Dense, frames, &canvas)
+        let packed = crate::packing::video_order_of(AttentionKind::Dense, latent_frames, raster)
             .expect("order")
             .len() as u64;
         assert!(rows.iter().all(|row| u64::from(*row) < packed));
         assert!(per_frame < packed);
         // The position table is axis-major over the largest tile's rows, and the register rows and the
         // trailing zero row carry no coordinate.
-        let tile = largest_tile(&config, &canvas).expect("a tile");
+        let tile = largest_tile(&config, raster.height, raster.width).expect("a tile");
         let table = positions(&tile).expect("positions");
         assert_eq!(table.len() as u64, 3 * tile.rows());
         for channel in 0..3u64 {
@@ -1118,6 +1201,32 @@ pub(crate) mod tests {
                 assert_eq!(table[(channel * tile.rows() + row) as usize], 0.0);
             }
         }
+        // The two tables a layout declares are the two this decoder reads, and their descriptors are
+        // the extents the layout states - the adapter adds no arithmetic of its own.
+        let layout = nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: config.latent_channels,
+                frames: latent_frames,
+                height: raster.height,
+                width: raster.width,
+            },
+            audio: None,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let declared = table_specs(
+            &config,
+            AttentionKind::Dense,
+            layout.video.frames,
+            layout.video.height,
+            layout.video.width,
+        )
+        .expect("specs");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].name, "video_positions");
+        assert_eq!(declared[1].name, "video_clip_rows");
+        assert_eq!(declared[1].shape.numel(), rows.len() as u64);
     }
 
     #[test]
