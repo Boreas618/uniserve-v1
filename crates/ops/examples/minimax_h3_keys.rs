@@ -772,10 +772,14 @@ fn main() {
     // itself (the tile reduction and its stride) is `vsa_prepare_tiles`' launch values.
     push(
         "vsa_scores",
-        // FP32: `vsa_prepare_tiles` writes each tile's per-head means in FP32, so the product has no
-        // element-type field at all.
-        ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
-            .to_string(),
+        ops::segments::ScoresDescriptor::new(
+            DType::BF16,
+            HEADS,
+            HEAD_DIM,
+            HEAD_DIM.next_power_of_two(),
+            PDL,
+        )
+        .to_string(),
     );
 
     // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
