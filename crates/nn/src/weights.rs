@@ -2007,6 +2007,60 @@ fn f32_to_half(value: f32) -> u16 {
 mod tests {
     use super::*;
 
+    /// The block-scale arrangement is the launcher's `computeSFIndex`: a permutation of the
+    /// checkpoint's row-major table into the 128x4 layout, padded with zeros.
+    ///
+    /// Three properties, and the third is the one that catches a skipped arrangement: the values
+    /// survive exactly once each; the result is not the padded row-major table, so an arrangement that
+    /// never ran fails here rather than passing as "the same numbers"; and one index follows the
+    /// reference's own arithmetic
+    /// (`(column % 4) + (column / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
+    /// (row / 128) * (128 * padded_columns)`), so a bijection that moved the right values to the wrong
+    /// places is not mistaken for the layout the products read.
+    ///
+    /// The shapes keep `rows * blocks` inside a byte, because the table is bytes: `(56, 4)` pads the
+    /// rows only and `(8, 8)` pads both axes.
+    #[test]
+    fn the_block_scales_are_permuted_into_the_laid_out_table() {
+        for (rows, blocks) in [(56_u64, 4_u64), (8, 8)] {
+            let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
+            let swizzled = swizzled_scales(&linear, rows, blocks);
+            let padded_rows = rows.div_ceil(128) * 128;
+            let padded_columns = blocks.div_ceil(4) * 4;
+            assert_eq!(
+                swizzled.len() as u64,
+                padded_rows * padded_columns,
+                "the table is padded to 128 rows and 4 columns"
+            );
+
+            let mut present: Vec<u8> = swizzled.iter().copied().filter(|value| *value != 0).collect();
+            let mut expected = linear.clone();
+            present.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(present, expected, "every scale survives exactly once");
+
+            let mut row_major = vec![0_u8; (padded_rows * padded_columns) as usize];
+            for row in 0..rows {
+                for column in 0..blocks {
+                    row_major[(row * padded_columns + column) as usize] =
+                        linear[(row * blocks + column) as usize];
+                }
+            }
+            assert_ne!(
+                swizzled, row_major,
+                "an arrangement that never ran is the row-major table"
+            );
+        }
+
+        // One index from the formula, at a row inside the first thirty-two and a column past the
+        // first group of four: the values are `row * blocks + column`, so this one is 5 * 8 + 6.
+        let (rows, blocks) = (128_u64, 8_u64);
+        let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
+        let swizzled = swizzled_scales(&linear, rows, blocks);
+        let index = 594_usize;
+        assert_eq!(swizzled[index], (5 * blocks + 6) as u8);
+    }
+
     #[test]
     fn half_round_trips_the_values_a_checkpoint_holds() {
         // A subnormal half has an absolute precision of 2^-24, not a relative one, so the bound is
