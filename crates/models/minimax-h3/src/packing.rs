@@ -845,10 +845,15 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
             None => None,
             Some(frame) => {
                 let raster = latent_raster(&frame.canvas)?;
+                // A still is one frame and one latent frame, with no repeat to the clip count: the
+                // reference returns 1 for `num_frames == 1` and its causal front padding agrees.
+                // A clip of any other length rounds **up**, because the reference repeats its last
+                // frame to the clip alignment rather than refusing the media - a 30-frame reference
+                // encodes as a 39-frame one.
                 let frames = if frame.num_frames == 1 {
                     1
                 } else {
-                    video_latent_frames(frame.num_frames)?
+                    video_latent_frames(align_num_frames(frame.num_frames))?
                 };
                 Some(Visual { frames, raster })
             }
@@ -2273,6 +2278,31 @@ mod tests {
             audio_samples: 0,
         };
         assert!(condition_segments(&[off_canvas], &target).is_err());
+    }
+
+    #[test]
+    fn a_reference_clip_of_any_length_rounds_up_to_the_clip_alignment() {
+        // The reference repeats a clip's last frame to the alignment rather than refusing the media,
+        // so a 30-frame reference encodes as a 39-frame one: two clips, twelve latent frames.
+        let target = canvas();
+        let clip = Condition {
+            role: Role::Reference,
+            frame: Some(Frame {
+                canvas: target,
+                num_frames: 30,
+            }),
+            audio_samples: 0,
+        };
+        let segments = condition_segments(&[clip], &target).expect("a short reference clip");
+        let visual = segments[0].visual.expect("pixels");
+        let aligned = align_num_frames(30);
+        assert_eq!(aligned % CLIP_FRAMES, CLIP_LATENTS);
+        assert!(aligned >= 30);
+        assert_eq!(
+            visual.frames,
+            video_latent_frames(aligned).expect("aligned")
+        );
+        assert_eq!(visual.frames, 12);
     }
 
     #[test]
