@@ -62,6 +62,10 @@ pub struct Memory {
     pub slots: RequestSlots,
     /// The page-locked host blocks copies go through.
     pub pinned: Arc<PinnedPool>,
+    /// The device's pools, which the scratch page set a paired forward writes
+    /// is taken from: its bytes are booked against the same allowance as every
+    /// other pool, so the shadow never writes memory the report cannot see.
+    pub pools: Arc<Mutex<crate::arena::Pools>>,
 }
 
 /// What the main process hands [`Memory::new`]: the sized plan and the
@@ -93,6 +97,9 @@ pub struct MemoryRequest<'a> {
     pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
     /// The pool's completion events.
     pub events: Arc<crate::stream::EventPool>,
+    /// The device's pools, which a paired forward's scratch page set is taken
+    /// from.
+    pub pools: Arc<Mutex<crate::arena::Pools>>,
 }
 
 /// What the main process hands [`open_memory`]: the parts only the deployment
@@ -118,6 +125,9 @@ pub struct OpenMemory<'a> {
     pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
     /// The pool's completion events.
     pub events: Arc<crate::stream::EventPool>,
+    /// The device's pools, which a paired forward's scratch page set is taken
+    /// from.
+    pub pools: Arc<Mutex<crate::arena::Pools>>,
 }
 
 /// Build every resident owner the plan sized: the cache planes and block
@@ -146,6 +156,7 @@ pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) 
             import_capacity: info.max_unresolved_calls as usize,
             conversion: request.conversion,
             events: request.events,
+            pools: request.pools,
         },
         storage,
     )
@@ -225,6 +236,7 @@ impl Memory {
             products,
             slots,
             pinned,
+            pools: request.pools,
         })
     }
 
@@ -241,7 +253,9 @@ impl Memory {
             mut products,
             slots,
             pinned,
+            pools,
         } = self;
+        drop(pools);
         // The products go first: their reads retain views into the cache, and the cache's
         // segments are the last thing an epoch gives back.
         let drained = products.close();
@@ -304,6 +318,12 @@ impl Memory {
         lock(&self.prefix_cache)
             .planes()
             .restore_segments(storage, stream, limit)
+    }
+
+    /// The device's pools, so a paired forward can take its scratch page set
+    /// from the same allowance as every other pool.
+    pub fn pools(&self) -> Arc<Mutex<crate::arena::Pools>> {
+        Arc::clone(&self.pools)
     }
 
     /// The cache pool as a reader shares it: the runner's provider holds this
