@@ -7,9 +7,13 @@
 // of those responses from the process it replaces. Each response stops at an
 // event boundary: the predecessor produced every body frame of the events it
 // consumed, and what it did not write to the socket travels here as bytes.
-// The successor writes those bytes, submits the request's continuation to the
-// engine that serves next and produces the frames of the events after it, so
-// the client reads one continuous response.
+//
+// The engine request keeps running: the successor takes its event stream over
+// from the position the response consumed (`uniserve.request.Command.Takeover`)
+// and produces the frames of the events after it, so the client reads one
+// continuous response and the request's tokens are computed once. Nothing here
+// is a submission: the request's facts travel as the record of what the
+// response's pipeline processed, not to be sent again.
 //
 // Like `request.proto` and `process.proto`, this schema changes only by
 // additions: a field is never renumbered or removed. A successor of a later
@@ -69,9 +73,12 @@ message Http {
 // A chat completion streamed as server-sent events, stopped at an event
 // boundary.
 message ChatStream {
-  // The request as this process submitted it last, with the tokens it
-  // generated (`uniserve.request.GenerationRequest`): the successor submits it
-  // again to the engine that serves next.
+  // The request as this process submitted it, with the tokens it generated
+  // (`uniserve.request.GenerationRequest`), for its record; the successor
+  // does not submit it again. It takes the engine's own event stream for the
+  // request over from `engine_consumed` (`uniserve.request.Command.Takeover`),
+  // so the request keeps generating in the engine that serves it and no token
+  // is computed twice.
   bytes request = 1;
   // How input processing lowered the request into the response, which the
   // successor reconstructs instead of lowering the request again: a later
@@ -92,11 +99,16 @@ message ChatStream {
   // Whether the terminal usage chunk (stream_options.include_usage) is still
   // owed to the client.
   bool usage_owed = 9;
+  // The request's identity in the engine that serves it: the stream the
+  // successor takes over (with `consumed_events`) instead of submitting the
+  // request again.
+  string engine_request_id = 10;
 }
 
 // One chat completion answered as a single JSON body.
 message ChatResponse {
-  // The request as submitted, as `ChatStream.request`.
+  // The request as submitted, as `ChatStream.request`: its record, not a
+  // submission the successor repeats.
   bytes request = 1;
   // How input processing lowered the request, as `ChatStream.lowering`.
   Lowering lowering = 2;
@@ -109,8 +121,12 @@ message ChatResponse {
   // What the non-streaming response collected: the message, token ids,
   // logprobs, images and usage.
   ChatCollection collection = 6;
-  uint64 consumed_events = 7;
-  uint64 consumed_tokens = 8;
+  // The request's identity in the engine that serves it, as
+  // `ChatStream.engine_request_id`; `consumed_events` and `consumed_tokens`
+  // are `ChatStream.consumed_events` and `ChatStream.consumed_tokens`.
+  string engine_request_id = 7;
+  uint64 consumed_events = 8;
+  uint64 consumed_tokens = 9;
 }
 
 // A video job's artifact streamed as the response body.
