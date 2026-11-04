@@ -1651,7 +1651,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         })?;
         let mut harness = self.shadow.take().ok_or_else(|| {
             Error::State(
-                "the runner has no shadow harness: it is allocated when the runner is bound".into(),
+                "the runner has no shadow harness: it is allocated when the runner is bound",
             )
         })?;
         harness.reset();
@@ -2076,7 +2076,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ) -> Result<()> {
         let Some(sampling) = &self.sampling else {
             return Err(Error::State(
-                "the runner has no sampler but the bucket samples".into(),
+                "the runner has no sampler but the bucket samples",
             ));
         };
         let rows = u64::from(bucket.rows);
