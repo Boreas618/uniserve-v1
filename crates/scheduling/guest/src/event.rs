@@ -47,6 +47,11 @@ pub enum Event {
     Arrived { request: RequestView },
     /// The mechanism admitted a queued request.
     Admitted { request: RequestId },
+    /// A resident request's view changed in a way the policy must see: its
+    /// next phase changed, its prompt progress or cached prefix moved, its
+    /// page count changed. Emitted before the `dispatch` of the step the
+    /// change belongs to, and always after the event that caused it.
+    Updated { request: RequestView },
     /// A call of the request advanced: its phase ran and produced `tokens`
     /// tokens (or latent units, for a media phase). One event per completed
     /// piece of work the policy put in a `Plan`.

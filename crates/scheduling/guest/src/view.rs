@@ -100,6 +100,11 @@ pub struct RequestView {
     /// Tokens of its prompt the prefix cache already holds.
     #[serde(default)]
     pub cached_prefix_tokens: u32,
+    /// Prompt tokens the runtime has computed so far (the next prefill chunk
+    /// starts here). Together with `cached_prefix_tokens` it gives the chunk
+    /// start and so the distance to the next KV page boundary.
+    #[serde(default)]
+    pub prefilled_tokens: u32,
     /// KV pages it currently holds.
     #[serde(default)]
     pub cached_pages: u32,
@@ -113,6 +118,12 @@ pub struct RequestView {
     /// starved (design §4.4: "驻留且不在等传输的请求超过 ... timeout").
     #[serde(default)]
     pub waiting_transfer: bool,
+    /// The rank recorded for the request's cache resume, when it resumes a
+    /// stored cache. `route` returns this rank when it is set; the mechanism
+    /// skips the routing decision for it (today `Routing::pick` is skipped the
+    /// same way).
+    #[serde(default)]
+    pub cache_rank: Option<usize>,
 }
 
 /// One phase of the epoch: a block's computation for one kind of call.
@@ -281,6 +292,10 @@ pub struct ReplicaView {
     /// `component_target`).
     #[serde(default)]
     pub holds_request: bool,
+    /// Whether it runs prefill only, so a decode-stage call never lands on it
+    /// (today `placement.rs`'s prefill-only groups).
+    #[serde(default)]
+    pub prefills_only: bool,
 }
 
 /// The call a `place` decision is about: a request's first call on a block.
