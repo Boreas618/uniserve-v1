@@ -103,6 +103,14 @@ pub struct ExecutionBatch {
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
+    /// The batch's columns in the layout the kernels read, filled when the
+    /// mechanism assembles the batch (design §4.3, `executor::BatchColumns`).
+    ///
+    /// The batch carries them so that a submission hands the executor one value
+    /// and nothing re-derives the layout from the calls. `None` means the
+    /// mechanism could not state them — a batch no executor may serve, as
+    /// opposed to one served on invented values.
+    pub columns: Option<executor::batch::BatchColumns>,
 }
 
 /// Published pages one worker group writes to the host KV cache, for
@@ -132,6 +140,7 @@ impl ExecutionBatch {
             input_transfers,
             cache_inputs: Vec::new(),
             page_offloads: None,
+            columns: None,
         }
     }
 
