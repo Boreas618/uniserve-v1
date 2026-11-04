@@ -753,39 +753,12 @@ async fn prepared_successor(
         observer,
         updates,
     )?);
-    // The successor adopts the epoch that serves: without its record the
-    // epoch layer would say no epoch serves and refuse the next switch
-    // ("nothing to switch from"), and without the process row it would
-    // number a new child at 1 again, under a live process's generation
-    // (§2.5, §7.4, §7.5). The record's build config and programs are the
-    // ones the adopted configuration fills; its generation is the launch
-    // generation the child reported, which is the identity it runs under.
+    // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
-        let deployment = crate::epoch::Deployment::of(options.clone());
-        epoch_records.record(
-            adopted_world,
-            crate::epoch::EpochRecord {
-                build_config: deployment.build_config.clone(),
-                kernels: deployment.programs.kernels.clone(),
-                policy: deployment.programs.policy.clone(),
-                previous_kernels: std::collections::BTreeMap::new(),
-                previous_policy: None,
-                status: crate::epoch::Status::Serving,
-                generation: Some(handed.engine),
-                world: adopted_world,
-            },
-        );
+        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options);
+        epoch_records.record(adopted_world, record);
         let mut processes = epoch_records.processes();
-        processes.push(crate::epoch::ManagedProcess {
-            role: crate::epoch::Role::MainProcess,
-            group: crate::engine::control::ENGINE_GROUP.to_owned(),
-            rank: 0,
-            pid: None,
-            epoch: Some(adopted_world),
-            build: deployment.build_config.executable.clone(),
-            generation: handed.engine,
-            state: crate::epoch::ProcessState::Serving,
-        });
+        processes.push(process);
         epoch_records.set_processes(processes);
     }
     let first = Arc::clone(&leader.replicas()[0]);
@@ -952,4 +925,63 @@ async fn prepared_successor(
     }
     let served = served.map(drop);
     crate::http::finish(&config, &leader, daemon, retire, handed_over, served).await
+}
+
+/// The epoch record and the process row of an epoch a restarting daemon
+/// adopts: the build config and the programs the adopted configuration
+/// fills, serving, at the launch generation the child reported (which is the
+/// identity it runs under, §7.4).
+///
+/// Without the record the epoch layer says no epoch serves and refuses the
+/// next switch; without the row the next launch would be numbered 1 again,
+/// under a live child's generation (§2.5).
+fn adopted_epoch(
+    world: u64,
+    engine: u64,
+    options: &crate::options::ServeConfig,
+) -> (crate::epoch::EpochRecord, crate::epoch::ManagedProcess) {
+    let deployment = crate::epoch::Deployment::of(options.clone());
+    let record = crate::epoch::EpochRecord {
+        build_config: deployment.build_config.clone(),
+        kernels: deployment.programs.kernels.clone(),
+        policy: deployment.programs.policy.clone(),
+        previous_kernels: std::collections::BTreeMap::new(),
+        previous_policy: None,
+        status: crate::epoch::Status::Serving,
+        generation: Some(engine),
+        world,
+    };
+    let process = crate::epoch::ManagedProcess {
+        role: crate::epoch::Role::MainProcess,
+        group: crate::engine::control::ENGINE_GROUP.to_owned(),
+        rank: 0,
+        pid: None,
+        epoch: Some(world),
+        build: deployment.build_config.executable.clone(),
+        generation: engine,
+        state: crate::epoch::ProcessState::Serving,
+    };
+    (record, process)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The adopted epoch states the configuration it serves, at the launch
+    /// generation its child reported, so a later switch compares against it
+    /// and numbers its children above it.
+    #[test]
+    fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
+        let options = crate::options::ServeConfig::default();
+        let (record, process) = adopted_epoch(7, 12, &options);
+        assert_eq!(record.status, crate::epoch::Status::Serving);
+        assert_eq!(record.world, 7);
+        assert_eq!(record.generation, Some(12));
+        assert_eq!(record.build_config, crate::epoch::BuildConfig::of(&options));
+        assert_eq!(process.generation, 12);
+        assert_eq!(process.epoch, Some(7));
+        assert_eq!(process.state, crate::epoch::ProcessState::Serving);
+        assert_eq!(process.role, crate::epoch::Role::MainProcess);
+    }
 }
