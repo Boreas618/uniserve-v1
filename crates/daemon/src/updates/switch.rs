@@ -796,8 +796,11 @@ impl Switch {
         use process::report::Kind;
         // Whichever report it is, it comes from a process of that generation:
         // the highest one seen is the epoch's current generation, which the
-        // commit's and the revert's acks therefore keep up to date.
-        if self.is_target(generation) {
+        // commit's and the revert's acks therefore keep up to date. While the
+        // return is under way the epoch's generation is settled — a successor
+        // of the previous epoch reports from a number above the target's, and
+        // it must not become the generation the target is stopped at.
+        if self.pending_restore.is_none() && self.is_target(generation) {
             self.accept(generation);
         }
         // The kind drives the phase; the whole report still states a failure.
