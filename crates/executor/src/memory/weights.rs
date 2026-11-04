@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_published_weight_is_a_hit_and_asks_the_storage_once() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let published = store
@@ -346,12 +346,12 @@ mod tests {
         let bytes = vec![0_u8; 4 * 8 * 2];
 
         // Another rank of the deployment publishes it first.
-        let mut other = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut other = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         other
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
             .expect("a well-formed weight");
 
-        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert_eq!(storage.fetches.load(Ordering::Relaxed), 1);
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_weight_nothing_published_is_a_miss_that_is_not_remembered() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         assert!(store.retained(&weight).expect("a miss").is_none());
         assert!(store.retained(&weight).expect("a miss").is_none());
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn publishing_under_a_key_of_another_element_type_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::F32, ops::Shape::new(&[4, 8]), &[0_u8; 128])
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn publishing_a_byte_count_the_shape_does_not_state_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &[0_u8; 7])
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn publishing_the_same_weight_twice_answers_the_region_it_holds() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let first = store
@@ -411,7 +411,7 @@ mod tests {
 
     impl WeightStorage for Shared {
         fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
-            self.0.fetch(key)
+            self.0.fetch(platform::DeviceId(0), key)
         }
 
         fn store(
@@ -420,7 +420,7 @@ mod tests {
             key: &[u8; 32],
             bytes: &[u8],
         ) -> Result<Backing> {
-            self.0.store(key, bytes)
+            self.0.store(platform::DeviceId(0), key, bytes)
         }
     }
 }
