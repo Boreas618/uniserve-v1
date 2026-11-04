@@ -50,9 +50,10 @@ pub mod tensor;
 pub mod weights;
 
 pub use capability::{
-    BatchRow, BatchRows, CausalLm, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder,
-    EncoderInputs, EncoderOutputs, ImageInput, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind,
-    Seed, StateTable, Step, TokenBatch, VideoRequest, VideoTask,
+    BatchRow, BatchRows, CausalLm, ConditionRole, ConditionShape, Conditioning, DecodedMedia,
+    Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt,
+    ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable,
+    Step, TokenBatch, VideoRequest, VideoTask,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
@@ -65,8 +66,8 @@ pub use layers::{
     GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey, PackedSwiGlu,
     ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation, Sampler, SamplerState,
     Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections,
-    Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
-    gather_rows,
+    SegmentAttention, SegmentTables, Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
+    VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
