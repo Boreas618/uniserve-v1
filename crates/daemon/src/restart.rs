@@ -823,7 +823,7 @@ async fn prepared_successor(
     if !streams.is_empty() {
         let adopting = Arc::clone(&leader);
         let mut sockets = std::iter::from_fn(|| next().ok());
-        let adopted = streams::adopt(&adopting, streams, &mut || {
+        let adopted = streams::adopt(&adopting, streams, &video_jobs, &mut || {
             sockets
                 .next()
                 .context("the takeover lacks a response's descriptor")

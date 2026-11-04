@@ -94,6 +94,27 @@ impl std::fmt::Debug for ProcessCommands {
 }
 
 impl ProcessCommands {
+    /// The two ends of the daemon's command channel: the daemon's, and the
+    /// service's — the commands it drains each round, and the reports it
+    /// fills.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn channel() -> (
+        Self,
+        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
+    ) {
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            },
+            commands_rx,
+            reports,
+        )
+    }
+
     /// Sends `command` to engine `engine`'s main process.
     ///
     /// # Errors
@@ -130,11 +151,13 @@ pub struct Daemon {
     /// supervises; `None` on a member daemon, which supervises none.
     commands: Option<ProcessCommands>,
     /// The epoch layer's ends of the service on the leader: its requests
-    /// down, and the peers and exits up. `None` on a member.
-    link: Option<roster::EpochLink>,
+    /// down, and the peers and exits up. `None` on a member. Taken once, by
+    /// the adapter; behind a lock because a `Daemon` is shared between the
+    /// HTTP threads and the channel ends are not themselves `Sync`.
+    link: std::sync::Mutex<Option<roster::EpochLink>>,
     /// One token per thing the epoch layer has to read, so the thread that
     /// advances the switch waits instead of polling.
-    awake: Option<std::sync::mpsc::Receiver<()>>,
+    awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// The process socket engines connect to, on the leader.
     address: Option<String>,
     /// The leader's socket file, removed once its service ends.
@@ -260,8 +283,8 @@ impl Daemon {
         let (address, socket) = served.unzip();
         Ok(Self {
             commands,
-            link,
-            awake,
+            link: std::sync::Mutex::new(link),
+            awake: std::sync::Mutex::new(awake),
             address,
             socket: socket.flatten(),
             requested,
@@ -333,8 +356,8 @@ impl Daemon {
         };
         let (address, socket) = address.unzip();
         Ok(Self {
-            link,
-            awake: leader.then_some(awake),
+            link: std::sync::Mutex::new(link),
+            awake: std::sync::Mutex::new(leader.then_some(awake)),
             commands,
             address,
             socket: socket.flatten(),
@@ -378,15 +401,18 @@ impl Daemon {
 
     /// The epoch layer's ends of this node's service: `None` on a member
     /// daemon, and once taken, `None` again — one adapter owns them.
-    pub(crate) fn epoch_link(&mut self) -> Option<roster::EpochLink> {
-        self.link.take()
+    pub(crate) fn epoch_link(&self) -> Option<roster::EpochLink> {
+        self.link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// The epoch layer of `deployment`: the driver the update entry and the
     /// adapter share, over `epochs` and this node's service (§7.4, §2.5).
     /// `None` on a member daemon, which commands no deployment's processes.
     pub(crate) fn updates(
-        &mut self,
+        &self,
         epochs: Arc<crate::epoch::Epochs>,
         deployment: String,
     ) -> Option<(
@@ -394,7 +420,11 @@ impl Daemon {
         std::sync::mpsc::Receiver<()>,
     )> {
         let link = self.epoch_link()?;
-        let awake = self.awake.take()?;
+        let awake = self
+            .awake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
         let roster = roster::ProcessRoster::new(epochs.clone(), deployment, Vec::new(), link);
         Some((
             Arc::new(crate::updates::driver::Driver::new(
