@@ -69,7 +69,11 @@ def _top_k_kernel(
     """
     row = tl.program_id(0).to(tl.int64)
     base = row * vocabulary
+    # `taken` is the quota the prefix's equal keys still hold, and it starts as the width; `live` is
+    # the width itself, and every bound on a slot index is this one - a slot bound read from the
+    # quota stopped at the last slot the equal keys filled and left the rest of the row stale.
     taken = width.to(tl.int32)
+    live_width = taken
     # The buffers' row stride is the live candidate count, not the sort's padded width.
     stride = width.to(tl.int64)
     columns = tl.arange(0, STEP)
@@ -119,11 +123,15 @@ def _top_k_kernel(
         gt = (keys > prefix) & live
         eq = (keys == prefix) & live
         slot_gt = filled + tl.cumsum(gt.to(tl.int32), axis=0) - 1
-        keep_gt = gt & (slot_gt < taken)
+        # The keys strictly above the selected value fill the low slots, and their count is
+        # `above`, not `taken`: `taken` is the quota the *equal* keys still hold (`above + taken`
+        # is the candidate width the whole way down), so bounding the greater keys by it dropped
+        # every one of them past the quota and left the row with a single slot written.
+        keep_gt = gt & (slot_gt < above)
         tl.store(values_ptr + row * stride + slot_gt, values, mask=keep_gt)
         tl.store(ids_ptr + row * stride + slot_gt, lanes.to(tl.int32), mask=keep_gt)
-        slot_eq = above + equal_count + tl.cumsum(eq.to(tl.int32), axis=0) - 1
-        keep_eq = eq & (slot_eq < taken)
+        slot_eq = above + tl.cumsum(eq.to(tl.int32), axis=0) - 1
+        keep_eq = eq & (slot_eq < above + taken)
         tl.store(values_ptr + row * stride + slot_eq, values, mask=keep_eq)
         tl.store(ids_ptr + row * stride + slot_eq, lanes.to(tl.int32), mask=keep_eq)
         filled += tl.sum(gt.to(tl.int32), axis=0)
@@ -131,10 +139,15 @@ def _top_k_kernel(
 
     # Slots the row did not fill keep a sentinel that sorts last: the lanes it did not fill inside
     # the live width, and - through the load's `other` below - the padding lanes of the network.
+    #
+    # The written slots are `[0, above)` and then the equal keys the quota still holds, so the count
+    # is `above + min(equal, taken - above)` - never `filled + equal_count`, which counts equal keys
+    # the quota refuses and so would leave slots below `taken` holding whatever the buffer had,
+    # and a stale positive key sorts above every real candidate.
     tl.debug_barrier()
     slots = tl.arange(0, WIDTH)
-    filled_slots = tl.minimum(tl.maximum(filled, above + equal_count), taken)
-    empty = (slots >= filled_slots) & (slots < taken)
+    written = tl.minimum(above + equal_count, live_width)
+    empty = (slots >= written) & (slots < live_width)
     tl.store(values_ptr + row * stride + slots, -float("inf"), mask=empty)
     tl.store(ids_ptr + row * stride + slots, 0, mask=empty)
 
@@ -143,15 +156,19 @@ def _top_k_kernel(
     # `WIDTH` lanes wide; the lanes past the live width read a sentinel that sorts last and are
     # never stored, so the padded network touches nothing outside the row.
     tl.debug_barrier()
-    in_row = slots < taken
+    in_row = slots < live_width
     pairs = tl.load(values_ptr + row * stride + slots, mask=in_row, other=-float("inf"))
     identities = tl.load(ids_ptr + row * stride + slots, mask=in_row, other=0).to(tl.int64)
-    packed = (_monotone(pairs).to(tl.int64) << 32) | (0xFFFFFFFF - identities)
+    # The key is packed into the high half of an int64 with its top bit taken off the key and put
+    # back on the signed side: a monotone key of a positive logit has its top bit set, and shifting
+    # it into place without this wrap overflowed into the sign bit, so the row's real candidates
+    # sorted below every sentinel.
+    packed = (_monotone(pairs).to(tl.int64) << 31) | (0x7FFFFFFF - identities)
     ordered = tl.sort(packed, dim=0, descending=True)
-    keys = (ordered >> 32).to(tl.uint32)
+    keys = (ordered >> 31).to(tl.uint32)
     tl.store(values_ptr + row * stride + slots, _value_of(keys), mask=in_row)
     tl.store(
         ids_ptr + row * stride + slots,
-        (0xFFFFFFFF - (ordered & 0xFFFFFFFF)).to(tl.int32),
+        (0x7FFFFFFF - (ordered & 0x7FFFFFFF)).to(tl.int32),
         mask=in_row,
     )
