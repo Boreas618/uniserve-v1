@@ -54,7 +54,7 @@ use crate::audio_vae::Binder;
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{Seams, MINIMUM_OVERLAP, TILE_PIXELS};
+use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
 use crate::{Error, Result};
 
 /// The spatial compression of the video encoder: input pixels per latent position.
@@ -626,12 +626,12 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
 
+use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
     GatedActivation, LayerNorm, Linear, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::Forward;
 use nn::{DType, Shape, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
