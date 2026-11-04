@@ -5,11 +5,12 @@ argument signature in the order the operator launches them, the compile-time val
 dimensions give, and the compilation options. The Program Server's Triton source drives
 ``_compile`` with it.
 
-Every field of the descriptor is baked in — the operator's key names the grid, the patch and the
-affine flag, because a model's raster is its own geometry — and only the launch's block width and
-its PDL flag travel as words. The affine form's launch carries two more operands, so its signature
-has two more pointers; a non-affine module's does not, and a launch that hands them anyway is
-refused by the operator before it reaches the kernel.
+Nothing of the raster is baked in: the channels, the token grid, the patch and the block all travel
+as words, so one module of a form serves every clip and every canvas, and a request shape the
+manifest never guessed is not a missing kernel. What is compiled is the element type and the affine
+form — the latter because its launch carries two more operands, so its signature has two more
+pointers; a non-affine module's does not, and a launch that hands them anyway is refused by the
+operator before it reaches the kernel.
 """
 
 import _compile

@@ -396,7 +396,7 @@ def check_gated(case, generator, dtype, width, rows, gate, indices):
         gate,
         indices,
         case["gate_stride"],
-        ELEMENTS=elements,
+        elements,
         WIDTH=width,
         BLOCK=GATED_BLOCK,
     )

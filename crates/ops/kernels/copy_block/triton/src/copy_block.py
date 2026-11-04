@@ -54,16 +54,37 @@ def _copy_block_kernel(
     """
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = index < total
+    # The extents arrive unsigned and the index is signed: one signedness for the decomposition, or
+    # Triton refuses the modulo rather than guessing which one was meant.
+    e0 = e0.to(tl.int64)
+    e1 = e1.to(tl.int64)
+    e2 = e2.to(tl.int64)
+    e3 = e3.to(tl.int64)
 
+    # Unrolled rather than looped over a list of tuples: Triton's AST transformer reads a Python
+    # ``for`` over a literal list as a loop over tensors and refuses it.
     rest = index
     source_offset = tl.zeros_like(index)
     out_offset = tl.zeros_like(index)
 
-    for extent, source_stride, out_stride in [(e3, s3, d3), (e2, s2, d2), (e1, s1, d1), (e0, s0, d0)]:
-        coordinate = rest % extent
-        rest = rest // extent
-        source_offset += coordinate * source_stride
-        out_offset += coordinate * out_stride
+    coordinate = rest % e3
+    rest = rest // e3
+    source_offset += coordinate * s3
+    out_offset += coordinate * d3
+
+    coordinate = rest % e2
+    rest = rest // e2
+    source_offset += coordinate * s2
+    out_offset += coordinate * d2
+
+    coordinate = rest % e1
+    rest = rest // e1
+    source_offset += coordinate * s1
+    out_offset += coordinate * d1
+
+    coordinate = rest % e0
+    source_offset += coordinate * s0
+    out_offset += coordinate * d0
 
     value = tl.load(source_ptr + source_offset, mask=live, other=0)
     tl.store(out_ptr + out_offset, value, mask=live)

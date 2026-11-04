@@ -52,6 +52,29 @@ impl RmsNorm {
     }
 
     /// `out = x · rsqrt(mean(x²) + eps) · weight`.
+    /// The descriptor [`Self::forward`] launches with, for an input of `input`.
+    ///
+    /// The row count is not in it: rows are a launch value, and a normalization is compiled per
+    /// column count and element type.
+    pub fn descriptor(&self, input: ops::DType) -> RmsNormDescriptor {
+        RmsNormDescriptor {
+            dtype: input,
+            columns: self.columns,
+            tile: row_tile(self.columns),
+            pdl: PDL,
+        }
+    }
+
+    /// The descriptor [`Self::forward_with_residual`] launches with, for an input of `input`.
+    pub fn add_descriptor(&self, input: ops::DType) -> AddRmsNormDescriptor {
+        AddRmsNormDescriptor {
+            dtype: input,
+            columns: self.columns,
+            tile: row_tile(self.columns),
+            pdl: PDL,
+        }
+    }
+
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         let columns = u64::from(self.columns);
         x.require_row("RmsNorm", x.dtype, columns)
@@ -64,12 +87,7 @@ impl RmsNorm {
                 format!("{} input rows against {} output rows", x.rows(), out.rows()),
             ));
         }
-        let descriptor = RmsNormDescriptor {
-            dtype: x.dtype,
-            columns: self.columns,
-            tile: row_tile(self.columns),
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor(x.dtype);
         let args = norm::RmsNormArgs {
             x,
             weight: self.weight.view(),
@@ -109,12 +127,7 @@ impl RmsNorm {
         }
         out.require_row("RmsNorm", out.dtype, columns)
             .map_err(Error::from)?;
-        let descriptor = AddRmsNormDescriptor {
-            dtype: x.dtype,
-            columns: self.columns,
-            tile: row_tile(self.columns),
-            pdl: PDL,
-        };
+        let descriptor = self.add_descriptor(x.dtype);
         let args = norm::AddRmsNormArgs {
             x,
             residual,
@@ -165,6 +178,20 @@ impl LayerNorm {
         })
     }
 
+    /// The descriptor [`Self::forward`] launches with, for an input of `input`.
+    ///
+    /// The bias is in it, so a layer with and one without are two modules: the epilogue loads a
+    /// second vector or it does not.
+    pub fn descriptor(&self, input: ops::DType) -> LayerNormDescriptor {
+        LayerNormDescriptor {
+            dtype: input,
+            columns: self.columns,
+            tile: row_tile(self.columns),
+            bias: self.bias.is_some(),
+            pdl: PDL,
+        }
+    }
+
     /// `out = (x − mean(x)) · rsqrt(var(x) + eps) · weight + bias`.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         let columns = u64::from(self.columns);
@@ -178,13 +205,7 @@ impl LayerNorm {
                 format!("{} input rows against {} output rows", x.rows(), out.rows()),
             ));
         }
-        let descriptor = LayerNormDescriptor {
-            dtype: x.dtype,
-            columns: self.columns,
-            tile: row_tile(self.columns),
-            bias: self.bias.is_some(),
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor(x.dtype);
         let args = norm::LayerNormArgs {
             x,
             weight: self.weight.view(),

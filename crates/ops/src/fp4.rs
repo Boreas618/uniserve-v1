@@ -115,8 +115,13 @@ pub struct QuantizeArgs {
     pub values: TensorView,
     /// The E4M3 block scales, in the descriptor's layout.
     pub scales: TensorView,
-    /// The encoder's global scale: the reciprocal of the checkpoint's FP32 tensor scale.
-    pub global_scale: f32,
+    /// `[1]` FP32: the encoder's global scale, the reciprocal of the checkpoint's activation tensor
+    /// scale.
+    ///
+    /// A device operand rather than a launch scalar: the encoder is calibrated data of the tensor
+    /// it encodes, published beside the weights, and the product that consumes the encoding reads
+    /// it as each thread block starts — so a host value here would serialize the pair.
+    pub global_scale: TensorView,
 }
 
 /// Encoding activations into the checkpoint's E2M1 representation.
@@ -180,6 +185,8 @@ impl Op for Nvfp4Quantize {
         args.scales
             .require_shape(Self::NAME, descriptor.layout.shape(rows, columns))?;
 
+        args.global_scale.require_row(Self::NAME, DType::F32, 1)?;
+
         let elements = rows * columns;
         let mut arguments = Arguments::new();
         arguments
@@ -187,7 +194,7 @@ impl Op for Nvfp4Quantize {
             .view(args.values)
             .view(args.scales)
             .u64(rows)
-            .f32(args.global_scale);
+            .view(args.global_scale);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,
             &mut arguments,

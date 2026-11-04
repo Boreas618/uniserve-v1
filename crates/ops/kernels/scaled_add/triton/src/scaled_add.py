@@ -30,7 +30,12 @@ def _scaled_add_kernel(
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = offsets < elements
-    target = tl.load(target_ptr + offsets, mask=live, other=0.0).to(tl.float32)
+    # A zero `beta` is a step that replaces the target rather than moving it, and the source may be
+    # widening into a target nothing has written yet: an uninitialised word can hold a NaN or an
+    # Infinity, and `0 * NaN` is a NaN the caller never asked to read. So the target is not loaded
+    # at all when its coefficient is zero, and `other=0.0` keeps the arithmetic below unchanged.
+    reads_target = beta != 0.0
+    target = tl.load(target_ptr + offsets, mask=live & reads_target, other=0.0).to(tl.float32)
     source = tl.load(source_ptr + offsets, mask=live, other=0.0).to(tl.float32)
     value = beta * target + alpha * source
     tl.store(

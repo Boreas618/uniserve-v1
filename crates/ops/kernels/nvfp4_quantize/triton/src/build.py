@@ -46,7 +46,9 @@ def spec(fields, parameters, target):
             "values_ptr": "*u8",
             "scales_ptr": "*u8",
             "rows": "i64",
-            "global_scale": "fp32",
+            # A device operand: the deployment's activation scale is published by the loader, so the
+            # operator passes its address rather than baking a host constant into the program.
+            "global_scale": "*fp32",
             "COLUMNS": "constexpr",
             "BLOCK": "constexpr",
             "SCALE_COLUMNS": "constexpr",
