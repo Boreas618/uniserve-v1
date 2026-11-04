@@ -80,7 +80,9 @@ pub use graph::{
     Capture, CaptureMode, Graph, GraphExec, GraphNode, GraphNodeKind, KernelNodeParams,
     OwnedKernelNodeParams,
 };
-pub use launch::{Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig};
+pub use launch::{
+    Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig, ParamInfo,
+};
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
