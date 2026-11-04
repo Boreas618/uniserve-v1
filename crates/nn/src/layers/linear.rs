@@ -167,8 +167,9 @@ pub struct Nvfp4Linear {
     bias: Option<Weight>,
     /// The layout of the activation's block scales, which also names the product.
     layout: ScaleLayout,
-    /// The encoder's global scale: the reciprocal of this projection's activation tensor scale.
-    activation_global_scale: f32,
+    /// `[1]` F32: the encoder's global scale, the reciprocal of this projection's activation tensor
+    /// scale, as the loading boundary published it beside the weights.
+    input_scale: Weight,
     /// The activation element type the encoder is compiled for.
     input: ops::DType,
     /// Elements one encoder program covers.
@@ -185,15 +186,14 @@ impl Nvfp4Linear {
     /// contraction is geometry the descriptor bakes in, so `k` must be whole sixteen-element
     /// blocks — the encoder's and the product's own requirement.
     ///
-    /// `activation_global_scale` is the reciprocal of the projection's activation tensor scale:
-    /// the checkpoint's `input_scale`, which a calibrated export states per quantized module. It
-    /// is a constructor argument rather than a checkpoint read because the loading boundary owns
-    /// that field; a caller that has none cannot serve this projection.
+    /// The activation encoder's scale is the checkpoint's `input_scale` for this projection, which
+    /// the loading boundary publishes beside the weights as [`QuantizedWeight::input_scale`]; a
+    /// weight-only export has none and **cannot serve this layer**, which is refused here by name
+    /// rather than encoded at an invented magnitude.
     pub fn new(
         weight: &QuantizedWeight,
         bias: Option<Weight>,
         layout: ScaleLayout,
-        activation_global_scale: f32,
         input: ops::DType,
         block: u32,
     ) -> Result<Self> {
@@ -233,12 +233,21 @@ impl Nvfp4Linear {
                 ),
             ));
         }
-        if !activation_global_scale.is_finite() || activation_global_scale <= 0.0 {
+        let Some(input_scale) = weight.input_scale else {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                "this projection has no calibrated activation input scale: a weight-only export \
+                 cannot be encoded by a program that reads one"
+                    .to_owned(),
+            ));
+        };
+        if input_scale.dtype() != ops::DType::F32 || input_scale.shape().numel() != 1 {
             return Err(Error::shape(
                 "Nvfp4Linear",
                 format!(
-                    "an activation global scale of {activation_global_scale} is not a positive \
-                     reciprocal"
+                    "the activation input scale is {} {:?}, and the encoder reads one FP32 number",
+                    input_scale.dtype(),
+                    input_scale.shape().dims()
                 ),
             ));
         }
@@ -270,7 +279,7 @@ impl Nvfp4Linear {
             scales: weight.scales,
             bias,
             layout,
-            activation_global_scale,
+            input_scale,
             input,
             block,
             k: u32::try_from(k).map_err(|_| {
@@ -351,7 +360,7 @@ impl Nvfp4Linear {
             input,
             values,
             scales,
-            global_scale: self.activation_global_scale,
+            global_scale: self.input_scale.view(),
         };
         f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
 
@@ -399,14 +408,16 @@ mod tests {
         }
     }
 
-    /// A calibrated projection: `[n, k]` logical, so the packed weight is `[n, k/2]` bytes and the
-    /// block scales carry the shape the checkpoint's layout gives them.
+    /// A calibrated projection: `[n, k]` logical, so the packed weight is `[n, k/2]` bytes, the
+    /// block scales carry the shape the checkpoint's layout gives them, and the activation encoder's
+    /// scale is published beside them.
     fn packed(n: u64, k: u64, layout: ScaleLayout) -> QuantizedWeight {
         QuantizedWeight {
             packed: weight(DType::U8, &[n, k / 2]),
             scales: weight(DType::U8, layout.shape(n, k).dims()),
             global_scale: 0.125,
             layout,
+            input_scale: Some(weight(DType::F32, &[1])),
         }
     }
 
@@ -416,7 +427,6 @@ mod tests {
             &packed(8, 64, ScaleLayout::Swizzled128X4),
             None,
             ScaleLayout::Swizzled128X4,
-            0.25,
             DType::BF16,
             128,
         )
@@ -428,40 +438,55 @@ mod tests {
     }
 
     #[test]
+    fn a_weight_only_export_cannot_be_encoded() {
+        // The distinction the loader keeps: a checkpoint that states no activation scale at all is
+        // not one whose encoder may invent a magnitude for.
+        let mut weight_only = packed(8, 64, ScaleLayout::Swizzled128X4);
+        weight_only.input_scale = None;
+        let error = Nvfp4Linear::new(
+            &weight_only,
+            None,
+            ScaleLayout::Swizzled128X4,
+            DType::BF16,
+            128,
+        )
+        .err()
+        .expect("a weight-only export has no encoder scale");
+        assert!(
+            error
+                .to_string()
+                .contains("no calibrated activation input scale"),
+            "{error}"
+        );
+        // A published scale that is not one FP32 number is not the encoder's operand.
+        let mut wrong = packed(8, 64, ScaleLayout::Swizzled128X4);
+        wrong.input_scale = Some(weight(DType::U8, &[1]));
+        assert!(
+            Nvfp4Linear::new(&wrong, None, ScaleLayout::Swizzled128X4, DType::BF16, 128).is_err()
+        );
+    }
+
+    #[test]
     fn a_packed_projection_refuses_what_it_cannot_contract() {
-        let refuse = |weight: QuantizedWeight, layout, scale, input, block| {
-            Nvfp4Linear::new(&weight, None, layout, scale, input, block)
+        let refuse = |weight: QuantizedWeight, layout, input, block| {
+            Nvfp4Linear::new(&weight, None, layout, input, block)
         };
         // Twelve elements are not whole sixteen-element blocks, so no encoder could produce them.
         let odd = packed(8, 62, ScaleLayout::Swizzled128X4);
-        assert!(refuse(odd, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
+        assert!(refuse(odd, ScaleLayout::Swizzled128X4, DType::BF16, 128).is_err());
         // A weight that is not packed bytes is a BF16 matrix, which this product does not read.
         let mut unpacked = packed(8, 64, ScaleLayout::Swizzled128X4);
         unpacked.packed = weight(DType::BF16, &[8, 32]);
-        assert!(refuse(unpacked, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
+        assert!(refuse(unpacked, ScaleLayout::Swizzled128X4, DType::BF16, 128).is_err());
         // The scales answer the layout's own shape, so a matrix of them is not one.
         let mut unscaled = packed(8, 64, ScaleLayout::Swizzled128X4);
         unscaled.scales = weight(DType::U8, &[8, 4]);
-        assert!(refuse(unscaled, ScaleLayout::Swizzled128X4, 0.25, DType::BF16, 128).is_err());
-        // The encoder's global scale is a positive reciprocal, never zero and never NaN.
-        for scale in [0.0, -1.0, f32::NAN] {
-            assert!(
-                refuse(
-                    packed(8, 64, ScaleLayout::Swizzled128X4),
-                    ScaleLayout::Swizzled128X4,
-                    scale,
-                    DType::BF16,
-                    128
-                )
-                .is_err()
-            );
-        }
+        assert!(refuse(unscaled, ScaleLayout::Swizzled128X4, DType::BF16, 128).is_err());
         // NVFP4 encodes BF16 and FP16 activations only.
         assert!(
             refuse(
                 packed(8, 64, ScaleLayout::Swizzled128X4),
                 ScaleLayout::Swizzled128X4,
-                0.25,
                 DType::F32,
                 128
             )
@@ -472,7 +497,6 @@ mod tests {
             refuse(
                 packed(8, 64, ScaleLayout::Swizzled128X4),
                 ScaleLayout::Swizzled128X4,
-                0.25,
                 DType::BF16,
                 12
             )
@@ -486,7 +510,6 @@ mod tests {
             &packed(8, 64, ScaleLayout::Swizzled128X4),
             Some(weight(DType::F32, &[7])),
             ScaleLayout::Swizzled128X4,
-            0.25,
             DType::BF16,
             128,
         )
