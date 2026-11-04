@@ -769,3 +769,161 @@ impl Op for LogprobGather {
         Tolerance::exact()
     }
 }
+
+/// One compilation of `candidate_order`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct OrderDescriptor {
+    /// Element type of the candidate values, which the permutation does not change.
+    pub values: DType,
+    /// Element type of the candidate ids.
+    pub ids: DType,
+    /// Launch with programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl fmt::Display for OrderDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The candidate count is a launch value: the reference's width follows the request's top-k,
+        // so an extent here would recompile the sampler per request.
+        Key::new()
+            .field("values", self.values)
+            .field("ids", self.ids)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `candidate_order`.
+#[derive(Clone, Copy)]
+pub struct OrderArgs {
+    /// `[rows, width]` the candidate values (probabilities or shaped logits — the permutation is the
+    /// same for either).
+    pub values: TensorView,
+    /// `[rows, width]` the candidate token ids.
+    pub ids: TensorView,
+    /// `[rows, width]` the values in ascending token order.
+    pub ordered_values: TensorView,
+    /// `[rows, width]` the ids in ascending token order.
+    pub ordered_ids: TensorView,
+}
+
+/// Put each row's candidates in ascending token order.
+///
+/// This is the step between filtering and drawing. [`InverseCdf`] inverts a cumulative distribution
+/// in the order it is given and sorts nothing, while the reference reorders the candidates **by token
+/// id** before the draw "so inverse-CDF draws are deterministic for a fixed random value independent
+/// of top-k kernel ordering, and matches the general path, which selects in vocabulary order"
+/// (`uniserve/sampling/top_k.py:307-314`). Without this step a draw would depend on the order the
+/// top-k program happened to produce, which is exactly what the reference refuses to depend on.
+///
+/// It permutes and nothing else: the row's greedy token is not read here. `Sampler::greedy` takes it
+/// from `argmax` over the shaped **full-vocabulary** row, where a column is a token id, so the index
+/// is the token and "lowest index among ties" is `torch.max`'s rule (`uniserve/sampling/greedy.py`);
+/// reading a second greedy token from the candidate set here would be a second answer to the same
+/// question, and the two would eventually disagree about a tie.
+pub struct CandidateOrder;
+
+impl Op for CandidateOrder {
+    const NAME: &'static str = "candidate_order";
+
+    type Descriptor = OrderDescriptor;
+    type Args<'a> = OrderArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.values.rows();
+        let width = args.values.last();
+        if width == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a row without candidates has no order".to_owned(),
+            ));
+        }
+        for (name, view, dtype) in [
+            ("values", args.values, descriptor.values),
+            ("ids", args.ids, descriptor.ids),
+            ("ordered_values", args.ordered_values, descriptor.values),
+            ("ordered_ids", args.ordered_ids, descriptor.ids),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+            if view.dtype != dtype {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} are {dtype} over [{rows}, {width}], the view says {}",
+                        view.dtype
+                    ),
+                ));
+            }
+            // A permutation written through rows that interleave would move each other's elements:
+            // the program writes one row contiguously, so every view must be packed.
+            if view.strides != crate::tensor::Strides::row_major(view.shape) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("the {name} are written row-major; found {}", view.strides),
+                ));
+            }
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.values)
+            .view(args.ids)
+            .view(args.ordered_values)
+            .view(args.ordered_ids)
+            .u64(rows)
+            .u32(u32::try_from(width).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("{width} candidates do not fit a kernel parameter"),
+                )
+            })?);
+        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        OrderArgs {
+            ordered_values: twins.shadow_of(args.ordered_values),
+            ordered_ids: twins.shadow_of(args.ordered_ids),
+            ..args
+        }
+    }
+
+    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        // A permutation: an implementation that differs has ordered a different candidate set, and
+        // the token it selects from a draw is then a different token, which no rounding bound covers.
+        Tolerance::exact()
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_names_the_types_and_not_the_candidate_count() {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: false,
+        };
+        assert_eq!(descriptor.to_string(), "values_f32_ids_i32_pdl_false");
+    }
+
+    #[test]
+    fn the_bound_is_exact_because_a_permutation_has_no_rounding() {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: false,
+        };
+        let bound = CandidateOrder::tolerance(&descriptor);
+        assert_eq!(bound.atol, 0.0);
+        assert_eq!(bound.rtol, 0.0);
+    }
+}
