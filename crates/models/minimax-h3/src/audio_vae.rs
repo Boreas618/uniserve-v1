@@ -28,6 +28,7 @@
 //! convolutions run through cuDNN without TF32: spec 9 keeps TF32 for the video VAE's FP32 `conv3d`
 //! alone.
 
+use crate::programs::Programs;
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
@@ -402,6 +403,27 @@ pub struct Source {
     pub parameter: String,
     /// Where the checkpoint stores it.
     pub tensor: Tensor,
+}
+
+/// Every checkpoint tensor a source list reads, in the order the load binds them.
+///
+/// One parameter can read more than one tensor: a weight-normalized convolution reads its direction
+/// and its magnitude, and a fused request reads every part. This is the other column of a component's
+/// source table rather than a second spelling of it, so a `keys` list built here cannot drift from the
+/// load that table drives.
+pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for source in sources {
+        match &source.tensor {
+            Tensor::Region(tensor) => keys.push(tensor.clone()),
+            Tensor::Parts(parts) => keys.extend(parts.iter().cloned()),
+            Tensor::Normalized { value, gain } => {
+                keys.push(value.clone());
+                keys.push(gain.clone());
+            }
+        }
+    }
+    keys
 }
 
 /// How the checkpoint stores one tensor.
@@ -841,6 +863,19 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
 }
 
 impl AudioDecoder {
+    /// Every checkpoint tensor the audio decoder reads, by name.
+    ///
+    /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
+    /// the key that fills it), so this list is that mapping's other column: a weight-normalized pair
+    /// names both tensors and a fused request names every part. A checkpoint that lacks one is refused
+    /// by block and name before a byte is read. `audio_vae/` ships no weights in the export this tree
+    /// was checked against, so the list's honest verdict against that checkpoint is "all absent" -
+    /// which is the right refusal for a task that needs the audio path and not a load failure from
+    /// inside a layer.
+    pub fn keys(config: &AudioVaeConfig) -> Result<Vec<String>> {
+        Ok(tensor_keys(&sources(config)?))
+    }
+
     /// Bind every parameter the checkpoint's audio decoder has, through [`sources`].
     ///
     /// The table is consumed exactly: a tensor it names but the load never reads is an error, so a
@@ -1006,6 +1041,111 @@ impl AudioDecoder {
         Ok(())
     }
 
+    /// The programs one decode of `config` launches, with no weights and no device.
+    ///
+    /// Every launch goes through the same construction the layer uses: `nn`'s `descriptor_of`
+    /// accessors for the convolutions, the activation and the interleave, and the model's own
+    /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
+    ///
+    /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
+    /// the descriptor, so they are stated once per stage width and per sample count the deployment
+    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
+    /// clip of another length replays the compiled program.
+    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+        use ops::audio_activation::AudioActivation as AudioActivationOp;
+        use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
+        use ops::pcm::PcmInterleave as PcmInterleaveOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+
+        let mut programs = Programs::default();
+        // The decoder computes in FP32 and its convolutions' weights are normalized at load, so every
+        // convolution below reads and writes that one type.
+        let dtype = DType::F32;
+        let decoder_dim = config.decoder_dim;
+        // The channel pairs are the weight's, not the key's: a convolution's descriptor is its
+        // geometry and its element types, so the three opening convolutions are their three kernels.
+        for (kernel, stride, padding) in [
+            // The statistics as a one-by-one convolution, the projection into the latent width, and
+            // the pre-convolution of kernel seven.
+            (1, 1, 0),
+            (1, 1, 0),
+            (7, 1, 3),
+        ] {
+            programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+                dtype,
+                dtype,
+                true,
+                dtype,
+                geometry(kernel, stride, padding)?,
+                false,
+            ));
+        }
+
+        let stages = stages(config)?;
+        for stage in &stages {
+            programs.launch::<ConvTranspose1dOp>(&ConvTranspose1d::descriptor_of(
+                dtype,
+                dtype,
+                true,
+                dtype,
+                geometry(stage.kernel, stage.rate, stage.padding)?,
+                false,
+            ));
+        }
+
+        for block in &blocks(config)? {
+            let channels = block.channels;
+            for step in &block.steps {
+                // A step is an activation, a convolution, an activation and a convolution.
+                for padding in [step.padding, (block.kernel - 1) / 2] {
+                    programs.launch::<AudioActivationOp>(&AudioActivation::descriptor_of(
+                        dtype,
+                        channels,
+                        ACTIVATION_KERNEL,
+                        ACTIVATION_RATIO,
+                        ACTIVATION_BLOCK,
+                    ));
+                    programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+                        dtype,
+                        dtype,
+                        true,
+                        dtype,
+                        geometry(block.kernel, 1, padding)?,
+                        false,
+                    ));
+                }
+            }
+        }
+
+        let last = stages
+            .last()
+            .map_or(decoder_dim, |stage| stage.channels_out);
+        programs.launch::<AudioActivationOp>(&AudioActivation::descriptor_of(
+            dtype,
+            last,
+            ACTIVATION_KERNEL,
+            ACTIVATION_RATIO,
+            ACTIVATION_BLOCK,
+        ));
+        programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            geometry(1, 1, 0)?,
+            false,
+        ));
+        programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
+
+        for bucket in buckets {
+            for stage in &stages {
+                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+            }
+        }
+        Ok(programs.finish())
+    }
+
     /// One stage's output: its three blocks summed and divided by three.
     fn stage(
         &self,
@@ -1148,10 +1288,11 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
 }
 
 impl Decoder for AudioDecoder {
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
-        // layout, so the runner uploads nothing for it.
-        Vec::new()
+        // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
+        // correct answer, and different from a failure to answer.
+        Ok(Vec::new())
     }
 
     fn prepare_layout(
@@ -1393,6 +1534,31 @@ impl<'a, 'b> Binder<'a, 'b> {
 pub(crate) mod tests {
 
     #[test]
+    fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
+        let config = audio_config();
+        let keys = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // A weight-normalized convolution reads a direction and a magnitude, and the load needs both:
+        // a list that named only the direction would refuse a checkpoint that is complete.
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_v"));
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_g"));
+        let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
+        let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
+        assert_eq!(magnitudes, directions, "every magnitude has its direction");
+        assert_eq!(
+            magnitudes, 136,
+            "the decoder's weight-normalized convolutions"
+        );
+        // The encoder reads a different half of a different directory; a shared name would be one
+        // block binding the other's tensor.
+        let encoder = crate::encoding::AudioEncoder::keys(&config).expect("the encoder's keys");
+        assert!(encoder.iter().all(|key| !keys.contains(key)));
+    }
+
+    #[test]
     fn the_load_binds_every_parameter_the_table_names() {
         let config = audio_config();
         let table = sources(&config).expect("the table");
@@ -1429,6 +1595,44 @@ pub(crate) mod tests {
     use super::*;
 
     /// The checkpoint's audio VAE config (`audio_vae/config.json`).
+    /// The decoder states its programs from its own configuration, and the statement is a **set**: a
+    /// convolution's key carries element types only (its geometry travels in the call structure), so
+    /// a kernel-one projection and a kernel-nine filter are one program, while the fused activation
+    /// is one per channel count.
+    #[test]
+    fn the_decoder_states_its_programs_from_its_own_config() {
+        let config = audio_config();
+        let programs = AudioDecoder::programs(&config, &[64, 256]).expect("the decoder's programs");
+        assert!(!programs.is_empty());
+        for (operator, key) in &programs {
+            assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");
+        }
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        // One program for every one-dimensional convolution of the decoder, in either direction: the
+        // window, the bias and the stride are launch values.
+        assert_eq!(count("conv1d"), 1);
+        assert_eq!(count("conv_transpose1d"), 1);
+        // The interleave converts two channels whatever the clip's length.
+        assert_eq!(count("pcm_interleave"), 1);
+
+        let stages = stages(&config).expect("the stages");
+        // The fused activation's key is the channel count, so a decoder has one per stage width plus
+        // the post-activation, which repeats the last width and shares its program.
+        assert_eq!(count("audio_activation"), stages.len());
+
+        // A row program carries its width, so the stage sums and the divide are per width and per
+        // sample count — deduplicated where a width and a count collide.
+        let row_programs = count("scaled_add");
+        assert!(row_programs > 0 && row_programs < 2 * stages.len(), "{programs:?}");
+        assert_eq!(programs.len(), count("conv1d") + count("conv_transpose1d") + count("pcm_interleave") + count("audio_activation") + row_programs);
+    }
+
     pub(crate) fn audio_config() -> AudioVaeConfig {
         let sidecar = serde_json::json!({
             "encoder_dim": 64,

@@ -217,20 +217,26 @@ impl Rotary {
     /// The token count is not in it: how many positions a call carries is a launch value, and the
     /// sections' widths, the axis count and the interleaving are the geometry a model binds once.
     pub fn factors_descriptor(&self, positions: ops::DType) -> FactorsDescriptor {
+        Self::factors_descriptor_of(self.rotated, self.scale, self.sections, positions)
+    }
+
+    /// The factor table's descriptor, from the rotation's numbers alone.
+    pub fn factors_descriptor_of(
+        rotated: u32,
+        scale: f32,
+        sections: Option<Sections>,
+        positions: ops::DType,
+    ) -> FactorsDescriptor {
         FactorsDescriptor {
             dtype: ops::DType::F32,
             positions,
-            columns: self.rotated / 2,
+            columns: rotated / 2,
             block: ROTARY_BLOCK,
-            scale: self.scale.into(),
+            scale: scale.into(),
             pdl: PDL,
-            axes: self.sections.map_or(1, |sections| sections.axes()),
-            interleaved: self
-                .sections
-                .is_some_and(|sections| sections.is_interleaved()),
-            sections: self
-                .sections
-                .map_or([0; MAX_AXES], |sections| sections.widths),
+            axes: sections.map_or(1, |sections| sections.axes()),
+            interleaved: sections.is_some_and(|sections| sections.is_interleaved()),
+            sections: sections.map_or([0; MAX_AXES], |sections| sections.widths),
         }
     }
 
@@ -245,19 +251,46 @@ impl Rotary {
         output: ops::DType,
         affine: bool,
     ) -> QkNormRopeDescriptor {
-        let head_dim = u64::from(self.head_dim);
+        Self::apply_descriptor_of(
+            self.head_dim,
+            self.q_heads,
+            self.k_heads,
+            self.rotation,
+            self.epsilon,
+            self.rotated,
+            input,
+            output,
+            affine,
+        )
+    }
+
+    /// The rotation-and-per-head-normalization descriptor, from the head geometry alone.
+    ///
+    /// `affine` states whether the normalization has a learned weigh, which is a different program.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_descriptor_of(
+        head_dim: u32,
+        q_heads: u32,
+        k_heads: u32,
+        rotation: Rotation,
+        epsilon: f32,
+        rotated: u32,
+        input: ops::DType,
+        output: ops::DType,
+        affine: bool,
+    ) -> QkNormRopeDescriptor {
+        let head = u64::from(head_dim);
         QkNormRopeDescriptor {
             dtype: input,
             output,
-            head_dim: self.head_dim,
-            q_heads: self.q_heads,
-            k_heads: self.k_heads,
-            rotation: self.rotation,
-            epsilon: self.epsilon.into(),
-            // Full-width unless the configuration narrows it.
-            rotated: self.rotated,
+            head_dim,
+            q_heads,
+            k_heads,
+            rotation,
+            epsilon: epsilon.into(),
+            rotated,
             rows: QK_NORM_TOKENS,
-            block: head_dim.next_power_of_two().min(1024) as u32,
+            block: head.next_power_of_two().min(1024) as u32,
             affine,
             pdl: PDL,
         }

@@ -116,78 +116,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so no test in this crate can execute a block's load path; the failure that hides there is the
     // narrow one: a key the loader names that the checkpoint does not hold. The index states every
     // tensor's name whether or not its shard is present, so that failure is a host fact and this
-    // walks it. Each prefix is one the loader builds - the loader is the authority and this table
-    // only quotes it, one line per group - and a group with no match is an error, not a count.
-    let prefixes: &[(&str, &str, &[&str])] = &[
+    // walks it. Each list is the block's own `keys` - the table its own load reads - so this half is
+    // exact in both directions: every name a component asks for is in the index, and every name in
+    // the index belongs to one of the components that read that directory.
+    let lists: &[(&str, &str, Vec<String>)] = &[
         (
             "vae",
             "video encoder",
-            &[
-                "encoder.conv_in.",
-                "encoder.norm_out.",
-                "encoder.conv_out.",
-                "encoder.down_blocks.",
-                "encoder.down_blocks.0.resnets.",
-                "quant_conv.",
-            ],
+            minimax_h3::encoding::VideoEncoder::keys(&config.video_vae)?,
         ),
         (
             "vae",
             "video decoder",
-            &[
-                "decoder.proj_in.",
-                "decoder.register_tokens",
-                "decoder.transformer_blocks.",
-                "decoder.norm_out.",
-                "decoder.proj_out.",
-            ],
+            minimax_h3::video_vae::VideoDecoder::keys(&config.video_vae)?,
         ),
         (
             "audio_vae",
             "audio encoder",
-            &["encoder.block.", "pre_block.", "mean_proj."],
+            minimax_h3::encoding::AudioEncoder::keys(&config.audio_vae)?,
         ),
         (
             "audio_vae",
             "audio decoder",
-            &[
-                "decoder.conv_pre",
-                "decoder.ups.",
-                "decoder.resblocks.",
-                "decoder.activation_post",
-                "decoder.conv_post",
-            ],
+            minimax_h3::audio_vae::AudioDecoder::keys(&config.audio_vae)?,
         ),
         (
             "text_encoder",
             "text encoder",
-            &[
-                "model.language_model.layers.",
-                "model.language_model.embed_tokens.",
-                // The tower's groups, from `vision.rs`'s own prefix. Its final norm is removed, so
-                // a table naming `model.visual.norm` would ask for a tensor nothing reads.
-                "model.visual.patch_embed.",
-                "model.visual.pos_embed.",
-                "model.visual.blocks.",
-                "model.visual.merger.",
-                "model.visual.deepstack_merger_list.",
-            ],
+            minimax_h3::text_encoder::TextEncoder::keys(&config.text_encoder),
+        ),
+        (
+            "text_encoder",
+            "vision tower",
+            minimax_h3::vision::VisionTower::keys(&config.text_encoder.vision),
         ),
     ];
     let mut names_by_directory = std::collections::BTreeMap::new();
-    // The DiT partitions are checked against their own `keys`, not against prefixes, so their
-    // directories are read here whether or not the prefix table names them.
+    // The DiT partitions are checked against their own `keys` too, so their directories are read
+    // here whether or not a conditioning list names them.
     let dit_directories = config
         .denoisers
         .keys()
         .map(|dit| dit.directory())
         .collect::<Vec<_>>();
-    let prefix_directories = prefixes
+    let list_directories = lists
         .iter()
         .map(|(directory, _, _)| *directory)
         .chain(dit_directories.iter().copied())
         .collect::<Vec<_>>();
-    for directory in prefix_directories {
+    for directory in list_directories {
         if names_by_directory.contains_key(directory) {
             continue;
         }
@@ -207,9 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         names_by_directory.insert(directory.to_owned(), names);
     }
-    // A DiT partition states its own keys, so this half is exact in both directions: every name
-    // the block asks for is in the index, and every name in the index is asked for. A prefix table
-    // could say the first of the two only.
+    // Both halves are exact in both directions, because both ask the block rather than a prefix
+    // table: every name a component asks for is in the index, and every name in the index belongs
+    // to one of the components that read that directory. A prefix table could say the first only.
     let mut missing = Vec::new();
     for (dit, denoiser) in &config.denoisers {
         let block = format!("{} DiT", dit.directory());
@@ -224,43 +201,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let keys = minimax_h3::denoiser::Denoiser::keys(denoiser);
         let absent =
             minimax_h3::checkpoint::absent(&keys, |key| names.iter().any(|name| name == key));
-        let unread = names
-            .iter()
-            .filter(|name| !keys.iter().any(|key| key == *name))
-            .count();
         println!(
-            "keys {block}: {} asked, {} in the index, {} missing, {} unread",
+            "keys {block}: {} asked, {} in the index, {} missing",
             keys.len(),
             keys.len() - absent.len(),
-            absent.len(),
-            unread
+            absent.len()
         );
         for key in absent {
             missing.push(format!("{block} asks for {key} and its index holds none"));
         }
     }
-    for (directory, block, groups) in prefixes {
+    for (directory, block, keys) in lists {
         let names = &names_by_directory[*directory];
         if names.is_empty() {
             println!("keys {block}: {directory} states no index here, so its keys are unread");
             continue;
         }
-        for group in *groups {
-            let found = names.iter().filter(|name| name.starts_with(group)).count();
-            if found == 0 {
-                missing.push(format!(
-                    "{block} asks for {group}* and {directory} holds none"
-                ));
-            } else {
-                println!("keys {block}: {group}* {found} tensors");
+        let absent =
+            minimax_h3::checkpoint::absent(keys, |key| names.iter().any(|name| name == key));
+        println!(
+            "keys {block}: {} asked, {} in the index, {} missing",
+            keys.len(),
+            keys.len() - absent.len(),
+            absent.len()
+        );
+        for key in absent {
+            missing.push(format!("{block} asks for {key} and {directory} holds none"));
+        }
+    }
+    // A directory's tensors are read by its components together, so a name none of them asks for is
+    // the report a reader wants: a tensor the export ships and the model never uses. That is the
+    // half a prefix table could not state at all.
+    for directory in names_by_directory.keys() {
+        let names = &names_by_directory[directory];
+        if names.is_empty() {
+            continue;
+        }
+        let mut asked: Vec<String> = lists
+            .iter()
+            .filter(|(list_directory, _, _)| list_directory == directory)
+            .flat_map(|(_, _, keys)| keys.iter().cloned())
+            .collect();
+        for (dit, denoiser) in &config.denoisers {
+            if dit.directory() == directory {
+                asked.extend(minimax_h3::denoiser::Denoiser::keys(denoiser));
             }
         }
+        let unread = names
+            .iter()
+            .filter(|name| !asked.iter().any(|key| key == *name))
+            .count();
+        println!(
+            "keys {directory}: {unread} of {} tensors unread",
+            names.len()
+        );
     }
     if !missing.is_empty() {
         for line in &missing {
             eprintln!("missing key: {line}");
         }
-        return Err(format!("{} key groups the blocks ask for are absent", missing.len()).into());
+        return Err(format!("{} keys a block asks for are absent", missing.len()).into());
     }
     Ok(())
 }

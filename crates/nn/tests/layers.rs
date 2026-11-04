@@ -7,7 +7,8 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
+    AdaptivePool, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, DType, DevicePtr, FrameNormPad,
+    GatedResidual, KvGroup, KvPlanes, KvView, Linear,
     ModulatedRmsNorm, Patch, Rotary, Rotate, Rotation, ScaledResidual, ScaledResidualRmsNorm,
     Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
@@ -259,4 +260,126 @@ fn a_vision_rotation_holds_a_head_and_its_heads() {
     assert!(Rotate::new(63, 12, Rotation::Half).is_err());
     assert!(Rotate::new(0, 12, Rotation::Half).is_err());
     assert!(Rotate::new(64, 0, Rotation::Half).is_err());
+}
+
+/// A layer's planes are the ones its own index names, and the refusal for an index the cache has not
+/// got names the count.
+///
+/// This is the seam the paged attention reads through: `Attention::forward` writes
+/// `cache.planes(group, layer)` and `Attention::attend` reads the same. A reader that took the
+/// group's first layer instead would answer another layer's keys and values — the defect that made
+/// every layer above the first attend over layer 0's cache — and no shape or dtype check can see it,
+/// because both answers are planes of the same geometry. A cache of one layer cannot tell the two
+/// apart, which is why this test builds two.
+#[test]
+fn a_layer_reads_the_planes_its_own_index_names() {
+    let plane = |marker: u64| {
+        let page = |offset: u64| {
+            TensorView::new(
+                DevicePtr::new(marker + offset),
+                DType::BF16,
+                Shape::new(&[2, 4, 2, 8]),
+            )
+        };
+        let flag = |offset: u64| {
+            TensorView::new(
+                DevicePtr::new(marker + offset),
+                DType::I32,
+                Shape::new(&[2, 1, 1, 1]),
+            )
+        };
+        KvPlanes {
+            key: page(0x0),
+            value: page(0x100),
+            key_initialized: flag(0x200),
+            value_initialized: flag(0x300),
+            key_scale: None,
+            value_scale: None,
+        }
+    };
+    let first = plane(0x10_0000);
+    let second = plane(0x20_0000);
+    let layers = [first, second];
+    let table = TensorView::new(DevicePtr::new(0x30_0000), DType::I32, Shape::new(&[1, 4]));
+    let group = KvGroup {
+        block_tables: table,
+        page_size: 4,
+        dtype: DType::BF16,
+        layers: &layers,
+    };
+    let groups = [group];
+    let cache = KvView { groups: &groups };
+
+    // Every field of the second layer's planes is the second layer's, not the first's: a reader that
+    // took one field from the wrong plane would read another layer's keys, values or flags.
+    let read = cache.planes(0, 1).expect("the second layer");
+    assert_eq!(read.key.ptr.address(), second.key.ptr.address());
+    assert_eq!(read.value.ptr.address(), second.value.ptr.address());
+    assert_eq!(
+        read.key_initialized.ptr.address(),
+        second.key_initialized.ptr.address()
+    );
+    assert_eq!(
+        read.value_initialized.ptr.address(),
+        second.value_initialized.ptr.address()
+    );
+    assert_ne!(read.key.ptr.address(), first.key.ptr.address());
+    assert_eq!(
+        cache
+            .planes(0, 0)
+            .expect("the first layer")
+            .key
+            .ptr
+            .address(),
+        first.key.ptr.address()
+    );
+
+    // A layer the group has not got, and a group the cache has not got, are refusals that name what
+    // the cache holds rather than addressing whatever follows the last plane.
+    let past = cache
+        .planes(0, 2)
+        .err()
+        .expect("a third layer in a two-layer group");
+    assert!(format!("{past}").contains("holds 2"), "{past}");
+    let group = cache
+        .planes(1, 0)
+        .err()
+        .expect("a second group in a one-group cache");
+    assert!(format!("{group}").contains("the cache has 1"), "{group}");
+}
+
+/// The three convolutions' weightless descriptors are the ones their launches take: the walk that
+/// asks a deployment which programs it needs reads these, so a drift between them would be a store
+/// built for programs the model never launches.
+#[test]
+fn a_convolution_states_the_descriptor_its_launch_takes() {
+    let geometry = ConvGeometry::new(1, [3, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0], 1).unwrap();
+    let spatial = ConvGeometry::new(3, [2, 2, 2], [1, 1, 1], [0, 0, 0], [1, 1, 1], 1).unwrap();
+    let one_dimensional = weight(&[8, 4, 3]);
+    let transposed_weight = weight(&[4, 8, 3]);
+    let spatial_weight = weight(&[8, 4, 2, 2, 2]);
+
+    let conv1d = Conv1d::new(one_dimensional, None, geometry, false).unwrap();
+    assert_eq!(
+        conv1d.descriptor(DType::F32, DType::F32),
+        Conv1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
+    );
+
+    let transposed =
+        ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
+    assert_eq!(
+        transposed.descriptor(DType::F32, DType::F32),
+        ConvTranspose1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
+    );
+
+    let conv3d = Conv3d::new(spatial_weight, None, spatial, false).unwrap();
+    assert_eq!(
+        conv3d.descriptor(DType::F32, DType::F32),
+        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false)
+    );
+    // A weight in another type is the descriptor's weight operand, not the launch's input.
+    assert_ne!(
+        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false),
+        Conv3d::descriptor_of(DType::F32, DType::BF16, false, DType::F32, spatial, false)
+    );
 }

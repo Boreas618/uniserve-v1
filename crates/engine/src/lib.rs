@@ -74,6 +74,10 @@ pub use crate::scheduler::{
     Validators, WorkerStats, arrival_view, ceilings_of,
 };
 pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_requests};
+// The simulated engine is test support: `mod sim` is built only with the
+// `testing` feature, so its surface is exported only with it. A production
+// build that exported these would not compile - the module they come from is
+// not there.
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,

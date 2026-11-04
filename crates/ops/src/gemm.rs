@@ -207,6 +207,28 @@ pub struct Args {
 /// The dense product operator.
 pub struct Gemm;
 
+impl Gemm {
+    /// Refuse a descriptor whose two operands disagree in type.
+    ///
+    /// A contraction is one type on both sides: `cublasLtMatmul` takes a single compute type and a
+    /// pair of different operand types is not a cell this operator can compile. The check lives in
+    /// the launch so a descriptor that slipped into a fixture — an f32 activation against a bf16
+    /// weight, say — is refused here, naming both types, rather than inside the library on the
+    /// first call, where the refusal says nothing about which descriptor was wrong.
+    fn operands(descriptor: &Descriptor) -> Result<()> {
+        if descriptor.input == descriptor.weight {
+            return Ok(());
+        }
+        Err(Error::argument(
+            Self::NAME,
+            format!(
+                "the operands are {} input against {} weight: a contraction takes one type on both sides",
+                descriptor.input, descriptor.weight
+            ),
+        ))
+    }
+}
+
 impl Op for Gemm {
     const NAME: &'static str = "gemm";
 
@@ -230,6 +252,7 @@ impl Op for Gemm {
                 ),
             ));
         }
+        Self::operands(descriptor)?;
         let (n, weight_row_stride) = match descriptor.order {
             WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight.strides)),
             WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight.strides)),
@@ -336,4 +359,36 @@ fn address(pointer: DevicePtr) -> u64 {
 
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| Error::argument(Gemm::NAME, "an extent above i64::MAX"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(input: DType, weight: DType) -> Descriptor {
+        Descriptor {
+            input,
+            weight,
+            accumulate: DType::F32,
+            output: DType::BF16,
+            order: WeightOrder::NxK,
+            epilogue: Epilogue::None,
+            k: 2048,
+        }
+    }
+
+    #[test]
+    fn a_mixed_operand_pair_is_refused_by_name() {
+        let refused = Gemm::operands(&descriptor(DType::F32, DType::BF16))
+            .expect_err("an f32 activation against a bf16 weight has no program")
+            .to_string();
+        assert!(
+            refused.contains("f32 input against bf16 weight"),
+            "the refusal must name both operand types: {refused}"
+        );
+        assert!(
+            Gemm::operands(&descriptor(DType::BF16, DType::BF16)).is_ok(),
+            "a pair of one type is the cell the operator declares"
+        );
+    }
 }

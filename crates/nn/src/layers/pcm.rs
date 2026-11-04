@@ -42,6 +42,24 @@ impl PcmInterleave {
         Ok(Self { dtype })
     }
 
+    /// The descriptor a two-channel interleave of `dtype` launches, stated without a layer.
+    ///
+    /// A deployment answers "which programs must be compiled for me?" before any weight is read; the
+    /// sample count is a launch value and is not part of the key.
+    pub fn descriptor_of(dtype: DType) -> Result<pcm::Descriptor> {
+        if dtype != DType::F32 {
+            return Err(Error::shape(
+                "PcmInterleave",
+                format!("the PCM interleave reads f32 channels, not {dtype}"),
+            ));
+        }
+        Ok(pcm::Descriptor {
+            dtype,
+            block: pcm::BLOCK,
+            pdl: PDL,
+        })
+    }
+
     /// Convert `planes [2, samples]` into `out [samples, 2]` i16.
     ///
     /// The two channels are addressed through `planes`' own stride, so a view into a larger buffer
@@ -92,11 +110,9 @@ impl PcmInterleave {
             Shape::new(&[samples]),
         );
         let first = TensorView::new(planes.ptr, self.dtype, Shape::new(&[samples]));
-        let descriptor = pcm::Descriptor {
-            dtype: self.dtype,
-            block: pcm::BLOCK,
-            pdl: PDL,
-        };
+        // One construction with `PcmInterleave::descriptor_of`: a walk and a launch cannot state
+        // different programs for the same interleave.
+        let descriptor = Self::descriptor_of(self.dtype)?;
         f.operate::<PcmInterleaveOp>(
             &descriptor,
             pcm::Args {
@@ -120,8 +136,10 @@ mod tests {
 
     #[test]
     fn a_pcm_conversion_reads_a_float_signal() {
+        // The program is compiled for f32 input, so every other element type is refused here rather
+        // than at a launch: f32 is the decoder's own output and the only type `pcm_interleave` reads.
         assert!(PcmInterleave::new(DType::F32).is_ok());
-        assert!(PcmInterleave::new(DType::BF16).is_ok());
+        assert!(PcmInterleave::new(DType::BF16).is_err());
         assert!(PcmInterleave::new(DType::I16).is_err());
         assert!(PcmInterleave::new(DType::U8).is_err());
     }

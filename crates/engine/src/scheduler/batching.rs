@@ -285,8 +285,16 @@ impl Scheduler {
                 break;
             }
             // The phase names the call kind this entry runs. A phase this epoch
-            // has no call for runs nothing.
+            // has no call for runs nothing, and says so: an entry the policy
+            // named and this loop discards is work the epoch believes it
+            // planned, and a pass that names nothing every step is a stall no
+            // other layer reports.
             let Some(kind) = views::phase_kind(phase).and_then(views::phase_call) else {
+                tracing::debug!(
+                    request = id.0,
+                    phase = phase.0,
+                    "a planned entry names a phase this epoch has no call for"
+                );
                 continue;
             };
             // A spent token budget ends the pass's token work; a media call
@@ -295,13 +303,28 @@ impl Scheduler {
                 break;
             }
             let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
-            if !self.can_schedule_next(id) {
+            // A media request lives in the media flow's own state, which the
+            // token rule cannot read: `can_schedule_next` finds no token state
+            // for it and would refuse every media call of the epoch.
+            let ready = if self.running_media.contains_key(&id) {
+                self.media_can_schedule_next(id)
+            } else {
+                self.can_schedule_next(id)
+            };
+            if !ready {
                 continue;
             }
+            // A media request's terminal intent lives in its own state; a
+            // request in neither map is one this pass must not serve.
             let cancelled = self
                 .running
                 .get(&id)
                 .map(|state| state.terminal_intent.is_terminal())
+                .or_else(|| {
+                    self.running_media
+                        .get(&id)
+                        .map(|state| state.terminal_intent.is_terminal())
+                })
                 .unwrap_or(true);
             if cancelled {
                 continue;
@@ -702,6 +725,7 @@ impl Scheduler {
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
+        let mut tables = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
                 tracing::debug!(
@@ -727,15 +751,45 @@ impl Scheduler {
             inputs.push(tokens);
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
+            // The layout addresses the request's current cache tables. A call
+            // declares a table on the wire only when it changed, so the
+            // declaration is a delta and not the layout: a decode whose pages
+            // did not move declares none, and the batch it travels in still
+            // needs the table it writes through.
+            let declared = placed.block_tables.clone();
+            tables.push(if declared.is_empty() {
+                let Some(pool) = state.request_pool_idx() else {
+                    tracing::debug!("a batch is dropped: a request holds no pool row");
+                    return;
+                };
+                match state.block_tables() {
+                    Some(tables) => tables
+                        .iter()
+                        .map(|table| IpcBlockTable {
+                            request_pool_idx: pool,
+                            group_id: u32::try_from(table.group_id()).unwrap_or(u32::MAX),
+                            start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
+                            unit_ids: table.unit_ids(),
+                            allocated_tokens: u32::try_from(table.capacity_tokens())
+                                .unwrap_or(u32::MAX),
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                }
+            } else {
+                declared
+            });
         }
         batch.columns = columns::columns(
             &batch.requests,
+            &tables,
             &inputs,
             &sampling,
             &draws,
             page,
             max_kv_len,
         );
+
         if batch.columns.is_none() {
             let tokens = batch
                 .requests
@@ -795,6 +849,12 @@ impl Scheduler {
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
+            // A speculating deployment's decode step verifies the drafts its
+            // last forward proposed: the call the mechanism builds from
+            // `DecodeUnd` is a verification, and the phase a policy reads must
+            // be the one that call runs in, or the batch is planned under one
+            // kind and built under another and is dropped unnamed.
+            Phase::DecodeUnd if self.speculates() => CallKind::Forward(ForwardMode::Verify),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::HandOff if st.handoff_export.is_some() => {
                 CallKind::Transfer(TransferMode::CacheInstall)

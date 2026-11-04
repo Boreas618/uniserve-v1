@@ -85,11 +85,29 @@ impl World {
         sim.set_speculation(speculation);
         let mut executor = SimExecutor::new(sim);
         let batches = executor.observe();
-        let scheduler = support::scheduler_with(
+        let scheduler = support::scheduler_with_stating(
             Box::new(executor),
             SimEngine::special_tokens(),
             SchedulerConfig {
                 draft_tokens: 3,
+                ..Default::default()
+            },
+            // What this world's own steps cost, as the policy weighs them:
+            // the tokens a verification commits over the decode steps it
+            // takes, and a refilled token's cost in decode steps. The
+            // mechanism measures both, but a policy reads stated parameters
+            // (design §7.7), so the world states what it measures.
+            //
+            // Leaving them unstated is not the same world: `refill_due` has no
+            // value to weigh then and refills whatever the steps cost, so the
+            // two cases below measure the stated path only. A deployment that
+            // does not state both refills regardless of whether it pays.
+            engine::Parameters {
+                expected_speedup: Some(
+                    (speculation.accepted + 1) as f64
+                        / (speculation.verify_us as f64 / speculation.decode_us as f64),
+                ),
+                refill_token_cost: Some(0.1),
                 ..Default::default()
             },
         )

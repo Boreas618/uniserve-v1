@@ -698,7 +698,18 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
         // phase it needs next, and its draft gap appears in `refill_tokens`.
         // `PhaseKind::Refill` stays in the phase table as the kind of the call
         // the mechanism builds, not as a phase a request sits in.
-        CallKind::Forward(ForwardMode::Prefill) if refill_gap(scheduler, state).is_some() => {
+        // Only a request whose context is fully ingested can be refilled:
+        // before that, a prefill call is the chunk that writes the rest of
+        // the prompt, and naming it a decode hides that chunk from the
+        // policy (the built call then differs from the plan and is dropped).
+        CallKind::Forward(ForwardMode::Prefill)
+            if refill_gap(scheduler, state).is_some()
+                && scheduler
+                    .num_scheduled_prompt_tokens(id)
+                    .is_some_and(|scheduled| {
+                        scheduled >= state.req.prompt_token_ids.len() as u32
+                    }) =>
+        {
             PhaseKind::Decode
         }
         other => call_phase(other),
@@ -714,7 +725,12 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// canvas-generating request's commit extends the context past its prompt, and
 /// the prefill that writes it is sized from this end.
 fn prefill_end(state: &RequestState) -> u32 {
-    let prompt = u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX);
+    // The end of the context the next prefill must reach. A migrated request's
+    // prompt continues with the tokens it generated before it moved here
+    // (`Scheduler::request_state`), so the prompt ids say how far the context
+    // goes, while `RequestState::prompt_tokens` is only what the request's
+    // usage charges and leaves those tokens out.
+    let prompt = u32::try_from(state.req.prompt_token_ids.len()).unwrap_or(u32::MAX);
     // Every vision block of an input image writes its cache tokens into the
     // context at its prompt position, so the prefill that reaches it is sized
     // past the text around it.

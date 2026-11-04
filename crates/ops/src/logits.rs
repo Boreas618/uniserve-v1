@@ -115,6 +115,13 @@ impl Op for LogitsGather {
 pub struct UnpadDescriptor {
     /// Element type of the gathered logits.
     pub dtype: DType,
+    /// Element type of the unpadded output.
+    ///
+    /// Separate from [`Self::dtype`] because this operator is the last one before the sampler, whose
+    /// candidate buffer is FP32 by design: the head's product is in the model's dtype and the logits
+    /// are widened here, once, exactly. A narrowing pair (FP32 logs into a BF16 output) rounds once
+    /// and the tolerance below says so.
+    pub output: DType,
     /// The vocabulary size the model uses.
     pub vocabulary: u32,
     /// The width the gathered matrix carries, at least `vocabulary`.
@@ -129,6 +136,7 @@ impl fmt::Display for UnpadDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
+            .field("output", self.output)
             .field("vocabulary", self.vocabulary)
             .field("padded", self.padded)
             .field("block", self.block)
@@ -174,12 +182,12 @@ impl Op for VocabUnpad {
             .require_shape(Self::NAME, Shape::new(&[rows, padded]))?;
         args.out
             .require_shape(Self::NAME, Shape::new(&[rows, vocabulary]))?;
-        if args.gathered.dtype != descriptor.dtype || args.out.dtype != descriptor.dtype {
+        if args.gathered.dtype != descriptor.dtype || args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected {} logits on both sides, found {} and {}",
-                    descriptor.dtype, args.gathered.dtype, args.out.dtype
+                    "expected {} logits gathered into {}, found {} and {}",
+                    descriptor.dtype, descriptor.output, args.gathered.dtype, args.out.dtype
                 ),
             ));
         }
@@ -206,9 +214,14 @@ impl Op for VocabUnpad {
         }
     }
 
-    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // A row's leading `vocabulary` columns are copied out of a wider row; no arithmetic, so no
-        // rounding to bound.
-        Tolerance::exact()
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // A row's leading `vocabulary` columns are copied out of a wider row; no arithmetic, so the
+        // only rounding is the store's. Widening is exact; a narrowing pair rounds once into the
+        // output type and the bound is that one rounding.
+        if descriptor.output.unit_roundoff() <= descriptor.dtype.unit_roundoff() {
+            Tolerance::exact()
+        } else {
+            Tolerance::rounding(1, descriptor.dtype, descriptor.output)
+        }
     }
 }

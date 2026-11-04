@@ -24,6 +24,9 @@ pub struct ParallelLMHead {
     padded: u32,
 }
 
+/// Elements one `logits_gather` / `logits_unpad` program handles.
+pub const BLOCK: u32 = 1024;
+
 impl ParallelLMHead {
     /// The head whose rank holds `local` vocabulary rows starting at id `first`, padded to `padded`.
     ///
@@ -166,7 +169,7 @@ impl ParallelLMHead {
                 "a gathered width above u32::MAX".to_owned(),
             )
         })?;
-        let descriptor = self.unpad_descriptor(gathered.dtype, width);
+        let descriptor = self.unpad_descriptor(gathered.dtype, out.dtype, width);
         let args = logits::UnpadArgs { gathered, out };
 
         f.operate::<VocabUnpad>(&descriptor, args)
@@ -183,8 +186,14 @@ impl ParallelLMHead {
         input: DType,
         output: DType,
     ) -> Result<ops::gemm::Descriptor> {
-        let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
-        Ok(linear.descriptor(input, output))
+        Ok(Linear::descriptor_of(
+            self.weight.shape().last() as u32,
+            self.weight.dtype(),
+            ops::gemm::WeightOrder::NxK,
+            false,
+            input,
+            output,
+        ))
     }
 
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
@@ -192,10 +201,42 @@ impl ParallelLMHead {
     ///
     /// The gathered width is `padded × ranks`, so it is a launch value that follows the deployment's
     /// rank count rather than a property of the head; the vocabulary and the block are the head's.
-    pub fn unpad_descriptor(&self, dtype: DType, gathered_width: u32) -> UnpadDescriptor {
+    /// The descriptor the unpadding launch uses: the gathered logits' element type, the type the
+    /// sampler's candidate buffer carries, the vocabulary, the gathered width, the block and PDL.
+    ///
+    /// The two element types are separate because the head's product is in the model's dtype and the
+    /// sampler reads FP32; [`ops::logits::VocabUnpad`] widens here, once.
+    pub fn unpad_descriptor(
+        &self,
+        dtype: DType,
+        output: DType,
+        gathered_width: u32,
+    ) -> UnpadDescriptor {
         UnpadDescriptor {
             dtype,
+            output,
             vocabulary: self.vocabulary,
+            padded: gathered_width,
+            block: BLOCK,
+            pdl: crate::layers::launch::PDL,
+        }
+    }
+
+    /// The unpad's descriptor, from the vocabulary's size alone.
+    ///
+    /// The gathered width is `padded × ranks` — a launch value that follows the deployment's rank
+    /// count — so it is an argument; the vocabulary and the block are the checkpoint's and the
+    /// program's.
+    pub fn unpad_descriptor_of(
+        vocabulary: u32,
+        dtype: DType,
+        output: DType,
+        gathered_width: u32,
+    ) -> UnpadDescriptor {
+        UnpadDescriptor {
+            dtype,
+            output,
+            vocabulary,
             padded: gathered_width,
             block: 1024,
             pdl: crate::layers::launch::PDL,
@@ -225,6 +266,19 @@ pub fn gather_rows(
 ) -> Result<()> {
     let columns = hidden.last();
     let count = rows.numel();
+    // The operator's indices are one axis and its output two, because it derives the row count from
+    // `out`. A caller holding `[1, count]` - the shape an output of one row needs - must flatten it
+    // itself: the same bytes as a two-axis view reach the kernel as two axes and are refused there
+    // (`expected 1 axes, found 2`), which names neither the caller nor the fix.
+    if rows.shape.rank() != 1 {
+        return Err(Error::shape(
+            "gather_rows",
+            format!(
+                "rows is {:?}, and the operator takes a flat [count] index view",
+                rows.shape.dims()
+            ),
+        ));
+    }
     if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != columns {
         return Err(Error::shape(
             "gather_rows",
@@ -238,7 +292,7 @@ pub fn gather_rows(
         dtype: hidden.dtype,
         columns: u32::try_from(columns)
             .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
-        block: 1024,
+        block: BLOCK,
         pdl: crate::layers::launch::PDL,
     };
     let args = logits::GatherArgs { hidden, rows, out };

@@ -14,14 +14,16 @@
 //! example enumerates and audits only: a deployment publishes its weights to device memory and
 //! passes what the model then asks for. Nothing here launches a kernel.
 //!
-//! The checkpoint is read through its headers and converted on the host, so the run needs the
-//! shards' bytes but no CUDA context; a checkpoint whose shards are missing cannot be loaded this way.
+//! **Nothing here opens a shard or a device.** The walk reads the checkpoint's `config.json` and its
+//! declaration and states every program from geometry and element types alone, so a machine holding
+//! only a checkpoint's metadata prints the same lines a GPU host does — which is what makes the
+//! note's diff checkable on any machine.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use nn::{Checkpoint, DType, HostStore, WeightLoader};
-use qwen3_moe::{Config, LoadOptions, Partition};
+use nn::DType;
+use qwen3_moe::{Config, Partition, Representation};
 
 /// The deployment a fixture is generated for, as the walk needs to hear it.
 ///
@@ -35,6 +37,14 @@ struct Deployment {
     expert_rank: usize,
     cache: DType,
     capacity: u32,
+    /// Tokens one prefix-cache page holds, and the dtype the activations have.
+    page: u32,
+    dtype: DType,
+    /// The row counts the executor captures, which the dense packed product is compiled per entry of.
+    buckets: Vec<u32>,
+    /// The representation the caller states, when the checkpoint cannot: `None` is the checkpoint's
+    /// own statement or, on a dense checkpoint, no statement at all.
+    quantization: Option<Representation>,
 }
 
 fn main() -> ExitCode {
@@ -46,6 +56,10 @@ fn main() -> ExitCode {
         expert_rank: 0,
         cache: DType::BF16,
         capacity: 0,
+        page: 64,
+        dtype: DType::BF16,
+        buckets: Vec::new(),
+        quantization: None,
     };
     let number = |value: Option<String>, name: &str| -> Result<usize, String> {
         value
@@ -91,6 +105,40 @@ fn main() -> ExitCode {
                 },
                 Err(message) => return usage(&message),
             },
+            "--quantization" => match arguments.next().as_deref() {
+                Some("bf16") => deployment.quantization = Some(Representation::Dense),
+                Some("nvfp4") => deployment.quantization = Some(Representation::Nvfp4 {
+                    excluded: Vec::new(),
+                    also_excluded: Vec::new(),
+                }),
+                other => {
+                    return usage(&format!("--quantization takes bf16 or nvfp4, not {other:?}"));
+                }
+            },
+            "--page" => match number(arguments.next(), "--page") {
+                Ok(value) => match u32::try_from(value) {
+                    Ok(value) => deployment.page = value,
+                    Err(_) => return usage("--page takes a token count that fits u32"),
+                },
+                Err(message) => return usage(&message),
+            },
+            "--buckets" => match arguments.next() {
+                None => return usage("--buckets takes a comma-separated row list"),
+                Some(value) => {
+                    let mut rows: Vec<u32> = Vec::new();
+                    for entry in value.split(',') {
+                        match entry.trim().parse::<u32>() {
+                            Ok(row) => rows.push(row),
+                            Err(_) => {
+                                return usage(&format!("--buckets takes numbers, not {entry:?}"));
+                            }
+                        }
+                    }
+                    rows.sort_unstable();
+                    rows.dedup();
+                    deployment.buckets = rows;
+                }
+            },
             other => return usage(&format!("unknown argument {other}")),
         }
     }
@@ -115,17 +163,49 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
         deployment.expert_rank,
     )
     .map_err(|error| format!("{}: {error}", root.display()))?;
-    let file = Checkpoint::open_roots(&[root])
-        .map_err(|error| format!("opening {}: {error}", root.display()))?;
-    let mut store = HostStore::new();
-    let model = {
-        let mut loader = WeightLoader::new(&file, &mut store, None, None);
-        qwen3_moe::load(root, partition, &mut loader, LoadOptions::default())
-            .map_err(|error| format!("loading {}: {error}", root.display()))?
+    // The checkpoint's own declaration says which representation its weights are in, and that is
+    // what decides whether the encoded programs are named at all — read from metadata, like the
+    // configuration.
+    let declared = Representation::read(root)
+        .map_err(|error| format!("{}: {error}", root.display()))?;
+    // The rule that keeps a stated representation honest: a checkpoint that declares one cannot be
+    // overridden — its own metadata is the ground truth and a flag that disagrees is a refusal —
+    // while a checkpoint that declares nothing leaves the flag as the only statement there is, and
+    // the header says which of the two it was.
+    let (packed, source) = match (&declared, &deployment.quantization) {
+        (Representation::Dense, Some(stated)) => (stated.is_encoded(), "flag (the checkpoint declares nothing)"),
+        (declared, Some(stated)) if declared.is_encoded() != stated.is_encoded() => {
+            return Err(format!(
+                "the checkpoint declares {} and --quantization says {}: its own metadata is the ground \
+                 truth, and a flag that disagrees with it is not a deployment",
+                if declared.is_encoded() { "NVFP4" } else { "no quantization" },
+                if stated.is_encoded() { "NVFP4" } else { "none" },
+            ));
+        }
+        (declared, _) => (declared.is_encoded(), "declaration"),
     };
-    let keys = model
-        .keys(deployment.cache, deployment.capacity)
-        .map_err(|error| format!("enumerating keys: {error}"))?;
+    // A packed projection's product is compiled per row count, so without the executor's buckets the
+    // rows cannot be named — and a row at an invented `m` would build a store for a forward the
+    // executor never forms. The products are left out and the omission is printed.
+    let projections_packed = packed && !deployment.buckets.is_empty();
+    if packed && deployment.buckets.is_empty() {
+        println!(
+            "# no --buckets: the dense packed products are named for no row count, because a forward \
+             no bucket holds is an error rather than an eager fallback"
+        );
+    }
+    let keys = qwen3_moe::keys::keys(
+        &config,
+        &partition,
+        deployment.dtype,
+        deployment.page,
+        deployment.cache,
+        deployment.capacity,
+        &deployment.buckets,
+        packed,
+        projections_packed,
+    )
+    .map_err(|error| format!("enumerating keys: {error}"))?;
     if keys.is_empty() {
         return Err("the model enumerated no programs".to_owned());
     }
@@ -133,7 +213,7 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
     // without inferring it from the keys. The comment is skipped by every fixture reader.
     println!(
         "# deployment: tensor_parallel {} tensor_rank {} expert_parallel {} expert_rank {} \
-         cache {} capacity {}",
+         cache {} capacity {} page {} buckets {} quantization {} ({})",
         deployment.tensor_parallel,
         deployment.tensor_rank,
         deployment.expert_parallel,
@@ -145,6 +225,19 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
             other => return Err(format!("the cache's {other} has no fixture name")),
         },
         deployment.capacity,
+        deployment.page,
+        if deployment.buckets.is_empty() {
+            "none".to_owned()
+        } else {
+            deployment
+                .buckets
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+        if packed { "nvfp4" } else { "bf16" },
+        source,
     );
     for (operator, key) in keys {
         println!("{operator}\t{key}");
@@ -157,10 +250,11 @@ fn usage(message: &str) -> ExitCode {
     eprintln!(
         "usage: qwen3-moe-keys [--checkpoint <dir>] [--cache bf16|f16|f8e4m3]\n\
          \x20   [--tensor-parallel N] [--tensor-rank N] [--expert-parallel N] [--expert-rank N]\n\
-         \x20   [--capacity rows]\n\n\
+         \x20   [--capacity rows] [--page tokens] [--buckets N,N,…]\n\n\
          Prints the deployment, then one `<operator>\\t<key>` line per program the model launches, \
          sorted and unique. --capacity is the exchange's rows per rank and is read only when \
-         --expert-parallel is above 1."
+         --expert-parallel is above 1; --buckets is the executor's captured row counts, and an \
+         empty list is legitimate only when no packed projection is named."
     );
     ExitCode::from(2)
 }
