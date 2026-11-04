@@ -300,3 +300,17 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
         "the executor was handed the work the facts' budgets admit"
     );
 }
+
+#[test]
+fn a_boot_from_a_file_that_is_not_there_names_the_file() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let error = SchedulerHandle::boot_from("/nonexistent/launch.toml", batches)
+        .err()
+        .expect("a launch file that is not there cannot boot a process");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("/nonexistent/launch.toml"),
+        "the failure names the file it was started with: {message}"
+    );
+}
