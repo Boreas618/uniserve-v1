@@ -60,12 +60,14 @@ pub enum Layer {
 
 impl Layer {
     /// Read layer `index`'s attention of a DiT partition, of the kind the deployment composes.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         kind: crate::config::AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
         rotated_axes: &[u32],
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
@@ -85,6 +87,7 @@ impl Layer {
                     rows,
                     rotated_axes,
                     tile,
+                    tile_bound,
                     partition,
                     loader,
                 )?,

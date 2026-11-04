@@ -2749,10 +2749,21 @@ impl Denoiser {
             groups,
             config.transformer.hidden_size,
         )?;
+        // A sparse deployment states the compression's tile bound once, from its own layouts: the
+        // score matrix is `[heads, query tiles, tiles]` and must cover every video tile any layout
+        // it serves can hold. A dense one has no tiles, and the stack's attention kind never reads
+        // the zero.
+        let tile_bound = match config.attention {
+            crate::config::AttentionKind::Sparse { .. } => {
+                Layouts::new(config.clone(), arrangement)?.tiles_bound()?
+            }
+            crate::config::AttentionKind::Dense => 0,
+        };
         let transformer = Transformer::load(
             &config.transformer,
             config.attention,
             rows,
+            tile_bound,
             partition,
             loader,
             heads,
