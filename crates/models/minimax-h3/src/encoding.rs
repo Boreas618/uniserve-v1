@@ -165,8 +165,11 @@ impl Stack {
     }
 
     /// The extent of the posterior moments: `2 * latent_channels` channels over the latent raster.
-    pub fn moments(&self, raster: Extent) -> Extent {
-        *self.extents(raster).last().expect("a nonempty stack")
+    pub fn moments(&self, raster: Extent) -> Result<Extent> {
+        self.extents(raster)
+            .last()
+            .copied()
+            .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
     }
 
     /// The tile grid of a raster, in input pixels, and the latent extent it produces.
@@ -433,7 +436,10 @@ impl AudioStack {
                 self.samples_per_latent
             )));
         }
-        Ok(*self.lengths(samples).last().expect("a nonempty stack"))
+        self.lengths(samples)
+            .last()
+            .copied()
+            .ok_or_else(|| Error::config("the audio encoder's stack has no stage".to_owned()))
     }
 }
 
@@ -617,13 +623,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![256, 128, 64, 32, 16, 16, 16]
         );
-        assert_eq!(stack.moments(extents[0]).frames, 5);
+        assert_eq!(stack.moments(extents[0]).expect("moments").frames, 5);
         // A single frame stays one latent frame.
-        let single = stack.moments(Extent {
-            frames: 1,
-            height: 16,
-            width: 16,
-        });
+        let single = stack
+            .moments(Extent {
+                frames: 1,
+                height: 16,
+                width: 16,
+            })
+            .expect("moments");
         assert_eq!(single.frames, 1);
         assert_eq!((single.height, single.width), (1, 1));
     }
