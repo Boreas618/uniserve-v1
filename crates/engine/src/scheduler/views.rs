@@ -715,8 +715,28 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// the prefill that writes it is sized from this end.
 fn prefill_end(state: &RequestState) -> u32 {
     let prompt = u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX);
+    // Every vision block of an input image writes its cache tokens into the
+    // context at its prompt position, so the prefill that reaches it is sized
+    // past the text around it.
+    let mut blocks = 0u32;
+    let mut cursor = generation::BlockCursor::default();
+    while let Some((_, input)) = state.input_block(cursor) {
+        if input.encoder != crate::ImageEncoder::Vision {
+            break;
+        }
+        let Some(tokens) = input.num_cache_tokens else {
+            break;
+        };
+        blocks = blocks.saturating_add(tokens);
+        let Some(next) = state.next_block(cursor) else {
+            break;
+        };
+        cursor = next;
+    }
     let commit = u32::try_from(state.canvas_commit.len()).unwrap_or(u32::MAX);
-    prompt.max(state.cache_visible_len.saturating_add(commit))
+    prompt
+        .saturating_add(blocks)
+        .max(state.cache_visible_len.saturating_add(commit))
 }
 
 fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u32 {
