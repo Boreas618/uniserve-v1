@@ -31,6 +31,7 @@ mod allocator;
 mod context;
 mod copy;
 mod cublas;
+mod cudnn;
 pub mod cupti;
 mod device;
 mod driver;
@@ -61,10 +62,13 @@ pub use cublas::{
     Algorithm, ComputeType, Epilogue, Matmul, MatmulArgs, MatmulBytes, MatmulDescriptor,
     MatrixLayout,
 };
+pub use cudnn::{
+    Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionPlan, Cudnn, Engine, Tensor,
+};
 pub use device::{
     Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
 };
-pub use dtype::DataType;
+pub use dtype::DType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::{
