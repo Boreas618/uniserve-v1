@@ -84,6 +84,7 @@
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
 //! `crates/executor` and are used as they are written there.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -986,34 +987,54 @@ impl MainProcess {
             return Ok(());
         }
 
-        // The descriptors each operator must cover are exactly the keys the
-        // serving generation holds: an update changes implementations and never
-        // the set of descriptors (§7.3 step 2, §5.3).
+        let tasks = match self.admit_installs(programs, &BTreeMap::new()) {
+            Ok(tasks) => tasks,
+            Err(failure) => return self.abandon_precopy(generation, failure, reply),
+        };
+
+        self.precopy = Some(Precopy {
+            generation,
+            reply,
+            policy: policy.clone(),
+            programs: programs.clone(),
+            learned: BTreeMap::new(),
+            next: Vec::new(),
+            policies: Vec::new(),
+            stage: PrecopyStage::Modules(tasks),
+        });
+        Ok(())
+    }
+
+    /// The module-load tasks one generation needs, one per device (§7.3 step 2).
+    ///
+    /// An update changes implementations and never the set of descriptors, so the keys each
+    /// operator must cover are the ones the serving generation holds. The epoch's *first*
+    /// generation has no serving generation to take them from, and nothing else can state them: a
+    /// descriptor is what the model's forward computes for a bucket, and only a walk of that
+    /// forward says which ones it launches. So the first generation starts with the keys already
+    /// learned and finds the rest by walking - each attempt that finds a kernel missing names the
+    /// operator and key it needed, and the install is admitted again with that key added.
+    fn admit_installs(
+        &mut self,
+        programs: &Programs,
+        learned: &BTreeMap<String, Vec<String>>,
+    ) -> std::result::Result<Vec<Arc<HostTask<Install>>>, UpdateFailure> {
+        let invalid = |reason: String| UpdateFailure::Precopy { reason };
         let mut descriptors = Vec::with_capacity(programs.len());
         let mut requests = Vec::with_capacity(programs.len());
         for (slot, program) in programs {
             let Some(operator) = ops::operator_name(&slot.op) else {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy {
-                        reason: format!("operator {} has no implementation in this build", slot.op),
-                    },
-                    reply,
-                );
+                return Err(invalid(format!(
+                    "operator {} has no implementation in this build",
+                    slot.op
+                )));
             };
-            let keys = descriptor_keys(&self.generations[0], operator);
-            if keys.is_empty() {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy {
-                        reason: format!(
-                            "operator {} holds no descriptor in the serving generation",
-                            slot.op
-                        ),
-                    },
-                    reply,
-                );
-            }
+            let serving = descriptor_keys(&self.generations[0], operator);
+            let keys = if serving.is_empty() {
+                learned.get(operator).cloned().unwrap_or_default()
+            } else {
+                serving
+            };
             descriptors.push(Descriptors {
                 op: slot.op.clone(),
                 keys,
@@ -1027,26 +1048,13 @@ impl MainProcess {
         let mut tasks = Vec::with_capacity(self.executors.len());
         for (index, executor) in self.executors.iter().enumerate() {
             let ordinal = executor.device();
-            let device = match platform::Device::new(ordinal) {
-                Ok(device) => device,
-                Err(error) => {
-                    return self.abandon_precopy(
-                        generation,
-                        UpdateFailure::Precopy {
-                            reason: format!("opening device {}: {error}", ordinal.0),
-                        },
-                        reply,
-                    );
-                }
-            };
+            let device = platform::Device::new(ordinal)
+                .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             let Some(target) = self.targets.get(index).cloned() else {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Precopy {
-                        reason: format!("device {} has no build target", ordinal.0),
-                    },
-                    reply,
-                );
+                return Err(invalid(format!(
+                    "device {} has no build target",
+                    ordinal.0
+                )));
             };
             let install = Install {
                 programs: Arc::clone(&self.programs),
@@ -1061,26 +1069,11 @@ impl MainProcess {
             match self.modules.admit(install) {
                 Ok(task) => tasks.push(task),
                 Err(error) => {
-                    return self.abandon_precopy(
-                        generation,
-                        UpdateFailure::Precopy {
-                            reason: format!("admitting a module load: {error}"),
-                        },
-                        reply,
-                    );
+                    return Err(invalid(format!("admitting a module load: {error}")));
                 }
             }
         }
-
-        self.precopy = Some(Precopy {
-            generation,
-            reply,
-            policy: policy.clone(),
-            next: Vec::new(),
-            policies: Vec::new(),
-            stage: PrecopyStage::Modules(tasks),
-        });
-        Ok(())
+        Ok(tasks)
     }
 
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
@@ -1154,12 +1147,54 @@ impl MainProcess {
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
+                        // A walk that found a kernel missing names the operator and key it needed:
+                        // that is how the epoch's first generation learns what it must install.
                         StageFailure::Failed(reason) => {
-                            return self.abandon_precopy(
+                            let Some((operator, key)) = missing_kernel(&submissions) else {
+                                return self.abandon_precopy(
+                                    generation,
+                                    UpdateFailure::Precopy { reason },
+                                    precopy.reply,
+                                );
+                            };
+                            if precopy
+                                .learned
+                                .get(&operator)
+                                .is_some_and(|keys| keys.contains(&key))
+                            {
+                                // The walk named a key this generation already installed, so no
+                                // further attempt can succeed: the loop stops with both names
+                                // rather than retrying a key it holds.
+                                return self.abandon_precopy(
+                                    generation,
+                                    UpdateFailure::Precopy {
+                                        reason: format!(
+                                            "{operator} still has no kernel under {key} after it \
+                                             was installed: the walk and the install disagree"
+                                        ),
+                                    },
+                                    precopy.reply,
+                                );
+                            }
+                            tracing::info!(
+                                %operator,
+                                %key,
                                 generation,
-                                UpdateFailure::Precopy { reason },
-                                precopy.reply,
+                                "the walk names a descriptor key this generation learns"
                             );
+                            precopy.learned.entry(operator).or_default().push(key);
+                            let tasks = match self.admit_installs(
+                                &precopy.programs,
+                                &precopy.learned,
+                            ) {
+                                Ok(tasks) => tasks,
+                                Err(failure) => {
+                                    return self.abandon_precopy(generation, failure, precopy.reply);
+                                }
+                            };
+                            precopy.stage = PrecopyStage::Modules(tasks);
+                            self.precopy = Some(precopy);
+                            return Ok(());
                         }
                     }
                 }
@@ -1784,6 +1819,29 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     Some(proto::process::Report { kind: Some(kind) })
 }
 
+/// The operator and descriptor key a failed walk named, when that is what failed (§7.3 step 2).
+///
+/// A generation holds every kernel its buckets launch, and a walk that finds one missing says
+/// which: this is the only producer of an epoch's first generation's descriptor keys, because a
+/// descriptor is what the model's forward computes for a bucket and nothing outside the forward can
+/// list them.
+fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
+    for submission in submissions {
+        let Some(Outcome::Failed(error)) = submission.outcome() else {
+            continue;
+        };
+        if let executor::Error::Ops(ops::Error::MissingKernel {
+            operator,
+            descriptor,
+            ..
+        }) = &*error
+        {
+            return Some(((*operator).to_owned(), descriptor.clone()));
+        }
+    }
+    None
+}
+
 /// Polls one set of scheduler answers (§7.3 steps 2 and 3).
 ///
 /// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
@@ -2036,6 +2094,12 @@ struct Precopy {
     reply: Option<u32>,
     /// The policy program the update installs.
     policy: Program,
+    /// The kernel programs the update installs, by slot: kept so the discovery loop can admit the
+    /// installs again with a key it just learned.
+    programs: Programs,
+    /// The descriptor keys the walk has taught this generation, by operator. The epoch's first
+    /// generation has no serving generation to take them from (§7.3 step 2).
+    learned: BTreeMap<String, Vec<String>>,
     /// The generation built for each device, in `executors` order.
     next: Vec<Arc<Generation>>,
     /// The answers of every scheduler that is preparing the update's policy program. The build runs
