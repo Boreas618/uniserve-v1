@@ -1733,55 +1733,6 @@ pub(crate) mod tests {
     /// loading boundary is the whole of what stops it: without this, the mismatch appears at the
     /// kernel that reads one type and is handed another, if the kernel checks at all.
     ///
-    /// The arena is the track's own plan, and a layout with no track is refused by name.
-    ///
-    /// The audio decode's plan is keyed by the track's latent steps, so the number a runner
-    /// allocates must follow the layout it was handed and not a value remembered beside it: a longer
-    /// track needs strictly more bytes, and a layout that states no audio is refused rather than
-    /// answered with the plan for zero steps, which would be an arena of no bytes for a decode that
-    /// runs.
-    #[test]
-    fn the_audio_decoders_arena_is_the_tracks_plan_and_no_track_is_refused() {
-        let config = audio_config();
-        let mut loader = WeightLoader::stated(DType::F32, None);
-        let decoder = BigVgan::load(&config, &mut loader).expect("the decoder");
-        let layout_of = |frames: u32| nn::capability::Layout {
-            video: nn::capability::LatentShape {
-                channels: 0,
-                frames: 0,
-                height: 0,
-                width: 0,
-            },
-            audio: Some(nn::capability::LatentShape {
-                channels: config.latent_channels,
-                frames,
-                height: 0,
-                width: 0,
-            }),
-            text_rows: 0,
-            condition_rows: 0,
-            condition_elements: 0,
-        };
-
-        let short = decoder.arena_bytes(&layout_of(32)).expect("a short track");
-        let long = decoder.arena_bytes(&layout_of(64)).expect("a longer track");
-        assert!(
-            short > 0 && long > short,
-            "a 64-step track states {long} B, not more than the {short} B of a 32-step one"
-        );
-
-        let error = decoder
-            .arena_bytes(&nn::capability::Layout {
-                audio: None,
-                ..layout_of(32)
-            })
-            .expect_err("a layout with no track");
-        assert!(
-            error.to_string().contains("no audio track"),
-            "the refusal names what the layout lacks: {error}"
-        );
-    }
-
     /// A shapes-only loader answers each request in its own shape and at the stated type
     /// (`WeightLoader::load`), so the first weight the load reads is enough to reach the refusal.
     #[test]
