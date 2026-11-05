@@ -711,6 +711,51 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let run = decoder.decode(&forward, latents, positions, out, &scratch);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
+
+    // **The stitch, over the clip's whole grid.** A one-tile decode launches no seam blend, so a
+    // harness that stops at `decode` records none of the `cross_fade` rows the walk states - and the
+    // blends are what the decoder cannot skip: every offered canvas is multi-column and multi-row.
+    // `decode_clip` decodes each tile again through the same decoder and writes it into the clip's
+    // raster, blending it with the tiles above and to its left in `Tile` order.
+    let stitches = minimax_h3::decoding::ClipDecoder::new(&config, DType::F32)
+        .map_err(|error| error.to_string())?;
+    let grid = tiles.tiles(&config, &clip_canvas);
+    let clip_voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+    let clip_latents = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[clip_voxels, u64::from(config.latent_channels)]),
+        )
+        .map_err(|error| error.to_string())?;
+    let clip_positions = arena
+        .tensor(DType::F32, Shape::new(&[3, canvas.rows()]))
+        .map_err(|error| error.to_string())?;
+    // The clip's raster in pixels: three channels over the clip's frames and the request's raster.
+    let clip_out = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[
+                u64::from(minimax_h3::output::Rgb::CHANNELS),
+                // The raster's frame axis is in **pixels**: each latent frame decodes to the VAE's
+                // temporal factor. The clip's own latent count is what the latents carry; the raster
+                // the tiles are stitched into is in decoded frames, rows and columns.
+                u64::from(clip_canvas.frames) * u64::from(config.temporal_compression()),
+                u64::from(height),
+                u64::from(width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    ops::capture::set_sink(Some(&mut recorded));
+    let stitched = stitches.decode_clip(
+        &forward,
+        &decoder,
+        &grid,
+        clip_latents,
+        clip_positions,
+        clip_out,
+    );
+    ops::capture::set_sink(None);
+    stitched.map_err(|error| error.to_string())?;
     Ok(recorded.0)
 }
 

@@ -486,65 +486,78 @@ impl ClipDecoder {
         let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
         self.unpatchify.forward(f, tokens, plain)?;
         self.unpatchify.forward(f, tokens, view)?;
-        // The blend can only read a neighbour that is one contiguous block. `cross_fade`'s sources are
-        // addressed flat in `[channels, frames, rows, columns]` order and only its destination carries
-        // strides (its program's own note says so), so a shift of a raster wider than the tile reads
-        // the wrong rows past the first. Refusing is the honest answer until the operator reads its
-        // sources through their strides: a silently misread seam is a different picture, not a slower
-        // one. Single-column grids are unaffected, because there the tile's rows are the raster's.
-        // The layout fact the refusal states, and the reason it is not a defect of one grid: the seam
-        // is always narrower than a tile (`MINIMUM_OVERLAP` and the grid's arithmetic keep `extent`
-        // below `TILE_PIXELS`), so a neighbour shifted by it is narrower than the raster whenever the
-        // grid has more than one column - which every canvas of this checkpoint has.
-        if (tile.above != 0 || tile.left != 0) && view.shape.dim(3) != decoded.shape.dim(3) {
-            return Err(Error::Unsupported(format!(
-                "the clip decoder cannot blend tile ({}, {}) of a raster {:?}: the tile's view is \
-                 {:?}, so a neighbour shifted by the seam ({} rows above, {} columns left) is not one \
-                 contiguous block, and cross_fade reads its sources contiguously; the seam is always \
-                 narrower than the {} the tile is cut at, so only a single-column grid can blend",
-                tile.row,
-                tile.column,
-                decoded.shape.dims(),
-                view.shape.dims(),
-                tile.above,
-                tile.left,
-                crate::video_vae::TILE_PIXELS
-            )));
+        // The blend reads the **band each tile contributes to the seam**: the predecessor's last
+        // `extent` positions along the axis and this tile's first `extent`, both views over their own
+        // raster with the raster's own strides. `cross_fade` takes strided sources, so a band of a
+        // raster that is wider than the tile is what it is handed - the tile itself would blend the
+        // tile's own first positions, because the operator reads a source's *last* `extent` and a
+        // tile-wide view shifted back by `extent` ends inside the current tile.
+        if tile.above != 0 {
+            let previous = self.band(decoded, tile, first_row, first_column, 2, tile.above, true)?;
+            let seam = self.band(blended, tile, first_row, first_column, 2, tile.above, false)?;
+            self.blend(tile.above, 2)?.forward(f, Some(previous), seam, seam)?;
         }
-        // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
-        // current tile's first `extent`. The predecessor's last positions are the seam itself, which
-        // still holds the predecessor's pixels in the raster, so the neighbour's view starts one
-        // tile-extent minus one overlap before the tile - not one overlap before it, which would read
-        // the tile's own pixels from a band further down.
-        let (tile_rows, tile_columns) = (
+        if tile.left != 0 {
+            let previous = self.band(decoded, tile, first_row, first_column, 3, tile.left, true)?;
+            let seam = self.band(blended, tile, first_row, first_column, 3, tile.left, false)?;
+            self.blend(tile.left, 3)?.forward(f, Some(previous), seam, seam)?;
+        }
+        Ok(())
+    }
+
+    /// A view of the band one tile contributes to a seam, keeping the raster's own strides.
+    ///
+    /// The operator blends a source's **last** `extent` positions along the seam's axis with the
+    /// next tile's **first** `extent`, so both operands are the same shape: for the tile above,
+    /// `[channels, frames, extent, columns]`; for the tile to the left,
+    /// `[channels, frames, rows, extent]`. `predecessor` moves the band back by its own width, which
+    /// lands it exactly where the earlier tile wrote - outside this tile's block, so the tile's own
+    /// decode does not overwrite it.
+    fn band(
+        &self,
+        dest: TensorView,
+        tile: &Tile,
+        first_row: u64,
+        first_column: u64,
+        axis: u32,
+        extent: u32,
+        predecessor: bool,
+    ) -> Result<TensorView> {
+        let ratio = u64::from(self.ratio);
+        let extent = u64::from(extent);
+        let (rows, columns) = (
             u64::from(tile.canvas.height) * ratio,
             u64::from(tile.canvas.width) * ratio,
         );
-        if tile.above != 0 {
-            let previous = self.placement(
-                decoded,
-                tile,
-                first_row,
+        let (row_start, column_start, shape) = match (axis, predecessor) {
+            (2, false) => (first_row, first_column, [dest.shape.dim(0), dest.shape.dim(1), extent, columns]),
+            (2, true) => (
+                first_row.checked_sub(extent).ok_or_else(|| {
+                    Error::config("a blend starts above the raster".to_owned())
+                })?,
                 first_column,
-                u32::try_from(tile_rows).unwrap_or(u32::MAX) - tile.above,
-                0,
-            )?;
-            self.blend(tile.above, 2)?
-                .forward(f, Some(previous), view, view)?;
-        }
-        if tile.left != 0 {
-            let previous = self.placement(
-                decoded,
-                tile,
+                [dest.shape.dim(0), dest.shape.dim(1), extent, columns],
+            ),
+            (3, false) => (first_row, first_column, [dest.shape.dim(0), dest.shape.dim(1), rows, extent]),
+            (3, true) => (
                 first_row,
-                first_column,
-                0,
-                u32::try_from(tile_columns).unwrap_or(u32::MAX) - tile.left,
-            )?;
-            self.blend(tile.left, 3)?
-                .forward(f, Some(previous), view, view)?;
-        }
-        Ok(())
+                first_column.checked_sub(extent).ok_or_else(|| {
+                    Error::config("a blend starts left of the raster".to_owned())
+                })?,
+                [dest.shape.dim(0), dest.shape.dim(1), rows, extent],
+            ),
+            (other, _) => {
+                return Err(Error::config(format!(
+                    "a seam runs along the height (2) or the width (3), not {other}"
+                )))
+            }
+        };
+        Ok(TensorView::with_strides(
+            dest.element(&[0, 0, row_start, column_start]),
+            dest.dtype,
+            Shape::new(&shape),
+            dest.strides,
+        ))
     }
 
     /// A view of `dest` holding one tile's pixel block, shifted back by `up` rows and `left` columns.
@@ -1183,6 +1196,81 @@ mod tests {
                 widths
                     .iter()
                     .all(|width| *width % alignment as u32 == 0 && u64::from(*width) >= minimum)
+            );
+        }
+    }
+
+    /// The band a seam blends is the predecessor's **last** positions and the tile's **first**.
+    ///
+    /// `cross_fade` reads a source's last `extent` along the seam's axis, so the two operands are
+    /// adjacent bands of one raster: the predecessor's ends exactly one element before the tile's
+    /// begins, in the raster's own coordinates. That is the property a shift that is off by one
+    /// breaks, and every shape and key still agrees when it does - the picture differs in a seam.
+    /// This test reads the views the stitch builds, without a device and without a kernel.
+    #[test]
+    fn a_seams_band_is_the_predecessors_last_positions_and_the_tiles_first() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = Canvas::clip(&config, 48, 84);
+        let decoder = ClipDecoder::new(&config, DType::F32).expect("a clip decoder");
+        let ratio = u64::from(decoder.ratio);
+        let tiles = Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas);
+        // A tile with a neighbour on each axis: the first row and column of the grid have none.
+        let tile = tiles
+            .iter()
+            .find(|tile| tile.above > 0 && tile.left > 0)
+            .expect("a multi-column, multi-row grid");
+        let first_row = u64::from(tile.latent_rows.0) * ratio;
+        let first_column = u64::from(tile.latent_columns.0) * ratio;
+        let (channels, frames) = (3_u64, u64::from(canvas.frames));
+        let (rows, columns) = (
+            u64::from(canvas.height) * ratio,
+            u64::from(canvas.width) * ratio,
+        );
+        let raster = TensorView::new(
+            ops::DevicePtr::new(0),
+            DType::F32,
+            Shape::new(&[channels, frames, rows, columns]),
+        );
+        for (axis, extent) in [(2, tile.above), (3, tile.left)] {
+            let previous = decoder
+                .band(raster, tile, first_row, first_column, axis, extent, true)
+                .expect("the predecessor's band");
+            let current = decoder
+                .band(raster, tile, first_row, first_column, axis, extent, false)
+                .expect("the tile's band");
+            assert_eq!(
+                previous.shape, current.shape,
+                "a blend's operands are the same shape along axis {axis}"
+            );
+            assert_eq!(
+                previous.shape.dim(axis as usize),
+                u64::from(extent),
+                "the band is the seam's width along axis {axis}"
+            );
+            assert_eq!(
+                previous.strides, raster.strides,
+                "a band keeps the raster's own strides along axis {axis}"
+            );
+            // Adjacency, in the raster's flat coordinates: the predecessor's band ends exactly one
+            // position before the tile's begins - one element to the left, or one raster row above -
+            // which is the property a shift of the wrong quantity breaks while every shape agrees.
+            let current_index = first_row * columns + first_column;
+            let previous_index = if axis == 3 {
+                current_index - u64::from(extent)
+            } else {
+                current_index - u64::from(extent) * columns
+            };
+            assert_eq!(
+                previous.ptr.address(),
+                raster.offset_elements(previous_index).address(),
+                "the predecessor's band starts at {previous_index} along axis {axis}"
+            );
+            assert_eq!(
+                current.ptr.address(),
+                raster.offset_elements(current_index).address(),
+                "the tile's band starts at {current_index} along axis {axis}"
             );
         }
     }
