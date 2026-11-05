@@ -1151,27 +1151,44 @@ impl Normalized {
     /// The padding is one pixel on each spatial side, mirrored or replicated, and two zero frames in
     /// front, so the convolution's own geometry carries none and no output frame reads a later input
     /// frame.
-    fn run(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
-        let (batch, _, frames, height, width) = extent(values)?;
-        let mean = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, u64::from(self.groups)]))?;
-        let rstd = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, u64::from(self.groups)]))?;
+    /// `pad` is `[1, channels, frames + 2, height + 2, width + 2]` and `mean`/`rstd` are
+    /// `[frames, groups]`, all reserved by the encoder's plan.
+    ///
+    /// **Nothing here allocates.** These three buffers were taken from the arena on every call, which
+    /// made the encode ask for roughly another set's worth of bytes per tile that no plan could state:
+    /// the first of them alone measured 647,534,592 B at 17 frames of 256x256 (level 0 at 128
+    /// channels). A reserved buffer is a buffer the plan can count, and the blocks run one after
+    /// another, so one pad per distinct channel count per level is enough.
+    fn run(
+        &self,
+        f: &Forward,
+        values: TensorView,
+        pad: TensorView,
+        mean: TensorView,
+        rstd: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let (_, channels, frames, height, width) = extent(values)?;
+        if channels != u64::from(self.channels)
+            || pad.shape.rank() != 5
+            || pad.shape.dims()
+                != [
+                    1,
+                    u64::from(self.channels),
+                    frames + 2,
+                    height + 2,
+                    width + 2,
+                ]
+        {
+            return Err(Error::config(format!(
+                "a normalization of {} channels got {:?} to carry its padded input",
+                self.channels,
+                pad.shape.dims()
+            )));
+        }
         FrameMoments::new(u64::from(self.groups), self.epsilon).forward(f, values, mean, rstd)?;
-        let padded = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[
-                batch,
-                u64::from(self.channels),
-                frames + 2,
-                height + 2,
-                width + 2,
-            ]),
-        )?;
-        self.norm.forward(f, values, mean, rstd, padded, 1, 1, 2)?;
-        Ok(self.conv.forward(f, padded, out)?)
+        self.norm.forward(f, values, mean, rstd, pad, 1, 1, 2)?;
+        Ok(self.conv.forward(f, pad, out)?)
     }
 }
 
@@ -1258,6 +1275,10 @@ struct EncoderSet {
     padded: TensorView,
     stream: TensorView,
     levels: Vec<LevelSet>,
+    /// The last normalization's own padded input, mean and inverse standard deviation.
+    output_pad: TensorView,
+    output_mean: TensorView,
+    output_rstd: TensorView,
 }
 
 /// One level's buffers: the pair its blocks alternate between, one working buffer the block reads back,
@@ -1275,6 +1296,14 @@ struct LevelSet {
     projected: Option<TensorView>,
     pad: Option<TensorView>,
     strided: Option<TensorView>,
+    /// One padded-input buffer per distinct channel count among the level's normalizations, keyed by
+    /// that count. A level's first block widens and its later blocks do not, so a level needs two; the
+    /// blocks run one after another and never hold two pads at once, so one buffer per count is enough.
+    norms: Vec<(u32, TensorView)>,
+    /// The statistics of every normalization at this level, `[frames, groups]` each. Every block of a
+    /// level runs at the level's own frame count, so one pair serves them all.
+    mean: TensorView,
+    rstd: TensorView,
 }
 
 impl VideoEncoder {
@@ -1472,20 +1501,36 @@ impl VideoEncoder {
                 ]),
             )?)
         };
-        let padded = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[
-                1,
-                u64::from(self.stack.input_channels),
-                u64::from(raster.frames + 2),
-                u64::from(raster.height + 2),
-                u64::from(raster.width + 2),
-            ]),
-        )?;
+        // One normalization's padded input: one pixel wider and taller on each side and two frames in
+        // front, exactly the shape `Normalized::run` checks.
+        let pad_buffer = |channels: u64, extent: &Extent| -> Result<TensorView> {
+            Ok(f.arena().tensor(
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    channels,
+                    u64::from(extent.frames) + 2,
+                    u64::from(extent.height) + 2,
+                    u64::from(extent.width) + 2,
+                ]),
+            )?)
+        };
+        let moments_buffer = |groups: u64, extent: &Extent| -> Result<TensorView> {
+            Ok(f.arena()
+                .tensor(DType::F32, Shape::new(&[u64::from(extent.frames), groups]))?)
+        };
+        let padded = pad_buffer(u64::from(self.stack.input_channels), &raster)?;
         let stream = buffer(u64::from(self.stack.widths[0]), &extents[0])?;
         let mut levels = Vec::with_capacity(extents.len() - 1);
         for index in 0..extents.len() - 1 {
             let width = u64::from(self.stack.widths[index]);
+            let groups = u64::from(
+                self.levels[index]
+                    .blocks
+                    .first()
+                    .map(|block| block.first.groups)
+                    .unwrap_or(self.output.groups),
+            );
             let extent = &extents[index];
             let next = &extents[index + 1];
             let downsample = self.levels[index].downsample.is_some();
@@ -1520,12 +1565,46 @@ impl VideoEncoder {
                     true => Some(buffer(width, next)?),
                     false => None,
                 },
+                norms: {
+                    let mut norms: Vec<(u32, TensorView)> = Vec::new();
+                    for block in &self.levels[index].blocks {
+                        for normalized in [&block.first, &block.second] {
+                            if norms.iter().any(|(count, _)| *count == normalized.channels) {
+                                continue;
+                            }
+                            // Level zero's first block normalizes raw pixels, so its pad is the pixel
+                            // pad the input convolution has already read: one buffer, not two.
+                            let view = match index == 0
+                                && normalized.channels == self.stack.input_channels
+                            {
+                                true => padded,
+                                false => pad_buffer(u64::from(normalized.channels), extent)?,
+                            };
+                            norms.push((normalized.channels, view));
+                        }
+                    }
+                    norms
+                },
+                mean: moments_buffer(groups, extent)?,
+                rstd: moments_buffer(groups, extent)?,
             });
         }
+        let last = extents[extents.len() - 1];
+        let output_pad = pad_buffer(u64::from(self.output.channels), &last)?;
+        let output_groups = u64::from(self.output.groups);
+        let output_mean = moments_buffer(output_groups, &last)?;
+        let output_rstd = moments_buffer(output_groups, &last)?;
+
+        // The normalizations' own padded inputs: one per distinct channel count, because a level's
+        // first block widens and its later blocks do not. Level zero's narrowest is the pixel pad the
+        // input convolution already read, so it is the same buffer rather than a second one.
         Ok(EncoderSet {
             padded,
             stream,
             levels,
+            output_pad,
+            output_mean,
+            output_rstd,
         })
     }
 
@@ -1585,7 +1664,17 @@ impl VideoEncoder {
                     0 => buffers.first,
                     _ => buffers.second,
                 };
-                self.block(f, block, source, target, buffers.working, buffers.projected)?;
+                self.block(
+                    f,
+                    block,
+                    source,
+                    target,
+                    buffers.working,
+                    buffers.projected,
+                    &buffers.norms,
+                    buffers.mean,
+                    buffers.rstd,
+                )?;
                 source = target;
             }
             if let Some(downsample) = &level.downsample {
@@ -1604,7 +1693,14 @@ impl VideoEncoder {
         // projection that follows it runs **once for the whole raster**, after the tiles are stitched
         // (`project`), because that is the reference's order: the tiles produce moments, the tiler
         // blends them, and the projection reads the stitched result.
-        self.output.run(f, source, out)
+        self.output.run(
+            f,
+            source,
+            set.output_pad,
+            set.output_mean,
+            set.output_rstd,
+            out,
+        )
     }
 
     /// The latent frames a **condition** of `frames` frames encodes to.
@@ -1691,9 +1787,28 @@ impl VideoEncoder {
         out: TensorView,
         working: TensorView,
         projected: Option<TensorView>,
+        norms: &[(u32, TensorView)],
+        mean: TensorView,
+        rstd: TensorView,
     ) -> Result<()> {
-        block.first.run(f, values, working)?;
-        block.second.run(f, working, out)?;
+        let pad_of = |normalized: &Normalized| -> Result<TensorView> {
+            norms
+                .iter()
+                .find(|(count, _)| *count == normalized.channels)
+                .map(|(_, view)| *view)
+                .ok_or_else(|| {
+                    Error::config(format!(
+                        "no reserved pad for a normalization of {} channels",
+                        normalized.channels
+                    ))
+                })
+        };
+        block
+            .first
+            .run(f, values, pad_of(&block.first)?, mean, rstd, working)?;
+        block
+            .second
+            .run(f, working, pad_of(&block.second)?, mean, rstd, out)?;
         let residual = match (&block.shortcut, projected) {
             (Some(shortcut), Some(projected)) => {
                 shortcut.forward(f, values, projected)?;
@@ -2483,7 +2598,53 @@ pub fn video_encoder_tile_arena(
             );
             push(format!("level{index}.strided"), width * pixels(next));
         }
+        // The normalizations' padded inputs: one per distinct channel count at this level, because a
+        // level's first block widens and its later blocks do not. Level zero's incoming count is the
+        // pixel pad above, which the input convolution reads and the block then reuses.
+        let incoming = match index {
+            0 => u64::from(stack.input_channels),
+            _ => u64::from(stack.widths[index - 1]),
+        };
+        let mut counts: Vec<u64> = Vec::new();
+        for channels in [incoming, width] {
+            if channels == incoming && index == 0 {
+                continue;
+            }
+            if counts.contains(&channels) {
+                continue;
+            }
+            counts.push(channels);
+            push(
+                format!("level{index}.norm{channels}"),
+                channels
+                    * u64::from(level.frames + 2)
+                    * u64::from(level.height + 2)
+                    * u64::from(level.width + 2),
+            );
+        }
+        let groups = u64::from(config.norm_num_groups);
+        push(
+            format!("level{index}.mean"),
+            u64::from(level.frames) * groups,
+        );
+        push(
+            format!("level{index}.rstd"),
+            u64::from(level.frames) * groups,
+        );
     }
+    // The last normalization, which reads the last level's output at its own extent.
+    let last = &extents[extents.len() - 1];
+    let channels = u64::from(stack.widths[stack.widths.len() - 1]);
+    push(
+        "output.norm".to_owned(),
+        channels
+            * u64::from(last.frames + 2)
+            * u64::from(last.height + 2)
+            * u64::from(last.width + 2),
+    );
+    let groups = u64::from(config.norm_num_groups);
+    push("output.mean".to_owned(), u64::from(last.frames) * groups);
+    push("output.rstd".to_owned(), u64::from(last.frames) * groups);
     Ok(plan)
 }
 
@@ -3474,6 +3635,26 @@ mod tests {
             if input != width {
                 expected.push(format!("level{index}.projected"));
             }
+            // One padded input per distinct channel count among the level's normalizations - the
+            // incoming width for its first block, its own for the rest - and one pair of statistics
+            // for them all. Level zero's incoming count is the pixel pad, which is already named.
+            let incoming = match index {
+                0 => stack.input_channels,
+                _ => stack.widths[index - 1],
+            };
+            let mut counts: Vec<u32> = Vec::new();
+            for channels in [incoming, width] {
+                if channels == incoming && index == 0 {
+                    continue;
+                }
+                if counts.contains(&channels) {
+                    continue;
+                }
+                counts.push(channels);
+                expected.push(format!("level{index}.norm{channels}"));
+            }
+            expected.push(format!("level{index}.mean"));
+            expected.push(format!("level{index}.rstd"));
             let next = &extents[index + 1];
             if next.frames < level.frames || next.height < level.height || next.width < level.width
             {
@@ -3481,6 +3662,10 @@ mod tests {
                 expected.push(format!("level{index}.strided"));
             }
         }
+        // The last normalization, which reads the last level's output at its own extent.
+        expected.push("output.norm".to_owned());
+        expected.push("output.mean".to_owned());
+        expected.push("output.rstd".to_owned());
         let mut planned: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
         planned.sort_unstable();
         let mut wanted: Vec<&str> = expected.iter().map(String::as_str).collect();
