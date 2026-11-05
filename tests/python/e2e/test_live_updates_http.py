@@ -1187,8 +1187,18 @@ def _restart_while_streaming(
     # One completion before any stream: a deployment that answers nothing says
     # so here, in seconds and with its own body, instead of as a stream that
     # produced no token in five minutes — a silence the two paths share and
-    # that therefore names neither.
-    answered = _chat(base_url, name, "Count from 1 to 3, separated by commas.")
+    # that therefore names neither. A refusal is the likelier failure (a
+    # relaunched process that was not handed the epoch's programs answers 503
+    # until it times out), and `raise_for_status` keeps the status but not the
+    # body, so the refusal's own `detail` is raised here as well.
+    probe = "Count from 1 to 3, separated by commas."
+    try:
+        answered = _chat(base_url, name, probe)
+    except httpx.HTTPStatusError as error:
+        raise AssertionError(
+            "the deployment refused a completion: "
+            f"{error.response.status_code} {error.response.text[:2000]}"
+        ) from error
     choice = (answered.get("choices") or [{}])[0]
     content = choice.get("message", {}).get("content")
     assert content, f"the deployment answered no content: {answered}"
