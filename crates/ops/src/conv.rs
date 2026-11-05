@@ -157,6 +157,17 @@ const _: () = assert!(
     std::mem::offset_of!(Call, kernel) == 32 + 3 * 5 * 8,
     "the convolution call structure's filter moved without its header"
 );
+// The message's offset and the structure's size are pinned on both sides - here and by the three
+// headers' `static_assert`s - because a field added to one mirror and not the other is a kernel
+// reading its geometry out of its error buffer.
+const _: () = assert!(
+    std::mem::offset_of!(Call, error) == 216,
+    "the convolution call's message moved: the headers pin the same offset"
+);
+const _: () = assert!(
+    std::mem::size_of::<Call>() == 728,
+    "the convolution call's size must equal the headers', which pin it at 728"
+);
 
 /// The arguments of a convolution.
 #[derive(Clone, Copy)]
