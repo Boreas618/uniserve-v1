@@ -71,6 +71,14 @@ pub(crate) enum Command {
     /// The Storage Server of this host and the operator's commands against
     /// it.
     Storage(Box<StorageArgs>),
+    /// Answer the video request rules as JSON: one request on standard
+    /// input, one answer on standard output. The rules are the `models`
+    /// crate's; this command computes none of them.
+    #[command(
+        hide = true,
+        override_usage = "uniserve rules < request.json > answer.json"
+    )]
+    Rules,
     /// A command whose parser belongs to another crate, such as the Program
     /// Server's: the executable hands the arguments to that parser instead of
     /// restating its surface here.
@@ -115,6 +123,7 @@ mod tests {
                 Command::Serve(_) => "serve",
                 Command::Frontend(_) => "frontend",
                 Command::Storage(_) => "storage",
+                Command::Rules => "rules",
                 Command::External(arguments) => match arguments.first().and_then(|name| name.to_str()) {
                     Some("program-server") => "program-server",
                     _ => "other",

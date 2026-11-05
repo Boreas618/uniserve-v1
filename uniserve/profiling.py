@@ -24,7 +24,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import functools
 import json
 import logging
@@ -121,47 +120,12 @@ def attach_fences(model: nn.Module, patterns: str) -> str:
         ...}``, in probe order.
     """
     from uniserve.errors import SetupError
-    from uniserve.numerics import function
-    from uniserve.worker import library
 
-    selected = [str(pattern) for pattern in json.loads(patterns)]
-    probe = library()["fence_probe"]
-    instances: list[dict[str, str]] = []
-    for path, module in model.named_modules():
-        try:
-            component = function(type(module)).split("/", 1)[0]
-        except SetupError:
-            # A container of no numerical component of its own.
-            continue
-        if not any(fnmatch.fnmatchcase(component, p) for p in selected):
-            continue
-        entry = 2 * len(instances)
-        instances.append({"path": path, "component": component})
-        module.register_forward_pre_hook(_entry_probe(probe, entry))
-        module.register_forward_hook(_exit_probe(probe, entry + 1))
-    return json.dumps(instances)
-
-
-def _entry_probe(probe: Callable[[int, int, int], Any], index: int):
-    """A forward pre-hook that launches probe ``index`` on the current
-    stream.
-    """  # noqa: D205
-
-    def hook(module: nn.Module, args: Any) -> None:
-        stream = torch.cuda.current_stream()
-        probe(stream.cuda_stream, stream.device_index, index)
-
-    return hook
-
-
-def _exit_probe(probe: Callable[[int, int, int], Any], index: int):
-    """A forward hook that launches probe ``index`` on the current stream."""
-
-    def hook(module: nn.Module, args: Any, output: Any) -> None:
-        stream = torch.cuda.current_stream()
-        probe(stream.cuda_stream, stream.device_index, index)
-
-    return hook
+    raise SetupError(
+        "the fence probes were the worker library's `fence_probe`; the Rust "
+        "executor launches the probes of the epoch it serves, and no Python "
+        "module launches one"
+    )
 
 
 def start_profiler(

@@ -1586,58 +1586,7 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
-                    // §2.5: a standby is promoted to serve the generation the epoch prepared in it.
-                    // A promotion that finds nothing prepared - the precopy was discarded, or the
-                    // epoch moved on before it ran - is a promotion of a process that cannot serve,
-                    // and it is refused here, by name, before admission opens: `Promoted` followed
-                    // by a first request that finds no graph would tell the daemon the promotion
-                    // succeeded and move the frontend onto a process with no kernels.
-                    if let Some(reason) = promote_refusal(self.standby, self.prepared.len()) {
-                        tracing::warn!(%reason, "a promotion this process cannot serve is refused");
-                        self.send_report(proto::process::Report {
-                            kind: Some(proto::process::report::Kind::Fault(
-                                proto::process::Fault {
-                                    kind: "promote".to_owned(),
-                                    reason: reason.clone(),
-                                    device: 0,
-                                },
-                            )),
-                        });
-                        bail!("{reason}");
-                    }
-                    // §2.5: the promotion runs on the addresses the predecessor's segments held, so
-                    // they are mapped again before anything is admitted, and a wake that fails fails
-                    // the promotion by name.
-                    self.take_back_segments()?;
-                    self.promoted = true;
-                    // The generation the schedulers must stamp this process's batches with: the one it
-                    // holds. A promotion is the one cut-over that reaches no `switchover` of this
-                    // process's own, so nothing else records it, and a promoted standby whose batches
-                    // were stamped 0 would find no graph - the same defect the switchover had.
-                    self.record_generation(self.served_generation());
-                    // A promoted standby admits on the same rule as any other process: once the
-                    // generation it will serve has been warmed (§4.5).
-                    self.open_admission()
-                        .context("promoting this process in place")?;
-                    if !self.boundary {
-                        // A promoted standby serves only once the switchover that fills its
-                        // generation has happened, the same rule a fresh process follows.
-                        self.serving = false;
-                        self.pending_serve = true;
-                    }
-                    // The two numbers answer different questions and both are needed: the launch
-                    // generation is what the epoch layer promotes a child by, and the program
-                    // generation is the one this process holds - the fact the daemon compares with
-                    // its own before it moves the frontend, so a promotion of a generation the
-                    // epoch has reverted is refused there instead of served here (§7.3, §2.5).
-                    self.send_report(proto::process::Report {
-                        kind: Some(proto::process::report::Kind::Promoted(
-                            proto::process::Promoted {
-                                generation: self.control.engine(),
-                                program_generation: self.served_generation(),
-                            },
-                        )),
-                    });
+                    self.promote_in_place()?;
                 }
                 // The five program commands were converted above; a command that states no kind
                 // states nothing to apply.
@@ -1825,6 +1774,15 @@ impl MainProcess {
             .generations
             .iter()
             .all(|generation| generation.is_empty());
+        // An update names the epoch's whole set, and only what differs from what serves is
+        // installed: a kernel that stays keeps its `Arc`, so its buckets and its graphs stay too.
+        let updated;
+        let programs = if never_installed {
+            programs
+        } else {
+            updated = updated_programs(programs, &self.serving_programs);
+            &updated
+        };
         let mut precopy = Precopy {
             generation,
             reply,
@@ -2904,7 +2862,9 @@ impl MainProcess {
         // and 3). They wait here, so a descriptor lookup still reads the serving generation and a
         // revert has nothing to undo.
         self.prepared = std::mem::take(&mut precopy.next);
-        self.prepared_programs = precopy.programs.clone();
+        // What serves after the switchover: what serves now, with what this precopy installed.
+        self.prepared_programs = self.serving_programs.clone();
+        self.prepared_programs.extend(precopy.programs.clone());
         if let Err(error) = self.update.precopied(generation) {
             // The generation this precopy built is not the one the machine waits for - a revert or a
             // later precopy took its place while the builds ran. The revert path discards what was
@@ -3310,6 +3270,71 @@ impl MainProcess {
         // it does at a switchover (§4.5).
         self.open_admission()
             .with_context(|| format!("resuming epoch {}", serve.epoch))
+    }
+
+    /// Promotes this standby in place (§2.5).
+    fn promote_in_place(&mut self) -> Result<()> {
+        // §2.5: a standby is promoted to serve the generation the epoch prepared in it.
+        // A promotion that finds nothing prepared - the precopy was discarded, or the
+        // epoch moved on before it ran - is a promotion of a process that cannot serve,
+        // and it is refused here, by name, before admission opens: `Promoted` followed
+        // by a first request that finds no graph would tell the daemon the promotion
+        // succeeded and move the frontend onto a process with no kernels.
+        // A standby that took the epoch's programs serves them already: its precopy, switchover
+        // and commit ran when the daemon handed them over, so its generation is the serving one.
+        let held = self.prepared.len()
+            + self
+                .generations
+                .iter()
+                .filter(|generation| !generation.is_empty())
+                .count();
+        if let Some(reason) = promote_refusal(self.standby, held) {
+            tracing::warn!(%reason, "a promotion this process cannot serve is refused");
+            self.send_report(proto::process::Report {
+                kind: Some(proto::process::report::Kind::Fault(
+                    proto::process::Fault {
+                        kind: "promote".to_owned(),
+                        reason: reason.clone(),
+                        device: 0,
+                    },
+                )),
+            });
+            bail!("{reason}");
+        }
+        // §2.5: the promotion runs on the addresses the predecessor's segments held, so
+        // they are mapped again before anything is admitted, and a wake that fails fails
+        // the promotion by name.
+        self.take_back_segments()?;
+        self.promoted = true;
+        // The generation the schedulers must stamp this process's batches with: the one it
+        // holds. A promotion is the one cut-over that reaches no `switchover` of this
+        // process's own, so nothing else records it, and a promoted standby whose batches
+        // were stamped 0 would find no graph - the same defect the switchover had.
+        self.record_generation(self.served_generation());
+        // A promoted standby admits on the same rule as any other process: once the
+        // generation it will serve has been warmed (§4.5).
+        self.open_admission()
+            .context("promoting this process in place")?;
+        if !self.boundary {
+            // A promoted standby serves only once the switchover that fills its
+            // generation has happened, the same rule a fresh process follows.
+            self.serving = false;
+            self.pending_serve = true;
+        }
+        // The two numbers answer different questions and both are needed: the launch
+        // generation is what the epoch layer promotes a child by, and the program
+        // generation is the one this process holds - the fact the daemon compares with
+        // its own before it moves the frontend, so a promotion of a generation the
+        // epoch has reverted is refused there instead of served here (§7.3, §2.5).
+        self.send_report(proto::process::Report {
+            kind: Some(proto::process::report::Kind::Promoted(
+                proto::process::Promoted {
+                    generation: self.control.engine(),
+                    program_generation: self.served_generation(),
+                },
+            )),
+        });
+        Ok(())
     }
 
     /// Opens admission, or owes it to the warmup (§4.5).
@@ -3794,6 +3819,14 @@ impl MainProcess {
                 self.stopping = true;
                 return Ok(None);
             }
+            // §2.5: a lost process's standby is promoted by the daemon that held the two, on this
+            // connection, because no epoch switch is running to command it on the process one. The
+            // daemon moves the frontend when this process states that it serves.
+            Some(proto::request::wire::engine_command::Kind::Promote(_)) => {
+                self.promote_in_place()?;
+                self.announce(proto::request::wire::EngineState::Ready)?;
+                return Ok(None);
+            }
             // §7.5.1 step 2: a hot restart's successor gives this engine a second daemon front, so
             // the responses in flight can move to it while the process goes on serving. A refusal
             // is a failed handover and not this process's end: the daemon that asked is still
@@ -3935,9 +3968,8 @@ impl MainProcess {
                     },
                 ))
             }
-            // Promote, FlushCache and Attach state no id and are answered with a state this
-            // process does not own: there is nothing to answer on, and a log line is what is
-            // left.
+            // FlushCache and Attach state no id and are answered with a state this process does
+            // not own: there is nothing to answer on, and a log line is what is left.
             Some(other) => {
                 tracing::warn!(
                     "the daemon sent an engine command this epoch does not serve: {}",
@@ -5708,6 +5740,29 @@ fn promote_refusal(standby: bool, prepared: usize) -> Option<String> {
     })
 }
 
+/// The programs of an update that differ from what serves.
+///
+/// The update names every operator the store holds, and an operator this process does not serve is
+/// no part of it. A program is compared by its backend and revision: its arguments are the package's
+/// defaults, which the two sides state in different words.
+fn updated_programs(named: &Programs, serving: &Programs) -> Programs {
+    named
+        .iter()
+        .filter(|(slot, program)| {
+            serving
+                .iter()
+                .filter(|(held, _)| {
+                    held.op == slot.op
+                        && (held.phase == slot.phase || held.phase.is_none() || slot.phase.is_none())
+                })
+                .any(|(_, held)| {
+                    held.backend != program.backend || held.revision != program.revision
+                })
+        })
+        .map(|(slot, program)| (slot.clone(), program.clone()))
+        .collect()
+}
+
 /// The operators whose programs differ between what serves and what a precopy prepared (§7.3).
 ///
 /// `changed` is not `new`. An operator the prepared generation holds and the serving one does not
@@ -6730,6 +6785,37 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An update names the whole set, and what it installs is what differs from what serves.
+    ///
+    /// The operator that stayed keeps its kernel, and with it every bucket it launches in: loading it
+    /// again read as a changed program, so an update of `rms_norm` compared `paged_attention` instead.
+    #[test]
+    fn an_update_installs_only_the_programs_that_changed() {
+        let program = |backend: &str, revision| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+        let slot = |op: &str| program_server::program::ProgramSlot::all(op);
+        let serving: Programs = [
+            (slot("rms_norm"), program("triton", 1)),
+            (slot("paged_attention"), program("trtllm", 1)),
+        ]
+        .into_iter()
+        .collect();
+        let named: Programs = [
+            (slot("rms_norm"), program("triton", 2)),
+            (slot("paged_attention"), program("trtllm", 1)),
+            (slot("gelu"), program("triton", 1)),
+        ]
+        .into_iter()
+        .collect();
+        let updated = updated_programs(&named, &serving);
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert_eq!(updated[&slot("rms_norm")].revision, 2);
+    }
+
     use super::*;
     /// A takeover replays what the predecessor produced past the position the successor's consumer
     /// states, and nothing else (§7.5.1 step 4).

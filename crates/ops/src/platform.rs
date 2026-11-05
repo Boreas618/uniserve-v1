@@ -185,3 +185,13 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
         DType::F4E2M1 => return None,
     })
 }
+
+/// Fills `bytes` bytes at `destination` with zero, in stream order.
+///
+/// # Safety
+/// `destination` holds `bytes` bytes on the stream's device and stays valid until the fill completes.
+pub unsafe fn zero_bytes(destination: DevicePtr, bytes: u64, stream: &Stream) -> crate::Result<()> {
+    // SAFETY: forwarded from the caller, who keeps the range valid until the fill completes.
+    unsafe { platform::memset_d8(destination.address(), 0, bytes as usize, stream) }
+        .map_err(crate::Error::from)
+}

@@ -950,6 +950,66 @@ pub fn prepare_epoch(
     Ok(pinned)
 }
 
+/// `filled` with every other operator the leader's store holds.
+///
+/// A deployment names the operators its configuration selects a backend for, and every other
+/// operator is filled from the store. An update has to name those too: a revision installed for one
+/// of them is what the update exists to serve, and the record states what serves. Each takes its
+/// highest installed revision, ties broken by the backend's name, which is the rule a main process
+/// fills its first generation by.
+///
+/// # Errors
+///
+/// Fails when the leader's Program Server cannot be reached or answers no listing.
+pub fn with_store_programs(
+    servers: &[ProgramServer],
+    leader: &str,
+    filled: &crate::epoch::FilledPrograms,
+) -> anyhow::Result<crate::epoch::FilledPrograms> {
+    let leader_server = servers
+        .iter()
+        .find(|server| server.host == leader)
+        .with_context(|| format!("no Program Server for the leader host {leader}"))?;
+    let mut client = program_server::Client::connect(&leader_server.socket).with_context(|| {
+        format!(
+            "connecting to the Program Server of {} at {}",
+            leader_server.host,
+            leader_server.socket.display()
+        )
+    })?;
+    let listing = client
+        .list()
+        .with_context(|| format!("reading the store of {}", leader_server.host))?;
+    let mut chosen: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    for package in listing.packages {
+        if package.op == POLICY_SLOT
+            || ops::operator_name(&package.op).is_none()
+            || filled.kernels.keys().any(|slot| slot.op == package.op)
+        {
+            continue;
+        }
+        let candidate = (package.revision, package.backend);
+        let wins = chosen.get(&package.op).is_none_or(|held| {
+            candidate.0 > held.0 || (candidate.0 == held.0 && candidate.1 < held.1)
+        });
+        if wins {
+            chosen.insert(package.op, candidate);
+        }
+    }
+    let mut complete = filled.clone();
+    for (op, (_, backend)) in chosen {
+        complete.kernels.insert(
+            program_server::ProgramSlot::all(op),
+            program_server::Program {
+                backend,
+                revision: 0,
+                arguments: toml::Table::new(),
+            },
+        );
+    }
+    Ok(complete)
+}
+
 /// How one host's `prepare` names the program that fills an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selector {
