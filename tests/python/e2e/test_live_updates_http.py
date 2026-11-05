@@ -596,6 +596,7 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "the successor owns it, so it is not relaunched here",
             "the engine read an engine command",
             "a serve pass took longer than five seconds",
+            "closed its front; the",
             "the daemon hands its service",
             "attaching a daemon failed",
             "an engine connected to this daemon's request socket",
