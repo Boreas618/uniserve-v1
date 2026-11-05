@@ -119,7 +119,7 @@ pub struct TokenBatch {
     pub phase: PhaseKind,
     /// Tokens per cache page.
     pub page_size: u32,
-    /// Query tokens packed into this batch.
+    /// Query tokens packed into this batch, including the padding a bucket appends.
     pub num_tokens: u32,
     /// The bound on keys any row of this batch reads: the attention descriptor's reduction length.
     pub max_kv_len: u32,
