@@ -183,19 +183,20 @@ def main():
 
     packages = load_packages(Path(args.kernels))
     root = Path(args.root)
-    # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
-    # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
-    if not [line for line in Path(args.fixture).read_text().splitlines()
-            if line.strip() and not line.startswith("#")]:
-        raise SystemExit(
-            f"{args.fixture} names no rows: an empty fixture is a walk that printed nothing, and "
-            f"a store built from it would be empty rather than correct"
-        )
+    # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
+    # inspects one read while the rows come from another cannot see an empty one.
     rows = [
         line.rstrip("\n").split("\t")
         for line in Path(args.fixture).read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ]
+    # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
+    # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
+    if not rows:
+        raise SystemExit(
+            f"{args.fixture} names no rows: an empty fixture is a walk that printed nothing, and "
+            f"a store built from it would be empty rather than correct"
+        )
 
     # A key names one program, so exactly one package may claim it. Two packages claiming one key
     # would let two hosts that build the same fixture store different modules under the same name,
