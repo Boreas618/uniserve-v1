@@ -206,7 +206,9 @@ for pair in "dense:$fixture_dense:" "sparse:$fixture_sparse:sparse"; do
     rest=${pair#*:}
     fixture=${rest%%:*}
     want=${rest#*:}
-    others=$(grep -cP '^(sparse_attention|vsa_[a-z_]+)\t' "$fixture")
+    # `grep -c` exits 1 when the count is zero, and `set -e` would end the script silently on the
+    # dense fixture - the one case this check exists for.
+    others=$(grep -cP '^(sparse_attention|vsa_[a-z_]+)\t' "$fixture" || true)
     if [ "$name" = dense ] && [ "$others" -ne 0 ]; then
         printf '  %-10s FAILED - %s row(s) of the sparse backend in the dense file\n' "$name" "$others"
         exit 1
@@ -268,7 +270,10 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     # A key the fixture names, that no package declares, and that the blocked block does not excuse,
     # is the one state a store must not be built from. The blocked block is pasted from
     # `--declared-blocked` above, so an excused key never reaches this test.
+    # The clean line is `# every key is covered for sm_100a`, which does not contain `0 of` - a check
+    # that tested only for the zero form failed on the one case it exists to pass.
     case "$coverage" in
+        *"every key is covered"*) ;;
         *" 0 of "*) ;;
         *)
             if [ ! -s "$staging/missing-$name.txt" ]; then
