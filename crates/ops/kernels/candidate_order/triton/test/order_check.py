@@ -24,6 +24,11 @@ tiles, a row whose ids repeat, and a row carrying an id that is not a token at a
 The destination buffers are pre-filled with the operator's own sentinels (`-1` ids,
 `nan` values), which no candidate can produce, so a slot the program failed to write
 fails the comparison instead of passing as a zero that a legitimate token could be.
+
+A sentinel has three properties, and the third is the one a row with a repeated id taught
+here: it is distinct from every value the producer can emit, **and** from every other
+illegal state the row can be in. `0` satisfied neither — it is a legal token, and two
+candidates with one id left a hole that read exactly like an untouched slot.
 """
 
 import argparse
