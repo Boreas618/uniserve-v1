@@ -768,6 +768,15 @@ fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
         ));
     }
     let elements = args.target.shape.numel();
+    // A call over no elements has nothing to add, and the grid would refuse it as `[0, 1, 1] has no
+    // block` — a message about the launch rather than about the blend. The width is the operand's
+    // now that it is not a descriptor field, so the empty case has to be read from the view too.
+    if elements == 0 {
+        return Err(Error::argument(
+            ScaledAdd::NAME,
+            "a blend of no elements adds nothing".to_owned(),
+        ));
+    }
     // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the count's
     // type is the arithmetic's type. No launch today reaches `i32::MAX` — a call holds a tile, not
     // a whole canvas — but a 32-bit count on a 64-bit offset space is an operator limit that no
@@ -837,7 +846,7 @@ mod scaled_add_tests {
         assert!(elements > i64::from(i32::MAX));
     }
 
-    #[allow(dead_code)]
+    #[test]
     fn the_two_operands_must_be_the_shape_the_descriptor_names() {
         let fine = args(view(DType::BF16, 2, 64), view(DType::F32, 2, 64));
         assert_eq!(
@@ -855,6 +864,20 @@ mod scaled_add_tests {
         assert!(
             check(&descriptor(DType::BF16, DType::F32), wrong_shape).is_err(),
             "a source row count the target does not have"
+        );
+    }
+
+    #[test]
+    fn a_blend_of_no_elements_is_refused_by_name_and_not_by_the_grid() {
+        let empty = args(view(DType::BF16, 2, 0), view(DType::F32, 2, 0));
+        let error = check(&descriptor(DType::BF16, DType::F32), empty)
+            .expect_err("a row of no elements has nothing to add");
+
+        // The refusal must name the operator: `LaunchGrid` would answer `grid [0, 1, 1] has no
+        // block`, which is true, arrives from the launch, and tells a caller nothing about the call.
+        assert!(
+            format!("{error}").contains("scaled_add"),
+            "the refusal names the operator: {error}"
         );
     }
 
