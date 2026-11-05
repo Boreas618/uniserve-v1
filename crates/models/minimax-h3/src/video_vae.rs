@@ -796,8 +796,22 @@ impl VideoDecoder {
     /// design's `dtype = "auto"` converts nothing). **No extent enters a key**: a clip's token count is
     /// a launch value the dense attention and the normalizations read position by position, so one
     /// program serves every raster — which is why this takes no bucket set while the post-processor,
-    /// whose blend is keyed by its pixel count, does. Every projection carries a bias and every
-    /// residual its projection's, as the checkpoint's mapping states.
+    /// whose blend is keyed by its pixel count, does. The bias each projection carries is its own (see
+    /// the projections below) and every residual its projection's, as the checkpoint's mapping states.
+    ///
+    /// **The element type is the deployment's, and every layer declares it.** `specs/worker.md`'s table
+    /// replaces `torch.autocast` with a per-layer declaration, and this is that mechanism in the
+    /// decoder: `dtype` is the type the deployment publishes its weights at (`dtype = "auto"` converts
+    /// nothing, so it is the checkpoint's own), and each `descriptor_of` below is handed the type its
+    /// own layer computes in. The reference wraps the whole decode in
+    /// `torch.autocast(dtype=decoder.decoder.input.weight.dtype)` (`video_vae.py`), with
+    /// `precision.py:148` putting that type on the projections and on every layer's `qkv`, `output` and
+    /// `mlp`. Two kinds of layer it does *not* move down - the normalizations and the attention's
+    /// softmax - and both are handled where they run: the softmax is the dense-attention kernel's own
+    /// FP32 accumulation, and the normalizations are declared here at the stream's type, which is the
+    /// one place this declaration is coarser than autocast was, because an operator of ours reads and
+    /// writes one element type. It is stated rather than hidden: a converted deployment keys the
+    /// decoder's rows in its own type, and the test beside this one is what says so.
     pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::UnpatchifyVideo;
@@ -2219,8 +2233,11 @@ pub(crate) mod tests {
         let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         // Every projection this decoder has, whatever its contraction: the key carries the element
-        // types and the order, and the contraction length is a descriptor field of one program.
-        assert_eq!(count("gemm"), 1);
+        // types and the order, and the contraction length is a descriptor field of one program. Two
+        // programs, because the epilogue is the one field that differs: `proj_in`, the attention's
+        // three projections and `proj_out` fold a bias, while `to_out`, the packed feed-forward
+        // projection and `ff.net.2` carry none.
+        assert_eq!(count("gemm"), 2);
         assert_eq!(count("rows"), 1, "three placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
@@ -2241,6 +2258,50 @@ pub(crate) mod tests {
         // One dense attention whatever the clip: the row count is a launch value, so the decoder's
         // programs do not depend on the raster a request asks for.
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
+    }
+
+    /// A converted deployment keys the decoder's rows in its own element type, and nothing is implicit.
+    ///
+    /// `specs/worker.md`'s table replaces `torch.autocast` with a declaration per layer. The observable
+    /// consequence is this: the same decoder at two deployments is two row sets, and every row that
+    /// names an element type names the deployment's - except the rotation's factor table, whose
+    /// *positions* are FP32 whatever the decode is (they are coordinates, not activations). A row that
+    /// stayed FP32 under a half deployment would be a layer silently computing in a type nobody chose,
+    /// which is the behaviour the design removed.
+    #[test]
+    fn a_converted_deployment_keys_the_decoders_rows_in_its_own_element_type() {
+        let config = video_config();
+        let rows =
+            |dtype: DType| VideoDecoder::programs(&config, dtype).expect("the decoder's programs");
+        let whole = rows(DType::F32);
+        let half = rows(DType::F16);
+        assert_eq!(
+            half.len(),
+            whole.len(),
+            "the same layers, in the same order"
+        );
+        let mut moved = 0;
+        for (converted, declared) in half.iter().zip(&whole) {
+            assert_eq!(converted.0, declared.0, "the same layer");
+            if converted.1 == declared.1 {
+                continue;
+            }
+            moved += 1;
+            // The one exception the declaration states: the factor table's positions are coordinates,
+            // FP32 whatever the decode is. Everything else in the row is the deployment's type.
+            let rest = converted.1.replace("positions_f32", "");
+            assert!(
+                !rest.contains("f32"),
+                "{} did not follow the deployment: {} at f16, {} at f32",
+                converted.0,
+                converted.1,
+                declared.1
+            );
+        }
+        assert!(
+            moved > 0,
+            "a converted deployment moves the rows it must: {whole:?}"
+        );
     }
 
     /// One dense attention, and its key is the form the element type it decodes at has.
