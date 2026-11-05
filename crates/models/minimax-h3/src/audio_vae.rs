@@ -1065,10 +1065,15 @@ impl AudioDecoder {
     /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
     ///
     /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
-    /// the descriptor, so they are stated once per stage width and per sample count the deployment
-    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
-    /// clip of another length replays the compiled program.
-    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+    /// the descriptor, so they are stated once per latent track length the deployment serves
+    /// (`tracks`, in **latent frames**). The per-channel ones do not: a convolution's key is its
+    /// geometry, and a clip of another length replays the compiled program.
+    ///
+    /// A track is stated in latent frames because that is the quantity a decode starts from
+    /// (`forward` takes the latent's frame count and multiplies it by each stage's rate); a sample
+    /// count is that number times the decoder's 800-fold upsampling, so passing one here would state
+    /// every stage's width 800 times too wide.
+    pub fn programs(config: &AudioVaeConfig, tracks: &[u32]) -> Result<Vec<(String, String)>> {
         use ops::audio_activation::AudioActivation as AudioActivationOp;
         use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
         use ops::pcm::PcmInterleave as PcmInterleaveOp;
@@ -1154,10 +1159,15 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
-        for bucket in buckets {
+        // The residual add's width is the **sample count at that stage**, not the channel count:
+        // the stage's buffers are `[PCM_CHANNELS, channels, length]` and the add reshapes them to
+        // `[PCM_CHANNELS · channels, length]` (`rows`), so the descriptor's `columns` is the length
+        // the stage's upsampling leaves. Stating `channels × bucket` named keys no launch asks for.
+        for track in tracks {
+            let mut length = u64::from(*track);
             for stage in &stages {
-                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+                length *= u64::from(stage.rate);
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, length)?);
             }
         }
         Ok(programs.finish())
@@ -1499,11 +1509,11 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
     ///
-    /// **A fused tensor is one binding with several views.** The anchor's attention stores query,
-    /// key and value as one `[3 * wide, wide]` matrix and the encoder reads each third as its own
-    /// layer; every third is a *slice of the same checkpoint tensor*, not a second binding. So the
-    /// first slice marks the entry used and later slices of it are views - while every other
-    /// accessor still refuses a repeated use, which is where a name bound twice would be a defect.
+    /// **One entry may be sliced any number of times**, which is why this does not go through
+    /// [`Self::entry`]: that guard refuses a parameter bound twice, and a fused matrix is bound once
+    /// and read in three windows. What the guard protects is a parameter read twice *whole* - two
+    /// layers sharing one checkpoint tensor - and [`Self::region`] and [`Self::normalized`] still
+    /// refuse it.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
         let index = self
             .table
@@ -1511,7 +1521,9 @@ impl<'a, 'b> Binder<'a, 'b> {
             .position(|source| source.parameter == parameter)
             .ok_or_else(|| {
                 Error::checkpoint(format!(
-                    "{parameter}: the checkpoint's audio decoder has no such parameter"
+                    "{}: {}",
+                    parameter.to_owned(),
+                    "the checkpoint's audio decoder has no such parameter".to_owned()
                 ))
             })?;
         self.used[index] = true;
