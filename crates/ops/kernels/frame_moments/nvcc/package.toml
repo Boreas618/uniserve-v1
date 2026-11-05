@@ -40,6 +40,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["f32"], epsilon = ["0x358637bd", "0x3727c5ac", "0x3eb0c6f7a0b5ed8d"] }
+dimensions = { dtype = ["f32"] }
 
 [parameters]

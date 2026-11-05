@@ -3,9 +3,10 @@
 
 This is the GPU check a build host cannot do: it loads the module the store holds
 (``module.so``), calls the operator's entry with the call structure of ``crates/ops/src/frame.rs``
-(600 bytes: ``values`` 0, ``values_batch`` 8, ``values_channel`` 16, ``values_frame`` 24,
-``frames`` 32, ``pixels`` 40, ``channels_per_group`` 48, ``groups`` 56, ``epsilon`` 64,
-``mean`` 72, ``rstd`` 80, ``error`` 88), and compares both statistics with PyTorch's own
+(608 bytes: ``values`` 0, ``values_batch`` 8, ``values_channel`` 16, ``values_frame`` 24,
+``values_pixel`` 32, ``frames`` 40, ``pixels`` 48, ``channels_per_group`` 56, ``groups`` 64,
+``epsilon`` 72, ``mean`` 80, ``rstd`` 88, ``error`` 96), and compares both statistics with
+PyTorch's own
 group-norm moments computed here — ``var_mean(unbiased=False)`` over the same group of channels
 and pixels, then ``rsqrt(var + eps)``.
 
@@ -22,6 +23,11 @@ contiguous, which is `[B, C, T, H, W]` as the model holds it: one frame of one c
 width` elements apart and a channel of the sequence is `frames · height · width`. A module that
 required a frame to hold a whole group — frame-major storage — would refuse this, and that refusal
 is a module defect rather than a check defect, because no model produces that layout.
+
+**Both layouts are checked.** The same values are also handed over stored channels-last (the same
+logical shape, `values_pixel` the channel count and the pixels of a row `channels` apart), because a
+channels-last span feeds the operator that way and a kernel that walked the pixels at a step of one
+would reduce the wrong values there while agreeing everywhere else.
 
 **One sample per call.** The call structure carries no sample count and the entry's grid is one
 sample's rows, so the operator's caller runs one video sample per call; this check does the same
@@ -52,6 +58,7 @@ class Call(ctypes.Structure):
         ("values_batch", ctypes.c_int64),
         ("values_channel", ctypes.c_int64),
         ("values_frame", ctypes.c_int64),
+        ("values_pixel", ctypes.c_int64),
         ("frames", ctypes.c_int64),
         ("pixels", ctypes.c_int64),
         ("channels_per_group", ctypes.c_int64),
@@ -123,6 +130,7 @@ def check_refusal(module_dir):
         groups=4,
         frames=2,
         values_frame=64,
+        values_pixel=1,
     )
     if entry(ctypes.byref(short), None) == 0:
         raise SystemExit("the entry accepted a frame shorter than one row of pixels")
@@ -145,14 +153,21 @@ def reference(values, groups, epsilon):
     return mean, torch.rsqrt(variance + epsilon)
 
 
-def run(module_dir, channels, groups, frames, height, width, epsilon):
+def run(module_dir, channels, groups, frames, height, width, epsilon, channels_last=False):
     """Call the entry and compare both statistics with the reference."""
     entry = load(module_dir)
     device = torch.device("cuda")
     torch.cuda.set_device(0)
     torch.manual_seed(3)
 
-    values = torch.randn(1, channels, frames, height, width, dtype=torch.float32, device=device)
+    base = torch.randn(1, channels, frames, height, width, dtype=torch.float32, device=device)
+    # The same values in the two layouts the operator reads: channels-last stores the channel
+    # innermost and hands the operator a view of the logical axes over it.
+    values = (
+        base.permute(0, 2, 3, 4, 1).contiguous().permute(0, 4, 1, 2, 3) if channels_last else base
+    )
+    if channels_last and not (values.stride(1) == 1 and values.stride(4) == channels):
+        raise SystemExit(f"the channels-last view has strides {values.stride()}")
     mean = torch.zeros(frames, groups, dtype=torch.float32, device=device)
     rstd = torch.zeros(frames, groups, dtype=torch.float32, device=device)
     call = Call(
@@ -160,6 +175,7 @@ def run(module_dir, channels, groups, frames, height, width, epsilon):
         values_batch=values.stride(0),
         values_channel=values.stride(1),
         values_frame=values.stride(2),
+        values_pixel=values.stride(4),
         frames=frames,
         pixels=height * width,
         channels_per_group=channels // groups,
@@ -221,15 +237,23 @@ def main():
     if options.cpu_only:
         print("cpu-only: the host-side parts of this script are consistent")
         return 0
-    return run(
-        options.module,
-        options.channels,
-        options.groups,
-        options.frames,
-        options.height,
-        options.width,
-        options.epsilon,
-    )
+    # Both layouts, over the same values: the two runs' bit-identical counts are then comparable,
+    # and a kernel that walked the pixels at the wrong step could not agree in both.
+    for channels_last in (False, True):
+        print(f"layout: {'channels-last' if channels_last else 'channel-first'}")
+        status = run(
+            options.module,
+            options.channels,
+            options.groups,
+            options.frames,
+            options.height,
+            options.width,
+            options.epsilon,
+            channels_last,
+        )
+        if status != 0:
+            return status
+    return 0
 
 
 if __name__ == "__main__":

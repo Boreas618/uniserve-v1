@@ -20,7 +20,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Strides, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -182,6 +182,47 @@ pub struct Args {
     pub out: TensorView,
 }
 
+/// The two layout obligations a convolution's arguments carry.
+///
+/// **The filter is not an operand a channels-last memory format reorders.** A checkpoint stores
+/// every module's weight packed in `[out, in, kd, kh, kw]` — the KCRS form the filter descriptor
+/// wants — and no framework's channels-last format touches module weights, so the entry derives
+/// row-major strides for the filter whatever the activations' order is. A filter in any other
+/// order is read at the wrong offsets while the numbers still look like a convolution.
+///
+/// **The activations and the output are.** With `channels_last` set the entry derives
+/// channels-last strides for both, so a buffer allocated in the other order is misread for the same
+/// reason. A unit channel axis has no order to disagree about and is exempt.
+fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) -> Result<()> {
+    if args.weight.strides != Strides::row_major(args.weight.shape) {
+        return Err(Error::argument(
+            operator,
+            "the filter is not packed row-major: a convolution reads `[out, in, kd, kh, kw]` in \
+             the order a checkpoint stores it, in either activation layout"
+                .to_owned(),
+        ));
+    }
+    if descriptor.channels_last {
+        for (operand, view) in [("input", args.input), ("out", args.out)] {
+            // A unit channel axis carries any stride's order and no other, so only an axis with
+            // more than one element can be misread.
+            if view.shape.dim(1) > 1 && view.strides.get(1) != 1 {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "the descriptor declares channels-last activations, and the {operand}'s \
+                         channel axis has stride {} rather than 1: the entry derives \
+                         channels-last strides for these operands, so the buffer must be \
+                         allocated in that order or the descriptor must say channels-first",
+                        view.strides.get(1)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A convolution through cuDNN.
 pub struct Conv;
 
@@ -204,6 +245,13 @@ impl Conv {
         let rank = rank as usize;
         args.input.require_rank(operator, rank + 2)?;
         args.out.require_rank(operator, rank + 2)?;
+        // The declared layout is the strides the entry derives for every operand, so a
+        // channels-last module reads the channel axis innermost in all three. A caller that
+        // declares channels-last over channel-first storage therefore gets numbers with nothing
+        // refusing it: the library indexes by the layout it was told, not by the bytes it holds.
+        // A filter is the operand this bites first, because a checkpoint stores it channel-first
+        // and a channels-last span is a layout its *weights* must be permuted into once.
+        check_layouts(operator, descriptor, args)?;
         if args.input.dtype != descriptor.input || args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 operator,
@@ -458,5 +506,94 @@ impl Op for ConvTranspose1d {
         let stride = u64::from(descriptor.geometry.stride[0].max(1));
         let taps = u64::from(descriptor.geometry.kernel[0]);
         Tolerance::dot(taps.div_ceil(stride), DType::F32, descriptor.output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::DevicePtr;
+
+    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
+        TensorView::with_strides(
+            DevicePtr::new(0x1000),
+            DType::BF16,
+            Shape::new(shape),
+            Strides::new(strides),
+        )
+    }
+
+    fn descriptor(channels_last: bool) -> Descriptor {
+        Descriptor {
+            input: DType::BF16,
+            weight: DType::BF16,
+            output: DType::BF16,
+            geometry: Geometry {
+                kernel: [3, 3, 3],
+                stride: [1, 1, 1],
+                padding: [1, 1, 1],
+                dilation: [1, 1, 1],
+                groups: 1,
+            },
+            bias: false,
+            tf32: false,
+            channels_last,
+            rank: 3,
+            transposed: false,
+        }
+    }
+
+    /// `[n, c, d, h, w]` with the channels innermost: the order a channels-last module derives.
+    fn channels_last(shape: &[u64]) -> TensorView {
+        let (c, d, h, w) = (shape[1], shape[2], shape[3], shape[4]);
+        view(shape, &[d * h * w * c, 1, h * w * c, w * c, c])
+    }
+
+    /// A channels-last convolution over channel-first activations is refused, not misread.
+    #[test]
+    fn channels_last_refuses_channel_first_activations() {
+        let shape = [1, 4, 2, 2, 2];
+        let args = Args {
+            input: view(&shape, &[32, 8, 4, 2, 1]),
+            weight: view(&[8, 4, 3, 3, 3], &[108, 27, 9, 3, 1]),
+            bias: None,
+            out: channels_last(&shape),
+        };
+        let error = check_layouts("conv3d", &descriptor(true), args)
+            .expect_err("a channels-last module over a channel-first buffer must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("the input's channel axis has stride 8"),
+            "{message}"
+        );
+    }
+
+    /// The filter stays packed in the order a checkpoint stores it, in either layout.
+    #[test]
+    fn a_channels_last_convolution_keeps_the_filter_packed() {
+        let shape = [1, 4, 2, 2, 2];
+        let packed = view(&[8, 4, 3, 3, 3], &[108, 27, 9, 3, 1]);
+        // The filter reordered into channels-last is what the kernel used to derive, and it is the
+        // one argument that must not travel that way: refusing it is what keeps a convolution's
+        // numbers a convolution's numbers.
+        let reordered = view(&[8, 4, 3, 3, 3], &[27, 1, 9, 3, 3]);
+        let args = Args {
+            input: channels_last(&shape),
+            weight: packed,
+            bias: None,
+            out: channels_last(&shape),
+        };
+        check_layouts("conv3d", &descriptor(true), args)
+            .expect("a packed filter is the form both layouts read");
+        let args = Args {
+            weight: reordered,
+            ..args
+        };
+        let error = check_layouts("conv3d", &descriptor(true), args)
+            .expect_err("a filter outside the checkpoint's order must refuse");
+        assert!(
+            error.to_string().contains("not packed row-major"),
+            "{error}"
+        );
     }
 }
