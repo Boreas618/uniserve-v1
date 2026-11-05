@@ -1892,6 +1892,11 @@ pub(crate) mod tests {
             error.to_string().contains("latent cells"),
             "the refusal names the canvas mismatch: {error}"
         );
+        assert!(
+            matches!(error, nn::Error::Shape { .. }),
+            "a layout this decoder cannot serve is a shape refusal and not the `Unsupported` a \
+             block with no plan at all states: {error:?}"
+        );
     }
 
     fn seams(starts: &[u32], overlaps: &[u32], length: u32) -> Seams {

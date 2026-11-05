@@ -779,12 +779,48 @@ fn stage_decode(args: &Args) -> Result<()> {
     };
 
     let packed = pack_latents(&latent_bytes, &tiles, &canvas, dtype)?;
+    // **Both counts in the same unit, and the excess named.** A tile set reads more voxels than the
+    // clip holds because neighbouring tiles share rows and columns for the blend to cross; the factor
+    // is the grid's overlap and nothing else. Printed as one number in bytes beside one in elements it
+    // read as a mismatch of 4x, which is a defect this line invented rather than found.
+    let element = dtype.bytes().unwrap_or(1);
+    let clip_elements = u64::try_from(latent_bytes.len()).unwrap_or(0) / element;
+    let tile_elements = u64::try_from(packed.len()).unwrap_or(0) / element;
+    let excess = if clip_elements == 0 {
+        1.0
+    } else {
+        tile_elements as f64 / clip_elements as f64
+    };
     println!(
-        "latents: {} bytes = {} elements at {dtype}; the rows this stage reads hold {}",
+        "latents: {} bytes = {clip_elements} elements at {dtype}; the {} tiles read {} bytes = \
+         {tile_elements} elements ({excess:.3}x), and the excess is the rows and columns neighbouring \
+         tiles share",
         latent_bytes.len(),
-        u64::try_from(latent_bytes.len()).unwrap_or(0) / dtype.bytes().unwrap_or(1),
-        packed.len()
+        tiles.len(),
+        packed.len(),
     );
+    // The grid's spans are the check, not the sentence: every tile reads a span of the clip, so the
+    // packed count is the sum of those spans over the frames and channels, and a gather that read the
+    // wrong span - a stride where a width belongs - shows here as a count rather than as a raster that
+    // is wrong in bands nobody looked at.
+    let spanned: u64 = tiles
+        .iter()
+        .map(|tile| {
+            // `(start, end)`, so the span is the difference: multiplying the end is the mistake this
+            // check exists to refuse, and it would refuse every run if the fields were read as extents.
+            let rows = u64::from(tile.latent_rows.1.saturating_sub(tile.latent_rows.0));
+            let columns = u64::from(tile.latent_columns.1.saturating_sub(tile.latent_columns.0));
+            rows * columns * 24 * u64::from(canvas.frames)
+        })
+        .sum();
+    if spanned != tile_elements {
+        return Err(Failure::message(format!(
+            "the {} tiles' spans cover {spanned} elements of a {clip_elements}-element clip, and the \
+             packed rows hold {tile_elements}: the excess is the grid's overlap and nothing else, so \
+             the gather read a span the grid does not name",
+            tiles.len()
+        )));
+    }
     let latents = upload(
         &stream,
         &arena,
@@ -816,13 +852,23 @@ fn stage_decode(args: &Args) -> Result<()> {
     let walk_path = args.out.join("walk.txt");
     std::fs::write(&walk_path, walk.text())
         .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
-    if decode_result.is_err() {
+    if let Err(error) = &decode_result {
+        // **The stop is named here, not left to a line of its own.** A walk of zero launches before a
+        // stop is a fact about the decode's first launch, not about its programs: it failed while
+        // binding its tables or its first program, so no launch ever reached the recorder. The two
+        // read identically in a summary, and they are opposite diagnoses.
         println!(
-            "walk: {} launches of {} distinct programs before the stop -> {}",
+            "walk: {} launches of {} distinct programs before the stop: {error} -> {}",
             walk.0.len(),
             walk.distinct(),
             walk_path.display()
         );
+        if walk.0.is_empty() {
+            println!(
+                "  the decode stopped before its first launch, so this walk says nothing about the \
+                 programs it would have bound"
+            );
+        }
         for (operator, key) in walk.0.iter().rev().take(5).rev() {
             println!("  {operator}\t{key}");
         }
@@ -1357,17 +1403,10 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             u64::from(latent_width),
         ]),
     )?;
-    clip.encode(
-        &forward,
-        &encoder,
-        &plan,
-        minimax_h3::tiled_encode::Scene {
-            pixels: &views,
-            blended,
-        },
-    )?;
+    // The buffers the encode writes into, allocated before the sink is armed: an allocation is not a
+    // launch, and a `?` between arming and disarming would leave the sink installed for every later
+    // stage of the process.
     let moments = arena.tensor(DType::F32, blended.shape)?;
-    encoder.project(&forward, blended, moments)?;
     let drawn = arena.tensor(
         DType::F32,
         Shape::new(&[
@@ -1381,14 +1420,6 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
         latent_channels * u64::from(latent_frames) * run_rows,
         u64::from(latent_width),
     ]));
-    nn::Noise::new().draw(
-        &forward,
-        flat,
-        nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
-        0,
-        0,
-        0,
-    )?;
     let latent_view = arena.tensor(
         DType::F32,
         Shape::new(&[
@@ -1398,7 +1429,59 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             u64::from(latent_width),
         ]),
     )?;
-    encoder.posterior(&forward, moments, drawn, latent_view)?;
+    // **Two components run in this stage, so one `walk.txt` cannot say which bound what.** The decode
+    // half writes `walk.txt` from its own sink; the encoder's launches - the encode blocks, the
+    // projection, the posterior's sample, the stitcher's blends and copies - go to `walk.encode.txt`.
+    // Without this the raster path's encoder was recorded nowhere: `walk.txt` named the decode's
+    // programs, and a reader who took it for the encode's found a list that did not match the store.
+    let mut encode_walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut encode_walk));
+    let encoded = clip
+        .encode(
+            &forward,
+            &encoder,
+            &plan,
+            minimax_h3::tiled_encode::Scene {
+                pixels: &views,
+                blended,
+            },
+        )
+        .and_then(|()| encoder.project(&forward, blended, moments))
+        .and_then(|()| {
+            // `and_then` needs one error type for the whole chain, and this is the one step that
+            // answers with `nn`'s; `?` would convert it, and a chain cannot.
+            nn::Noise::new()
+                .draw(
+                    &forward,
+                    flat,
+                    nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
+                    0,
+                    0,
+                    0,
+                )
+                .map_err(Into::into)
+        })
+        .and_then(|()| encoder.posterior(&forward, moments, drawn, latent_view));
+    ops::capture::set_sink(None);
+    // Written before the outcome is read, as the decode half's is: a stop has no other record of how
+    // far it got, and the launch after the last line is the one that stopped.
+    let encode_walk_path = args.out.join("walk.encode.txt");
+    std::fs::write(&encode_walk_path, encode_walk.text()).map_err(|error| {
+        Failure::message(format!("{}: {error}", encode_walk_path.display()))
+    })?;
+    println!(
+        "encode walk: {} launches of {} distinct programs -> {}",
+        encode_walk.0.len(),
+        encode_walk.distinct(),
+        encode_walk_path.display()
+    );
+    encoded?;
+    if encode_walk.0.is_empty() {
+        return Err(Failure::message(
+            "the encoder's walk recorded no launches: the encode replayed a captured graph, or no \
+             sink was installed, and either way this stage has not measured the raster path",
+        ));
+    }
     stream.synchronize()?;
 
     // 8. The latent, read back and written in the container the decode already reads: a denoiser's
