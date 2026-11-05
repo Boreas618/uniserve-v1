@@ -217,7 +217,7 @@ pub fn keys(
         for (n, k) in projections {
             push(
                 <ops::gemm::Gemm as Op>::NAME,
-                Linear::descriptor_of(k, dtype, WeightOrder::NxK, false, dtype, dtype).to_string(),
+                Linear::descriptor_of(k, dtype, dtype, WeightOrder::NxK, false, dtype).to_string(),
             );
             if projections_packed {
                 for rows in buckets {
@@ -286,7 +286,7 @@ pub fn keys(
             for (n, k) in [(dense_width, hidden), (dense_width, hidden), (hidden, dense_width)] {
                 push(
                     <ops::gemm::Gemm as Op>::NAME,
-                    Linear::descriptor_of(k, dtype, WeightOrder::NxK, false, dtype, dtype).to_string(),
+                    Linear::descriptor_of(k, dtype, dtype, WeightOrder::NxK, false, dtype).to_string(),
                 );
                 if projections_packed {
                     for rows in buckets {
@@ -306,7 +306,7 @@ pub fn keys(
     push("rms_norm", RmsNorm::descriptor_of(hidden, dtype).to_string());
     push(
         <ops::gemm::Gemm as Op>::NAME,
-        Linear::descriptor_of(hidden, dtype, WeightOrder::NxK, false, dtype, dtype).to_string(),
+        Linear::descriptor_of(hidden, dtype, dtype, WeightOrder::NxK, false, dtype).to_string(),
     );
     let gathered = shard * width(partition.tensor_parallel, "tensor parallel width")?;
     push(
