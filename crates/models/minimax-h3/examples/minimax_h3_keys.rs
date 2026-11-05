@@ -154,8 +154,21 @@ const VSA_TILE_ROWS: u32 = 64;
 /// kernel's own tiling inside a tile, compiled in.
 const VSA_BLOCK_ROWS: u32 = 16;
 
-/// The key tiles of the deployment's longest sparse reduction: 40960 keys at `VSA_TILE_ROWS`.
-const VSA_MAX_TILES: u32 = 640;
+/// The **class** of the deployment's longest sparse reduction: the key field, not the live bound.
+///
+/// The bound itself is the model's, computed once at load from the canvas rule
+/// (`denoiser.rs::Layouts::tiles_bound`): the maximum of `segment_packing(...).extent.video_tiles`
+/// over every canvas the deployment offers and every clip length it serves, which is **5400** tiles
+/// for the released base network at `VSA_TILE_ROWS` (printed by `examples/deployment_sizes.rs
+/// --root <checkpoint>`). Both descriptors that read it key
+/// `next_power_of_two()` of it - `CompressPooledDescriptor`'s `max_tiles` and
+/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` states from the score matrix's own
+/// key extent) - because the package compiles the reduction to a power of two, so two bounds inside
+/// one class are one module and a key that told them apart would demand a compilation per tile count
+/// a deployment happens to request. **So this constant is 8192 while the launch passes 5400**: a
+/// reader who assumes the key field holds the number they can compute is the reader this comment is
+/// for.
+const VSA_MAX_TILES: u32 = 8192;
 
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
