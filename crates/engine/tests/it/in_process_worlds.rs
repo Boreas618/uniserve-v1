@@ -95,6 +95,19 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
         .expect("the scheduler answers within the bound")
 }
 
+/// Collects a request's terminal event, answering what ended it.
+fn terminal(events: &mut engine::EventRx) -> Event {
+    let deadline = Instant::now() + ANSWER;
+    while Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(event) if event.is_terminal() => return event,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    panic!("the request never ended within {ANSWER:?}");
+}
+
 /// A world that succeeds a running one takes over the running world's prefix
 /// cache index and continues a request the running one generated part of: the
 /// continuation samples what the uninterrupted request sampled next.
@@ -104,23 +117,40 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let reference_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
     let mut reference_config = EngineConfig::sim("worlds");
     reference_config.world = 1;
-    let reference = SchedulerHandle::over_batches(
-        reference_config,
-        reference_pool.clone() as Arc<dyn Batches>,
-    )
-    .expect("the reference world serves");
+    let reference =
+        SchedulerHandle::over_batches(reference_config, reference_pool.clone() as Arc<dyn Batches>)
+            .expect("the reference world serves");
     install(&reference, &reference_pool);
     let mut reference_events = reference
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the reference takes the request");
-    let (expected, finished) = support::wait_for_tokens(
-        &mut reference_events,
+    let (expected, finished) =
+        support::wait_for_tokens(&mut reference_events, GENERATED + CONTINUED, ANSWER);
+    // Two facts with two owners: how many tokens the request produced is its
+    // budget's, and what event ended it is the stream's. A single assertion
+    // would let either answer for the other.
+    assert_eq!(
+        expected.len(),
         GENERATED + CONTINUED,
-        ANSWER,
+        "the reference generated {} of its {} tokens",
+        expected.len(),
+        GENERATED + CONTINUED
     );
+    let ended = match finished {
+        Some(event) => event,
+        None => terminal(&mut reference_events),
+    };
     assert!(
-        finished.is_none(),
-        "the reference generated every token asked for"
+        matches!(
+            ended,
+            Event::Finished {
+                reason: engine::FinishReason::MaxTokens,
+                completion_tokens,
+                ..
+            } if completion_tokens as usize == GENERATED + CONTINUED
+        ),
+        "the reference ended as {ended:?} after {} tokens",
+        expected.len()
     );
     reference.shutdown();
 
@@ -128,21 +158,19 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let running_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
     let mut running_config = EngineConfig::sim("worlds");
     running_config.world = 1;
-    let running = SchedulerHandle::over_batches(
-        running_config,
-        running_pool.clone() as Arc<dyn Batches>,
-    )
-    .expect("the running world serves");
+    let running =
+        SchedulerHandle::over_batches(running_config, running_pool.clone() as Arc<dyn Batches>)
+            .expect("the running world serves");
     install(&running, &running_pool);
     let mut running_events = running
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the running world takes the request");
-    let (first, _) = support::wait_for_tokens(
-        &mut running_events,
-        GENERATED,
-        ANSWER,
+    let (first, _) = support::wait_for_tokens(&mut running_events, GENERATED, ANSWER);
+    assert_eq!(
+        first,
+        expected[..GENERATED],
+        "the running world generates the reference's first tokens"
     );
-    assert_eq!(first, expected[..GENERATED], "the running world generates the reference's first tokens");
 
     // Its successor starts beside it, under the same claim, with its cache.
     let caches = answer(running.describe_cache()).expect("the running world states its cache");
@@ -165,11 +193,9 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
             })
             .collect(),
     );
-    let successor = SchedulerHandle::over_batches(
-        successor_config,
-        successor_pool.clone() as Arc<dyn Batches>,
-    )
-    .expect("the successor starts beside the running world");
+    let successor =
+        SchedulerHandle::over_batches(successor_config, successor_pool.clone() as Arc<dyn Batches>)
+            .expect("the successor starts beside the running world");
     install(&successor, &successor_pool);
 
     // The running world parks, the successor is promoted with its index, and
@@ -185,11 +211,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let mut continuation = successor
         .submit(request(91, 8, 100, first.clone()))
         .expect("the successor takes the continuation");
-    let (continued, _) = support::wait_for_tokens(
-        &mut continuation,
-        CONTINUED,
-        ANSWER,
-    );
+    let (continued, _) = support::wait_for_tokens(&mut continuation, CONTINUED, ANSWER);
     assert_eq!(
         continued,
         expected[GENERATED..GENERATED + CONTINUED],
@@ -201,7 +223,9 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     // would sample the same ids from the same extent. What separates them is
     // the successor's first batch, so the case reads it.
     let batches = successor_pool.submitted();
-    let first = batches.first().expect("the successor served the continuation");
+    let first = batches
+        .first()
+        .expect("the successor served the continuation");
     assert_eq!(
         first.shape.tokens, 1,
         "the successor decodes one token from the parked cache rather than prefilling the prompt \
