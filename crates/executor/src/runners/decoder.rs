@@ -84,6 +84,21 @@ impl DecoderColumns {
     }
 }
 
+/// The media computation a batch states, or the refusal a decoder runner gives a batch with none.
+///
+/// A decoder serves one computation and the mechanism states it in the batch rather than in the
+/// runner: `Batch::media` is `Some` for a media batch and `None` for every token batch. The check is
+/// its own function because it is the one part of `submit` that is a fact about the batch alone - a
+/// device-free test can state a batch with no computation and read the message, where a test of
+/// `submit` itself would need a constructed runner and therefore a device.
+fn media_of(batch: &Batch) -> Result<&crate::batch::MediaColumns> {
+    batch.media.as_ref().ok_or_else(|| {
+        Error::Invalid(
+            "a decoder runner serves a media batch; this one states no computation".into(),
+        )
+    })
+}
+
 /// The decoder's runner: one device stream, the canvas its model serves, and its graphs.
 pub struct DecoderRunner<M: Decoder + Send + Sync> {
     id: RunnerId,
@@ -494,11 +509,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
     /// canvas, and a clip of another canvas must hear that it has no bucket rather than be served by
     /// a graph whose constants belong to a different raster.
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
-        let media = batch.media.clone().ok_or_else(|| {
-            Error::Invalid(
-                "a decoder runner serves a media batch; this one states no computation".into(),
-            )
-        })?;
+        let media = media_of(&batch)?.clone();
         media.check()?;
         let computation = media.computation;
         if computation.variant() != Some(Variant::Decode) {
@@ -743,11 +754,9 @@ mod tests {
     fn the_plan_is_told_what_every_bucket_of_a_canvas_needs() {
         // The two tables are six f32 and six i32: one number the mechanism books before admission,
         // derived from the model's declaration rather than from a runner's own constant.
-        let bytes = DecoderRunner::<Fixed>::table_bytes(
-            &Fixed,
-            Bucket::clip(SERVED.0, SERVED.1, SERVED.2),
-        )
-        .expect("the tables' bytes");
+        let bytes =
+            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(SERVED.0, SERVED.1, SERVED.2))
+                .expect("the tables' bytes");
         assert_eq!(bytes, 6 * 4 + 6 * 4);
     }
 
@@ -755,8 +764,9 @@ mod tests {
     fn a_bucket_that_is_not_a_decode_states_what_it_is() {
         // A prefill bucket has no clip, and a decoder asked for its layout must say so by name rather
         // than answer with a layout that reads as one.
-        let error = DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
-            .expect_err("a prefill bucket is not a decode");
+        let error =
+            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
+                .expect_err("a prefill bucket is not a decode");
         assert!(
             format!("{error}").contains("is not a decode bucket"),
             "the refusal names the bucket's kind: {error}"
@@ -847,5 +857,33 @@ mod tests {
         // exists, and a byte count cannot say whether a column holds f16 or bf16.
         assert_eq!(Fixed.element_type(), DType::F16);
         assert_eq!(DType::F16.bytes(), Some(2));
+    }
+
+    /// A batch with a phase, no calls and no media: what the mechanism sends when it has nothing to
+    /// compute, and the shape whose refusal is a fact about the batch rather than about a runner.
+    fn no_computation() -> Batch {
+        Batch {
+            id: crate::batch::BatchId(1),
+            phase: ipc::PhaseId(0),
+            calls: Vec::new(),
+            shape: crate::plan::Shape::decode(1, Variant::DecodeGreedy),
+            columns: crate::batch::BatchColumns::default(),
+            generation: 1,
+            cache_units: Vec::new(),
+            block_tables: Vec::new(),
+            media: None,
+        }
+    }
+
+    #[test]
+    fn a_batch_that_states_no_computation_is_refused_by_name() {
+        let refused =
+            media_of(&no_computation()).expect_err("a batch with no media computation is refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("a decoder runner serves a media batch")
+                && message.contains("states no computation"),
+            "the refusal names what the runner serves and what the batch states, got: {message}"
+        );
     }
 }
