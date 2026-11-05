@@ -114,6 +114,10 @@ const ACTIVATION_KERNEL: u32 = 12;
 
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
+/// The video latent's channels, `vae/config.json`'s `latent_channels` four to a token: the DiT's
+/// input projection reads `4 * VIDEO_CHANNELS` = 96 features per patch, and the solver's step is one
+/// gated residual over the whole trajectory, so that width is both an input and a residual.
+const VIDEO_CHANNELS: u32 = 24;
 
 /// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
 /// tables and the one cast that narrows the timestep activation into them are this wide.
@@ -302,12 +306,13 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     }
 
     // `snake` is the encoder's: one linear parameter, used by the DAC residual units and encoder
-    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). The encoder doubles its
-    // width at each rate.
+    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). **A stage runs its
+    // Snake at the width it takes in and doubles on the way out** (`EncoderStage.inner` is "half the
+    // stage's output width"), and the network ends with one more Snake at the doubled width - six
+    // widths over five rates, not five. Doubling before the push lost the narrowest one, and with it
+    // the encoder's first stage.
     let mut encoder_channels = ENCODER_DIM;
-    for rate in ENCODER_RATES {
-        let _ = rate;
-        encoder_channels *= 2;
+    for _ in ENCODER_RATES {
         push(
             "snake",
             ops::snake::Descriptor {
@@ -318,7 +323,18 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             }
             .to_string(),
         );
+        encoder_channels *= 2;
     }
+    push(
+        "snake",
+        ops::snake::Descriptor {
+            dtype: DType::F32,
+            channels: encoder_channels,
+            block: ELEMENTWISE_BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
 
     // The decoder's upsamplers are the reference's `Activation1d`: a replicate pad, a transposed
     // convolution of stride 2, a `SnakeBeta`, then a low-pass of the same ratio — which is our
@@ -640,6 +656,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             columns: HIDDEN,
             tile: row_tile(HIDDEN),
             absmax: false,
+        }
+        .to_string(),
+    );
+    // The DiT's output norm, `norm_out.norm`, is a **plain** `RmsNorm` over the hidden state
+    // (`transformer.rs`'s `load`, `RmsNorm::new(gain(...), eps)`) - the stack's own final
+    // normalization, not the weighted one every block wears and not the modulated one it consumes.
+    // It had no row at this width in either type, and a walk of the stack launches it once per
+    // forward: the last normalization before the output projection would have been the first
+    // `no kernel` of a run that had already done all its work.
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: deployment,
+            columns: HIDDEN,
+            tile: row_tile(HIDDEN),
+            pdl: PDL,
         }
         .to_string(),
     );
@@ -996,12 +1028,28 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target,
                 source,
-                columns: 96,
+                columns: 4 * VIDEO_CHANNELS,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
     }
+    // **The solver's step over the whole trajectory, at the sample's own width and type.** The sample
+    // is `[tokens, 4 * video_channels]` for the video latent and the audio latent's own width for its
+    // own trajectory, and `Solver::step` runs one gated residual over all of it - so the width is the
+    // latent's, not the stack's, and the type is `SAMPLE_DTYPE`, which the forward refuses to depart
+    // from. Keyed from the stack these would name a row no step launches, which is how the 96-column
+    // one came to be absent while the same 96 was in the list as a `scaled_add`.
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: minimax_h3::denoiser::SAMPLE_DTYPE,
+            columns: 4 * VIDEO_CHANNELS,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
