@@ -685,14 +685,12 @@ def keys_mode(path: pathlib.Path, kernels: pathlib.Path) -> int:
             return -1
         rows.append((operator, key))
 
-    packages: dict[str, list[pathlib.Path]] = {}
     blocks: dict[str, list[dict[str, set[str]]]] = {}
     for operator in {operator for operator, _ in rows}:
         manifests = sorted((kernels / operator).glob("*/package.toml"))
         if not manifests:
             print(f"  NO PACKAGE {operator}", file=sys.stderr)
             return -1
-        packages[operator] = manifests
         blocks[operator] = [
             block for manifest in manifests for block in descriptor_blocks(manifest)
         ]
@@ -727,9 +725,11 @@ def keys_mode(path: pathlib.Path, kernels: pathlib.Path) -> int:
             absent = [field for field in parsed if not any(field in b for b in blocks[operator])]
             print(f"  NO FIELD {operator}: {', '.join(absent) or 'the blocks disagree field by field'}")
 
+    # A row whose cell no manifest declares is not a row to delete: it is a requirement the package has
+    # not met yet, and the count is stated that way so nobody reads the gap as a defect in the list.
     print(
-        f"{len(rows) - unserved} of {len(rows)} rows are declared by one package block, "
-        f"{unserved} are not"
+        f"{len(rows) - unserved} of {len(rows)} rows are declared by one package block; "
+        f"{unserved} wait on cells no manifest declares yet"
     )
     return 1 if unserved else 0
 

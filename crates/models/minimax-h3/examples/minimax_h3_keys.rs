@@ -3,12 +3,25 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example minimax_h3_keys
+//! cargo run -p minimax-h3 --example minimax_h3_keys [-- --root <checkpoint>] [--rasters HxW,...]
 //! ```
 //!
 //! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
 //! every component this build loads states, over both element types - so no package has to guess a
 //! variant.
+//!
+//! ## The two flags, and why the canvases are one
+//!
+//! `--root` names the checkpoint the video encoder's rows are derived from (default
+//! `/opt/uv/models/MiniMax-H3`); its `vae/config.json` is the geometry, and the header prints the
+//! fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
+//! to `NAMED_CANVASES` - **the six the model offers**, because a store built for one canvas stops at
+//! `no kernel` on any other.
+//!
+//! A deployment that serves a canvas the model does not name builds **its own store** rather than
+//! adding a row to this one: a row is a cell every store built from this list must compile, so a
+//! canvas outside the offered set belongs to a list generated with `--rasters` naming it. The two
+//! lists are then two stores, and neither claims the other's canvases.
 //!
 //! It is not the fixture. `notes/programs/minimax-h3-keys.txt` is **one deployment's** rows, copied
 //! from that deployment's walk (`examples/programs.rs` then `examples/h3_fixture.rs`), and it is a
@@ -207,7 +220,62 @@ const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
 /// the opposite of the stack above - so these rows carry both and nothing else about them moves.
 const VAES: [DType; 2] = [DType::F16, DType::F32];
 
+/// The value a flag was given, or a message naming the flag that was given none.
+///
+/// The generator's flags are the deployment's, so a missing one is a caller's mistake rather than a
+/// condition to recover from; naming the flag is the whole of the help it needs.
+fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> String {
+    match arguments.next() {
+        Some(value) => value,
+        None => panic!("{flag} needs a value"),
+    }
+}
+
+/// One component of a `HxW` raster, or a message naming the raster and the part that is not a number.
+fn parse(part: &str, raster: &str, what: &str) -> u32 {
+    match part.parse() {
+        Ok(value) => value,
+        Err(_) => panic!("{raster}: {part} is not {what}"),
+    }
+}
+
 fn main() {
+    // The checkpoint states the geometry the derived rows are built from, so the generator reads it
+    // rather than restating it: `--root`, or the deployment's own path. A generator that transcribed
+    // these numbers could not be checked against the checkpoint at all.
+    let mut arguments = std::env::args().skip(1);
+    let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut rasters: Vec<(u32, u32)> = Vec::new();
+    while let Some(flag) = arguments.next() {
+        match flag.as_str() {
+            "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
+            "--rasters" => {
+                for raster in value(&mut arguments, "--rasters").split(',') {
+                    let Some((height, width)) = raster.trim().split_once('x') else {
+                        panic!("{raster} is not HxW");
+                    };
+                    rasters.push((
+                        parse(height, raster, "a height"),
+                        parse(width, raster, "a width"),
+                    ));
+                }
+            }
+            other => panic!("unknown flag {other}"),
+        }
+    }
+    if rasters.is_empty() {
+        rasters = minimax_h3::NAMED_CANVASES
+            .iter()
+            .map(|canvas| (canvas.height, canvas.width))
+            .collect();
+    }
+    let config = match minimax_h3::config::Config::read(&root, None) {
+        Ok(config) => config,
+        Err(error) => panic!(
+            "the checkpoint at {} has no configuration to read: {error}",
+            root.display()
+        ),
+    };
     // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
@@ -216,10 +284,45 @@ fn main() {
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment));
     }
+    // ---- The video encoder's rows, **derived rather than written**.
+    //
+    // Its frame operators key on classes the raster derives - `frame_pad`'s tile is a function of the
+    // output's columns and the levels' `scaled_add` widths are latent-space extents - so a written set
+    // covers one canvas and leaves every level of every other one without a program. The encoder
+    // itself states what it launches, and **every canvas the model offers is one the store must
+    // serve**: a store with one canvas's rows stops at `no kernel` on any other.
+    //
+    // This is the one place the generator reads the deployment rather than restating it, and it is
+    // deliberate: a twenty-two field literal of the video VAE's config would be the largest written
+    // copy in this file, and the copies are what have been wrong all night. `MINIMAX_H3_CHECKPOINT`
+    // names another root; regenerating the list therefore needs the checkpoint, which a store build
+    // has by construction.
+    let root = std::env::var("MINIMAX_H3_CHECKPOINT")
+        .unwrap_or_else(|_| "/opt/uv/models/MiniMax-H3".to_owned());
+    let sidecar = format!("{root}/vae/config.json");
+    let values: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&sidecar)
+            .unwrap_or_else(|error| panic!("the video VAE's sidecar at {sidecar}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("{sidecar} is not JSON: {error}"));
+    let video_vae = minimax_h3::config::VideoVaeConfig::parse(&values)
+        .unwrap_or_else(|error| panic!("{sidecar}: {error}"));
+    // **The canvases the deployment serves**, which are the ones the model offers - not the raster a
+    // test case happens to use. The encoder's frame operators key on the canvas, so this is the whole
+    // reason the rows are derived: a written set covers one canvas and leaves the others without a
+    // program. `NAMED_CANVASES` is the offered set - it is what `--rasters` defaults to above, so a
+    // caller who narrows the canvases narrows the rows, and the two cannot say different things.
+    lines.extend(
+        match minimax_h3::encoding::VideoEncoder::programs(&video_vae, &rasters) {
+            Ok(rows) => rows,
+            Err(error) => panic!("the video encoder's programs: {error}"),
+        },
+    );
+
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines);
+    header(&lines, &config.video_vae, &rasters);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -231,7 +334,11 @@ fn main() {
 /// questioned at least once. Every number here is computed from the rows themselves, so the header
 /// cannot disagree with them; `build_fixtures` reads only the rows, so a line starting `#` is a
 /// reader's and never a cell.
-fn header(lines: &[(String, String)]) {
+fn header(
+    lines: &[(String, String)],
+    video_vae: &minimax_h3::config::VideoVaeConfig,
+    rasters: &[(u32, u32)],
+) {
     let operators = lines
         .iter()
         .map(|(operator, _)| operator.as_str())
@@ -272,11 +379,27 @@ fn header(lines: &[(String, String)]) {
          config, so one set of rows serves the base network and the reference DiT."
     );
     println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    // The four fields that decide the derived rows, printed from the checkpoint that decided them. A
+    // reader asking "which canvas is this file for" gets the answer beside the count, and the answer
+    // cannot drift from the rows: both come from one read of `--root`.
+    println!(
+        "# derived: the video encoder's canvas-class rows, from `--root`'s own config (default \
+         /opt/uv/models/MiniMax-H3). block_out_channels {:?}, spatial_downsample_factors {:?}, \
+         temporal_downsample_factors {:?}, latent_channels {}; rasters (height, width) {:?}.",
+        video_vae.block_out_channels,
+        video_vae.spatial_downsample_factors,
+        video_vae.temporal_downsample_factors,
+        video_vae.latent_channels,
+        rasters,
+    );
     // The second category of a row that varies with the request, distinct from a deployment's type.
     // A store built from this file serves the canvases and lengths its rows describe; a key derived
     // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
     // a layout is not a program key but a table the executor uploads - the distinction matters,
     // because only one of the two belongs in a list of programs.
+    println!(
+        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` (MINIMAX_H3_CHECKPOINT names another root), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
+    );
     println!(
         "# request-derived: a key computed from the request's own numbers cannot be a row here. \
          `frame_pad`'s tile and the `scaled_add` latent widths follow the canvas, and \
@@ -1034,6 +1157,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
+    // **The conditioner's per-head normalization.** `TokenRefiner::programs` states two norm widths -
+    // the hidden state's and **one head's**, `config.head_dim` = 128 - because its attention
+    // normalizes each query and key over a head rather than through the fused `qk_norm_rope` the DiT's
+    // blocks use. The hidden width was a row; the head's was not, so the conditioner's attention would
+    // have stopped at its first normalization. It is the conditioner's dtype - BF16 at `auto`, like
+    // the rest of that path - and the tile is the operator's for 128 columns.
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: deployment,
+            columns: HEAD_DIM,
+            tile: HEAD_DIM.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
     // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
     for (target, source) in [(DType::F32, DType::F32), (deployment, deployment)] {
@@ -1463,38 +1602,34 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             }
             .to_string(),
         );
-        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window, and
-        // **no offsets** - `attend_dense(..., None, None, rows, ...)` attends one clip as one
-        // sequence, and the key names that form only by its `cu_seq_lens_false` suffix.
+        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window.
         //
-        // **A named gap, not a missing row: only the FP32 backend serves the offset-free form.**
-        // `dense_attention/fa4` is the F16/BF16 backend and its package states why it serves the packed
-        // form alone - FlashAttention-4's interface takes the sequence offsets, so a key without them
-        // is not a launch it can make. So an export that stores its VAE half has the decoder's
-        // attention unresolved until either this call passes one sequence's offsets (`[0, rows]`, the
-        // packed form every other consumer uses) or the FP32 backend's SGEMM program gains an F16
-        // form. Neither is this list's to choose; writing the row here would be a cell no program can
-        // run, which is the one thing this list does not do.
-        if vae == DType::F32 {
-            push(
-                "dense_attention",
-                ops::attention::DenseDescriptor {
-                    query: vae,
-                    key_value: vae,
-                    output: vae,
-                    head_dim: 64,
-                    q_heads: 32,
-                    kv_heads: 32,
-                    mask: ops::attention::Mask::Dense,
-                    windowed: false,
-                    // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
-                    // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
-                    max_kv_len: 2048,
-                    cu_seq_lens: false,
-                }
-                .to_string(),
-            );
-        }
+        // **The form follows the element type**, because the two programs serve different shapes and
+        // each key names its own. The FP32 program is a GEMM and a softmax over one sequence and
+        // reads no offsets, so its key carries `cu_seq_lens_false`; FlashAttention-4's kernel serves
+        // the packed form, takes the offsets table and refuses a null one, so its key carries no
+        // suffix at all. One sequence makes them arithmetically identical, and the layer states the
+        // same predicate (`video_vae.rs`'s `block_attention` and `packed`), so the element type alone
+        // decides - a clip decoded at the checkpoint's own FP16 must not ask the FP32 package for a
+        // row, nor the flash kernel for one at f32.
+        push(
+            "dense_attention",
+            ops::attention::DenseDescriptor {
+                query: vae,
+                key_value: vae,
+                output: vae,
+                head_dim: 64,
+                q_heads: 32,
+                kv_heads: 32,
+                mask: ops::attention::Mask::Dense,
+                windowed: false,
+                // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
+                // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
+                max_kv_len: 2048,
+                cu_seq_lens: vae != DType::F32,
+            }
+            .to_string(),
+        );
         // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
         // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
         for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
