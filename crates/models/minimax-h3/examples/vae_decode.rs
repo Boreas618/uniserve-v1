@@ -519,10 +519,13 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
     let plan = video_arena(&config.video_vae, &canvas, dtype)?;
-    let mut planned = 0_u64;
-    for buffer in &plan {
-        planned += buffer.elements * buffer.width()?;
-    }
+    // **Each buffer at the arena's alignment, not at its raw size.** The arena aligns every give-out
+    // to `nn::forward::ALIGNMENT`, so the raw sum is short by up to 255 bytes per buffer - and the
+    // first run to meet it was 64 bytes short of a 372 MiB region, which is the two rotary tables'
+    // padding and nothing else. `arena_reservation` is that sum, so a runner that reserves by the
+    // plan cannot be short by an alignment it did not know about.
+    let planned = minimax_h3::decoding::arena_reservation(&plan);
+    let raw: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
     // **The harness is also the runner.** The latents it uploads and the raster it decodes into are,
     // in service, the request's latent and `DecodedMedia.video` - the caller's buffers, which the
     // runner allocates and the plan deliberately does not count (`video_arena`'s note). Here they come
@@ -558,10 +561,12 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned at {}, {} KiB held by this harness, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {} ({} KiB of alignment), {} KiB held by this \
+         harness, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
         minimax_h3::text_encoder::element_of(dtype),
+        (planned - raw) >> 10,
         held >> 10,
         arena_bytes >> 20,
         if arena_bytes > reserved {
