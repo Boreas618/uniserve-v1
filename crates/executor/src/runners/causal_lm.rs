@@ -836,6 +836,19 @@ fn runner_dump() -> bool {
 }
 
 /// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
+/// Whether a replay walks its batch eagerly instead of launching the bucket's graph.
+///
+/// A diagnosis of one question: is a wrong answer the batch the runner staged, or the graph it
+/// launched? Both are answered by the same run, because the walk uses the same columns, the same arena
+/// and the same programs. It is never a serving path: an eager walk is what capture does, and a
+/// deployment that ran it would launch every operator again on every batch.
+fn eager_replay() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER.get_or_init(|| {
+        std::env::var_os("UNISERVE_EAGER_REPLAY").is_some_and(|value| !value.is_empty())
+    })
+}
+
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
     for (index, value) in values.iter().enumerate() {
@@ -1675,6 +1688,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                let launched = Instant::now();
+                // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
+                // same model, launched operator by operator instead of as one graph. It splits every
+                // remaining question in two - a wrong answer here is what the runner *staged*, and a
+                // right answer here is capture or replay - without a second deployment to compare
+                // against.
+                let eager = eager_replay();
+                if eager {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        generation = *generation,
+                        live_tokens = self.staging.live_tokens(),
+                        "this replay walks the batch eagerly instead of launching its graph"
+                    );
+                    // Cloned before the walk: the epoch is borrowed for the walk itself.
+                    let kernels = self.lifecycle.generation_named(*generation)?.clone();
+                    self.walk(*bucket, &kernels)?;
+                }
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
@@ -1695,12 +1726,14 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
-                let launched = Instant::now();
                 let enqueue = Instant::now();
-                captured.launch(&stream)?;
+                let nodes = captured.kernel_nodes();
+                if !eager {
+                    captured.launch(&stream)?;
+                }
                 self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
-                    counters.launches(captured.kernel_nodes());
+                    counters.launches(nodes);
                 }
                 // The captured launch's token bound is the pose the bucket was captured with, which
                 // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
@@ -3136,6 +3169,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         let inside = |address: u64| inside_bytes(address, width);
         let mut out = String::from(" probes:");
+        // Every extent an attention launch named as its output. If the layers share one, a digest read
+        // after the whole graph says nothing about what any single layer wrote: the last writer of
+        // that extent is the one being read, and the reading is the graph's rather than a layer's.
+        let mut attn_extents: Vec<u64> = Vec::new();
 
         // The span the launch reads, as the columns hold it *now*: `cum_seq_lens_q` names where each
         // row's queries start and end, and `seq_lens` how many keys that row may read. A bound baked
@@ -3237,6 +3274,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     Some(value) => format!(" cnt={value}"),
                     None => String::new(),
                 };
+                if !attn_extents.contains(&address) {
+                    attn_extents.push(address);
+                }
                 if layer == 0 && address != 0 {
                     layer0_out = address;
                 }
@@ -3273,6 +3313,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 out.push_str(&format!(
                     " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}"
                 ));
+                if layer0_out != 0 && address == layer0_out && layer > 0 {
+                    out.push_str("(shared)");
+                }
                 layer += 1;
             }
         }
@@ -3309,6 +3352,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 }
             }
         }
+        out.push_str(&format!(" attn_extents={}", attn_extents.len()));
         functions.sort_by(|left, right| right.1.cmp(&left.1));
         // Every function of the graph, not the twelve most frequent: the question the histogram
         // answers is which kernels are *absent* (a reduction node, a reduction's second launch), and
