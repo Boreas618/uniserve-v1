@@ -1024,10 +1024,29 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             (path.clone(), held, extents, payload)
         }
         (None, true) => {
+            // The **deployment's** canvas, not the latent flags' default: a drawn raster of extents no
+            // request can name is a raster no deployment serves, and this path exists to run the pair at
+            // the canvas the rows are keyed for. A flag pair that names an offered canvas is honoured;
+            // anything else - including the defaults - draws the first of the six.
+            let offered = offered_canvases();
+            let first = offered.first().ok_or_else(|| {
+                Failure::message("the deployment offers no canvas to draw".to_owned())
+            })?;
+            let canvas = offered
+                .iter()
+                .find(|canvas| {
+                    canvas.height == args.latent_height * ratio
+                        && canvas.width == args.latent_width * ratio
+                })
+                .unwrap_or(first);
             let frames = config.video_vae.clip_length;
-            let rows = args.latent_height * ratio;
-            let columns = args.latent_width * ratio;
-            let (held, extents, payload) = pattern_pixels(frames, rows, columns)?;
+            println!(
+                "raster: drawing the {} canvas, {frames} frames of {} x {} pixels",
+                canvas.name(),
+                canvas.height,
+                canvas.width
+            );
+            let (held, extents, payload) = pattern_pixels(frames, canvas.height, canvas.width)?;
             (PathBuf::from("drawn"), held, extents, payload)
         }
         (None, false) => {
