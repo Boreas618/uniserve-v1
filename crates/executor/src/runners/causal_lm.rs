@@ -2219,7 +2219,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
-            parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
+            // A warm pose of a sampled bucket must state a valid *draw*: the sampler's forward
+            // divides by the row's temperature, so a zeroed row asks it to divide by zero - and a
+            // capture that does so is a device nobody can tell from a hung one. The permissive
+            // pose keeps every candidate (`top_k` 0), takes all of the nucleus (`top_p` 1) and
+            // applies no penalty, which is a request the sampler answers and whose token is
+            // discarded. A greedy bucket's pose is not read through this path at all: the launch
+            // sequence follows the bucket's variant.
+            parameters: warm_parameters(rows),
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
@@ -2367,6 +2374,24 @@ pub fn calls_output(
 /// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
 /// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
 /// host argmax of the row's kept logits (`greedy_first_tokens`).
+
+/// The sampling parameters a warm pose states: one valid, permissive draw per row.
+///
+/// `TEMPERATURE` is 1 rather than 0 because the sampler's forward divides by it - a zeroed row
+/// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
+/// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
+/// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+fn warm_parameters(rows: usize) -> Vec<f32> {
+    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let mut parameters = vec![0.0; rows * columns];
+    for row in 0..rows {
+        let row = &mut parameters[row * columns..(row + 1) * columns];
+        row[ops::sampler::TEMPERATURE as usize] = 1.0;
+        row[ops::sampler::TOP_P as usize] = 1.0;
+    }
+    parameters
+}
+
 fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());
@@ -3083,6 +3108,34 @@ mod sampled_output_tests {
         let gather = indices.shaped(&[narrow]);
         assert_eq!(gather.shape.dims(), &[narrow]);
         assert_eq!(gather.numel(), narrow, "the count the gather reads");
+    }
+
+
+    /// The warm pose of a sampled bucket states a draw the sampler can make: temperature 1, every
+    /// candidate kept. A zeroed pose asks the forward to divide by a zero temperature - and it is
+    /// the very input `refuse_mixed_sampling` refuses in a real batch, which is why a capture that
+    /// ran on it was a bucket the batch check would have rejected.
+    #[test]
+    fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = warm_parameters(2);
+        assert_eq!(parameters.len(), 2 * columns, "a row per row");
+        for row in 0..2 {
+            let row = &parameters[row * columns..(row + 1) * columns];
+            assert_eq!(row[ops::sampler::TEMPERATURE as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_P as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_K as usize], 0.0);
+        }
+        refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &parameters)
+            .expect("the pose of a sampled bucket is not a greedy row");
+        assert!(
+            refuse_mixed_sampling(
+                crate::plan::Variant::DecodeSampled,
+                &vec![0.0; 2 * columns]
+            )
+            .is_err(),
+            "the zeroed pose the capture used to state is not a draw"
+        );
     }
 
 }
