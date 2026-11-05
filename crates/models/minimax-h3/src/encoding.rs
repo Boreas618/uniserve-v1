@@ -359,7 +359,6 @@ impl VideoEncoder {
         for source in sources(config)? {
             match source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => keys.push(tensor),
-                crate::audio_vae::Tensor::Parts(parts) => keys.extend(parts),
                 crate::audio_vae::Tensor::Normalized { value, gain } => {
                     keys.push(value);
                     keys.push(gain);
@@ -701,15 +700,22 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
     ] {
         region(&mut sources, parameter.to_owned(), tensor.to_owned());
     }
-    // One fused query-key-value bias from three checkpoint vectors, in query, key, value order.
-    sources.push(Source {
-        parameter: "projection.qkv.bias".to_owned(),
-        tensor: Tensor::Parts(vec![
-            "pre_block.attn.q_bias".to_owned(),
-            "pre_block.attn.zero_k_bias".to_owned(),
-            "pre_block.attn.v_bias".to_owned(),
-        ]),
-    });
+    // The checkpoint fuses query, key and value into one `[3 * wide]` bias parameter and keeps its
+    // three windows as three tensors; the reference fills the windows from them in this order
+    // (`audio_vae.py:521-534`). This encoder's attention reads the three windows as three layers, so
+    // each window is its own source and its own load: a window is a whole tensor here, while the
+    // fused weight below is one tensor read at three offsets.
+    //
+    // `pre_block.attn.zero_k_bias` is the checkpoint's stored key window - a vector it carries like
+    // the other two - so it is requested and loaded, never substituted by a constant on the strength
+    // of its name: a buffer placed in a learned slot is a silent change to the arithmetic.
+    for (parameter, tensor) in [
+        ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+        ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+        ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+    ] {
+        region(&mut sources, parameter.to_owned(), tensor.to_owned());
+    }
     Ok(sources)
 }
 
@@ -1844,12 +1850,17 @@ impl AudioEncoder {
             dtype,
         ));
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);
+        // **Causal**, because that is what this encoder's `Projection` builds when it loads
+        // (`Projection::load` below passes `true`) and what the reference states: `DenseInput(
+        // causal=True)` over the latent frames, so a frame depends only on the audio before it
+        // (`audio_vae.py:433`). A non-causal row here is a row nothing launches - and the one that
+        // would be launched would then be missing from the store.
         let attention = Attention::dense(
             head_dim,
             config.num_attention_heads,
             config.num_attention_heads,
             LONGEST_TRACK,
-            false,
+            true,
             None,
             1.0 / (head_dim as f32).sqrt(),
         )?;
@@ -2006,8 +2017,12 @@ impl AudioEncoder {
 
         let projection = Projection::load(config, &mut binder, frames)?;
         let channels = u64::from(config.latent_channels);
+        // The reference's mean projection is `nn.Conv1d(latent_channels, latent_channels, 1)`, so the
+        // checkpoint stores a three-dimensional filter `[out, in, kernel]` and not a matrix: a kernel
+        // of one makes the two the same arithmetic but not the same rank, and `Conv1d::new` refuses a
+        // filter that is not 3-d.
         let mean = Conv1d::new(
-            binder.region("mean_projection.weight", &[channels, channels])?,
+            binder.region("mean_projection.weight", &[channels, channels, 1])?,
             Some(binder.region("mean_projection.bias", &[channels])?),
             crate::audio_vae::geometry(1, 1, 0)?,
             false,
@@ -2467,14 +2482,14 @@ impl Projection {
          -> Result<Weight> {
             binder.slice(name, index * shape.iter().product::<u64>(), shape)
         };
-        let linear = |binder: &mut Binder<'_, '_>, index: u64| -> Result<Linear> {
+        let linear = |binder: &mut Binder<'_, '_>, index: u64, window: &str| -> Result<Linear> {
             let weight = slice(binder, "projection.qkv.weight", index, &[third, wide])?;
-            let bias = slice(binder, "projection.qkv.bias", index, &[third])?;
+            let bias = binder.region(&format!("projection.qkv.{window}_bias"), &[third])?;
             Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
         };
-        let query = linear(binder, 0)?;
-        let key = linear(binder, 1)?;
-        let value = linear(binder, 2)?;
+        let query = linear(binder, 0, "q")?;
+        let key = linear(binder, 1, "k")?;
+        let value = linear(binder, 2, "v")?;
         let head_dim = u32::try_from(wide / heads)
             .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
         let heads_u32 = u32::try_from(heads)
@@ -2679,6 +2694,46 @@ mod tests {
         );
     }
 
+    /// The audio encoder's names are the checkpoint's, tensor for tensor.
+    ///
+    /// A mapping that invents one name and drops another still asks for 171, so a count is not the
+    /// check - the set is. The fixture is the encoder half of `FastVideo-FastH3-8-Step-V2`'s
+    /// `audio_vae/`, recorded from the run host's `artifacts/h3-reference/component-tensors.json`:
+    /// 147 `encoder.*` tensors, the 22 of `pre_block.*` and the 2 of `mean_proj.*`. It caught the
+    /// mapping's stage Snake and widening convolution being one index too low (asked at `.block.4`
+    /// and `.block.5` where the checkpoint has `.block.3` and `.block.4`), which is twenty names and
+    /// a count that does not move.
+    #[test]
+    fn the_audio_encoders_names_are_the_checkpoints() {
+        let config = crate::audio_vae::tests::audio_config();
+        let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
+        ours.sort_unstable();
+        let fixture: Vec<&str> = include_str!("../tests/data/audio-encoder-names.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture.len(), 171, "the recorded export's encoder half");
+        let missing: Vec<&str> = fixture
+            .iter()
+            .copied()
+            .filter(|name| !ours.iter().any(|ours| ours == name))
+            .collect();
+        let extra: Vec<&str> = ours
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !fixture.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the checkpoint has encoder names this crate does not ask for: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "this crate asks for encoder names the checkpoint does not have: {extra:?}"
+        );
+    }
+
     /// The video encoder states its programs from its configuration and the rasters it serves: one
     /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
     /// frame, the posterior head's sample, and one residual per block at its level's own extent.
@@ -2791,7 +2846,7 @@ mod tests {
         assert_eq!(
             attention,
             [
-                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"
+                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_causal_window_false_cu_seq_lens_false"
             ],
             "{programs:?}"
         );
@@ -3339,9 +3394,9 @@ mod tests {
             .expect("the encoder's parameters");
         // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
         // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
-        // the projection block with the mean convolution: twenty-one tensors and the fused
-        // query-key-value bias.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22);
+        // the projection block with the mean convolution: twenty-one parameters, the fused
+        // query-key-value weight, and the three bias windows the checkpoint keeps as three tensors.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 21 + 1 + 3);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
@@ -3356,7 +3411,8 @@ mod tests {
             "output_snake.alpha",
             "output.weight",
             "projection.qkv.weight",
-            "projection.qkv.bias",
+            "projection.qkv.k_bias",
+            "projection.qkv.v_bias",
             "projection.mlp.gate.weight",
             "mean_projection.bias",
         ] {
@@ -3374,21 +3430,21 @@ mod tests {
             .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
             .count();
         assert_eq!(normalized, 1 + 5 * 7 + 1);
-        // The fused query-key-value bias names its three checkpoint vectors in order.
-        let bias = table
-            .iter()
-            .find(|source| source.parameter == "projection.qkv.bias")
-            .expect("the fused bias");
-        match &bias.tensor {
-            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
-                parts,
-                &vec![
-                    "pre_block.attn.q_bias".to_owned(),
-                    "pre_block.attn.zero_k_bias".to_owned(),
-                    "pre_block.attn.v_bias".to_owned(),
-                ]
-            ),
-            other => panic!("the fused bias is {other:?}"),
+        // The fused query-key-value bias names its three checkpoint windows in order: each window is
+        // its own parameter here, and the key's is the checkpoint's `zero_k_bias` tensor.
+        for (parameter, tensor) in [
+            ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+            ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+            ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+        ] {
+            let source = table
+                .iter()
+                .find(|source| source.parameter == parameter)
+                .unwrap_or_else(|| panic!("{parameter} is missing"));
+            match &source.tensor {
+                crate::audio_vae::Tensor::Region(name) => assert_eq!(name, tensor),
+                other => panic!("{parameter} is {other:?}"),
+            }
         }
     }
 

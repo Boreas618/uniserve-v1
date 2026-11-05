@@ -114,6 +114,10 @@ const ACTIVATION_KERNEL: u32 = 12;
 
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
+/// The video latent's channels, `vae/config.json`'s `latent_channels` four to a token: the DiT's
+/// input projection reads `4 * VIDEO_CHANNELS` = 96 features per patch, and the solver's step is one
+/// gated residual over the whole trajectory, so that width is both an input and a residual.
+const VIDEO_CHANNELS: u32 = 24;
 
 /// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
 /// tables and the one cast that narrows the timestep activation into them are this wide.
@@ -130,6 +134,11 @@ const VAE_WIDTH: u32 = 32 * 64;
 
 /// The video VAE's spatial compression: 256 output pixels per 16 latent columns.
 const VAE_SPATIAL_COMPRESSION: u32 = 16;
+
+/// The video decoder's rotated width: three quarters of its 64-wide attention head (`vae/config.json`:
+/// `decoder_attention_head_dim 64`, `decoder_rope_dim_ratio 0.75`), which is 48 elements - a 24-column
+/// table, split evenly over the three coordinate axes (`video_vae::rotary`).
+const VAE_DECODER_ROTATED: u32 = 48;
 
 /// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
 /// `[rows, 8192]`).
@@ -234,6 +243,16 @@ fn header(lines: &[(String, String)]) {
         "# The program rows a MiniMax-H3 deployment launches, one `operator<TAB>key` line each."
     );
     println!("# {} data rows, {operators} operators", lines.len());
+    // The rule the row set is grown and shrunk by, stated where a reader meets the count. A row was
+    // dropped once for having no launcher and a device run stopped on it in its first four launches
+    // (`rotary_factors ... sections_16-16-16`, the video decoder's), so the asymmetry is written down:
+    // **a row costs a compile and a missing row costs a run**, and a removal has to be argued from the
+    // construction rather than from an absence of launches.
+    println!(
+        "# rows are here because a launcher reaches them or because the construction requires them; \
+         a row is removed only when the construction contradicts it, never because no walk has \
+         produced it yet (`tools/walk_gaps.py --by-shape` reports a walk's shape the file lacks)."
+    );
     println!(
         "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
          {}; a run states which deployment it serves and a store built from this file serves all of \
@@ -253,6 +272,20 @@ fn header(lines: &[(String, String)]) {
          config, so one set of rows serves the base network and the reference DiT."
     );
     println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    // The second category of a row that varies with the request, distinct from a deployment's type.
+    // A store built from this file serves the canvases and lengths its rows describe; a key derived
+    // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
+    // a layout is not a program key but a table the executor uploads - the distinction matters,
+    // because only one of the two belongs in a list of programs.
+    println!(
+        "# request-derived: a key computed from the request's own numbers cannot be a row here. \
+         `frame_pad`'s tile and the `scaled_add` latent widths follow the canvas, and \
+         `scaled_residual ... columns_<elements>` follows the trajectory's element count, so a store \
+         built from this file serves the canvases and lengths its rows describe \
+         (`tools/walk_gaps.py --by-shape` prints both sides' statements). A value that varies with a \
+         layout and is *not* a program key - the vision tower's position tables - is uploaded per \
+         request and appears in no list of programs."
+    );
     println!(
         "# sparse: the `vsa_*` and `sparse_attention` rows belong to the video-sparse deployment and \
          are the only group no device run has exercised; their tile fields name the class the \
@@ -287,12 +320,13 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     }
 
     // `snake` is the encoder's: one linear parameter, used by the DAC residual units and encoder
-    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). The encoder doubles its
-    // width at each rate.
+    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). **A stage runs its
+    // Snake at the width it takes in and doubles on the way out** (`EncoderStage.inner` is "half the
+    // stage's output width"), and the network ends with one more Snake at the doubled width - six
+    // widths over five rates, not five. Doubling before the push lost the narrowest one, and with it
+    // the encoder's first stage.
     let mut encoder_channels = ENCODER_DIM;
-    for rate in ENCODER_RATES {
-        let _ = rate;
-        encoder_channels *= 2;
+    for _ in ENCODER_RATES {
         push(
             "snake",
             ops::snake::Descriptor {
@@ -303,7 +337,18 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             }
             .to_string(),
         );
+        encoder_channels *= 2;
     }
+    push(
+        "snake",
+        ops::snake::Descriptor {
+            dtype: DType::F32,
+            channels: encoder_channels,
+            block: ELEMENTWISE_BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
 
     // The decoder's upsamplers are the reference's `Activation1d`: a replicate pad, a transposed
     // convolution of stride 2, a `SnakeBeta`, then a low-pass of the same ratio — which is our
@@ -458,15 +503,31 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // - **The text encoder's** is Qwen3-VL's M-RoPE: three unequal sections (48, 40, 40 of the
     //   head's 128 rotated elements) whose frequencies cycle over (time, height, width), a
     //   64-column table.
-    for (rotated, per_axis, interleaved) in [
-        (ROTATED, [ROTATED / ROPE_AXES; 3], false),
-        (128, [48, 40, 40], true),
+    //
+    // - **The video decoder's** is a third cut again, and it is not a head of the stack: its head is
+    //   64 wide and three quarters of it rotate (`vae/config.json`: `decoder_attention_head_dim 64`,
+    //   `decoder_rope_dim_ratio 0.75`), so 48 elements split evenly over three axes - a 24-column
+    //   table - and its **coordinates are F32 whatever the decode's element type is**, which is the
+    //   same fact that makes the decoder plan's `cosine`/`sine` entries F32
+    //   (`video_vae::rotary`). The stage-2 walk asked for exactly this row -
+    //   `rotary_factors dtype_f32_positions_f32_columns_24_..._sections_16-16-16` - in the first four
+    //   launches the decoder ever made, and the file did not hold it because no launcher had reached
+    //   it when the row was dropped. A row costs a compile; a missing row costs a run.
+    for (rotated, per_axis, interleaved, positions) in [
+        (ROTATED, [ROTATED / ROPE_AXES; 3], false, DType::I32),
+        (128, [48, 40, 40], true, DType::I32),
+        (
+            VAE_DECODER_ROTATED,
+            [VAE_DECODER_ROTATED / ROPE_AXES; 3],
+            false,
+            DType::F32,
+        ),
     ] {
         push(
             "rotary_factors",
             ops::rope::FactorsDescriptor {
                 dtype: DType::F32,
-                positions: DType::I32,
+                positions,
                 columns: rotated / 2,
                 block: ROTARY_BLOCK,
                 // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
@@ -609,6 +670,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             columns: HIDDEN,
             tile: row_tile(HIDDEN),
             absmax: false,
+        }
+        .to_string(),
+    );
+    // The DiT's output norm, `norm_out.norm`, is a **plain** `RmsNorm` over the hidden state
+    // (`transformer.rs`'s `load`, `RmsNorm::new(gain(...), eps)`) - the stack's own final
+    // normalization, not the weighted one every block wears and not the modulated one it consumes.
+    // It had no row at this width in either type, and a walk of the stack launches it once per
+    // forward: the last normalization before the output projection would have been the first
+    // `no kernel` of a run that had already done all its work.
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: deployment,
+            columns: HIDDEN,
+            tile: row_tile(HIDDEN),
+            pdl: PDL,
         }
         .to_string(),
     );
@@ -867,12 +944,18 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     //
-    // One launch per block activation, and each stage's blocks run at the stage's own width: the
-    // seven widths are 1024, 512, 256, 128, 64, 32 and 16 (`audio_vae.py`'s decoder widths), while
-    // the taps, the ratio and the program's block are the same at every stage (`ACTIVATION_*`), so
-    // the key differs only in its width. A single row at the first width would describe one of the
-    // seven launches and leave six without a program.
-    for channels in [1024_u32, 512, 256, 128, 64, 32, 16] {
+    // One launch per block activation, and each stage's blocks run at the stage's own width - the
+    // decoder's schedule halving per stage, `1024 >> (stage + 1)`, so 512 down to 8 over the seven
+    // rates. The taps, the ratio and the program's block are the same at every stage, so the key
+    // differs only in its width, and a single row at the first width would describe one launch and
+    // leave the rest without a program.
+    //
+    // **The widths are the schedule's, computed, not a list.** A written list held 1024 - a width the
+    // schedule never produces, since the first stage halves the decoder's widest - and stopped at 16,
+    // missing the narrowest stage's 8: one row with no launcher and one launch with no row, from the
+    // same transcription, and the deployment's audio decoder would have stopped at its last block.
+    for stage in 0..DECODER_RATES.len() as u32 {
+        let channels = DECODER_DIM >> (stage + 1);
         push(
             "audio_activation",
             ops::audio_activation::Descriptor {
@@ -880,23 +963,25 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 channels,
                 kernel: ACTIVATION_KERNEL,
                 ratio: ACTIVATION_RATIO,
-                // The decoder's widest stage, which is the model's own number
-                // (`AudioDecoder`'s channel schedule), not a layer constant: `nn`'s
-                // `AudioActivation` takes the block as a construction argument.
-                block: 1024,
+                // The model's own program width, read from it rather than restated: the launcher
+                // passes `audio_vae::ACTIVATION_BLOCK` to `AudioActivation::new`, so a copy of the
+                // number here is a second answer to a question the launch already answers - and this
+                // row said 1024 for seven launches the device makes at 256.
+                block: minimax_h3::audio_vae::ACTIVATION_BLOCK,
                 pdl: PDL,
             }
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width. Its element type is
-    // FP32 at every deployment: the AdaLN pair this activation feeds is FP32 whatever the stack's
-    // weights are (`crates/ops/src/modulation.rs` refuses any other type), so a row at the
-    // deployment's dtype would build a cell no launch can reach.
+    // The timestep embedding's activation, over the transformer's hidden width, at **the stack's own
+    // element type**: `transformer.rs` launches `Silu::descriptor_of(dtype, config.time_hidden_dim)`
+    // from the stack's `dtype`, and the stage-5 walk launched it at `f16` for an f16 deployment. A row
+    // at FP32 alone was this file's defect: the AdaLN *pair* downstream is FP32, but the activation
+    // that feeds it is not, and a BF16 deployment would have stopped on this key.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: DType::F32,
+            dtype: deployment,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,
@@ -957,12 +1042,28 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target,
                 source,
-                columns: 96,
+                columns: 4 * VIDEO_CHANNELS,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
     }
+    // **The solver's step over the whole trajectory, at the sample's own width and type.** The sample
+    // is `[tokens, 4 * video_channels]` for the video latent and the audio latent's own width for its
+    // own trajectory, and `Solver::step` runs one gated residual over all of it - so the width is the
+    // latent's, not the stack's, and the type is `SAMPLE_DTYPE`, which the forward refuses to depart
+    // from. Keyed from the stack these would name a row no step launches, which is how the 96-column
+    // one came to be absent while the same 96 was in the list as a `scaled_add`.
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: minimax_h3::denoiser::SAMPLE_DTYPE,
+            columns: 4 * VIDEO_CHANNELS,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
@@ -1009,13 +1110,16 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The audio encoder's projection block, the refiner's own operators: a **causal** dense attention
-    // and a **tanh-GELU** gated unit, and neither shape existed anywhere in this list.
+    // The audio encoder's projection block: a **causal** attention and a **tanh-GELU** gated unit.
     //
     // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
-    // `num_attention_heads 8` heads of 256, with as many key heads as query heads; `Projection::load`
-    // passes `causal = true` and one sequence with no offsets, so the key carries the `mask_causal`
-    // and `cu_seq_lens_false` forms. The gated unit is `GatedActivation::new(GeluTanh)` over the
+    // `num_attention_heads 8` heads of 256, with as many key heads as query heads. The mask is
+    // `causal`: a frame depends only on the audio before it (`audio_vae.py:433`), and **the object
+    // the load builds is the authority** - `Projection::load` constructs
+    // `Attention::dense(..., true, ...)`. This list once said `dense` on the strength of a
+    // `programs` parameter, which is a statement about the load rather than the load; the file's row
+    // is the one that follows the constructed layer. The gated unit is
+    // `GatedActivation::new(GeluTanh)` over the
     // latent channels, whose gate and value are **two separate** `[frames, 2 · 32]` buffers rather
     // than one packed one - so the row stride is the width, and this row is the `gelu_tanh`
     // activation the DiT's `silu` rows cannot stand in for.
@@ -1030,7 +1134,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             kv_heads: AUDIO_ATTENTION_HEADS,
             mask: ops::attention::Mask::Causal,
             windowed: false,
-            // A launch bound outside the key: the refiner attends one clip's frames as one sequence.
+            // A launch bound outside the key: the encoder attends one track's frames as one sequence.
             max_kv_len: 4096,
             cu_seq_lens: false,
         }
@@ -1130,6 +1234,23 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             dtype: deployment,
             columns: 1152,
             tile: 1152_u32.next_power_of_two(),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // **The mergers' norm, at a merged row's width** - the same operator one width over, and it was
+    // missing: `vision.rs` launches `LayerNorm::descriptor_of(dtype, merged, true)` beside the
+    // blocks' own, with `merged = hidden_size · spatial_merge_size²` (`BlockRows::merged_width`,
+    // 1152 · 4 = **4608**). The mergers' two `gemm`s at that width were already rows, so the family
+    // was in the file while the normalization that feeds them was not - the encode path would have
+    // stopped between the merger's norm and its own projection.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: deployment,
+            columns: 1152 * 4,
+            tile: (1152 * 4_u32).next_power_of_two(),
             bias: true,
             pdl: PDL,
         }
@@ -1573,6 +1694,27 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             activation: ops::activation::Activation::Silu,
             gate_stride: 2 * 14336,
             value_stride: 2 * 14336,
+            wide: false,
+            pdl: PDL,
+            stepwise: true,
+        }
+        .to_string(),
+    );
+    // **The refiner's feed-forward**: the same width and the same activation as the DiT's block MLP
+    // and a different program, because `conditioning.rs` runs its gate and up projections into two
+    // *separate* contiguous buffers - both row strides are the intermediate width, while the DiT
+    // reads the halves of one packed projection at twice it. A walk of this tree launches both, so
+    // both are rows; one row at the packed stride would leave the refiner's every conditioned
+    // request without a program.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: deployment,
+            width: 14336,
+            block: ELEMENTWISE_BLOCK,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 14336,
+            value_stride: 14336,
             wide: false,
             pdl: PDL,
             stepwise: true,
