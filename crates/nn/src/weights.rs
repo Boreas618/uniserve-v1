@@ -26,6 +26,7 @@
 //! device mappings. `nn` owns no device memory: a [`Weight`] is a [`Backing`] plus the view the
 //! operator reads.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ops::fp4::ScaleLayout;
@@ -810,6 +811,10 @@ pub struct WeightLoader<'a> {
     store: Option<&'a mut dyn RetainedWeights>,
     dtype: Option<DType>,
     quantization: Option<Quantization>,
+    /// The checkpoint tensors' extents, when a shapes-only loader states them from a table instead of
+    /// from a checkpoint's headers. A computed weight — the folded form of a weight-normalized
+    /// convolution — has no request to take its extents from, so it is answered from here.
+    extents: Option<&'a BTreeMap<String, (DType, Shape)>>,
 }
 
 impl<'a> WeightLoader<'a> {
@@ -828,6 +833,7 @@ impl<'a> WeightLoader<'a> {
             store: Some(store),
             dtype,
             quantization,
+            extents: None,
         }
     }
 
@@ -840,11 +846,23 @@ impl<'a> WeightLoader<'a> {
     /// derives are what decide the programs a model launches, and the values never reach a kernel. So
     /// a walk of a model's programs needs no shards and no device.
     pub fn shapes(dtype: DType) -> Self {
+        Self::stated(dtype, None)
+    }
+
+    /// A shapes-only loader that also states the checkpoint tensors' extents from `extents`.
+    ///
+    /// A weight a module merely reads takes its extents from the request, so a shapes-only loader needs
+    /// no table for it. A weight **computed at load** does: the folded form of a weight-normalized
+    /// convolution reduces `v · g / ‖v‖`, and `v`'s extents are a fact of the checkpoint's header. The
+    /// table is that header's content — produced where the weights are, used where they are not — so a
+    /// walk needs no shard while still stating the shapes the checkpoint really holds.
+    pub fn stated(dtype: DType, extents: Option<&'a BTreeMap<String, (DType, Shape)>>) -> Self {
         Self {
             checkpoint: None,
             store: None,
             dtype: Some(dtype),
             quantization: None,
+            extents,
         }
     }
 
@@ -1004,6 +1022,46 @@ impl<'a> WeightLoader<'a> {
     /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
     /// be confused with a plain region of either.
     pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
+        if self.is_shapes() {
+            // The folded weight keeps `v`'s extents and one gain per output channel; both are facts of
+            // the checkpoint's header, which the table states.
+            let extents = self.extents.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: this loader states shapes but holds no table of the checkpoint's \
+                     extents, and a weight-normalized weight's extents are not in any request"
+                ))
+            })?;
+            let (value_dtype, shape) = extents.get(v).copied().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: the extents table does not name `{v}`, which the folded weight is read from"
+                ))
+            })?;
+            let (_, gain) = extents.get(g).copied().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: the extents table does not name `{g}`, which carries the gain"
+                ))
+            })?;
+            if gain.numel() != shape.dim(0) {
+                return Err(Error::weight(
+                    name,
+                    format!(
+                        "a gain of {} elements for {} output channels",
+                        gain.numel(),
+                        shape.dim(0)
+                    ),
+                ));
+            }
+            let dtype = self.dtype.unwrap_or(value_dtype);
+            let bytes = shape
+                .numel()
+                .checked_mul(dtype.bytes().unwrap_or(0))
+                .ok_or_else(|| Error::weight(name, "the weight's bytes overflow".to_owned()))?;
+            let backing = Backing::new(DevicePtr::new(0), bytes);
+            return Ok(Weight {
+                view: backing.view(dtype, shape)?,
+                backing,
+            });
+        }
         let value = self.shards()?.read(v)?;
         let gain = self.shards()?.read(g)?;
         if value.shape.rank() == 0 {
@@ -1096,6 +1154,7 @@ impl<'a> WeightLoader<'a> {
             store: Some(self.retention()?),
             dtype,
             quantization,
+            extents: None,
         })
     }
 
