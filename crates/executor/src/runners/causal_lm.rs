@@ -1075,6 +1075,52 @@ fn baked_difference(
     )
 }
 
+/// What depends on the first attention launches of a graph, by each dependent's kernel name.
+///
+/// A graph holds the edges the recording saw. Work an operator issued on another stream leaves none,
+/// and the graph then runs the consumer in whatever order the driver chooses - a projection reading
+/// its input before attention wrote it gives exactly a right layer and a wrong next one, with every
+/// scalar in the launch agreeing.
+fn attention_edges(captured: &crate::captured::Captured) -> String {
+    let graph = captured.template();
+    let nodes = kernel_nodes(captured.nodes());
+    let mut out = String::new();
+    let mut reported = 0usize;
+    for (ordinal, (operator, node)) in nodes.iter().enumerate() {
+        if *operator != "paged_attention" || reported >= 2 {
+            continue;
+        }
+        let dependents = match graph.dependents(node) {
+            Ok(dependents) => dependents,
+            Err(error) => {
+                out.push_str(&format!(" attention{reported}=unreadable({error})"));
+                reported += 1;
+                continue;
+            }
+        };
+        let named: Vec<String> = dependents
+            .iter()
+            .map(|dependent| match graph.kernel_node_params(dependent) {
+                Ok(params) => params
+                    .function
+                    .name()
+                    .unwrap_or_else(|error| format!("unnamed({error})")),
+                Err(_) => "not-a-kernel".to_owned(),
+            })
+            .collect();
+        out.push_str(&format!(
+            " attention{reported}@{ordinal} depends_on_me={} [{}]",
+            named.len(),
+            named.join(",")
+        ));
+        reported += 1;
+    }
+    if reported == 0 {
+        return " no attention node in the graph".to_owned();
+    }
+    out
+}
+
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
     for (index, value) in values.iter().enumerate() {
@@ -2004,6 +2050,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         bucket = %bucket,
                         difference = %baked_difference(captured, *bucket, &self.staging),
                         "the serving graph's baked numbers against the batch it is serving"
+                    );
+                    tracing::warn!(
+                        bucket = %bucket,
+                        edges = %attention_edges(captured),
+                        "what the graph's edges say waits for attention"
                     );
                 }
                 let enqueue = Instant::now();
