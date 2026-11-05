@@ -44,6 +44,7 @@ use std::process::ExitCode;
 
 use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
+use minimax_h3::config::AttentionKind;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
@@ -138,6 +139,13 @@ struct Args {
     dtype: Option<DType>,
     /// How many of the checkpoint schedule's evaluations stage `denoise` runs; `None` is all of them.
     evaluations: Option<u32>,
+    /// The attention kind the case expects; `None` is `auto`, whatever the export states.
+    ///
+    /// The kind is a property of the checkpoint's `fastvideo_inference.json` and no flag can change
+    /// it, so stating it here is a case's *expectation*: a case that says sparse and a checkpoint
+    /// that says dense is refused by name instead of producing a dense page that would be read as a
+    /// sparse one.
+    attention: Option<AttentionKind>,
     out: PathBuf,
 }
 
@@ -157,6 +165,7 @@ impl Args {
             arena_gib: 12,
             seed: 0,
             dtype: None,
+            attention: None,
             evaluations: None,
             out: PathBuf::from("artifacts/h3-dit-layer0"),
         };
@@ -263,13 +272,34 @@ impl Args {
                         }
                     };
                 }
+                "--attention" => {
+                    // A case states the attention kind it means to run. The kind is the
+                    // checkpoint's, so the flag cannot select one; what it can do is refuse a case
+                    // whose expectation the export does not meet - a sparse case served by a dense
+                    // export would otherwise produce a dense page that reads as a sparse one.
+                    args.attention = match value("--attention")?.as_str() {
+                        "auto" => None,
+                        "dense" => Some(AttentionKind::Dense),
+                        "sparse" => Some(AttentionKind::Sparse {
+                            tile: 0,
+                            sparsity: 0.0,
+                            reference_keep: None,
+                        }),
+                        other => {
+                            return Err(Failure::message(format!(
+                                "unknown attention `{other}`; expected auto, dense or sparse"
+                            )));
+                        }
+                    };
+                }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "dit_layer --stage weights|block|denoise [--root PATH] [--store PATH] \
                          [--dit base|ref] [--device N] [--layers N] [--frames N] [--width N] \
                          [--height N] [--text-tokens N] [--arena-gib N] [--seed N] \
-                         [--evaluations N] [--dtype auto|bf16|f32|f16] [--out DIR]",
+                         [--evaluations N] [--dtype auto|bf16|f32|f16] \
+                         [--attention auto|dense|sparse] [--out DIR]",
                     ));
                 }
                 other => {
@@ -522,6 +552,56 @@ fn stage_denoise(args: &Args) -> Result<()> {
         "loaded: {} stack layers, hidden {hidden}, {rows} packed rows, {dtype}",
         denoiser_config.transformer.num_hidden_layers
     );
+    // Which attention kind this page is produced by. A sparse run and a dense run write files of
+    // the same shapes, so a page that does not print its kind cannot be told from the other one -
+    // and the kind is a property of the checkpoint (`config/mod.rs` reads it from the export's own
+    // `fastvideo_inference.json`), so a run that prints it also records which export it served.
+    let attention = denoiser_config.attention;
+    let attention_kind = match attention {
+        AttentionKind::Dense => "dense",
+        AttentionKind::Sparse { .. } => "sparse",
+    };
+    if let Some(expected) = args.attention
+        && std::mem::discriminant(&expected) != std::mem::discriminant(&attention)
+    {
+        return Err(Failure::message(format!(
+            "the case asks for the {} kind and this export states {attention_kind} \
+             (`fastvideo_inference.json` decides it, not a flag)",
+            match expected {
+                AttentionKind::Dense => "dense",
+                AttentionKind::Sparse { .. } => "sparse",
+            }
+        )));
+    }
+    match attention {
+        AttentionKind::Dense => println!("attention: dense"),
+        AttentionKind::Sparse {
+            tile,
+            sparsity,
+            reference_keep,
+        } => {
+            let total = packing.padded_tokens / tile;
+            let video = packing::segment_extent(
+                frames,
+                &canvas,
+                packing.text_rows,
+                packing.condition_rows,
+                tile,
+                1,
+            )
+            .map(|extent| extent.video_tiles)
+            .map_err(|error| Failure::message(format!("a sparse layout of this case: {error}")))?;
+            let keep = packing::kept_tiles(sparsity, video);
+            println!(
+                "attention: sparse, tiles {tile}, sparsity {sparsity:.2}, kept {keep} of {video} \
+                 video tiles of {total}{}",
+                match reference_keep {
+                    Some(rate) => format!(", reference keep {rate:.2}"),
+                    None => String::new(),
+                }
+            );
+        }
+    }
     // The stage's files are the prefix source and the trajectory, and it writes them in the
     // checkpoint's own element type: a conversion there would be a second representation of the same
     // numbers on one side of the comparison only. `dtype` is the block's, which is the deployment's -
@@ -763,7 +843,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
          \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
          \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
-         \"schedule\": {grid:?}, \
+         \"schedule\": {grid:?}, \"attention\": \"{attention_kind}\", \
          \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \"dtype\": \"{dtype}\", \
          \"video_shape\": {}}}\n",
         args.width,
