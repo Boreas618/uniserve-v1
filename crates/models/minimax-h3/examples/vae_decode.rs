@@ -1108,6 +1108,27 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             names.join(", ")
         )));
     }
+    // **The frame count, before a weight is opened.** The encoder reads one still or one clip, and the
+    // clip's length is the configuration's: a raster of any other count has no path through the
+    // network, so the refusal belongs here rather than inside the first launch - a caller with a
+    // 3-frame container would otherwise load 4.5 GiB of weights to be told it cannot be read.
+    let clip_frames = config.video_vae.clip_length;
+    if frames != 1 && frames != clip_frames {
+        return Err(Failure::message(format!(
+            "{}: {frames} frames; the video encoder reads one still (1) or one {clip_frames}-frame \
+             clip, and a condition longer than a clip is cut by the runner into clips of that length",
+            pixels_path.display()
+        )));
+    }
+    // And `--frames` is a decode flag: this stage derives the latent's frame count from the raster and
+    // the encoder's own arithmetic, so a stated count would be silently replaced - refused instead.
+    if args.frames.is_some() {
+        return Err(Failure::message(
+            "stage `raster` derives the frame count from the raster and the encoder's clip \
+             arithmetic; `--frames` belongs to `--stage decode`, which reads a latent of that count"
+                .to_owned(),
+        ));
+    }
     if !rows.is_multiple_of(ratio) || !columns.is_multiple_of(ratio) {
         return Err(Failure::message(format!(
             "{}: {rows} x {columns} pixels is not a multiple of the encoder's {ratio}-pixel spatial \
