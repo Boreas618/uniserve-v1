@@ -1850,12 +1850,17 @@ impl AudioEncoder {
             dtype,
         ));
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);
+        // **Causal**, because that is what this encoder's `Projection` builds when it loads
+        // (`Projection::load` below passes `true`) and what the reference states: `DenseInput(
+        // causal=True)` over the latent frames, so a frame depends only on the audio before it
+        // (`audio_vae.py:433`). A non-causal row here is a row nothing launches - and the one that
+        // would be launched would then be missing from the store.
         let attention = Attention::dense(
             head_dim,
             config.num_attention_heads,
             config.num_attention_heads,
             LONGEST_TRACK,
-            false,
+            true,
             None,
             1.0 / (head_dim as f32).sqrt(),
         )?;
@@ -2841,7 +2846,7 @@ mod tests {
         assert_eq!(
             attention,
             [
-                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"
+                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_causal_window_false_cu_seq_lens_false"
             ],
             "{programs:?}"
         );
