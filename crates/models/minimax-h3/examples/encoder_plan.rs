@@ -258,8 +258,11 @@ fn run() -> Result<(), String> {
         }
         // The whole raster driver, not the encoder's half: `Scene::encode` takes the stitcher's ring and
         // hand-off **after** the reservation, and only driving it shows whether a run's arena funds
-        // them. The arena here is exactly the run plan, which is what the harness allocates by default
-        // (`--arena-gib 0`), so a refusal *is* the device stop, measured on a host.
+        // them. **The arena carries the set plus a cushion so the driver runs to the end and the
+        // overshoot can be read:** an arena of exactly the set stops inside the driver and reports no
+        // number at all. What `--check` refuses on is that measured overshoot, `used() - set`, not the
+        // arena's size - so the cushion changes no verdict, and the pricing is compared against the
+        // measurement below rather than against the cushion.
         let set_bytes_run = arena_reservation(&tile_plan);
         let run_arena = Arena::new(ops::DevicePtr::new(0), set_bytes_run + (64 << 20));
         let caller_arena = Arena::new(ops::DevicePtr::new(0), 1_u64 << 40);
