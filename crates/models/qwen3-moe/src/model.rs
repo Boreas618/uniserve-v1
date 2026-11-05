@@ -922,7 +922,10 @@ impl Qwen3Moe {
         // is not zero here: every bucket's extents share one range, so another bucket's tensors
         // were written over these bytes, and a stale count reduces a row before its CTAs are in.
         // One fill per forward is enough, because the layers leave the count as they found it.
-        f.zero(buffers.workspace, plan.workspace.min(ATTENTION_COUNTER_BYTES))?;
+        f.zero(
+            buffers.workspace,
+            plan.workspace.min(ATTENTION_COUNTER_BYTES),
+        )?;
         let mut residual = hidden;
         let mut input = hidden;
         for (offset, layer) in self.layers[start..=last].iter().enumerate() {
@@ -1328,13 +1331,8 @@ impl Substage {
     ///
     /// The spellings are the contract with a command line that names a stage: the model refuses
     /// anything else, so a mistyped stage cannot silently run a different cut.
-    pub const NAMES: [&'static str; 5] = [
-        "normalized",
-        "projected",
-        "attended",
-        "gate_in",
-        "mlp_out",
-    ];
+    pub const NAMES: [&'static str; 5] =
+        ["normalized", "projected", "attended", "gate_in", "mlp_out"];
 
     /// The stage `name` asks for, or `None` when it names no cut.
     pub fn parse(name: &str) -> Option<Self> {
