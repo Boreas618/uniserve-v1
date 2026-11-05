@@ -1112,7 +1112,7 @@ impl AttentionLayer {
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
         // Row parallel: each rank's partial output is summed over the query-head split.
         if let Some(group) = f.group {
-            group.all_reduce_sum(out, f.stream).map_err(Error::from)?;
+            group.all_reduce_sum(out, f.stream()?).map_err(Error::from)?;
         }
         Ok(())
     }
