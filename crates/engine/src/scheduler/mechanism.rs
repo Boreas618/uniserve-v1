@@ -1322,6 +1322,13 @@ impl Watchdog {
         self.advancing.keys()
     }
 
+    /// When each tracked request last advanced, for a starvation report: the
+    /// deadline's own bookkeeping is what says how long a request has been
+    /// silent.
+    pub(crate) fn advancing(&self) -> impl Iterator<Item = (&RequestId, Nanos)> {
+        self.advancing.iter().map(|(id, since)| (id, *since))
+    }
+
     pub(crate) fn starved(&self, live: &Live<'_>, now: Nanos, timeout: Nanos) -> Option<RequestId> {
         for (id, since) in &self.advancing {
             let Some(request) = live.requests.get(id) else {
