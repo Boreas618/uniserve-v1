@@ -62,8 +62,15 @@ echo "== the sparse list against its generator"
 # The sparse file is a deployment of its own: its rows come from the generator run
 # with `--sparse`, and a file cut from a walk at another clip fails here by name
 # rather than by falling through to a walk comparison, which measures the walk.
+#
+# The spelling is the *producer's*, character for character (`tools/recut_h3_fixtures.sh`'s
+# `sparse=`): the third field is a reference keep rate a deployment states only when it differs
+# from the checkpoint's own, so `64,0.9` and `64,0.9,0.9` are two deployments that happen to
+# produce one row set today - the rows agree and the launches do not. A check that spelled the
+# deployment differently from the tool that cut the file would compare two deployments and call
+# the equality of their rows a match.
 if [ -f "$sparse_fixture" ]; then
-    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9,0.9 \
+    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9 \
         --fixture "$sparse_fixture" || sparse_not_generated=1
 else
     echo "   skipped: $sparse_fixture is absent"
