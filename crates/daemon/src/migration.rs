@@ -70,6 +70,13 @@ use tokio::sync::mpsc;
 use crate::engine::client::{EventStream, StreamCancelCause, SubmitError};
 use crate::engine::hold::{Kept, RequestHold};
 
+/// How long a migration waits for an engine to serve the request it carries.
+///
+/// The wait itself has no other bound — a deployment between engines is the
+/// ordinary case a successor daemon covers — so this is the point at which a
+/// request that no engine takes is answered instead of staying open.
+const MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Submits the leader's requests and moves its token requests between
 /// engines.
 pub struct Migrator {
@@ -625,6 +632,11 @@ impl RequestEvents {
     async fn migrate(&mut self, migration: Migration) -> Result<(), Event> {
         let cause = migration.cause;
         let started = Instant::now();
+        tracing::info!(
+            ?cause,
+            request = self.stream.id().0,
+            "a response migrates to the engine that serves it now"
+        );
         let failed = |message: String| Event::Error { message };
         if !self.open {
             return Err(failed(
@@ -653,9 +665,18 @@ impl RequestEvents {
             .flatten();
         // Admission resolves the current owner first. After a daemon handoff
         // that owner supplies both the engine and the continuation's state.
-        let (client, kept) = hold
-            .ready(previous_world)
+        // A migration that finds no engine must say so: the wait for one has no
+        // other bound (a deployment between engines is the ordinary case a
+        // successor daemon covers), so a request that finds none is answered
+        // with its own deadline rather than left open on the engine that went.
+        let (client, kept) = tokio::time::timeout(MIGRATION_TIMEOUT, hold.ready(previous_world))
             .await
+            .map_err(|_| {
+                failed(format!(
+                    "the request could not migrate: no engine served it within {} s",
+                    MIGRATION_TIMEOUT.as_secs()
+                ))
+            })?
             .map_err(|error| failed(format!("the request could not migrate: {error}")))?;
         let mut continuation = request.continuation(&migration, kept);
         if let Request::Generation(generation) = &mut continuation {
