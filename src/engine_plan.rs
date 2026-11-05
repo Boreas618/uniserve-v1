@@ -994,11 +994,14 @@ impl EpochPlan {
                     placement.expert_parallel as usize,
                     placement.expert_rank as usize,
                 )?;
-                let model = qwen3_moe::load(
+                // The checkpoint states its own representation: a calibrated export is read packed,
+                // and a dense one dense. The layout is the one the serving programs are built for.
+                let model = qwen3_moe::load::load_checkpoint(
                     &self.checkpoint,
                     partition,
                     &mut loader,
                     placement.load_options,
+                    ops::fp4::ScaleLayout::Linear,
                 )?;
                 let served = Served::Text(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
