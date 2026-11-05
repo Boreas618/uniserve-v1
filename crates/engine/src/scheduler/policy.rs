@@ -927,6 +927,13 @@ impl PolicySlot {
             validators.experts(load, &order)?;
         }
 
+        // A trial must leave a stateful program as it found it. The calls above
+        // are the trial's, and a program that decides from its own call history
+        // has spent them: serving must start from the program's `init` on this
+        // boundary's state, not from what the trial left behind. The candidate
+        // is therefore a second instance of the same module on that state, and
+        // the trialled one is dropped with the cost it counted.
+        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Candidate {
             program,
             module,
