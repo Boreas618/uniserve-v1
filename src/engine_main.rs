@@ -3334,6 +3334,8 @@ impl MainProcess {
                 },
             )),
         });
+        // The request link says so too: the daemon's client waits on it to move its frontend.
+        self.announce(proto::request::wire::EngineState::Ready)?;
         Ok(())
     }
 
@@ -3824,7 +3826,6 @@ impl MainProcess {
             // daemon moves the frontend when this process states that it serves.
             Some(proto::request::wire::engine_command::Kind::Promote(_)) => {
                 self.promote_in_place()?;
-                self.announce(proto::request::wire::EngineState::Ready)?;
                 return Ok(None);
             }
             // §7.5.1 step 2: a hot restart's successor gives this engine a second daemon front, so
