@@ -793,11 +793,15 @@ impl EpochPlan {
             kv_cache_dtype: None,
             host_cache: None,
             // A media rank captures graphs per bucket, and a bucket of this class is not sized by
-            // tokens: the tiers a policy is checked against do not exist here.
-            graph_tiers: None,
-            bos: None,
-            eos: None,
-            end_of_image: None,
+            // tokens: the tiers a policy is checked against do not exist here, which is what an
+            // empty list states (`SchedulerConfig::graph_tiers`).
+            graph_tiers: Some(Vec::new()),
+            // The media class decodes no tokens, so no tokenizer fact reaches a scheduler call: `0`
+            // stands for the absence of a token, as a causal LM's `end_of_image` does, and the list
+            // of terminating tokens is empty.
+            bos: Some(0),
+            eos: Some(Vec::new()),
+            end_of_image: Some(0),
             // A media request generates a clip, not tokens, so no understanding feature is served;
             // the engine still needs the two lower bounds, as the frontend's arm for this class
             // states them (`crates/frontend/src/model/generation.rs`).
