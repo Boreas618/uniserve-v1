@@ -217,6 +217,39 @@ pub trait Products: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<bool>;
 
+    /// Copies `request`'s `kind` product into host memory and waits for the copy to land.
+    ///
+    /// This is the read the media work makes. `crates/media`'s encoders and muxer take host bytes,
+    /// and both products they consume - the clip and the track - are device regions. `out` is pinned
+    /// host memory of exactly the product's size, which [`Products::product`] states; `stream` is
+    /// the reader's own stream, and the copy is ordered on it after the producer's write exactly as
+    /// [`Products::copy_into`] orders a device copy. The call **waits** before it returns, because
+    /// the reader runs on this thread and has no stream to wait on.
+    ///
+    /// `false` is a product no call of `request` produced - never a buffer of zeros, which would be
+    /// a frame of black nobody made.
+    ///
+    /// The bytes carry the producer's own element type: this store copies, and a `f16` clip stays
+    /// `f16`. A reader that wants `u8` pixels converts them, because the conversion is the model's
+    /// arithmetic and its range is the model's statement.
+    ///
+    /// A store that holds no device cannot answer, and its default refusal says so rather than
+    /// handing back a buffer nobody wrote.
+    fn stage(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        out: &platform::PinnedBuffer,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        let _ = (request, kind, out, stream);
+        Err(crate::Error::Invalid(
+            "this product store cannot copy a product to host memory: it holds no device, and the \
+             media work reads its bytes on the host"
+                .into(),
+        ))
+    }
+
     /// Drops every product of `request`, answering how many there were.
     ///
     /// **The executor calls this when a request's last call has been served**, and it is the other
@@ -514,6 +547,59 @@ impl Products for Held {
                 stream,
             )?;
         }
+        Ok(true)
+    }
+
+    fn stage(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        out: &platform::PinnedBuffer,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(false);
+        };
+        let product = placed.view.byte_len()?;
+        if product != out.len() as u64 {
+            return Err(crate::Error::Invalid(format!(
+                "request {} stages {product} byte(s) of {} into {} byte(s) of host memory: a \
+                 partial copy is a reader whose buffer disagrees with the product's shape",
+                request.request_id.0,
+                kind.name(),
+                out.len()
+            )));
+        }
+        let read = (stream.device(), StreamId(stream.raw()));
+        if route((placed.device, placed.stream), read) == Route::AfterTheWriter {
+            let Some(written) = placed.written.as_ref() else {
+                return Err(crate::Error::Invalid(format!(
+                    "request {} stages {} written on device {} stream {} with no record of its \
+                     write: a producer that expects a host reader states the event (`written_on`) \
+                     when it publishes",
+                    request.request_id.0,
+                    kind.name(),
+                    placed.device.0,
+                    placed.stream.0
+                )));
+            };
+            stream.wait_event(written)?;
+        }
+        // SAFETY: both ranges outlive the copy - the product's region belongs to the request, which
+        // is in flight while it is read, and `out` belongs to the caller - and the copy is ordered
+        // on `stream` after the writer's event where they differ. `synchronize` is what makes the
+        // host bytes readable on this thread, and it is why the caller needs no stream of its own.
+        unsafe {
+            platform::memcpy_async(
+                out.address(),
+                placed.view.ptr.address(),
+                usize::try_from(product)
+                    .map_err(|_| crate::Error::Invalid("a product is larger than memory".into()))?,
+                stream,
+            )?;
+        }
+        stream.synchronize()?;
         Ok(true)
     }
 
