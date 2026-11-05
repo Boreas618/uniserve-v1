@@ -283,8 +283,42 @@ fn task_name(task: VideoTask) -> &'static str {
 /// what a stage is for. Its output is the runner's prefix buffer, which is what a deployment passes
 /// between the two stages and what this harness states as a synthetic pattern (stage 4 owns the text
 /// encoder). Placing it here would reserve it and read nothing.
-fn stage_partition(config: &Config, task: VideoTask, place: Place) -> Result<Partition, String> {
-    let serving = Partition::serving(config, task, 1, 1, 0, 0).map_err(show)?;
+/// The condition rows one case asks for, from the packing's own segments.
+///
+/// A stage's layout is sized **before** the checkpoint is loaded, so the rows cannot come from the
+/// loaded denoiser: they come from the packing the request would be laid out under. The case's own
+/// canvas and its own pieces decide, which is why this is not `Partition::serving`'s deployment-wide
+/// worst - that one reserves two keyframes at the largest canvas the deployment offers (2016 rows),
+/// and a case at 768x768 needs 1152. An oversized capacity is not free: the prefix the DiT gathers
+/// from holds one row per reserved condition row.
+fn case_condition_rows(config: &Config, request: &VideoRequest) -> Result<u32, String> {
+    // `condition_segments` reduces each shape's pixels to its latent raster through the packing's own
+    // rule, and counts an image, a video and a keyframe as the model does.
+    let canvas = minimax_h3::denoiser::canvas_of(request).map_err(show)?;
+    let clip = minimax_h3::encoding::Clip::of(&config.video_vae).map_err(show)?;
+    let segments = minimax_h3::packing::condition_segments(
+        &minimax_h3::denoiser::conditions_of(request),
+        &canvas,
+        clip,
+    )
+    .map_err(show)?;
+    let rows: u32 = segments
+        .iter()
+        .map(|segment| segment.video_rows() + segment.audio_rows())
+        .sum();
+    // An arrangement states its capacity in whole units, so the case's rows round up to them.
+    minimax_h3::partition::capacity(config, Dit::Base, rows).map_err(show)
+}
+
+fn stage_partition(
+    config: &Config,
+    task: VideoTask,
+    place: Place,
+    condition_rows: u32,
+) -> Result<Partition, String> {
+    let serving = Partition::serving(config, task, 1, 1, 0, 0)
+        .map_err(show)?
+        .sized(minimax_h3::partition::RELEASED_TEXT_ROWS, condition_rows);
     let placed = serving.blocks.without(Component::TextEncoder);
     Ok(serving.placing(match place {
         Place::Deployment => placed,
@@ -359,7 +393,12 @@ fn weights(args: &Args) -> Result<(), String> {
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
 
-    let partition = stage_partition(&config, args.task, args.place)?;
+    let partition = stage_partition(
+        &config,
+        args.task,
+        args.place,
+        minimax_h3::partition::condition_rows(&config, args.task).map_err(show)?,
+    )?;
     println!(
         "{} places {} blocks (the text encoder is the stage before this one): {}",
         task_name(args.task),
@@ -444,13 +483,16 @@ fn largest_tile(pixels: Extent) -> Result<Extent, String> {
 fn case_conditions(args: &Args) -> Result<(Vec<ConditionShape>, u32, u32, u32), String> {
     match args.task {
         VideoTask::FirstLastToVideoAudio => {
+            // A keyframe is **fitted to the generated canvas** - the packing refuses any other
+            // raster (`H3 keyframes are fitted to the target canvas`) - so the anchor's shape is the
+            // canvas and `--image` states nothing here.
             let conditions = [ConditionRole::FirstFrame, ConditionRole::LastFrame]
                 .into_iter()
                 .map(|role| ConditionShape {
                     role,
                     frames: 1,
-                    height: args.image,
-                    width: args.image,
+                    height: args.height,
+                    width: args.width,
                     audio_samples: 0,
                 })
                 .collect();
@@ -462,10 +504,13 @@ fn case_conditions(args: &Args) -> Result<(Vec<ConditionShape>, u32, u32, u32), 
             // images, three videos and two keyframes of 64-row units (`RELEASED_CONDITION_ROWS`) -
             // so a reference video is admissible at up to three 64-row frames, while a full-canvas
             // reference at 1344x768 is 1008 rows and the packing refuses it, correctly.
+            // One clip of pixel frames: the packing refuses a soundtrack on an *image* reference
+            // (`an H3 image reference carries no audio`), so the reference is the clip's own length
+            // and its audio is the clip's.
             let samples = minimax_h3::CLIP_FRAMES * minimax_h3::AUDIO_SAMPLE_RATE / minimax_h3::FPS;
             let conditions = vec![ConditionShape {
                 role: ConditionRole::Reference,
-                frames: 1,
+                frames: minimax_h3::CLIP_FRAMES,
                 // The shape states **pixels**: the packing reduces them to the latent raster its own
                 // `Visual` carries, so dividing here would divide twice.
                 height: args.image,
@@ -492,18 +537,8 @@ fn plan(args: &Args) -> Result<(), String> {
     let sidecars =
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
-    let partition = stage_partition(&config, args.task, args.place)?;
-    let dit = config
-        .denoisers
-        .get(&Dit::Base)
-        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
-        .clone();
-    let arrangement = partition.arrangement(&dit).map_err(show)?;
-    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
-
-    // The deployment's type for the terms the refiner reads and writes; the condition views are FP32
-    // and are counted at 4 bytes below whatever this is.
-    let dtype = args.dtype.unwrap_or(DType::BF16);
+    // The case before the partition: a stage's condition capacity is the rows its case asks for, and
+    // the rows cannot be read off a layout sized by a constant.
     let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
         task: args.task,
@@ -518,6 +553,19 @@ fn plan(args: &Args) -> Result<(), String> {
         conditions: &conditions,
         vision_spans: &[],
     };
+    let condition_rows = case_condition_rows(&config, &request)?;
+    let partition = stage_partition(&config, args.task, args.place, condition_rows)?;
+    let dit = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
+        .clone();
+    let arrangement = partition.arrangement(&dit).map_err(show)?;
+    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
+
+    // The deployment's type for the terms the refiner reads and writes; the condition views are FP32
+    // and are counted at 4 bytes below whatever this is.
+    let dtype = args.dtype.unwrap_or(DType::BF16);
     let (one, packing) = layouts.layout(&request).map_err(show)?;
     let canvas = layouts.canvas(&request).map_err(show)?;
     let raster = minimax_h3::packing::latent_raster(&canvas).map_err(show)?;
@@ -715,19 +763,6 @@ fn encode(args: &Args) -> Result<(), String> {
     //    build, attaches the condition encoders to the denoiser block, and converts nothing.
     let checkpoint = Checkpoint::open(&args.root).map_err(show)?;
     let config = Config::read(&args.root, None).map_err(show)?;
-    let partition = stage_partition(&config, args.task, args.place)?;
-    let dit = config
-        .denoisers
-        .get(&Dit::Base)
-        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
-        .clone();
-    let arrangement = partition.arrangement(&dit).map_err(show)?;
-    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
-
-    // 3. The case: the conditions the task names, and a request the deployment lays out with its own
-    //    rule. `fl2va` anchors the first and the last generated frame; `ref2va` carries one reference
-    //    clip with its own soundtrack. `t2va` has no condition at all, so it is another stage's case
-    //    and this one refuses it rather than running an unconditioned request down a conditioned path.
     let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
         task: args.task,
@@ -742,6 +777,20 @@ fn encode(args: &Args) -> Result<(), String> {
         conditions: &conditions,
         vision_spans: &[],
     };
+    let condition_rows = case_condition_rows(&config, &request)?;
+    let partition = stage_partition(&config, args.task, args.place, condition_rows)?;
+    let dit = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
+        .clone();
+    let arrangement = partition.arrangement(&dit).map_err(show)?;
+    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
+
+    // 3. The case: the conditions the task names, and a request the deployment lays out with its own
+    //    rule. `fl2va` anchors the first and the last generated frame; `ref2va` carries one reference
+    //    clip with its own soundtrack. `t2va` has no condition at all, so it is another stage's case
+    //    and this one refuses it rather than running an unconditioned request down a conditioned path.
     let (layout, packing) = layouts.layout(&request).map_err(show)?;
 
     // The resident pool is sized by what this partition will publish - the checkpoint's own bytes
