@@ -90,6 +90,14 @@ OPTIONS = (
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+    # The step's token budget is the prefill graph's size, and it is the bound
+    # the scheduling policy's own limits are given: unstated, the daemon has no
+    # token bound to hand the policy, the policy falls back to its own default
+    # (a 8192-token chunk) and the mechanism refuses it against the build
+    # config's ceiling of 512 -- the number this deployment's captured prefill
+    # graph states. Stating the budget makes the deployment, its graphs and its
+    # policy agree on one number instead of three.
+    "max_num_batched_tokens=512",
 )
 # A change of the options that only a new world executes: graphs of other
 # decode batch sizes.

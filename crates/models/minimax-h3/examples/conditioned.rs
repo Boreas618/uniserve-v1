@@ -86,6 +86,9 @@ struct Args {
     /// The request's seed, which addresses the condition's draw.
     seed: u64,
     device: u32,
+    /// The element type the deployment loads at. `auto` is the design's default: the checkpoint's own
+    /// representation, nothing converted at load, and each request's pin decides.
+    dtype: Option<DType>,
     /// The program store `--stage encode` reads its modules from.
     store: Option<PathBuf>,
 }
@@ -117,6 +120,7 @@ impl Args {
             image: 256,
             seed: 0,
             device: 0,
+            dtype: None,
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
         };
         let mut words = std::env::args().skip(1);
@@ -191,6 +195,19 @@ impl Args {
                     args.device = value()?
                         .parse()
                         .map_err(|_| "`--device` takes an index".to_owned())?;
+                }
+                "--dtype" => {
+                    args.dtype = match value()?.as_str() {
+                        "auto" => None,
+                        "bf16" => Some(DType::BF16),
+                        "f16" => Some(DType::F16),
+                        "f32" => Some(DType::F32),
+                        other => {
+                            return Err(format!(
+                                "`{other}` is not an element type; write auto, bf16, f16 or f32"
+                            ));
+                        }
+                    };
                 }
                 other => return Err(format!("`{other}` is not a flag of this harness")),
             }
@@ -365,6 +382,9 @@ fn plan(args: &Args) -> Result<(), String> {
     let arrangement = partition.arrangement(&dit).map_err(show)?;
     let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
 
+    // The deployment's type for the terms the refiner reads and writes; the condition views are FP32
+    // and are counted at 4 bytes below whatever this is.
+    let dtype = args.dtype.unwrap_or(DType::BF16);
     let condition = ConditionShape {
         role: ConditionRole::FirstFrame,
         frames: 1,
@@ -440,15 +460,32 @@ fn plan(args: &Args) -> Result<(), String> {
             println!("  {:<24} {:>12} elements", buffer.name, buffer.elements);
         }
     }
-    // The draws are FP32 and the text buffers the deployment's type, which the device stage reads
-    // from the checkpoint; on this host the case's own type is the export's, so both are four bytes
-    // unless a caller says otherwise.
+    // Every term states the element type it is counted at, because the two kinds differ here: the
+    // **source** the refiner reads and writes is the deployment's own (`dtype`, BF16 on this export
+    // and F16 on the preset), while **every condition view is FP32** - the text encoder's features,
+    // the piece's pixels and its anchoring draw, which `precision.py` pins FP32 at every preset. One
+    // term counted at 4 bytes for both kinds is a plan whose reader cannot tell which it overstated.
+    let width = dtype.bytes().unwrap_or(4);
+    // One line, two kinds: the terms the refiner reads and writes are the deployment's type, every
+    // condition view is FP32. Stating the two kinds once beats repeating the type on each term, and
+    // it is the line a reader needs when a figure looks half of what a block allocates.
+    let typed = match args.dtype {
+        Some(stated) => {
+            format!("the source at {stated} (stated by --dtype), the condition views at f32")
+        }
+        // `--stage plan` opens no checkpoint, so on a host with indexes and no shards `auto` cannot
+        // ask the export; it states the design's default rather than pass a guess off as the export's.
+        None => format!(
+            "the source at {dtype} (--dtype auto: this stage loads nothing, so it is the design's \
+             default), the condition views at f32"
+        ),
+    };
     let prefix_mib =
-        ((packing.zero_row() as u64 + 1) * u64::from(dit.transformer.hidden_size) * 4) >> 20;
-    let text_mib = (u64::from(one.text_rows)
-        * (u64::from(dit.transformer.hidden_size) + u64::from(config.text_encoder.hidden_size))
-        * 4)
-        >> 20;
+        ((packing.zero_row() as u64 + 1) * u64::from(dit.transformer.hidden_size) * width) >> 20;
+    let source_mib =
+        (u64::from(one.text_rows) * u64::from(dit.transformer.hidden_size) * width) >> 20;
+    let text_mib =
+        (u64::from(one.text_rows) * u64::from(config.text_encoder.hidden_size) * 4) >> 20;
     let pixel_mib = (u64::from(pixels.frames)
         * u64::from(pixels.height)
         * u64::from(pixels.width)
@@ -461,9 +498,10 @@ fn plan(args: &Args) -> Result<(), String> {
         * u64::from(dit.transformer.video_channels)
         * 4)
         >> 20;
+    println!("plan types: {typed}");
     println!(
-        "plan buffers: prefix {prefix_mib} MiB, text+source {text_mib} MiB, pixels {pixel_mib} MiB, \
-         draw {draw_mib} MiB"
+        "plan buffers: prefix {prefix_mib} MiB, source {source_mib} MiB, text features {text_mib} \
+         MiB, pixels {pixel_mib} MiB, draw {draw_mib} MiB"
     );
     println!(
         "plan arena total (the two plans alone): {} MiB",
@@ -553,7 +591,7 @@ fn encode(args: &Args) -> Result<(), String> {
     // the timestep pair FP32, the AdaLN projections and the stack BF16 - so every weight is
     // published as stored and each request's pin decides. Nothing converts at load, so asking the
     // component for a single type here would refuse the export the model is designed to load.
-    let deployment: Option<DType> = None;
+    let deployment: Option<DType> = args.dtype;
     let mut published = 0_u64;
     let mut tensors = 0_u64;
     for component in partition.blocks.iter() {
