@@ -158,23 +158,22 @@ impl Captured {
         // also how a bucket first comes to serve: refusing it there would take the deployment down
         // for a fault of the update path. So it is reported at `warn` with all three counts, and
         // the rebind path refuses by name exactly where the missing nodes would be written.
-        let complete = nodes.iter().all(|(_, _, launch)| !launch.is_empty());
-        if complete && recorded_kernels < template_kernels {
-            return Err(Error::Invariant(format!(
-                "the walk named {recorded_kernels} kernel node(s) and the graph holds \
-                 {template_kernels}: the walk cannot account for {} of them, and a rebind would \
-                 leave those running the replaced program",
-                template_kernels - recorded_kernels
-            )));
-        }
-        if !complete {
+        // Reported, not refused, and the reason is a fact about the mechanism rather than a
+        // concession: one launch may add more than one kernel node (the paged attention's second
+        // reduction does), so a complete table legitimately names fewer kernels than its graph
+        // holds. A refusal here would refuse a correct capture - and at capture time that is a
+        // deployment that never serves. The refusal belongs where the parameters are written:
+        // `rebind_launch` refuses a launch whose recorded kernels differ from the walk's, and
+        // `nodes_complete` makes an unexplained launch a recapture rather than a silent rebind.
+        if recorded_kernels < template_kernels {
             tracing::warn!(
                 launches = launched,
                 recorded_nodes = recorded_anything,
                 recorded_kernels,
                 template_kernels,
-                "the walk's node table names fewer kernels than the graph holds: a rebind of this \
-                 bucket cannot set every launch's parameters"
+                complete = nodes.iter().all(|(_, _, launch)| !launch.is_empty()),
+                "the walk's node table names fewer kernel nodes than the graph holds: a rebind of \
+                 this bucket covers only the nodes the table names"
             );
         }
         Ok(Self {
