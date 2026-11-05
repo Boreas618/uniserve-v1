@@ -38,9 +38,9 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::forward::ALIGNMENT;
-use nn::layers::{Nvfp4Linear,
-    Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu, TILE_ROWS,
-    TRTLLM_WORKSPACE_BYTES,
+use nn::layers::{
+    Attention, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary, SwiGlu,
+    TILE_ROWS, TRTLLM_WORKSPACE_BYTES,
 };
 use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
@@ -137,18 +137,13 @@ impl Projection {
                 // buffer holds the class (the plan reserved it so) and the request's rows are its
                 // prefix, which is what every later op reads. Passing the request's height here is
                 // how a 128-row launch would write past the region.
-                let counted = u32::try_from(out.rows()).map_err(|_| {
-                    Error::Config(format!("{} activation rows", out.rows()))
-                })?;
+                let counted = u32::try_from(out.rows())
+                    .map_err(|_| Error::Config(format!("{} activation rows", out.rows())))?;
                 let class = u64::from(nn::layers::packed_rows(counted)?);
                 let width = out.last();
                 let shape = Shape::new(&[class, width]);
-                let product = TensorView::with_strides(
-                    out.ptr,
-                    out.dtype,
-                    shape,
-                    Strides::row_major(shape),
-                );
+                let product =
+                    TensorView::with_strides(out.ptr, out.dtype, shape, Strides::row_major(shape));
                 linear
                     .forward(f, input, alpha.view(), product)
                     .map_err(Error::from)
@@ -1060,8 +1055,7 @@ impl DecoderLayer {
         // rotary tables are not one of those: `walk` reserves one pair per call and every layer of the
         // run reads it, so no layer selects a table.
         if first {
-            self.input_norm
-                .forward(f, hidden, normalized)?;
+            self.input_norm.forward(f, hidden, normalized)?;
         } else {
             self.input_norm
                 .forward_with_residual(f, hidden, residual, residual, normalized)
@@ -1112,10 +1106,8 @@ impl AttentionLayer {
         out: TensorView,
     ) -> Result<()> {
         self.q_proj.forward(f, normalized, buffers.query)?;
-        self.k_proj
-            .forward(f, normalized, buffers.key)?;
-        self.v_proj
-            .forward(f, normalized, buffers.value)?;
+        self.k_proj.forward(f, normalized, buffers.key)?;
+        self.v_proj.forward(f, normalized, buffers.value)?;
 
         let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
         let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
@@ -1157,7 +1149,9 @@ impl AttentionLayer {
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
         // Row parallel: each rank's partial output is summed over the query-head split.
         if let Some(group) = f.group {
-            group.all_reduce_sum(out, f.stream()?).map_err(Error::from)?;
+            group
+                .all_reduce_sum(out, f.stream()?)
+                .map_err(Error::from)?;
         }
         Ok(())
     }
@@ -1211,17 +1205,13 @@ impl DenseMlp {
                 "a dense block runs in a forward planned without dense buffers".to_owned(),
             )
         })?;
-        self.gate_proj
-            .forward(f, normalized, dense.gate)?;
-        self.up_proj
-            .forward(f, normalized, dense.up)?;
+        self.gate_proj.forward(f, normalized, dense.gate)?;
+        self.up_proj.forward(f, normalized, dense.up)?;
         // `silu(gate) · up`, written into the gate buffer: the activation applies to the branch
         // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
         self.activation
             .forward(f, dense.gate, dense.up, dense.gate)?;
-        self.down_proj
-            .forward(f, dense.gate, out)
-            
+        self.down_proj.forward(f, dense.gate, out)
     }
 }
 
@@ -1548,7 +1538,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(packed.padded, 128, "fifteen rows are the 128-row class");
-        assert_eq!(dense.padded, 15, "a dense deployment launches the rows it has");
+        assert_eq!(
+            dense.padded, 15,
+            "a dense deployment launches the rows it has"
+        );
         assert!(
             packed.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap(),
             "the class's rows are reserved, not the request's"
@@ -1587,8 +1580,15 @@ mod tests {
     fn tensor_parallel_heads_divide_the_projection() {
         let config = config();
         let partition = Partition::new(&config, 4, 1, 1, 0).unwrap();
-        let plan =
-            Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16, 0).unwrap();
+        let plan = Plan::new(
+            &config,
+            &partition,
+            3,
+            &LoadOptions::default(),
+            DType::BF16,
+            0,
+        )
+        .unwrap();
         assert_eq!(plan.query, 8 * 128);
         assert_eq!(plan.key_value, 128);
     }

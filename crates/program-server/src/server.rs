@@ -468,10 +468,7 @@ impl ProgramServer {
                 revision: 0,
                 target: target.to_string(),
                 descriptor: String::new(),
-                message: format!(
-                    "the policy's build wrote no {}",
-                    crate::source::MODULE_WASM
-                ),
+                message: format!("the policy's build wrote no {}", crate::source::MODULE_WASM),
             });
         }
         std::fs::copy(&artifact, package.root.join(crate::source::MODULE_WASM))?;

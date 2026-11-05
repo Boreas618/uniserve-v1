@@ -120,7 +120,10 @@ fn a_calibration_that_quantizes_the_router_is_refused_by_name() {
     let refused = representation
         .adopts("model.layers.0.mlp.gate.weight", Role::Router)
         .expect_err("a packed router");
-    assert!(format!("{refused}").contains("the router's scoring projection"), "{refused}");
+    assert!(
+        format!("{refused}").contains("the router's scoring projection"),
+        "{refused}"
+    );
 
     // And the model's whole set is refused, not just the name a caller happened to ask about: the
     // walk stops at the router — a `Linear` in the checkpoint's module tree, which is the reason the
@@ -139,9 +142,8 @@ fn a_calibration_that_quantizes_the_router_is_refused_by_name() {
 
 #[test]
 fn an_unserved_algorithm_is_refused_before_the_architecture_is_even_read() {
-    let dir = directory(
-        r#""quantization_config": {"quant_method": "modelopt", "quant_algo": "MXFP4"},"#,
-    );
+    let dir =
+        directory(r#""quantization_config": {"quant_method": "modelopt", "quant_algo": "MXFP4"},"#);
     let refused = Representation::read(&dir).expect_err("an unserved algorithm");
     assert!(format!("{refused}").contains("MXFP4"), "{refused}");
 }
@@ -166,6 +168,9 @@ fn the_declaration_states_itself_in_one_line() {
         excluded,
         also_excluded: vec!["lm_head".to_owned()],
     };
-    assert_eq!(side.summary(), "nvfp4, 48 module(s) excluded and 1 on the side file");
+    assert_eq!(
+        side.summary(),
+        "nvfp4, 48 module(s) excluded and 1 on the side file"
+    );
     assert_eq!(Representation::Dense.summary(), "dense");
 }
