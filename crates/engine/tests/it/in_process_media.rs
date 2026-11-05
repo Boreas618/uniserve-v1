@@ -211,10 +211,11 @@ fn text_is_served_before_any_rejection() {
     // here means nothing was served. The wait itself is shared, because the
     // engine publishes generated tokens as `TextTokens` and a case that
     // matched only `TextToken` read a served deployment as a starved one.
-    let (served_tokens, _) = support::wait_for_tokens(&mut served, 1, ANSWER);
+    let (served_tokens, ended) = support::wait_for_tokens(&mut served, 1, ANSWER);
     assert!(
         !served_tokens.is_empty(),
-        "the deployment serves text before any rejection: no token arrived"
+        "the deployment serves text before any rejection: no token arrived, and the request \
+         ended as {ended:?} — a terminal event here names the refusal the text request itself met"
     );
 
     // A second text request separates a state the first request poisoned from
