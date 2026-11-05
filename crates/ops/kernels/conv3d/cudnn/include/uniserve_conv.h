@@ -34,6 +34,10 @@ struct uniserve_conv_call {
   // only an engine that does not narrow its inputs; a convolution whose inputs are
   // not FP32 may not set it, and is refused if it does.
   int32_t tf32;
+  // 0 for channels-first (NCDHW, the default), 1 for channels-last (NDHWC). The shapes in this
+  // call are logical [n, c, d, h, w] either way: only the strides the entry derives change, and a
+  // package with no channels-last path refuses 1 by name rather than reading it as 0.
+  int32_t channels_last;
   char error[512];
 };
 
@@ -51,7 +55,10 @@ enum uniserve_conv_dtype : int64_t {
 
 static_assert(offsetof(uniserve_conv_call, input_shape) == 32,
               "the convolution call's input shape must follow its four pointers");
-static_assert(offsetof(uniserve_conv_call, error) == 212,
+// 216: four pointers, `[3][5]` shape triples, four `[3]` geometry triples, `groups`, `transposed`,
+// `tf32` and `channels_last`. The message still ends the structure at 728 - the order filled the four
+// bytes of tail padding the alignment had left.
+static_assert(offsetof(uniserve_conv_call, error) == 216,
               "the convolution call's error message must sit after its geometry");
 static_assert(sizeof(uniserve_conv_call) == 728,
               "the convolution call must be the size of the operator's layout");
