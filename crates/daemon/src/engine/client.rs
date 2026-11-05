@@ -175,12 +175,18 @@ enum Answered {
 }
 
 impl Shared {
+    /// Sends one frame to the engine and says whether it was taken; a closed
+    /// connection is ordinarily the reader's to report, so a caller that has
+    /// nowhere else to look for the answer reads the result instead.
+    fn write(&self, kind: to_engine::Kind) -> proto::Result<()> {
+        let message = wire::ToEngine { kind: Some(kind) };
+        lock(&self.writer).send(&message)
+    }
+
     /// Sends one frame to the engine; a closed connection is the reader's to
     /// report.
     fn send(&self, kind: to_engine::Kind) {
-        let message = wire::ToEngine { kind: Some(kind) };
-        let mut writer = lock(&self.writer);
-        if let Err(error) = writer.send(&message) {
+        if let Err(error) = self.write(kind) {
             tracing::debug!(%error, "the engine's connection refused a frame");
         }
     }
@@ -960,13 +966,33 @@ impl EngineClient {
     /// Commands the engine to connect to the daemon whose request socket is
     /// `requests` beside this one (a hot restart's successor), which it then
     /// serves as well.
+    ///
+    /// The command is the handover's second step (§7.5.1): the successor has no
+    /// front on this engine until it arrives, so whether the engine was told is
+    /// the difference between a handover that is waiting and one that can never
+    /// finish. Everywhere else a refused frame is the reader's to report, and at
+    /// a handover the reader may already be gone — so the write states its own
+    /// outcome, at the level a handover's failure deserves.
     pub fn attach(&self, requests: &str) {
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::Attach(wire::Attach {
-                    requests: requests.to_owned(),
-                })),
-            }));
+        let command = to_engine::Kind::Engine(wire::EngineCommand {
+            kind: Some(wire::engine_command::Kind::Attach(wire::Attach {
+                requests: requests.to_owned(),
+            })),
+        });
+        match self.shared.write(command) {
+            Ok(()) => tracing::info!(
+                engine = ?self.engine,
+                daemon = requests,
+                "asked the engine to dial the successor daemon's request socket"
+            ),
+            Err(error) => tracing::warn!(
+                engine = ?self.engine,
+                daemon = requests,
+                %error,
+                "the engine was not asked to dial the successor daemon: the request connection \
+                 refused the command, so the successor waits for a front that will not come"
+            ),
+        }
     }
 
     /// The daemon connection the engine's process lives under, for a

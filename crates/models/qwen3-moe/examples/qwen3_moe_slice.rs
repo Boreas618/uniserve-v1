@@ -92,13 +92,45 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Message(message)) => {
-            eprintln!("{message}");
+            // Printed in short lines, not one long one: the tail of these messages is the diagnosis
+            // (the operand, the launch, the number), and a run log that cuts a long line at a fixed
+            // width takes the tail with it. Every stop this harness has produced has been read
+            // through such a log, and two of them had to be re-derived because the end was gone.
+            for line in wrap(&message, 100) {
+                eprintln!("{line}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
-/// What the harness can fail with: one line, because it is read off a terminal by whoever ran it.
+/// `text` broken into lines no longer than `width` characters.
+///
+/// A break falls on a space when one lies in the last fifth of the line, and mid-token otherwise: a
+/// descriptor has no spaces at all, and a fixed-width log keeps whole short lines and truncates long
+/// ones.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > width {
+        let mut cut = width;
+        if let Some(index) = rest[..width.min(rest.len())].rfind(' ')
+            && index + width / 5 >= width
+        {
+            cut = index + 1;
+        }
+        cut = rest
+            .char_indices()
+            .nth(cut)
+            .map_or(rest.len(), |(at, _)| at);
+        lines.push(rest[..cut].to_owned());
+        rest = &rest[cut..];
+    }
+    lines.push(rest.to_owned());
+    lines
+}
+
+/// What the harness can fail with: one line of meaning, printed in lines a log keeps whole.
 enum Failure {
     Message(String),
 }
@@ -1887,6 +1919,24 @@ mod tests {
         ENCODED_OPERATORS, Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys,
         slot_for,
     };
+
+    /// A stop survives a log that cuts a long line: every line is short, and nothing is lost.
+    #[test]
+    fn a_stop_is_printed_in_lines_a_log_keeps() {
+        let message = format!("nn: operator `x`: {}", "descriptor ".repeat(60));
+        let lines = wrap(&message, 100);
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 100),
+            "{lines:?}"
+        );
+        assert_eq!(lines.concat(), message, "the text survives whole");
+        // A run of spaces at the break is kept, and a token with no space in it is split rather than
+        // left over-long: descriptors are one word and are the commonest thing in these messages.
+        let long = "a".repeat(250);
+        let lines = wrap(&long, 100);
+        assert!(lines.iter().all(|line| line.chars().count() <= 100));
+        assert_eq!(lines.concat(), long);
+    }
 
     /// An encoded deployment's install list holds its packed product, at the class its own rows
     /// round to.
