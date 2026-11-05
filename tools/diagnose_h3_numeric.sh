@@ -138,8 +138,12 @@ sed 's/^/   /' "$run/stage2-commands.txt" | head -3
 #     to the encoder.
 echo
 echo "== stages 4/5: the video encoder's rows"
+# The prefixes are the stage's own: `fl2va places …` names the blocks, and the two `… encoder:`
+# lines are each key list against its component's index. A grep for prefixes no stage prints would
+# print nothing and read as a stage that passed.
 cargo run -q -p minimax-h3 --example conditioned -- --stage weights --root "$root" 2>&1 \
-    | grep -E '^(names|io|encoder|condition)' | sed 's/^/   /' || true
+    | grep -E '^(fl2va|t2va|ref2va|video encoder|audio encoder|audio_vae)' \
+    | sed 's/^/   /' || true
 
 cat >"$run/stage45-commands.txt" <<COMMANDS
 Stages 4 and 5 numeric half: the conditioned stage writes the encoder's unprojected rows, and the
