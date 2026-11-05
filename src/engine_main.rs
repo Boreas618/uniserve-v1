@@ -4901,9 +4901,46 @@ impl Install {
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
         // daemon, so both sides state it.
+        // The packages are named, not counted: an operator the store splits across two backends is
+        // asked in two requests, and a log that says only `programs=1` twice leaves the reader to
+        // guess which package carries which phase's keys.
+        let asking: Vec<String> = request
+            .descriptors
+            .iter()
+            .map(|descriptors| {
+                // One request may carry several of one package's operators, and a split operator's
+                // slot states the phase its keys belong to - so both come from the entry whose
+                // operator these descriptors are for.
+                let entry = request
+                    .programs
+                    .iter()
+                    .find(|entry| entry.slot.op == descriptors.op);
+                let phase = entry
+                    .and_then(|entry| entry.slot.phase)
+                    .map(|phase| format!(" phase={}", phase.as_str()))
+                    .unwrap_or_default();
+                match entry.map(|entry| &entry.selector) {
+                    Some(program_server::Selector::Fixed(program)) => format!(
+                        "{}/{}@{}{} keys={}",
+                        descriptors.op,
+                        program.backend,
+                        program.revision,
+                        phase,
+                        descriptors.keys.len()
+                    ),
+                    _ => format!(
+                        "{}{} keys={}",
+                        descriptors.op,
+                        phase,
+                        descriptors.keys.len()
+                    ),
+                }
+            })
+            .collect();
         tracing::info!(
             programs = request.programs.len(),
             descriptors = request.descriptors.len(),
+            packages = ?asking,
             target = %self.target,
             "asking the Program Server to prepare this generation's modules"
         );
@@ -5680,12 +5717,48 @@ fn operator_slots(
         op: op.to_owned(),
         phase,
     };
+    let (claims, refusal) = split_claims(holders);
+    if refusal.is_none() && claims.len() > 1 {
+        return claims
+            .into_iter()
+            .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
+            .collect();
+    }
+    // The fallback is right - a wrong split would have a package asked for a key it cannot build -
+    // and it used to be silent, which is what made a run's `no kernel for operator X descriptor
+    // phase_...` read as a fresh mystery instead of the consequence of a decision. So the decision
+    // says itself here, in the words `split_claims` gives it.
+    if let Some(reason) = refusal {
+        let packages: Vec<&str> = holders
+            .iter()
+            .map(|(program, _)| program.backend.as_str())
+            .collect();
+        tracing::warn!(
+            op = %op,
+            %reason,
+            packages = ?packages,
+            "this operator's phases are not split across packages, so one program fills it: a key \
+             of another phase will fail at its capture unless every package covers it"
+        );
+    }
+    match holders.first().map(|(program, _)| program).or(fallback) {
+        Some(program) => vec![(slot(None), program.clone())],
+        None => Vec::new(),
+    }
+}
+
+/// The phases an operator's packages claim, and - when they cannot be split across them - why.
+///
+/// `claims` is one entry per (phase, package) a package's built keys name; an operator whose claims
+/// are one per phase is split across them, and anything else is filled by one program. `Some(reason)`
+/// is the two cases that refuse a split, stated with the packages that brought them about: two
+/// packages building one phase, or a package whose key states no phase at all. `None` with fewer than
+/// two packages is not a refusal - there is nothing to split.
+fn split_claims(holders: &[(Program, Vec<String>)]) -> (Vec<(PhaseKind, usize)>, Option<String>) {
     let phaseful = holders
         .iter()
         .all(|(_, keys)| keys.iter().all(|key| key_phase(key).is_some()));
     let mut claims: Vec<(PhaseKind, usize)> = Vec::new();
-    // Which two packages claimed one phase, when two did: the refusal to split names them, because
-    // "one program fills the operator" is not an answer a reader can act on without them.
     let mut clash: Option<(PhaseKind, usize, usize)> = None;
     if phaseful && holders.len() > 1 {
         for (index, (_, keys)) in holders.iter().enumerate() {
@@ -5700,47 +5773,23 @@ fn operator_slots(
             }
         }
     }
-    if clash.is_none() && claims.len() > 1 {
-        return claims
-            .into_iter()
-            .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
-            .collect();
-    }
-    // The fallback is right - a wrong split would have a package asked for a key it cannot build -
-    // and it used to be silent, which is what made a run's `no kernel for operator X descriptor
-    // phase_...` read as a fresh mystery instead of the consequence of a decision. So the decision
-    // says itself here, with the reason and the packages that brought it about.
-    if holders.len() > 1 {
-        let packages: Vec<&str> = holders
-            .iter()
-            .map(|(program, _)| program.backend.as_str())
-            .collect();
-        let reason = match clash {
-            Some((phase, first, second)) => format!(
-                "two packages build the {} phase: {} and {}",
-                phase, holders[first].0.backend, holders[second].0.backend
-            ),
-            None => {
-                let unphased = holders
-                    .iter()
-                    .find(|(_, keys)| keys.iter().any(|key| key_phase(key).is_none()))
-                    .map(|(program, _)| program.backend.as_str())
-                    .unwrap_or("one of them");
-                format!("a key {} built states no phase", unphased)
-            }
-        };
-        tracing::warn!(
-            op = %op,
-            %reason,
-            packages = ?packages,
-            "this operator's phases are not split across packages, so one program fills it: a key \
-             of another phase will fail at its capture unless every package covers it"
-        );
-    }
-    match holders.first().map(|(program, _)| program).or(fallback) {
-        Some(program) => vec![(slot(None), program.clone())],
-        None => Vec::new(),
-    }
+    let refusal = match (holders.len(), clash) {
+        (0 | 1, _) => None,
+        (_, Some((phase, first, second))) => Some(format!(
+            "two packages build the {} phase: {} and {}",
+            phase, holders[first].0.backend, holders[second].0.backend
+        )),
+        (_, None) if !phaseful => {
+            let unphased = holders
+                .iter()
+                .find(|(_, keys)| keys.iter().any(|key| key_phase(key).is_none()))
+                .map(|(program, _)| program.backend.as_str())
+                .unwrap_or("one of them");
+            Some(format!("a key {unphased} built states no phase"))
+        }
+        _ => None,
+    };
+    (claims, refusal)
 }
 
 /// The generation's programs, from the deployment's named programs and this host's store.
@@ -6412,6 +6461,66 @@ mod tests {
         assert_eq!(
             programs.get(&slot).map(|program| program.backend.as_str()),
             Some("fa4")
+        );
+    }
+
+    /// The three shapes `split_claims` decides, and the reason each refusal gives: the run at
+    /// `b43aaac5e` was the second one, and it failed a page later with `no kernel for operator
+    /// paged_attention descriptor phase_prefill_...` because nothing said the split had been
+    /// declined.
+    #[test]
+    fn a_split_is_stated_exactly_or_its_refusal_names_what_stopped_it() {
+        let program = |backend: &str| Program {
+            backend: backend.to_owned(),
+            revision: 1,
+            arguments: Default::default(),
+        };
+        let prefill = "phase_prefill_dtype_bf16".to_owned();
+        let decode = "phase_decode_dtype_bf16".to_owned();
+
+        // Two packages, one phase each: split, and nothing to state.
+        let split = vec![
+            (program("trtllm"), vec![decode.clone()]),
+            (program("fa4"), vec![prefill.clone()]),
+        ];
+        let (claims, refusal) = split_claims(&split);
+        assert_eq!(claims.len(), 2, "the phases the packages claim");
+        assert_eq!(refusal, None, "a clean split must not refuse itself");
+
+        // Two packages building one phase: the refusal names both.
+        let clash = vec![
+            (program("trtllm"), vec![decode.clone()]),
+            (program("fa4"), vec![decode.clone()]),
+        ];
+        let (_, refusal) = split_claims(&clash);
+        let reason = refusal.expect("two packages building one phase is a refusal");
+        assert!(
+            reason.contains("trtllm") && reason.contains("fa4"),
+            "the refusal named neither package: {reason}"
+        );
+        assert!(
+            reason.contains("decode"),
+            "the refusal did not name the phase both build: {reason}"
+        );
+
+        // A key that states no phase fits every slot, so the operator is filled by one program.
+        let unphased = vec![
+            (program("trtllm"), vec![decode.clone()]),
+            (program("fa4"), vec!["dtype_bf16_kv_bf16".to_owned()]),
+        ];
+        let (_, refusal) = split_claims(&unphased);
+        let reason = refusal.expect("a key with no phase is a refusal");
+        assert!(
+            reason.contains("fa4") && reason.contains("no phase"),
+            "the refusal did not name the package whose key states no phase: {reason}"
+        );
+
+        // One package is not a refusal: there is nothing to split.
+        let single = vec![(program("trtllm"), vec![decode, prefill])];
+        let (_, refusal) = split_claims(&single);
+        assert_eq!(
+            refusal, None,
+            "one package covering every phase is the answer, not a refusal"
         );
     }
 

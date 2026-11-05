@@ -308,11 +308,11 @@ fn a_rebound_bucket_launches_the_walk_s_parameters() {
 
     let mut params = Vec::new();
     for (_, _, launch) in &walked_nodes {
-        for node in launch {
-            if node.kind().expect("a node kind") == GraphNodeKind::Kernel {
+        for walked in launch {
+            if walked.node.kind().expect("a node kind") == GraphNodeKind::Kernel {
                 params.push(
                     walked_template
-                        .kernel_node_params(node)
+                        .kernel_node_params(&walked.node)
                         .expect("a kernel node's parameters"),
                 );
             }
@@ -495,11 +495,11 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
     );
     let mut params = Vec::new();
     for (_, _, launch) in &walked_nodes {
-        for node in launch {
-            if node.kind().expect("a node kind") == GraphNodeKind::Kernel {
+        for walked in launch {
+            if walked.node.kind().expect("a node kind") == GraphNodeKind::Kernel {
                 params.push(
                     walked_template
-                        .kernel_node_params(node)
+                        .kernel_node_params(&walked.node)
                         .expect("a kernel node's parameters"),
                 );
             }
@@ -641,11 +641,11 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
     .expect("the prepared generation's bucket");
     let mut params = Vec::new();
     for (_, _, launch) in &walked_nodes {
-        for node in launch {
-            if node.kind().expect("a node kind") == GraphNodeKind::Kernel {
+        for walked in launch {
+            if walked.node.kind().expect("a node kind") == GraphNodeKind::Kernel {
                 params.push(
                     walked_template
-                        .kernel_node_params(node)
+                        .kernel_node_params(&walked.node)
                         .expect("a kernel node's parameters"),
                 );
             }
