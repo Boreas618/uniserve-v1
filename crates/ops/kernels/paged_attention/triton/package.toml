@@ -1,0 +1,38 @@
+# The paged_attention operator's Triton backend: the program for a cache the vendor libraries refuse.
+#
+# `fa4` and `trtllm` both refuse a plane carrying an f32 scale, by name, and both are right to: a
+# manifest field that made one of them declare `kv = f8e4m3` would be a cell that builds and then dies
+# inside a vendor library on the first launch. So the quantized cache needs a program of ours, and this
+# package is it: `notes/programs/paged_attention_fp8.md` states the operator's contract and
+# `notes/programs/paged_attention_fp8_program.md` where the launch plugs in.
+#
+# **Decode is the row declared here, and it is declared alone.** The prefill row is a second landing
+# with its own mask; a package that declared it before it existed would be the dangerous form.
+#
+# `len` is the descriptor's longest key count and it is in the key because the operator's tolerance is
+# written against the reduction length: a call over a longer context is a different bound, not the same
+# program with more work.
+
+op = "paged_attention"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/paged_attention_decode.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+# `phase_decode_dtype_bf16_kv_f8e4m3_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`
+[kernel.descriptors]
+dimensions = { phase = ["decode"], dtype = ["bf16"], kv = ["f8e4m3"], out = ["bf16"], head_dim = ["128"], page = ["64"], q_heads = ["32"], kv_heads = ["4"], mask = ["causal"], window = ["false"], len = ["40960"] }
