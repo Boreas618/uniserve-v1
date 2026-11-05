@@ -1552,11 +1552,6 @@ impl Decoder for VideoDecoder {
     /// request's. So this states that canvas's layout and refuses any other clip by both extents:
     /// a runner that handed it another canvas would capture a graph whose constants belong to a
     /// different raster.
-    ///
-    /// The ratios are the checkpoint's - `temporal_compression` frames per latent frame and
-    /// `spatial_compression()` pixels per latent cell - and they are why the map belongs here: a
-    /// runtime that divided by either would be holding this deployment's compression in its own
-    /// code.
     fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
         let refuse = |problem: String| nn::Error::Shape {
             owner: "VideoDecoder",
