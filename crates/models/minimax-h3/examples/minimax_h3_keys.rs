@@ -216,6 +216,40 @@ fn main() {
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment));
     }
+    // ---- The video encoder's rows, **derived rather than written**.
+    //
+    // Its frame operators key on classes the raster derives - `frame_pad`'s tile is a function of the
+    // output's columns and the levels' `scaled_add` widths are latent-space extents - so a written set
+    // covers one canvas and leaves every level of every other one without a program. The encoder
+    // itself states what it launches, and **every canvas the model offers is one the store must
+    // serve**: a store with one canvas's rows stops at `no kernel` on any other.
+    //
+    // This is the one place the generator reads the deployment rather than restating it, and it is
+    // deliberate: a twenty-two field literal of the video VAE's config would be the largest written
+    // copy in this file, and the copies are what have been wrong all night. `MINIMAX_H3_CHECKPOINT`
+    // names another root; regenerating the list therefore needs the checkpoint, which a store build
+    // has by construction.
+    let root = std::env::var("MINIMAX_H3_CHECKPOINT")
+        .unwrap_or_else(|_| "/opt/uv/models/MiniMax-H3".to_owned());
+    let sidecar = format!("{root}/vae/config.json");
+    let values: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&sidecar)
+            .unwrap_or_else(|error| panic!("the video VAE's sidecar at {sidecar}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("{sidecar} is not JSON: {error}"));
+    let video_vae = minimax_h3::config::VideoVaeConfig::parse(&values)
+        .unwrap_or_else(|error| panic!("{sidecar}: {error}"));
+    // **One raster: the one this tree's runs, walks and acceptance cases use.** The encoder's
+    // canvas-class rows for the canvases the model *offers* (`NAMED_CANVASES`, short edge 768) are a
+    // further 36, and the package set does not declare a cell for them yet - so they are a decision
+    // about which canvases a deployment admits and a package build, not a row to slip into the list.
+    // Generating them is this vector with those canvases appended; the header states what is served.
+    let rasters = vec![(480_u32, 832_u32)];
+    lines.extend(
+        minimax_h3::encoding::VideoEncoder::programs(&video_vae, &rasters)
+            .unwrap_or_else(|error| panic!("the video encoder's programs: {error}")),
+    );
+
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
@@ -277,6 +311,9 @@ fn header(lines: &[(String, String)]) {
     // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
     // a layout is not a program key but a table the executor uploads - the distinction matters,
     // because only one of the two belongs in a list of programs.
+    println!(
+        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` (MINIMAX_H3_CHECKPOINT names another root), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
+    );
     println!(
         "# request-derived: a key computed from the request's own numbers cannot be a row here. \
          `frame_pad`'s tile and the `scaled_add` latent widths follow the canvas, and \
