@@ -950,6 +950,17 @@ impl Device {
                         // time is a reason no run shows. The bucket follows, so the two readings a
                         // failure needs - what stopped and which bucket - are one line apart.
                         tracing::warn!(%error, "a bucket's capture failed");
+                        // The error text opens with the operator and its descriptor, and a
+                        // descriptor is a hundred characters: whatever prints a trimmed line keeps
+                        // the head and loses the REASON, which is the end of the text. Print the
+                        // end on a line of its own, so the reason survives any width.
+                        let text = error.to_string();
+                        let tail: String = {
+                            let mut chars = text.chars().rev().take(220).collect::<Vec<_>>();
+                            chars.reverse();
+                            chars.into_iter().collect()
+                        };
+                        tracing::warn!("a capture's reason, as the end of its text: {tail}");
                         tracing::info!(bucket = %bucket, elapsed_ms, "the bucket whose capture failed");
                     }
                 }
