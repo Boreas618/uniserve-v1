@@ -1184,6 +1184,15 @@ def _restart_while_streaming(
     assert status["deployment"]["engine"] == "ready", status
     (old_daemon,) = _pids(log, "Daemon")
 
+    # One completion before any stream: a deployment that answers nothing says
+    # so here, in seconds and with its own body, instead of as a stream that
+    # produced no token in five minutes — a silence the two paths share and
+    # that therefore names neither.
+    answered = _chat(base_url, name, "Count from 1 to 3, separated by commas.")
+    choice = (answered.get("choices") or [{}])[0]
+    content = choice.get("message", {}).get("content")
+    assert content, f"the deployment answered no content: {answered}"
+
     # Three streams in flight at the restart, of different lengths so their
     # boundaries fall at different events of different requests.
     reads: list[list[str]] = [[] for _ in HANDED_STREAMS]
