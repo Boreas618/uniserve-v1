@@ -1,35 +1,62 @@
-//! A job that never finishes is reported the way a rank's stalled builder
-//! thread is: as a failure naming the forward it was running and the requests
-//! whose calls it held.
+//! A rank's stall report becomes the engine's first error, naming the forward
+//! that stalled, its batch and the calls it held, over the simulated
+//! executor.
 //!
-//! The launched path states this with a worker process whose stub forward
-//! embeds a stalling token; the mechanism that names the forward is the
-//! engine's own, so the in-process case states the same failure from the
-//! simulator and asserts the same three facts.
+//! The launched case stalls a rank's builder thread under a running request
+//! and asserts that the failure it surfaces names the same three things. The
+//! rank is only the *cause* of the report; the report's shape and the name the
+//! engine builds from it are scheduler-side, so the case asserts both here.
+//!
+//! The consequence for the request — a running text request ends as
+//! migratable for a loss — is `migration.rs`'s subject and is not restated.
 
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use engine::{Executor, SimEngine, SimExecutor, WorkerFailure, WorkerGroupId};
-use ipc::{CallId, ErrorCallIdentity, RequestId, RequestKey, Stall};
+use engine::{SimEngine, SimExecutor, SpecialTokenIds, WorkerGroupId};
+use ipc::{CallId, ErrorCallIdentity, RequestKey, Stall};
 
-/// The key a request submitted by `id` carries before it is admitted.
-fn request_key(id: u64) -> RequestKey {
+use crate::support;
+
+/// How long the engine may take to report the stall.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+/// The group the simulated executor serves.
+fn group() -> WorkerGroupId {
+    WorkerGroupId("sim".to_owned())
+}
+
+/// The call identity a stalled job names: one request's prefill call.
+fn request_key(request: u64) -> RequestKey {
     RequestKey {
         engine_id: 0,
-        request_id: RequestId(id),
+        request_id: ipc::RequestId(request),
         request_epoch: 0,
     }
 }
 
-/// A stall is reported as a worker failure that names the forward the job
-/// belongs to, the batch and the call, and it carries the request whose work
-/// is gone.
+/// The special tokens the simulated engine states.
+fn special_tokens() -> SpecialTokenIds {
+    SimEngine::special_tokens()
+}
+
+/// A stall is reported as the engine's first error, naming the forward the
+/// job belongs to, its batch and the call it held, and the group it served
+/// fails with it.
 #[test]
 fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
     let mut executor = SimExecutor::new(SimEngine::new());
     let reports = executor.loss();
+    let scheduler = support::scheduler(Box::new(executor), special_tokens(), 32)
+        .expect("the scheduler is built over the simulated executor");
+    let failure = scheduler.failure_handle();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let commands = engine::CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    // The rank reports a job of the first batch that has not completed.
     reports.stall(
-        WorkerGroupId("sim".to_owned()),
+        group(),
         &Stall {
             batch_id: Some(1),
             route: Some("prefill".to_owned()),
@@ -42,30 +69,52 @@ fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
         },
     );
 
-    let error = executor
-        .poll(Duration::from_secs(1))
-        .expect_err("a stalled job fails its group");
-    let failure = error
-        .downcast_ref::<WorkerFailure>()
-        .expect("a stall is reported as a worker failure");
-    // The rank's report failed the group, not the group's own deadline: the
-    // name of the stalled forward is what the deadline's failure lacks.
+    // The group fails with the report, so nothing serves on.
+    let stopped = scheduler_thread.join().expect("the scheduler thread ends");
+    assert!(
+        stopped,
+        "the engine served on after a stall failed its group"
+    );
+    assert!(
+        commands
+            .submit(engine::GenerationRequest {
+                request_id: ipc::RequestId(9),
+                prompt_token_ids: vec![7; 8],
+                negative_prompt_token_ids: Vec::new(),
+                multimodal_inputs: Default::default(),
+                constraint: engine::GenerationConstraint::UndOnly,
+                sampling: Default::default(),
+                image: Default::default(),
+                max_images: 1,
+                max_und_tokens: 4,
+                include_stop_token: false,
+                stop_strings: Vec::new(),
+                stop_token_ids: Vec::new(),
+                priority: 0,
+                cache: Default::default(),
+                image_generation: Default::default(),
+                readout: Vec::new(),
+                generated_token_ids: Vec::new(),
+                adapter: 0,
+                generated_images: Vec::new(),
+                trajectory: Default::default(),
+            })
+            .is_err(),
+        "a stopped engine accepted another submission"
+    );
+
+    // The engine's first error is the stall, and it names what stalled.
+    let deadline = Instant::now() + DEADLINE;
+    let mut reported = failure.get();
+    while reported.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+        reported = failure.get();
+    }
+    let reported = reported.expect("the engine reports its first error");
     for named in ["the builder thread stalled", "batch 1 (prefill", "31/"] {
         assert!(
-            failure.message.contains(named),
-            "the failure does not name {named:?}: {}",
-            failure.message
+            reported.contains(named),
+            "the failure does not name {named:?}: {reported}"
         );
     }
-    let requests = failure
-        .requests
-        .iter()
-        .map(|request| request.request_id.0)
-        .collect::<Vec<_>>();
-    assert_eq!(requests, [31], "the failure names the requests it held");
-    // The group the job belonged to fails with it: no other group serves.
-    assert!(
-        !executor.is_ready(&WorkerGroupId("sim".to_owned())),
-        "the group whose job stalled stayed ready"
-    );
 }
