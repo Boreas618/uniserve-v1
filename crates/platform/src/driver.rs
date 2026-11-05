@@ -185,6 +185,50 @@ pub(crate) struct GraphEdgeData {
     pub(crate) reserved: [u8; 5],
 }
 
+/// `CUDA_MEMCPY3D`: one captured copy's operands, as `cuGraphMemcpyNodeGetParams` states them.
+///
+/// The layout is the driver's own: four `size_t` offsets, the source memory type and its three
+/// operand spellings, two reserved words, and the same for the destination, then the extent.
+/// `srcDevice`/`dstDevice` hold a device address for the spellings that use one, and
+/// `srcHost`/`dstHost` the host address for the others.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Memcpy3D {
+    pub(crate) src_x: usize,
+    pub(crate) src_y: usize,
+    pub(crate) src_z: usize,
+    pub(crate) src_lod: usize,
+    pub(crate) src_memory_type: i32,
+    pub(crate) src_host: *const c_void,
+    pub(crate) src_device: u64,
+    pub(crate) src_array: Handle,
+    pub(crate) reserved0: *mut c_void,
+    pub(crate) src_pitch: usize,
+    pub(crate) src_height: usize,
+    pub(crate) dst_x: usize,
+    pub(crate) dst_y: usize,
+    pub(crate) dst_z: usize,
+    pub(crate) dst_lod: usize,
+    pub(crate) dst_memory_type: i32,
+    pub(crate) dst_host: *mut c_void,
+    pub(crate) dst_device: u64,
+    pub(crate) dst_array: Handle,
+    pub(crate) reserved1: *mut c_void,
+    pub(crate) dst_pitch: usize,
+    pub(crate) dst_height: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) depth: usize,
+}
+
+impl Default for Memcpy3D {
+    fn default() -> Self {
+        // SAFETY: every field is a plain integer, pointer or handle, so an all-zero bit pattern is
+        // the driver's own "unset", which is what the API expects before it fills the struct.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// `CUlaunchConfig`: the full configuration of one `cuLaunchKernelEx`.
 #[repr(C)]
 pub(crate) struct LaunchConfig {
@@ -375,6 +419,9 @@ driver_table! {
         // export it degrades the dump rather than failing the device: the entry is lazy, and a
         // `name()` that finds it absent answers an empty string.
         func_get_name = "cuFuncGetName": fn(*mut *const c_char, Handle);
+        // One captured copy's operands. A diagnostic like the name above: a driver without it
+        // leaves the dump unable to describe a copy node, which must not fail the device.
+        graph_memcpy_node_get_params = "cuGraphMemcpyNodeGetParams": fn(Handle, *mut Memcpy3D);
     }
 }
 
