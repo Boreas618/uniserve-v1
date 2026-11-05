@@ -182,9 +182,16 @@ impl Staging {
                 self.parameters[index * parameters + column] = 0.0;
             }
         }
-        self.rows.seq_lens.resize(bucket_rows, 1);
+        // A row the batch does not fill is an **empty sequence**, not a short one: it owns no token,
+        // its block-table row is `-1`, and it therefore has no key to attend to. `seq_lens` states
+        // that as a length of zero - a length of one would tell the attention kernel that the row
+        // the table left absent has a page of keys at page `-1`, which is a read the pool never
+        // reserved. The row count itself stays the bucket's: inside a captured graph every per-row
+        // operand has the bucket's extent and the batch's width is a mask over it (`logits_rows`
+        // below, and the loader's `-1` slots), never the extent of an operand.
+        self.rows.seq_lens.resize(bucket_rows, 0);
         for index in rows..bucket_rows {
-            self.rows.seq_lens[index] = 1;
+            self.rows.seq_lens[index] = 0;
         }
         self.rows.logits_rows.resize(bucket_rows, -1);
         for index in rows..bucket_rows {
@@ -1199,6 +1206,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A batch is homogeneous in its sampling path, and the check is about this batch's own
+        // rows: a warm pose has no request rows, so it is made here rather than in the capture.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
         // pooled table, so the row must state the request's own pages before the replay, and the
         // table states where the row begins (`start_page`) and how far it runs.
@@ -1227,6 +1237,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
@@ -2041,7 +2053,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
+        // The batch is checked where a real one is staged (`submit`, `shadow`): a capture has no
+        // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
+        // row - so the check here would refuse a sampled bucket its own capture.
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
@@ -2608,6 +2622,52 @@ mod tests {
         )?;
         assert_eq!(staged.tokens, 64);
         assert_eq!(&staging.batch_rows().slot_mapping[3..], &[-1i32; 61]);
+        Ok(())
+    }
+
+    /// A batch narrower than its bucket fills the bucket's rows with **empty sequences**: the row
+    /// count of every per-row operand is the bucket's, and the rows the batch does not fill state
+    /// length zero, no pool slot, no logits row and inert sampling parameters.
+    ///
+    /// This is the warmup's normal case, not an edge case: a bucket is a catalogue size and a batch
+    /// is whatever arrived. A capture is of the bucket, so the extent of `seq_lens`,
+    /// `query_offsets`, `logits_rows`, the sampler's rows and the commit's count is fixed at capture
+    /// and must be the bucket's at every replay.
+    #[test]
+    fn the_rows_a_batch_does_not_fill_are_empty_sequences() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(4, Variant::DecodeGreedy),
+            Bucket::decode(8, Variant::DecodeGreedy),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let bucket = Bucket::decode(8, Variant::DecodeGreedy);
+        staging.stage(
+            &decode_columns(),
+            &[CallId(0), CallId(1)],
+            &Shape::decode(2, Variant::DecodeGreedy),
+            bucket,
+        )?;
+
+        let rows = bucket.rows as usize;
+        // The bucket's extents, not the batch's four.
+        assert_eq!(staging.batch_rows().seq_lens.len(), rows);
+        assert_eq!(staging.batch_rows().logits_rows.len(), rows);
+        assert_eq!(staging.batch_rows().query_offsets.len(), rows + 1);
+        assert_eq!(staging.slots(rows).len(), rows);
+        // Rows 2..8 are empty sequences: length zero, no slot, no logits row, no sampling state.
+        assert_eq!(&staging.batch_rows().seq_lens[..], &[4, 9, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&staging.slots(rows)[2..], &[-1; 6]);
+        assert_eq!(&staging.logits_rows()[2..], &[-1; 6]);
+        assert!(
+            staging.parameters(rows)[2 * ops::sampler::PARAMETER_COLUMNS as usize..]
+                .iter()
+                .all(|value| *value == 0.0),
+            "an empty row states sampling parameters"
+        );
+        // The pack ends where the batch's last token ends and stays there: an empty row owns no
+        // token, so every offset past the batch's rows repeats the end of the packed tokens.
+        assert_eq!(&staging.batch_rows().query_offsets[..], &[0, 1, 2, 2, 2, 2, 2, 2, 2]);
         Ok(())
     }
 
