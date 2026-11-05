@@ -10,6 +10,12 @@ The output is a store a reader can use: `program_server::store::Store::open([roo
 `qwen3_moe_slice` example's `--store`. It is a stopgap for a host where the Program Server has not
 run; the published layout and the environment are the Program Server's own, so the two cannot
 disagree about what a module looks like.
+
+Every cell states the digest of the source it was built from, and `--verify` answers whether the
+cells a fixture needs were built from the source this tree holds. A store outlives the tree it was
+built from, and a cell that says nothing about its source cannot be told from one built yesterday
+against a package that has changed since - which is how two runs stopped inside kernels whose
+constants and argument order had moved.
 """
 
 import argparse
@@ -244,6 +250,93 @@ def module_digest(directory):
     return digest.hexdigest(), total
 
 
+def source_digest(package):
+    """The digest of the source a cell's module was built from.
+
+    A package's own directory is its source: the manifest that declares it, the compile script that
+    runs, and whatever that script compiles. A store outlives the tree it was built from, and a cell
+    said nothing about which source produced it - so a store older than the source answered a changed
+    package with the module its older source built, and two runs in a row stopped inside kernels for
+    exactly that (`bf16 = 3` in an entry header, a word order in a signature).
+
+    Build scratch is excluded: the compile script runs inside the package directory, so an import
+    leaves `__pycache__` behind and its bytes shift with nothing the module depends on.
+    """
+    digest = hashlib.sha256()
+    root = package["root"]
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix == ".pyc" or "__pycache__" in path.parts:
+            continue
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def write_source_record(directory: Path, digest: str, target: str) -> None:
+    """State, in the cell, which source built it."""
+    (directory / "source.json").write_text(
+        json.dumps({"digest": digest, "target": target}, indent=1) + "\n"
+    )
+
+
+def verify(root: Path, rows, packages, target, revision, fixture) -> int:
+    """Answer whether every cell this fixture needs was built from the source this tree holds.
+
+    This is where a stale store is refused by name. The install cannot ask the question - a
+    deployment host holds the store and not the package trees it was built from - and the build
+    cannot either, because a build that finds a cell already there is not the tree's statement about
+    it. The fixture holds both: it names the rows, and it runs in the tree.
+    """
+    print(f"# verify: {root} (revision {revision}, {target})")
+    print(f"# fixture: {fixture} ({len(rows)} rows)")
+    stale, absent, fresh = [], [], 0
+    for op, key, stated_backend in rows:
+        candidates = [
+            package for package in packages.get(op, [])
+            if covers(package, key)
+            and target in package["manifest"]["kernel"]["architectures"]
+            and (stated_backend is None or package["backend"] == stated_backend)
+        ]
+        if not candidates:
+            absent.append((op, "-", key, "no package covers this key for the target"))
+            continue
+        verdict, found = None, False
+        for package in candidates:
+            directory = root / op / package["backend"] / str(revision) / target / key
+            if not (directory / ".committed").is_file():
+                continue
+            found = True
+            record = directory / "source.json"
+            if not record.is_file():
+                verdict = (op, package["backend"], key,
+                           "the cell states no source digest, so it cannot be told from a stale one")
+                break
+            stated = json.loads(record.read_text()).get("digest")
+            current = source_digest(package)
+            if stated != current:
+                verdict = (op, package["backend"], key,
+                           f"built from {str(stated)[:12]}, and this tree's source is "
+                           f"{current[:12]}")
+                break
+        if verdict is not None:
+            stale.append(verdict)
+        elif found:
+            fresh += 1
+        else:
+            absent.append((op, "-", key, "the store holds no cell for this key"))
+    for op, backend, key, reason in stale:
+        print(f"stale\t{op}\t{backend}\t{key}: {reason}")
+    for op, backend, key, reason in absent:
+        print(f"absent\t{op}\t{backend}\t{key}: {reason}")
+    print(
+        f"# {fresh} of {len(rows)} cells were built from this tree's source; "
+        f"{len(stale)} are stale, {len(absent)} absent"
+    )
+    return 1 if stale or absent else 0
+
+
 def read_rows(fixture):
     """The fixture's rows, as `(operator, key, backend-or-None)`.
 
@@ -282,6 +375,12 @@ def main():
              "than assumed to be this one",
     )
     parser.add_argument("--revision", type=int, default=1)
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="answer whether every cell this fixture needs was built from the source this tree "
+             "holds, and exit non-zero naming the stale and absent ones; builds nothing",
+    )
     args = parser.parse_args()
 
     if args.target not in TARGETS:
@@ -334,6 +433,9 @@ def main():
             + "\n".join(report)
         )
 
+    if args.verify:
+        sys.exit(verify(root, rows, packages, args.target, args.revision, args.fixture))
+
     built, skipped = [], []
     for op, key, stated_backend in rows:
         candidates = [
@@ -371,6 +473,7 @@ def main():
                 failures.append(f"{package['backend']}: {failure}")
                 continue
             (directory / ".committed").write_text("")
+            write_source_record(directory, source_digest(package), args.target)
             built.append((op, package["backend"], key))
             break
         else:
