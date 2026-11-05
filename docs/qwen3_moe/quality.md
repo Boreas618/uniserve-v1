@@ -77,11 +77,11 @@ export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 # UNISERVE_QWEN3_FP8_ATTENTION_BACKEND selects the FP8 cell's provider.
 ```
 
-The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The reference side is a **second checkout of the baseline tree** — `git worktree add /tmp/gsm8k-reference f1de185a2`, with its own `uv sync` — so the two implementations never share an environment; the block below is that side's, then the candidate's. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the reference plan and run, then build and run the candidate's three cells by name, then compare each cell with itself:
+The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The reference side is a **second checkout of the baseline tree** — `git worktree add "$HOME/gsm8k-reference" f1de185a2`, with its own `uv sync` — so the two implementations never share an environment; the block below is that side's, then the candidate's. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the reference plan and run, then build and run the candidate's three cells by name, then compare each cell with itself:
 
 ```bash
 # The reference side, in its own worktree and its own environment.
-cd /tmp/gsm8k-reference
+cd "$HOME/gsm8k-reference"
 .venv/bin/python -m pytest -q tests/python/unit/eval_driver/test_gsm8k_benchmark.py tests/python/unit/eval_driver/test_accuracy_compare.py
 .venv/bin/python -c "from uniserve_eval.config import load_config; from uniserve_eval.datasets import load_examples; c = load_config('uniserve_eval/qwen3_moe.toml'); rows, _ = load_examples(c.selected_points('qwen3-moe-gsm8k-bf16')[0]); print(len(rows), rows[0].id, rows[-1].id)"
 .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k
