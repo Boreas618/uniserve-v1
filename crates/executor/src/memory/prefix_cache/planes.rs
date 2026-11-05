@@ -1349,10 +1349,14 @@ impl CachePlanes {
         }
         let column = (layer as u32) % columns;
         let unit = (layer as u32) / columns;
-        if unit >= plan.units_per_page {
+        // The page's unit count is the one the group's layers make over the
+        // pool's columns, which a plan may leave unstated in its own field;
+        // reading that field instead reported every layer of a plan that states
+        // its layers and not their page as lying in a page holding no unit.
+        let units = self.units_per_page(group)?;
+        if unit >= units {
             return Err(Error::Invariant(format!(
-                "layer {layer} of cache group {group} lies in unit {unit} of a page holding {}",
-                plan.units_per_page
+                "layer {layer} of cache group {group} lies in unit {unit} of a page holding {units}"
             )));
         }
         Ok((column, unit))
