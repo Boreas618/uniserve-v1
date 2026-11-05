@@ -214,7 +214,14 @@ impl VsaTiles {
         }
     }
 
-    /// The descriptor one `vsa_select_tiles` launch takes, for `tiles` key tiles.
+    /// The descriptor one `vsa_select_tiles` launch takes, for a key-tile **bound**.
+    ///
+    /// `block` is the lane width the compiled program ranks in, and the package's own signature
+    /// makes it a capacity rather than a count: `tiles` is a runtime argument
+    /// (`build.py:28-29`) and the kernel masks every lane at or past it (`keys < tiles`), so a
+    /// program compiled for the deployment's bound serves **every** request up to it. A descriptor
+    /// built from a request's tile count instead compiles a fresh module per distinct count whose
+    /// extra lanes are all masked off - the same arithmetic at the cost of a class per request.
     pub fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
         Ok(segments::SelectTilesDescriptor {
             block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
@@ -687,11 +694,27 @@ impl VsaTiles {
             ));
         }
         let tiles = scores.shape.dim(2);
-        let descriptor = segments::SelectTilesDescriptor {
-            block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
-                Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
-            })?,
-        };
+        // The compiled lane width is the deployment's tile **bound**, not this request's count: the
+        // count travels as the package's `tiles` argument, and a program built for the bound ranks
+        // any request up to it. One class per deployment, and the launch refuses a request the bound
+        // cannot cover rather than compiling a module for it.
+        if self.max_tiles == 0 {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a selection needs the deployment's key-tile bound: call with_tile_bound"
+                    .to_owned(),
+            ));
+        }
+        if tiles > u64::from(self.max_tiles) {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "a request ranks {tiles} key tiles, past the deployment's bound of {}",
+                    self.max_tiles
+                ),
+            ));
+        }
+        let descriptor = self.select_descriptor(u64::from(self.max_tiles))?;
         let args = segments::SelectTilesArgs {
             scores,
             segments,
@@ -709,14 +732,18 @@ impl VsaTiles {
 mod tests {
     use super::*;
 
-    /// The selection's block is the key-tile count rounded up to a power of two: the program's own
-    /// table width, so a walk that reads the accessor sees the same key the launch would.
+    /// The selection's block is the deployment's bound rounded up to a power of two, not the request's
+    /// count: the package's `tiles` is a runtime argument and the kernel masks the lanes past it, so
+    /// one compiled class serves every request up to the bound.
     #[test]
-    fn the_select_block_is_the_tile_count_rounded_up() {
-        let layer = VsaTiles::with_default_tile(4, 128, 1e-6).unwrap();
+    fn the_select_block_is_the_deployments_bound_rounded_up() {
+        let layer = VsaTiles::with_default_tile(4, 128, 1e-6)
+            .unwrap()
+            .with_tile_bound(5_400)
+            .unwrap();
+        // 5 400 rounds up to 8 192: the bound's class, whatever a request asks for.
+        assert_eq!(layer.select_descriptor(5_400).unwrap().block, 8_192);
         assert_eq!(layer.select_descriptor(1).unwrap().block, 1);
-        assert_eq!(layer.select_descriptor(5).unwrap().block, 8);
-        assert_eq!(layer.select_descriptor(64).unwrap().block, 64);
         // The member table is the layer's own statement of the gate's slots.
         let compose = layer.compose_descriptor(DType::BF16, &[2, 5]);
         assert_eq!(compose.members, 2);
