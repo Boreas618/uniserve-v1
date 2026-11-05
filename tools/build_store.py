@@ -244,6 +244,30 @@ def module_digest(directory):
     return digest.hexdigest(), total
 
 
+def read_rows(fixture):
+    """The fixture's rows, as `(operator, key, backend-or-None)`.
+
+    A row is `op<TAB>descriptor`, and it may state a third field: the backend the deployment launches
+    this key on. That field is not decoration - `paged_attention` declares `bf16`/`f16` on `trtllm`
+    and `f8e4m3` on `triton`, so which package covers a key depends on the cache dtype, and a
+    deployment that names one backend while the fixture states no backend can be served a cell from
+    the other. A stated backend is held to: the store builds that package or refuses, and never
+    quietly substitutes the other.
+    """
+    rows = []
+    for number, line in enumerate(Path(fixture).read_text().splitlines(), start=1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) not in (2, 3) or not all(one.strip() for one in fields):
+            raise SystemExit(
+                f"{fixture}:{number} states {len(fields)} field(s); a row is `op<TAB>descriptor` "
+                f"or `op<TAB>descriptor<TAB>backend`"
+            )
+        rows.append((fields[0], fields[1], fields[2] if len(fields) == 3 else None))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True)
@@ -272,11 +296,7 @@ def main():
     root = Path(args.root)
     # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
     # inspects one read while the rows come from another cannot see an empty one.
-    rows = [
-        line.rstrip("\n").split("\t")
-        for line in Path(args.fixture).read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    rows = read_rows(args.fixture)
     # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
     # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
     if not rows:
@@ -292,10 +312,11 @@ def main():
     # fixture before anything compiles, because a build that succeeds differently on another host is
     # worse than one that stops.
     claims = {}
-    for op, key in rows:
+    for op, key, stated_backend in rows:
         claiming = [
             package for package in packages.get(op, [])
             if covers(package, key)
+            and (stated_backend is None or package["backend"] == stated_backend)
             and args.target in package["manifest"]["kernel"]["architectures"]
         ]
         if len(claiming) > 1:
@@ -314,14 +335,24 @@ def main():
         )
 
     built, skipped = [], []
-    for op, key in rows:
+    for op, key, stated_backend in rows:
         candidates = [
             package for package in packages.get(op, [])
             if covers(package, key)
             and args.target in package["manifest"]["kernel"]["architectures"]
+            and (stated_backend is None or package["backend"] == stated_backend)
         ]
         if not candidates:
-            skipped.append((op, key, "no package covers this key for the target"))
+            skipped.append(
+                (
+                    op,
+                    key,
+                    f"no package covers this key for the target (this row states the backend "
+                    f"{stated_backend!r})"
+                    if stated_backend
+                    else "no package covers this key for the target",
+                )
+            )
             continue
         # A package may cover a key by its dimensions and still refuse the descriptor's variant
         # (the FA4 attention backend serves prefill only), so every candidate is tried before the
@@ -364,6 +395,11 @@ def main():
     # fixtures built into one log read as one count, and a row of one fixture's failures then looks
     # like a failure of the other's deployment.
     print(f"# fixture: {args.fixture} ({len(rows)} rows)")
+    stated = sum(1 for _, _, backend in rows if backend)
+    if stated:
+        # A row that states its backend is the deployment's own statement, and the store held it: the
+        # count says how much of this store is that claim rather than a coverage choice.
+        print(f"# {stated} of {len(rows)} row(s) state the backend their deployment launches")
 
     # How many of those cells hold the same program. A key field that reaches no compiled word
     # writes an identical module under its own name (tools/key_field_audit.py proves which), so the
