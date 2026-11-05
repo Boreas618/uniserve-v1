@@ -777,8 +777,12 @@ impl WorkerExecutor {
             cache_inputs,
             page_offloads: batch.page_offloads.clone(),
             // The columns are the mechanism's statement to an in-process
-            // executor; a worker projection carries no device layout.
+            // executor; a worker projection carries no device layout. A media
+            // computation is served in process for the same reason: its
+            // buffers are the executor's own, and `into_protocol` refuses one
+            // rather than sending a worker a media call with no inputs.
             columns: None,
+            media: None,
         }
         .into_protocol(collective_seq)?;
 

@@ -25,13 +25,15 @@
 //! set. They are filled from the binder's warm request for the bucket - a request whose counts match
 //! the layout it was derived from, which is why the bucket and the warm request are one object here.
 //!
-//! **The seam this runner needs from a batch, and its first form.** A step needs three things the
-//! executor does not derive: the request's latents, its conditioning rows, and which step of the
-//! schedule this batch is. `MediaColumns::inputs` is the field a media batch states its per-request
-//! values in, and no runner reads it yet, so its meaning is stated here: **one `DenoiseRequest` per
-//! request, in batch order, as JSON.** That is the seam's first form - everything crosses as host
-//! bytes, the latents included - and its second form is device views once the worker's latent pool
-//! exposes them. The change is `stage_request`'s body and nothing else.
+//! **The seam from the mechanism.** A media batch's columns state, per request, what the mechanism
+//! owns: the request's conditioning exactly as the model family planned it, and the step, seed and
+//! canvas the request states ([`crate::batch::StagedRequest`], written by the scheduler's media
+//! arm). A step also reads two things the mechanism cannot state, because they are device products
+//! of the model's own preparation: the request's latent trajectory and its encoded conditioning
+//! rows. Those are the model's, and this runner reads them from [`Prepared`], a set no capability
+//! prepares yet - so a batch is refused by name at the point where it would need one, rather than
+//! served with a step index and no latents. When a residency layer for a request's media products
+//! lands, it fills `prepared()` and `stage_request` keeps its body.
 
 use std::sync::{Arc, Mutex};
 
@@ -244,19 +246,18 @@ impl DenoiseColumns {
     }
 }
 
-/// One request's facts and values, as a denoise batch stages them.
+/// One request's model-side inputs: what the model prepared on the device for its next step.
 ///
-/// The bytes of this type are what `MediaColumns::inputs` carries, one per request in batch order.
-/// It states everything a step reads that the runner cannot derive: which step of the schedule the
-/// batch is, the request's seed, and the request's own latents and conditioning rows. The seed is
-/// here rather than in the batch's columns because a draw is a request's, and the runner passes it
-/// on unchanged (`Denoiser::draw_noise` is the model's; this runner never draws).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct DenoiseRequest {
-    /// The zero-based step of the schedule this batch is.
-    pub step: u32,
-    /// The request's own seed, for the draw a first step makes.
-    pub seed: u64,
+/// This is the half of a step the mechanism cannot state. The latent trajectory is a device product
+/// of the previous step and the encoded conditioning rows are the text encoder's output, so both
+/// reach a step from the model's own residency rather than from a batch's columns; the mechanism
+/// states the request's parameters and this type carries the values.
+///
+/// A set is host bytes in the layout's element type, row-major, and it is **copied** into the
+/// batch's staged columns, so a residency layer may own the underlying device buffers without this
+/// runner reaching into them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prepared {
     /// The video latents, `[channels, frames, height, width]`, row-major in the layout's element
     /// type.
     pub video: Vec<u8>,
@@ -264,27 +265,6 @@ pub struct DenoiseRequest {
     pub audio: Vec<u8>,
     /// The encoded conditioning rows, `[text_rows + condition_rows, width]`.
     pub text: Vec<u8>,
-}
-
-impl DenoiseRequest {
-    /// Decodes the bytes one request's row of `MediaColumns::inputs` holds.
-    ///
-    /// The row is the request's own JSON document and nothing else: a row that carries two buffers,
-    /// or bytes that are not a document, is refused by name rather than served with a step index
-    /// nobody stated.
-    pub fn decode(row: &[Vec<u8>]) -> Result<Self> {
-        let [bytes] = row else {
-            return Err(Error::Invalid(format!(
-                "a denoise request's row carries {} buffer(s); it states one document",
-                row.len()
-            )));
-        };
-        serde_json::from_slice(bytes).map_err(|error| {
-            Error::Invalid(format!(
-                "a denoise request's row is not the document this runner reads: {error}"
-            ))
-        })
-    }
 }
 
 /// One bucket and the request it was derived from.
@@ -550,12 +530,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     }
 
     /// Stages one request's row of a batch into the host side of the columns.
-    fn stage_request(
-        &mut self,
-        bucket: Bucket,
-        index: u32,
-        request: &DenoiseRequest,
-    ) -> Result<()> {
+    fn stage_request(&mut self, bucket: Bucket, index: u32, request: &Prepared) -> Result<()> {
         let layout = layout_of(bucket)?;
         let expected = latent_bytes(&layout.video, self.shape.dtype)?;
         if request.video.len() as u64 != expected {
@@ -610,6 +585,17 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             "conditioning rows",
         )?;
         Ok(())
+    }
+
+    /// The model's prepared inputs for the request a batch placed at `index`, when this runner
+    /// holds them.
+    ///
+    /// No residency layer for a media request's products exists yet, so this answers `None` and the
+    /// step is refused by name where it would be served. The signature is the contract such a layer
+    /// fills: given the row a batch placed a request at, the trajectory and the encoded conditioning
+    /// rows the model prepared for it.
+    fn prepared(&self, _index: u32) -> Option<Prepared> {
+        None
     }
 
     /// Writes the coefficient index the step reads, before a walk or a replay, and records it for
@@ -813,20 +799,36 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         }
         let steps = self.schedule(bucket)?;
         let mut step = None;
-        for (index, row) in media.inputs.iter().enumerate() {
-            let request = DenoiseRequest::decode(row)?;
+        for (index, _row) in media.inputs.iter().enumerate() {
+            // The mechanism states the request's parameters: which step this is, and the seed and
+            // canvas it runs at. `StagedRequest` is that record and this is the one reader of it.
+            let stated_request = media.request(index)?;
             let index = u32::try_from(index)
                 .map_err(|_| Error::Invalid("a batch of more requests than rows".into()))?;
-            self.stage_request(bucket, index, &request)?;
-            // Every row of one batch is the same step of the same schedule: a batch is one step
-            // (`Variant::Denoise`), so a row that names another step describes another batch.
-            let stated = steps.get(request.step as usize).copied().ok_or_else(|| {
+            // What a step also reads is the model's own preparation, and a runner that invented it
+            // would stage a trajectory nobody produced: the refusal names both halves.
+            let prepared = self.prepared(index).ok_or_else(|| {
                 Error::Invalid(format!(
-                    "a request of bucket {bucket} states step {} and the schedule has {}",
-                    request.step,
-                    steps.len()
+                    "a denoise step of bucket {bucket} names row {index}, whose latents and encoded \
+                     conditioning rows no capability prepared: the mechanism states a request's \
+                     parameters and the model's own preparation of it is held by no runner yet \
+                     (step {} of {})",
+                    stated_request.step, stated_request.steps
                 ))
             })?;
+            self.stage_request(bucket, index, &prepared)?;
+            // Every row of one batch is the same step of the same schedule: a batch is one step
+            // (`Variant::Denoise`), so a row that names another step describes another batch.
+            let stated = steps
+                .get(stated_request.step as usize)
+                .copied()
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "a request of bucket {bucket} states step {} and the schedule has {}",
+                        stated_request.step,
+                        steps.len()
+                    ))
+                })?;
             match step {
                 None => step = Some(stated),
                 Some(first) if first.index == stated.index => {}
@@ -1055,35 +1057,6 @@ mod tests {
         assert_eq!(numel(&shape).unwrap(), 384);
         assert_eq!(latent_bytes(&shape, DType::F32).unwrap(), 384 * 4);
         assert_eq!(latent_bytes(&shape, DType::BF16).unwrap(), 384 * 2);
-    }
-
-    #[test]
-    fn a_row_of_inputs_states_one_document() {
-        let request = DenoiseRequest {
-            step: 3,
-            seed: 7,
-            video: vec![0u8; 8],
-            audio: Vec::new(),
-            text: vec![1u8; 4],
-        };
-        let bytes = serde_json::to_vec(&request).unwrap();
-        let decoded = DenoiseRequest::decode(&[bytes]).unwrap();
-        assert_eq!(decoded.step, 3);
-        assert_eq!(decoded.seed, 7);
-        assert_eq!(decoded.video.len(), 8);
-    }
-
-    #[test]
-    fn a_row_of_two_buffers_names_what_it_carries() {
-        let error = DenoiseRequest::decode(&[Vec::new(), Vec::new()]).unwrap_err();
-        assert!(matches!(error, Error::Invalid(_)), "{error:?}");
-        assert!(format!("{error}").contains("carries 2 buffer(s)"));
-    }
-
-    #[test]
-    fn bytes_that_are_not_a_document_are_refused_by_name() {
-        let error = DenoiseRequest::decode(&[b"not a document".to_vec()]).unwrap_err();
-        assert!(format!("{error}").contains("not the document this runner reads"));
     }
 
     #[test]
