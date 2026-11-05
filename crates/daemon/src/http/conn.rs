@@ -336,6 +336,14 @@ impl Connection {
                         return Ok(());
                     }
                 }
+                // A handed-over response's socket belongs to the successor from here: it
+                // writes this response's next bytes on the descriptor it was given. Every
+                // other ending shuts the socket's write half, and `shutdown` reaches the
+                // socket the two processes share — so shutting it here is what made the
+                // successor's first frame fail with `Broken pipe`, after a pause that had
+                // otherwise succeeded. Dropping this process's descriptor is all that is
+                // left to do.
+                Outcome::Adopted => return Ok(()),
                 Outcome::Close => {
                     let _ = self.io.shutdown().await;
                     return Ok(());
@@ -560,7 +568,7 @@ impl Connection {
                 {
                     HandedOutcome::Complete => true,
                     HandedOutcome::Ended => false,
-                    HandedOutcome::Adopted => return Ok(Outcome::Close),
+                    HandedOutcome::Adopted => return Ok(Outcome::Adopted),
                 },
                 None => self.write_payload(&mut payload, chunked).await?,
             };
@@ -961,6 +969,10 @@ enum Drain {
 enum Outcome {
     KeepAlive,
     Close,
+    /// The successor took the response over and writes it on the socket this
+    /// connection shares: nothing more is written here, and the socket is not
+    /// shut down, because that would end the successor's half of it too.
+    Adopted,
 }
 
 /// What a handoffable body's pause produced.
@@ -2233,9 +2245,9 @@ mod tests {
     }
 
     /// One streamed response paused and adopted: this process writes nothing
-    /// after the boundary, terminates no body and ends the connection.
+    /// after the boundary, terminates no body and hands its socket over.
     #[tokio::test]
-    async fn an_adopted_response_stops_writing_and_closes() {
+    async fn an_adopted_response_stops_writing_and_hands_its_socket_over() {
         let registry = Handoff::new();
         let registration = registry.register();
         let (mut client, frames) = serve_handed(
@@ -2268,6 +2280,54 @@ mod tests {
         assert!(
             !raw.ends_with("0\r\n\r\n"),
             "the body was not terminated here: {raw}"
+        );
+    }
+
+    /// The socket an adopted response leaves is still writable by the process
+    /// that took it over. The predecessor's copy of the connection shares that
+    /// socket, so a `shutdown` here would shut the write half for the
+    /// successor too — its first frame would fail with `Broken pipe`, after a
+    /// pause that had otherwise succeeded.
+    #[tokio::test]
+    async fn an_adopted_response_leaves_its_socket_writable_for_the_successor() {
+        use std::io::Write as _;
+
+        let registry = Handoff::new();
+        let registration = registry.register();
+        let (mut client, frames) = serve_handed(
+            registry.clone(),
+            Arc::clone(&registration),
+            "handoff-stream-3",
+            pair,
+        );
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
+        frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
+        tokio::task::yield_now().await;
+
+        let frozen = tokio::time::timeout(std::time::Duration::from_secs(5), registry.pause())
+            .await
+            .expect("the pause is answered");
+        let frozen = frozen.into_iter().next().expect("one frozen response");
+        // The descriptor the successor writes on, taken before the decision:
+        // it is the same socket the predecessor's connection holds.
+        let mut successor = std::os::unix::net::UnixStream::from(frozen.descriptor);
+        frozen.decision.send(Decision::Adopt).unwrap();
+        // Let the predecessor's connection end before the successor writes, so
+        // a `shutdown` there would already be in effect.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        successor
+            .write_all(b"data: b\n\n")
+            .expect("the adopted socket is still writable");
+        drop(successor);
+
+        let raw = client.read_to_end().await;
+        assert!(raw.contains("data: a"), "{raw}");
+        assert!(
+            raw.contains("data: b"),
+            "the successor's frame reached the client: {raw}"
         );
     }
 
