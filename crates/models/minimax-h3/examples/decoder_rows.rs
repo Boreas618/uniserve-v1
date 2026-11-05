@@ -32,7 +32,8 @@
 //!
 //! The last thing this program checks is the figure a runner sizes storage from: `video_arena` states
 //! a clip's buffers, and a whole clip is decoded in an arena of **exactly** those bytes, at every
-//! canvas and in both element types. A decode that does not fit fails there rather than on a device
+//! canvas and at every element type a deployment can name. A decode that does not fit fails there
+//! rather than on a device
 //! partway through the stitch, and a decode that fits with room to spare means the plan reserves a
 //! buffer nothing takes - so the check requires the clip to consume the plan entirely, and the one
 //! number it prints per canvas (`takes all N bytes of its 17 buffer plan`) is the reservation a
@@ -312,7 +313,7 @@ fn run() -> Result<(), String> {
 /// Two directions, one measurement. A decode that does not fit fails here; a decode that fits with room
 /// to spare means the plan states a buffer nothing reserves, which is device memory a runner would
 /// reserve for no reason. The plan is exact when the clip takes every byte of it, at every canvas and
-/// both element types, so the allowance is zero rather than one buffer.
+/// every element type, so the allowance is zero rather than one buffer.
 fn fit_arenas(
     config: &minimax_h3::VideoVaeConfig,
     extents: &BTreeMap<String, (DType, Shape)>,
@@ -321,9 +322,12 @@ fn fit_arenas(
 ) -> Result<(), String> {
     let ratio = config.spatial_compression();
     let mut failures: Vec<String> = Vec::new();
-    // The decoder's own element types: the checkpoint stores the video VAE in F16, and an unconverted
-    // deployment keeps its FP32 weights, so both plans a device can ask for are measured.
-    for dtype in [DType::F32, DType::F16] {
+    // The decoder's own element types. **This export stores the video VAE in FP32** - all 703 tensors
+    // (`artifacts/h3-reference/component-tensors.json`, and `deployment_sizes.rs`'s weight rows) - so
+    // an `auto` deployment decodes at FP32 and converts nothing. FP16 is a released preset's compute
+    // type, and BF16 the calibrated preset's (`uniserve/models/minimax_h3/precision.py:183-190`), so
+    // all three plans a deployment can ask for are measured.
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
         for &(height, width) in canvases {
             let clip_canvas = Canvas::clip(config, height / ratio, width / ratio);
             let tiles = Tiles::of(config, &clip_canvas)
@@ -415,7 +419,7 @@ fn fit_arenas(
         }
     }
     if failures.is_empty() {
-        println!("# every canvas's clip fits its plan exactly, in both element types.");
+        println!("# every canvas's clip fits its plan exactly, at every element type a deployment can name.");
         Ok(())
     } else {
         for failure in &failures {
