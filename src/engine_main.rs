@@ -599,6 +599,12 @@ struct Served {
 /// the range a window-sized journal drops, silently losing the tokens a handover
 /// was meant to carry. A request that reaches this bound has a consumer that
 /// stopped; the takeover logs the gap when it is asked for one.
+///
+/// **It is a memory budget, not a number.** An event is a token or a scheduling
+/// fact, about 100 bytes with its wire form: 4096 of them is roughly 400 KB for
+/// one request, so a deployment whose every stream stall at the bound spends
+/// about 50 MB at 128 streams. Raising it buys a longer stall before a takeover
+/// would have to state a gap; it does not change what a gap means.
 const KEPT_EVENTS: usize = 4096;
 
 pub(crate) struct MainProcess {
