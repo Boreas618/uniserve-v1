@@ -16,6 +16,9 @@
 //! It prints one answer line, `probe(nccl-capture): ANSWER 12 ...`, followed by both ranks'
 //! readings.
 //!
+//! Each collective starts from a fill of the rank's own value, because the two passes read the same
+//! buffer: the sum a pass leaves is evidence only if it began at the pass's own input.
+//!
 //! Run (caller, one host with two free GPUs; a few seconds):
 //!
 //! ```text
@@ -83,21 +86,7 @@ fn run_rank(
         .map_err(|error| format!("PinnedBuffer::new: {error}"))?;
 
     let value = 16.0f32 * (rank as f32 + 1.0);
-    {
-        let values = [value; 4];
-        // SAFETY: `host` is exclusive to this thread and no copy that writes it is pending.
-        let target = unsafe { host.as_mut_slice() };
-        for (slot, value) in target.chunks_exact_mut(4).zip(values) {
-            slot.copy_from_slice(&value.to_le_bytes());
-        }
-    }
-    // SAFETY: the copy is 16 bytes from a 16-byte pinned buffer into a 16-byte allocation, and the
-    // buffer outlives the wait below.
-    unsafe { platform::memcpy_async(buffer.address(), host.address(), 16, &stream) }
-        .map_err(|error| format!("memcpy_async to the device: {error}"))?;
-    stream
-        .synchronize()
-        .map_err(|error| format!("synchronize after the fill: {error}"))?;
+    fill(value, &mut host, &buffer, &stream)?;
 
     let communicator = Communicator::init(device, size, rank, &id)
         .map_err(|error| format!("Communicator::init: {error}"))?;
@@ -143,6 +132,11 @@ fn run_rank(
     let exec = graph
         .instantiate()
         .map_err(|error| format!("Graph::instantiate: {error}"))?;
+    // The buffer is returned to this rank's own value before the replay, so each reading is that
+    // pass's own result: the eager collective left both ranks at the sum, and a replay that ran on
+    // top of it would read twice the sum whether or not it communicated. From this rank's value,
+    // the sum proves the replay communicated and this rank's value alone proves it did not.
+    fill(value, &mut host, &buffer, &stream)?;
     exec.launch(&stream)
         .map_err(|error| format!("GraphExec::launch: {error}"))?;
     stream
@@ -166,6 +160,30 @@ fn run_rank(
         eager,
         replayed,
     })
+}
+
+/// Puts this rank's own value in all four f32 of `buffer`, through the pinned staging buffer.
+///
+/// Each collective in the probe starts from this fill: the answer it reads is a sum over both
+/// ranks only if this rank's contribution is its own value and not a previous pass's result.
+fn fill(
+    value: f32,
+    host: &mut platform::PinnedBuffer,
+    buffer: &platform::Buffer,
+    stream: &platform::Stream,
+) -> Result<(), String> {
+    // SAFETY: `host` is exclusive to this thread and no copy that writes it is pending.
+    let target = unsafe { host.as_mut_slice() };
+    for slot in target.chunks_exact_mut(4) {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    // SAFETY: the copy is 16 bytes from a 16-byte pinned buffer into a 16-byte allocation, and the
+    // buffer outlives the wait below.
+    unsafe { platform::memcpy_async(buffer.address(), host.address(), 16, stream) }
+        .map_err(|error| format!("memcpy_async to the device: {error}"))?;
+    stream
+        .synchronize()
+        .map_err(|error| format!("synchronize after the fill: {error}"))
 }
 
 /// Copies the buffer's four f32 back to the host and reads them.
