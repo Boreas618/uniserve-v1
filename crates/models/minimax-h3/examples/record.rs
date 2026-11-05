@@ -44,28 +44,28 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::audio_vae::AudioDecoder;
-use minimax_h3::video_vae::Tiles;
-use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
+use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
+use minimax_h3::video_vae::Tiles;
 // The capability trait, for the request's noise draw: it is a method of the trait, not of the struct.
+use minimax_h3::AttentionKind;
+use minimax_h3::Partition;
+use minimax_h3::output::{Splice, VideoPostprocessor};
+use minimax_h3::text_encoder::TextEncoder;
+use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use nn::capability::Denoiser as _;
 use nn::capability::{
     ConditionRole, ConditionShape, Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape,
     TokenBatch, VideoRequest, VideoTask,
 };
 use nn::{PhaseKind, TensorView};
-use minimax_h3::AttentionKind;
-use minimax_h3::output::{Splice, VideoPostprocessor};
-use minimax_h3::text_encoder::TextEncoder;
-use minimax_h3::video_vae::{Canvas, VideoDecoder};
-use minimax_h3::Partition;
 
-use nn::layers::{Linear, WeightOrder};
-use nn::weights::WeightRequest;
 use nn::forward::Arena;
+use nn::layers::{Linear, WeightOrder};
 use nn::tensor::DevicePtr;
 use nn::weights::WeightLoader;
+use nn::weights::WeightRequest;
 use nn::{DType, Forward, Shape};
 
 fn main() -> ExitCode {
@@ -155,7 +155,11 @@ fn run() -> Result<(), String> {
     let mut list = false;
     let mut names = false;
     while let Some(argument) = arguments.next() {
-        let mut value = || arguments.next().ok_or_else(|| format!("{argument} needs a value"));
+        let mut value = || {
+            arguments
+                .next()
+                .ok_or_else(|| format!("{argument} needs a value"))
+        };
         match argument.as_str() {
             "--root" => root = PathBuf::from(value()?),
             "--component" => component = value()?,
@@ -181,7 +185,11 @@ fn run() -> Result<(), String> {
             }
             "--rows" => rows = Some(value()?.parse().map_err(|_| "--rows is a count")?),
             "--tokens" => tokens = value()?.parse().map_err(|_| "--tokens is a count")?,
-            "--track" => track = value()?.parse().map_err(|_| "--track is a count of samples")?,
+            "--track" => {
+                track = value()?
+                    .parse()
+                    .map_err(|_| "--track is a count of samples")?
+            }
             "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
             "--conditioned" => {
@@ -206,8 +214,14 @@ fn run() -> Result<(), String> {
                     return Err("--sparse is `tile,sparsity[,reference_keep]`".to_owned());
                 }
                 sparse = Some((
-                    parts[0].trim().parse().map_err(|_| "--sparse's tile is a row count")?,
-                    parts[1].trim().parse().map_err(|_| "--sparse's sparsity is a fraction")?,
+                    parts[0]
+                        .trim()
+                        .parse()
+                        .map_err(|_| "--sparse's tile is a row count")?,
+                    parts[1]
+                        .trim()
+                        .parse()
+                        .map_err(|_| "--sparse's sparsity is a fraction")?,
                     match parts.get(2) {
                         Some(keep) => Some(
                             keep.trim()
@@ -268,8 +282,7 @@ fn run() -> Result<(), String> {
                         return Err(format!(
                             "--raster {}x{} is not one of the deployment's offered canvases {offered:?}",
                             pair.0, pair.1
-                        )
-                        .into());
+                        ));
                     }
                 }
                 claimed
@@ -407,7 +420,8 @@ fn run() -> Result<(), String> {
 /// failure that cost a caller run and four rows in one day. `stated, not recorded` is the other direction and is
 /// its own defect, because a store then holds a cell nothing reads.
 fn compare(recorded: &[(String, String)], walk: &Path) -> Result<(), String> {
-    let stated = std::fs::read_to_string(walk).map_err(|error| format!("{}: {error}", walk.display()))?;
+    let stated =
+        std::fs::read_to_string(walk).map_err(|error| format!("{}: {error}", walk.display()))?;
     let stated: std::collections::BTreeSet<(String, String)> = stated
         .lines()
         .filter(|line| !line.starts_with('#') && line.contains('\t'))
@@ -538,34 +552,36 @@ fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let stack = minimax_h3::encoding::Stack::of(&config).map_err(|error| error.to_string())?;
     let mut recorded = Recorded::default();
     for (height, width) in request.rasters.clone() {
-    for frames in [1, stack.clip.frames] {
-        let latency = encoder.latent_frames(frames).map_err(|error| error.to_string())?;
-        // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a
-        // bias and an output that disagree, which is what a mixed operand reads as).
-        let pixels = arena
-            .tensor(
-                DType::F32,
-                Shape::new(&[1, 3, u64::from(frames), u64::from(height), u64::from(width)]),
-            )
-            .map_err(|error| error.to_string())?;
-        let compression = u64::from(config.spatial_compression());
-        let moments = arena
-            .tensor(
-                DType::F32,
-                Shape::new(&[
-                    2 * u64::from(config.latent_channels),
-                    u64::from(latency),
-                    u64::from(height) / compression,
-                    u64::from(width) / compression,
-                ]),
-            )
-            .map_err(|error| error.to_string())?;
+        for frames in [1, stack.clip.frames] {
+            let latency = encoder
+                .latent_frames(frames)
+                .map_err(|error| error.to_string())?;
+            // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a
+            // bias and an output that disagree, which is what a mixed operand reads as).
+            let pixels = arena
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[1, 3, u64::from(frames), u64::from(height), u64::from(width)]),
+                )
+                .map_err(|error| error.to_string())?;
+            let compression = u64::from(config.spatial_compression());
+            let moments = arena
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        2 * u64::from(config.latent_channels),
+                        u64::from(latency),
+                        u64::from(height) / compression,
+                        u64::from(width) / compression,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
 
-        ops::capture::set_sink(Some(&mut recorded));
-        let run = encoder.encode(&forward, pixels, moments);
-        ops::capture::set_sink(None);
-        run.map_err(|error| error.to_string())?;
-    }
+            ops::capture::set_sink(Some(&mut recorded));
+            let run = encoder.encode(&forward, pixels, moments);
+            ops::capture::set_sink(None);
+            run.map_err(|error| error.to_string())?;
+        }
     }
     Ok(recorded.0)
 }
@@ -596,17 +612,13 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         .copied()
         .ok_or("a clip with no tiles to decode")?
         .canvas;
-    let model_width =
-        config.decoder_num_attention_heads * config.decoder_attention_head_dim;
+    let model_width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
 
     let projection = loader
         .load(&WeightRequest::region(
             "virtual.proj_in.weight",
             0,
-            Shape::new(&[
-                u64::from(model_width),
-                u64::from(config.latent_channels),
-            ]),
+            Shape::new(&[u64::from(model_width), u64::from(config.latent_channels)]),
         ))
         .map_err(|error| error.to_string())?;
     // The checkpoint's first affine carries a bias (`decoder.proj_in.bias`), which the loader reads
@@ -632,7 +644,9 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
-    let scratch = decoder.scratch(&forward).map_err(|error| error.to_string())?;
+    let scratch = decoder
+        .scratch(&forward)
+        .map_err(|error| error.to_string())?;
     let latents = arena
         .tensor(
             DType::F32,
@@ -642,10 +656,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // The layout declares `video_positions` as FP32 (`video_vae::table_specs`), so the decode step
     // reads the table at that type; a harness that hands it i32 records a rotation nothing launches.
     let positions = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[3, canvas.rows()]),
-        )
+        .tensor(DType::F32, Shape::new(&[3, canvas.rows()]))
         .map_err(|error| error.to_string())?;
     // The decoder writes one row per token, and a row is the pixels and frames its final projection
     // produces: three channels over the temporal and both spatial upsamples, not the model's width.
@@ -654,10 +665,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         * u64::from(config.spatial_compression())
         * u64::from(config.spatial_compression());
     let out = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[canvas.rows(), out_channels]),
-        )
+        .tensor(DType::F32, Shape::new(&[canvas.rows(), out_channels]))
         .map_err(|error| error.to_string())?;
 
     let mut recorded = Recorded::default();
@@ -737,7 +745,10 @@ fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, S
     } else {
         None
     };
-    let images: Vec<ImageInput> = pixels.iter().map(|pixels| ImageInput { pixels: *pixels }).collect();
+    let images: Vec<ImageInput> = pixels
+        .iter()
+        .map(|pixels| ImageInput { pixels: *pixels })
+        .collect();
     let layout = Encoder::layout(&encoder, &batch, &shapes);
     let specs = Encoder::state_tables(&encoder, &layout);
     let mut tables = Vec::with_capacity(specs.len());
@@ -782,7 +793,12 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
     // The post-processor runs in the VAE container's type, which is the type its rows key.
     let vae_type = component_type(request, "vae")?;
     let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
-    let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let bytes = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
     let mean = loader
         .constant(
             "video_postprocessor.pixel_mean",
@@ -810,46 +826,46 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
     // raster records one canvas's blend and leaves the others' stated and unrecorded.
     let mut recorded = Recorded::default();
     for (height, width) in request.rasters.clone() {
-    let clip = arena
-        .tensor(
-            vae_type,
-            Shape::new(&[
-                3,
-                u64::from(splice.overlap.1),
-                u64::from(height),
-                u64::from(width),
-            ]),
-        )
-        .map_err(|error| error.to_string())?;
-    // A timeline's second clip blends against its predecessor's tail; the first has nothing to fade
-    // against and skips the seam, so the harness states the predecessor and the blend is recorded.
-    let previous = arena
-        .tensor(
-            vae_type,
-            Shape::new(&[
-                3,
-                u64::from(splice.overlap.1 - splice.overlap.0),
-                u64::from(height),
-                u64::from(width),
-            ]),
-        )
-        .map_err(|error| error.to_string())?;
-    let out = arena
-        .tensor(
-            DType::U8,
-            Shape::new(&[
-                u64::from(splice.frames()),
-                u64::from(height),
-                u64::from(width),
-                3,
-            ]),
-        )
-        .map_err(|error| error.to_string())?;
+        let clip = arena
+            .tensor(
+                vae_type,
+                Shape::new(&[
+                    3,
+                    u64::from(splice.overlap.1),
+                    u64::from(height),
+                    u64::from(width),
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+        // A timeline's second clip blends against its predecessor's tail; the first has nothing to fade
+        // against and skips the seam, so the harness states the predecessor and the blend is recorded.
+        let previous = arena
+            .tensor(
+                vae_type,
+                Shape::new(&[
+                    3,
+                    u64::from(splice.overlap.1 - splice.overlap.0),
+                    u64::from(height),
+                    u64::from(width),
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+        let out = arena
+            .tensor(
+                DType::U8,
+                Shape::new(&[
+                    u64::from(splice.frames()),
+                    u64::from(height),
+                    u64::from(width),
+                    3,
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
 
-    ops::capture::set_sink(Some(&mut recorded));
-    let run = post.forward(&forward, Some(previous), clip, &splice, out);
-    ops::capture::set_sink(None);
-    run.map_err(|error| error.to_string())?;
+        ops::capture::set_sink(Some(&mut recorded));
+        let run = post.forward(&forward, Some(previous), clip, &splice, out);
+        ops::capture::set_sink(None);
+        run.map_err(|error| error.to_string())?;
     }
     Ok(recorded.0)
 }
@@ -862,7 +878,8 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
 /// costs no device and no checkpoint byte.
 fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let dit_type = component_type(request, "transformer")?;
-    let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+    let config =
+        minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
     let network = config
         .denoisers
         .get(&Dit::Base)
@@ -878,8 +895,8 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let config_hidden = network.transformer.hidden_size;
     // The two prefix capacities are the request's own: a prompt of the walk's length and one unit of
     // condition rows, which a `t2va` request leaves empty. The bound is the deployment's.
-    let arrangement = Arrangement::new(&network, request.tokens, 64, 1)
-        .map_err(|error| error.to_string())?;
+    let arrangement =
+        Arrangement::new(&network, request.tokens, 64, 1).map_err(|error| error.to_string())?;
     // The layout rule is the same statement the network loads with: the tables a step reads are the
     // rule's, and a harness that built its own would be a second source of truth for them.
     let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
@@ -922,7 +939,9 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
     // Every table the layout names, at the shape and type the model declares for it.
-    let specs = rules.table_specs(&layout).map_err(|error| error.to_string())?;
+    let specs = rules
+        .table_specs(&layout)
+        .map_err(|error| error.to_string())?;
     let mut tables = Vec::with_capacity(specs.len());
     for spec in &specs {
         tables.push(
@@ -1027,7 +1046,8 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
 fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     let text_type = component_type(request, "text_encoder")?;
     let dit_type = component_type(request, "transformer")?;
-    let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+    let config =
+        minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
     let network = config
         .denoisers
         .get(&Dit::Base)
@@ -1074,7 +1094,9 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     .map_err(|error| error.to_string())?;
     // The reference's raster is the request's own latent raster, which the layout states for the video
     // it generates: the canvas the rule returns is the decoder's pixel canvas, not this count.
-    let (probe_layout, _) = probe_rules.layout(&probe).map_err(|error| error.to_string())?;
+    let (probe_layout, _) = probe_rules
+        .layout(&probe)
+        .map_err(|error| error.to_string())?;
     let raster = minimax_h3::packing::LatentRaster {
         height: probe_layout.video.height,
         width: probe_layout.video.width,
@@ -1138,7 +1160,9 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
-    let specs = rules.table_specs(&layout).map_err(|error| error.to_string())?;
+    let specs = rules
+        .table_specs(&layout)
+        .map_err(|error| error.to_string())?;
     let mut tables = Vec::with_capacity(specs.len());
     for spec in &specs {
         tables.push(
@@ -1252,7 +1276,8 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
 /// The text encoder's statement: its own `config.json` and the processor's preprocessor config.
 fn text_config(root: &Path) -> Result<minimax_h3::TextEncoderConfig, String> {
     let read = |path: PathBuf| -> Result<serde_json::Value, String> {
-        let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
     };
     let metadata = read(root.join("text_encoder/config.json"))?;
@@ -1262,7 +1287,8 @@ fn text_config(root: &Path) -> Result<minimax_h3::TextEncoderConfig, String> {
 
 fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
     let path = root.join("vae/config.json");
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let values: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     minimax_h3::VideoVaeConfig::parse(&values).map_err(|error| error.to_string())
@@ -1270,7 +1296,8 @@ fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
 
 fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
     let path = root.join("audio_vae/config.json");
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let values: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())
@@ -1309,7 +1336,8 @@ fn deployment_bound(
         network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
             .map_err(|error| error.to_string())?;
     }
-    let arrangement = Arrangement::new(&network, tokens, 64, 1).map_err(|error| error.to_string())?;
+    let arrangement =
+        Arrangement::new(&network, tokens, 64, 1).map_err(|error| error.to_string())?;
     let rules = Layouts::new(network, arrangement).map_err(|error| error.to_string())?;
     rules.rows_bound().map_err(|error| error.to_string())
 }
@@ -1323,9 +1351,9 @@ fn deployment_bound(
 /// their own type, because the table's entry is the more particular fact.
 fn component_type(request: &Request, component: &str) -> Result<DType, String> {
     let stated = match request.types.as_deref() {
-        Some(table) => Some(
-            minimax_h3::load::ElementTypes::read(table).map_err(|error| error.to_string())?,
-        ),
+        Some(table) => {
+            Some(minimax_h3::load::ElementTypes::read(table).map_err(|error| error.to_string())?)
+        }
         None => None,
     };
     let checkpoint = nn::Checkpoint::open(&request.root).ok();
@@ -1374,7 +1402,8 @@ fn list_names(root: &Path, component: &str) -> Result<(), String> {
 /// This is the checkpoint's shard-header content, not a model fact: it is produced where the weights are and
 /// used where they are not.
 fn read_extents(path: &Path) -> Result<BTreeMap<String, (DType, Shape)>, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let values: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     let object = values
@@ -1392,7 +1421,10 @@ fn read_extents(path: &Path) -> Result<BTreeMap<String, (DType, Shape)>, String>
             .and_then(|value| value.as_array())
             .ok_or_else(|| format!("{name}: the entry states no shape"))?
             .iter()
-            .map(|dim| dim.as_u64().ok_or_else(|| format!("{name}: a dimension is not a count")))
+            .map(|dim| {
+                dim.as_u64()
+                    .ok_or_else(|| format!("{name}: a dimension is not a count"))
+            })
             .collect::<Result<Vec<u64>, String>>()?;
         extents.insert(name.clone(), (dtype, Shape::new(&dims)));
     }
