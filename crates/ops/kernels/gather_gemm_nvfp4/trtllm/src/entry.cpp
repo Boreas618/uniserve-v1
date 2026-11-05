@@ -123,11 +123,13 @@ Product& runner() {
       /*activationType=*/kActivation,
       /*useShuffledMatrix=*/true,
       /*weight_layout=*/kWeightLayout,
-      // Every BF16-output E2M1 kernel in the artifact carries a per-column bias, so a runner
-      // constructed with `None` has no passing configuration at all. This operator has no bias, and
-      // the entry hands the kernel a zeroed table: adding zero is exact in f32 and in the f32
-      // accumulator, so the product is the one the operands describe.
-      /*biasType=*/batchedGemm::gemm::BiasType::M,
+      // The operator has no bias, and `None` is the only bias type the artifact's cubins and the
+      // runner can agree on: the runner's options hardcode the bias dtype to BF16 while every
+      // gated BF16-output cubin in this artifact is `biasFp32M`, so a bias kernel can never match.
+      // With `None` the runner skips the bias checks and accepts a null pointer (its own words:
+      // "we can pass nullptr bias to get biasType::None for any bias kernel"), which is exactly
+      // this operator's contract.
+      /*biasType=*/batchedGemm::gemm::BiasType::None,
       // The artifact's FP4 kernels read the encoder's per-token factor beside the block scales.
       /*usePerTokenScaling=*/true,
       /*usePerChannelScaling=*/false);
@@ -227,11 +229,11 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
   // host allocation inside a captured graph.
   size_t const required = product.getWorkspaceSizeInBytes(top_k, hidden, intermediate, experts,
                                                           tokens, config);
-  // The scratch the entry owns: the padded route count (one i32), then the zeroed per-column bias
-  // the artifact's kernels take (one f32 per column of the gated product), then the tactic's own.
-  size_t const bias_bytes = sizeof(float) * 2 * static_cast<size_t>(intermediate);
+  // The scratch the entry owns: the padded route count (one i32), then the tactic's own. The
+  // bias table this entry used to zero is gone with `BiasType::None`: a null pointer is the
+  // operator's contract, and a table nothing reads is a buffer a capture would size for nothing.
   size_t const bias_at = 16;
-  size_t const needed = bias_at + bias_bytes + required;
+  size_t const needed = bias_at + required;
   if (static_cast<size_t>(call->workspace_bytes) < needed) {
     char message[512];
     std::snprintf(message, sizeof(message),
@@ -243,8 +245,7 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
 
   auto* seat = static_cast<unsigned char*>(call->workspace);
   auto* total_num_padded_tokens = reinterpret_cast<int32_t*>(seat);
-  auto* bias = reinterpret_cast<float*>(seat + bias_at);
-  void* bmm_workspace = static_cast<void*>(seat + bias_at + bias_bytes);
+  void* bmm_workspace = static_cast<void*>(seat + bias_at);
   cudaStream_t const order = reinterpret_cast<cudaStream_t>(stream);
   // The GEMM bounds its M by the padded route count, which is this call's own value: it
   // is written on the stream, before the product, so the ordering is the stream's.
@@ -252,14 +253,6 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
                        static_cast<unsigned int>(call->routes), 1,
                        reinterpret_cast<CUstream>(order)) != CUDA_SUCCESS) {
     return refuse(call, "the padded route count could not be written on the call's stream");
-  }
-
-  // The bias is zero, on the same stream and before the product: the operator has none, and the
-  // kernel's slot takes the additive identity rather than a value the model never stated.
-  if (cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(bias), 0,
-                       static_cast<size_t>(bias_bytes / sizeof(float)),
-                       reinterpret_cast<CUstream>(order)) != CUDA_SUCCESS) {
-    return refuse(call, "the zeroed bias could not be written on the call's stream");
   }
 
   int device = 0;
@@ -272,7 +265,7 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
               const_cast<void*>(call->hidden_token_scale), /*perChannelScales=*/nullptr,
               const_cast<float*>(static_cast<float const*>(call->global_scale)),
               const_cast<float*>(static_cast<float const*>(call->global_scale_gate)),
-              bias, /*gatedActAlpha=*/nullptr, /*gatedActBeta=*/nullptr,
+              /*bias=*/nullptr, /*gatedActAlpha=*/nullptr, /*gatedActBeta=*/nullptr,
               /*clampLimit=*/nullptr, /*permutedIdxToBiasRowIdx=*/nullptr, call->out,
               /*outputScale=*/nullptr, top_k, hidden, intermediate, experts, tokens,
               const_cast<int32_t*>(call->permuted_to_expanded),
