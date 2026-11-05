@@ -967,8 +967,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Copies the staged host sides to the device, in one place, so a capture and a replay agree on
-    /// what the graph reads.
+    /// Copies the staged host sides to the device, **every column**, for a walk.
+    ///
+    /// A capture has no trajectory and must still read defined values, so it stages zeros into the
+    /// latent columns and uploads them here. A replay does not: see [`Self::upload_step`].
     fn upload(&mut self) -> Result<()> {
         let stream = self.stream.clone();
         // The host side and the device column are two fields of one value, so the copy borrows
@@ -988,6 +990,33 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
+        self.columns.text.upload(&stream)?;
+        self.columns.source.upload(&stream)?;
+        self.columns.step.upload(&stream)?;
+        Ok(())
+    }
+
+    /// Copies the columns a **replay** writes from the host: the conditioning rows and the step's
+    /// index.
+    ///
+    /// **The trajectory is not one of them.** The captured graph advances the latents *in place* —
+    /// that is the whole of a diffusion step — while the staged buffer holds a warm capture's zeros,
+    /// so uploading it before every replay would restart the trajectory at zero whenever a step
+    /// began. Nothing refused: step one would advance zeros, and the clip would be the draw plus one
+    /// step rather than the schedule. The draw at step zero writes the whole block itself
+    /// (`first_step`), so the column never needs this path for its initial values.
+    fn upload_step(&mut self) -> Result<()> {
+        let stream = self.stream.clone();
+        let DenoiseColumns {
+            text,
+            source,
+            step,
+            staged,
+            ..
+        } = &mut self.columns;
+        text.write(&staged.text)?;
+        source.write(&staged.source)?;
+        step.write(&staged.step)?;
         self.columns.text.upload(&stream)?;
         self.columns.source.upload(&stream)?;
         self.columns.step.upload(&stream)?;
@@ -1210,9 +1239,11 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 bucket, generation, ..
             } => {
                 let stream = self.stream.clone();
-                self.upload()?;
+                // What a replay writes from the host: the conditioning rows and the step index. The
+                // trajectory is the column's own, advanced in place by the previous step.
+                self.upload_step()?;
                 // The conditioning is the store's, and it overwrites the rows the upload just wrote:
-                // that order is why one upload covers every column.
+                // that order is why one upload covers every column it writes.
                 self.seed(*bucket)?;
                 // The first step's trajectory is drawn and folded here, on the arena the graph
                 // below addresses, so the graph advances a trajectory rather than a warm capture's
