@@ -4233,8 +4233,93 @@ impl Unavailable {
 struct Resolved {
     image: Option<Vec<u8>>,
     metadata: Option<Vec<u8>>,
-    native: Option<(std::fs::File, String)>,
+    native: Option<NativeModule>,
     entry: String,
+}
+
+/// The path `dlopen` loads a native module from (§4.2).
+///
+/// `dlopen` takes a path, and the handle the Program Server sends has none of its own. The file is
+/// used where it still has a name - glibc keys a loaded object by the name it was opened with, so a
+/// name this process derives from a descriptor would answer for the next module to land on that
+/// number, and one library's handle would serve another. When the store's file has no name left, the
+/// bytes are copied to one this process owns and that copy goes when the module does: `dlopen` maps
+/// the file, so the mapping outlives the name.
+struct NativeModule {
+    path: std::path::PathBuf,
+    /// The copy, when the handle the server sent named no file of its own.
+    copy: Option<std::path::PathBuf>,
+}
+
+impl Drop for NativeModule {
+    fn drop(&mut self) {
+        let Some(copy) = &self.copy else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_file(copy) {
+            tracing::warn!(
+                path = %copy.display(),
+                %error,
+                "removing this process's copy of a native module failed"
+            );
+        }
+    }
+}
+
+/// The path a native module is loaded from: the store's own file when it still has one, and a copy
+/// this process owns when the handle the server sent has outlived its name.
+fn native_module(file: &program_server::ModuleFile) -> executor::Result<NativeModule> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let invalid = |reason: String| executor::Error::Invalid(reason);
+    let link = format!("/proc/self/fd/{}", file.file.as_raw_fd());
+    if let Ok(target) = std::fs::read_link(&link) {
+        let named = !target.to_string_lossy().ends_with(" (deleted)");
+        if named && target.is_file() {
+            return Ok(NativeModule {
+                path: target,
+                copy: None,
+            });
+        }
+    }
+
+    // The handle names nothing this process can open: the server unlinked the file after sending
+    // it, or the descriptor addresses something that is not a file. One copy, under a name no
+    // other module shares.
+    static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ordinal = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!("uniserve-native-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| invalid(format!("preparing {}: {error}", directory.display())))?;
+    let name: String = file
+        .name
+        .chars()
+        .map(|held| {
+            if held.is_ascii_alphanumeric() || held == '.' || held == '_' || held == '-' {
+                held
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = directory.join(format!("{ordinal}-{name}"));
+    let mut bytes = Vec::with_capacity(file.size as usize);
+    (&file.file)
+        .read_to_end(&mut bytes)
+        .map_err(|error| invalid(format!("reading {}: {error}", file.name)))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|error| invalid(format!("writing {}: {error}", path.display())))?;
+    tracing::warn!(
+        module = %file.name,
+        path = %path.display(),
+        "the store's file has no name this process can open, so the module is loaded from a copy \
+         it owns"
+    );
+    Ok(NativeModule {
+        copy: Some(path.clone()),
+        path,
+    })
 }
 
 impl Resolved {
@@ -4246,8 +4331,8 @@ impl Resolved {
                 metadata: self.metadata.as_deref(),
                 entry: &self.entry,
             }),
-            (None, Some((_, path))) => Ok(ops::Module::Native {
-                path: std::path::Path::new(path),
+            (None, Some(native)) => Ok(ops::Module::Native {
+                path: native.path.as_path(),
                 entry: &self.entry,
             }),
             (None, None) => Err(executor::Error::Invalid(
@@ -4262,7 +4347,6 @@ impl Resolved {
 /// own process are not kernels.
 fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
     use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
 
     let invalid = |reason: String| executor::Error::Invalid(reason);
     let mut files = module.files.into_iter();
@@ -4309,13 +4393,10 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
             let Some(file) = files.next() else {
                 return Err(invalid("a native module carries no library".to_owned()));
             };
-            // `dlopen` opens a path, and the handle the server sent has none of its own: the fd is
-            // the same inode, and the handle stays ours for as long as the library is loaded.
-            let path = format!("/proc/self/fd/{}", file.file.as_raw_fd());
             Ok(Resolved {
                 image: None,
                 metadata: None,
-                native: Some((file.file, path)),
+                native: Some(native_module(&file)?),
                 entry: entry.clone(),
             })
         }
