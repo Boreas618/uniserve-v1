@@ -11,7 +11,7 @@ use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
     Geometry,
 };
-use ops::{DType, TensorView};
+use ops::{DType, Shape, Strides, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -91,6 +91,53 @@ pub struct Conv3d {
     channels_last: bool,
 }
 
+/// The strides of a channels-last (`NDHWC`) buffer read as its logical `[n, c, d, h, w]` shape.
+///
+/// The channel axis runs fastest, then the spatial axes from the innermost out, then the batch —
+/// the same order `conv3d`'s kernel derives from the descriptor's flag.
+fn channels_last_strides(shape: Shape) -> Strides {
+    let (channels, depth) = (shape.dim(1), shape.dim(2));
+    let (rows, columns) = (shape.dim(3), shape.dim(4));
+    let plane = columns * channels;
+    let body = rows * plane;
+    Strides::new(&[depth * body, 1, body, plane, columns])
+}
+
+/// Refuse a channels-last convolution whose operand is not stored channels-last.
+///
+/// The kernel derives every operand's strides from the descriptor's `channels_last` flag alone, so
+/// the flag **is** the layout: a convolution declared channels-last over a channels-first buffer
+/// reads the same bytes in another order and produces wrong numbers with no error anywhere. A model
+/// that wants the order but not the storage needs a permute in front of the convolution, and this is
+/// where that gap is named rather than measured.
+fn channels_last_storage(owner: &'static str, operand: &'static str, view: TensorView) -> Result<()> {
+    if view.shape.rank() != 5 {
+        return Err(Error::shape(
+            owner,
+            format!(
+                "a channels-last convolution takes 5-d operands, and its {operand} is {:?}",
+                view.shape.dims()
+            ),
+        ));
+    }
+    let expected = channels_last_strides(view.shape);
+    if view.strides != expected {
+        return Err(Error::shape(
+            owner,
+            format!(
+                "the {operand} of a channels-last convolution must be stored NDHWC: its strides are \
+                 {:?} over {:?}, and the packed channels-last layout is {:?}. The kernel derives the \
+                 strides from the descriptor, so a channels-first buffer would be read in the wrong \
+                 order",
+                view.strides.as_slice(),
+                view.shape.dims(),
+                expected.as_slice()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Conv3d {
     /// The convolution of `weight` (`[out, in, kd, kh, kw]` or its group form).
     pub fn new(
@@ -118,7 +165,15 @@ impl Conv3d {
     /// `out = conv3d(input)`.
     ///
     /// `input` is `[n, c, d, h, w]` and `out` `[n, k, d', h', w']`.
+    ///
+    /// A convolution built channels-last takes both operands **stored** channels-last, which a
+    /// caller states by viewing an `NDHWC` buffer as its logical shape; the check is here because
+    /// the kernel reads the order from the descriptor and would otherwise misread the bytes.
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        if self.channels_last {
+            channels_last_storage("Conv3d", "input", input)?;
+            channels_last_storage("Conv3d", "out", out)?;
+        }
         launch(
             f,
             "conv3d",
@@ -438,5 +493,45 @@ fn launch(
         (rank, transposed) => Err(Error::Unsupported(format!(
             "Conv: rank {rank} transposed={transposed} is not a convolution this layer builds"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{channels_last_storage, channels_last_strides};
+    use ops::tensor::{DType, DevicePtr, Shape, Strides, TensorView};
+
+    /// The encoder's first convolution's operand: 3 channels, 19 frames, 258 x 258 pixels.
+    fn operand(strides: Strides) -> TensorView {
+        TensorView::with_strides(
+            DevicePtr::new(0x1_0000),
+            DType::F32,
+            Shape::new(&[1, 3, 19, 258, 258]),
+            strides,
+        )
+    }
+
+    #[test]
+    fn a_channels_last_operand_is_packed_ndhwc() {
+        // The kernel's own order: channel fastest, then width, height, depth, batch.
+        let shape = Shape::new(&[1, 3, 19, 258, 258]);
+        assert_eq!(
+            channels_last_strides(shape).as_slice(),
+            &[3 * 19 * 258 * 258, 1, 258 * 258 * 3, 258 * 3, 3]
+        );
+    }
+
+    #[test]
+    fn a_channels_first_buffer_is_refused_by_a_channels_last_convolution() {
+        let shape = Shape::new(&[1, 3, 19, 258, 258]);
+        // Packed channels-first: the layout every other layer of the model builds.
+        let error = channels_last_storage("Conv3d", "input", operand(Strides::row_major(shape)))
+            .expect_err("a channels-first buffer read channels-last is wrong numbers, not a plan");
+        let text = format!("{error}");
+        assert!(text.contains("must be stored NDHWC"), "{text}");
+
+        // The same bytes viewed channels-last are accepted, which is what the encoder must build.
+        channels_last_storage("Conv3d", "input", operand(channels_last_strides(shape)))
+            .expect("the packed channels-last layout is what the descriptor promises");
     }
 }
