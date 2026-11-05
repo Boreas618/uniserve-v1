@@ -536,6 +536,9 @@ mod tests {
         refusal: String,
         frame: Option<proto::request::wire::ToEngine>,
     ) -> std::thread::JoinHandle<(proto::request::wire::Hello, proto::request::wire::State)> {
+        // Whether the daemon refuses this engine, kept beside the welcome it is sent in: the
+        // fixture's own branch below asks the same question, and the welcome consumes the string.
+        let refuses = !refusal.is_empty();
         std::thread::spawn(move || {
             let mut connection = loop {
                 match listener.try_accept() {
@@ -557,15 +560,22 @@ mod tests {
                     spec: None,
                 })
                 .expect("answering the hello");
-            let reported: Option<proto::request::wire::FromEngine> = connection
-                .recv(Duration::from_secs(10))
-                .expect("reading the state");
-            let state: proto::request::wire::State = reported
-                .and_then(|message| match message.kind {
-                    Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
-                    _ => None,
-                })
-                .expect("the engine stated what it serves");
+            // A refused engine states nothing: the refusal is the whole answer and the engine
+            // closes the connection after reading it, which is the correct behaviour and the
+            // reason this fixture must not wait for a state frame it will never receive.
+            let state: proto::request::wire::State = if !refuses {
+                let reported: Option<proto::request::wire::FromEngine> = connection
+                    .recv(Duration::from_secs(10))
+                    .expect("reading the state");
+                reported
+                    .and_then(|message| match message.kind {
+                        Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
+                        _ => None,
+                    })
+                    .expect("the engine stated what it serves")
+            } else {
+                proto::request::wire::State::default()
+            };
             if let Some(frame) = frame {
                 connection.send(&frame).expect("sending a frame");
             }

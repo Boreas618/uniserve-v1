@@ -574,9 +574,23 @@ mod tests {
         let empty = scratch_column(&[], &[0], &[], 0, 4, 2, 4).expect("an empty batch");
         assert_eq!(empty, vec![-1; 4]);
 
-        let error = scratch_column(&[0], &[0, 1], &[7], 1, 2, 1, 4)
-            .expect_err("a batch of one live token cannot name a bucket of none");
+        // A batch wider than the bucket it is served from is the case the guard exists for: the
+        // mapping is sized by the bucket's token extent, so a live count past it would write past
+        // the column. The case below states it with numbers that really violate it - two live
+        // tokens in a bucket of one - and then with a bucket of none.
+        let error = scratch_column(&[0, 1], &[0, 2], &[7, 8], 2, 1, 1, 4)
+            .expect_err("two live tokens cannot name a bucket of one");
         assert!(error.to_string().contains("bucket of"), "{error}");
+
+        let error = scratch_column(&[0], &[0, 1], &[7], 1, 0, 1, 4)
+            .expect_err("one live token cannot name a bucket of none");
+        assert!(error.to_string().contains("bucket of"), "{error}");
+
+        // The three columns describe one batch: a slot or a position list shorter than the live
+        // count is a batch whose own columns disagree, and the refusal names the lengths.
+        let error = scratch_column(&[0, 1], &[0, 2], &[7], 2, 2, 1, 4)
+            .expect_err("two positions and one slot are not one batch");
+        assert!(error.to_string().contains("slot(s)"), "{error}");
     }
 
     /// A NaN has no distance to anything, so the comparison treats two NaNs as agreeing and a NaN

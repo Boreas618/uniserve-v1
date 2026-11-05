@@ -175,6 +175,26 @@ impl Executor {
         scratch: u64,
         shadow: u64,
     ) -> Result<Self> {
+        // The graph range is divided among the streams that map it, and the plan states that
+        // count before the runners exist. Here they exist, so the two are compared: a runner the
+        // division did not count would take its share from the ones before it and be refused at
+        // its first capture as an allocator fault. A preparation takes one more range than the
+        // serving generation does, so the check allows for it.
+        {
+            let pools = pools.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let needed = runners.len() + 1;
+            if needed > pools.streams() {
+                return Err(Error::Interface(format!(
+                    "device {} serves {} runner(s) and a preparation, which need {} graph ranges, \
+                     and its graph storage was divided among {}; a runner whose stream was not \
+                     counted takes its share from the ones before it",
+                    device.0,
+                    runners.len(),
+                    needed,
+                    pools.streams(),
+                )));
+            }
+        }
         let counters = Arc::new(SharedCounters::default());
         // What the device thread is performing, read by whoever reports a stall from another thread
         // (2.4): the thread that is stuck cannot say it, and a stall line naming the stage alone
