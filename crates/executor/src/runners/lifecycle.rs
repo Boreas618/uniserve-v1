@@ -299,19 +299,29 @@ impl Lifecycle {
         // kind changed. A recapture that says only "the structure changed" leaves the reader to
         // guess whether a program was built differently or the same program is ordered differently.
         let mismatch = served.structure_mismatch(&walked.nodes)?;
-        if unannotated || mismatch.is_some() {
+        // A serving graph whose own table left a launch unexplained cannot be rebound for any
+        // program: the parameters of that launch have no node to land on, and the bucket would be
+        // reported as prepared while it kept running the kernel the update replaced. The structure
+        // comparison cannot see it - both tables are empty at the same positions - so it is its own
+        // condition, and it is a recapture.
+        let reboundable = served.nodes_complete();
+        if unannotated || !reboundable || mismatch.is_some() {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments. The generation being
             // replaced keeps its own graph and executable, which a revert serves from.
             let held = hold_kernels(kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
-            if unannotated {
+            if unannotated || !reboundable {
+                // The recorder's defect, not the capture's: the launches ran and the graph holds
+                // their nodes, and the table that should name them is empty at some position.
                 tracing::error!(
                     bucket = %bucket,
                     generation,
-                    "the walk reported no node table; recaptured the bucket rather than silently \
-                     rebinding nothing"
+                    walk_annotated = !unannotated,
+                    serving_annotated = reboundable,
+                    "a node table left launches unexplained; recaptured the bucket rather than \
+                     rebinding fewer nodes than the graph launches"
                 );
             } else {
                 tracing::info!(
