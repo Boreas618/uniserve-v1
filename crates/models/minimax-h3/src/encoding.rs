@@ -1339,8 +1339,8 @@ impl VideoEncoder {
                 // The input convolution reads padded pixels and normalizes nothing of its own.
                 pad(&mut programs, u64::from(*width) + 2);
                 // Each level's blocks run at the level's incoming extent and its incoming width.
-                for (index, out) in stack.widths.iter().enumerate() {
-                    let extent = extents[index];
+                for (index, extent) in extents.iter().take(stack.widths.len()).enumerate() {
+                    let extent = *extent;
                     let channels = if index == 0 {
                         stack.input_channels
                     } else {
@@ -1369,13 +1369,14 @@ impl VideoEncoder {
                             true,
                             padded,
                         ));
-                        // The block's residual add, keyed on the **row width** and not on the element
-                        // count: the launch reshapes the level to `[frames · pixels, channels]` and
-                        // takes the descriptor's columns from the last dimension
-                        // (`nn/src/layers/residual.rs`'s `forward`, `target.shape.last()`). Stating
-                        // the element count here named 36 keys no launch asks for, at widths up to
-                        // 2.2e9, and a package cannot serve a key nothing launches.
-                        let columns = u64::from(*out);
+                        // The block's residual add is keyed on the level's **width in pixels**, and
+                        // the recorder is the witness: `block` adds `rows(out)` to `rows(residual)`,
+                        // `rows` takes `dim(4)` of a `[1, channels, frames, height, width]` buffer as
+                        // its columns, and that is the width. So the raster is load-bearing for this
+                        // row - 672x1536 launches at 1536, 768, 384, 192 and 96, and 768x1024 at 1024,
+                        // 512, 256, 128 and 64 - and a statement keyed on the channel count names a
+                        // key no launch asks for while leaving every key it does ask for unstated.
+                        let columns = u64::from(extent.width);
                         // Stated or refused, never silently omitted: a width the descriptor cannot
                         // hold cannot be launched either, so swallowing the refusal would turn a
                         // configuration this VAE cannot run into a program list that looks complete.
@@ -2912,35 +2913,45 @@ mod tests {
             "a raster changes the pads' columns, not the frame statistics"
         );
 
-        // **The residuals are the levels' channel widths, and no raster can change them.** A block's add
-        // reshapes the level to `[frames · pixels, channels]` and the descriptor takes the last
-        // dimension, so the aligned packing of a raster reaches the pads and never the residuals - and a
-        // statement that keyed the element count instead would move with every raster, which is the
-        // shape of the defect this row replaced.
+        // **The residuals are keyed on the levels' widths in pixels, so the raster moves them.** A
+        // block adds `rows(out)` to `rows(residual)`, and `rows` takes `dim(4)` of a
+        // `[1, channels, frames, height, width]` buffer as its columns - the width, not the channel
+        // count. The recorder is the independent witness: 672x1536 launches at 1536, 768, 384, 192 and
+        // 96, and 768x1024 at 1024, 512, 256, 128 and 64.
         let residuals = |rows: &[(String, String)]| -> Vec<String> {
             rows.iter()
                 .filter(|(name, _)| name == "scaled_add")
                 .map(|(_, key)| key.clone())
                 .collect()
         };
-        assert_eq!(
+        assert_ne!(
             residuals(&other),
             residuals(&programs),
-            "the residual rows are channel widths: a raster cannot move one"
+            "the residual columns are the levels' widths: a narrower raster launches narrower ones"
         );
         let stack = Stack::of(&config).expect("the stack");
-        for width in &stack.widths {
+        let extents = stack.extents(Extent {
+            frames: stack.clip.frames,
+            height: raster[0].0,
+            width: raster[0].1,
+        });
+        for extent in extents.iter().take(stack.widths.len()) {
+            let width = extent.width;
             assert!(
                 residuals(&programs)
                     .iter()
                     .any(|key| key.contains(&format!("columns_{width}_"))),
-                "no residual row for a level's {width} channels: {:?}",
+                "no residual row for a level {width} pixels wide: {:?}",
                 residuals(&programs)
             );
         }
-        // Two levels can share a width (`block_out_channels` repeats 256 and 512), and the rows are a
-        // set, so the count is over the **distinct** widths rather than over the levels.
-        let distinct: std::collections::BTreeSet<u32> = stack.widths.iter().copied().collect();
+        // Levels can share a width - `[2, 2, 2, 2, 1, 1]` makes the last two the same - and the rows
+        // are a set, so the count is over the **distinct** widths rather than over the levels.
+        let distinct: std::collections::BTreeSet<u32> = extents
+            .iter()
+            .take(stack.widths.len())
+            .map(|extent| extent.width)
+            .collect();
         assert_eq!(
             residuals(&programs).len(),
             distinct.len(),

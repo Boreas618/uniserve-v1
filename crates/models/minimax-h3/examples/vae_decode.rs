@@ -1024,10 +1024,29 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             (path.clone(), held, extents, payload)
         }
         (None, true) => {
+            // The **deployment's** canvas, not the latent flags' default: a drawn raster of extents no
+            // request can name is a raster no deployment serves, and this path exists to run the pair at
+            // the canvas the rows are keyed for. A flag pair that names an offered canvas is honoured;
+            // anything else - including the defaults - draws the first of the six.
+            let offered = offered_canvases();
+            let first = offered.first().ok_or_else(|| {
+                Failure::message("the deployment offers no canvas to draw".to_owned())
+            })?;
+            let canvas = offered
+                .iter()
+                .find(|canvas| {
+                    canvas.height == args.latent_height * ratio
+                        && canvas.width == args.latent_width * ratio
+                })
+                .unwrap_or(first);
             let frames = config.video_vae.clip_length;
-            let rows = args.latent_height * ratio;
-            let columns = args.latent_width * ratio;
-            let (held, extents, payload) = pattern_pixels(frames, rows, columns)?;
+            println!(
+                "raster: drawing the {} canvas, {frames} frames of {} x {} pixels",
+                canvas.name(),
+                canvas.height,
+                canvas.width
+            );
+            let (held, extents, payload) = pattern_pixels(frames, canvas.height, canvas.width)?;
             (PathBuf::from("drawn"), held, extents, payload)
         }
         (None, false) => {
@@ -1088,6 +1107,27 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             pixels_path.display(),
             names.join(", ")
         )));
+    }
+    // **The frame count, before a weight is opened.** The encoder reads one still or one clip, and the
+    // clip's length is the configuration's: a raster of any other count has no path through the
+    // network, so the refusal belongs here rather than inside the first launch - a caller with a
+    // 3-frame container would otherwise load 4.5 GiB of weights to be told it cannot be read.
+    let clip_frames = config.video_vae.clip_length;
+    if frames != 1 && frames != clip_frames {
+        return Err(Failure::message(format!(
+            "{}: {frames} frames; the video encoder reads one still (1) or one {clip_frames}-frame \
+             clip, and a condition longer than a clip is cut by the runner into clips of that length",
+            pixels_path.display()
+        )));
+    }
+    // And `--frames` is a decode flag: this stage derives the latent's frame count from the raster and
+    // the encoder's own arithmetic, so a stated count would be silently replaced - refused instead.
+    if args.frames.is_some() {
+        return Err(Failure::message(
+            "stage `raster` derives the frame count from the raster and the encoder's clip \
+             arithmetic; `--frames` belongs to `--stage decode`, which reads a latent of that count"
+                .to_owned(),
+        ));
     }
     if !rows.is_multiple_of(ratio) || !columns.is_multiple_of(ratio) {
         return Err(Failure::message(format!(
