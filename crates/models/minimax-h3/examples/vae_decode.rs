@@ -566,6 +566,9 @@ fn stage_decode(args: &Args) -> Result<()> {
             directory.display()
         );
     }
+    // The clip's latent frames, named once: the messages below state the container in both of the
+    // forms a caller may hand this stage, and a bare `{}` twice is a place a wrong number can hide.
+    let latent_frames = canvas.frames;
     let (latent_bytes, generated) = match &args.latents {
         Some(path) if !path.exists() && is_index(path) => {
             // A bare number is an *evaluation index*, not a path, and three runs have now stopped on
@@ -588,27 +591,51 @@ fn stage_decode(args: &Args) -> Result<()> {
             // value and what the stage expects is the difference between a command to correct and a
             // defect to hunt.
             return Err(Failure::message(format!(
-                "`--latents {}`: no such file. The flag takes the path of an `.h3t` container holding \
-                 the clip's `[1, {latent_channels}, {}, H, W]` latents - leave it out and the stage \
-                 draws its fixed pattern instead, and writes it to <out>/video_decoder/latents.h3t",
+                "`--latents {}`: no such file. The flag takes an `.h3t` container holding either the \
+                 clip's `[1, {latent_channels}, {latent_frames}, H, W]` latents or a denoiser's trajectory \
+                 `[{latent_channels}, {latent_frames}, H, W]` in FP32, which is what stage 3 writes - leave it \
+                 out and the stage draws its fixed pattern instead, and writes it to \
+                 <out>/video_decoder/latents.h3t",
                 path.display(),
-                canvas.frames,
             )));
         }
-        Some(path) => (
-            read_h3t(
-                path,
-                &[
-                    1,
-                    latent_channels,
-                    canvas.frames.into(),
-                    u64::from(args.latent_height),
-                    u64::from(args.latent_width),
-                ],
-                container,
-            )?,
-            false,
-        ),
+        Some(path) => {
+            // Two forms are read: this stage's own `[1, C, frames, H, W]` at the decode's element type,
+            // and the **trajectory's** `[C, frames, H, W]` as a denoiser writes it - FP32, because the
+            // sample is. The second is narrowed to the decode's type here and says so, so a pipeline of
+            // stage 3 then stage 2 is one command rather than a hand conversion nobody records.
+            let (held, extents, payload) = read_container(path)?;
+            let wanted = [
+                1,
+                latent_channels,
+                canvas.frames.into(),
+                u64::from(args.latent_height),
+                u64::from(args.latent_width),
+            ];
+            let trajectory = [
+                latent_channels,
+                canvas.frames.into(),
+                u64::from(args.latent_height),
+                u64::from(args.latent_width),
+            ];
+            if held == container && extents == wanted {
+                (payload, false)
+            } else if extents == trajectory {
+                println!(
+                    "latents: {} - trajectory form {extents:?} of element code {held}, converted to \
+                     {dtype}",
+                    path.display()
+                );
+                (convert_latents(&payload, held, dtype)?, false)
+            } else {
+                return Err(Failure::message(format!(
+                    "{}: holds {extents:?} of element type {held}. This stage reads its own \
+                     {wanted:?} of {container}, or a denoiser's trajectory {trajectory:?} of code \
+                     {CONTAINER_F32} (FP32), which it narrows to {dtype}",
+                    path.display()
+                )));
+            }
+        }
         None => (
             pattern_latents(
                 1,
@@ -1256,7 +1283,8 @@ fn is_index(path: &Path) -> bool {
 }
 
 /// Read a `.h3t` container, refusing a shape or an element type this run cannot use.
-fn read_h3t(path: &Path, shape: &[u64], dtype: u8) -> Result<Vec<u8>> {
+/// A container's three parts: its element code, its extents, and its payload.
+fn read_container(path: &Path) -> Result<(u8, Vec<u64>, Vec<u8>)> {
     let bytes = std::fs::read(path)
         .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
     if bytes.len() < 6 || &bytes[..4] != b"H3D1" {
@@ -1276,13 +1304,59 @@ fn read_h3t(path: &Path, shape: &[u64], dtype: u8) -> Result<Vec<u8>> {
         })?;
         extents.push(u64::from_le_bytes(word.try_into().unwrap_or_default()));
     }
-    if held != dtype || extents != shape {
+    Ok((held, extents, bytes[6 + rank * 8..].to_vec()))
+}
+
+/// The container's element code for FP32, which is what a denoiser's trajectory holds.
+const CONTAINER_F32: u8 = 1;
+
+/// Re-encode a latent payload from element type `held` to the decode's `dtype`.
+///
+/// The trajectory a denoiser writes is the sample's own type, which is FP32, while this stage holds the
+/// VAE in the checkpoint's half precision: the pipeline therefore has one narrowing between the draw and
+/// the decode, and the reference makes the same one (`latents.to(dtype)` before its decoder). It is
+/// stated on the run's own line, never silent, and only the two float widths this pipeline uses convert -
+/// a file of any other type is refused by name rather than reinterpreted.
+fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
+    let from = match held {
+        CONTAINER_F32 => 4_usize,
+        other if other == element_of(DType::F16).unwrap_or(u8::MAX) => 2,
+        other => {
+            return Err(Failure::message(format!(
+                "a latent of element code {other} cannot be converted: this stage converts FP32 to \
+                 the decode's type and nothing else"
+            )));
+        }
+    };
+    let to = usize::try_from(dtype.bytes().unwrap_or(0)).map_err(|_| {
+        Failure::message(format!(
+            "the decode is {dtype}, a width this stage cannot write"
+        ))
+    })?;
+    if from == to {
+        return Ok(bytes.to_vec());
+    }
+    if !bytes.len().is_multiple_of(from) {
         return Err(Failure::message(format!(
-            "{}: holds {extents:?} of element type {held}, and this stage reads {shape:?} of {dtype}",
-            path.display()
+            "{} bytes is not a whole number of {from}-byte elements",
+            bytes.len()
         )));
     }
-    Ok(bytes[6 + rank * 8..].to_vec())
+    let mut out = Vec::with_capacity(bytes.len() / from * to);
+    for element in bytes.chunks(from) {
+        let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
+        match dtype {
+            DType::F16 => out.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
+            other => {
+                return Err(Failure::message(format!(
+                    "the decode is {other}, which this stage has no conversion to"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The latents a run without `--latents` uses: a fixed pattern, so two runs of this harness agree and
@@ -1408,4 +1482,57 @@ fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTAINER_F32, Failure, convert_latents};
+    use nn::DType;
+
+    /// The one narrowing the pipeline makes: a denoiser's FP32 latent, read by a decode whose element
+    /// type is the checkpoint's half precision.
+    #[test]
+    fn a_trajectory_latent_narrows_to_the_decodes_type() {
+        let values: [f32; 4] = [1.0, 1.5, -2.0, 0.5];
+        let source: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let narrowed = match convert_latents(&source, CONTAINER_F32, DType::F16) {
+            Ok(narrowed) => narrowed,
+            Err(Failure::Message(message)) => panic!("the narrowing: {message}"),
+        };
+        // Each expectation is the half-precision encoding of the value, written from the format's own
+        // fields: sign, exponent biased by 15, and ten mantissa bits.
+        let wanted: [u16; 4] = [0x3c00, 0x3e00, 0xc000, 0x3800];
+        assert_eq!(narrowed.len(), 2 * values.len());
+        for (element, want) in narrowed.as_chunks::<2>().0.iter().zip(wanted) {
+            assert_eq!(u16::from_le_bytes([element[0], element[1]]), want);
+        }
+    }
+
+    /// A decode already in FP32 takes the trajectory's bytes as they are: no conversion, no rounding.
+    #[test]
+    fn a_float_latent_read_at_its_own_width_is_copied_unchanged() {
+        let source: Vec<u8> = [0.25_f32, -1.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let same = match convert_latents(&source, CONTAINER_F32, DType::F32) {
+            Ok(same) => same,
+            Err(Failure::Message(message)) => panic!("the copy: {message}"),
+        };
+        assert_eq!(same, source);
+    }
+
+    /// An element type this stage has no conversion to is refused by name rather than reinterpreted as
+    /// bytes of another width.
+    #[test]
+    fn an_integer_latent_is_refused_by_its_element_code() {
+        let refused = convert_latents(&[0_u8; 8], 3, DType::F16);
+        assert!(
+            refused.is_err(),
+            "an i32 container is not a latent this stage reads"
+        );
+    }
 }
