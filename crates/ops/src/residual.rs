@@ -767,10 +767,10 @@ fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
         ));
     }
     let elements = args.target.shape.numel();
-    // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the only limit
-    // is the count itself. A 32-bit count is not enough: the video encoder's residual add at a
-    // 1536x672 canvas over a 17-frame clip is 17 * 1032192 * 128 = 2 246 049 792 elements, which
-    // is past `i32::MAX` and would be a launch this operator refused rather than a wrong number.
+    // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the count's
+    // type is the arithmetic's type. No launch today reaches `i32::MAX` — a call holds a tile, not
+    // a whole canvas — but a 32-bit count on a 64-bit offset space is an operator limit that no
+    // device imposes, and it costs nothing to not have one.
     if elements > i64::MAX as u64 {
         return Err(Error::argument(
             ScaledAdd::NAME,
@@ -816,10 +816,10 @@ mod scaled_add_tests {
     }
 
     #[test]
-    /// The kernel takes the extent as an `i64`, so a row set that is one row of the video
-    /// encoder's largest residual add is a legal call. The count `17 * 1032192 * 128` is past
-    /// `i32::MAX`, and a 32-bit extent would have refused it — an operator limit, not a device
-    /// one, since the kernel computes every offset in `int64` already.
+    /// The count's type is the arithmetic's type: the kernel computes every offset in `int64`, so
+    /// the extent is an `i64` and a call is limited by its tensor rather than by a 32-bit field.
+    /// This count is past `i32::MAX` and is used here as the widest the type admits, not as one
+    /// the model launches — a launch holds a tile.
     fn a_call_past_the_int32_count_is_a_call_and_not_a_refusal() {
         const WIDEST_ENCODER_ROW: u64 = 2_246_049_792;
 
