@@ -1201,57 +1201,9 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             extent += VAE_SPATIAL_COMPRESSION;
         }
     }
-    // The **video encoder's** seam blends, derived from the code rather than written down: the tile grid
-    // of every canvas the model serves (`NAMED_CANVASES`) and the latent-space widths its seams produce.
-    //
-    // The encoder works on the latent grid, so its blend width is a decoder-space overlap divided by the
-    // spatial compression (`Grid::blends` over `Seams::split`'s overlaps, `encoding.rs`). Asking the grid
-    // itself for those widths is the point: the numbers depend on the raster, a canvas the config gains
-    // later would add one, and a transcription would go stale silently - a blend's extent divides its
-    // weights, so a wrong width fades a seam by the wrong ramp and no shape check sees it.
-    //
-    // One extent-1 layer is built unconditionally for the placement of a tile that has no neighbour
-    // (`tiled_encode.rs`), so it belongs in the set with the derived ones.
-    {
-        let mut widths: Vec<u32> = vec![1];
-        for canvas in minimax_h3::NAMED_CANVASES {
-            // A named canvas is a legal raster, so its grid exists; a refusal here is a defect in the
-            // canvas list rather than in this list, and it must not be silently skipped.
-            let Ok(grid) = minimax_h3::encoding::Grid::of(canvas.height, canvas.width) else {
-                panic!(
-                    "the named canvas {}x{} has no tile grid",
-                    canvas.height, canvas.width
-                );
-            };
-            for overlap in minimax_h3::encoding::Grid::blends(&grid.rows)
-                .into_iter()
-                .chain(minimax_h3::encoding::Grid::blends(&grid.columns))
-            {
-                // `Grid::blends` answers the latent-space widths itself (it divides the pixel overlaps
-                // by the spatial compression); a zero is an axis with no seam.
-                if overlap != 0 {
-                    widths.push(overlap);
-                }
-            }
-        }
-        widths.sort_unstable();
-        widths.dedup();
-        for extent in widths {
-            for axis in [2_u32, 3] {
-                push(
-                    "cross_fade",
-                    ops::cross_fade::Descriptor {
-                        dtype: DType::F32,
-                        extent,
-                        axis,
-                        block: ops::cross_fade::BLOCK,
-                        pdl: PDL,
-                    }
-                    .to_string(),
-                );
-            }
-        }
-    }
+    // The video encoder's seam blends are **not** written here: `ClipEncoder::programs` states them
+    // from `Grid::blends` over the canvases the deployment offers, and a typed ladder beside it was a
+    // second answer that had to be kept in step by hand. `Deployment::vae_rows` calls it.
     // The video decoder's per-head normalization fused with its rotation - **no learned gain**, which
     // is what `affine_false` states and what makes this a different program from the DiT's row.
     //
@@ -1340,15 +1292,17 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width, at **the stack's own
-    // element type**: `transformer.rs` launches `Silu::descriptor_of(dtype, config.time_hidden_dim)`
-    // from the stack's `dtype`, and the stage-5 walk launched it at `f16` for an f16 deployment. A row
-    // at FP32 alone was this file's defect: the AdaLN *pair* downstream is FP32, but the activation
-    // that feeds it is not, and a BF16 deployment would have stopped on this key.
+    // The timestep embedding's activation, over the transformer's hidden width, at **FP32 - the
+    // checkpoint's own type for `time_embedder`**, which is one of the twelve F32 tensors the
+    // component stores. The model's own forward says so and it says it one-sidedly: the recorder
+    // states `silu dtype_f32_columns_5376` and **no BF16 `silu` at all** - so a row at the stack's
+    // type was this file's defect in the direction that stops a run, and the caller's run stopped on
+    // it by name. `transformer.rs` derives the activation's type from the embedder's weights, not
+    // from the stack's.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: deployment,
+            dtype: DType::F32,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,

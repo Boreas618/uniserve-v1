@@ -28,6 +28,13 @@
 //!
 //! The two payloads must differ: a decode that left its input in place is a silent failure the exit
 //! code would otherwise pass.
+//!
+//! **The stitch's layout.** `--stage decode` decodes the clip's tiles in `Tile` order, because the
+//! stitch reads what the tile above and the tile to its left have already written, and it hands the
+//! stitch the plan's tiled layout: `latents` in tile order, the largest tile's position table, and the
+//! clip's raster. A tile's neighbour is not one contiguous block of a raster wider than the tile, and
+//! the blend addresses its sources flat, so the stitch copies the neighbour into one tile-shaped block
+//! first - which is why the raster may be any width and why the walk states a `copy_block` row.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
