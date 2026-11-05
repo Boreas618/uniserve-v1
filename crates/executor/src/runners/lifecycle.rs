@@ -557,13 +557,32 @@ pub(crate) fn hold_kernels(
     Ok(held)
 }
 
+/// How many launches' node lists a capture reports at `debug` before it stops reporting them.
+///
+/// The first few say whether attribution is empty from the first launch or only once the capture
+/// has advanced, which is the difference between a recorder that cannot see nodes and one that saw
+/// them all at once.
+const REPORTED_LAUNCHES: usize = 4;
+
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
         // The walk's edges, not only its nodes: a programmatic edge orders less than a
         // completion edge, and 4.5's rebind condition compares the structure those kinds make.
         let recorded = self.capture.borrow_mut().record_walk();
         match recorded {
-            Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
+            Ok(nodes) => {
+                let launch = self.nodes.len();
+                if launch < REPORTED_LAUNCHES {
+                    tracing::debug!(
+                        launch,
+                        operator,
+                        key,
+                        nodes = nodes.len(),
+                        "a capture's launch reported the nodes it added"
+                    );
+                }
+                self.nodes.push((operator, key.to_owned(), nodes));
+            }
             Err(error) => {
                 if self.failure.is_none() {
                     self.failure = Some(error);
