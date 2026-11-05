@@ -1292,15 +1292,17 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width, at **the stack's own
-    // element type**: `transformer.rs` launches `Silu::descriptor_of(dtype, config.time_hidden_dim)`
-    // from the stack's `dtype`, and the stage-5 walk launched it at `f16` for an f16 deployment. A row
-    // at FP32 alone was this file's defect: the AdaLN *pair* downstream is FP32, but the activation
-    // that feeds it is not, and a BF16 deployment would have stopped on this key.
+    // The timestep embedding's activation, over the transformer's hidden width, at **FP32 - the
+    // checkpoint's own type for `time_embedder`**, which is one of the twelve F32 tensors the
+    // component stores. The model's own forward says so and it says it one-sidedly: the recorder
+    // states `silu dtype_f32_columns_5376` and **no BF16 `silu` at all** - so a row at the stack's
+    // type was this file's defect in the direction that stops a run, and the caller's run stopped on
+    // it by name. `transformer.rs` derives the activation's type from the embedder's weights, not
+    // from the stack's.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: deployment,
+            dtype: DType::F32,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,
