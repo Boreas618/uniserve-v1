@@ -135,6 +135,7 @@ pub use install::{Module, install, operator_name, operators};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
 pub use op::Op;
 pub use phase::PhaseKind;
+pub use platform::zero_bytes;
 pub use platform::{
     CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
 };
