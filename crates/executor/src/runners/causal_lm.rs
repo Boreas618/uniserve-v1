@@ -1192,6 +1192,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// launch carries and the pointers the kernel dereferences. A kernel handed a table of zeros or
     /// a bound of one reads nothing, and no host-side figure says which.
     pending_attention: Option<String>,
+    /// Whether this runner has served a batch. A bucket captured before that may be warmed by an
+    /// eager walk; one captured afterwards may not, because the walk would run a forward over an
+    /// arena a serving bucket owns.
+    served: bool,
     pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
@@ -1311,6 +1315,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             cache_page: None,
             pending_attention: None,
+            served: false,
             pending_install: None,
             pending_dump: None,
             last_prefill: None,
@@ -1719,6 +1724,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                          holds: the bound was taken from the pose the bucket was captured with"
                     );
                 }
+                self.served = true;
                 if runner_dump() {
                     let call = format!(
                         "{}{}",
@@ -1851,9 +1857,45 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// executable are the same for every runner, so those live in [`Lifecycle`].
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
+        self.warm(bucket, &kernels)?;
         let stream = self.stream.clone();
         let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
+    }
+
+    /// Walks a bucket's pose once *before* it is captured, so every operator's first-use host work
+    /// is done outside the recording.
+    ///
+    /// A capture records launches, not the host work behind them. An operator that builds a runner,
+    /// loads a cubin or compiles a module on its first call does that work inside the recording, and
+    /// the graph then replays a launch whose preparation never happened again - which is how a
+    /// captured attention writes nothing while the same call outside a graph works. One eager walk
+    /// of the same pose makes every operator ready, so the capture records launches of things that
+    /// exist. The operator's entry can refuse a capture that meets an unprepared runner; this is what
+    /// keeps that refusal from firing on a healthy warmup.
+    ///
+    /// It runs only where a bucket is first captured - a warmup, before the bucket serves - and not
+    /// where a bucket is rebound: a hot update's new operators are warmed by the shadow pass, and an
+    /// eager walk of a new generation over a serving bucket's own arena is work the switchover
+    /// design does not allow.
+    fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
+        if self.served {
+            // A bucket recaptured after serving is recaptured because a program changed, and the
+            // operator that changed was warmed by its shadow pass; an eager forward here would run
+            // over the arena a serving bucket owns.
+            return Ok(());
+        }
+        let began = std::time::Instant::now();
+        self.walk(bucket, kernels)?;
+        // The warm launches are real device work on the pool's stream; a capture begun over them is
+        // legal and does not contain them, but nothing may plan a mapping while they are in flight.
+        self.stream.synchronize()?;
+        tracing::debug!(
+            bucket = %bucket,
+            warm_ms = began.elapsed().as_secs_f64() * 1e3,
+            "a bucket's operators were warmed before its capture"
+        );
+        Ok(())
     }
 
     /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
@@ -3828,6 +3870,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn stage_warm(&mut self, bucket: Bucket) -> Result<Shape> {
         let tokens = bucket.tokens as usize;
         let rows = bucket.rows as usize;
+        let span = warm_span(bucket);
         let columns = BatchColumns {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
@@ -3836,16 +3879,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
                 // pose that gave every row one token would describe a batch of `rows` tokens wearing
                 // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
-                seq_lens: {
-                    let mut lengths = vec![1_i32; rows];
-                    lengths[0] = bucket.tokens as i32;
-                    lengths
-                },
-                query_offsets: {
-                    let mut offsets = vec![bucket.tokens as i32; rows + 1];
-                    offsets[0] = 0;
-                    offsets
-                },
+                seq_lens: span.0,
+                query_offsets: span.1,
                 logits_rows: vec![-1; rows],
                 calls: vec![nn::BatchRow {
                     request: 0,
@@ -4028,6 +4063,33 @@ pub fn calls_output(
 /// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
 /// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
 /// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+/// The span a warm pose states: `seq_lens` per row, and `query_offsets` per row boundary.
+///
+/// A prefill row carries a multi-token run, so the first row holds the bucket's whole extent and the
+/// rest hold none - a partition of `num_tokens` into one run. **A decode row is one query token of
+/// its own sequence**, so its partition is the identity: row `i` holds `cum_seq_lens_q[i]..[i + 1]`,
+/// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
+/// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
+/// partition no tensor has computes a tiling and a mask that no buffer matches.
+fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
+    let rows = usize::try_from(bucket.rows).unwrap_or(0);
+    let tokens = bucket.tokens as i32;
+    let mut lengths = vec![1_i32; rows];
+    let offsets = if bucket.variant.is_decode() {
+        (0..=rows as i32).collect()
+    } else {
+        if let Some(first) = lengths.first_mut() {
+            *first = tokens;
+        }
+        let mut offsets = vec![tokens; rows + 1];
+        if let Some(first) = offsets.first_mut() {
+            *first = 0;
+        }
+        offsets
+    };
+    (lengths, offsets)
+}
+
 fn warm_parameters(rows: usize) -> Vec<f32> {
     let columns = ops::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
@@ -4111,6 +4173,33 @@ fn gather_indices(
 
 #[cfg(test)]
 mod tests {
+    use super::{Bucket, Variant, warm_span};
+
+    #[test]
+    fn a_decode_bucket_partitions_its_queries_one_per_row() {
+        // The defect this guards: the pose gave row 0 the whole run, which is the prefill partition,
+        // and the attention kernel then computed four queries in row 0 of a tensor holding one row
+        // per token - the launch that faulted at four rows and never at one.
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(
+            query_offsets,
+            vec![0, 1, 2, 3, 4],
+            "a decode row is one query token, so the partition is the identity"
+        );
+        assert_eq!(seq_lens, vec![1, 1, 1, 1], "one key per row in the warm pose");
+    }
+
+    #[test]
+    fn a_prefill_bucket_gives_its_first_row_the_whole_run() {
+        // A prefill row carries a multi-token run: the partition puts every token in row 0 and the
+        // reach of every other row at zero, which is what the kernel reads to split the run.
+        let bucket = Bucket::prefill(2, 512, Variant::PrefillOutput);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(query_offsets, vec![0, 512, 512]);
+        assert_eq!(seq_lens, vec![512, 1]);
+    }
+
     /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
     /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
     /// a diagnostic, it would fail the batch after it.
