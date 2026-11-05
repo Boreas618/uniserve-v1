@@ -401,6 +401,16 @@ def by_shape(args):
             shapes.setdefault(shape_of(operator, key), {}).setdefault(
                 path, set()
             ).update(types_of(key))
+    # An empty walk is not a walk. Every lane below compares the two sides, and a
+    # side with no rows makes all of them pass on any list - the same vacuity the
+    # canvas union check refuses when its parts stop differing.
+    empty = [path for path in args.walk if not read_lines(path)]
+    if empty:
+        raise SystemExit(
+            f"{', '.join(empty)}: a walk with no rows proves nothing - every"
+            " comparison here passes when one side is empty, so the run that"
+            " produced this file failed before it printed a row"
+        )
     fixture = read_lines(args.fixture)
     held = {shape_of(operator, key) for operator, key in fixture}
 
@@ -590,6 +600,25 @@ def self_test() -> int:
     # states a count it does not hold, a repeated line, and an operator `crates/ops` does not
     # define. Each is a failure of the file rather than a missing row, so no walk comparison sees
     # it - the count is quoted by every reader after it.
+    # A walk with no rows must be refused rather than compared: every comparison
+    # below passes when one side is empty, which is what this checks.
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        blank = root / "empty.txt"
+        blank.write_text("")
+        held = root / "held.txt"
+        held.write_text(
+            "# 1 data row\nrms_norm\tdtype_bf16_columns_5376_block_1024\n"
+        )
+        try:
+            by_shape(
+                argparse.Namespace(walk=[str(blank)], fixture=str(held))
+            )
+        except SystemExit as refused:
+            assert "a walk with no rows proves nothing" in str(refused), refused
+        else:
+            raise AssertionError("an empty walk was compared instead of refused")
+
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         good = root / "good.txt"
