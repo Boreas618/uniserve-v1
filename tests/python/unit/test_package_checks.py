@@ -153,3 +153,22 @@ def test_an_empty_store_is_not_a_green(sweep, tmp_path):
     assert not sweep.store_holds_cells(tmp_path)
     (tmp_path / "op" / "triton" / "1" / "sm_100a" / "key" / "metadata.json").write_text("{}")
     assert sweep.store_holds_cells(tmp_path)
+
+
+def test_a_comparison_that_compared_nothing_is_not_a_pass(sweep, tmp_path):
+    """Exit 0 over zero cells is the green that is worse than a refusal."""
+    install(
+        tmp_path,
+        "kernel_arguments.py",
+        """
+        import sys
+        print("0 cell(s) compared in order against the packages that wrote them")
+        print("0 problem(s), 3 gap(s)")
+        sys.exit(0)
+        """,
+    )
+
+    outcome, detail, _ = sweep.run_tree_check(tmp_path, "kernel_arguments.py", ("--check",), 60)
+
+    assert outcome == "unrunnable"
+    assert "compared no cell" in detail

@@ -370,6 +370,16 @@ def run_tree_check(root, name, arguments, timeout):
     output = (completed.stdout + completed.stderr).strip().splitlines()
     summary = output[0] if output else ""
     if completed.returncode == 0:
+        # Exit 0 means "no disagreement", and a comparison that compared nothing has none: the tool
+        # prints how many cells it read, and a zero there is the green that is worse than a refusal.
+        # `store_holds_cells` refuses an empty store before this runs; this closes the case where the
+        # store holds cells and none of them answers a row of the fixture.
+        if summary.startswith("0 cell(s) compared"):
+            return (
+                "unrunnable",
+                f"tools/{name} compared no cell of this fixture: {summary}",
+                "",
+            )
         return ("passed", summary, "")
     if completed.returncode == 1 and not any("Traceback (most recent call last)" in line for line in output):
         problems = [line.strip() for line in output if line.strip().startswith("problem:")]
