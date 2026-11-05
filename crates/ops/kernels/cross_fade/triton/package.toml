@@ -5,8 +5,10 @@
 # [channels, frames, height, width] tile. The weights are the decoded dtype's own arithmetic, so the
 # operator's tolerance is exact and one implementation produces the reference's bits.
 #
-# The axis and the block are compiled; `extent`, the tile's four extents, the destination's three
-# outer strides and the PDL flag are the launch's words. `out` may alias `current`.
+# The axis and the block are compiled; `extent`, the tile's four extents, **each of the three views'
+# three outer strides** and the PDL flag are the launch's words. The strides travel because a source
+# may be a view inside the raster the tiles were decoded into — the seam the decoder passes is one —
+# and `out` may still alias `current`.
 
 op = "cross_fade"
 backend = "triton"
