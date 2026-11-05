@@ -17,8 +17,8 @@ use std::ops::{Deref, Range};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use platform::Stream;
 use ipc::{CacheTransfer, Locator, Wake};
+use platform::Stream;
 use tvm_ffi::{Any, AnyView};
 
 use super::{CacheImport, CacheImporter};
@@ -54,7 +54,7 @@ impl ImportWorkspace {
 
     /// Allocate a workspace for `planes` on its own ordinary stream and
     /// construct the unit resets and the page conversion on it.
-    pub(crate) fn bind(planes: &CachePlanes) -> Result<Self> {
+    pub(crate) fn bind(planes: &Arc<CachePlanes>) -> Result<Self> {
         let (elements, scales) = planes.plan().page_extents();
         let bytes = Self::scratch_bytes(elements, scales) as usize;
         let (stream, scratch) = match planes.device() {
@@ -185,9 +185,7 @@ pub(crate) struct ImportCopy {
 impl ImportCopy {
     /// Reset newly allocated destination units on the workspace's stream.
     pub(super) fn reset(&self, workspace: &ImportWorkspace) -> Result<()> {
-        workspace
-            .units
-            .zero(&self.planes, &self.initialized, workspace.stream())
+        workspace.units.zero(&self.initialized, workspace.stream())
     }
 
     /// Copy cache values and retain every physical transport read on the
@@ -447,7 +445,7 @@ impl GroupCopy<'_> {
         let units: Vec<u32> = spans.iter().map(|&(unit, _, _)| unit).collect();
         self.workspace
             .units
-            .mark_initialized(planes, &units, self.workspace.stream())
+            .mark_initialized(&units, self.workspace.stream())
     }
 
     fn converted(&self, locators: &mut [Vec<Option<Arc<Locator>>>]) -> Result<()> {

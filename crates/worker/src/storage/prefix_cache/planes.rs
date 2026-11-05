@@ -1,7 +1,8 @@
 //! The cache unit pool's device storage and its unit-level resets.
 //!
-//! Each field (key, value) owns separate allocations in the layout the
-//! numerical cache library reads (`uniserve.prefix_cache.units`):
+//! Each field (key, value) owns separate allocations in the layout the cache
+//! computations read - the executor's operators, and the unit resets below,
+//! which address these fields directly:
 //!
 //! | Field | Element | Shape |
 //! | --- | --- | --- |
@@ -41,9 +42,7 @@ use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 use tvm_ffi::Any;
 
 use super::plan::CachePlan;
-use crate::ffi::{
-    Backing, DType, DeferredCall, Function, Handle, Interpreter, MemoryKind, strings,
-};
+use crate::ffi::{Backing, DType, strings};
 use crate::storage::allocation::{Storage, StorageView};
 use crate::storage::retained::{
     ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
@@ -955,6 +954,41 @@ impl CachePlanes {
         Ok(())
     }
 
+    /// Set the initialization flags of units `[first, first + count)` in every
+    /// column, in `stream` order: what a committed import or a restored set of
+    /// pages states about the units whose values it wrote.
+    pub(crate) fn mark_units_initialized(
+        &self,
+        first: u32,
+        count: u32,
+        stream: impl Issue,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.require_unit(first + count - 1)?;
+        let units = self.num_units as usize;
+        let columns = self.plan.columns as usize;
+        let (first, count) = (first as usize, count as usize);
+        // Units `[first, first + count)` of every column: one row per column,
+        // a column's units apart.
+        for field in 0..2 {
+            let fill = RowFill {
+                address: self.initialized[field].address() + first as u64,
+                pitch: units,
+                value: 1,
+                width: 1,
+                count,
+                height: columns,
+            };
+            // SAFETY: the rows lie inside the flag allocations owned by this
+            // pool, whose units the caller has mapped; the caller orders the
+            // fills.
+            unsafe { stream.memset_2d(fill) }?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
     }
@@ -1192,119 +1226,61 @@ impl CachePlanes {
     }
 }
 
-/// One stream's binding of the scattered unit resets: a Rust-owned column of
-/// unit ids and the Python operations that read its prefix.
+/// The scattered unit resets of one stream: the units a recycle, an import or
+/// a restore prepares, reset in the pool's own address space.
 ///
-/// A column is reused only in its stream's order: an upload for the next
-/// operation is ordered after the previous operation's kernels.
+/// A reset of scattered units cannot be one fill, so the pool resets each run
+/// of consecutive units with its own fills, in the stream's order, over the
+/// fields the pool already owns. Nothing is bound and nothing is allocated:
+/// the unit ids are known on the host, so no column of ids and no numerical
+/// library call are involved.
 pub struct UnitColumn {
-    units: StorageView,
+    planes: Arc<CachePlanes>,
     stream: Option<usize>,
-    /// The library's `UnitResets` over the column and the pool's fields.
-    resets: Handle,
-    zero: Function,
-    recycle: Function,
-    mark_initialized: Function,
 }
 
-/// The library class of the scattered unit resets.
-const UNIT_RESETS: &str = "uniserve.prefix_cache.units.UnitResets";
-
 impl UnitColumn {
-    /// Device bytes of a column over a pool of `num_units` units: one int64
-    /// unit index each.
+    /// Bytes one column of `num_units` unit indices is charged: one `i64` per
+    /// unit, per column of a pool.
+    ///
+    /// The resets address the pool's fields directly, so the plan's figure
+    /// covers no storage a reset maps; it is the plan's account of the unit
+    /// index the resets used to keep on the device, kept until the plan is
+    /// refitted without it.
     pub(crate) fn bytes(num_units: u32) -> u64 {
         u64::from(num_units) * DType::I64.bytes() as u64
     }
 
-    /// Allocate a column for `planes` and construct the library's
-    /// `UnitResets` over it on `stream` (`None` for a CPU pool).
-    pub(crate) fn bind(planes: &CachePlanes, stream: Option<&Stream>) -> Result<Self> {
-        let count = i64::from(planes.num_units);
-        let bytes = Self::bytes(planes.num_units) as usize;
-        // A column is rebuilt with the stream that binds it, so it is the
-        // worker's own storage.
-        let owner = match planes.device {
-            Some(device) => Storage::device(device, bytes)?,
-            None => Storage::host(bytes),
-        };
-        let units = StorageView::contiguous(owner as Arc<dyn Backing>, 0, DType::I64, &[count])?;
-
-        let mut arguments = vec![
-            units.handle()?.to_any(),
-            Any::from(stream.map_or(0, |stream| stream.raw() as i64)),
-        ];
-        arguments.extend(planes.field_arguments()?);
-        let resets = Handle::new(Interpreter::import(UNIT_RESETS)?.call_values(&arguments)?)?;
-        let method = |name: &str| Interpreter::import(&format!("{UNIT_RESETS}.{name}"));
+    /// Bind the resets of `planes` to `stream` (`None` for a host pool).
+    pub(crate) fn bind(planes: &Arc<CachePlanes>, stream: Option<&Stream>) -> Result<Self> {
+        if planes.device.is_some() != stream.is_some() {
+            return Err(Error::Invalid(
+                "device planes are reset on a stream of their device".into(),
+            ));
+        }
         Ok(Self {
-            units,
+            planes: Arc::clone(planes),
             stream: stream.map(Stream::raw),
-            resets,
-            zero: method("zero")?,
-            recycle: method("recycle")?,
-            mark_initialized: method("mark_initialized")?,
         })
     }
 
-    /// Write `units` into the column prefix in `stream` order.
-    fn upload(&self, planes: &CachePlanes, units: &[u32], stream: impl Issue) -> Result<i64> {
+    /// The column is bound to one stream: a reset must come from it.
+    fn require_stream(&self, stream: impl Issue) -> Result<()> {
         if stream.stream().map(Stream::raw) != self.stream {
             return Err(Error::Invariant(
                 "a unit column is used on the stream it was bound to".into(),
             ));
         }
-        if units.len() > planes.num_units as usize {
-            return Err(Error::Invalid(
-                "more cache units than the pool holds".into(),
-            ));
-        }
-        let ids = units
-            .iter()
-            .map(|&unit| planes.require_unit(unit).map(|()| i64::from(unit)))
-            .collect::<Result<Vec<_>>>()?;
-        let bytes = ids.len() * size_of::<i64>();
-        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-        batch.push(self.units.address(), ids.as_ptr() as u64, bytes);
-        match self.units.device() {
-            // SAFETY: the ids are read during the call; the column write is
-            // ordered on the stream after the previous operation that read
-            // it.
-            MemoryKind::Cuda(_) if stream.stream().is_some() => unsafe { stream.copy(&batch) }?,
-            // SAFETY: a host column is written in its issuer's order, after
-            // the previous operation that read it.
-            _ => unsafe { stream.host().copy(&batch) }?,
-        }
-        Ok(ids.len() as i64)
-    }
-
-    /// Upload `units` and run `function` over the column's prefix, in
-    /// `stream` order.
-    fn apply(
-        &self,
-        function: &Function,
-        planes: &CachePlanes,
-        units: &[u32],
-        stream: impl Issue,
-    ) -> Result<()> {
-        if units.is_empty() {
-            return Ok(());
-        }
-        let count = self.upload(planes, units, stream)?;
-        stream.call(DeferredCall::new(
-            function.clone(),
-            vec![self.resets.to_any(), Any::from(count)],
-        ))
+        Ok(())
     }
 
     /// Reset `units` completely: values zero, flags clear, scales one.
-    pub(crate) fn zero(
-        &self,
-        planes: &CachePlanes,
-        units: &[u32],
-        stream: impl Issue,
-    ) -> Result<()> {
-        self.apply(&self.zero, planes, units, stream)
+    pub(crate) fn zero(&self, units: &[u32], stream: impl Issue) -> Result<()> {
+        self.require_stream(stream)?;
+        for &unit in units {
+            self.planes.reset_units(unit, 1, true, stream)?;
+        }
+        Ok(())
     }
 
     /// Prepare units that held earlier tokens for a new owner. Readers never
@@ -1312,29 +1288,251 @@ impl UnitColumn {
     /// single-dtype unquantized pool needs no device work, a quantized one
     /// resets flags and scales, and a mixed-dtype pool is zeroed because
     /// stale bytes of one type need not decode as finite values of another.
-    pub(crate) fn recycle(
-        &self,
-        planes: &CachePlanes,
-        units: &[u32],
-        stream: impl Issue,
-    ) -> Result<()> {
-        if planes.plan.mixed_types() {
-            self.zero(planes, units, stream)
-        } else if planes.plan.quantized {
-            self.apply(&self.recycle, planes, units, stream)
-        } else {
-            Ok(())
+    pub(crate) fn recycle(&self, units: &[u32], stream: impl Issue) -> Result<()> {
+        self.require_stream(stream)?;
+        let plan = self.planes.plan();
+        if plan.mixed_types() {
+            return self.zero(units, stream);
         }
+        if !plan.quantized {
+            return Ok(());
+        }
+        // One fill per run of consecutive units, in the order the caller gave
+        // them: a reused unit's scales are one again, so a later import
+        // re-converts it, and a scattered release costs its runs and not its
+        // units.
+        for (first, count) in runs(units) {
+            self.planes.reset_units(first, count, false, stream)?;
+        }
+        Ok(())
     }
 
-    /// Commit transferred values and scales of whole units: set both
-    /// fields' initialization flags in every column.
-    pub(crate) fn mark_initialized(
-        &self,
-        planes: &CachePlanes,
-        units: &[u32],
-        stream: impl Issue,
-    ) -> Result<()> {
-        self.apply(&self.mark_initialized, planes, units, stream)
+    /// Commit transferred values and scales of whole units: set both fields'
+    /// initialization flags in every column, in runs like `recycle`.
+    pub(crate) fn mark_initialized(&self, units: &[u32], stream: impl Issue) -> Result<()> {
+        self.require_stream(stream)?;
+        for (first, count) in runs(units) {
+            self.planes.mark_units_initialized(first, count, stream)?;
+        }
+        Ok(())
+    }
+}
+
+/// The runs of consecutive unit ids a sorted, deduplicated list holds: `n`
+/// scattered units cost their runs, not their units.
+fn runs(units: &[u32]) -> Vec<(u32, u32)> {
+    let mut units = units.to_vec();
+    units.sort_unstable();
+    units.dedup();
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < units.len() {
+        let mut end = start + 1;
+        while end < units.len() && units[end] == units[end - 1] + 1 {
+            end += 1;
+        }
+        runs.push((units[start], (end - start) as u32));
+        start = end;
+    }
+    runs
+}
+
+#[cfg(test)]
+mod unit_reset_tests {
+    use super::super::plan::{CacheGroupPlan, GroupAxis};
+    use super::*;
+    use crate::ffi::Handle;
+
+    /// A host pool of `columns` columns and `num_units` units whose one group's
+    /// planes are `plane_bytes` each. The resets fill the pool's own fields, so
+    /// host storage is the whole pool they need.
+    fn host_pool(
+        columns: u32,
+        num_units: u32,
+        plane_bytes: u64,
+        quantized: bool,
+    ) -> Arc<CachePlanes> {
+        let cells = (columns * num_units) as usize;
+        let plane = plane_bytes as usize;
+        let group = CacheGroupPlan {
+            window: None,
+            state: false,
+            draft: false,
+            block_size: plane_bytes as u32 / 16,
+            units_per_page: 1,
+            layers: vec!["layers.0".to_owned()],
+            layer_ids: vec![0],
+            axis: GroupAxis {
+                offset: 0,
+                total: 1,
+            },
+            num_kv_heads: 1,
+            total_kv_heads: 1,
+            kv_head_offset: 0,
+            head_dim: 8,
+            dtype: DType::BF16,
+            compute_dtype: DType::BF16,
+        };
+        Arc::new(CachePlanes {
+            plan: Arc::new(CachePlan {
+                columns,
+                plane_bytes,
+                quantized,
+                unit_bytes: plane_bytes,
+                dtype: ipc::PrefixCacheDtype::BFloat16,
+                groups: vec![group],
+                states: Vec::new(),
+                checkpoints: Vec::new(),
+                handle: Handle::none(),
+            }),
+            device: None,
+            num_units,
+            segmenting: None,
+            values: [0, 1].map(|_| Storage::host(cells * plane)),
+            scales: quantized.then(|| [0, 1].map(|_| Storage::host(cells * 4))),
+            initialized: [0, 1].map(|_| Storage::host(cells)),
+            fields: Vec::new(),
+        })
+    }
+
+    /// Write `byte` over a whole storage: a pool a reset has to clear.
+    fn pattern(storage: &Storage, byte: u8) {
+        let len = unsafe { storage.host_bytes() }.expect("host storage").len();
+        // SAFETY: host storage this test owns, whole, and nothing reads it
+        // concurrently.
+        unsafe { std::ptr::write_bytes(storage.address() as *mut u8, byte, len) };
+    }
+
+    /// The bytes of unit `unit` of `column` in `storage`, `width` bytes a cell.
+    fn cell(storage: &Storage, units: u32, column: u32, unit: u32, width: usize) -> Vec<u8> {
+        let index = (column * units + unit) as usize;
+        let bytes = unsafe { storage.host_bytes() }.expect("host storage");
+        bytes[index * width..(index + 1) * width].to_vec()
+    }
+
+    /// A zero reset clears the values and the flags of exactly the units it
+    /// names, in every column, and leaves their neighbours alone.
+    #[test]
+    fn a_zero_reset_clears_the_units_it_names() -> Result<()> {
+        let (columns, units, plane) = (2, 8, 32);
+        let pool = host_pool(columns, units, plane, false);
+        for storage in pool.values.iter().chain(pool.initialized.iter()) {
+            pattern(storage, 0xAA);
+        }
+        let column = UnitColumn::bind(&pool, None)?;
+        column.zero(&[2, 3], None)?;
+
+        for field in 0..2 {
+            for named in [2, 3] {
+                for column_index in 0..columns {
+                    assert_eq!(
+                        cell(
+                            &pool.values[field],
+                            units,
+                            column_index,
+                            named,
+                            plane as usize
+                        ),
+                        vec![0; plane as usize],
+                        "field {field} of unit {named} in column {column_index} was not zeroed"
+                    );
+                    assert_eq!(
+                        cell(&pool.initialized[field], units, column_index, named, 1),
+                        vec![0],
+                        "the flag of unit {named} in column {column_index} was not cleared"
+                    );
+                }
+            }
+            assert_eq!(
+                cell(&pool.values[field], units, 0, 1, plane as usize),
+                vec![0xAA; plane as usize],
+                "a unit the reset did not name was written"
+            );
+            assert_eq!(
+                cell(&pool.initialized[field], units, 0, 1, 1),
+                vec![1],
+                "the flag of a unit the reset did not name was written"
+            );
+        }
+        Ok(())
+    }
+
+    /// A recycle of a quantized pool clears the flags and resets the scales to
+    /// one, and writes no value: a reused unit's stale values stay readable by
+    /// nothing, because its flag is clear.
+    #[test]
+    fn a_recycle_resets_the_scales_of_a_quantized_pool() -> Result<()> {
+        let (columns, units, plane) = (2, 8, 32);
+        let pool = host_pool(columns, units, plane, true);
+        let scales = pool.scales.as_ref().expect("a quantized pool holds scales");
+        for storage in pool.values.iter() {
+            pattern(storage, 0xAA);
+        }
+        for storage in pool.initialized.iter().chain(scales.iter()) {
+            pattern(storage, 0);
+        }
+        for storage in pool.initialized.iter() {
+            pattern(storage, 1);
+        }
+        let column = UnitColumn::bind(&pool, None)?;
+        column.recycle(&[5], None)?;
+
+        for field in 0..2 {
+            assert_eq!(
+                cell(&pool.initialized[field], units, 1, 5, 1),
+                vec![0],
+                "the flag of a recycled unit was not cleared"
+            );
+            assert_eq!(
+                cell(&scales[field], units, 1, 5, 4),
+                0x3F80_0000_u32.to_le_bytes().to_vec(),
+                "a recycled unit's scale is not one"
+            );
+            assert_eq!(
+                cell(&pool.values[field], units, 1, 5, plane as usize),
+                vec![0xAA; plane as usize],
+                "a recycle wrote a recycled unit's values"
+            );
+        }
+        Ok(())
+    }
+
+    /// A recycle of a dense pool of one element type writes nothing, and
+    /// marking units initialized sets their flags in every column.
+    #[test]
+    fn a_dense_recycle_writes_nothing_and_a_mark_sets_the_flags() -> Result<()> {
+        let (columns, units, plane) = (2, 8, 32);
+        let pool = host_pool(columns, units, plane, false);
+        for storage in pool.values.iter() {
+            pattern(storage, 0xAA);
+        }
+        let column = UnitColumn::bind(&pool, None)?;
+        column.recycle(&[4], None)?;
+        for field in 0..2 {
+            assert_eq!(
+                cell(&pool.values[field], units, 0, 4, plane as usize),
+                vec![0xAA; plane as usize],
+                "a dense recycle wrote a unit's values"
+            );
+        }
+
+        column.mark_initialized(&[6, 7], None)?;
+        for field in 0..2 {
+            for column_index in 0..columns {
+                for unit in [6, 7] {
+                    assert_eq!(
+                        cell(&pool.initialized[field], units, column_index, unit, 1),
+                        vec![1],
+                        "the flag of unit {unit} in column {column_index} was not set"
+                    );
+                }
+                assert_eq!(
+                    cell(&pool.initialized[field], units, column_index, 5, 1),
+                    vec![0],
+                    "a unit no mark named had its flag set"
+                );
+            }
+        }
+        Ok(())
     }
 }
