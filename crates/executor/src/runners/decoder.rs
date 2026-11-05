@@ -527,10 +527,10 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // denoise step publishes it under this request's name at every step. So the clip is copied
         // from there, ordered on this runner's stream, which is the only path that also works when
         // the denoiser ran on another device.
-        if let Some(products) = self.products.clone() {
-            if products.holds(request, Product::VideoLatents) {
-                return self.stage_product(bucket, request, products.as_ref());
-            }
+        if let Some(products) = self.products.clone()
+            && products.holds(request, Product::VideoLatents)
+        {
+            return self.stage_product(bucket, request, products.as_ref());
         }
         let row = Self::clip_of(media)?;
         let Some(latents) = row.first() else {
@@ -644,7 +644,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(TensorView::new(
             ops::DevicePtr::new(buffer.address()),
             published.dtype,
-            Shape::new(&[published.bytes / u64::from(element)]),
+            Shape::new(&[published.bytes / element]),
         ))
     }
 
@@ -956,7 +956,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             u64::from(overlap)
                 .saturating_mul(u64::from(height))
                 .saturating_mul(u64::from(width))
-                .saturating_mul(u64::from(element)),
+                .saturating_mul(element),
         )
         .map_err(|_| Error::Invalid("a clip's tail is larger than memory".into()))?;
         let stride = u64::from(overlap)

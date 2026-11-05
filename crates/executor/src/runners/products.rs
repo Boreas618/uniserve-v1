@@ -100,9 +100,9 @@ pub enum Product {
     ///
     /// The audio decode runner publishes it and an audio encode reads it. It is a different product
     /// from [`Product::Audio`] on purpose: that one is a request's reference audio condition (an
-    /// input the media reader produced), and this one is what this request's own denoising produced
-    /// - one is read by a conditioner, the other by the muxer's audio encode, and a store that gave
-    /// them one name would let a `ref2va` request read its input as its output.
+    /// input the media reader produced), and this one is what this request's own denoising produced:
+    /// a conditioner reads the first, the muxer's audio encode reads the second, and a store that
+    /// gave them one name would let a `ref2va` request read its input as its output.
     Track,
 }
 

@@ -1607,7 +1607,6 @@ impl Decoder for VideoDecoder {
             })
     }
 
-    /// The checkpoint's own element type, read at load rather than chosen (design 1).
     /// The checkpoint's clip schedule for a timeline of `frames` frames.
     ///
     /// The schedule is `17 * n + 5` whatever block is asked: it depends on the checkpoint's clip body
@@ -1619,6 +1618,7 @@ impl Decoder for VideoDecoder {
         VideoPostprocessor::splices_of(frames)
     }
 
+    /// The checkpoint's own element type, read at load rather than chosen (design 1).
     fn element_type(&self) -> nn::DType {
         self.dtype
     }
