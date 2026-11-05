@@ -690,7 +690,6 @@ impl Leader {
     clippy::unwrap_used,
     reason = "the deployment replacement lock retains the decision until its final take"
 )]
-
 impl Replica {
     /// Reports what the replica executes and what its configuration is: the
     /// engine that takes requests with its state, the digest of the

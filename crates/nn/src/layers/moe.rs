@@ -1496,7 +1496,7 @@ impl Moe {
             input,
             columns,
             layout,
-            block: ENCODE_CHUNK,
+            block: crate::layers::linear::Nvfp4Linear::encode_block(columns, ENCODE_CHUNK),
             pdl: crate::layers::launch::PDL,
         }
     }
@@ -1520,7 +1520,8 @@ impl Moe {
         scale: DType,
         layout: ScaleLayout,
     ) -> RouteGemmNvfp4Descriptor {
-        self.geometry().route_nvfp4_descriptor(hidden, scale, layout)
+        self.geometry()
+            .route_nvfp4_descriptor(hidden, scale, layout)
     }
 
     /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.

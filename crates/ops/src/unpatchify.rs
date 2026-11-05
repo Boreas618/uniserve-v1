@@ -109,6 +109,112 @@ impl Args {
     pub fn tokens(&self) -> u64 {
         u64::from(self.frames) * u64::from(self.height) * u64::from(self.width)
     }
+
+    /// The planar raster a launch writes: `[channels, frames, height, width]`, each spatial axis
+    /// multiplied by the patch it replaces.
+    ///
+    /// The channels are the **outer** axis and the width the **innermost**, so the contiguous row a
+    /// launch may write is `width · patch_width` values — not `channels`. The two differ in every
+    /// geometry this operator serves (`24` against `84` for the transformer's latents, `3` against
+    /// `160` for the decoder's raster), and a launch check that reads the outer axis for the row
+    /// refuses each of them.
+    pub fn raster(&self) -> Shape {
+        Shape::new(&[
+            u64::from(self.channels),
+            u64::from(self.frames) * u64::from(self.patch_frames),
+            u64::from(self.height) * u64::from(self.patch_height),
+            u64::from(self.width) * u64::from(self.patch_width),
+        ])
+    }
+
+    /// Values on the raster's innermost axis, which is the row a launch writes.
+    pub fn raster_row(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.patch_width)
+    }
+
+    /// Whether this launch may run at all: the operands' shapes, their element types, the affine
+    /// pair's presence against the compiled form, and the destination's contiguity.
+    ///
+    /// It is separate from `launch` so that the contract is reachable without a device: a kernel is
+    /// only loadable on one, and a check that cannot be run is a check nobody has run.
+    pub fn validate(&self, descriptor: &Descriptor) -> Result<()> {
+        let channels = u64::from(self.channels);
+        let volume = self.patch_volume();
+        let frames = u64::from(self.frames);
+        let height = u64::from(self.height);
+        let width = u64::from(self.width);
+        let tokens = self.tokens();
+        if channels == 0 || frames == 0 || height == 0 || width == 0 || volume == 0 {
+            return Err(Error::argument(
+                Unpatchify::NAME,
+                "a grid with no tokens, no channels or a patch with no voxels has no raster"
+                    .to_owned(),
+            ));
+        }
+        let out_shape = self.raster();
+        self.out.require_shape(Unpatchify::NAME, out_shape)?;
+        self.out
+            .require_row(Unpatchify::NAME, descriptor.dtype, self.raster_row())?;
+        self.tokens
+            .require_shape(Unpatchify::NAME, Shape::new(&[tokens, self.token_width()]))?;
+        if self.tokens.dtype != descriptor.dtype {
+            return Err(Error::argument(
+                Unpatchify::NAME,
+                format!(
+                    "expected {} tokens, found {}",
+                    descriptor.dtype, self.tokens.dtype
+                ),
+            ));
+        }
+        // The two denormalization operands arrive together or not at all, and the descriptor says
+        // which form this launch is: one alone would write a raster nobody asked for.
+        let affine = match (self.scale, self.bias) {
+            (Some(scale), Some(bias)) => Some((scale, bias)),
+            (None, None) => None,
+            _ => {
+                return Err(Error::argument(
+                    Unpatchify::NAME,
+                    "the scale and the bias are given together or both absent".to_owned(),
+                ));
+            }
+        };
+        if affine.is_some() != descriptor.affine {
+            return Err(Error::argument(
+                Unpatchify::NAME,
+                if descriptor.affine {
+                    "the module was compiled with a per-channel affine and the launch has none"
+                } else {
+                    "the module was compiled without a per-channel affine and the launch has one"
+                }
+                .to_owned(),
+            ));
+        }
+        if let Some((scale, bias)) = affine {
+            for (name, view) in [("scale", scale), ("bias", bias)] {
+                view.require_shape(Unpatchify::NAME, Shape::new(&[channels]))?;
+                if view.dtype != descriptor.dtype {
+                    return Err(Error::argument(
+                        Unpatchify::NAME,
+                        format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
+                    ));
+                }
+            }
+        }
+        // The raster is written contiguously: the program addresses the destination as a flat
+        // element range, so a destination whose rows interleave would be written to the wrong voxels.
+        // A tile inside a larger raster needs the three outer strides as launch words, which the
+        // program does not take yet; refusing here is what keeps that from being a silent wrong answer.
+        if self.out.strides != Strides::row_major(out_shape) {
+            return Err(Error::argument(
+                Unpatchify::NAME,
+                format!(
+                    "the raster is written contiguously; found strides {} for {out_shape}",
+                    self.out.strides
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The packed-token to planar-raster mapping, with an optional per-channel denormalization.
@@ -126,89 +232,10 @@ impl Op for Unpatchify {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let channels = u64::from(args.channels);
-        let volume = args.patch_volume();
-        let frames = u64::from(args.frames);
-        let height = u64::from(args.height);
-        let width = u64::from(args.width);
-        let tokens = args.tokens();
-        if channels == 0 || frames == 0 || height == 0 || width == 0 || volume == 0 {
-            return Err(Error::argument(
-                Self::NAME,
-                "a grid with no tokens, no channels or a patch with no voxels has no raster"
-                    .to_owned(),
-            ));
-        }
-        let out_shape = Shape::new(&[
-            channels,
-            frames * u64::from(args.patch_frames),
-            height * u64::from(args.patch_height),
-            width * u64::from(args.patch_width),
-        ]);
-        args.out.require_shape(Self::NAME, out_shape)?;
-        args.out
-            .require_row(Self::NAME, descriptor.dtype, out_shape.dims()[0])?;
-        args.tokens
-            .require_shape(Self::NAME, Shape::new(&[tokens, args.token_width()]))?;
-        if args.tokens.dtype != descriptor.dtype {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "expected {} tokens, found {}",
-                    descriptor.dtype, args.tokens.dtype
-                ),
-            ));
-        }
-        // The two denormalization operands arrive together or not at all, and the descriptor says
-        // which form this launch is: one alone would write a raster nobody asked for.
-        let affine = match (args.scale, args.bias) {
-            (Some(scale), Some(bias)) => Some((scale, bias)),
-            (None, None) => None,
-            _ => {
-                return Err(Error::argument(
-                    Self::NAME,
-                    "the scale and the bias are given together or both absent".to_owned(),
-                ));
-            }
-        };
-        if affine.is_some() != descriptor.affine {
-            return Err(Error::argument(
-                Self::NAME,
-                if descriptor.affine {
-                    "the module was compiled with a per-channel affine and the launch has none"
-                } else {
-                    "the module was compiled without a per-channel affine and the launch has one"
-                }
-                .to_owned(),
-            ));
-        }
-        if let Some((scale, bias)) = affine {
-            for (name, view) in [("scale", scale), ("bias", bias)] {
-                view.require_shape(Self::NAME, Shape::new(&[channels]))?;
-                if view.dtype != descriptor.dtype {
-                    return Err(Error::argument(
-                        Self::NAME,
-                        format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
-                    ));
-                }
-            }
-        }
-        // The raster is written contiguously: the program addresses the destination as a flat
-        // element range, so a destination whose rows interleave would be written to the wrong voxels.
-        // A tile inside a larger raster needs the three outer strides as launch words, which the
-        // program does not take yet; refusing here is what keeps that from being a silent wrong answer.
-        if args.out.strides != Strides::row_major(out_shape) {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the raster is written contiguously; found strides {} for {out_shape}",
-                    args.out.strides
-                ),
-            ));
-        }
+        args.validate(descriptor)?;
         let mut arguments = Arguments::new();
         arguments.view(args.tokens);
-        if let Some((scale, bias)) = affine {
+        if let (Some(scale), Some(bias)) = (args.scale, args.bias) {
             arguments.view(scale).view(bias);
         }
         // The affine operand pair and the raster's form are the compilation's, not the launch's: the
@@ -263,6 +290,17 @@ mod tests {
         }
     }
 
+    /// A contiguous view of `dims`, which is what every operand of an admitted launch is.
+    fn contiguous(dtype: DType, dims: &[u64]) -> TensorView {
+        let shape = Shape::new(dims);
+        TensorView::with_strides(
+            crate::tensor::DevicePtr::new(0x2000),
+            dtype,
+            shape,
+            Strides::row_major(shape),
+        )
+    }
+
     fn grid() -> Args {
         let view = TensorView::with_strides(
             crate::tensor::DevicePtr::new(0x1000),
@@ -309,6 +347,81 @@ mod tests {
         let key = latents().to_string();
         assert!(!key.contains("patch"), "{key}");
         assert!(!key.contains("channels"), "{key}");
+    }
+
+    #[test]
+    fn the_raster_row_is_the_width_and_not_the_channels() {
+        // The transformer's latents: 24 channels out of a `1x2x2` patch, so the raster is
+        // `[24, 37, 48, 84]` and its innermost axis is 84 values — the row a launch writes.
+        let latents = grid();
+        assert_eq!(latents.raster().dims(), &[24, 37, 48, 84]);
+        assert_eq!(latents.raster_row(), 84);
+        assert_ne!(latents.raster_row(), u64::from(latents.channels));
+
+        // The decoder's raster from the same compiled module: 3 channels and a `4x16x16` patch.
+        let decoded = Args {
+            channels: 3,
+            patch_frames: 4,
+            patch_height: 16,
+            patch_width: 16,
+            frames: 9,
+            height: 8,
+            width: 10,
+            ..latents
+        };
+        assert_eq!(decoded.raster().dims(), &[3, 36, 128, 160]);
+        assert_eq!(decoded.raster_row(), 160);
+
+        // Neither geometry has a raster row equal to its channel count, which is why a launch check
+        // reading the outer axis refuses every real raster instead of admitting it.
+        assert_ne!(decoded.raster_row(), u64::from(decoded.channels));
+    }
+
+    #[test]
+    fn the_launch_refuses_a_raster_whose_row_is_its_channel_count() {
+        let descriptor = latents();
+        let mut launch = grid();
+        launch.tokens = contiguous(
+            DType::F16,
+            &[launch.tokens(), launch.token_width()],
+        );
+        let per_channel = contiguous(DType::F16, &[u64::from(launch.channels)]);
+        launch.scale = Some(per_channel);
+        launch.bias = Some(per_channel);
+
+        // The raster this operator writes: `[channels, frames, height, width]` and its innermost
+        // axis is the width, so the launch is admitted.
+        launch.out = contiguous(DType::F16, &[24, 37, 48, 84]);
+        launch
+            .validate(&descriptor)
+            .expect("the raster the operator writes is admitted");
+
+        // The raster rowed by its channel count, which is what a check reading the outer axis
+        // demands, is refused — and the refusal names the raster the operator writes, not the one
+        // the check would have accepted. `require_shape` holds that shape before the row check, so
+        // the message a caller sees is the raster's own dimensions.
+        launch.out = contiguous(DType::F16, &[24, 37, 48, 24]);
+        let error = launch
+            .validate(&descriptor)
+            .expect_err("a raster whose row is the channel count");
+        let text = error.to_string();
+        assert!(text.contains("[24, 37, 48, 84]"), "{text}");
+
+        // The row check itself: the raster's shape is right and its innermost axis is not contiguous,
+        // so the program would address the wrong voxels. This is the branch `require_row` adds over
+        // `require_shape`, and it is the one a tile inside a larger raster would hit.
+        let shape = Shape::new(&[24, 37, 48, 84]);
+        launch.out = TensorView::with_strides(
+            crate::tensor::DevicePtr::new(0x3000),
+            DType::F16,
+            shape,
+            Strides::new(&[1, 24, 24 * 37, 24 * 37 * 48]),
+        );
+        let error = launch
+            .validate(&descriptor)
+            .expect_err("a raster written column-major");
+        let text = error.to_string();
+        assert!(text.contains("last axis"), "{text}");
     }
 
     #[test]

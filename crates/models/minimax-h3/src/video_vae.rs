@@ -504,8 +504,16 @@ pub struct VideoDecoder {
     output: Linear,
     rotary: Rotary,
     place: Rows,
-    /// The index table that places each voxel row of the stream.
+    /// The index table that places each voxel row of the stream: for every latent voxel of one clip, the
+    /// packed row of the patch it lies in, under **this deployment's** packing. A sparse deployment orders
+    /// its rows by spatiotemporal tile, so the table differs from the dense one and is the model's own
+    /// constant, published at load by [`pack_voxel_rows`].
     voxel_rows: Weight,
+    /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of the canvas rather than
+    /// a checkpoint tensor. The dense attention's flash backend serves the packed form only — it hands
+    /// the vendor's `cu_seqlens` path its offsets and refuses a null table — so one clip is the packed
+    /// form of one sequence and states its offsets.
+    offsets: Weight,
     config: VideoVaeConfig,
     ffn_mult: u32,
     /// Elements per head.
@@ -529,9 +537,9 @@ pub struct VideoDecoder {
 /// because that is what the checkpoint's `video_vae.voxel_rows` holds and all a decode ever reads; how
 /// many clips a request has is the runner's question and the splice's, not this table's.
 ///
-/// Nothing calls it at runtime: the checkpoint publishes the table, and this is the arithmetic that says
-/// what the published table must contain, checked by [`the_decoder_tables_name_one_voxel_and_one_position_per_row`].
-#[cfg(test)]
+/// The checkpoint holds no such table — its `video_vae` tensors are the weights and the state tables —
+/// so the model publishes this one as a constant of the canvas at load ([`pack_voxel_rows`]), and it is
+/// the arithmetic below rather than a stored tensor that decides what the table says.
 fn voxel_rows(
     config: &VideoVaeConfig,
     attention: AttentionKind,
@@ -565,6 +573,41 @@ fn voxel_rows(
     Ok(rows)
 }
 
+/// Publish the one voxel-row table a deployment's decode reads, encoded as the gather's `i32` indices.
+///
+/// The packed order is the deployment's: dense packing reads the raster order, a sparse deployment reads
+/// spatiotemporal tiles, so a decoder handed a sparsely packed latent cannot be read through the dense
+/// table — the entries would name another voxel's row. One table per decoder, built from the packing this
+/// decoder serves; [`voxel_rows`] is the arithmetic and this is only its encoding.
+fn pack_voxel_rows(
+    loader: &mut WeightLoader,
+    config: &VideoVaeConfig,
+    attention: AttentionKind,
+    canvas: Canvas,
+) -> Result<Weight> {
+    let rows = voxel_rows(config, attention, canvas.height, canvas.width)?;
+    if rows.len() as u64 != canvas.voxels() {
+        return Err(Error::config(format!(
+            "the decoder's voxel table names {} rows for a clip of {} voxels",
+            rows.len(),
+            canvas.voxels()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(rows.len() * 4);
+    for row in &rows {
+        let row = i32::try_from(*row)
+            .map_err(|_| Error::config("a packed row wider than an index".to_owned()))?;
+        bytes.extend_from_slice(&row.to_le_bytes());
+    }
+    Ok(loader.constant(
+        "video_vae.voxel_rows",
+        DType::I32,
+        Shape::new(&[rows.len() as u64]),
+        &bytes,
+        "minimax-h3",
+    )?)
+}
+
 /// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
 ///
 /// The grid's tiles are uniform where the canvas is at least one tile wide, so this is the checkpoint's
@@ -583,9 +626,9 @@ fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) 
 ///
 /// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the latent
 /// raster, which every other tile's positions are a slice of because the tiles are uniform. There is one
-/// table and not two: the clip's voxel rows are the checkpoint's own `video_vae.voxel_rows`, a constant
-/// read once at load ([`voxel_rows`] states what it must contain), so a per-layout copy of them would be
-/// a second source of truth for a value that never varies with the layout.
+/// table and not two: the clip's voxel rows are published once at load by [`pack_voxel_rows`] from the
+/// deployment's own packing, so a per-layout copy of them would be a second source of truth for a value
+/// that never varies with the layout.
 pub(crate) fn table_specs(
     config: &VideoVaeConfig,
     latent_height: u32,
@@ -718,6 +761,124 @@ impl VideoDecoder {
         Ok(crate::audio_vae::tensor_keys(&sources(config)?))
     }
 
+    /// The programs one clip's decode of `config` launches.
+    ///
+    /// Stated from the configuration alone, because a deployment compiles its store before it opens
+    /// the checkpoint: the geometry is the config's and the element type is the checkpoint's (the
+    /// design's `dtype = "auto"` converts nothing). **No extent enters a key**: a clip's token count is
+    /// a launch value the dense attention and the normalizations read position by position, so one
+    /// program serves every raster — which is why this takes no bucket set while the post-processor,
+    /// whose blend is keyed by its pixel count, does. Every projection carries a bias and every
+    /// residual its projection's, as the checkpoint's mapping states.
+    pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ValueFirstSwiglu as SwigluOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::cross_fade::CrossFade as CrossFadeOp;
+        use ops::gemm::Gemm;
+        use ops::norm::LayerNorm as LayerNormOp;
+        use ops::norm::RmsNorm as RmsNormOp;
+        use ops::residual::ScaledResidual as ResidualOp;
+        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
+        use ops::rows::{self, Rows as RowsOp};
+        use nn::layers::UnpatchifyVideo;
+        use ops::unpatchify::Unpatchify;
+
+        let (head, heads) = (
+            config.decoder_attention_head_dim,
+            config.decoder_num_attention_heads,
+        );
+        let width = heads * head;
+        let ffn = width * config.decoder_ffn_mult;
+        let spatial = config.spatial_compression().max(1);
+        let patch = config.out_channels * config.temporal_compression() * spatial * spatial;
+        let (rotated, sections) = rotary(config)?;
+        let sections = nn::layers::Sections::new(&sections)?;
+        let bias = true;
+
+        let mut programs = Programs::default();
+
+        // The clip's latents in, the clip's pixels out.
+        for k in [config.latent_channels, width, ffn, width, patch] {
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                k,
+                dtype,
+                WeightOrder::NxK,
+                bias,
+                dtype,
+                dtype,
+            ));
+        }
+
+        // The three placements into the token stream: every row-major gather is one program.
+        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, width));
+
+        // The rotation's table once, then its application in every layer.
+        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
+            rotated,
+            1.0,
+            Some(sections),
+            DType::F32,
+        ));
+        programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
+            head,
+            heads,
+            heads,
+            Rotation::Half,
+            config.decoder_norm_eps,
+            rotated,
+            dtype,
+            dtype,
+            // The checkpoint stores no per-head normalization weight, which is what its absence means.
+            false,
+        ));
+
+        // The layer's two halves: their normalization, the residual each projection folds into, and
+        // the gated feed-forward's packed activation.
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(width, dtype));
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(width), bias)?);
+        programs.launch::<SwigluOp>(&PackedSwiGlu::descriptor_of(
+            dtype,
+            u64::from(ffn),
+            2 * u64::from(ffn),
+            bias,
+            false,
+        )?);
+
+        // The output path: the final normalization, the projection to pixels, and the stitch's
+        // unpatchify and its blends.
+        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, width, bias));
+        programs.launch::<Unpatchify>(&UnpatchifyVideo::new(
+            dtype,
+            u64::from(config.out_channels),
+            config.temporal_compression(),
+            spatial,
+        )?
+        .descriptor());
+        for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
+            programs.launch::<CrossFadeOp>(&blend.descriptor());
+        }
+
+        // One dense attention for the whole decoder: the clip's row count is a launch value, not a
+        // key field, so the largest sequence the decoder was accepted for states the program too.
+        let attention = Attention::dense(
+            head,
+            heads,
+            heads,
+            width,
+            false,
+            None,
+            (head as f32).sqrt().recip(),
+        )?;
+        // The packed form of one sequence: the flash backend refuses a null offsets table, so the
+        // launch states the offsets and the key is the one fa4 declares.
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, width, true,
+        ));
+
+        Ok(programs.finish())
+    }
+
     /// Read the 36 layers and the head of the checkpoint's decoder.
     pub fn load(
         config: &VideoVaeConfig,
@@ -727,17 +888,6 @@ impl VideoDecoder {
         input: Linear,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
-        // The clip's rows are gathered by the checkpoint's own `video_vae.voxel_rows`, which names the
-        // dense packed order; a denoiser that packed sparsely would hand rows in another order and the
-        // gather would read a neighbouring voxel's channel. Sparse serving is refused before this block
-        // is reached, and it is refused here too rather than read through the wrong table.
-        if attention != AttentionKind::Dense {
-            return Err(Error::config(
-                "the video decoder's voxel rows are the checkpoint's dense packed order, so a \
-                 sparsely packed denoiser cannot hand it latents"
-                    .to_owned(),
-            ));
-        }
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
@@ -902,13 +1052,24 @@ impl VideoDecoder {
             output,
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
-            voxel_rows: indices(
-                loader,
-                &declared_sizes,
-                "video_vae.voxel_rows",
-                0,
-                canvas.voxels() as u32,
-            )?,
+            voxel_rows: pack_voxel_rows(loader, config, attention, canvas)?,
+            offsets: {
+                // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
+                // created once with the weights and read by every clip's attention launch.
+                let rows = i32::try_from(canvas.rows())
+                    .map_err(|_| Error::config("a clip's rows exceed a sequence offset".to_owned()))?;
+                let mut bytes = Vec::with_capacity(8);
+                for offset in [0i32, rows] {
+                    bytes.extend_from_slice(&offset.to_le_bytes());
+                }
+                loader.constant(
+                    "video_vae.sequence_offsets",
+                    DType::I32,
+                    Shape::new(&[2]),
+                    &bytes,
+                    "minimax-h3",
+                )?
+            },
             attention: Attention::dense(
                 head,
                 heads,
@@ -1028,15 +1189,19 @@ fn indices(
 }
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
-fn frequencies(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    config: &VideoVaeConfig,
-) -> Result<Weight> {
+/// The decoder's inverse frequencies, in the order its factors are laid out.
+///
+/// One block per axis, each over that axis's own width: the reference builds its embedding with
+/// `head_dim · ratio / 3` and reuses those frequencies on all three axes (`video_vae.py:547-549`,
+/// `uniserve/nn/rope.py:355-380`), so axis `a` takes `theta^(-2k / sections[a])` rather than a slice
+/// of one wider spectrum.
+///
+/// This is the table the decoder publishes as `video_vae.rotary.{rotated}.{theta}` and the one a
+/// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
+/// element type or key check can see, so the numbers have to be comparable without a device
+/// (`examples/vae_rope.rs`, `tools/compare_rope_factors.py --vae`).
+pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
     let (rotated, sections) = rotary(config)?;
-    // One block per axis, each over that axis's own width: the reference builds its embedding with
-    // `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
-    // `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
     let mut table = Vec::new();
     for width in &sections {
         for pair in 0..width / 2 {
@@ -1051,6 +1216,16 @@ fn frequencies(
             rotated / 2
         )));
     }
+    Ok(table)
+}
+
+fn frequencies(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    config: &VideoVaeConfig,
+) -> Result<Weight> {
+    let (rotated, _) = rotary(config)?;
+    let table = inverse_frequencies(config)?;
     let mut bytes = Vec::with_capacity(table.len() * 4);
     for value in &table {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -1211,14 +1386,15 @@ impl VideoDecoder {
                 per_head(rotated_query),
                 per_head(rotated_key),
             )?;
-            // One sequence: the clip's rows, its registers and its tail attended together.
+            // One sequence: the clip's rows, its registers and its tail attended together, stated as
+            // the packed form of one sequence because the flash backend serves only that form.
             self.attention.attend_dense(
                 f,
                 per_head(rotated_query),
                 per_head(rotated_key),
                 per_head(value),
-                None,
-                None,
+                Some(self.offsets.view()),
+                Some(self.offsets.view()),
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
                 attended,
@@ -1475,6 +1651,59 @@ pub(crate) mod tests {
             }
             self
         }
+    }
+
+    #[test]
+    fn the_voxel_table_names_packed_rows_and_follows_the_deployment_packing() {
+        let config = video_config();
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (7, 4),
+            width: 1344,
+            height: 768,
+        };
+        let raster = crate::packing::latent_raster(&canvas).expect("raster");
+        let clip = Canvas::clip(&config, raster.height, raster.width);
+        let side = crate::packing::PATCH_SIDE;
+        let sparse = AttentionKind::sparse(64, 0.8, None).expect("a sparse kind");
+
+        // The gather writes `destination[indices[voxel]] = source[voxel]`, so every entry must name a
+        // packed row of the clip. A table copied from the voxel indices runs to four times that bound
+        // and scatters the clip's tokens past the end of the stream - which is why this is asserted
+        // rather than assumed.
+        for attention in [AttentionKind::Dense, sparse] {
+            let rows =
+                voxel_rows(&config, attention, raster.height, raster.width).expect("voxel rows");
+            let packed = clip.rows();
+            assert_eq!(rows.len() as u64, clip.voxels());
+            assert!(
+                rows.iter().all(|row| u64::from(*row) < packed),
+                "a table entry names a row outside the clip's {packed} packed rows"
+            );
+            // Each video row is named once per voxel of its own patch, so the counts are the patch's
+            // area and nothing else: no row is skipped and none is named twice as often. The register
+            // and tail rows of the clip are not voxels and are named by no entry.
+            let mut counts = vec![0_u32; clip.rows() as usize];
+            for row in &rows {
+                counts[*row as usize] += 1;
+            }
+            let video = (clip.frames * raster.patch_rows()) as usize;
+            assert!(
+                counts[..video].iter().all(|count| *count == side * side),
+                "{attention:?} names the clip's video rows unevenly"
+            );
+            assert!(
+                counts[video..].iter().all(|count| *count == 0),
+                "{attention:?} names a register or tail row with a voxel"
+            );
+        }
+
+        // The deployments do not read the same table: a sparse packing orders the rows by tile, so a
+        // decoder built for one packing cannot be read through the other's.
+        let dense = voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width)
+            .expect("the dense table");
+        let tiled = voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
+        assert_ne!(dense, tiled, "{dense:?}");
     }
 
     #[test]
@@ -1928,4 +2157,44 @@ pub(crate) mod tests {
         });
         VideoVaeConfig::parse(&sidecar).expect("the checkpoint's video VAE sidecar")
     }
+
+    /// The decoder's programs follow from its configuration and the rasters the deployment serves:
+    /// one key per operator whose key does not vary with the launch, a blend per seam width the stitch
+    /// compiles, and one dense attention per distinct token count.
+    #[test]
+    fn the_decoder_states_its_programs_from_its_own_config() {
+        let config = video_config();
+        let programs = VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        // Every projection this decoder has, whatever its contraction: the key carries the element
+        // types and the order, and the contraction length is a descriptor field of one program.
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("rows"), 1, "three placements, one program");
+        assert_eq!(count("rotary_factors"), 1);
+        assert_eq!(count("qk_norm_rope"), 1);
+        assert_eq!(count("rms_norm"), 1);
+        assert_eq!(count("layer_norm"), 1);
+        assert_eq!(count("scaled_residual"), 1);
+        assert_eq!(count("value_first_swiglu"), 1);
+        assert_eq!(count("unpatchify_video"), 1);
+
+        // The stitch compiles one blend per seam width on each of the two axes.
+        let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
+            .expect("the stitch")
+            .blends()
+            .len();
+        assert!(blends > 0);
+        assert_eq!(count("cross_fade"), blends);
+
+        // One dense attention whatever the clip: the row count is a launch value, so the decoder's
+        // programs do not depend on the raster a request asks for.
+        assert_eq!(count("dense_attention"), 1, "{programs:?}");
+    }
+
 }

@@ -13,6 +13,7 @@ disagree about what a module looks like.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -153,6 +154,21 @@ def build(package, key, target, out_dir):
     return None
 
 
+def module_digest(directory):
+    """One program's digest and byte size: every file the package wrote, by relative name."""
+    digest = hashlib.sha256()
+    total = 0
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.name == ".committed":
+            continue
+        data = path.read_bytes()
+        digest.update(path.relative_to(directory).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(data)
+        total += len(data)
+    return digest.hexdigest(), total
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True)
@@ -167,11 +183,20 @@ def main():
 
     packages = load_packages(Path(args.kernels))
     root = Path(args.root)
+    # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
+    # inspects one read while the rows come from another cannot see an empty one.
     rows = [
         line.rstrip("\n").split("\t")
         for line in Path(args.fixture).read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ]
+    # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
+    # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
+    if not rows:
+        raise SystemExit(
+            f"{args.fixture} names no rows: an empty fixture is a walk that printed nothing, and "
+            f"a store built from it would be empty rather than correct"
+        )
 
     # A key names one program, so exactly one package may claim it. Two packages claiming one key
     # would let two hosts that build the same fixture store different modules under the same name,
@@ -228,6 +253,28 @@ def main():
             skipped.append((op, key, "; ".join(failures)))
             continue
     print(f"# built {len(built)} of {len(rows)} keys into {root} (revision {args.revision}, {args.target})")
+
+    # How many of those cells hold the same program. A key field that reaches no compiled word
+    # writes an identical module under its own name (tools/key_field_audit.py proves which), so the
+    # store pays a cell, a directory and the compile for code it already has. The count is printed
+    # rather than acted on: collapsing cells is a decision about descriptor identity, and this tool
+    # only says what it would save.
+    digests = {}
+    for op, backend, key in built:
+        directory = root / op / backend / str(args.revision) / args.target / key
+        digest, size = module_digest(directory)
+        digests.setdefault(digest, []).append((op, key, size))
+    distinct = len(digests)
+    duplicated = len(built) - distinct
+    cells_bytes = sum(one[2] for group in digests.values() for one in group)
+    module_bytes = sum(group[0][2] for group in digests.values())
+    if duplicated:
+        print(
+            f"# {len(built)} cells hold {distinct} distinct programs: {duplicated} cells duplicate one "
+            f"({cells_bytes} bytes stored, {module_bytes} distinct)"
+        )
+    else:
+        print(f"# {len(built)} cells, {distinct} distinct programs")
     for op, backend, key in built:
         print(f"built\t{op}\t{backend}\t{key}")
     for op, key, reason in skipped:

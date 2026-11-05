@@ -130,16 +130,31 @@ impl ScaledResidual {
     /// `dtype` is the caller's: the hidden states' element type is the deployment's, while the
     /// layer's width and its bias's presence are its own.
     pub fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
+        Self::descriptor_of(
+            dtype,
+            self.scale.shape().numel(),
+            self.bias.is_some(),
+        )
+    }
+
+    /// The descriptor a residual over `columns`-wide rows launches, stated without its weights.
+    ///
+    /// A walk has the config's width and the checkpoint's bias presence and neither weight.
+    pub fn descriptor_of(
+        dtype: DType,
+        columns: u64,
+        update_bias: bool,
+    ) -> Result<residual::ScaledResidualDescriptor> {
         Ok(residual::ScaledResidualDescriptor {
             dtype,
-            columns: u32::try_from(self.scale.shape().numel()).map_err(|_| {
+            columns: u32::try_from(columns).map_err(|_| {
                 Error::shape(
                     "ScaledResidual",
                     "a row wider than a descriptor holds".to_owned(),
                 )
             })?,
             block: BLOCK,
-            update_bias: self.bias.is_some(),
+            update_bias,
         })
     }
 

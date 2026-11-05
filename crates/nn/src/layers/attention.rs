@@ -301,6 +301,34 @@ impl Attention {
     ///
     /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
     /// descriptor, and the package behind it decides the tile and split heuristics.
+    /// The descriptor one dense attention launch takes, for a walk that asks a model which programs
+    /// it launches with no device.
+    ///
+    /// Everything the key carries is here: the geometry is the module's, the element types and the key
+    /// bound are the call's, and `cu_seq_lens` says which of the two programs the call selects — not
+    /// what this launch reads.
+    pub fn dense_descriptor(
+        &self,
+        query: DType,
+        key_value: DType,
+        output: DType,
+        max_kv_len: u32,
+        cu_seq_lens: bool,
+    ) -> DenseDescriptor {
+        DenseDescriptor {
+            query,
+            key_value,
+            output,
+            head_dim: self.head_dim,
+            q_heads: self.q_heads,
+            kv_heads: self.kv_heads,
+            mask: if self.causal { Mask::Causal } else { Mask::Dense },
+            windowed: self.window.is_some(),
+            max_kv_len,
+            cu_seq_lens,
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the call's operands and its two offset tables are the design's argument list"
@@ -341,23 +369,13 @@ impl Attention {
                 ),
             ));
         }
-        let descriptor = DenseDescriptor {
-            query: query.dtype,
-            key_value: key.dtype,
-            output: out.dtype,
-            head_dim: self.head_dim,
-            q_heads: self.q_heads,
-            kv_heads: self.kv_heads,
-            mask: if self.causal {
-                Mask::Causal
-            } else {
-                Mask::Dense
-            },
-            windowed: self.window.is_some(),
+        let descriptor = self.dense_descriptor(
+            query.dtype,
+            key.dtype,
+            out.dtype,
             max_kv_len,
-            // Which of the two programs this call launches, not what this launch reads.
-            cu_seq_lens: cu_seq_lens_q.is_some(),
-        };
+            cu_seq_lens_q.is_some(),
+        );
         let args = DenseArgs {
             query,
             key,
@@ -885,7 +903,10 @@ mod tests {
         };
 
         assert!(page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::F32))).is_ok());
-        assert!(page_scale(plane(DType::F8E4M3), None).is_err(), "no scale at all");
+        assert!(
+            page_scale(plane(DType::F8E4M3), None).is_err(),
+            "no scale at all"
+        );
         assert!(
             page_scale(plane(DType::F8E4M3), Some(scale(1, DType::F32))).is_err(),
             "one scalar where a page table belongs"

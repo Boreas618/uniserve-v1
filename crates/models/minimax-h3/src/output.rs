@@ -1023,12 +1023,7 @@ mod tests {
         let rasters = [(480_u32, 832_u32), (720, 1280), (480, 832)];
         let programs = VideoPostprocessor::programs(DType::F16, &rasters);
 
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
         assert_eq!(count("rgb_bytes"), 1);
         assert_eq!(count("scaled_add"), 2, "{programs:?}");
         assert!(
