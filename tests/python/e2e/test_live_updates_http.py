@@ -564,7 +564,13 @@ def _log_lines(log: Path) -> list[str]:
     return [colors.sub("", line) for line in log.read_text().splitlines()]
 
 
-def _chat(base_url: str, model: str, prompt: str, tokens: int = 16) -> dict:
+def _chat(
+    base_url: str,
+    model: str,
+    prompt: str,
+    tokens: int = 16,
+    timeout_s: float = 600,
+) -> dict:
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -574,7 +580,7 @@ def _chat(base_url: str, model: str, prompt: str, tokens: int = 16) -> dict:
             "temperature": 0,
             "max_completion_tokens": tokens,
         },
-        timeout=600,
+        timeout=timeout_s,
     )
     response.raise_for_status()
     return response.json()
@@ -1230,8 +1236,11 @@ def _restart_while_streaming(
     # until it times out), and `raise_for_status` keeps the status but not the
     # body, so the refusal's own `detail` is raised here as well.
     probe = "Count from 1 to 3, separated by commas."
+    # Three numbers from a deployment that is serving take seconds; two
+    # minutes is generous and turns a deployment that answers nothing at all
+    # into a failure this test names, instead of ten minutes of silence.
     try:
-        answered = _chat(base_url, name, probe)
+        answered = _chat(base_url, name, probe, timeout_s=120)
     except httpx.HTTPStatusError as error:
         raise AssertionError(
             "the deployment refused a completion: "
