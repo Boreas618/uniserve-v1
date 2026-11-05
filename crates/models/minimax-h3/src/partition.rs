@@ -1229,7 +1229,12 @@ mod tests {
             0,
         )
         .expect_err("no transformer");
-        assert!(error.to_string().contains("transformer"), "{error}");
+        // Which check answers is the checkpoint's task list, not the directory: a task is stated by
+        // the partitions the export holds (`Config::tasks`), so removing the base partition removes
+        // `t2va` from the checkpoint's vocabulary and the refusal names the task it cannot serve.
+        // Asserting the directory instead would pass only while nothing between the two checks
+        // consults the tasks, and it would let a refusal that cannot say *which* task failed through.
+        assert!(error.to_string().contains("TextToVideoAudio"), "{error}");
         Partition::serving(
             &config,
             VideoTask::ReferenceToVideoAudio,
