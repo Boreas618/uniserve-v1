@@ -182,19 +182,19 @@ impl Deployment {
         Self::new(Config::read(root, None)?, types, rungs, tasks)
     }
 
-    /// The tasks the checkpoint's own `fastvideo_inference.json` states it serves.
+    /// The tasks the checkpoint at `root` states it serves.
     ///
     /// A deployment's served set is its checkpoint's unless a caller names a subset; reading it here
     /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
     /// [`Self::new`] refuses a task the checkpoint does not.
+    ///
+    /// The statement is the checkpoint's own, read from `root`: each DiT's task list in the
+    /// architecture config, which a FastH3 export narrows to the single task its student was
+    /// distilled for. **A table in this file would answer for every checkpoint** - a base checkpoint
+    /// holding no `transformer_ref` would be reported as serving `ref2va`, and the deployment that
+    /// believed it would load no such partition.
     pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
-        // The table is `checkpoint`'s, not this file's, and it is read from the checkpoint's own
-        // metadata when `root` is walked - `root` is the path that walk will take.
-        let _ = root;
-        Ok(crate::checkpoint::TASK_DITS
-            .iter()
-            .map(|(task, _)| *task)
-            .collect())
+        Ok(Config::read(root, None)?.tasks())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
