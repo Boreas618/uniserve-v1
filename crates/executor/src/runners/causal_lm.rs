@@ -1802,6 +1802,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            // A host call is no device work: the media stage performs it, and a device runner
+            // handed one was given a job another runner returned.
+            Job::Host { call, .. } => Err(Error::Invariant(format!(
+                "a runner that serves device work was asked for host call {}",
+                call.0
+            ))),
         }
     }
 

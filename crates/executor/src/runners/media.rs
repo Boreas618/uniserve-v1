@@ -15,11 +15,16 @@
 //! stream, which is why the three media calls a `t2va` request ends with are not device variants.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use ipc::RequestKey;
 
 use crate::Result;
-use crate::host::{HostAction, Outcome};
+use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::host::{HostAction, Lane, Outcome};
+use crate::plan::{Extent, Variant};
+use crate::runner::{Binding, Runner, RunnerId};
+use crate::runners::products::{Product, Products};
 
 /// The rates one request's artifact is built at.
 ///
@@ -331,6 +336,323 @@ fn request_id(request: RequestKey) -> u64 {
     request.request_id.0
 }
 
+/// The runner that serves a media request's three host calls.
+///
+/// §2.4 makes encoding, muxing and reading media the executor's fourth kind of blocking work, and
+/// this is the runner those calls belong to: it owns no captured graph, no arena and no device
+/// column, because none of the three calls computes on a device. What it owns is the request's two
+/// published products' bytes and the assembly they go into.
+///
+/// **The two halves of a host call are as far apart as the executor's own protocol puts them.**
+/// `submit` runs on the device thread when the batch reaches it, and it stages the product the call
+/// reads into pinned host memory there - one device copy, ordered on this runner's stream after the
+/// producer's write, which is the only place both ordering facts are known. `serve` runs when the
+/// device executor reaches the job that `submit` returned, and it performs the stage on the
+/// process's `Media` lane and waits for it: the bytes never touch a device stream, and a slow encode
+/// holds a lane thread rather than a launch.
+///
+/// The artifact leaves as the call's `media_output`: the mux's bytes are published into a shared
+/// memory object whose name crosses the wire, and the receiver unlinks it (`MediaSource::into_locator`),
+/// so nothing here holds it after the call is answered.
+pub struct MediaStage {
+    /// The executor's name for this runner.
+    id: RunnerId,
+    /// The phases this runner serves, in scheduler order.
+    phases: Vec<ipc::PhaseId>,
+    /// The device the products it stages live on.
+    device: platform::DeviceId,
+    /// The stream its staging copies are ordered on.
+    stream: platform::Stream,
+    /// The media group's host encoder, one per deployment.
+    output: Arc<Output>,
+    /// The process's media lane: one action per admitted stage (2.4).
+    lane: Lane<MediaWork>,
+    /// The store the two products are read from, attached by the executor once.
+    products: Option<Arc<dyn Products>>,
+    /// The frames of each video unit of a request's timeline: the model's schedule, handed in as a
+    /// function because it is the model's arithmetic and the executor holds no copy of it.
+    units_of: fn(u32) -> Result<Vec<u32>>,
+    /// What `submit` staged and `serve` performs, for the one job in flight.
+    pending: Option<Prepared>,
+}
+
+/// One staged host call: the product's bytes, and the stage that reads them.
+struct Prepared {
+    /// The call this stage answers.
+    call: CallId,
+    /// The request whose assembly the stage appends to.
+    request: RequestKey,
+    /// The request's units, as the model's schedule states them.
+    units: Vec<u32>,
+    /// The stage and the extent it works at.
+    stage: Stage,
+    /// The product's bytes, and nothing for the mux, which reads what `output` holds.
+    input: Option<platform::PinnedBuffer>,
+}
+
+impl MediaStage {
+    /// The runner of one deployment's three media calls.
+    ///
+    /// `units_of` is the model's own schedule - the frames of each video unit of a `frames`-frame
+    /// timeline - passed rather than restated: a video unit's length is the checkpoint's arithmetic
+    /// (`CLIP_FRAMES` and the seam), and an executor that computed it would be a second home for a
+    /// number the model already states.
+    pub fn new(
+        binding: Binding,
+        output: Arc<Output>,
+        lane: Lane<MediaWork>,
+        units_of: fn(u32) -> Result<Vec<u32>>,
+    ) -> Self {
+        Self {
+            id: binding.id,
+            phases: binding.phases,
+            device: binding.device,
+            stream: binding.stream,
+            output,
+            lane,
+            products: None,
+            units_of,
+            pending: None,
+        }
+    }
+
+    /// The store this runner reads the request's products from, and the refusal that names a
+    /// deployment whose plan bound no such store.
+    fn products(&self) -> Result<&Arc<dyn Products>> {
+        self.products.as_ref().ok_or_else(|| {
+            crate::Error::Invalid(
+                "the media stage reads the request's published products and the executor attached \
+                 no product store to it"
+                    .into(),
+            )
+        })
+    }
+
+    /// Copies `kind` into pinned host memory, ordered after its producer's write.
+    ///
+    /// The copy happens here, on the device thread, because that is where both facts live: the
+    /// product's byte length (`Products::product`) and the stream the copy is ordered on. A stage
+    /// that deferred it would have to hold the request's region open across a lane thread's life.
+    fn stage_product(&self, request: RequestKey, kind: Product) -> Result<platform::PinnedBuffer> {
+        let products = self.products()?;
+        let published = products.product(request, kind)?.ok_or_else(|| {
+            crate::Error::Invalid(format!(
+                "request {} has no {} product: the call that reads it is served only after the \
+                 call that writes it, and nothing of this request wrote one",
+                request.request_id.0,
+                kind.name()
+            ))
+        })?;
+        let bytes = usize::try_from(published.bytes)
+            .map_err(|_| crate::Error::Invalid("a product is larger than memory".into()))?;
+        let buffer = platform::PinnedBuffer::new(self.device, bytes)?;
+        if !products.stage(request, kind, &buffer, &self.stream)? {
+            return Err(crate::Error::Invalid(format!(
+                "request {} lost its {} product between being asked for and being copied",
+                request.request_id.0,
+                kind.name()
+            )));
+        }
+        Ok(buffer)
+    }
+
+    /// Performs the staged stage on the media lane, answering the call's completion.
+    fn perform(&mut self, call: CallId) -> Result<BatchOutput> {
+        let prepared = self.pending.take().ok_or_else(|| {
+            crate::Error::Invariant(format!(
+                "the media stage was asked to serve call {} with no stage staged: a host job is \
+                 returned by `submit` and served once, in that order",
+                call.0
+            ))
+        })?;
+        if prepared.call != call {
+            return Err(crate::Error::Invariant(format!(
+                "the media stage staged call {} and the device asked it for call {}",
+                prepared.call.0, call.0
+            )));
+        }
+        let work = MediaWork::new(
+            Arc::clone(&self.output),
+            prepared.request,
+            prepared.units,
+            prepared.stage,
+            prepared.input,
+        );
+        let started = Instant::now();
+        let task = self.lane.admit(work)?;
+        let answered = match task.wait() {
+            Outcome::Success(bytes) => bytes,
+            Outcome::Failed(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "request {}'s {:?} stage failed: {error}",
+                    prepared.request.request_id.0, prepared.stage
+                )));
+            }
+            Outcome::Cancelled => {
+                return Err(crate::Error::State(
+                    "a media stage was cancelled before it ran: the lane withdrew work the \
+                     request's artifact cannot be assembled without",
+                ));
+            }
+        };
+        let mut answer = CallOutput::completed(call, Vec::new(), RowState::default());
+        if let Some(bytes) = answered.as_ref() {
+            // The mux ends the request: its bytes are the artifact, published into a shared memory
+            // object the receiving process claims by name and unlinks on receipt.
+            let locator = ipc::MediaSource::publish(bytes)
+                .map_err(|error| {
+                    crate::Error::Invalid(format!(
+                        "request {}'s artifact could not be published: {error}",
+                        prepared.request.request_id.0
+                    ))
+                })?
+                .into_locator();
+            answer.media_output = Some(ipc::MediaOutput {
+                handle: ipc::ArtifactHandle::PosixShm { name: locator.name },
+                bytes: locator.bytes,
+            });
+        }
+        Ok(BatchOutput {
+            calls: vec![answer],
+            timing: ipc::TimingCounters {
+                host_us: started.elapsed().as_micros() as u64,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Which stage a host call is, and which product it reads.
+///
+/// The three calls differ in exactly these two facts, and stating them in one place is what keeps
+/// the runner's own dispatch to the protocol: a video unit reads the postprocessor's raster, an
+/// audio encode reads the decoder's window, and the mux reads only what the two encodes wrote.
+fn staged(computation: crate::plan::Computation) -> Result<(Stage, Option<Product>)> {
+    let variant = computation.variant().ok_or_else(|| {
+        crate::Error::Invalid(format!(
+            "a {:?} batch is a computation no variant states",
+            computation.call
+        ))
+    })?;
+    match variant {
+        Variant::VideoEncode => match computation.extent {
+            Extent::Clip {
+                frames,
+                height,
+                width,
+            } => Ok((
+                Stage::Unit {
+                    frames,
+                    height,
+                    width,
+                },
+                Some(Product::Video),
+            )),
+            other => Err(crate::Error::Invalid(format!(
+                "a video encode is a clip's raster and this batch states {other:?}"
+            ))),
+        },
+        Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
+        Variant::Mux => Ok((Stage::Mux, None)),
+        other => Err(crate::Error::Invalid(format!(
+            "the media stage serves the artifact's three calls and was asked for a {other:?} batch"
+        ))),
+    }
+}
+
+impl Runner for MediaStage {
+    fn phases(&self) -> &[ipc::PhaseId] {
+        &self.phases
+    }
+
+    fn stream(&self) -> Option<&platform::Stream> {
+        Some(&self.stream)
+    }
+
+    /// One batch is one host call: stage the product it reads and hand the device thread the job
+    /// that performs it.
+    ///
+    /// The refusal for a batch of another variant is by name: this runner serves the artifact's
+    /// three calls and nothing else, and a media call it does not serve reaching it would otherwise
+    /// be answered with an empty completion the mechanism reads as success.
+    fn submit(&mut self, batch: Batch) -> Result<Jobs> {
+        let media = batch.media.as_ref().ok_or_else(|| {
+            crate::Error::Invalid(format!(
+                "a batch of phase {} reached the media stage with no media columns: the three host \
+                 calls are media computations and carry a staged request",
+                batch.phase.0
+            ))
+        })?;
+        media.check()?;
+        let computation = media.computation;
+        let call = *batch.calls.first().ok_or_else(|| {
+            crate::Error::Invalid(
+                "a media batch advances no call: a host stage answers one call's completion".into(),
+            )
+        })?;
+        let request = media.request(0)?;
+        let (stage, product) = staged(computation)?;
+        let units = (self.units_of)(request.frames)?;
+        let input = match product {
+            Some(kind) => Some(self.stage_product(request.request, kind)?),
+            None => None,
+        };
+        self.pending = Some(Prepared {
+            call,
+            request: request.request,
+            units,
+            stage,
+            input,
+        });
+        Ok(Jobs::new([Job::Host {
+            runner: self.id,
+            call,
+        }]))
+    }
+
+    fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
+        match job {
+            Job::Host { call, .. } => self.perform(*call),
+            other => Err(crate::Error::Invariant(format!(
+                "the media stage serves host calls and the device asked it for {other:?}"
+            ))),
+        }
+    }
+
+    /// The store the request's products are read from (4.5's executor-owned storage).
+    fn attach_products(&mut self, products: Arc<dyn Products>) {
+        self.products = Some(products);
+    }
+
+    /// Nothing to capture: this runner owns no graph. The three calls a media request ends with
+    /// are host work, so a generation changes under them without changing anything here - the
+    /// encoder and the muxer belong to the deployment, not to a program generation.
+    fn warmup(&mut self) -> Result<Jobs> {
+        Ok(Jobs::default())
+    }
+
+    /// Nothing to prepare, for the same reason: no graph of this runner reads a program.
+    fn precopy(&mut self, _next: &Arc<ops::Generation>) -> Result<Jobs> {
+        Ok(Jobs::default())
+    }
+
+    /// Nothing to switch: the host work reads no kernel, so a generation boundary is empty here.
+    fn switchover(&mut self, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Nothing to revert, for the same reason.
+    fn revert(&mut self, _generation: u64) {}
+
+    /// Nothing to release: this runner holds no graph that references a generation.
+    fn purge(&mut self, _generation: u64) {}
+
+    /// Nothing to discard, for the same reason.
+    fn discard(&mut self, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +735,78 @@ mod tests {
         assert!(
             message.contains("204") && message.contains("16"),
             "the refusal names both byte counts: {message}"
+        );
+    }
+
+    /// A host call names the stage it is and the product it reads, and nothing else is served.
+    ///
+    /// The two facts are what the runner owes the protocol: a video encode works at a clip's
+    /// raster and reads the postprocessor's frames, an audio encode reads the decoder's track, and
+    /// the mux reads neither - its inputs are the two encodes the deployment's output holds. A call
+    /// of another class reaching the stage would otherwise be answered with an empty completion the
+    /// mechanism reads as success.
+    #[test]
+    fn a_host_call_states_the_stage_and_the_product_it_reads() {
+        let clip = crate::plan::Extent::Clip {
+            frames: 17,
+            height: 2,
+            width: 2,
+        };
+        let video = crate::plan::Computation {
+            call: ipc::MediaCall::VideoEncoding,
+            rows: 1,
+            tokens: 0,
+            extent: clip,
+        };
+        assert_eq!(
+            staged(video).expect("a video encode"),
+            (
+                Stage::Unit {
+                    frames: 17,
+                    height: 2,
+                    width: 2,
+                },
+                Some(Product::Video),
+            )
+        );
+
+        let audio = crate::plan::Computation {
+            call: ipc::MediaCall::AudioEncoding,
+            extent: crate::plan::Extent::None,
+            ..video
+        };
+        assert_eq!(
+            staged(audio).expect("an audio encode"),
+            (Stage::Track, Some(Product::Track))
+        );
+
+        let mux = crate::plan::Computation {
+            call: ipc::MediaCall::Muxing,
+            ..audio
+        };
+        assert_eq!(staged(mux).expect("a mux"), (Stage::Mux, None));
+
+        // A video encode with no raster cannot say which frames it covers: the extent is the
+        // batch's only statement of them.
+        let unshaped = crate::plan::Computation {
+            extent: crate::plan::Extent::None,
+            ..video
+        };
+        let message = format!("{}", staged(unshaped).expect_err("no raster"));
+        assert!(
+            message.contains("raster"),
+            "the refusal names what a video encode needs: {message}"
+        );
+
+        // A device computation is another runner's: this one serves the artifact's three calls.
+        let denoise = crate::plan::Computation {
+            call: ipc::MediaCall::Denoising,
+            ..video
+        };
+        let message = format!("{}", staged(denoise).expect_err("a denoise"));
+        assert!(
+            message.contains("three calls"),
+            "the refusal states what this runner serves: {message}"
         );
     }
 }
