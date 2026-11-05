@@ -1,17 +1,20 @@
 //! A checkpoint: its safetensors shards, the tensors they hold, and the identity of every file.
 //!
 //! The loader never converts a checkpoint's weights in place and never holds a whole shard in host
-//! memory: each shard is mapped read-only with `memmap2`, [`read_header`] reads its header — eight
-//! bytes of length, the JSON body, and each tensor's `{dtype, shape, data_offsets}` — and one
-//! tensor's bytes are copied when a weight is converted.
+//! memory: each shard is mapped read-only with `memmap2`, the `safetensors` crate parses its header
+//! through [`read_header`], and one tensor's bytes are copied when a weight is converted. A shard is
+//! mapped for the life of the [`Checkpoint`], which is the model's life; the mapping costs virtual
+//! address space, not resident memory.
 //!
-//! The header reader is ours and not a crate's because the dtype set is the **format's**, while a
-//! crate's `Dtype` enum is a subset of it: a calibrated NVFP4 export stores its block scales as
-//! `F8_E4M3`, and a reader that cannot name that cannot open the model. Every dtype name our
-//! operators speak is mapped onto an operator ABI [`DType`], and any other name is refused at open,
-//! with the name and the tensor in the message, rather than reach a launch that would misread it. A shard is mapped for the life of
-//! the [`Checkpoint`], which is the model's life; the mapping costs virtual address space, not
-//! resident memory.
+//! **The format is read by the format's own crate, and the element type is ours.** `safetensors`
+//! parses the header, checks each tensor's byte range against its extents and element width, and
+//! drops the optional metadata block; its `Dtype` now names every type this checkpoint set carries,
+//! FP8 and FP4 included. What stays here is the map from that `Dtype` onto the operator ABI's
+//! [`DType`], because the ABI names a subset: a format type it cannot express is refused at open
+//! with the tensor and the type in the message, rather than reach a launch that would misread its
+//! bytes. The match names every variant of the crate's enum, and the catch-all that its
+//! `#[non_exhaustive]` makes the language require **refuses and prints the variant it saw**, so a
+//! type a future release adds is a shard this loader will not open, never a number read as another.
 //!
 //! ## File identity
 //!
@@ -35,6 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
 use ops::{DType, Shape};
+use safetensors::Dtype as FormatDtype;
+use safetensors::SafeTensors;
 
 use crate::error::{Error, Result};
 
@@ -289,6 +294,59 @@ impl Checkpoint {
         })
     }
 
+    /// A pipeline whose components are the subdirectories of `root` and whose tensors are never read.
+    ///
+    /// It exists for a walk that states a model's extents without its bytes: every component handle
+    /// resolves, so a `load` that chooses a component per weight runs unchanged, and a `read` refuses
+    /// because no tensor is known. Unlike [`Checkpoint::open`], a component directory holding an index
+    /// and no shards is a component here rather than a directory that is skipped — which is what a
+    /// metadata-only deployment on a machine without the weights looks like.
+    pub fn unopened(root: &Path) -> Result<Self> {
+        let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let mut components = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| Error::Io {
+                path: root.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            components.insert(
+                name,
+                Self {
+                    root: path.clone(),
+                    roots: vec![path],
+                    files: Vec::new(),
+                    tensors: BTreeMap::new(),
+                    components: BTreeMap::new(),
+                    read: Mutex::new(BTreeSet::new()),
+                },
+            );
+        }
+        if components.is_empty() {
+            return Err(Error::Checkpoint {
+                path: root.to_path_buf(),
+                problem: "no component directory below it".to_owned(),
+            });
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            roots: vec![root.to_path_buf()],
+            files: Vec::new(),
+            tensors: BTreeMap::new(),
+            components,
+            read: Mutex::new(BTreeSet::new()),
+        })
+    }
+
     /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
     ///
     /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
@@ -466,6 +524,18 @@ impl Checkpoint {
 
     /// Read the tensor named `name` into host memory.
     pub fn read(&self, name: &str) -> Result<HostTensor> {
+        if self.files.is_empty() && self.tensors.is_empty() && !self.roots.is_empty() {
+            // No shard set was ever opened for this handle: either an unopened pipeline or one of its
+            // components. Say so, rather than reporting a name as absent from a table never filled.
+            if self.components.is_empty() {
+                return Err(Error::Checkpoint {
+                    path: self.root.clone(),
+                    problem: format!(
+                        "this handle states a component's extents and reads no tensor (`{name}` was asked for)"
+                    ),
+                });
+            }
+        }
         let location = self.tensors.get(name).ok_or_else(|| {
             if self.roots.len() == 1 {
                 return Error::MissingTensor(name.to_owned());
@@ -646,70 +716,34 @@ struct HeaderTensor {
     offsets: (u64, u64),
 }
 
-/// One header entry as the format states it.
-#[derive(serde::Deserialize)]
-struct RawTensor {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: (u64, u64),
-}
-
-/// Read one shard's header: the byte length of the header (its JSON body plus the eight-byte
-/// length that precedes it) and every tensor it names.
+/// Read one shard's header through the `safetensors` crate: the byte length of the header (its JSON
+/// body plus the eight-byte length that precedes it) and every tensor it names.
 ///
-/// The format is eight little-endian bytes of JSON length, that many bytes of JSON, then the
-/// payload. The JSON is an object of tensor name to `{dtype, shape, data_offsets}`, with an optional
-/// `__metadata__` entry that carries no tensor — accepted and ignored, as the format says.
-///
-/// **This is the crate's job done here**, deliberately: `safetensors` 0.3.3's `Dtype` has no FP8 or
-/// FP4 variant, so a shard carrying `F8_E4M3` — which a calibrated NVFP4 checkpoint's block scales
-/// are — fails in the crate's own deserialization, before any lookup. The dtype set is a property of
-/// the format, and the format's names are mapped here onto what our operators speak (specs/worker.md
-/// 9, `DType`); a name outside that set is refused with the name in the message rather than read as
-/// something it is not.
+/// The format's own reader is used rather than one written here. `read_metadata` parses the length
+/// and the header body, checks every tensor's byte range against its extents and element width, and
+/// drops the optional `__metadata__` block, which carries no tensor. **What stays ours is the element
+/// type**, because the crate's `Dtype` is the format's and ours is the operator ABI's: a type we
+/// cannot express is refused here, at open, with the tensor in the message, rather than reach a
+/// launch that would misread its bytes.
 fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTensor)>)> {
-    let length = bytes.get(..8).ok_or_else(|| Error::Checkpoint {
+    let (header, metadata) = SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
         path: path.to_path_buf(),
-        problem: "a shard begins with eight bytes of header length".to_owned(),
+        problem: format!("the safetensors header does not parse: {problem}"),
     })?;
-    let mut word = [0_u8; 8];
-    word.copy_from_slice(length);
-    let json_length = u64::from_le_bytes(word);
-    let header = json_length
-        .checked_add(8)
-        .filter(|end| *end <= bytes.len() as u64)
-        .ok_or_else(|| Error::Checkpoint {
-            path: path.to_path_buf(),
-            problem: format!(
-                "a {json_length}-byte header does not fit a {}-byte shard",
-                bytes.len()
-            ),
-        })?;
+    let header = header as u64;
     let payload = bytes.len() as u64 - header;
-    let body =
-        std::str::from_utf8(&bytes[8..header as usize]).map_err(|error| Error::Checkpoint {
-            path: path.to_path_buf(),
-            problem: format!("the header is not UTF-8: {error}"),
-        })?;
-    let parsed: BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(body).map_err(|error| Error::Checkpoint {
-            path: path.to_path_buf(),
-            problem: format!("the header is not valid JSON: {error}"),
-        })?;
 
-    let mut tensors = Vec::with_capacity(parsed.len());
-    for (name, value) in parsed {
-        // The format's optional metadata block is an object of strings, not a tensor.
-        if name == "__metadata__" {
-            continue;
-        }
-        let raw: RawTensor = serde_json::from_value(value).map_err(|error| Error::Checkpoint {
-            path: path.to_path_buf(),
-            problem: format!("tensor `{name}` is not {{dtype, shape, data_offsets}}: {error}"),
-        })?;
-        let dtype = dtype_of(path, &name, &raw.dtype)?;
-        let shape = shape_of(path, &name, &raw.shape)?;
-        let (start, end) = raw.data_offsets;
+    // The crate answers its tensors in a hash map's order; the checkpoint keys them by name and a
+    // report is diffed between two loads, so they are taken in name order here.
+    let mut stated = metadata.tensors().into_iter().collect::<Vec<_>>();
+    stated.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut tensors = Vec::with_capacity(stated.len());
+    for (name, info) in stated {
+        let dtype = element_type(path, &name, info.dtype)?;
+        let shape = extents(path, &name, &info.shape)?;
+        let start = info.data_offsets.0 as u64;
+        let end = info.data_offsets.1 as u64;
         if start > end || end > payload {
             return Err(Error::Checkpoint {
                 path: path.to_path_buf(),
@@ -730,36 +764,57 @@ fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTen
     Ok((header, tensors))
 }
 
-/// The operator ABI element type a safetensors dtype **name** states.
+/// The operator ABI element type the format's `Dtype` names.
 ///
-/// The whole set our operators speak is accepted, FP8 and FP4 included; a name that is not in the
-/// set — the format's `BOOL`, `I8`, `U16`, F6 and F8_E5M2 among them, and any future one — is
-/// refused by name here, at open, rather than reaching a launch that would misread its bytes.
-fn dtype_of(path: &Path, tensor: &str, name: &str) -> Result<DType> {
-    Ok(match name {
-        "U8" => DType::U8,
-        "I16" => DType::I16,
-        "I32" => DType::I32,
-        "I64" => DType::I64,
-        "F16" => DType::F16,
-        "BF16" => DType::BF16,
-        "F32" => DType::F32,
-        "F8_E4M3" => DType::F8E4M3,
-        "F4_E2M1" | "F4" => DType::F4E2M1,
-        other => {
-            return Err(Error::Checkpoint {
-                path: path.to_path_buf(),
-                problem: format!(
-                    "tensor `{tensor}` is `{other}`, which the operator ABI has no type for"
-                ),
-            });
-        }
-    })
+/// **Every variant of the crate's enum is named here and there is no catch-all.** A variant the
+/// crate adds must be a compile error in this file, because the alternative is a `_` arm that reads
+/// a future element type as whatever the arm says, and a silent default in a checkpoint parser is a
+/// wrong number with a right shape. The variants the ABI has no type for are refused by name: they
+/// are real format types this operator set does not speak, and reading one as another type would be
+/// worse than refusing the shard.
+fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> {
+    let refuses = |kind: &str| {
+        Err(Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("tensor `{tensor}` is `{kind}`, which the operator ABI has no type for"),
+        })
+    };
+    match dtype {
+        FormatDtype::U8 => Ok(DType::U8),
+        FormatDtype::I16 => Ok(DType::I16),
+        FormatDtype::I32 => Ok(DType::I32),
+        FormatDtype::I64 => Ok(DType::I64),
+        FormatDtype::F16 => Ok(DType::F16),
+        FormatDtype::BF16 => Ok(DType::BF16),
+        FormatDtype::F32 => Ok(DType::F32),
+        FormatDtype::F8_E4M3 => Ok(DType::F8E4M3),
+        FormatDtype::F4 => Ok(DType::F4E2M1),
+        FormatDtype::BOOL => refuses("BOOL"),
+        FormatDtype::I8 => refuses("I8"),
+        FormatDtype::U16 => refuses("U16"),
+        FormatDtype::U32 => refuses("U32"),
+        FormatDtype::U64 => refuses("U64"),
+        FormatDtype::F64 => refuses("F64"),
+        FormatDtype::C64 => refuses("C64"),
+        FormatDtype::F6_E2M3 => refuses("F6_E2M3"),
+        FormatDtype::F6_E3M2 => refuses("F6_E3M2"),
+        FormatDtype::F8_E5M2 => refuses("F8_E5M2"),
+        FormatDtype::F8_E8M0 => refuses("F8_E8M0"),
+        FormatDtype::F8_E4M3FNUZ => refuses("F8_E4M3FNUZ"),
+        FormatDtype::F8_E5M2FNUZ => refuses("F8_E5M2FNUZ"),
+        // The crate marks `Dtype` `#[non_exhaustive]`, so the language requires a catch-all: a
+        // release may name an element type this build has never heard of. It **refuses** and prints
+        // the variant it saw rather than reading it as one of ours, so the arm the exhaustiveness
+        // rule forces is the one that cannot become a silent default.
+        other => refuses(&format!("{other:?}")),
+    }
 }
 
 /// A shape the operator ABI can hold.
-fn shape_of(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
-    let mut extents = [0_u64; ops::MAX_RANK];
+///
+/// The format allows any rank; the ABI's is a fixed maximum, so a shard of deeper tensors is refused
+/// by name rather than truncated to the axes that fit.
+fn extents(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
     if dims.len() > ops::MAX_RANK {
         return Err(Error::Checkpoint {
             path: path.to_path_buf(),
@@ -770,8 +825,157 @@ fn shape_of(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
             ),
         });
     }
+    let mut extents = [0_u64; ops::MAX_RANK];
     for (axis, &extent) in dims.iter().enumerate() {
         extents[axis] = extent as u64;
     }
     Ok(Shape::new(&extents[..dims.len()]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipeline handle names every component directory — including one that holds an index and no
+    /// shards, which `open` skips — and reading a tensor from it refuses by name rather than reporting
+    /// a name absent from a table that was never filled.
+    ///
+    /// This is what a walk over a metadata-only deployment uses: the weights' shapes come from the
+    /// model's own `load`, and the checkpoint is a handle to the component directories only.
+    #[test]
+    fn an_unopened_pipeline_names_components_and_reads_no_tensor() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        for component in ["vae", "text_encoder"] {
+            std::fs::create_dir(root.path().join(component)).expect("a component directory");
+        }
+        // An index with no shard beside it is what a metadata-only deployment looks like.
+        std::fs::write(
+            root.path()
+                .join("vae")
+                .join("diffusion_pytorch_model.safetensors.index.json"),
+            br#"{"weight_map":{}}"#,
+        )
+        .expect("an index");
+        std::fs::write(root.path().join("model_index.json"), b"{}").expect("a pipeline index");
+
+        let checkpoint = Checkpoint::unopened(root.path()).expect("the pipeline handle");
+        let mut names = checkpoint.components().collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, vec!["text_encoder", "vae"]);
+        assert!(checkpoint.component("vae").is_ok());
+        assert!(checkpoint.component("audio_vae").is_err());
+
+        let problem = checkpoint
+            .component("vae")
+            .expect("the vae handle")
+            .read("weight")
+            .expect_err("an unopened component reads nothing");
+        assert!(
+            problem.to_string().contains("reads no tensor"),
+            "the refusal says what this handle is: {problem}"
+        );
+    }
+
+    /// Write one shard of `tensors` — each `(name, dtype, shape, bytes)` — into `directory` and
+    /// answer the root to open.
+    ///
+    /// The header is composed here from the format's own grammar (an eight-byte length, the JSON
+    /// body, then the payload laid out in the order the offsets state), so the test states the
+    /// format rather than going through the parser it is testing.
+    fn shard(directory: &Path, tensors: &[(&str, &str, &[usize], &[u8])]) -> PathBuf {
+        let mut body = String::from("{");
+        let mut payload = Vec::new();
+        for (index, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let start = payload.len();
+            payload.extend_from_slice(bytes);
+            let extents = shape
+                .iter()
+                .map(|extent| extent.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!(
+                r#""{name}":{{"dtype":"{dtype}","shape":[{extents}],"data_offsets":[{start},{}]}}"#,
+                payload.len()
+            ));
+        }
+        body.push('}');
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        file.extend_from_slice(body.as_bytes());
+        file.extend_from_slice(&payload);
+        let path = directory.join("model.safetensors");
+        std::fs::write(&path, &file).expect("a shard");
+        path
+    }
+
+    /// A shard's tensors read back **byte for byte at the payload-relative offsets the header
+    /// states**, each with its own element type and extents, and a non-float tensor is named.
+    ///
+    /// The trap this pins is the one the crate's `read_metadata` makes easy to fall into: the
+    /// payload starts *after* the header's length, so a reader that adds the wrong offset answers a
+    /// slice of the right length for every tensor and every shape agrees. The bytes are therefore
+    /// unlike the header's own text and unlike each other, and the integer tensor is checked because
+    /// `names()` must keep its meaning for it: a parser that filtered to float types would make a
+    /// mixed component look uniform.
+    #[test]
+    fn a_shards_tensors_read_back_at_their_own_offsets_and_types() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        // Two elements of BF16: 2 × 3 extents, twelve bytes.
+        let halfs: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+        // Four I32 elements, sixteen bytes.
+        let words: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        shard(
+            root.path(),
+            &[
+                ("halfs", "BF16", &[2, 3], &halfs),
+                ("words", "I32", &[4], &words),
+            ],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        let mut names = checkpoint.names().collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["halfs", "words"],
+            "a non-float tensor is named like any other"
+        );
+
+        let halfs_read = checkpoint.read("halfs").expect("halfs");
+        assert_eq!(halfs_read.dtype, DType::BF16, "the tensor's own type");
+        assert_eq!(halfs_read.shape, Shape::new(&[2, 3]), "its own extents");
+        assert_eq!(halfs_read.bytes, halfs, "the bytes the header points at");
+
+        let words_read = checkpoint.read("words").expect("words");
+        assert_eq!(words_read.dtype, DType::I32, "an integer keeps its type");
+        assert_eq!(words_read.shape, Shape::new(&[4]));
+        assert_eq!(words_read.bytes, words, "and its own bytes");
+    }
+
+    /// A shard whose tensor is a real format type the operator ABI does not speak is refused **at
+    /// open**, naming the tensor and the type, rather than read as one of ours.
+    #[test]
+    fn a_tensor_of_an_unknown_element_type_is_refused_by_name() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        // `F8_E5M2` is eight bits an element, so two elements are two bytes and the crate's own
+        // header validation is satisfied: what refuses is this loader's type match.
+        shard(root.path(), &[("wide", "F8_E5M2", &[2], &[0x00, 0x01])]);
+
+        let problem = Checkpoint::open(root.path())
+            .err()
+            .expect("a type the ABI has no name for is refused");
+        let message = problem.to_string();
+        assert!(
+            message.contains("wide") && message.contains("F8_E5M2"),
+            "the refusal names the tensor and the type: {message}"
+        );
+    }
+
 }

@@ -711,9 +711,9 @@ impl Op for ScaledAdd {
             .view(args.source)
             .f32(args.alpha)
             .f32(args.beta)
-            .i32(elements);
+            .i64(elements);
         kernel.launch(
-            LaunchGrid::covering(u64::from(elements as u32), u64::from(descriptor.block))?,
+            LaunchGrid::covering(elements as u64, u64::from(descriptor.block))?,
             &mut arguments,
             stream,
         )
@@ -746,7 +746,7 @@ impl Op for ScaledAdd {
 }
 
 /// Validate a call and answer its flattened element count.
-fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i32> {
+fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
     if descriptor.columns == 0 || descriptor.block == 0 {
         return Err(Error::argument(
             ScaledAdd::NAME,
@@ -767,13 +767,17 @@ fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i32> {
         ));
     }
     let elements = args.target.shape.numel();
-    if elements > i32::MAX as u64 {
+    // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the count's
+    // type is the arithmetic's type. No launch today reaches `i32::MAX` — a call holds a tile, not
+    // a whole canvas — but a 32-bit count on a 64-bit offset space is an operator limit that no
+    // device imposes, and it costs nothing to not have one.
+    if elements > i64::MAX as u64 {
         return Err(Error::argument(
             ScaledAdd::NAME,
-            format!("{elements} elements do not fit the kernel's int32 count"),
+            format!("{elements} elements do not fit the kernel's int64 count"),
         ));
     }
-    Ok(elements as i32)
+    Ok(elements as i64)
 }
 
 #[cfg(test)]
@@ -812,6 +816,28 @@ mod scaled_add_tests {
     }
 
     #[test]
+    /// The count's type is the arithmetic's type: the kernel computes every offset in `int64`, so
+    /// the extent is an `i64` and a call is limited by its tensor rather than by a 32-bit field.
+    /// This count is past `i32::MAX` and is used here as the widest the type admits, not as one
+    /// the model launches — a launch holds a tile.
+    fn a_call_past_the_int32_count_is_a_call_and_not_a_refusal() {
+        const WIDEST_ENCODER_ROW: u64 = 2_246_049_792;
+
+        let target = view(DType::BF16, 1, WIDEST_ENCODER_ROW);
+        let source = view(DType::F32, 1, WIDEST_ENCODER_ROW);
+        let descriptor = ScaledAddDescriptor {
+            target: DType::BF16,
+            source: DType::F32,
+            columns: WIDEST_ENCODER_ROW as u32,
+            block: SCALED_ADD_BLOCK,
+        };
+
+        let elements = check(&descriptor, args(target, source))
+            .expect("a count past i32::MAX is a launch of this operator");
+        assert_eq!(elements, WIDEST_ENCODER_ROW as i64);
+        assert!(elements > i64::from(i32::MAX));
+    }
+
     fn the_two_operands_must_be_the_shape_the_descriptor_names() {
         let fine = args(view(DType::BF16, 2, 64), view(DType::F32, 2, 64));
         assert_eq!(

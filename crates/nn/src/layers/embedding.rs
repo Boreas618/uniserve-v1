@@ -136,7 +136,7 @@ impl Embedding {
                         .to_owned(),
                 )
             })?;
-            group.all_reduce_sum(out, f.stream)?;
+            group.all_reduce_sum(out, f.stream()?)?;
         }
         Ok(())
     }
