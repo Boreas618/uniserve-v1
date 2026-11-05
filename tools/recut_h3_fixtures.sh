@@ -47,7 +47,7 @@ fi
 # outside because the deployment states them: `124,192,243,362` are the delivery's durations snapped to
 # the `17n + 5` rung. A clip set written here is a second statement of the deployment, which is the
 # defect this file has already been fixed for twice (a raster and a bound).
-samples=${SAMPLES:-22}
+samples=${SAMPLES:-260}
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -68,7 +68,7 @@ elements=123456
 # recorder refuses any other by name.
 # The walk derives the track from the clip (`--samples [260] imply tracks [346400]`) and refuses a
 # mismatched pair, so this file passes no track to it. `TRACK` is still what the *recorder* takes.
-track=${TRACK:-29600}
+track=${TRACK:-346400}
 # The task is required and its rows differ: `t2va` states one row the conditioned walks do not.
 task=${TASK:-ref2va}
 
