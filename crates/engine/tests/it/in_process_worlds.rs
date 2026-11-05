@@ -42,7 +42,7 @@ fn request(id: u64, length: u32, first: u32, generated: Vec<u32>) -> GenerationR
         negative_prompt_token_ids: Vec::new(),
         multimodal_inputs: Default::default(),
         constraint: GenerationConstraint::UndOnly,
-        max_und_tokens: generated.len() + CONTINUED,
+        max_und_tokens: generated.len() + GENERATED + CONTINUED,
         sampling: SamplingParams::default(),
         image: ImageParams::default(),
         max_images: 1,
