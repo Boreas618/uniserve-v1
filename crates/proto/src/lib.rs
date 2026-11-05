@@ -59,8 +59,12 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`, `PrecopyFailed`,
 /// `NonFiniteLogits`); the frontend's peer registration and the daemon's
 /// commands to it (`Serve`, `Drain`, `Pause`, `Drained`); and the main
-/// process's `/metrics` counters (`FromEngine::Metrics`).
-pub const PROTOCOL_MINOR: u32 = 4;
+/// process's `/metrics` counters (`FromEngine::Metrics`). Minor 5 states the
+/// program generation a promotion serves (`Promoted.program_generation`), so
+/// the daemon can compare it with the epoch's own before it moves the
+/// frontend; unstated is a process that holds none, which is minor 4's
+/// behaviour.
+pub const PROTOCOL_MINOR: u32 = 5;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled
