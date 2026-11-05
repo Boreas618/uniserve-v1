@@ -313,6 +313,11 @@ impl TokenRefiner {
             u64::from(hidden),
             false,
         )?);
+        // The refiner's identity scale: one published FP32 value applied to the whole stream, so the
+        // row is one column wide and keyed at the stream's own type - the target's, not the scale's.
+        // A conditioned request is the only one that reaches the refiner, which is why this row
+        // appears in no unconditioned recording.
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, 1, false)?);
 
         // The attention over the request's document, and the stepwise gated activation.
         let attention = Attention::dense(
