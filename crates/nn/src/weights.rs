@@ -2457,13 +2457,20 @@ mod tests {
         let mut store = HostStore::new();
         let loader = WeightLoader::new(&checkpoint, &mut store, None, None);
 
-        let zero = WeightRequest::region("layers.0.attention.v_proj.weight", 0, Shape::new(&[2, 2]));
+        let zero =
+            WeightRequest::region("layers.0.attention.v_proj.weight", 0, Shape::new(&[2, 2]));
         let problem = loader
             .refuse_zeros(&zero)
             .expect_err("an all-zero projection is refused");
         let text = problem.to_string();
-        assert!(text.contains("v_proj.weight"), "the refusal names the tensor: {text}");
-        assert!(text.contains("every stored byte is zero"), "and what is wrong with it: {text}");
+        assert!(
+            text.contains("v_proj.weight"),
+            "the refusal names the tensor: {text}"
+        );
+        assert!(
+            text.contains("every stored byte is zero"),
+            "and what is wrong with it: {text}"
+        );
 
         let live_request =
             WeightRequest::region("layers.0.attention.k_proj.weight", 0, Shape::new(&[2, 2]));
