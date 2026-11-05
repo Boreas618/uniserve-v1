@@ -142,6 +142,12 @@ pub(crate) trait Roster {
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
     /// Commands the main process of `generation` on `host`.
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
+    /// Makes the process of `generation` on `host` commandable: the epoch the switch leaves was
+    /// started by the daemon's engine control, so this roster holds no row of it, and a `Drain` to
+    /// a process it does not know would reach nothing.
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        let _ = (host, group, rank, generation);
+    }
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
     /// Returns the previous epoch at `host` to serving.
@@ -187,6 +193,10 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
 
     fn command(&mut self, host: &str, generation: u64, command: process::Command) {
         (**self).command(host, generation, command)
+    }
+
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        (**self).adopt(host, group, rank, generation)
     }
 
     fn serve(&mut self, epoch: u64, requests: &str) {
@@ -438,6 +448,9 @@ impl Switch {
     /// Starts the precopy: every node starts the target's main process, then
     /// claims the target world's storage before the child maps it.
     pub(crate) fn start(&mut self, roster: &mut impl Roster) {
+        for node in &self.nodes {
+            roster.adopt(&node.host, &self.group, node.rank, self.previous_generation);
+        }
         for node in &self.nodes {
             let spawn = Spawn {
                 host: node.host.clone(),

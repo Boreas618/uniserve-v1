@@ -988,7 +988,11 @@ impl VideoDecoder {
         // every canvas only where every canvas is the same tiles. A deployment whose rasters tile
         // differently would need a table per raster, and is refused by both named.
         let tile = largest_tile(config, canvas.height, canvas.width)?;
-        let rows_bound = canvases.iter().map(|canvas| canvas.rows()).max().unwrap_or(0);
+        let rows_bound = canvases
+            .iter()
+            .map(|canvas| canvas.rows())
+            .max()
+            .unwrap_or(0);
         for other in &canvases[1..] {
             if largest_tile(config, other.height, other.width)? != tile {
                 return Err(Error::config(format!(
@@ -1771,7 +1775,7 @@ impl Decoder for VideoDecoder {
     ///
     /// The layout states the canvas's latent extents, and the block decodes one canvas, so a layout
     /// naming another raster is refused by name - the same mismatch `layout_of` refuses from its side,
-    /// reached here by a caller that built the layout itself. The plan is [`video_arena`]'s for that
+    /// reached here by a caller that built the layout itself. The plan is `video_arena`'s for that
     /// canvas at this decoder's element type, so the number and the plan a runner allocates from are
     /// one statement rather than two.
     fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
