@@ -258,8 +258,8 @@ def main(argv: list[str] | None = None) -> int:
             "on purpose"
         )
     # The row set states a ladder in its own `axes:` line, and that statement is
-    # what a store serves: a rung the model cannot produce is a row set for clips
-    # no request can name, whatever the generator's default happens to be.
+    # what a store serves: a rung the model cannot produce is a row set for
+    # clips no request can name, whatever the generator's default is.
     file_rungs = served(FIXTURE)
     if file_rungs:
         file_refused, _ = requestable(file_rungs, clause)
