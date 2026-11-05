@@ -38,7 +38,7 @@ const EXPERTS: u32 = 24576;
 /// module on its own thread.
 const ANSWER: Duration = Duration::from_secs(30);
 
-/// A toy policy program: limits that fit what the simulated workers were
+/// A toy policy program: limits that fit what the simulated executors were
 /// started for, and an empty plan.
 ///
 /// An empty plan asks for nothing, so a scheduler that serves under the toy
@@ -373,8 +373,8 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 fn a_scheduler_on_the_worker_processes_refuses_a_shadow_pass_and_names_why() {
     let world = World::start();
 
-    // §7.3 step 2's paired pass is the in-process arm's: a worker-process
-    // executor shadows a world on its own workers, so the ask is answered with
+    // §7.3 step 2's paired pass is the in-process arm's: an executor-process
+    // executor shadows a world on its own executors, so the ask is answered with
     // that rather than left waiting for a step that cannot run it.
     let refused = answer(world.handle.shadow(7))
         .expect_err("a scheduler over the worker processes runs no shadow pass");

@@ -4,12 +4,12 @@
 //! node's daemon, and on the leader the application), `frontend` (the
 //! deployment's application process), `engine` (a node's main process for one
 //! epoch), `storage` (a host's Storage Server), `program-server` (a host's
-//! Program Server) and `worker` (one worker of the Python runtime the daemon
+//! Program Server) and `executor` (one executor of the Python runtime the daemon
 //! still starts). The binary's own options, its log levels, are global; each
 //! command declares its own. `serve` and `frontend` take the serving command
 //! line (`daemon::options::ServeArgs`), which resolves one configuration from
-//! a `--config` file, a few flags and `--set` assignments. `worker` hands its
-//! arguments to the worker library unparsed.
+//! a `--config` file, a few flags and `--set` assignments. `executor` hands its
+//! arguments to the executor library unparsed.
 
 use std::ffi::OsString;
 
@@ -49,7 +49,7 @@ pub(crate) struct LogLevels {
 pub(crate) enum Command {
     /// Run this node's daemon; on the leader (node rank 0), also the
     /// UniServe OpenAI server, whose Rust engine and scheduler run
-    /// in-process and drive forward-only workers. Without a model, a
+    /// in-process and drive forward-only executors. Without a model, a
     /// single-node daemon serves its admin API alone until `PUT
     /// /admin/config` brings a deployment up.
     #[command(

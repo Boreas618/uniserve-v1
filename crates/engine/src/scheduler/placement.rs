@@ -6,7 +6,7 @@
 //! component, its later calls for that component stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
 //! which is its prefill replica unless that replica only prefills
-//! (`WorkerGroupRole::Prefill`): then a decode replica installs its cache.
+//! (`ExecutorGroupRole::Prefill`): then a decode replica installs its cache.
 
 use super::*;
 use ipc::{ForwardMode, TransferMode};
@@ -21,14 +21,14 @@ pub(super) struct Placement {
     /// `DEFAULT_COMPONENT` rather than the requested name).
     /// `Scheduler::refill_executor` prunes entries of requests that are no
     /// longer running or retiring.
-    pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
+    pub(super) affinity: HashMap<(RequestKey, String), crate::ExecutorGroupId>,
     /// Replica that decodes each request for one bound component name: the
     /// replica of its decode-stage calls (`decodes`), recorded as `affinity`
     /// is.
-    pub(super) decode_affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
-    /// The groups that prefill only (`WorkerGroupRole::Prefill`): their
+    pub(super) decode_affinity: HashMap<(RequestKey, String), crate::ExecutorGroupId>,
+    /// The groups that prefill only (`ExecutorGroupRole::Prefill`): their
     /// requests decode on the scheduler's decode groups.
-    pub(super) prefill_groups: HashSet<crate::WorkerGroupId>,
+    pub(super) prefill_groups: HashSet<crate::ExecutorGroupId>,
 }
 
 /// Whether a call of `kind` belongs to a request's decode stage, which a
@@ -49,7 +49,7 @@ pub(super) enum Choice {
     Existing,
     /// The policy's answer for a request that has not run there yet: the worker
     /// it named among the candidates `views::replicas` showed it.
-    Target(crate::WorkerGroupId),
+    Target(crate::ExecutorGroupId),
 }
 
 impl Placement {
@@ -65,7 +65,7 @@ impl Placement {
         world: &'a dyn super::submission::World,
         info: &'a WorkerInfo,
         kind: CallKind,
-    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -88,7 +88,7 @@ impl Placement {
         world: &'a dyn super::submission::World,
         kind: CallKind,
         component: &'a str,
-    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)> {
         world.info().workers.iter().filter_map(move |(id, info)| {
             if !info.supported_calls.contains(&kind) {
                 return None;
@@ -135,7 +135,7 @@ impl Placement {
         kind: CallKind,
         component: &'a str,
         choice: &Choice,
-    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
+    ) -> Option<(&'a crate::ExecutorGroupId, &'a str)> {
         // A decode-stage call runs on a replica that decodes: a cache
         // install, which a prefill replica could serve, hands the request to
         // a decode replica.
@@ -210,7 +210,7 @@ impl Placement {
         request: RequestKey,
         kind: CallKind,
         choice: &Choice,
-    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
+    ) -> Option<(&'a crate::ExecutorGroupId, &'a str)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -233,7 +233,7 @@ impl Placement {
         info: &WorkerInfo,
         request: RequestKey,
         kind: CallKind,
-    ) -> Option<crate::WorkerGroupId> {
+    ) -> Option<crate::ExecutorGroupId> {
         let (id, bound_component) =
             self.worker_target(world, info, request, kind, &Choice::Existing)?;
         let target = (id.clone(), bound_component.to_owned());
@@ -256,7 +256,7 @@ impl Placement {
         info: &WorkerInfo,
         call: &Call,
         choice: &Choice,
-    ) -> Option<(crate::WorkerGroupId, String)> {
+    ) -> Option<(crate::ExecutorGroupId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
             self.worker_target(world, info, call.request_key, call.kind, choice)
         } else {
@@ -277,7 +277,7 @@ impl Placement {
     /// Returns each call's placed worker plus every worker holding residency
     /// for a command's request. `Scheduler::dispatch_submissions` uses this
     /// set to hold back later batches that share a blocked destination.
-    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerGroupId> {
+    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::ExecutorGroupId> {
         let mut targets = batch
             .requests
             .iter()

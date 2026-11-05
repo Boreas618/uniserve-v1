@@ -1,7 +1,7 @@
 //! Serving warmup through the scheduler.
 //!
 //! Once the epoch's first policy serves, the engine admits real requests of the
-//! shapes the workers prepared for, so the serving path of every captured row
+//! shapes the executors prepared for, so the serving path of every captured row
 //! count, guidance-branch count and diffusion LM step has run before the first
 //! client request that needs it.
 //!
@@ -55,13 +55,13 @@ use crate::handle::EventRx;
 /// prepared latent and a step from a denoised one.
 const IMAGE_STEPS: u16 = 2;
 
-/// Runs the warmup requests the workers' reports call for on `core`.
+/// Runs the warmup requests the executors' reports call for on `core`.
 ///
 /// Returns once every request has finished. Fails, naming the group, when a
 /// request is rejected, ends in an error, or the engine dies first.
 ///
-/// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
-/// worker has no kernels or graphs to warm.
+/// Warmup runs only where the executors execute on CUDA devices: a CPU or stub
+/// executor has no kernels or graphs to warm.
 /// What a warm-up needs of a scheduler, so a thread of the engine's can warm a
 /// rank without holding the handle the engine serves with.
 pub(crate) struct Warm {
@@ -228,7 +228,7 @@ pub(crate) fn groups(
 
     if info.diffusion_lm_step_rows > 0 {
         let sampling = config.worker_process.canvas_sampling.context(
-            "workers report diffusion LM step rows but the deployment has no block sampling",
+            "executors report diffusion LM step rows but the deployment has no block sampling",
         )?;
         let length = sampling.canvas_length as usize;
         // Requests of different lengths stop stepping together once the

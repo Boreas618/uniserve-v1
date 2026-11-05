@@ -1,13 +1,13 @@
 //! Scheduler-owned request slots, cache references, latent pages, and Tensor spans.
 //!
-//! Each pool allocates its actual backing. Worker addresses are assembled from
+//! Each pool allocates its actual backing. Executor addresses are assembled from
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
-//! The backing storage itself lives in the worker processes, which report its
+//! The backing storage itself lives in the executor processes, which report its
 //! capacity in `WorkerInfo`; these pools assign its rows, units, pages, and
 //! byte ranges. Row zero of the request state, unit zero of the cache pool and
-//! page zero of the latent pool are the worker's inactive sentinels, so no
-//! pool ever hands them out, and the worker IPC validation rejects a request
+//! page zero of the latent pool are the executor's inactive sentinels, so no
+//! pool ever hands them out, and the executor IPC validation rejects a request
 //! row, cache unit or latent page of zero.
 //!
 //! An allocation is an owned, non-`Clone` value that the issuing pool's `free`
@@ -84,7 +84,7 @@ pub enum OutOfStorage {
 /// Only [`RequestPool::allocate`] creates a [`RequestSlot`] and only
 /// [`RequestPool::free`] consumes one, so a slot cannot be released twice.
 /// The slot does not record its pool; the scheduler holds several pools (its
-/// main pool and one per media worker) and must free a slot into its issuer.
+/// main pool and one per media executor) and must free a slot into its issuer.
 pub(crate) struct RequestPool {
     /// Unassigned rows as a LIFO stack, initially ordered so that `allocate`
     /// hands out the lowest row first.
@@ -94,7 +94,7 @@ pub(crate) struct RequestPool {
 impl RequestPool {
     /// Creates an allocator for the supplied capacity.
     ///
-    /// Rows are numbered `1..=capacity`, matching the worker's one-based
+    /// Rows are numbered `1..=capacity`, matching the executor's one-based
     /// request rows. The capacity is clamped to `1..=u32::MAX` rows.
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(1, u32::MAX as usize);
@@ -171,7 +171,7 @@ impl LatentPool {
     }
 }
 
-/// Cache unit pool and cross-group coordination derived from worker
+/// Cache unit pool and cross-group coordination derived from executor
 /// capabilities.
 pub(crate) struct PrefixCacheManager {
     pub(crate) block_pool: BlockPool,
@@ -179,7 +179,7 @@ pub(crate) struct PrefixCacheManager {
 }
 
 impl PrefixCacheManager {
-    /// Builds scheduler cache state when a worker advertises a paged unit pool.
+    /// Builds scheduler cache state when an executor advertises a paged unit pool.
     ///
     /// Returns `None` when `info` has no prefix cache. `BlockPool::new` panics on
     /// a pool without an allocatable unit and `BlockTable::new` on an empty
@@ -246,7 +246,7 @@ impl RequestPool {
         Ok(RequestSlot { index })
     }
 
-    /// Return a row after all participating workers acknowledge its release.
+    /// Return a row after all participating executors acknowledge its release.
     ///
     /// The caller passes the slot this pool issued; consuming it is what
     /// retires the row, so no liveness check remains to fail.

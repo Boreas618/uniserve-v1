@@ -9,8 +9,8 @@ use anyhow::Context;
 use ipc::{BatchCommand, BufferId, CallKind, CallStatus, ForwardMode, RequestKey, TransferMode};
 
 use super::Dispatcher;
-use crate::executor::WorkerResult;
-use crate::executor::{CommandOutcome, WorkerFailure, logical_result};
+use crate::executor::ExecutorResult;
+use crate::executor::{CommandOutcome, ExecutorFailure, logical_result};
 
 impl Dispatcher {
     /// Routes an executor result into its executor aggregate and publishes transferable products.
@@ -18,7 +18,7 @@ impl Dispatcher {
     /// Validates the report against the executor's pending calls, stores the
     /// product and cache exports it returns, and publishes its completions.
     /// When some calls failed, the report, failed completions included, is
-    /// still published and the method then returns a `WorkerFailure` naming
+    /// still published and the method then returns a `ExecutorFailure` naming
     /// the failed calls' requests and the buffers those calls would have
     /// produced. A request the executor refused, an input-error completion that
     /// states why, is named with that reason, so the scheduler rejects it
@@ -26,7 +26,7 @@ impl Dispatcher {
     pub(super) fn route_result(
         &mut self,
         worker_index: usize,
-        report: WorkerResult,
+        report: ExecutorResult,
     ) -> anyhow::Result<()> {
         let mut report = report;
         let failed_calls = report
@@ -136,13 +136,13 @@ impl Dispatcher {
                 .get(&product.product.buffer_id())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "executor {worker_index} returned an unplanned cross-worker product {:?}",
+                        "executor {worker_index} returned an unplanned cross-executor product {:?}",
                         product.product
                     )
                 })?;
             anyhow::ensure!(
                 route.worker_index == worker_index,
-                "executor {worker_index} returned a cross-worker product owned by worker {}",
+                "executor {worker_index} returned a cross-executor product owned by worker {}",
                 route.worker_index
             );
             if let Some(existing) = self.transfer_products.get_mut(&product.product.buffer_id()) {
@@ -193,7 +193,7 @@ impl Dispatcher {
                     .remove(&(completion.output.request_key, completion.output.call_id));
             }
         }
-        let execution = crate::executor::WorkerExecError::non_finite(
+        let execution = crate::executor::ExecuteError::non_finite(
             batch_id,
             report.results.iter().map(|completion| &completion.output),
         );
@@ -201,7 +201,7 @@ impl Dispatcher {
         if !failed_calls.is_empty() {
             // Keep the actual failed completion and all accepted independent work.
             // Future consumers cannot become ready when their producer has failed.
-            return Err(WorkerFailure {
+            return Err(ExecutorFailure {
                 worker_id: self.workers[worker_index].0.clone(),
                 endpoints: Vec::new(),
                 requests: failed_calls.iter().map(|(request, _)| *request).collect(),
@@ -224,7 +224,7 @@ impl Dispatcher {
     /// its recorded outcome or `Applied`, and applies the executor's own
     /// retirement bookkeeping for each command that did not fail. A result is
     /// queued for `poll` when it carries completions or is terminal.
-    pub(super) fn publish_result(&mut self, report: WorkerResult) -> anyhow::Result<()> {
+    pub(super) fn publish_result(&mut self, report: ExecutorResult) -> anyhow::Result<()> {
         let batch_id = report.batch_id;
         let std::collections::btree_map::Entry::Occupied(entry) = self.pending.entry(batch_id)
         else {

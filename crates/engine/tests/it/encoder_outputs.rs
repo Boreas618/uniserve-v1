@@ -30,7 +30,7 @@ use crate::support::video::{video_request, video_worker};
 /// prompt's conditioning in one page.
 const PAGE_BYTES: u64 = 4096;
 
-/// A scheduler of a simulated worker whose rank maps a host encoder pool of
+/// A scheduler of a simulated executor whose rank maps a host encoder pool of
 /// a Storage Server, with its loop running: one world of a deployment.
 struct Encoders {
     handle: CommandSender,

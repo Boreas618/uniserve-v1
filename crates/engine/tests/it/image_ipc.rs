@@ -1,8 +1,8 @@
-//! Image understanding and generation through a native worker process.
+//! Image understanding and generation through a native executor process.
 //!
-//! These tests run a scheduler (`SchedulerHandle`) over one real worker process
-//! (`uniserve worker` with the weightless stub model on CPU), so every
-//! image call the engine plans executes in the worker's image and text
+//! These tests run a scheduler (`SchedulerHandle`) over one real executor process
+//! (`uniserve executor` with the weightless stub model on CPU), so every
+//! image call the engine plans executes in the executor's image and text
 //! runtimes: vision encoding of an inline image and the context prefill that
 //! places its features; and an image's generation: the conditioning prefill
 //! and cache export, latent preparation, guided denoising with guidance prefix
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig, ExecutorProcessArgs};
+use engine::{EngineConfig, SchedulerHandle, ExecutorGroupConfig, ExecutorProcessArgs};
 use engine::{
     Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
@@ -74,7 +74,7 @@ fn engine() -> anyhow::Result<SchedulerHandle> {
     };
     config.eos = vec![END_OF_IMAGE];
     config.end_of_image = END_OF_IMAGE;
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    config.worker_groups = vec![ExecutorGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         1,
@@ -433,9 +433,9 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
 }
 
 /// A request that generated an image and left its engine continues on
-/// another from its facts, through the worker's own feedback computation:
+/// another from its facts, through the executor's own feedback computation:
 /// the engine writes the carried image's decoded values into its context
-/// by the request's feedback encoder, which the worker prepares as it
+/// by the request's feedback encoder, which the executor prepares as it
 /// prepares the decoded product, and the request generates the images and
 /// text the uninterrupted request generates after it, numbered after the
 /// carried image, with a usage that counts every token and image.
