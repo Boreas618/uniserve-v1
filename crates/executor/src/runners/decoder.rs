@@ -307,6 +307,21 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(())
     }
 
+    /// The one clip a decode bucket serves, or the refusal that names how many the batch carries.
+    ///
+    /// The bucket's extent names one raster, so a batch of two requests for it describes two clips in
+    /// one graph - a plan the mechanism does not make, and one whose second clip would be decoded
+    /// from the first clip's columns.
+    fn clip_of(media: &crate::batch::MediaColumns) -> Result<&Vec<Vec<u8>>> {
+        let [buffers] = media.inputs.as_slice() else {
+            return Err(Error::Invalid(format!(
+                "a decode bucket holds one clip and this batch carries {} request(s)",
+                media.inputs.len()
+            )));
+        };
+        Ok(buffers)
+    }
+
     /// Stages a batch's buffers into the columns `bucket`'s graph reads.
     ///
     /// The buffers are the model's own: `prepare_layout` states the first as the clip's latents and
@@ -322,14 +337,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
         let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        // One clip per bucket: the extent names one raster, so a batch carrying two requests of this
-        // bucket describes two clips in one graph, which is a plan the mechanism does not make.
-        let [buffers] = media.inputs.as_slice() else {
-            return Err(Error::Invalid(format!(
-                "a decode bucket holds one clip and this batch carries {} request(s)",
-                media.inputs.len()
-            )));
-        };
+        let buffers = Self::clip_of(media)?;
         let expected = tables.len() + 1;
         if buffers.len() != expected {
             return Err(Error::Invalid(format!(
@@ -761,6 +769,43 @@ mod tests {
         assert!(
             message.contains("it serves 2x3x4 only"),
             "and it carries the decoder's own reason: {message}"
+        );
+    }
+
+    #[test]
+    fn a_batch_of_two_requests_for_one_canvas_is_refused_by_its_count() {
+        // A bucket's extent names one raster, so two requests in one batch of it describe two clips in
+        // one graph: the second would be decoded from the first's columns. The refusal names the count
+        // rather than serving one and silently dropping the other.
+        let media = crate::batch::MediaColumns {
+            computation: crate::plan::Computation {
+                call: ipc::MediaCall::VideoDecoding,
+                rows: 2,
+                tokens: 0,
+                extent: crate::plan::Extent::Clip {
+                    frames: SERVED.0,
+                    height: SERVED.1,
+                    width: SERVED.2,
+                },
+            },
+            inputs: vec![vec![vec![0_u8; 8]], vec![vec![0_u8; 8]]],
+        };
+        let error = DecoderRunner::<Fixed>::clip_of(&media).expect_err("two clips, one bucket");
+        assert!(
+            format!("{error}").contains("holds one clip and this batch carries 2 request(s)"),
+            "the refusal counts the batch: {error}"
+        );
+
+        let one = crate::batch::MediaColumns {
+            inputs: vec![vec![vec![0_u8; 8]]],
+            ..media
+        };
+        assert_eq!(
+            DecoderRunner::<Fixed>::clip_of(&one)
+                .expect("one clip")
+                .len(),
+            1,
+            "one request carries the clip's one set of buffers"
         );
     }
 
