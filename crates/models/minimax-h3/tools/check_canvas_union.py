@@ -16,9 +16,10 @@ here: the header is what the generator says it served, and a tool carrying its
 own copy could agree with itself while disagreeing with the file. One build per
 canvas, no device.
 
-Exits non-zero, naming the rows that differ, on a mismatch - and non-zero with a
-different sentence when the flag no longer selects any row, because a comparison
-of identical parts passes on any list.
+Exit status: **0** the list is the union of its per-canvas runs, **1** they
+disagree (naming the rows), **2** there is no subject - the rows do not
+follow the raster, so every comparison here would pass on any list and the tool
+says so instead of passing.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
+
+# Exit statuses: 0 the union is the parts, 1 they disagree, and 2 no subject
+# - the rows do not follow the raster, so there is nothing to check.
+NO_SUBJECT = 2
 
 # The generator's header states the rasters it served as height and width.
 RASTERS = re.compile(r"rasters \(height, width\) \[(?P<list>[^\]]*)\]")
@@ -84,6 +89,16 @@ def rasters(header: str) -> list[tuple[int, int]]:
     ]
 
 
+def derived_keys(header: str) -> bool:
+    """Whether the file says its canvas keys are request-derived.
+
+    True means no row can depend on the raster, so a per-canvas union has no
+    subject and a pass would prove nothing; False means the same silence is a
+    canvas-class row gone missing.
+    """
+    return REQUEST_DERIVED.search(header) is not None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -136,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         # row can depend on the raster and this comparison has no subject; or a
         # canvas-class row may be missing, in which case the parts are missing
         # rather than equal and that is a defect.
-        if REQUEST_DERIVED.search(header):
+        if derived_keys(header):
             print(
                 f"{len(canvases)} canvases produced one row set of "
                 f"{len(whole)} rows, and the file states this: the keys that "
@@ -144,7 +159,9 @@ def main(argv: list[str] | None = None) -> int:
                 "the raster and one store serves every canvas. This "
                 "comparison has no subject, and it is not a pass"
             )
-            return 0
+            # Its own status: a script must be able to tell "the union is right"
+            # from "there is no union to check", and 0 would conflate them.
+            return NO_SUBJECT
         raise SystemExit(
             f"{len(canvases)} canvases produced one row set of {len(whole)} "
             "rows: no row depends on --rasters and the file does not state "
@@ -203,8 +220,9 @@ def self_test() -> int:
     # The file's own statement decides whether a vacuous union is expected or a
     # missing canvas-class row: both readings are exercised here.
     stated_derived = "# request-derived: `frame_pad`'s tile follows the canvas."
-    assert REQUEST_DERIVED.search(stated_derived)
-    assert not REQUEST_DERIVED.search("# request-derived: nothing here.")
+    assert derived_keys(stated_derived)
+    assert not derived_keys("# request-derived: nothing here.")
+    assert NO_SUBJECT != 0 and NO_SUBJECT != 1, NO_SUBJECT
     print(
         "ok   the union comparison, both mismatch directions, the parse, and "
         "the raster's effect"
