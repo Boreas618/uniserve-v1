@@ -58,7 +58,7 @@ if [ ! -f "$PREFIX/lib/libavcodec.so" ] || [ ! -f "$PREFIX/lib/libx264.so" ]; th
       cd "$build/ffmpeg"
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
         --prefix="$PREFIX" \
-        --enable-shared --disable-static --enable-rpath \
+        --enable-shared --disable-static \
         --enable-gpl --enable-libx264 --enable-version3 \
         --disable-doc --disable-debug --disable-ffplay --disable-autodetect \
         --enable-zlib
@@ -67,5 +67,24 @@ if [ ! -f "$PREFIX/lib/libavcodec.so" ] || [ ! -f "$PREFIX/lib/libx264.so" ]; th
     )
   fi
 fi
+
+# Every shared library records `$ORIGIN` as its run path rather than the prefix it was built in.
+# FFmpeg's `--enable-rpath` writes the prefix as an absolute path into each library, so a prefix
+# built in one worktree and provisioned elsewhere leaves `libavcodec` looking for `libx264` in a
+# directory that does not exist - and the loader resolves a library's own dependency with the
+# requiring library's run path, so no path on the executable can make up for it. `$ORIGIN` is the
+# library's own directory, which makes the prefix relocatable: a binary that names its `lib` runs
+# with no `LD_LIBRARY_PATH`. This runs for an existing prefix too, so a provisioned copy is
+# repaired rather than rebuilt.
+if ! command -v patchelf > /dev/null; then
+  echo "patchelf is needed to make $PREFIX relocatable: without it every library keeps the path it" >&2
+  echo "was built in, and a copy of the prefix cannot resolve its own dependencies" >&2
+  exit 1
+fi
+for library in "$PREFIX"/lib/libav*.so.* "$PREFIX"/lib/libsw*.so.* "$PREFIX"/lib/libx264.so.*; do
+  if [ -f "$library" ]; then
+    patchelf --set-rpath '$ORIGIN' "$library"
+  fi
+done
 
 echo "media native runtime: $PREFIX"

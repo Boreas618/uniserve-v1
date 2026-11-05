@@ -16,10 +16,12 @@ runtime the crate links is provisioned by the committed script
 `crates/media/native/build.sh`, which builds libx264 (pinned by SHA-256) and
 then FFmpeg 8.1.2 (`--enable-shared --enable-rpath --enable-libx264
 --enable-version3`) from the environment's FFmpeg source into
-`artifacts/native/prefix`. `--enable-rpath` bakes the prefix's `lib` into the
-runtime's own executables and shared libraries, so `bin/ffmpeg` and
-`bin/ffprobe` run without `LD_LIBRARY_PATH`, and a `cargo` test process links
-the same way. That directory is git-ignored; rebuild it with:
+`artifacts/native/prefix`. The script then sets every shared
+library's run path to `$ORIGIN`, so the prefix is relocatable: `bin/ffmpeg` and
+`bin/ffprobe` run without `LD_LIBRARY_PATH`, a binary that names the prefix's
+`lib` in its own run path resolves `libx264` beside `libavcodec`, and a prefix
+built in one worktree and provisioned elsewhere still works. That directory is
+git-ignored; rebuild it with:
 
 ```sh
 crates/media/native/build.sh            # into artifacts/native/prefix
@@ -27,8 +29,11 @@ crates/media/native/build.sh /some/prefix
 ```
 
 The build script finds the runtime in `UNISERVE_FFMPEG_DIR` when set, and in
-`<workspace>/artifacts/native/prefix` otherwise. Headers and shared libraries
-must both be present. The static `/opt/uv/ffmpeg-8.1.2/bin/ffmpeg` and
+`<workspace>/artifacts/native/prefix` otherwise; `crates/media/build_support/ffmpeg_prefix.rs` holds
+that rule once, for this crate's build script and for the workspace's (which
+records the prefix's `lib` in the executable's run path, since Cargo passes a
+dependency's link search path and library names on but not its link arguments).
+Headers and shared libraries must both be present. The static `/opt/uv/ffmpeg-8.1.2/bin/ffmpeg` and
 `ffprobe` stay in use as external programs: the reference video decoder is an
 external `ffmpeg` process by design, and tests validate MP4s with `ffprobe`.
 
