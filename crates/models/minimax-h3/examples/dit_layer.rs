@@ -807,10 +807,9 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let arena_bytes = needed.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
-    allocator.reserve(platform::PoolKind::Graph, reserve)?;
-    let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
-    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
-    let forward = Forward::new(&stream, &generation, &arena);
+    // The two numbers a pool refusal is about, printed **before** the reservation that can fail:
+    // a run that dies in the allocator otherwise leaves no statement of what it asked for, which is
+    // the one line a reader needs to tell a plan that is too large from a pool that is too small.
     println!(
         "tables: {} constants, {} state; arena {:.2} GiB needed of {:.2} GiB reserved",
         constant_specs.len(),
@@ -818,6 +817,10 @@ fn stage_denoise(args: &Args) -> Result<()> {
         needed as f64 / f64::from(1 << 30),
         arena_bytes as f64 / f64::from(1 << 30)
     );
+    allocator.reserve(platform::PoolKind::Graph, reserve)?;
+    let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
+    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
 
     // 5. The walk starts at the constants: the AdaLN cache's own projections are launches, and a walk
     //    that began at the forward would report a complete list while the run refused at the cache.
@@ -942,7 +945,6 @@ fn stage_denoise(args: &Args) -> Result<()> {
         latents,
     )?;
     stream.synchronize()?;
-
 
     write_h3t(
         &directory.join("text_features.h3t"),
@@ -1294,6 +1296,14 @@ fn stage_block(args: &Args) -> Result<()> {
 
     let arena_bytes = bytes.max(args.arena_gib << 30);
     let allocator = weights.allocator();
+    // The two numbers a pool refusal is about, printed **before** the reservation that can fail. The
+    // estimate is this stage's own (`bytes`), not `Denoiser::denoise_arena`'s plan, and the word says
+    // so: the plan belongs to a loaded denoiser and this stage keeps no second copy of it.
+    println!(
+        "arena {:.2} GiB estimated of {:.2} GiB reserved",
+        bytes as f64 / f64::from(1 << 30),
+        arena_bytes as f64 / f64::from(1 << 30)
+    );
     allocator.reserve(
         platform::PoolKind::Graph,
         usize::try_from(arena_bytes).unwrap_or(usize::MAX),
