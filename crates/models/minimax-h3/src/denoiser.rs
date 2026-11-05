@@ -1563,13 +1563,12 @@ impl nn::capability::Denoiser for Denoiser {
             ))));
         }
         // The draw is a flat stream - `(seed, element)` - so the operator reads a two-axis view and
-        // the raster keeps its own shape: merging the last two axes is one reinterpretation of the
-        // same bytes, and the element order is the raster's flat order either way. Handing the
-        // four-axis view over is what the operator refused (`expected 2 axes, found 4`), and it
-        // refused it after the load, one launch after the first stage's.
-        let flat = out
-            .video
-            .reshape(Shape::new(&[native[0] * native[1] * native[2], native[3]]));
+        // the raster keeps its own shape: `noise_view` merges the leading three axes into rows and
+        // leaves the last as the width, one reinterpretation of the same bytes, and the element
+        // order is the raster's flat order either way. Handing the four-axis view over is what the
+        // operator refused (`expected 2 axes, found 4`), and it refused it after the load, one
+        // launch after the first stage's.
+        let flat = out.video;
         // Both draws carry the **same** `stage` and `draw`, and only the offset differs: the
         // operator's address is `counter = [pair_low, pair_high, stage, draw]`, so either of those
         // words selects a different stream rather than a later position in this one. The reference
