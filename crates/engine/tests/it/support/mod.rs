@@ -10,7 +10,7 @@ pub(crate) mod serving;
 pub(crate) mod storage;
 pub(crate) mod video;
 
-pub(crate) use serving::{pool, rank, Serving, SAMPLED};
+pub(crate) use serving::{config, pool, rank, Serving, SAMPLED};
 
 /// Waits for `want` generated tokens, or for the request's terminal event.
 ///

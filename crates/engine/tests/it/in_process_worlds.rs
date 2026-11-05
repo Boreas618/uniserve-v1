@@ -115,7 +115,7 @@ fn terminal(events: &mut engine::EventRx) -> Event {
 fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     // The reference: the same request, generated without interruption.
     let reference_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut reference_config = EngineConfig::sim("worlds");
+    let mut reference_config = support::config(&reference_pool, "worlds");
     reference_config.world = 1;
     let reference =
         SchedulerHandle::over_batches(reference_config, reference_pool.clone() as Arc<dyn Batches>)
@@ -156,7 +156,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
 
     // The running world generates the first part.
     let running_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut running_config = EngineConfig::sim("worlds");
+    let mut running_config = support::config(&running_pool, "worlds");
     running_config.world = 1;
     let running =
         SchedulerHandle::over_batches(running_config, running_pool.clone() as Arc<dyn Batches>)
@@ -175,7 +175,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     // Its successor starts beside it, under the same claim, with its cache.
     let caches = answer(running.describe_cache()).expect("the running world states its cache");
     let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut successor_config = EngineConfig::sim("worlds");
+    let mut successor_config = support::config(&successor_pool, "worlds");
     successor_config.world = 2;
     successor_config.predecessor = Some(
         caches
