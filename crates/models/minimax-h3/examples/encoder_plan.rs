@@ -104,33 +104,6 @@ fn run() -> Result<(), String> {
     let tile_plan =
         video_encoder_run_arena(&config, &extents).map_err(|error| error.to_string())?;
 
-    // The stitcher's own buffers, which the run plan does **not** state and the run cannot do without:
-    // `tiled_encode::Scene::encode` takes a ring of two blocks per tile column plus one hand-off block
-    // *after* the encoder's reservation, each `[1, 2 * latent_channels, tile_rows, tile_columns]` F32.
-    // Its signature is `(config, extents)` and its only caller is the frozen harness, so the grid it
-    // would need to know is not reachable here - this prices what is missing rather than fixing it.
-    let columns = {
-        let mut starts: Vec<u32> = plan.tiles.iter().map(|tile| tile.columns.0).collect();
-        starts.sort_unstable();
-        starts.dedup();
-        starts.len()
-    };
-    let tile_rows = plan
-        .tiles
-        .first()
-        .map(|tile| u64::from(tile.rows.1))
-        .unwrap_or(0);
-    let tile_columns = plan
-        .tiles
-        .first()
-        .map(|tile| u64::from(tile.columns.1))
-        .unwrap_or(0);
-    let stitch_block = 2 * u64::from(config.latent_channels) * tile_rows * tile_columns;
-    let stitch = (2 * u64::try_from(columns).unwrap_or(0) + 1) * stitch_block * 4;
-    println!(
-        "the stitcher takes {stitch} B in {} block(s) of {stitch_block} elements ({columns} tile column(s)), which the run plan does not state",
-        2 * columns + 1
-    );
     // The conditioning runs once per request over the *latent* grid.
     let latent_frames = minimax_h3::encoding::Stack::of(&config)
         .map_err(|error| error.to_string())?
@@ -283,15 +256,108 @@ fn run() -> Result<(), String> {
                 "one tile allocates {tile_bytes} B beyond the set it was reserved: a layer is taking buffers from the arena inside a forward"
             ));
         }
-        if check {
-            return Err(format!(
-                "the run plan is {stitch} B short of the forward: the stitcher's ring and hand-off are \
-                 {} block(s) of {stitch_block} elements. A run sized from this plan stops at the first \
-                 of them unless `--arena-gib` covers it, and the fix is the harness passing its grid to \
-                 `video_encoder_run_arena`",
-                2 * columns + 1
-            ));
+        // The whole raster driver, not the encoder's half: `Scene::encode` takes the stitcher's ring and
+        // hand-off **after** the reservation, and only driving it shows whether a run's arena funds
+        // them. The arena here is exactly the run plan, which is what the harness allocates by default
+        // (`--arena-gib 0`), so a refusal *is* the device stop, measured on a host.
+        let set_bytes_run = arena_reservation(&tile_plan);
+        let run_arena = Arena::new(ops::DevicePtr::new(0), set_bytes_run + (64 << 20));
+        let caller_arena = Arena::new(ops::DevicePtr::new(0), 1_u64 << 40);
+        let driver = Forward::recording(&run_arena);
+        let mut views = Vec::with_capacity(extents.len());
+        for extent in &extents {
+            views.push(
+                caller_arena
+                    .tensor(
+                        DType::F32,
+                        Shape::new(&[
+                            1,
+                            u64::from(config.in_channels),
+                            u64::from(extent.frames),
+                            u64::from(extent.height),
+                            u64::from(extent.width),
+                        ]),
+                    )
+                    .map_err(|error| error.to_string())?,
+            );
         }
+        let (origin, end) = clip.plan().extent();
+        let blended = caller_arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[
+                    2 * u64::from(config.latent_channels),
+                    u64::from(latent_frames),
+                    u64::from(end - origin),
+                    u64::from(width / 16),
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+        let driven = clip.encode(
+            &driver,
+            &encoder,
+            &clip.plan(),
+            minimax_h3::tiled_encode::Scene {
+                pixels: &views,
+                blended,
+            },
+        );
+        // The block is `[blended.dim(0), blended.dim(1), tile_rows, tile_columns]`, so the latent-frame
+        // axis is part of it - the first version of this line left it out and priced the stitcher at
+        // half, which the driver's own measurement then disagreed with.
+        let columns = {
+            let mut starts: Vec<u32> = clip.plan().tiles.iter().map(|t| t.columns.0).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            starts.len()
+        };
+        let first = clip
+            .plan()
+            .tiles
+            .first()
+            .map(|tile| (u64::from(tile.rows.1), u64::from(tile.columns.1)));
+        let (tile_rows_u, tile_columns_u) = first.unwrap_or((0, 0));
+        let stitch_block = 2
+            * u64::from(config.latent_channels)
+            * u64::from(latent_frames)
+            * tile_rows_u
+            * tile_columns_u;
+        let stitch = (2 * u64::try_from(columns).unwrap_or(0) + 1) * stitch_block * 4;
+        match driven {
+            Ok(()) => {
+                let beyond = run_arena.used() - set_bytes_run;
+                let first = clip
+                    .plan()
+                    .tiles
+                    .first()
+                    .map(|tile| (u64::from(tile.rows.1), u64::from(tile.columns.1)));
+                println!(
+                    "trace: the whole raster driver takes {beyond} B beyond the encoder's set (the set is {set_bytes_run} B)"
+                );
+                println!(
+                    "trace: the stitcher's ring and hand-off are {} block(s) of {stitch_block} elements = {stitch} B ({columns} tile column(s)), which the run plan does not state",
+                    2 * columns + 1
+                );
+                if stitch != beyond {
+                    return Err(format!(
+                        "the stitcher's blocks price at {stitch} B but the driver took {beyond} B beyond the set: the pricing and the measurement disagree"
+                    ));
+                }
+                if check && beyond != 0 {
+                    return Err(format!(
+                        "the run plan is {beyond} B short of the raster driver, measured: the stitcher's ring and hand-off are {} block(s) of {stitch_block} elements, which `video_encoder_run_arena` does not state. A run sized from this plan stops at the first of them",
+                        2 * columns + 1
+                    ));
+                }
+                println!(
+                    "trace: blended {:?}, first tile latent {:?}",
+                    blended.shape.dims(),
+                    first
+                );
+            }
+            Err(error) => println!("trace: the raster driver does not fit - {error}"),
+        }
+
         if check && set_plan - set_bytes > nn::forward::ALIGNMENT - 1 {
             return Err(format!(
                 "the tile plan reserves {} B more than `reserve` takes, past the {} B an alignment step explains: a buffer nothing reads",
