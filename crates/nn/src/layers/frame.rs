@@ -56,7 +56,9 @@ impl FramePad {
     /// zeros and whose extra rows and columns are mirrored or replicated.
     ///
     /// `top`, `left` and `front` are the padding before the source on each axis; the output's own
-    /// extents give the padding after it.
+    /// extents give the padding after it. Both operands may be stored channel-first or
+    /// channels-last: the logical axes keep their meaning and the strides state the order
+    /// (`ops::conv`'s rule), so a channels-last span hands the same call a permuted view.
     pub fn forward(
         &self,
         f: &Forward,
@@ -124,8 +126,9 @@ impl FrameMoments {
 
     /// Reduce each frame's group means and reciprocal standard deviations.
     ///
-    /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
-    /// contiguous; `mean` and `rstd` are `[batch · frames, groups]` FP32.
+    /// `values` is `[batch, channels, frames, height, width]` FP32 in either layout — the operator
+    /// derives a frame's pixel step from the strides; `mean` and `rstd` are the `[batch · frames,
+    /// groups]` FP32.
     pub fn forward(
         &self,
         f: &Forward,
