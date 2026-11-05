@@ -2096,7 +2096,11 @@ fn round_even(value: u32, shift: u32) -> u32 {
 }
 
 /// The `f32` value of an IEEE half-precision bit pattern.
-fn half_to_f32(half: u16) -> f32 {
+///
+/// Public because a container that must hold `f32` (the diagnosis' `.npy`, which numpy reads) is
+/// written from a payload the device produced at the checkpoint's own width: the widening is one
+/// exact conversion and belongs beside its inverse rather than in every producer that needs it.
+pub fn half_to_f32(half: u16) -> f32 {
     let sign = u32::from(half & 0x8000) << 16;
     let exponent = (half >> 10) & 0x1f;
     let mantissa = u32::from(half & 0x03ff);
@@ -2121,7 +2125,10 @@ fn half_to_f32(half: u16) -> f32 {
 }
 
 /// The IEEE half-precision bit pattern nearest to `value`.
-fn f32_to_half(value: f32) -> u16 {
+///
+/// Public with [`half_to_f32`]: a producer that narrows a tensor to the deployment's type and a
+/// producer that widens one for a file are the same two functions read in opposite directions.
+pub fn f32_to_half(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = (bits >> 23) & 0xff;

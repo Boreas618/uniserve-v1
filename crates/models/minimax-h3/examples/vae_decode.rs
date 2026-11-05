@@ -819,6 +819,19 @@ fn stage_decode(args: &Args) -> Result<()> {
         element_of(dtype)?,
         &transposed,
     )?;
+    // **The raster in numpy's own container, beside the crate's.** `tools/diagnosis/compare.py`
+    // pairs the two implementations' trees by relative path and reads `.npy`; a raster written only
+    // as `.h3t` would appear there as a file the reference has and this crate does not - a false
+    // absence in a delivery artifact, which is worse than a missing row because it reads as a defect
+    // in the decoder. The two files hold the same numbers: the payload is the tensor's bytes, and the
+    // widening to `f32` is this container's one requirement (`diagnosis::write_npy`).
+    let raster_shape = [frames, u64::from(height), u64::from(width_px), channels];
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("raster.npy"),
+        &raster_shape,
+        &widen_to_f32(&transposed, dtype)?,
+    )
+    .map_err(Failure::message)?;
     // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
     // whole-raster residual: a seam that is faded with the wrong weight moves a band of a few dozen
     // pixels, and the maximum over a 25-frame raster is somewhere else. The grid knows where every
@@ -876,7 +889,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         walk_path.display()
     );
     println!(
-        "wrote {}/raster.h3t: [{frames}, {height}, {width_px}, {channels}] from {} tiles, latents {}",
+        "wrote {}/raster.h3t and raster.npy: [{frames}, {height}, {width_px}, {channels}] from {} \
+         tiles, latents {}",
         directory.display(),
         tiles.len(),
         if generated {
@@ -1332,6 +1346,31 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// The `f32` bytes of a payload at `dtype`: the widening `diagnosis::write_npy` requires.
+///
+/// A decode at the checkpoint's own half precision writes its `.h3t` at that width, and the reference
+/// covers its `.npy` twin by widening on the reader's side. This crate writes both files from one
+/// payload, so the widening happens here: FP32 is copied, FP16 is widened exactly (every half is a
+/// value a `f32` holds), and any other width is refused by name rather than guessed at.
+fn widen_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::F32 => Ok(bytes.to_vec()),
+        DType::F16 => {
+            let mut widened = Vec::with_capacity(bytes.len() * 2);
+            for half in bytes.as_chunks::<2>().0 {
+                widened.extend_from_slice(
+                    &nn::weights::half_to_f32(u16::from_le_bytes(*half)).to_le_bytes(),
+                );
+            }
+            Ok(widened)
+        }
+        other => Err(Failure::message(format!(
+            "a raster at {other} has no `f32` twin this stage writes: it widens FP16 and copies \
+             FP32, and another width would have to be guessed at"
+        ))),
+    }
+}
+
 /// The frames one clip keeps: its body, the frames the final clip drops and the tail that overlaps the
 /// next clip - the span the decoder trims to, which is fewer than the frames it decodes.
 fn kept_frames(config: &minimax_h3::VideoVaeConfig) -> u64 {
@@ -1442,7 +1481,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     for element in bytes.chunks(from) {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
-            DType::F16 => out.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1480,7 +1519,7 @@ fn pattern_latents(
         // rounding and not in the pattern - which is what makes two pages comparable.
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
-            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1503,30 +1542,6 @@ fn bf16_bits(value: f32) -> u16 {
     } else {
         upper
     }
-}
-
-/// The nearest float16 bit pattern of `value`, by the round-to-nearest-even rule `DType::F16` keeps.
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00;
-    }
-    let shifted = exponent - 127 + 15;
-    if shifted >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if shifted <= 0 {
-        return sign;
-    }
-    let mut half = ((shifted as u32) << 10) | (mantissa >> 13);
-    let remainder = mantissa & 0x1fff;
-    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
-        half += 1;
-    }
-    sign | half as u16
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
