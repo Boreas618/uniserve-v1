@@ -1705,9 +1705,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // computes for itself.
                 let live = self.staging.live_tokens();
                 if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
+                    // The bound alone says the launch runs work this batch does not hold; what the
+                    // work *does* is decided by the columns those rows read, and the rows past the
+                    // live span are the ones no operator wrote. A slot there is either absent
+                    // (`-1`, which the cache write skips) or left from another batch, and a row
+                    // naming a slot this batch never allocated is a write outside its pages - which
+                    // the device reports as an illegal address two commands later.
                     tracing::warn!(
                         captured_tokens = bucket.tokens,
                         live_tokens = live,
+                        beyond = %self.beyond_span(live, u64::from(bucket.tokens)),
                         "a prefill bucket's captured launch states more tokens than this batch \
                          holds: the bound was taken from the pose the bucket was captured with"
                     );
@@ -2954,6 +2961,40 @@ impl<M: CausalLm> CausalLmRunner<M> {
         out
     }
 
+    /// What the slot column holds for the rows a captured bound names beyond this batch's span.
+    ///
+    /// The cache write reads one slot per row of the launch's grid. Rows past the live span are rows
+    /// this batch never staged, so their slots are whatever the column last held: `-1` (which the
+    /// write skips), a slot of an earlier batch (a write into another request's pages), or a value
+    /// nothing ever wrote (a write into pages that do not exist, which is an illegal address on the
+    /// device). The three are indistinguishable from the bound alone, and only the third faults.
+    fn beyond_span(&self, live: u64, tokens: u64) -> String {
+        let first = usize::try_from(live).unwrap_or(0);
+        let count = usize::try_from(tokens.saturating_sub(live)).unwrap_or(0).min(4096);
+        if count == 0 {
+            return "none".to_owned();
+        }
+        let address = self.columns.slot_mapping.device.ptr.address().saturating_add((first as u64) * 4);
+        let Some(raw) = self.read_device(address, count * 4) else {
+            return "unreadable".to_owned();
+        };
+        let mut negative = 0_usize;
+        let mut largest = i64::MIN;
+        let mut first_few = String::new();
+        for (index, word) in raw.chunks_exact(4).enumerate() {
+            let slot = i32::from_ne_bytes(word.try_into().unwrap_or([0; 4]));
+            if slot < 0 {
+                negative += 1;
+            } else {
+                largest = largest.max(i64::from(slot));
+            }
+            if index < 4 {
+                first_few.push_str(&format!("{slot},"));
+            }
+        }
+        format!("rows={count} negative={negative} max={largest} first=[{first_few}]")
+    }
+
     /// The tensors a captured graph writes, read back from the pointers its own launches name.
     ///
     /// Layer 0's keys and values are byte-identical to the slice's and layer 1's are not, so the
@@ -3029,6 +3070,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // because the node's own argument is the struct that holds the pointer.
         let mut layer = 0_usize;
         let mut layer0_out = 0_u64;
+        let mut dirty = Vec::new();
         for (operator, _, launches) in captured.nodes() {
             if *operator != "paged_attention" {
                 continue;
@@ -3045,15 +3087,39 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .as_ref()
                     .map(|params| format!("{:?}", params.grid))
                     .unwrap_or_else(|| "unknown".to_owned());
-                let named = if address == 0 {
-                    "null".to_owned()
+                // A digest names a value; a byte count names its content. An output nobody wrote
+                // reads as all zeros, which is the same digest for every batch - and that is a
+                // different defect from an output written wrongly, so it is stated beside the digest.
+                let (named, written) = if address == 0 {
+                    ("null".to_owned(), String::new())
                 } else if !inside(address) {
-                    "outside".to_owned()
+                    ("outside".to_owned(), String::new())
                 } else {
                     match self.read_device(address, width) {
-                        Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
-                        None => "unreadable".to_owned(),
+                        Some(raw) => (
+                            format!("{:016x}", platform::fnv1a(&raw)),
+                            format!(" nz={}", raw.iter().filter(|byte| **byte != 0).count()),
+                        ),
+                        None => ("unreadable".to_owned(), String::new()),
                     }
+                };
+                // The partial matrix and stats the multi-CTA split fills: the FMHA kernel writes
+                // these and a separate reduction turns them into the output, so nonzero partials
+                // beside a zero output is that reduction not having run.
+                let partial = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(1024..1032))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let split = if partial != 0 && self.in_arena(partial, 4096) {
+                    self.read_device(partial, 4096)
+                        .map(|raw| {
+                            format!(" pnz={}", raw.iter().filter(|byte| **byte != 0).count())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
                 };
                 // The multi-CTA counter, read after the launch: a reduction that leaves it dirty
                 // hands the next launch a counter that never reaches its CTA bound, which is the
@@ -3064,25 +3130,68 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .and_then(|blob| blob.get(1000..1008))
                     .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
                     .unwrap_or(0);
-                let counted = if counter != 0 && self.in_arena(counter, 4) {
+                let counter_value = if counter != 0 && self.in_arena(counter, 4) {
                     self.read_device(counter, 4)
-                        .map(|raw| {
-                            format!(
-                                " cnt={}",
-                                i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4]))
-                            )
-                        })
-                        .unwrap_or_default()
+                        .map(|raw| i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4])))
                 } else {
-                    String::new()
+                    None
+                };
+                let counted = match counter_value {
+                    Some(value) => format!(" cnt={value}"),
+                    None => String::new(),
                 };
                 if layer == 0 && address != 0 {
                     layer0_out = address;
                 }
-                out.push_str(&format!(" attn{layer}={named}@{grid}{counted}"));
+                if let Some(value) = counter_value {
+                    if value != 0 {
+                        dirty.push((layer, value));
+                    }
+                }
+                out.push_str(&format!(" attn{layer}={named}{written}{split}@{grid}{counted}"));
                 layer += 1;
             }
         }
+
+        // Which layers left the multi-CTA counter dirty, and what the graph's kernels actually are.
+        // The counter is a semaphore the kernels reset, so a nonzero value after a launch is a
+        // protocol that did not complete - and the layers that share the value are the answer to
+        // "which batches", because every layer of one batch is launched by the same graph.
+        out.push_str(&format!(" cnt_dirty={}/{}", dirty.len(), layer));
+        if !dirty.is_empty() {
+            let named: Vec<String> = dirty
+                .iter()
+                .take(6)
+                .map(|(layer, value)| format!("L{layer}={value}"))
+                .collect();
+            out.push_str(&format!("[{}]", named.join(",")));
+        }
+        // An operator's name says what asked for a launch; the kernel's name says what ran. A
+        // protocol that is two launches shows as two names under one operator, and a launch filed
+        // under the wrong operator cannot hide.
+        let mut functions: Vec<(String, usize)> = Vec::new();
+        for (_, _, launches) in captured.nodes() {
+            for launch in launches {
+                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
+                    continue;
+                };
+                let name = params
+                    .function
+                    .name()
+                    .unwrap_or_else(|error| format!("unnamed({error})"));
+                match functions.iter_mut().find(|(known, _)| *known == name) {
+                    Some((_, count)) => *count += 1,
+                    None => functions.push((name, 1)),
+                }
+            }
+        }
+        functions.sort_by(|left, right| right.1.cmp(&left.1));
+        let spelled: Vec<String> = functions
+            .iter()
+            .take(12)
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect();
+        out.push_str(&format!(" functions=[{}]", spelled.join(",")));
 
         // The projection out of the attention block: the slice's `attended` cut is the attention
         // block's output *projected out and before the residual add*, so the tensor to compare
