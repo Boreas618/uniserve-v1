@@ -1022,15 +1022,19 @@ fn indices(
 }
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
-fn frequencies(
-    loader: &mut WeightLoader,
-    declared_sizes: &[(String, u64)],
-    config: &VideoVaeConfig,
-) -> Result<Weight> {
+/// The decoder's inverse frequencies, in the order its factors are laid out.
+///
+/// One block per axis, each over that axis's own width: the reference builds its embedding with
+/// `head_dim · ratio / 3` and reuses those frequencies on all three axes (`video_vae.py:547-549`,
+/// `uniserve/nn/rope.py:355-380`), so axis `a` takes `theta^(-2k / sections[a])` rather than a slice
+/// of one wider spectrum.
+///
+/// This is the table the decoder publishes as `video_vae.rotary.{rotated}.{theta}` and the one a
+/// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
+/// element type or key check can see, so the numbers have to be comparable without a device
+/// (`examples/vae_rope.rs`, `tools/compare_rope_factors.py --vae`).
+pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
     let (rotated, sections) = rotary(config)?;
-    // One block per axis, each over that axis's own width: the reference builds its embedding with
-    // `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
-    // `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
     let mut table = Vec::new();
     for width in &sections {
         for pair in 0..width / 2 {
@@ -1045,6 +1049,16 @@ fn frequencies(
             rotated / 2
         )));
     }
+    Ok(table)
+}
+
+fn frequencies(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    config: &VideoVaeConfig,
+) -> Result<Weight> {
+    let (rotated, _) = rotary(config)?;
+    let table = inverse_frequencies(config)?;
     let mut bytes = Vec::with_capacity(table.len() * 4);
     for value in &table {
         bytes.extend_from_slice(&value.to_le_bytes());
