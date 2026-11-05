@@ -33,6 +33,7 @@
 //! place that reads it.
 
 use nn::{Block, BlockName};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::audio_vae::AudioDecoder;
@@ -240,6 +241,69 @@ pub fn stored_types(
         if !found.iter().any(|(dtype, _)| *dtype == location.dtype) {
             found.push((location.dtype, name.to_owned()));
         }
+    }
+    Ok(found)
+}
+
+/// One component's stored element types, counted: what a deployment's header states about it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StoredTypes {
+    /// The component's name in the checkpoint, which is the name a deployment names it by.
+    pub component: &'static str,
+    /// Each element type the component stores weights in, with how many tensors carry it, in the
+    /// order they first appear. Empty when the table states none for it.
+    pub dtypes: Vec<(String, usize)>,
+}
+
+impl StoredTypes {
+    /// The one field a deployment's header carries for this component, such as
+    /// `transformer: BF16 x626 + F32 x12`.
+    ///
+    /// A row is keyed by an element type, so a header without these cannot tell a differing row from
+    /// a differing deployment - and the types are **not derivable on a host with no shard**:
+    /// `nn::Checkpoint::open` reads a shard's header and `unopened` carries no names. So they are
+    /// stated by the caller, from the same table the extents are filled from.
+    pub fn field(&self) -> String {
+        if self.dtypes.is_empty() {
+            return format!("{}: unstated", self.component);
+        }
+        let stated = self
+            .dtypes
+            .iter()
+            .map(|(dtype, count)| format!("{dtype} x{count}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        format!("{}: {stated}", self.component)
+    }
+}
+
+/// The four components a deployment's header names, with the element types each stores weights in,
+/// read from a `component-tensors.json` the caller exported from the checkpoint's own headers.
+///
+/// The table is the checkpoint export's (`{"<component>": {"<tensor>": {"dtype": …, "shape": …}}}`),
+/// and it is a caller's artifact because reading it here needs no shard: the point of stating it is
+/// that a shardless host cannot read the types for itself.
+pub fn element_types(table: &Path) -> Result<Vec<StoredTypes>> {
+    const COMPONENTS: [&str; 4] = ["text_encoder", "transformer", "vae", "audio_vae"];
+    let text = std::fs::read_to_string(table)
+        .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+    let table: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+    let mut found = Vec::with_capacity(COMPONENTS.len());
+    for component in COMPONENTS {
+        let mut dtypes: Vec<(String, usize)> = Vec::new();
+        if let Some(tensors) = table.get(component).and_then(|value| value.as_object()) {
+            for meta in tensors.values() {
+                let Some(dtype) = meta.get("dtype").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                match dtypes.iter_mut().find(|(name, _)| name == dtype) {
+                    Some((_, count)) => *count += 1,
+                    None => dtypes.push((dtype.to_owned(), 1)),
+                }
+            }
+        }
+        found.push(StoredTypes { component, dtypes });
     }
     Ok(found)
 }
