@@ -157,45 +157,54 @@ if [ ! -f "$extents" ]; then
     echo "   skipped: $extents is absent, and without it audio-encoder, audio-decoder"
     echo "   and conditioned refuse and their rows would read as absent"
 else
-    # Both paths are recorded. The conditioned path builds the text encoder's own harness
-    # and states a weight's element type from its own loader, so a loader that reports the
-    # wrong type keys a row this pass alone can contradict - it is the only instrument that
-    # would have caught a harness stating the audio VAE's F32 for every DiT weight.
-    : >"$scratch/recorded.txt"
-    for cond in false true; do
-    for point in $points; do
-        r_canvas=${point%%:*}
-        r_clip=${point##*:}
-        cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
-            --clip "$r_clip" --raster "$r_canvas" --tokens 4096 \
-            --track "$(python3 -c "print(round($r_clip * 40 / 24) * 800)")" \
-            --elements 123456 --types "$types" --extents "$extents" --conditioned "$cond" \
-            2>/dev/null | grep -P '\t' >>"$scratch/recorded.txt" || true
-    done
-    done
-    cut -f1,2 "$scratch/recorded.txt" | grep -v '^#' | sort -u >"$scratch/recorded.rows"
-    cut -f1,2 "$fixture" | grep -v '^#' | sort -u >"$scratch/file.rows"
-    # Two fields are a request's, not a deployment's, and a row that differs only in one of them
-    # is not a missing row: `columns_<elements>` carries the request's trajectory width, and
-    # `wide_true|false` is `elements >= u32::MAX` - a launch at any real request is `wide_false`
-    # while the file states the form its bound requires. Both sides are legitimate; comparing
-    # them literally would report the file's own bound as a gap.
-    missing=$(comm -23 "$scratch/recorded.rows" "$scratch/file.rows" | grep -v 'columns_123456' \
-        | while read -r row; do
-            folded=$(printf '%s' "$row" | sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/')
-            if grep -qF "$(printf '%s' "$folded" | cut -f2)" <(sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/' "$scratch/file.rows"); then
-                continue
-            fi
-            printf '%s\n' "$row"
-        done)
-    echo "   $(wc -l <"$scratch/recorded.rows") row(s) recorded at $(echo "$points" | wc -w) point(s)"
-    if [ -n "$missing" ]; then
-        echo "$missing" | sed 's/^/     NOT IN THE FILE: /' | head -6
-        fail "a forward launches a descriptor the file does not state"
-    fi
+    # Both paths are recorded, for both deployments. The conditioned pass builds the text
+    # encoder's own harness and states a weight's element type from its own loader, so a loader
+    # that reports the wrong type keys a row only that pass can contradict. The sparse file is
+    # recorded with the walk's own sparse setting, because the file that ships is the sparse
+    # one and a launch record for the dense list alone says nothing about it.
+    record_deployment() {
+        local fixture_path=$1
+        local recorded_txt=$2
+        shift 2
+        : >"$recorded_txt"
+        for cond in false true; do
+            for point in $points; do
+                r_canvas=${point%%:*}
+                r_clip=${point##*:}
+                cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
+                    --clip "$r_clip" --raster "$r_canvas" --tokens 4096 \
+                    --track "$(python3 -c "print(round($r_clip * 40 / 24) * 800)")" \
+                    --elements 123456 --types "$types" --extents "$extents" --conditioned "$cond" \
+                    "$@" 2>/dev/null | grep -P '\t' >>"$recorded_txt" || true
+            done
+        done
+        cut -f1,2 "$recorded_txt" | grep -v '^#' | sort -u >"$recorded_txt.rows"
+        cut -f1,2 "$fixture_path" | grep -v '^#' | sort -u >"$recorded_txt.file.rows"
+        # Two fields are a request's, not a deployment's, and a row that differs only in one of
+        # them is not a missing row: `columns_<elements>` carries the request's trajectory width,
+        # and `wide_true|false` is `elements >= u32::MAX` - a launch at any real request is
+        # `wide_false` while the file states the form its bound requires. Both sides are
+        # legitimate; comparing them literally would report the file's own bound as a gap.
+        comm -23 "$recorded_txt.rows" "$recorded_txt.file.rows" | grep -v 'columns_123456' \
+            | while read -r row; do
+                folded=$(printf '%s' "$row" | sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/')
+                if grep -qF "$(printf '%s' "$folded" | cut -f2)" \
+                    <(sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/' "$recorded_txt.file.rows"); then
+                    continue
+                fi
+                printf '%s\n' "$row"
+            done >"$recorded_txt.missing"
+        echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s)"
+        if [ -s "$recorded_txt.missing" ]; then
+            sed 's/^/     NOT IN THE FILE: /' "$recorded_txt.missing" | head -6
+            fail "a forward launches a descriptor $(basename "$fixture_path") does not state"
+        fi
+    }
+
+    record_deployment "$fixture" "$scratch/recorded.dense" || true
+    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse 64,0.9,0.9 || true
 fi
 
-echo
 echo "== four walks: one per task, and a sparse one"
 run() {
     name=$1
