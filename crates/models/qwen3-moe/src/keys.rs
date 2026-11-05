@@ -40,7 +40,6 @@ use nn::layers::{
     TILE_ROWS,
 };
 use ops::Op;
-use ops::fp4::ScaleLayout;
 use ops::attention::Phase;
 use ops::gemm::WeightOrder;
 use ops::moe::exchange::Mode;
@@ -283,7 +282,7 @@ pub fn keys(
                 // form, the plain product's in the 128x4 swizzled form. The walk states one key per
                 // descriptor the forward launches, so it states these two exactly as they are.
                 for (k, layout) in [
-                    (hidden, ScaleLayout::Linear),
+                    (hidden, Moe::GATED_TOKEN_SCALE_LAYOUT),
                     (
                         width(config.moe_intermediate_size, "expert intermediate width")?,
                         Moe::ACTIVATION_SCALE_LAYOUT,
@@ -300,7 +299,7 @@ pub fn keys(
                         dtype,
                         activation(config.hidden_act)?,
                         DType::F8E4M3,
-                        Moe::ACTIVATION_SCALE_LAYOUT,
+                        Moe::GATED_TOKEN_SCALE_LAYOUT,
                     )
                     .to_string(),
                 );
