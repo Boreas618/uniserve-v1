@@ -1357,7 +1357,7 @@ def _restart_while_streaming(
         # the end of this output, so a long tail in front of the verdict is
         # what drops the counts and the threads' own errors from the artifact.
         raise AssertionError(
-            f"{_log_trouble(log)}{log_tail(log, 80)}"
+            f"{_log_trouble(log)}{log_tail(log, 30)}"
             f"\n{error} (counts so far: {[len(read) for read in reads]}; "
             f"stream errors: {[repr(one) for one in errors]})"
         ) from error
