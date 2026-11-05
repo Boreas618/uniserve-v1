@@ -37,6 +37,7 @@
 //! never an acceptance gate).
 
 use crate::config::AttentionKind;
+use crate::output::VideoPostprocessor;
 use crate::{Error, Result, VideoVaeConfig};
 
 /// The latent frames one clip decodes: seven for the checkpoint.
@@ -1607,6 +1608,17 @@ impl Decoder for VideoDecoder {
     }
 
     /// The checkpoint's own element type, read at load rather than chosen (design 1).
+    /// The checkpoint's clip schedule for a timeline of `frames` frames.
+    ///
+    /// The schedule is `17 * n + 5` whatever block is asked: it depends on the checkpoint's clip body
+    /// and overlap frame counts, which the decoder holds as well as the postprocessor does. So both
+    /// answer through [`VideoPostprocessor::splices_of`], and a runner that bound only a decoder - a
+    /// checkpoint with no postprocessor publishes the clip's own raster - still gets the timeline's
+    /// unit list rather than the trait's refusal.
+    fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
+        VideoPostprocessor::splices_of(frames)
+    }
+
     fn element_type(&self) -> nn::DType {
         self.dtype
     }
