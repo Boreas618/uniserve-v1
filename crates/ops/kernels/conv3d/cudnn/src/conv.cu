@@ -687,13 +687,19 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return refuse(error, "a convolution's workspace could not be allocated");
   }
 
-  // The variant pack names this call's buffers by the operation graph's unique
-  // ids: the input is the operation's `x` (its `dy` when transposed), the output
-  // its `y` (its `dx`).
+  // The variant pack names this call's buffers by the operation graph's unique ids, so each pointer
+  // must be the tensor its descriptor describes. **Which buffer the `X` id takes depends on the
+  // pass**, exactly as the descriptors do: a forward convolution's `X` is the layer's input and its
+  // `Y` the output, while the backward-data pass of a transposed one has `dx` - the layer's output -
+  // in the `X` id and `dy` - the layer's input - in the `Y` id. Binding both ids to the forward
+  // arrangement gave a transposed convolution a graph describing one tensor and a pack supplying
+  // another, which is the same fault the descriptors had one way round.
   void* variant = nullptr;
   bool built = library.backend_create(kDescriptorVariantPack, &variant) == kSuccess;
   const int64_t uids[3] = {kUidX, kUidW, kUidY};
-  void* pointers[3] = {const_cast<void*>(call->input), const_cast<void*>(call->weight), call->out};
+  void* pointers[3] = {const_cast<void*>(call->transposed != 0 ? call->out : call->input),
+                       const_cast<void*>(call->weight),
+                       const_cast<void*>(call->transposed != 0 ? call->input : call->out)};
   built = built && library.backend_set(variant, kAttrVariantPackDataPointers, kTypeVoidPtr, 3,
                                        pointers) == kSuccess &&
           library.backend_set(variant, kAttrVariantPackUniqueIds, kTypeInt64, 3, uids) ==
