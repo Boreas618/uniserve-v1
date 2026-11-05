@@ -1883,7 +1883,45 @@ fn check_continuation(
 mod tests {
     use std::path::Path;
 
-    use super::{KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
+    use super::{
+        ENCODED_OPERATORS, Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys,
+        slot_for,
+    };
+
+    /// An encoded deployment's install list holds its packed product, at the class its own rows
+    /// round to.
+    ///
+    /// `nvfp4_gemm` belongs to neither the model's operator list nor the three routed products, so
+    /// while it was absent from both every stage's list dropped it: the generation loaded, the first
+    /// packed product found no kernel, and the key had been in the fixture the whole time.
+    #[test]
+    fn an_encoded_deployment_installs_its_packed_product() {
+        let encoded = Encoded {
+            declared: true,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let keys = needed_keys(
+            Path::new("a store root the pre-flight never reads"),
+            Stage::Decode,
+            true,
+            KvPages::Bf16,
+            encoded,
+        )
+        .expect("the deployment's list");
+
+        let packed: Vec<&str> = keys
+            .iter()
+            .filter(|(operator, _)| operator == "nvfp4_gemm")
+            .map(|(_, descriptor)| descriptor.as_str())
+            .collect();
+        // Sixteen rows round to the first class, and one continuation row to the same one, so the
+        // list holds the three projections at that class and no other.
+        assert_eq!(packed.len(), 3, "no packed product in {keys:?}");
+        for descriptor in &packed {
+            assert!(descriptor.contains("_m_128_"), "{descriptor}");
+        }
+    }
 
     /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
     /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
@@ -1948,6 +1986,93 @@ mod tests {
     fn a_short_sequence_length_is_refused() {
         let refused = check_continuation(15, 0, 15, 15, 15, 64).expect_err("seq_len 15 for 16");
         assert!(refused.to_string().contains("seq_len"), "{refused}");
+    }
+
+    /// Every operator the harness declares as encoded reaches an encoded deployment's list.
+    ///
+    /// The defect this generalises was one omission: `nvfp4_gemm` was in no list, so every encoded
+    /// stage dropped it, the generation loaded, and the first packed product found no kernel
+    /// although the store held the key. A test naming one operator would not catch the next
+    /// omission, so this one walks the set the harness declares.
+    #[test]
+    fn an_encoded_deployment_installs_every_encoded_operator() {
+        let encoded = Encoded {
+            declared: true,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let keys = needed_keys(
+            Path::new("a store root the pre-flight never reads"),
+            Stage::Decode,
+            true,
+            KvPages::Bf16,
+            encoded,
+        )
+        .expect("the deployment's list");
+        for operator in ENCODED_OPERATORS {
+            assert!(
+                keys.iter().any(|(named, _)| named == operator),
+                "`{operator}` is not in an encoded deployment's list"
+            );
+        }
+    }
+
+    /// The page type selects the cache's own rows and no others.
+    ///
+    /// `needed_keys` is the whole list a run installs, so a filter that applied the page type to
+    /// every row would leave an fp8 deployment with the three cache rows and no embedding, no
+    /// projections and no MoE - a list that loads and then refuses at the first operator it left
+    /// out, one stage away from the cause.
+    #[test]
+    fn a_page_type_selects_the_cache_rows_and_no_others() {
+        let store = Path::new("a store root the pre-flight never reads");
+        let encoded = Encoded {
+            declared: false,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let bf16 = needed_keys(store, Stage::Decode, true, KvPages::Bf16, encoded)
+            .expect("the deployment's list");
+        let fp8 = needed_keys(store, Stage::Decode, true, KvPages::Fp8, encoded)
+            .expect("the deployment's list");
+
+        assert_eq!(
+            bf16.len(),
+            fp8.len(),
+            "the two pages launch the same number of programs"
+        );
+        // Every operator that is not the cache's appears in both lists.
+        for (operator, _) in &bf16 {
+            if matches!(
+                operator.as_str(),
+                "kv_write" | "kv_write_scaled" | "paged_attention"
+            ) {
+                continue;
+            }
+            assert!(
+                fp8.iter().any(|(other, _)| other == operator),
+                "`{operator}` left the fp8 list"
+            );
+        }
+        // And the cache's rows swapped: the scaled write and the f8e4m3 planes in, the bf16 out.
+        assert!(
+            fp8.iter()
+                .any(|(operator, _)| operator == "kv_write_scaled"),
+            "the fp8 list has no scaled cache write"
+        );
+        assert!(
+            !bf16
+                .iter()
+                .any(|(operator, _)| operator == "kv_write_scaled"),
+            "the bf16 list has an fp8 cache write"
+        );
+        assert!(
+            fp8.iter()
+                .filter(|(operator, key)| operator == "paged_attention" && key.contains("kv_f8e4m3"))
+                .count()
+                == 2,
+            "both attention phases read an fp8 plane"
+        );
     }
 
     /// A position past the page table has no page to write, which is a refusal and not a launch.
@@ -2903,11 +3028,19 @@ fn needed_keys(
         };
         // A cache this deployment does not select is not a missing program: the `kv_f8e4m3` rows
         // belong to an fp8 deployment and the bf16 rows to a bf16 one, and a run must not be blocked
-        // by the other's gap.
+        // by the other's gap - and, just as much, must be blocked by a gap in its own. Only the
+        // cache's own operators are per-page-type: `kv_write`/`kv_write_scaled` and the fused
+        // attention, whose key carries the plane. Every other operator is the deployment's whatever
+        // the page is, so a filter that compares the page type across all rows drops the embedding,
+        // the projections and the MoE from an fp8 run's list and leaves three rows where nineteen
+        // launch - which the run then reports as a missing program far from the cause.
+        let cache_row = operator == "kv_write"
+            || operator == "kv_write_scaled"
+            || operator == "paged_attention";
         let scaled = operator == "kv_write_scaled"
             || descriptor.contains("kv_f8e4m3")
             || descriptor.contains("kv_f8e5m2");
-        if scaled != (kv_pages == KvPages::Fp8) {
+        if cache_row && scaled != (kv_pages == KvPages::Fp8) {
             continue;
         }
         // An encoded checkpoint's programs are its own: a dense deployment must not be held up by
@@ -3003,9 +3136,20 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
 /// list at two and keeps a missing `log_softmax` program out of the way of a token's id.
 const SAMPLER_OPERATORS: &[&str] = &["logits_shape", "argmax"];
 
-/// The operators an encoded checkpoint's step launches: the activation encoder, the packed product,
-/// and the two routed products whose grid is the sorted rows.
-const ENCODED_OPERATORS: &[&str] = &["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"];
+/// The operators an encoded checkpoint's step launches: the activation encoder, the four packed
+/// products (the attention projections, the dense path's gated product, and the two routed ones whose
+/// grid is the sorted rows).
+///
+/// The packed product belongs here and not in the model's own list: `nvfp4_gemm` is compiled per row
+/// class, so a row of it is required only for the classes this run launches, and the filter above is
+/// what keeps those. Leaving it out of both lists dropped every `nvfp4_gemm` row from every stage's
+/// install list, and the generation then held no kernel for the first product it launched.
+const ENCODED_OPERATORS: &[&str] = &[
+    "nvfp4_quantize",
+    "nvfp4_gemm",
+    "gather_gemm_nvfp4",
+    "route_gemm_nvfp4",
+];
 
 /// What an encoded deployment asks the store for, and which row counts.
 #[derive(Clone, Copy, Default)]
