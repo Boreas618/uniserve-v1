@@ -649,9 +649,9 @@ impl Transformer {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
             dtype,
+            dtype,
             WeightOrder::NxK,
             false,
-            dtype,
             dtype,
         ));
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
