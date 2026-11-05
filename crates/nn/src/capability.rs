@@ -649,7 +649,12 @@ pub struct DecodedMedia {
     /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
     /// `[frames, height, width, channels]` for a file converts once, where it writes.
     pub video: Option<TensorView>,
-    /// `[samples]` decoded audio.
+    /// `[samples, 2]` interleaved stereo PCM, `i16`, at the decoder's own sample rate.
+    ///
+    /// Two channels, interleaved: one row per sample frame, the left channel's value before the
+    /// right's. The wire format and the file format both want that order, so the decoder writes it and
+    /// no caller transposes. The channel count is fixed - `output::Pcm::CHANNELS` is two - because this
+    /// checkpoint's soundtrack is stereo.
     pub audio: Option<TensorView>,
 }
 
