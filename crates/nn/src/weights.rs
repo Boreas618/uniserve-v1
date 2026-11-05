@@ -1288,6 +1288,21 @@ impl<'a> WeightLoader<'a> {
                 format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
             ));
         }
+        // A calibrated export never packs an all-zero matrix: every E2M1 code would be zero, the
+        // product would answer zeros for every activation, and a cache filled from it would read as
+        // "this projection is broken" long after the loading boundary could have said so. One host
+        // read of a few megabytes per projection, at load only, buys that sentence.
+        if !self.is_shapes() {
+            let bytes = self.shards()?.read(&values_request.tensor)?;
+            if bytes.bytes.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    &values_request.tensor,
+                    "every packed E2M1 byte is zero: the product would answer zeros for every \
+                     activation, so this tensor's calibration did not run"
+                        .to_owned(),
+                ));
+            }
+        }
         // The file's arrangement and the product's are two statements, and the permutation between
         // them happens here once: a kernel must never read a table under a claim it does not meet.
         let scales = if file == product {
