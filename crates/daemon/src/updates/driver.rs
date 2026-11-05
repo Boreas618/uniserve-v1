@@ -179,7 +179,7 @@ mod tests {
     use super::*;
     use crate::epoch::{BuildConfig, EpochRecord, Program, Status, Update};
     use crate::options::ServeConfig;
-    use crate::updates::switch::{Event, Node, Start};
+    use crate::updates::switch::{Event, Start};
 
     /// The reports the test feeds as if the adapter had delivered them.
     type Feed = Arc<Mutex<Vec<Event>>>;
