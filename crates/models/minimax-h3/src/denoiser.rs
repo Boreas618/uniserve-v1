@@ -1108,8 +1108,8 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
 /// The segments a request's conditions pack into, in packed order.
 ///
 /// A runner hands one raster, one soundtrack and one draw per segment and reads back the row counts
-/// the packing reserved - it does not re-derive them, because those rows are the same arithmetic as
-/// [`condition_placements`] and a second statement of them is what makes a dropped condition
+/// the packing reserved - it does not re-derive them, because those rows are the same arithmetic the
+/// packer's own placements compute and a second statement of them is what makes a dropped condition
 /// invisible. Each segment carries its kind, its request index, its anchor (a keyframe's), its
 /// pixels' raster when it has any, and its audio frames.
 ///
