@@ -109,8 +109,20 @@ impl WarmRequest {
 /// The figures a denoiser's columns are sized by, which the deployment states once at open.
 #[derive(Clone, Copy, Debug)]
 pub struct DenoiserShape {
-    /// The element type the latents and the packed conditioning rows are stored in.
-    pub dtype: DType,
+    /// The element type of the **stack**: the packed conditioning rows a step reads and the
+    /// checkpoint's own arithmetic. The text encoder writes these, so this is the encoder's type.
+    pub stack: DType,
+    /// The element type of the **sample**: the trajectory the solver accumulates into, and its
+    /// noise. It is the model's own statement rather than this runner's
+    /// (`minimax_h3::denoiser::SAMPLE_DTYPE` is FP32) and it is not the stack's: the reference keeps
+    /// its trajectory in FP32 and refuses any other type at its entry, because a sample in the
+    /// stack's type would round the trajectory once per evaluation.
+    ///
+    /// **Two types, therefore two sizes.** A latent column sized at the stack's type is half the
+    /// bytes the model reads, so a runner that held one type here would refuse every step with
+    /// "the video latents are bf16 and a trajectory is f32" and the arena floor would be short by the
+    /// trajectory's own size.
+    pub sample: DType,
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
     pub width: u32,
@@ -223,10 +235,10 @@ impl DenoiseColumns {
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
         let text = width * u64::from(shape.width.max(1));
         Ok(Self {
-            video: Column::new(device, shape.dtype, rows * video)?,
-            audio: Column::new(device, shape.dtype, rows * audio)?,
-            text: Column::new(device, shape.dtype, rows * text)?,
-            source: Column::new(device, shape.dtype, rows * text)?,
+            video: Column::new(device, shape.sample, rows * video)?,
+            audio: Column::new(device, shape.sample, rows * audio)?,
+            text: Column::new(device, shape.stack, rows * text)?,
+            source: Column::new(device, shape.stack, rows * text)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
         })
@@ -238,19 +250,19 @@ impl DenoiseColumns {
         let rows = u64::from(rows.max(1));
         Staged::zero(
             &mut self.staged.video,
-            rows * latent_bytes(&layout.video, shape.dtype)?,
+            rows * latent_bytes(&layout.video, shape.sample)?,
         )?;
         let audio = match layout.audio {
-            Some(audio) => latent_bytes(&audio, shape.dtype)?,
-            None => shape.dtype.bytes().unwrap_or(1),
+            Some(audio) => latent_bytes(&audio, shape.sample)?,
+            None => shape.sample.bytes().unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
         let text = u64::from(shape.width.max(1));
         let bytes = shape
-            .dtype
+            .stack
             .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.dtype)))?;
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.stack)))?;
         Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
         // The conditioner folds these into `text`, so a warm capture must read defined features as
         // well as defined rows: an uninitialised buffer would make the capture's output depend on
@@ -715,8 +727,8 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
         let (rows, width) = conditioning_row(&self.shape, &layout);
-        let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
+        let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
         })?);
         let bytes = rows * width * element;
         for row in &pending {
@@ -736,7 +748,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
                 let destination = TensorView::new(
                     ops::DevicePtr::new(column.host.address() + u64::from(index) * bytes),
-                    self.shape.dtype,
+                    self.shape.stack,
                     Shape::new(&[copied / u64::from(element)]),
                 );
                 if !products.copy_into(request, kind, &destination, &stream)? {
