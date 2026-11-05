@@ -22,6 +22,7 @@ use nn::weights::WeightLoader;
 use nn::{Arena, DType, Forward, Shape};
 
 use minimax_h3::audio_vae::{BigVgan, audio_arena, track_samples};
+use nn::capability::Decoder;
 use minimax_h3::decoding::arena_reservation;
 use minimax_h3::encoding::{AudioEncoder, audio_encoder_arena};
 
@@ -94,6 +95,43 @@ fn run() -> Result<(), String> {
         let out = caller
             .tensor(DType::I16, Shape::new(&[samples, 2]))
             .map_err(|error| error.to_string())?;
+        // The number a runner allocates from is the decoder's own, asked of the capability rather
+        // than transcribed beside the plan: it must be the reservation the decode consumes.
+        let track = |audio: Option<nn::capability::LatentShape>| nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: 0,
+                frames: 0,
+                height: 0,
+                width: 0,
+            },
+            audio,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let stated = decoder
+            .arena_bytes(&track(Some(nn::capability::LatentShape {
+                channels: config.latent_channels,
+                frames: length,
+                height: 0,
+                width: 0,
+            })))
+            .map_err(|error| error.to_string())?;
+        if stated != reserved {
+            return Err(format!(
+                "{length} latent frames: the decoder states {stated} B of arena and its plan reserves {reserved} B"
+            ));
+        }
+        let silent = decoder
+            .arena_bytes(&track(None))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        if !silent.contains("no audio track") {
+            return Err(format!(
+                "{length} latent frames: a layout with no track answers `{silent}`, not a refusal by name"
+            ));
+        }
         decoder
             .forward(&f, latents, out)
             .map_err(|error| format!("{length} latent frames: {error}"))?;
