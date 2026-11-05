@@ -1454,6 +1454,11 @@ impl MainProcess {
                     // the promotion by name.
                     self.take_back_segments()?;
                     self.promoted = true;
+                    // The generation the schedulers must stamp this process's batches with: the one it
+                    // holds. A promotion is the one cut-over that reaches no `switchover` of this
+                    // process's own, so nothing else records it, and a promoted standby whose batches
+                    // were stamped 0 would find no graph - the same defect the switchover had.
+                    self.record_generation(self.served_generation());
                     // A promoted standby admits on the same rule as any other process: once the
                     // generation it will serve has been warmed (§4.5).
                     self.open_admission()
