@@ -99,7 +99,7 @@ impl Scheduler {
             // submitted beside the serving one (7.3 step 2). The copy is made
             // only when an update asked, and before the serving submit takes the
             // batch.
-            let shadow = self.shadow_generation();
+            let shadow = self.shadow_generation(&batch);
             let shadow_batch = shadow.map(|_| batch.clone());
             // The `Finish` commands this batch carries close the rows of the
             // requests they name once it is submitted: batches reach a rank in
@@ -137,8 +137,12 @@ impl Scheduler {
                     // as the serving submit does. A refused pass is answered at
                     // once, because waiting will not shadow it.
                     if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
+                        let shape = shadow_batch
+                            .columns
+                            .as_ref()
+                            .map(crate::scheduler::batching::columns::batch_shape);
                         match self.executor.shadow(shadow_batch, generation) {
-                            Ok(()) => self.note_shadowed(),
+                            Ok(()) => self.note_shadowed(shape),
                             Err(ExecutorSubmitError::Failed(error)) => {
                                 self.shadow_failed(format!("{error:#}"));
                             }
