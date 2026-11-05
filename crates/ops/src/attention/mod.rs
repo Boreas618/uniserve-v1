@@ -703,12 +703,14 @@ impl Op for PagedAttention {
                 kernel,
                 descriptor,
                 &args,
-                batch,
-                q_heads,
-                kv_heads,
-                page_size,
-                tokens,
-                max_q_len,
+                PagedLaunch {
+                    batch,
+                    q_heads,
+                    kv_heads,
+                    page_size,
+                    tokens,
+                    max_q_len,
+                },
                 stream,
             );
         }
@@ -785,7 +787,25 @@ impl Op for PagedAttention {
     }
 }
 
+/// The numbers one paged launch is sized by: its rows, its heads, its page and its longest query.
+///
+/// They are launch-time, not descriptor-time — two launches of one descriptor can differ in every
+/// field — so they travel as one value. Six adjacent `u64` arguments are transposable by a call site
+/// and the compiler says nothing: `q_heads` and `kv_heads` swapped is a launch of the wrong grid with
+/// both values in range, which is the defect class this crate keeps removing by making it
+/// unrepresentable rather than by reading more carefully.
+struct PagedLaunch {
+    batch: u64,
+    q_heads: u64,
+    kv_heads: u64,
+    page_size: u64,
+    tokens: u64,
+    max_q_len: u64,
+}
+
 impl PagedAttention {
+
+
     /// Launch this crate's own Triton program for an `E4M3` page.
     ///
     /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
@@ -802,12 +822,7 @@ impl PagedAttention {
         kernel: &Kernel,
         descriptor: &Descriptor,
         args: &Args,
-        batch: u64,
-        q_heads: u64,
-        kv_heads: u64,
-        page_size: u64,
-        tokens: u64,
-        max_q_len: u64,
+        launch: PagedLaunch,
         stream: &Stream,
     ) -> Result<()> {
         if descriptor.key_value != DType::F8E4M3 {
@@ -835,10 +850,10 @@ impl PagedAttention {
                 ),
             ));
         }
-        if q_heads % kv_heads != 0 {
+        if !launch.q_heads.is_multiple_of(launch.kv_heads) {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{q_heads} query heads do not divide into {kv_heads} key-value heads"),
+                format!("{} query heads do not divide into {} key-value heads", launch.q_heads, launch.kv_heads),
             ));
         }
 
@@ -881,7 +896,7 @@ impl PagedAttention {
             .i32(stride("the output's head stride", &args.out, 1)?)
             .i32(stride("the output's element stride", &args.out, 2)?)
             .i32(word("the page table's width", args.page_table.shape.dim(1))?)
-            .i32(word("the page size", page_size)?)
+            .i32(word("the page size", launch.page_size)?)
             .f32(args.scale);
         if descriptor.phase == Phase::Prefill {
             // A packed batch states each row's first query token; an unpacked one gives every row
@@ -891,7 +906,7 @@ impl PagedAttention {
             // branches on, and an unpacked call leaves the pointer unread.
             arguments
                 .view(args.cum_seq_lens_q)
-                .i32(word("the longest query row", max_q_len)?)
+                .i32(word("the longest query row", launch.max_q_len)?)
                 .i32(i32::from(packed));
         }
 
@@ -899,10 +914,10 @@ impl PagedAttention {
         // prefill the row's query tokens are its first grid dimension. The head decides the
         // key-value head the program reads.
         let grid = match descriptor.phase {
-            Phase::Decode => LaunchGrid::new([batch, q_heads, 1])?,
+            Phase::Decode => LaunchGrid::new([launch.batch, launch.q_heads, 1])?,
             // Over the packed token count rather than a row's length: the longest row is only known
             // from the offsets on the device, so a shorter row's tiles return before reading a page.
-            Phase::Prefill => LaunchGrid::new([tokens, q_heads, batch])?,
+            Phase::Prefill => LaunchGrid::new([launch.tokens, launch.q_heads, launch.batch])?,
         };
         kernel.launch(grid, &mut arguments, stream)
     }

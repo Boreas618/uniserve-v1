@@ -838,6 +838,7 @@ mod scaled_add_tests {
         assert!(elements > i64::from(i32::MAX));
     }
 
+    #[test]
     fn the_two_operands_must_be_the_shape_the_descriptor_names() {
         let fine = args(view(DType::BF16, 2, 64), view(DType::F32, 2, 64));
         assert_eq!(
