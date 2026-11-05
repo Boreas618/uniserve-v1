@@ -608,6 +608,47 @@ mod tests {
         );
     }
 
+    /// A reader that must place a product's bytes asks the store its length: the conditioning row
+    /// sizes its copy from it and pads the rest, and the length it sees is the **current** write's,
+    /// because a trajectory is published step by step and the latest is the one a reader wants.
+    #[test]
+    fn the_length_is_the_latest_writes_and_the_request_that_wrote_it() {
+        let store = Held::new();
+        assert_eq!(
+            store
+                .product_bytes(request(1), Product::Text)
+                .expect("an absent product is not an error"),
+            None,
+            "nothing wrote this request's kind"
+        );
+        for elements in [4096, 8192] {
+            store
+                .publish(
+                    request(1),
+                    Product::Text,
+                    DeviceId(0),
+                    StreamId(1),
+                    None,
+                    &view(64, elements),
+                )
+                .expect("a store accepts a view");
+        }
+        assert_eq!(
+            store
+                .product_bytes(request(1), Product::Text)
+                .expect("a published product has a length"),
+            Some(8192 * 2),
+            "the second write is the one a reader places"
+        );
+        assert_eq!(
+            store
+                .product_bytes(request(2), Product::Text)
+                .expect("another request's absence is not an error"),
+            None,
+            "a product belongs to the request that wrote it"
+        );
+    }
+
     /// A trajectory is published at every step, so the second write replaces the first: a reader
     /// that got the first region would advance a step the solver already left.
     #[test]
