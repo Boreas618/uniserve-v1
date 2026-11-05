@@ -1132,11 +1132,43 @@ impl CommandSender {
 
     /// Reports the KV cache each executor group holds now
     /// (`Command::DescribeCache`).
+    /// Answers `answer` with the reason a command could not be delivered.
+    ///
+    /// A command sent to a scheduler that has ended never reaches it, and the answer channel is
+    /// dropped with the command: a caller then sees a receiver with no sender, which reads as "not
+    /// yet" at one call site and as "the group is gone" at another. Neither sentence is the one a
+    /// reader can act on, and both are guesses about a fact this function holds: the send failed.
+    ///
+    /// The scheduler's own fatal stop is logged where it is recorded; what a caller of one of these
+    /// commands needs is that the command was refused and by what, not a sentence inferring it from
+    /// a dropped channel.
+    fn refuse_into<T>(&self, answer: &crossbeam_channel::Sender<Result<T, String>>, delivered: bool) {
+        if !delivered {
+            let _ = answer.send(Err(Self::ended()));
+        }
+    }
+
+    /// The same, for the channel whose payload is a [`StageAnswer`].
+    fn refuse_next_step(
+        &self,
+        answer: &crossbeam_channel::Sender<Result<StageApplied, String>>,
+        delivered: bool,
+    ) {
+        if !delivered {
+            let _ = answer.send(Err(Self::ended()));
+        }
+    }
+
+    /// What a scheduler that took no command is: one whose thread has ended.
+    fn ended() -> String {
+        "the scheduler took no command: its thread has ended".to_owned()
+    }
+
     pub fn describe_cache(
         &self,
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {
         let (answer, described) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::DescribeCache(answer));
+        self.refuse_into(&answer, self.send(Command::DescribeCache(answer.clone())).is_ok());
         described
     }
 
@@ -1148,11 +1180,15 @@ impl CommandSender {
         source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PrecopyPolicy {
-            program,
-            source,
-            answer,
-        });
+        self.refuse_into(
+            &answer,
+            self.send(Command::PrecopyPolicy {
+                program,
+                source,
+                answer: answer.clone(),
+            })
+            .is_ok(),
+        );
         done
     }
 
@@ -1166,10 +1202,14 @@ impl CommandSender {
         stage: crate::scheduler::Stage,
     ) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::StagePolicy {
-            stage,
-            answer: StageAnswer::Step(answer),
-        });
+        self.refuse_next_step(
+            &answer,
+            self.send(Command::StagePolicy {
+                stage,
+                answer: StageAnswer::Step(answer.clone()),
+            })
+            .is_ok(),
+        );
         done
     }
 

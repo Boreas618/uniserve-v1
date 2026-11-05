@@ -557,6 +557,16 @@ pub(crate) fn run(
 /// each executor thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
+/// How many of a request's events this process keeps for a takeover while a handover is open.
+///
+/// The ordinary bound is `EVENT_WINDOW`: what a consumer can be behind by, since the same figure
+/// gates the credit this process waits on. A handover is the one case where that reasoning does
+/// not hold - a predecessor's consumer stops reading at the pause while this process goes on
+/// producing - so the gap a successor's position names grows with the pause. The journal is
+/// widened for it and stays bounded: a takeover whose position is older than what is kept is
+/// refused by name rather than served as a stream with a hole in it.
+pub(crate) const HANDOVER_JOURNAL: usize = proto::request::EVENT_WINDOW as usize * 256;
+
 /// One admitted request and the connection its events belong to.
 ///
 /// A request belongs to the daemon front that submitted it until a `Takeover`
@@ -3747,10 +3757,10 @@ impl MainProcess {
                 return Ok(());
             }
             Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
-                let Some(served) = self
+                let Some(index) = self
                     .streams
-                    .iter_mut()
-                    .find(|served| served.request == command.request)
+                    .iter()
+                    .position(|served| served.request == command.request)
                 else {
                     // A handover's takeover names a request this process kept running for it:
                     // one it does not hold is either a request that ended first or a front that
@@ -3766,8 +3776,50 @@ impl MainProcess {
                 // The request is this daemon's from the position its consumer states: what the
                 // predecessor produced past it is replayed, because its own consumer stopped
                 // reading at the pause.
-                let replay = replay_after(&served.kept, takeover.events);
-                served.front = front;
+                //
+                // The journal and the position are read out before the process is borrowed again:
+                // a refusal writes to a front, and the stream is a field of the same process.
+                let kept = self.streams[index].kept.clone();
+                let sent = self.streams[index].sent;
+                // A position older than the journal cannot be replayed: the events between it and
+                // the oldest one kept were dropped, and handing the successor what is left is a
+                // stream that skips tokens with nothing saying so. It is refused, naming the two
+                // positions and how far behind the consumer was, so the daemon ends the response
+                // instead of serving a body with a hole in it.
+                if let (Some((oldest, _)), true) = (kept.front(), sent > takeover.events) {
+                    if takeover.events + 1 < *oldest {
+                        let oldest = *oldest;
+                        let behind = sent - takeover.events;
+                        tracing::error!(
+                            request = command.request,
+                            front,
+                            from = takeover.events,
+                            oldest,
+                            sent,
+                            behind,
+                            "a takeover names a position this process no longer holds: the \
+                             consumer was more events behind than the journal kept"
+                        );
+                        self.reject(
+                            front,
+                            command.request,
+                            proto::request::RejectionKind::Overloaded,
+                            format!(
+                                "the request could not be taken over: its consumer's position \
+                                 {} is {} event(s) behind, and this process kept the last {} of \
+                                 them from position {} - the handover produced more events of \
+                                 this request than a pause may",
+                                takeover.events,
+                                behind,
+                                kept.len(),
+                                oldest,
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
+                let replay = replay_after(&kept, takeover.events);
+                self.streams[index].front = front;
                 for event in replay {
                     tracing::debug!(
                         request = command.request,
@@ -4195,6 +4247,10 @@ impl MainProcess {
         // The streams are taken out so that sending an event can borrow the process: the map is
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
+        // Whether a handover is open, read once for the pass: a second front that has attached and
+        // not yet taken its requests over. The journal's bound is wider while it is, because a
+        // predecessor's consumer stops reading at the pause while this process keeps producing.
+        let handover_open = self.control.attached_fronts() > 0;
         let mut running = Vec::with_capacity(streams.len());
         for mut served in streams {
             let id = served.request;
@@ -4228,7 +4284,23 @@ impl MainProcess {
                         // earlier position replays.
                         served.sent += 1;
                         served.kept.push_back((served.sent, wire.clone()));
-                        while served.kept.len() > proto::request::EVENT_WINDOW as usize {
+                        // The journal's bound is `EVENT_WINDOW` events - what a consumer can be
+                        // behind by, since the same figure gates the credit this process waits on
+                        // - EXCEPT while a handover is open. A predecessor's consumer stops
+                        // reading at the pause and this process keeps producing, so the gap a
+                        // successor's position names grows with the pause and not with the
+                        // consumer. A journal trimmed to the ordinary bound therefore drops the
+                        // events in the middle of the pause, and the replay that follows hands the
+                        // successor a stream with a hole in it. The wider bound is the pause's,
+                        // and it is still a bound: a handover that produces more than this many
+                        // events of one request is refused at the takeover by name rather than
+                        // served with a gap.
+                        let bound = if handover_open {
+                            HANDOVER_JOURNAL
+                        } else {
+                            proto::request::EVENT_WINDOW as usize
+                        };
+                        while served.kept.len() > bound {
                             served.kept.pop_front();
                         }
                         self.send_event(
