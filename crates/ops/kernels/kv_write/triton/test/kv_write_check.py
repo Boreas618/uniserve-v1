@@ -9,7 +9,7 @@ The operator scatters one row per token into the page slot the scheduler assigne
 key, value        [tokens, heads, head_dim]
 key_cache, value_cache   [pages, page, heads, head_dim]
 slots             [tokens] i32, the flat `page · page_size + offset`, or -1 to skip
-initialized       [pages, 1, 1, 1] i32, raised to 1 by the write
+initialized       [pages, 1, 1, 1] u8, one byte per page, raised to 1 by the write
 ```
 
 and the operator's tolerance is `exact()`: the kernel **moves** values, so two implementations agree
@@ -75,8 +75,12 @@ def launch(module, *, tokens, pages, page, heads, head_dim, tile, dtype, slots, 
     value = torch.randn(tokens, heads, head_dim, dtype=torch.float32).to(element)
     key_cache = torch.full((pages, page, heads, head_dim), CACHE_SENTINEL, dtype=element)
     value_cache = torch.full((pages, page, heads, head_dim), CACHE_SENTINEL, dtype=element)
-    key_initialized = torch.full((pages, 1, 1, 1), FLAG_SENTINEL, dtype=torch.int32)
-    value_initialized = torch.full((pages, 1, 1, 1), FLAG_SENTINEL, dtype=torch.int32)
+    # The flags are one byte per page, and the buffer is longer than the view so the bytes after the
+    # last page are visible: a four-byte store at an odd page count writes into them.
+    key_flags = torch.full((pages + 4,), FLAG_SENTINEL, dtype=torch.uint8)
+    value_flags = torch.full((pages + 4,), FLAG_SENTINEL, dtype=torch.uint8)
+    key_initialized = key_flags[:pages].view(pages, 1, 1, 1)
+    value_initialized = value_flags[:pages].view(pages, 1, 1, 1)
     slots = torch.tensor(slots, dtype=torch.int32)
 
     module._kv_write_kernel[(tokens, (row + tile - 1) // tile, 1)](
@@ -85,13 +89,14 @@ def launch(module, *, tokens, pages, page, heads, head_dim, tile, dtype, slots, 
         tokens, page, heads, head_dim, 0,
         TILE=tile, PDL=False,
     )
-    return key, value, key_cache, value_cache, key_initialized, value_initialized
+    return (key, value, key_cache, value_cache, key_initialized, value_initialized,
+            key_flags, value_flags)
 
 
 def check(what, *, dtype, tokens, pages, page, heads, head_dim, tile, slots):
     """One scatter against the layout the operator documents, element for element."""
     (key, value, key_cache, value_cache,
-     key_initialized, value_initialized) = launch(
+     key_initialized, value_initialized, key_flags, value_flags) = launch(
         MODULE, tokens=tokens, pages=pages, page=page, heads=heads, head_dim=head_dim,
         tile=tile, dtype=dtype, slots=slots,
     )
@@ -128,6 +133,16 @@ def check(what, *, dtype, tokens, pages, page, heads, head_dim, tile, slots):
                 f"first at {first}: {float(got.reshape(-1)[first])} vs "
                 f"{float(want.reshape(-1)[first])}"
             )
+    # The bytes past the last page: a flag stored as four bytes at a page count not divisible by
+    # four clobbers them, and nothing else in the case would show it.
+    for name, flags in (("key flags", key_flags), ("value flags", value_flags)):
+        tail = flags[len(flags) - 4:]
+        if not torch.equal(tail, torch.full_like(tail, FLAG_SENTINEL)):
+            raise SystemExit(
+                f"{where}: the {name} wrote past the last page: {tail.tolist()} after "
+                f"{len(flags)} bytes of a {len(flags) - 4}-page plane"
+            )
+
     # The counts, so a case that wrote nothing or flagged nothing cannot pass quietly.
     if written and int(expected_flags.sum()) == 0:
         raise SystemExit(f"{where}: the case writes {written} tokens and flags no page")
@@ -182,7 +197,7 @@ def main():
     print(
         f"ok: {len(cases)} scatters, {total_written} rows written and bit for bit in place, "
         f"{total_flagged} pages flagged, {total_skipped} skipped slots that wrote nothing, "
-        f"and no other position moved"
+        f"no other position moved, and no flag written past its page's byte"
     )
     return 0
 
