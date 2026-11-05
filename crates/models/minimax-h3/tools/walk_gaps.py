@@ -66,8 +66,10 @@ which of the two it is.
 """
 
 import argparse
+import pathlib
 import re
 import sys
+import tempfile
 from collections import Counter
 
 
@@ -242,6 +244,13 @@ def classify(missing, shapes, rasters_of, sampled):
 EXTENTS = ("columns", "elements", "rows", "extent", "samples", "tokens")
 
 
+class _Args:
+    """The two fields `wellformed` reads, so the self-test can drive it without a parser."""
+
+    def __init__(self, fixture):
+        self.fixture = fixture
+
+
 def without(key, fields):
     """The key with each named field and its value removed.
 
@@ -286,6 +295,65 @@ def families(args):
                 f"  {operator}: {len(whole)} key(s) -> {len(fewer)} without the field(s)"
             )
     print(f"{total} key(s) launched, {collapsed} with the field(s) removed")
+
+
+OPS = pathlib.Path("crates/ops/src")
+NAME = re.compile(r'const NAME: &\'static str = "([a-z0-9_]+)"')
+COUNT = re.compile(r"^# (\d+) data rows")
+
+
+def wellformed(args):
+    """The list's own properties: its stated count, its uniqueness, and its operator names.
+
+    Three failures that a walk comparison cannot see, because each makes the *file* wrong rather
+    than a row missing: a header that states a count the file does not hold (the count every later
+    reader quotes), a line repeated (the same program compiled twice, or a collision hidden), and an
+    operator name `crates/ops` does not define (an install failure far from here).
+    """
+    text = pathlib.Path(args.fixture).read_text().splitlines()
+    rows, stated = [], None
+    for line in text:
+        if line.startswith("#"):
+            found = COUNT.match(line)
+            if found:
+                stated = int(found.group(1))
+            continue
+        if "\t" in line:
+            operator, key = line.split("\t", 1)
+            rows.append((operator, key))
+    failures = 0
+    if stated is None:
+        print(
+            "the header states no row count: a reader quoting the file has no number"
+        )
+        failures += 1
+    elif stated != len(rows):
+        print(
+            f"the header states {stated} data rows and the file holds {len(rows)}"
+        )
+        failures += 1
+    repeats = sorted({row for row in rows if rows.count(row) > 1})
+    if repeats:
+        print(f"{len(repeats)} line(s) repeated:")
+        for operator, key in repeats[:5]:
+            print(f"  {operator}\t{key}")
+        failures += 1
+    defined = set()
+    for path in OPS.rglob("*.rs"):
+        defined.update(NAME.findall(path.read_text()))
+    unknown = sorted({operator for operator, _ in rows} - defined)
+    if unknown:
+        print(
+            f"{len(unknown)} operator(s) `crates/ops` does not define: {unknown}"
+        )
+        failures += 1
+    if failures:
+        return 1
+    print(
+        f"the list states what it holds: {len(rows)} rows, no repeat, and every"
+        f" operator among the {len(defined)} `crates/ops` defines"
+    )
+    return 0
 
 
 def phantom(args):
@@ -505,6 +573,35 @@ def self_test() -> int:
     canvas, dependent, real = classify([], shapes, rasters_of, sampled)
     assert not canvas and not dependent and not real
 
+    # `--wellformed` catches each of the three ways the file itself can be wrong: a header that
+    # states a count it does not hold, a repeated line, and an operator `crates/ops` does not
+    # define. Each is a failure of the file rather than a missing row, so no walk comparison sees
+    # it - the count is quoted by every reader after it.
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        good = root / "good.txt"
+        good.write_text(
+            "# 2 data rows\n"
+            "rms_norm\tdtype_bf16_columns_5376_block_1024\n"
+            "gemm\tdtype_bf16_rows_64_columns_64\n"
+        )
+        assert wellformed(_Args(str(good))) == 0
+        stale = root / "stale.txt"
+        stale.write_text(
+            "# 3 data rows\n"
+            "rms_norm\tdtype_bf16_columns_5376_block_1024\n"
+            "gemm\tdtype_bf16_rows_64_columns_64\n"
+        )
+        assert wellformed(_Args(str(stale))) == 1
+        repeated = root / "repeated.txt"
+        repeated.write_text(
+            "# 3 data rows\nrms_norm\tone\nrms_norm\tone\ngemm\tother\n"
+        )
+        assert wellformed(_Args(str(repeated))) == 1
+        unknown = root / "unknown.txt"
+        unknown.write_text("# 1 data rows\nnot_an_op\tone\n")
+        assert wellformed(_Args(str(unknown))) == 1
+
     # `--families` removes a field and the value after it, and nothing else.
     assert without("a_columns_128_block_1024", {"columns"}) == "a_block_1024"
     assert (
@@ -522,6 +619,11 @@ def self_test() -> int:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--wellformed",
+        action="store_true",
+        help="the list alone: its stated count, its uniqueness, and its operator names",
+    )
     parser.add_argument(
         "--phantom",
         action="store_true",
@@ -567,8 +669,13 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
-    # `--families` reads launches only: it has no second side to be given.
-    if not args.walk or (not args.fixture and not args.families):
+    # `--families` reads launches only and `--wellformed` reads the list only: neither has a
+    # second side to be given.
+    if args.wellformed and not args.fixture:
+        parser.error("--wellformed reads the list: give it --fixture")
+    if not args.wellformed and (
+        not args.walk or (not args.fixture and not args.families)
+    ):
         parser.error(
             "--walk and --fixture name the two sides, or --families reads the walks"
             " alone, or --self-test proves the tool"
@@ -579,6 +686,8 @@ def main(argv=None):
         return families(args)
     if args.phantom:
         return phantom(args)
+    if args.wellformed:
+        return wellformed(args)
     walk = read_lines(args.walk[0])
     fixture = read_lines(args.fixture)
 
