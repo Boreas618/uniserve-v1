@@ -502,7 +502,15 @@ impl Attention {
         let planes = cache.planes(group, layer)?;
         let group_view = cache.group(group)?;
         self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, group_view, planes, query, out, workspace)
+        self.attend(f, batch, group_view, planes, query, out, workspace)?;
+        // Read the layer's own output while it exists: the buffer is the forward's and the next layer
+        // overwrites it, so a digest taken after the graph has run is the last layer's bytes.
+        if let Some(probe) = f.attention_probe {
+            if let Ok(stream) = f.stream() {
+                probe.attention_output(layer, out, stream);
+            }
+        }
+        Ok(())
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
