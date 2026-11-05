@@ -288,21 +288,47 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     }
     return true;
   };
-  auto finalize = [&library, error, status](void* descriptor) {
+  // Which descriptor could not be finalized, because cuDNN's own reason is one string for all of them:
+  // a tensor with the wrong strides, a convolution with an impossible geometry and a graph whose
+  // implied output shape is not the one given all read the same, and the caller has to know which.
+  auto finalize = [&library, error, status](void* descriptor, const char* which) {
     if (library.backend_finalize(descriptor) != kSuccess) {
-      *status = refuse(error, "cudnnBackendFinalize failed");
+      char why[256];
+      std::snprintf(why, sizeof(why), "cudnnBackendFinalize failed on %s", which);
+      *status = refuse(error, why);
       return false;
     }
     return true;
   };
+  // A tensor's refusal carries the tensor's own numbers. A caller that reads only the operand's name
+  // cannot tell a zero extent from a layout cuDNN will not take from a dimension past its limit, and
+  // those have different cures - so the dims, the strides and the element type travel with the fault.
+  auto finalize_tensor = [&library, error, status](void* descriptor, const char* which,
+                                                   const int64_t* dims, const int64_t* strides,
+                                                   int32_t dtype) {
+    if (library.backend_finalize(descriptor) == kSuccess) {
+      return true;
+    }
+    std::snprintf(error, 512,
+                  "cudnnBackendFinalize failed on %s: dims [%lld %lld %lld %lld %lld] strides "
+                  "[%lld %lld %lld %lld %lld] dtype %d",
+                  which, static_cast<long long>(dims[0]), static_cast<long long>(dims[1]),
+                  static_cast<long long>(dims[2]), static_cast<long long>(dims[3]),
+                  static_cast<long long>(dims[4]), static_cast<long long>(strides[0]),
+                  static_cast<long long>(strides[1]), static_cast<long long>(strides[2]),
+                  static_cast<long long>(strides[3]), static_cast<long long>(strides[4]),
+                  static_cast<int>(dtype));
+    *status = 1;
+    return false;
+  };
   auto tensor = [&](const int64_t* dims, const int64_t* strides, int32_t dtype, int64_t uid,
-                    void** descriptor) {
+                    const char* which, void** descriptor) {
     return make(kDescriptorTensor, descriptor) &&
            set(*descriptor, kAttrTensorDataType, kTypeDataType, 1, &dtype) &&
            set(*descriptor, kAttrTensorDimensions, kTypeInt64, kSpatial + 2, dims) &&
            set(*descriptor, kAttrTensorStrides, kTypeInt64, kSpatial + 2, strides) &&
            set(*descriptor, kAttrTensorUniqueId, kTypeInt64, 1, &uid) &&
-           finalize(*descriptor);
+           finalize_tensor(*descriptor, which, dims, strides, dtype);
   };
   /// Row-major strides of a contiguous tensor, the last axis running fastest.
   auto row_major = [](const int64_t* dims, int64_t* strides) {
@@ -340,9 +366,9 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   void* x = nullptr;
   void* w = nullptr;
   void* y = nullptr;
-  bool built = tensor(x_dims, x_strides, x_type, kUidX, &x) &&
-               tensor(w_dims, w_strides, w_type, kUidW, &w) &&
-               tensor(y_dims, y_strides, y_type, kUidY, &y);
+  bool built = tensor(x_dims, x_strides, x_type, kUidX, "the input tensor", &x) &&
+               tensor(w_dims, w_strides, w_type, kUidW, "the weight tensor", &w) &&
+               tensor(y_dims, y_strides, y_type, kUidY, "the output tensor", &y);
 
   // The geometry: the layer's padding before and after each spatial axis,
   // because the layer's output padding is zero.
@@ -362,8 +388,16 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
           set(convolution, kAttrConvolutionPostPaddings, kTypeInt64, kSpatial, post) &&
           set(convolution, kAttrConvolutionFilterStrides, kTypeInt64, kSpatial, strides) &&
           set(convolution, kAttrConvolutionDilations, kTypeInt64, kSpatial, dilations) &&
-          finalize(convolution);
+          finalize(convolution, "the convolution");
 
+  // **Which descriptor is the operation's input and which its output depends on the pass.** A forward
+  // convolution is `Y = W * X` over the layer's own `input` and `out`; the backward-data pass of a
+  // transposed one is `Dx = W * Dy`, where `dx` is the layer's `out` and `dy` its `input`. Handing `y`
+  // to the forward's `X` finalizes a graph whose implied output shape is the input's, which cuDNN
+  // refuses - so the descriptors follow the case, not only the attribute's name.
+  // The descriptor the operation's `X`/`Dx` attribute takes, and the one its `Y`/`Dy` takes.
+  void* dx_or_x = transposed ? y : x;
+  void* dy_or_y = transposed ? x : y;
   const float alpha = 1.0f;
   const float beta = 0.0f;
   void* operation = nullptr;
@@ -380,15 +414,15 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
             set(operation, transposed ? kAttrOperationBwdDataW : kAttrOperationForwardW,
                 kTypeBackendDescriptor, 1, &w) &&
             set(operation, transposed ? kAttrOperationBwdDataDx : kAttrOperationForwardX,
-                kTypeBackendDescriptor, 1, &y) &&
+                kTypeBackendDescriptor, 1, &dx_or_x) &&
             set(operation, transposed ? kAttrOperationBwdDataDy : kAttrOperationForwardY,
-                kTypeBackendDescriptor, 1, &x) &&
-            finalize(operation);
+                kTypeBackendDescriptor, 1, &dy_or_y) &&
+            finalize(operation, "the operation");
   }
   void* graph = nullptr;
   built = built && make(kDescriptorOperationGraph, &graph) &&
           set(graph, kAttrOperationGraphOps, kTypeBackendDescriptor, 1, &operation) &&
-          finalize(graph);
+          finalize(graph, "the operation graph");
 
   // The heuristic, asked once for this shape: the engine the tuning data names,
   // or the first proposal.
@@ -398,7 +432,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     built = make(kDescriptorEngineHeuristic, &heuristic) &&
             set(heuristic, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1, &graph) &&
             set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &kHeuristicModeA) &&
-            finalize(heuristic);
+            finalize(heuristic, "the heuristic");
     void* configs[kMaxEngineConfigs] = {};
     int64_t count = 0;
     if (built &&
@@ -478,7 +512,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       built = make(kDescriptorExecutionPlan, &plan) &&
               set(plan, kAttrExecutionPlanEngineConfig, kTypeBackendDescriptor, 1,
                   &configs[take]) &&
-              finalize(plan);
+              finalize(plan, "the plan");
     }
     for (int64_t at = 0; at < count; ++at) {
       library.backend_destroy(configs[at]);
@@ -680,7 +714,13 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
   void* variant = nullptr;
   bool built = library.backend_create(kDescriptorVariantPack, &variant) == kSuccess;
   const int64_t uids[3] = {kUidX, kUidW, kUidY};
-  void* pointers[3] = {const_cast<void*>(call->input), const_cast<void*>(call->weight), call->out};
+  // **Each pointer must be the tensor its descriptor describes.** A forward convolution's `X` id is the
+  // layer's input and its `Y` the output; the backward-data pass of a transposed one has `dx` - the
+  // layer's output - in `X` and `dy` - its input - in `Y`. Binding both ids to the forward arrangement
+  // gave a transposed convolution a graph describing one tensor and a pack supplying another.
+  void* pointers[3] = {const_cast<void*>(call->transposed != 0 ? call->out : call->input),
+                       const_cast<void*>(call->weight),
+                       const_cast<void*>(call->transposed != 0 ? call->input : call->out)};
   built = built && library.backend_set(variant, kAttrVariantPackDataPointers, kTypeVoidPtr, 3,
                                        pointers) == kSuccess &&
           library.backend_set(variant, kAttrVariantPackUniqueIds, kTypeInt64, 3, uids) ==

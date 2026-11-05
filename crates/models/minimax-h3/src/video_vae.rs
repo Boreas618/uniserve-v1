@@ -796,8 +796,22 @@ impl VideoDecoder {
     /// design's `dtype = "auto"` converts nothing). **No extent enters a key**: a clip's token count is
     /// a launch value the dense attention and the normalizations read position by position, so one
     /// program serves every raster — which is why this takes no bucket set while the post-processor,
-    /// whose blend is keyed by its pixel count, does. Every projection carries a bias and every
-    /// residual its projection's, as the checkpoint's mapping states.
+    /// whose blend is keyed by its pixel count, does. The bias each projection carries is its own (see
+    /// the projections below) and every residual its projection's, as the checkpoint's mapping states.
+    ///
+    /// **The element type is the deployment's, and every layer declares it.** `specs/worker.md`'s table
+    /// replaces `torch.autocast` with a per-layer declaration, and this is that mechanism in the
+    /// decoder: `dtype` is the type the deployment publishes its weights at (`dtype = "auto"` converts
+    /// nothing, so it is the checkpoint's own), and each `descriptor_of` below is handed the type its
+    /// own layer computes in. The reference wraps the whole decode in
+    /// `torch.autocast(dtype=decoder.decoder.input.weight.dtype)` (`video_vae.py`), with
+    /// `precision.py:148` putting that type on the projections and on every layer's `qkv`, `output` and
+    /// `mlp`. Two kinds of layer it does *not* move down - the normalizations and the attention's
+    /// softmax - and both are handled where they run: the softmax is the dense-attention kernel's own
+    /// FP32 accumulation, and the normalizations are declared here at the stream's type, which is the
+    /// one place this declaration is coarser than autocast was, because an operator of ours reads and
+    /// writes one element type. It is stated rather than hidden: a converted deployment keys the
+    /// decoder's rows in its own type, and the test beside this one is what says so.
     pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::UnpatchifyVideo;
@@ -826,14 +840,25 @@ impl VideoDecoder {
 
         let mut programs = Programs::default();
 
-        // The clip's latents in, the clip's pixels out.
-        for k in [config.latent_channels, width, ffn, width, patch] {
+        // The clip's latents in, the clip's pixels out. **The bias flag is the projection's own, not a
+        // policy of the block's**: `proj_in`, the attention's three projections and `proj_out` carry one,
+        // while `to_out`, the packed feed-forward projection and `ff.net.2` do not - their biases are
+        // folded into the residuals and into the packed activation. The epilogue is the only part of the
+        // key that differs, so a statement that assumed one flag for all five launches would name a cell
+        // the decode never asks for and leave the one it does ask for unbuilt.
+        for (k, bias) in [
+            (config.latent_channels, true),
+            (width, true),
+            (width, false),
+            (ffn, false),
+            (patch, true),
+        ] {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 k,
                 dtype,
+                dtype,
                 WeightOrder::NxK,
                 bias,
-                dtype,
                 dtype,
             ));
         }
@@ -892,6 +917,12 @@ impl VideoDecoder {
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
+        // The stitch copies each seam's neighbour into one contiguous block before the blend reads it:
+        // `cross_fade` addresses its sources flat, and a neighbour in a raster wider than the tile is
+        // not one contiguous block. One copy serves every seam and every canvas, whatever the tile's
+        // extents, because its key is the pair of element types and the extents are a launch value.
+        use ops::copy_block::CopyBlock as CopyBlockOp;
+        programs.launch::<CopyBlockOp>(&nn::layers::CopyBlock::descriptor_of(dtype));
 
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
@@ -1436,7 +1467,13 @@ impl VideoDecoder {
                 offsets,
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
-                attended,
+                // The attention writes one row per head, so its output is the same three axes its
+                // inputs are: the scratch buffer is a flat `[rows, width]` block and the heads are
+                // the middle axis of the same bytes. Passing the flat view was `dense_attention:
+                // expected 3 axes, found 2` at the first device run - the only call site of the six
+                // in this model that did not reshape its output, and the shapes of the other five
+                // were already `[rows, heads, head]` at the arena.
+                per_head(attended),
             )?;
             layer.output.forward(f, attended, update)?;
             layer.residual1.forward(f, hidden, update)?;
@@ -1494,6 +1531,60 @@ impl Decoder for VideoDecoder {
                 owner: "VideoDecoder",
                 problem: error.to_string(),
             })
+    }
+
+    /// The checkpoint's own element type, read at load rather than chosen (design 1).
+    fn element_type(&self) -> nn::DType {
+        self.dtype
+    }
+
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// The argument is the **decoded raster** - frames, rows and columns of the media this block
+    /// writes - and the return is the **latent** layout its tables and arena are keyed by. The
+    /// ratios between them are this deployment's own, read at construction from the checkpoint's
+    /// config (`temporal_compression` frames per latent frame, `spatial_compression()` pixels per
+    /// latent cell), which is why the map is the decoder's: a runtime that divided by either would
+    /// be holding this checkpoint's compression in its own code.
+    ///
+    /// **The decoder is built for one canvas** (`VideoDecoder::load` takes it), because its register
+    /// rows, its voxel-row table and its sequence offsets are the canvas's constants rather than a
+    /// request's. So this states that canvas's layout and refuses any other clip by both extents:
+    /// a runner that handed it another canvas would capture a graph whose constants belong to a
+    /// different raster.
+    fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let (width, height) = self.canvas.pixels(&self.config);
+        let frames = self.canvas.frames_out(&self.config);
+        if (clip.height, clip.width) != (height, width) {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes a {}x{height} raster and the call states a {}x{} one",
+                width, clip.height, clip.width,
+            )));
+        }
+        // The raster includes the padding frames the splice drops, so the clip is compared against
+        // the canvas's own native output rather than against a muxed frame count.
+        if clip.frames != frames {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes {frames} frame(s) and the call states {}",
+                clip.frames
+            )));
+        }
+        Ok(nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: self.config.latent_channels,
+                frames: self.canvas.frames,
+                height: self.canvas.height,
+                width: self.canvas.width,
+            },
+            audio: None,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        })
     }
 
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
@@ -2208,8 +2299,11 @@ pub(crate) mod tests {
         let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         // Every projection this decoder has, whatever its contraction: the key carries the element
-        // types and the order, and the contraction length is a descriptor field of one program.
-        assert_eq!(count("gemm"), 1);
+        // types and the order, and the contraction length is a descriptor field of one program. Two
+        // programs, because the epilogue is the one field that differs: `proj_in`, the attention's
+        // three projections and `proj_out` fold a bias, while `to_out`, the packed feed-forward
+        // projection and `ff.net.2` carry none.
+        assert_eq!(count("gemm"), 2);
         assert_eq!(count("rows"), 1, "three placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
@@ -2218,6 +2312,18 @@ pub(crate) mod tests {
         assert_eq!(count("scaled_residual"), 1);
         assert_eq!(count("value_first_swiglu"), 1);
         assert_eq!(count("unpatchify_video"), 1);
+        // The stitch's third family: each seam's neighbour is copied into one contiguous block before
+        // the blend reads it, because a blend addresses its sources flat and a neighbour in a raster
+        // wider than the tile is not one contiguous block. One copy serves every seam of every canvas.
+        assert_eq!(count("copy_block"), 1);
+        // A copy's key names its element types as `source_*_out_*`, not `dtype_*`: the two operands
+        // are the only thing that selects the program, and this decoder states them as one pair.
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "copy_block" && key.contains("source_bf16_out_bf16")),
+            "the copy states the deployment's element type twice, as its source and its out: {programs:?}"
+        );
 
         // The stitch compiles one blend per seam width on each of the two axes.
         let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
@@ -2230,6 +2336,53 @@ pub(crate) mod tests {
         // One dense attention whatever the clip: the row count is a launch value, so the decoder's
         // programs do not depend on the raster a request asks for.
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
+    }
+
+    /// A converted deployment keys the decoder's rows in its own element type, and nothing is implicit.
+    ///
+    /// `specs/worker.md`'s table replaces `torch.autocast` with a declaration per layer. The observable
+    /// consequence is this: the same decoder at two deployments is two row sets, and every row that
+    /// names an element type names the deployment's - except the rotation's factor table, whose
+    /// *positions* are FP32 whatever the decode is (they are coordinates, not activations). A row that
+    /// stayed FP32 under a half deployment would be a layer silently computing in a type nobody chose,
+    /// which is the behaviour the design removed.
+    #[test]
+    fn a_converted_deployment_keys_the_decoders_rows_in_its_own_element_type() {
+        let config = video_config();
+        let rows =
+            |dtype: DType| VideoDecoder::programs(&config, dtype).expect("the decoder's programs");
+        let whole = rows(DType::F32);
+        let half = rows(DType::F16);
+        assert_eq!(
+            half.len(),
+            whole.len(),
+            "the same layers, in the same order"
+        );
+        let mut moved = 0;
+        for (converted, declared) in half.iter().zip(&whole) {
+            assert_eq!(converted.0, declared.0, "the same layer");
+            if converted.1 == declared.1 {
+                continue;
+            }
+            moved += 1;
+            // The one exception the declaration states: the factor table's positions are coordinates,
+            // FP32 whatever the decode is. Everything else in the row is the deployment's type.
+            // The row's own element type is the deployment's. An operand that stays FP32 - the
+            // rotation's positions, the attention's kv - is a layer's declaration, not the row's.
+            // A row names its element type in one of two spellings: `dtype_*` where the program has
+            // one operand type, and `source_*_out_*` where it has a pair (the stitch's copy). Both are
+            // a statement of the deployment's type, so the check is that f16 appears, not where.
+            assert!(
+                converted.1.contains("f16"),
+                "{} did not follow the deployment: {} at f16",
+                converted.0,
+                converted.1
+            );
+        }
+        assert!(
+            moved > 0,
+            "a converted deployment moves the rows it must: {whole:?}"
+        );
     }
 
     /// One dense attention, and its key is the form the element type it decodes at has.

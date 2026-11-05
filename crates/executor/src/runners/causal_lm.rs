@@ -182,9 +182,16 @@ impl Staging {
                 self.parameters[index * parameters + column] = 0.0;
             }
         }
-        self.rows.seq_lens.resize(bucket_rows, 1);
+        // A row the batch does not fill is an **empty sequence**, not a short one: it owns no token,
+        // its block-table row is `-1`, and it therefore has no key to attend to. `seq_lens` states
+        // that as a length of zero - a length of one would tell the attention kernel that the row
+        // the table left absent has a page of keys at page `-1`, which is a read the pool never
+        // reserved. The row count itself stays the bucket's: inside a captured graph every per-row
+        // operand has the bucket's extent and the batch's width is a mask over it (`logits_rows`
+        // below, and the loader's `-1` slots), never the extent of an operand.
+        self.rows.seq_lens.resize(bucket_rows, 0);
         for index in rows..bucket_rows {
-            self.rows.seq_lens[index] = 1;
+            self.rows.seq_lens[index] = 0;
         }
         self.rows.logits_rows.resize(bucket_rows, -1);
         for index in rows..bucket_rows {
@@ -202,7 +209,14 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        if tokens < bucket_tokens
+        // Padding **tokens** belong to a prefill: a chunk of host tokens shorter than the bucket has
+        // the rest of the bucket's token axis to fill, and the last row's range extends over it
+        // (those tokens write no cache page). A decode bucket has no padding tokens - it has padding
+        // *rows*, each evaluating one token with a commit slot below zero - so extending the last
+        // row's range there would make a one-token row own the rest of the bucket's token axis: a
+        // row attending to tokens it never carried and a pack whose end is not the batch's.
+        if !bucket.variant.is_decode()
+            && tokens < bucket_tokens
             && let Some(last) = self.rows.query_offsets.last_mut()
         {
             *last = bucket_tokens as i32;
@@ -366,17 +380,35 @@ struct Columns {
     logits_row: platform::PinnedBuffer,
 }
 
+/// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
+///
+/// The two are maxima over **different** buckets and must not be read off one: a prefill bucket can
+/// be long and narrow while a decode bucket is short and wide, and a column sized from whichever
+/// bucket wins a tuple comparison would then be shorter than the batches that address it. Nothing
+/// bounds an [`Column::extent`] view against its column, so a column one bucket short is a silent
+/// read or write past the allocation rather than an error.
+fn column_extents(buckets: &Buckets) -> Result<(u64, u64)> {
+    if buckets.is_empty() {
+        return Err(Error::Invalid("the runner has no bucket to serve".into()));
+    }
+    let tokens = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.tokens))
+        .max()
+        .unwrap_or(0);
+    let rows = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.rows))
+        .max()
+        .unwrap_or(0);
+    Ok((tokens, rows))
+}
+
 impl Columns {
-    /// Allocates the columns for the largest bucket `buckets` holds, with `vocabulary` as the width
-    /// of the logits row the greedy first token is taken from.
+    /// Allocates the columns over the widest token count and row count `buckets` hold, with
+    /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
-        let largest = buckets
-            .iter()
-            .max_by_key(|bucket| (bucket.rows, bucket.tokens))
-            .copied()
-            .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
-        let tokens = largest.tokens as u64;
-        let rows = largest.rows as u64;
+        let (tokens, rows) = column_extents(buckets)?;
         let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
         Ok(Self {
             positions: Column::new(device, DType::I32, tokens)?,
@@ -694,6 +726,62 @@ struct Sampled {
 /// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
 /// captured `argmax` operator applies on the device, and it is here in one place so the host path
 /// and its test cannot disagree about it.
+/// How many tokens a slot had committed **before** the step whose readback is `readback`.
+///
+/// The commit table answers the sampling position after the batch, and the batch commits the row's
+/// own token, so a row that ends a prompt answers 1 and a slot that already held four answers 5. The
+/// greedy host path is valid only for the first: it argmaxes the raw logits row, and the penalties a
+/// continuing slot carries are computed by the captured sampler and not by this path.
+fn committed_before(readback: i32) -> usize {
+    usize::try_from(readback).unwrap_or(0).saturating_sub(1)
+}
+
+/// How a prompt-ending row's first token is decided (4.4), from the batch's own staged figures.
+///
+/// A prefill bucket's job is the KV cache; the sampler is a decode operator, and the prompt ending
+/// is the one token a prefill can owe the mechanism. Three cases, and only the first needs the host:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptToken {
+    /// The row ends no prompt: whatever the graph drew for it is discarded.
+    Discarded,
+    /// A greedy row that has committed nothing: the host takes the argmax of its own logits row,
+    /// which is the same token the captured sampler would take - every penalty is a no-op for a
+    /// slot with no history.
+    HostArgmax,
+    /// A sampled row: its first token is the graph's draw over its penalized logits, not an argmax.
+    Draw,
+}
+
+/// The decision for one row, and the refusal when the row cannot be decided here.
+///
+/// `readback` is the slot's sampling position **after** this batch, and this batch committed the
+/// row's own token, so the figure the decision needs is [`committed_before`] of it. A greedy row
+/// with earlier commits is refused by name: its token is the argmax of *penalized* logits, which
+/// only the captured sampler computes, and argmaxing the raw row would silently answer a different
+/// request's token.
+fn prompt_token(
+    samples_nothing: bool,
+    temperature: f32,
+    slot: i32,
+    readback: i32,
+) -> Result<PromptToken> {
+    if samples_nothing {
+        return Ok(PromptToken::Discarded);
+    }
+    if temperature != 0.0 {
+        return Ok(PromptToken::Draw);
+    }
+    let committed = committed_before(readback);
+    if committed > 0 {
+        return Err(Error::Invalid(format!(
+            "a greedy row of slot {slot} ends a prompt that already holds {committed} \
+             committed token(s): its token is the argmax of its penalized logits, which only \
+             the captured sampler computes"
+        )));
+    }
+    Ok(PromptToken::HostArgmax)
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best = 0_usize;
     for (index, value) in values.iter().enumerate() {
@@ -1181,6 +1269,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A batch is homogeneous in its sampling path, and the check is about this batch's own
+        // rows: a warm pose has no request rows, so it is made here rather than in the capture.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
         // pooled table, so the row must state the request's own pages before the replay, and the
         // table states where the row begins (`start_page`) and how far it runs.
@@ -1209,29 +1300,47 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
+        // Every program of the prepared generation ends this pass in one of three states: compared,
+        // paired against another key of the same operator, or recorded as unmeasured. An operator
+        // split across two backends holds one program per phase, and both are launched by their own
+        // descriptor, so `covered` is what stops the second of them being neither.
+        let mut covered: Vec<(&'static str, String)> = Vec::new();
         for (operator, key, kernel) in self.lifecycle.generation.iter() {
             let candidate = match next.kernel(operator, key) {
-                Ok(candidate) => candidate,
+                Ok(candidate) => {
+                    covered.push((operator, key.to_owned()));
+                    candidate
+                }
                 // A recapture replaces the operator's program by another compilation, whose
                 // descriptor text may differ. The comparison pairs by operator (7.3 step 2), and
                 // the previous program is resolved by the key it served with, so the update is
                 // still compared rather than silently committed. The walk has already recaptured
                 // this bucket for the new descriptor; the comparison is what measures the program.
+                //
+                // That pairing is sound only while the operator holds **one** program: an operator
+                // split across two backends holds two, and pairing this launch with the other one
+                // would compare two different computations and call the result a measurement.
                 Err(_) => {
-                    let Some(other) = next.keys(operator).next() else {
-                        // The operator left the deployment: no program of the prepared generation
-                        // launches it, so there is nothing for a comparison to pair.
+                    let mut keys = next.keys(operator);
+                    let first = keys.next();
+                    let only = first.filter(|_| keys.next().is_none());
+                    let Some(other) = only else {
                         tracing::debug!(
                             operator,
                             key,
-                            "the prepared generation holds no program for this operator; no paired forward"
+                            programs = next.keys(operator).count(),
+                            "the prepared generation holds no program under this key and more than \
+                             one for the operator: no paired forward"
                         );
                         continue;
                     };
+                    covered.push((operator, other.to_owned()));
                     next.kernel(operator, other)?
                 }
             };
@@ -1246,19 +1355,36 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation: batch.generation,
             });
         }
-        // An operator the prepared generation *adds* has no program in the serving generation to
-        // be compared against: the update's evidence does not cover it, and saying so is the
-        // difference between an update that was measured and one that merely ran.
+        // A program the prepared generation *adds* has nothing in the serving generation to be
+        // compared against - a new operator, and equally a new phase of an operator the deployment
+        // already serves. The update's evidence does not cover it, and saying so is the difference
+        // between an update that was measured and one that merely ran.
         for (operator, key, _) in next.iter() {
-            if self.lifecycle.generation.keys(operator).next().is_some() {
+            if self.lifecycle.generation.contains(operator, key) {
                 continue;
             }
-            self.note_uncompared(format!(
-                "operator {operator} is new in generation {}: the serving generation holds no \
-                 program of it, so there is nothing to compare it against (its {key} program is \
-                 unmeasured)",
-                batch.generation
-            ));
+            if covered
+                .iter()
+                .any(|(covered_by, covered_key)| *covered_by == operator && covered_key == key)
+            {
+                continue;
+            }
+            let new_operator = self.lifecycle.generation.keys(operator).next().is_none();
+            if new_operator {
+                self.note_uncompared(format!(
+                    "operator {operator} is new in generation {}: the serving generation holds no \
+                     program of it, so there is nothing to compare it against (its {key} program is \
+                     unmeasured)",
+                    batch.generation
+                ));
+            } else {
+                self.note_uncompared(format!(
+                    "operator {operator} {key} is new in generation {}: the deployment already \
+                     serves this operator under another program, and no launch of the serving one \
+                     computes this descriptor, so this program is unmeasured",
+                    batch.generation
+                ));
+            }
         }
         Ok(Jobs::new(jobs))
     }
@@ -1592,10 +1718,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
     /// decision is made here, once per request, before the token leaves this process.
     ///
-    /// The penalties are no-ops for a row whose slot has committed nothing, which is what a prompt
-    /// ending is: a row whose slot already holds committed tokens would need the penalized logits,
-    /// which the graph computes and this path does not, so it is **refused by name** rather than
-    /// argmaxed over the raw row.
+    /// The penalties are no-ops for a row whose slot has committed nothing *before this step*, which
+    /// is what a prompt ending is: a row whose slot already held committed tokens would need the
+    /// penalized logits, which the graph computes and this path does not, so it is **refused by
+    /// name** rather than argmaxed over the raw row. The readback states the position after this
+    /// batch's own token was committed, so the row's commit is subtracted before the test.
     fn greedy_first_tokens(
         &mut self,
         logits: TensorView,
@@ -1618,23 +1745,21 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         let columns = ops::sampler::PARAMETER_COLUMNS as usize;
         for row in 0..rows {
-            let samples_nothing = self.staging.logits_rows()[row] < 0;
-            let greedy = self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize]
-                == 0.0;
-            if samples_nothing || !greedy {
-                continue;
-            }
             let slot = self.staging.slots(rows)[row];
-            let position = usize::try_from(slot)
+            let readback = usize::try_from(slot)
                 .ok()
                 .and_then(|slot| sampling.get(slot).copied())
                 .unwrap_or(0);
-            if position > 0 {
-                return Err(Error::Invalid(format!(
-                    "a greedy row of slot {slot} ends a prompt that already holds {position} \
-                     committed token(s): its token is the argmax of its penalized logits, which only \
-                     the captured sampler computes"
-                )));
+            let decision = prompt_token(
+                self.staging.logits_rows()[row] < 0,
+                self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize],
+                slot,
+                readback,
+            )?;
+            // A drawn row keeps the graph's token, and a row that ends no prompt keeps nothing: the
+            // host answers only the greedy prompt ending.
+            if decision != PromptToken::HostArgmax {
+                continue;
             }
             let source = logits.ptr.address() + row as u64 * width * 4;
             // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
@@ -1990,13 +2115,23 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
+        // The batch is checked where a real one is staged (`submit`, `shadow`): a capture has no
+        // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
+        // row - so the check here would refuse a sampled bucket its own capture.
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
         )?;
-        nn::gather_rows(forward, hidden, self.columns.indices.device, gathered)
-            .map_err(Error::from)?;
+        // The indices are the same defect one operator earlier: `gather_rows` takes a flat `[count]`
+        // view and derives `count` from the gathered rows, so the column's own extent - the largest
+        // bucket's - is refused for every bucket narrower than it, before the sampler is reached.
+        nn::gather_rows(
+            forward,
+            hidden,
+            self.columns.indices.shaped(&[rows]),
+            gathered,
+        )
+        .map_err(Error::from)?;
         let logits = arena.tensor(
             self.geometry.logits_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
@@ -2004,10 +2139,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.model
             .logits(forward, gathered, logits)
             .map_err(Error::from)?;
+        // The sampler reads its request state per row: `parameters` is `[rows, PARAMETER_COLUMNS]`
+        // and `slots` is `[rows]`. A bucket narrower than the largest reads its own rows from the
+        // column's head - a captured graph addresses the column's base pointer, so the view states
+        // the bucket's shape and not the column's flat extent, which is the largest bucket's.
+        let parameters = self
+            .columns
+            .parameters
+            .shaped(&[rows, u64::from(ops::sampler::PARAMETER_COLUMNS)]);
+        let slots = self.columns.slots.shaped(&[rows]);
         let state = SamplerState {
             counts: sampling.counts,
-            parameters: self.columns.parameters.device,
-            slots: self.columns.slots.device,
+            parameters,
+            slots,
             extras: None,
         };
         let samples = Samples::reserve(arena, DType::I32, rows, false)?;
@@ -2024,7 +2168,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         } else {
             sampling
                 .sampler
-                .forward(forward, logits, &state, self.columns.draws.device, &samples)
+                .forward(
+                    forward,
+                    logits,
+                    &state,
+                    self.columns.draws.shaped(&[rows]),
+                    &samples,
+                )
                 .map_err(Error::from)?;
         }
         // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
@@ -2131,7 +2281,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
-            parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
+            // A warm pose of a sampled bucket must state a valid *draw*: the sampler's forward
+            // divides by the row's temperature, so a zeroed row asks it to divide by zero - and a
+            // capture that does so is a device nobody can tell from a hung one. The permissive
+            // pose keeps every candidate (`top_k` 0), takes all of the nucleus (`top_p` 1) and
+            // applies no penalty, which is a request the sampler answers and whose token is
+            // discarded. A greedy bucket's pose is not read through this path at all: the launch
+            // sequence follows the bucket's variant.
+            parameters: warm_parameters(rows),
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
@@ -2279,6 +2436,24 @@ pub fn calls_output(
 /// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
 /// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
 /// host argmax of the row's kept logits (`greedy_first_tokens`).
+
+/// The sampling parameters a warm pose states: one valid, permissive draw per row.
+///
+/// `TEMPERATURE` is 1 rather than 0 because the sampler's forward divides by it - a zeroed row
+/// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
+/// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
+/// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+fn warm_parameters(rows: usize) -> Vec<f32> {
+    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let mut parameters = vec![0.0; rows * columns];
+    for row in 0..rows {
+        let row = &mut parameters[row * columns..(row + 1) * columns];
+        row[ops::sampler::TEMPERATURE as usize] = 1.0;
+        row[ops::sampler::TOP_P as usize] = 1.0;
+    }
+    parameters
+}
+
 fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());
@@ -2351,6 +2526,10 @@ mod tests {
             text.contains("decode_sampled") && text.contains("row 1"),
             "the refusal names neither the bucket nor the row: {text}"
         );
+        assert!(
+            text.contains("temperature 0"),
+            "the refusal does not name the temperature the row stated: {text}"
+        );
 
         let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
             .expect_err("a sampled row was argmaxed in a greedy bucket");
@@ -2358,6 +2537,47 @@ mod tests {
             error.to_string().contains("decode_greedy"),
             "the refusal does not name the bucket: {error}"
         );
+    }
+
+    /// The homogeneity check reads the **batch's** rows, and the rows the bucket pads around them
+    /// are not rows of the batch: a padded row's parameters are zero, and zero reads as a greedy
+    /// row, so a check handed the bucket's rows would refuse a perfectly homogeneous sampled batch
+    /// for the rows nobody sent.
+    ///
+    /// This is the same boundary the capture's failure was on, with a boolean instead of a count:
+    /// the figure the check reads is the batch's, the figure the graph is built from is the bucket's.
+    #[test]
+    fn the_rows_a_bucket_pads_are_not_rows_of_the_batch() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(2, Variant::DecodeSampled),
+            Bucket::decode(4, Variant::DecodeSampled),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let mut columns = decode_columns();
+        let stated = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..2 {
+            columns.parameters[row * stated + ops::sampler::TEMPERATURE as usize] = 0.7;
+        }
+        let shape = Shape::decode(2, Variant::DecodeSampled);
+        staging.stage(&columns, &[CallId(0), CallId(1)], &shape, bucket)?;
+
+        // The batch's own rows: both sampled, so the bucket takes them.
+        assert!(
+            refuse_mixed_sampling(bucket.variant, staging.parameters(shape.rows as usize)).is_ok(),
+            "a homogeneous sampled batch was refused for rows it did not send"
+        );
+        // The bucket's rows: the two the staging padded state temperature 0, so they read as greedy
+        // rows of a sampling bucket. That is what the capture used to be refused by.
+        let error = refuse_mixed_sampling(bucket.variant, staging.parameters(bucket.rows as usize))
+            .expect_err("a padded row read as a row of the batch");
+        let text = error.to_string();
+        assert!(
+            text.contains("row 2") && text.contains("temperature 0"),
+            "the refusal does not name the first padded row: {text}"
+        );
+        Ok(())
     }
 
     /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
@@ -2537,6 +2757,52 @@ mod tests {
         Ok(())
     }
 
+    /// A batch narrower than its bucket fills the bucket's rows with **empty sequences**: the row
+    /// count of every per-row operand is the bucket's, and the rows the batch does not fill state
+    /// length zero, no pool slot, no logits row and inert sampling parameters.
+    ///
+    /// This is the warmup's normal case, not an edge case: a bucket is a catalogue size and a batch
+    /// is whatever arrived. A capture is of the bucket, so the extent of `seq_lens`,
+    /// `query_offsets`, `logits_rows`, the sampler's rows and the commit's count is fixed at capture
+    /// and must be the bucket's at every replay.
+    #[test]
+    fn the_rows_a_batch_does_not_fill_are_empty_sequences() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(4, Variant::DecodeGreedy),
+            Bucket::decode(8, Variant::DecodeGreedy),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let bucket = Bucket::decode(8, Variant::DecodeGreedy);
+        staging.stage(
+            &decode_columns(),
+            &[CallId(0), CallId(1)],
+            &Shape::decode(2, Variant::DecodeGreedy),
+            bucket,
+        )?;
+
+        let rows = bucket.rows as usize;
+        // The bucket's extents, not the batch's four.
+        assert_eq!(staging.batch_rows().seq_lens.len(), rows);
+        assert_eq!(staging.batch_rows().logits_rows.len(), rows);
+        assert_eq!(staging.batch_rows().query_offsets.len(), rows + 1);
+        assert_eq!(staging.slots(rows).len(), rows);
+        // Rows 2..8 are empty sequences: length zero, no slot, no logits row, no sampling state.
+        assert_eq!(&staging.batch_rows().seq_lens[..], &[4, 9, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&staging.slots(rows)[2..], &[-1; 6]);
+        assert_eq!(&staging.logits_rows()[2..], &[-1; 6]);
+        assert!(
+            staging.parameters(rows)[2 * ops::sampler::PARAMETER_COLUMNS as usize..]
+                .iter()
+                .all(|value| *value == 0.0),
+            "an empty row states sampling parameters"
+        );
+        // The pack ends where the batch's last token ends and stays there: an empty row owns no
+        // token, so every offset past the batch's rows repeats the end of the packed tokens.
+        assert_eq!(&staging.batch_rows().query_offsets[..], &[0, 1, 2, 2, 2, 2, 2, 2, 2]);
+        Ok(())
+    }
+
     /// The commit launch is well formed for the rows a bucket holds, and its table is the
     /// mechanism's in the layout the operator states: `[COMMIT_FIELDS, capacity]` i32,
     /// column-major, the staged rows first.
@@ -2574,8 +2840,10 @@ mod tests {
         assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
         let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
-        // The rows past the batch are not written from the staged table.
-        assert_eq!(slots[rows], 0);
+        // The rows past the batch are **inert**, not zero: a zero slot is slot 0, a real destination,
+        // so a launch that ever ran over the whole capacity would commit phantom tokens into the
+        // first slot the deployment serves. `-1` is the operator's sentinel for "no slot".
+        assert_eq!(&slots[rows..], &[-1, -1]);
         // A table of the wrong length is refused rather than read past its end.
         assert!(commit_table(&staged[..rows], rows, capacity).is_err());
         Ok(())
@@ -2826,6 +3094,35 @@ mod sampled_output_tests {
         );
     }
 
+    /// The columns are sized by the widest token count and the widest row count, which can come from
+    /// two different buckets: a plan holding a long narrow prefill bucket and a short wide decode
+    /// bucket has no bucket that is largest in both. A column sized from one bucket alone would be
+    /// shorter than the batches that address it, and nothing bounds an extent view against it.
+    ///
+    /// No constructor in the tree builds such a set - `Buckets::causal_lm` crosses every row size
+    /// with every token size - so this is the rule stated rather than a defect a deployment reached.
+    #[test]
+    fn the_columns_cover_both_maxima_and_not_one_bucket() {
+        let buckets = Buckets::new([
+            Bucket::prefill(1, 4096, Variant::PrefillWrite),
+            Bucket::decode(64, Variant::DecodeGreedy),
+        ]);
+        let (tokens, rows) = column_extents(&buckets).expect("a plan of two buckets");
+        assert_eq!(tokens, 4096, "the longest bucket names the token columns");
+        assert_eq!(rows, 64, "the widest bucket names the row columns");
+        // The mistake this states against: one bucket read for both figures.
+        let widest = buckets
+            .iter()
+            .max_by_key(|bucket| (bucket.rows, bucket.tokens))
+            .copied()
+            .expect("a bucket");
+        assert_ne!(
+            (widest.tokens as u64, widest.rows as u64),
+            (tokens, rows),
+            "no single bucket holds both maxima, which is why one is not read for both"
+        );
+    }
+
     /// A sampling row outside every call, or fewer sampled ids than sampling rows, is an invariant
     /// violation: silently dropping either would hand the mechanism the wrong request's token.
     #[test]
@@ -2837,6 +3134,148 @@ mod sampled_output_tests {
             .expect_err("no id was sampled for row 0");
         calls_output(&[5], &[0], &batch, &[CallId(1)], &[])
             .expect_err("one call, no trajectory position");
+    }
+
+
+    /// A sampling bucket narrower than the largest reads its own rows: the state the sampler is
+    /// handed is `[rows, PARAMETER_COLUMNS]` over the column's head, and `[rows]` for its slots and
+    /// draws, never the column's flat extent. A captured graph addresses the column's base pointer,
+    /// so the two views differ in shape alone - and a flat one states the largest bucket's width,
+    /// which the sampler refuses by the shape it expected.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_narrower_sampling_bucket_reads_its_own_rows() {
+        let columns = u64::from(ops::sampler::PARAMETER_COLUMNS);
+        let largest = 8;
+        let narrow = 2;
+        let parameters = Column::new(platform::DeviceId(0), DType::F32, largest * columns)
+            .expect("the parameters column");
+        assert_eq!(parameters.device.shape.dims(), &[largest * columns]);
+        let view = parameters.shaped(&[narrow, columns]);
+        assert_eq!(view.shape.dims(), &[narrow, columns]);
+        assert_eq!(
+            view.ptr.address(),
+            parameters.device.ptr.address(),
+            "the bucket's view names the column's own base, which is what a captured graph addresses"
+        );
+        let slots =
+            Column::new(platform::DeviceId(0), DType::I32, largest).expect("the slots column");
+        assert_eq!(slots.shaped(&[narrow]).shape.dims(), &[narrow]);
+        let draws =
+            Column::new(platform::DeviceId(0), DType::F32, largest).expect("the draws column");
+        assert_eq!(draws.shaped(&[narrow]).shape.dims(), &[narrow]);
+        // The gather column is the same shape one operator earlier: `gather_rows` takes a flat
+        // `[count]` view and derives `count` from the rows it gathers, so a flat column states the
+        // largest bucket's row count and every narrower bucket is refused before the sampler.
+        let indices =
+            Column::new(platform::DeviceId(0), DType::I32, largest).expect("the indices column");
+        let gather = indices.shaped(&[narrow]);
+        assert_eq!(gather.shape.dims(), &[narrow]);
+        assert_eq!(gather.numel(), narrow, "the count the gather reads");
+    }
+
+
+    /// The warm pose of a sampled bucket states a draw the sampler can make: temperature 1, every
+    /// candidate kept. A zeroed pose asks the forward to divide by a zero temperature - and it is
+    /// the very input `refuse_mixed_sampling` refuses in a real batch, which is why a capture that
+    /// ran on it was a bucket the batch check would have rejected.
+    #[test]
+    fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = warm_parameters(2);
+        assert_eq!(parameters.len(), 2 * columns, "a row per row");
+        for row in 0..2 {
+            let row = &parameters[row * columns..(row + 1) * columns];
+            assert_eq!(row[ops::sampler::TEMPERATURE as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_P as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_K as usize], 0.0);
+        }
+        refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &parameters)
+            .expect("the pose of a sampled bucket is not a greedy row");
+        assert!(
+            refuse_mixed_sampling(
+                crate::plan::Variant::DecodeSampled,
+                &vec![0.0; 2 * columns]
+            )
+            .is_err(),
+            "the zeroed pose the capture used to state is not a draw"
+        );
+    }
+
+
+    /// A prompt ending's own token is one the batch committed, so the readback the greedy host path
+    /// reads answers 1 for it and not 0. Refusing on that raw figure refused every deployment's
+    /// first token (the run at `091731ffb`: `a greedy row of slot 1 ends a prompt that already holds 1
+    /// committed token(s)`), and a slot that really did hold tokens is still refused.
+    #[test]
+    fn a_prompt_ending_holds_no_committed_token_before_its_own() {
+        assert_eq!(committed_before(1), 0, "a prompt ending's own token only");
+        assert_eq!(committed_before(5), 4, "four tokens before this step's");
+        assert_eq!(committed_before(0), 0, "an unread slot has none");
+        assert_eq!(committed_before(-1), 0, "a readback that never ran has none");
+    }
+
+    /// **A greedy prompt ending is argmaxed on the host.** The row is greedy (temperature zero), it
+    /// ends a prompt (the readback states the position after its own commit, so one means none
+    /// before it), and its token is the argmax of its own logits row - the same token the captured
+    /// sampler would take, because every penalty is a no-op for a slot with no history.
+    ///
+    /// The device half - the copy of the row out of the arena and the readback the mechanism reads -
+    /// is the caller's run; what is stated here is the decision and the argmax it rests on.
+    #[test]
+    fn a_greedy_prompt_ending_is_argmaxed_on_the_host() {
+        assert_eq!(
+            prompt_token(false, 0.0, 3, 1).expect("a prompt ending that committed only its own"),
+            PromptToken::HostArgmax
+        );
+        // The token is the largest value of the row, and a tie is the lowest index.
+        assert_eq!(argmax(&[0.5, 9.0, 9.0, -3.0]), 1);
+        // A non-finite value is never the largest: the first finite value wins over a NaN before it,
+        // and a row with no finite value has no largest candidate to name.
+        assert_eq!(argmax(&[f32::NAN, 2.0, 1.5]), 1);
+        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY]), 0);
+        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY, f32::NAN]), 0);
+    }
+
+    /// **A sampled prompt ending is NOT argmaxed**: its first token is the graph's draw over the
+    /// penalized logits. The host leaves the drawn token alone, and the decision is taken before any
+    /// history is consulted - a sampled slot may hold as much history as it has decoded, because the
+    /// captured sampler is what applies the penalties.
+    #[test]
+    fn a_sampled_prompt_ending_is_drawn_and_not_argmaxed() {
+        for readback in [1, 9, -1] {
+            assert_eq!(
+                prompt_token(false, 0.7, 3, readback).expect("a sampled row is decided by the draw"),
+                PromptToken::Draw,
+                "a sampled prompt ending was argmaxed on the host, which would answer the largest                  candidate instead of a token of its distribution"
+            );
+        }
+        // A row that ends no prompt is discarded whatever its temperature: the graph drew for it in
+        // a bucket that draws, and the draw belongs to no call.
+        for temperature in [0.0, 1.0] {
+            assert_eq!(
+                prompt_token(true, temperature, 3, 1).expect("a row that ends no prompt"),
+                PromptToken::Discarded
+            );
+        }
+    }
+
+    /// **A greedy row with a committed history is refused by name.** Its token is the argmax of the
+    /// *penalized* logits, which only the captured sampler computes; argmaxing the raw row would
+    /// answer a different request's token, so the row is refused with both figures rather than
+    /// served with the wrong one.
+    #[test]
+    fn a_greedy_row_with_a_committed_history_is_refused_by_name() {
+        let refusal = prompt_token(false, 0.0, 7, 5).expect_err("four tokens before this step's");
+        assert!(
+            matches!(refusal, Error::Invalid(_)),
+            "a row that cannot be decided here was not stated as a refusal: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("slot 7") && text.contains("4 committed token"),
+            "the refusal names neither the slot nor the history it found: {text}"
+        );
     }
 
 }

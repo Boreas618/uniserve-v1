@@ -9,17 +9,32 @@ runs them on a schedule: this does, in one pass, device-free and in seconds, bec
 set `TRITON_INTERPRET` themselves or accept it from here.
 
 A script is **run** only when it is a check: one with an `if __name__` block. A module a check
-imports (`scenario.py` and the like) is not run on its own, and a check that needs a *module
-directory* or a device on its command line is reported as **skipped with its reason**, which is what
-its own argument parser says.
+imports (`scenario.py` and the like) is not run on its own.
+
+**A tree check answers about the whole tree rather than about one package** (`TREE_CHECKS`): today
+`tools/kernel_arguments.py --check`, which compares the three statements of every Triton kernel's
+argument list — the kernel's `def`, the package's `spec`, and the operator's Rust `Arguments` chain.
+It is one check in the count line like any other, and its verdict is `passed`, `failed` or
+`unrunnable`; never `skipped`, because a disagreement it finds is a defect and an absence of the tool
+is a gap in the harness. An instrument a run never calls is a gap this runner exists to name: nineteen
+checks read as device-dependent for weeks because nothing called them with the argument they wanted.
+
+**A check that refuses for a missing argument is called again with the arguments this runner can
+answer** — today that is `--op`, whose value is the operator the package is for, since it is the
+directory the check lives under. One that needs an argument nobody here can answer is **unrunnable**,
+named with the argument: that is a gap in the instrument, not a property of the kernel. The runner
+does not compile a module to feed one, because a check that loads a module launches it, so it is a
+device check, and a device check is skipped here by design rather than compiled for and then skipped.
 
 Outcomes:
 
 - **passed**: exit status 0.
-- **skipped**: the check refused before doing arithmetic — it wants a compiled module, a device, or an
-  argument this runner does not invent. The first line of its refusal is printed, so a skip that is
-  really a defect is visible rather than counted as success.
-- **failed**: anything else. Exit status 1 if any check failed.
+- **skipped**: the check refused before doing arithmetic for something this host does not have — a
+  device, a compiled module, a library. The line it printed is shown, so a skip that is really a
+  defect stays visible rather than counting as success.
+- **unrunnable**: this runner cannot call the check at all; the line names the argument it would have
+  needed. Reported, not failed, for the same reason `unreachable` is: nobody's kernel is wrong.
+- **failed**: anything else. Exit status 1 if any check failed, timed out or was contended.
 
 This is not a test and runs nothing a caller's suite would: it exercises the operators' kernels on the
 interpreter, which is where a wrong index or a missing mask is cheapest to find.
@@ -29,6 +44,7 @@ import argparse
 import concurrent.futures
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -47,6 +63,102 @@ SKIP_MARKERS = (
     "module directory is required",
     "a module directory",
 )
+
+#: Arguments a check declares required that this runner can answer from where the check lives. A
+#: required argument the runner cannot answer makes a check **unrunnable** rather than skipped: "wants
+#: a device" is a statement about the host, and "the harness does not know how to call it" is a
+#: statement about the harness — filing the second under the first is how nineteen checks read as
+#: device-dependent for weeks (`usage: conv_check.py [-h] --op {conv1d,conv3d,conv_transpose1d}`).
+DERIVABLE = {
+    # `--op` names the operator the package is for, which is where the script lives.
+    "--op": lambda operator, script: operator,
+}
+
+#: What argparse prints when it refuses for a missing argument, with the names that were required.
+REQUIRED = re.compile(r"the following arguments are required: (.+)$", re.MULTILINE)
+
+#: A check's own verdict on the arithmetic it did. A marker says a part of the check could not run
+#: here; a verdict says a part that *did* run disagreed with its reference, and that outranks the
+#: marker: `modulated_rms_norm` prints "…'s E4M3 output needs a device" for one output and then
+#: `FAIL: hand-computed …` for the hand case, and it was reported as skipped — a real arithmetic
+#: failure filed under a platform limitation.
+FAILURE_VERDICTS = ("FAIL", "DIFFERS")
+
+#: Checks that are kept as **byte-identical copies** in more than one package, because each copy's
+#: `default_op()` names its own operator from the package it lives in. A fix landed in one copy and
+#: not the other is invisible to every other instrument: the two `modulation_check.py` copies diverged
+#: once, and the `gated_residual` copy then launched the modulated form's kernel against the gated
+#: literals for a whole stretch. The sweep compares them before it runs anything.
+SHARED_CHECKS = ("modulation_check.py",)
+
+#: Checks that are not a package's own but the whole tree's, run by name from `tools/`. Each is one
+#: check in the count line. They are listed here rather than discovered, because a tool that refuses
+#: by not existing must still be one entry in the count: an instrument missing from the tree is a gap
+#: to report, not a check that disappears from the arithmetic.
+#:
+#: `kernel_arguments.py` compares the three statements of a Triton kernel's argument list. **Only
+#: against a built artifact**, whose `metadata.json` is what a launch reads: its source mode compares
+#: one operator's Rust chain against the union of its arms, so an operator with a phase-selected or
+#: field-selected kernel is reported as disagreeing with itself - eight operators and thirteen causes
+#: on the first run, at least two of them impossible, since the launch refuses a count or kind
+#: mismatch before it runs. A check that guesses is worse than one that refuses, so without a built
+#: store this check is `unrunnable` and says so.
+#:
+#: The store is one this runner is **given**, never one it builds: a second store for one run is two
+#: statements of one thing. Each entry is `(tool, invocations, options it needs)`, and a tool may
+#: need more than one invocation to cover its subject: `kernel_arguments.py` compares a cubin cell
+#: against its recorded signature under `--check`, and a native package's C entry against the Rust
+#: structure that mirrors it under `--native`. `--native` also early-returns and needs no store, so
+#: one invocation carrying both modes compares no cell at all - the two passes are two invocations
+#: and one verdict: 131 cells and 21 call structures of the H3 deployment, which is all 152 of them.
+TREE_CHECKS = (
+    ("kernel_arguments.py", (("--check",), ("--check", "--native")), ("--fixture", "--store")),
+)
+
+#: Where a launch's descriptor is built. A package whose operator no file here names **in code** is
+#: a check over a kernel nothing can reach, and its green is not evidence about the model: five
+#: packages of exactly this kind were deleted on 2026-11-04 after one of their checks cost an evening.
+#: The search strips Rust comments first, because an operator's name in a doc comment is a comment
+#: and not a launch — that distinction is what turned "nine deletions" into six.
+CALLERS = ("crates/nn/src", "crates/models", "crates/executor/src")
+
+
+def declared(repository):
+    """Every operator `ops` declares, as `name -> Rust type`, read from its own `impl Op` blocks.
+
+    The type is what a caller writes: a layer builds `WeightedRmsNorm`'s descriptor, and the operator
+    NAME string appears nowhere at a launch site. So a census that greps names finds nothing and a
+    census that greps types finds the callers — that was the one wrong turn this instrument had.
+    """
+    found = {}
+    for source in sorted((repository / "crates/ops/src").rglob("*.rs")):
+        text = source.read_text(errors="ignore")
+        for block in text.split("impl Op for ")[1:]:
+            name = block.split('const NAME: &\'static str = "')
+            if len(name) < 2:
+                continue
+            found[name[1].split('"')[0]] = block.split(None, 1)[0].strip(" {")
+    return found
+
+
+def comments_stripped(text):
+    """The file with its Rust comments removed, so a mention in prose does not count as a launch."""
+    import re
+
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", text)
+
+
+def reachable(repository, operators):
+    """The operators whose type at least one caller crate names in code."""
+    bodies = []
+    for where in CALLERS:
+        for source in sorted((repository / where).rglob("*.rs")):
+            bodies.append(comments_stripped(source.read_text(errors="ignore")))
+    body = "\n".join(bodies)
+    import re
+
+    return {name for name, kind in operators.items() if re.search(rf"\b{kind}\b", body)}
 
 
 def is_check(path):
@@ -68,14 +180,37 @@ def packages(root):
     return found
 
 
-def run_one(package, script, timeout):
-    """Run one check in its own directory with the interpreter enabled."""
+def offers(script, flag):
+    """Whether a check's own argument parser lists `flag`."""
     environment = dict(os.environ)
     environment.setdefault("TRITON_INTERPRET", "1")
     environment.pop("PYTHONPATH", None)
     try:
         completed = subprocess.run(
-            [sys.executable, script.name],
+            [sys.executable, script.name, "--help"],
+            cwd=str(script.parent),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return flag in (completed.stdout + completed.stderr)
+
+
+def run_one(package, script, timeout, operator=None, arguments=(), retried=False, cpu_only=False):
+    """Run one check in its own directory with the interpreter enabled.
+
+    A check that refuses for a missing argument is called once more with the arguments this runner
+    can answer (`DERIVABLE`); one that needs an argument nobody here can answer is `unrunnable`.
+    """
+    environment = dict(os.environ)
+    environment.setdefault("TRITON_INTERPRET", "1")
+    environment.pop("PYTHONPATH", None)
+    try:
+        completed = subprocess.run(
+            [sys.executable, script.name, *arguments],
             cwd=str(script.parent),
             env=environment,
             capture_output=True,
@@ -89,7 +224,58 @@ def run_one(package, script, timeout):
     head = output[0] if output else ""
     if completed.returncode == 0:
         return ("passed", tail, "")
+    verdict = next(
+        (line for line in output if line.startswith(FAILURE_VERDICTS)), None
+    )
+    if verdict is not None:
+        return ("failed", verdict, "")
+    missing = REQUIRED.search("\n".join(output))
+    if missing is not None:
+        names = [one.strip() for one in missing.group(1).split(",") if one.strip()]
+        unknown = [one for one in names if one not in DERIVABLE]
+        if unknown:
+            # A required name that is not a flag is a positional: either an input this runner does
+            # not produce (a compiled module) or a choice among the check's own cases. Both are the
+            # harness's gap and neither is answered by writing a value into the check's mouth.
+            flags = [one for one in unknown if one.startswith("-")]
+            positional = [one for one in unknown if not one.startswith("-")]
+            needs = []
+            if flags:
+                needs.append(f"the arguments {', '.join(flags)}")
+            if positional:
+                needs.append(f"its input {', '.join(positional)}")
+            return (
+                "unrunnable",
+                f"{script.name}: this runner supplies {' and '.join(needs)}, so the check is not "
+                f"called and proves nothing here",
+                2,
+            )
+        if not retried:
+            supplied = []
+            for one in names:
+                supplied.extend((one, DERIVABLE[one](operator, script)))
+            return run_one(package, script, timeout, operator, tuple(supplied), retried=True)
+        # The second call refused for an argument this runner did supply, so the refusal is not one
+        # the table can answer and the check stays uncalled rather than passed off as a skip.
+        return (
+            "unrunnable",
+            f"{script.name}: still refusing for {', '.join(names)} after they were supplied",
+            2,
+        )
     if any(marker in head or marker in tail for marker in SKIP_MARKERS):
+        # A check that offers `--cpu-only` can be held to the half of itself that does not need a
+        # device, and that half is a real assertion: `gemm_check.py` refuses without a module and
+        # then passes `--cpu-only` with four verdicts it had never been asked for here.
+        if not cpu_only and offers(script, "--cpu-only"):
+            again = run_one(
+                package, script, timeout, operator,
+                tuple(arguments) + ("--cpu-only",), retried=True, cpu_only=True,
+            )
+            if again[0] == "passed":
+                return ("passed", f"host-only half: {again[1]}", 0)
+            if again[0] == "failed":
+                return again
+            return ("skipped", f"{head or tail} (and --cpu-only: {again[1]})", "")
         return ("skipped", head or tail, "")
     if completed.returncode < 0:
         # A check killed by a signal may be a check that dies when several interpreter runs
@@ -128,24 +314,176 @@ def run_one_alone(script, timeout):
         return subprocess.CompletedProcess([], 124, "", "no answer")
 
 
+def tree_arguments(name, fixture=None, store=None, target="sm_100a"):
+    """The invocations one tree check is called with when it can run at all.
+
+    The store is one this runner is **given**, never one it builds: a second store for one run is two
+    statements of one thing, and this runner is the place they would drift apart. Each invocation
+    carries the store, because each compares cells of it.
+    """
+    if tree_needs(name, fixture, store):
+        raise ValueError(f"{name} cannot run without {' and '.join(tree_needs(name, fixture, store))}")
+    invocations = {entry[0]: entry[1] for entry in TREE_CHECKS}[name]
+    return tuple(
+        (*invocation, "--fixture", fixture, "--store", store, "--target", target)
+        for invocation in invocations
+    )
+
+
+def store_holds_cells(store):
+    """Whether a store holds at least one built cell.
+
+    A comparison against an empty store compares nothing and passes, which is the one green that is
+    worse than a refusal: `--store` naming a directory the build never filled would read as agreement.
+    """
+    return store is not None and any(pathlib.Path(store).rglob("metadata.json"))
+
+
+def tree_needs(name, fixture=None, store=None):
+    """The options one tree check needs and was not given, by name.
+
+    A check that cannot run soundly here is `unrunnable` with what it needs, never run in a mode that
+    guesses: `kernel_arguments.py` enters its artifact comparison on `--fixture`, so a store without a
+    fixture would fall back to the source comparison the ruling excludes.
+    """
+    needs = {entry[0]: entry[2] for entry in TREE_CHECKS}[name]
+    given = {"--fixture": fixture, "--store": store}
+    return [option for option in needs if not given.get(option)]
+
+
+def run_tree_check(root, name, invocations, timeout):
+    """Run one tree check's invocations and merge them into one verdict.
+
+    The loudest outcome wins and names the mode that produced it; all clean is `passed` with the
+    detail of each, because the subject is "the deployment's arguments" and half of it is not a pass.
+    """
+    outcomes = []
+    for arguments in invocations:
+        outcomes.append((arguments, run_one_invocation(root, name, arguments, timeout)))
+    for arguments, (outcome, detail, code) in outcomes:
+        if outcome != "passed":
+            mode = " ".join(arguments[:2])
+            return (outcome, f"{mode}: {detail}", code)
+    return ("passed", "; ".join(detail for _, (_, detail, _) in outcomes), "")
+
+
+def run_one_invocation(root, name, arguments, timeout):
+    """Run one tree check and classify it the way a package check is classified.
+
+    `passed` for exit 0 — the check may still report gaps, and its own line counts them; `failed` for
+    exit 1 with a report, which is the check saying a shape disagrees, and the line names the cause;
+    `unrunnable` for anything else, including the tool not being in this tree, because a check this
+    runner cannot call is the harness's gap and not a verdict about a kernel.
+    """
+    script = pathlib.Path(root) / "tools" / name
+    if not script.is_file():
+        return (
+            "unrunnable",
+            f"tools/{name} is not in this tree, so nothing compares the kernels' argument lists",
+            "",
+        )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), *arguments],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ("timeout", f"tools/{name} did not answer in {timeout} s", "")
+    output = (completed.stdout + completed.stderr).strip().splitlines()
+    summary = output[0] if output else ""
+    if completed.returncode == 0:
+        # Exit 0 means "no disagreement", and a comparison that compared nothing has none: the tool
+        # prints how many cells it read, and a zero there is the green that is worse than a refusal.
+        # `store_holds_cells` refuses an empty store before this runs; this closes the case where the
+        # store holds cells and none of them answers a row of the fixture.
+        if summary.startswith("0 cell(s) compared"):
+            return (
+                "unrunnable",
+                f"tools/{name} compared no cell of this fixture: {summary}",
+                "",
+            )
+        return ("passed", summary, "")
+    if completed.returncode == 1 and not any("Traceback (most recent call last)" in line for line in output):
+        problems = [line.strip() for line in output if line.strip().startswith("problem:")]
+        named = problems[0] if problems else summary
+        extra = f" (+{len(problems) - 1} more cause(s))" if len(problems) > 1 else ""
+        return ("failed", f"{named}{extra}", "")
+    # A tool that ends in an exception did not compare anything, so its exit status is not a verdict
+    # about a kernel: the last line of the traceback is the reason, and the outcome is the harness's
+    # gap. Reading a crash as a disagreement would report a defect nobody can act on.
+    reason = output[-1].strip() if output else "no output"
+    return ("unrunnable", f"tools/{name} could not run here: {reason}", "")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernels", default="crates/ops/kernels", type=pathlib.Path)
     parser.add_argument("--jobs", type=int, default=6, help="checks run at once")
     parser.add_argument("--timeout", type=int, default=120, help="seconds per check")
     parser.add_argument("--verbose", action="store_true", help="name every check, not only outcomes")
+    parser.add_argument(
+        "--fixture",
+        help="the key fixture a tree check compares built cells against (needs --store)",
+    )
+    parser.add_argument("--store", help="a store already built for --fixture")
+    parser.add_argument("--target", default="sm_100a", help="the architecture --store was built for")
     options = parser.parse_args()
+    if options.fixture and not options.store:
+        parser.error("--fixture needs --store: the cells are what the comparison reads")
 
     found = packages(options.kernels)
+    diverged = []
+    for name in SHARED_CHECKS:
+        copies = sorted(script for _, scripts in found for script in scripts if script.name == name)
+        if len(copies) > 1 and len({script.read_bytes() for script in copies}) > 1:
+            diverged.append(
+                f"{name}: {len(copies)} copies are not identical — "
+                + ", ".join(str(script.parent.parent.parent.name) for script in copies)
+            )
     jobs = [
         (package, script)
         for package, scripts in found
         for script in scripts
     ]
-    outcomes = {"passed": [], "skipped": [], "failed": [], "timeout": [], "contended": []}
+    outcomes = {
+        "passed": [],
+        "skipped": [],
+        "failed": [],
+        "timeout": [],
+        "contended": [],
+        "unreachable": [],
+        "unrunnable": [],
+    }
+    for line in diverged:
+        outcomes["failed"].append((line.split(":")[0], line, 1))
+    operators = declared(pathlib.Path("."))
+    live = reachable(pathlib.Path("."), operators)
+    # `package` is the backend directory (`kernels/<operator>/<backend>`), so the operator is the
+    # first component below the kernels root — `package.name` would be `triton`, `fa4`, `cudnn`.
+    seen = set()
+    for package, _ in found:
+        name = package.relative_to(options.kernels).parts[0]
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in operators and name in live:
+            continue
+        reason = (
+            f"{operators[name]}: no crate outside `ops` names it in code, so its checks prove "
+            f"nothing about the model"
+            if name in operators
+            else "`ops` declares no operator of this name"
+        )
+        outcomes["unreachable"].append((name, reason, 1))
     with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
         futures = {
-            pool.submit(run_one, package, script, options.timeout): (package, script)
+            pool.submit(
+                run_one, package, script, options.timeout,
+                package.relative_to(options.kernels).parts[0],
+            ): (package, script)
             for package, script in jobs
         }
         for future in concurrent.futures.as_completed(futures):
@@ -154,19 +492,69 @@ def main():
             name = f"{package.relative_to(options.kernels)}/{script.name}"
             outcomes[outcome].append((name, detail, code))
 
-    checks = sum(len(scripts) for _, scripts in found)
-    print(
-        f"# {len(found)} packages, {checks} checks: {len(outcomes['passed'])} passed, "
-        f"{len(outcomes['skipped'])} skipped, {len(outcomes['failed'])} failed, "
-        f"{len(outcomes['timeout'])} timed out, {len(outcomes['contended'])} contended"
+    # A tree check stands outside `packages()`: there is no package directory under it, and its
+    # subject is every package at once. It runs after the packages so its output reads beside theirs.
+    for name, _, _ in TREE_CHECKS:
+        missing = tree_needs(name, options.fixture, options.store)
+        if missing:
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    f"needs {' and '.join(missing)}: the comparison is only sound against a built "
+                    f"artifact, and source mode reports an operator's arms against each other",
+                    "",
+                )
+            )
+            continue
+        if not store_holds_cells(options.store):
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    "the store under --store holds no built cell, so there is nothing to compare",
+                    "",
+                )
+            )
+            continue
+        arguments = tree_arguments(name, options.fixture, options.store, options.target)
+        outcome, detail, code = run_tree_check(pathlib.Path("."), name, arguments, options.timeout)
+        outcomes[outcome].append((f"tools/{name}", detail, code))
+
+    checks = sum(len(scripts) for _, scripts in found) + len(TREE_CHECKS)
+    # A package directory is one backend of one operator, so the two counts differ where an operator
+    # has more than one backend. Both are stated because a count is quoted without its unit, and an
+    # operator with two backends read as two operators is a number nobody can reconcile later.
+    operators_count = len({package.relative_to(options.kernels).parts[0] for package, _ in found})
+    parts = (
+        ("passed", len(outcomes["passed"])),
+        ("skipped", len(outcomes["skipped"])),
+        ("failed", len(outcomes["failed"])),
+        ("timed out", len(outcomes["timeout"])),
+        ("contended", len(outcomes["contended"])),
+        ("unrunnable", len(outcomes["unrunnable"])),
     )
-    for outcome in ("failed", "timeout", "contended", "skipped"):
+    print(
+        f"# {len(found)} packages ({operators_count} operators), {checks} checks: "
+        + ", ".join(f"{count} {word}" for word, count in parts)
+        + f"; {len(outcomes['unreachable'])} unreachable operator(s)"
+    )
+    # The arithmetic is printed because a count that does not close is a finding rather than a
+    # rounding: every check has exactly one outcome, and `unreachable` is a statement about an
+    # operator (a package no launch names) rather than about a check, so it is not in the sum.
+    total = sum(count for _, count in parts)
+    closing = " + ".join(f"{count} {word}" for word, count in parts) + f" = {total}"
+    print(f"# {total} checks by outcome: {closing}" + ("" if total == checks else f" — NOT {checks}"))
+    for outcome in ("failed", "timeout", "contended", "unreachable", "unrunnable", "skipped"):
         for name, detail, code in sorted(outcomes[outcome]):
             prefix = f" [{code}]" if code not in (0, "", None) else ""
             print(f"{outcome:8s} {name}{prefix} — {detail}")
     if options.verbose:
         for name, detail, _ in sorted(outcomes["passed"]):
             print(f"passed   {name} — {detail}")
+    # `unreachable` does not fail the run: it says a package exists that no caller can launch, which
+    # is a question for the operator set's owner, not a check that went wrong. What it must not do is
+    # disappear, so it is in the count line, in the detail lines, and out of the passed count.
+    # `unrunnable` is the same shape for the harness: a check this runner cannot call is a gap in the
+    # instrument, named with the argument it would have needed, and not a verdict about the kernel.
     return 1 if outcomes["failed"] or outcomes["timeout"] or outcomes["contended"] else 0
 
 

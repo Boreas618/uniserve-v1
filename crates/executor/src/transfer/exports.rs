@@ -387,8 +387,17 @@ mod tests {
         Ok(())
     }
 
+    /// A channel export carries the bytes its issuer copied, and a later write
+    /// to the source does not reach them: the copy belongs to the issuer, and
+    /// with a host source and no stream to order it on the issuer is this call.
+    ///
+    /// A deferred host export does not exist: a recorder refuses a strided host
+    /// copy by name, because the staging it would write is read after the batch
+    /// performed and a strided host copy has no way to keep its operands alive
+    /// that far. So the export of device storage is what a job's record defers,
+    /// and it is exercised where a device exists.
     #[test]
-    fn a_recorded_channel_export_carries_what_its_job_copied() -> Result<()> {
+    fn a_channel_export_carries_the_bytes_its_copy_staged() -> Result<()> {
         let transports = channel()?;
         let storage = Storage::host(4);
         let source = Spans::single(StorageView::contiguous(
@@ -398,8 +407,10 @@ mod tests {
             &[4],
         )?)?;
 
-        // The export is recorded before its producer wrote the value, as a
-        // forward records its publication behind its own operations.
+        // SAFETY: four bytes of host storage this test owns.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1_u8, 2, 3, 4].as_ptr(), storage.address() as *mut u8, 4)
+        };
         let exports = export(
             &transports,
             &source,
@@ -409,9 +420,11 @@ mod tests {
             Option::<&platform::Stream>::None,
             |_| Ok(()),
         )?;
-        // SAFETY: four bytes of host storage this test owns.
+        // The source is rewritten after the copy was issued: the payload is the
+        // export's own bytes, not a view of the source.
+        // SAFETY: as above.
         unsafe {
-            std::ptr::copy_nonoverlapping([1_u8, 2, 3, 4].as_ptr(), storage.address() as *mut u8, 4)
+            std::ptr::copy_nonoverlapping([5_u8, 6, 7, 8].as_ptr(), storage.address() as *mut u8, 4)
         };
 
         let locations = exports.locate(|_| Ok(()))?;

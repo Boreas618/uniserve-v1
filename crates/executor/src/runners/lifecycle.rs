@@ -295,7 +295,11 @@ impl Lifecycle {
         // node to set the prepared generation's parameters on and the bucket must be recaptured
         // rather than prepared from a structure nobody can address.
         let unannotated = walked.nodes.is_empty();
-        if unannotated || !served.same_structure(&walked.nodes)? {
+        // Which fact declined the rebind, when one did: a count, a node's kind, or an edge whose
+        // kind changed. A recapture that says only "the structure changed" leaves the reader to
+        // guess whether a program was built differently or the same program is ordered differently.
+        let mismatch = served.structure_mismatch(&walked.nodes)?;
+        if unannotated || mismatch.is_some() {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments. The generation being
             // replaced keeps its own graph and executable, which a revert serves from.
@@ -313,6 +317,7 @@ impl Lifecycle {
                 tracing::info!(
                     bucket = %bucket,
                     generation,
+                    mismatch = %mismatch.as_deref().unwrap_or("the walk's structure differs"),
                     "the launch structure changed; recaptured the bucket"
                 );
             }
@@ -333,10 +338,10 @@ impl Lifecycle {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
             for node in launch {
-                if node.kind()? != platform::GraphNodeKind::Kernel {
+                if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(walked.template.kernel_node_params(node)?);
+                params.push(walked.template.kernel_node_params(&node.node)?);
             }
             launches.push((*operator, *ordinal, params));
             *ordinal += 1;
@@ -348,7 +353,12 @@ impl Lifecycle {
             applied += prepared.rebind_launch(operator, ordinal, &params)?;
         }
         self.graphs.insert(bucket, generation, prepared);
-        tracing::debug!(bucket = %bucket, applied, "rebound a bucket for a new generation");
+        // At `info`, because a run's log is where the delivery test's two mechanisms are told apart:
+        // a recapture states itself at `info` a page below, and a rebind that stated itself at
+        // `debug` would be indistinguishable from a bucket the update never prepared at all. `applied`
+        // is the number of node tables set on the executable the serving graph's own template built,
+        // which is the strongest statement this layer can make about what happened (7.3).
+        tracing::info!(bucket = %bucket, generation, applied, "rebound a bucket for a new generation");
         Ok(())
     }
 
@@ -470,26 +480,49 @@ pub(crate) fn walk_capture(
         // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
         // handle is shared across threads, which it is not, and the allocator is right to warn
         // about a non-`Send` handle in an `Arc`.
+        let started = std::time::Instant::now();
         let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
             stream,
             platform::CaptureMode::Relaxed,
         )?));
+        // The phases of one capture, at `debug`: a cold epoch's first capture may legitimately pay
+        // minutes, and which phase pays them is the difference between a slow device and a walk
+        // that is waiting on something. Descriptor resolution and the launches are inside the walk.
+        let begun = started.elapsed().as_micros() as u64;
         let mut recording = Recording::new(std::rc::Rc::clone(&capture));
         // The forward runs with the generation being walked and the bucket's arena, so every
         // operator launch becomes a node of the template and is reported to `recording`.
         ops::capture::set_sink(Some(&mut recording));
         let walked = walk();
         ops::capture::set_sink(None);
-        let nodes = recording.nodes;
-        if let Some(failure) = recording.failure {
+        // The recorder holds a clone of the capture while the walk runs, and this thread holds the
+        // other: taking the table and the failure out by field would leave the clone alive to the
+        // end of the function, so `try_unwrap` below would refuse the only handle that can end the
+        // capture. Destructuring drops the recorder with it, which is what makes the capture ours
+        // again.
+        let Recording {
+            nodes,
+            failure,
+            capture: recorder,
+        } = recording;
+        drop(recorder);
+        if let Some(failure) = failure {
             return Err(failure.into());
         }
         walked?;
+        let walked_us = started.elapsed().as_micros() as u64;
         let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
             Error::Invariant("the capture is still shared by its recorder".into())
         })?;
         let capture = capture.into_inner();
         let template = capture.end()?;
+        tracing::debug!(
+            begin_us = begun,
+            walk_us = walked_us.saturating_sub(begun),
+            end_us = started.elapsed().as_micros() as u64 - walked_us,
+            nodes = nodes.len(),
+            "the phases of one capture"
+        );
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
         // reported no node table serves batches correctly but cannot be rebound, because there is
@@ -516,7 +549,9 @@ pub(crate) fn hold_kernels(
 
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        let recorded = self.capture.borrow_mut().record();
+        // The walk's edges, not only its nodes: a programmatic edge orders less than a
+        // completion edge, and 4.5's rebind condition compares the structure those kinds make.
+        let recorded = self.capture.borrow_mut().record_walk();
         match recorded {
             Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
             Err(error) => {
@@ -568,5 +603,29 @@ impl Recording {
     /// The node table, the recorder consumed.
     pub fn into_nodes(self) -> Nodes {
         self.nodes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capture taken through `walk_capture` comes back as a template. The recorder holds a clone
+    /// of the capture for as long as it lives, so a partly moved `Recording` would keep the capture
+    /// shared past the walk and `Rc::try_unwrap` would answer `the capture is still shared by its
+    /// recorder` - which is a bucket no generation can replay, reached after a whole forward.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_capture_through_the_walk_returns_its_template() {
+        let stream = platform::Stream::new(platform::DeviceId(0)).expect("a stream");
+        let walked = walk_capture(&stream, || Ok(())).expect("a walk that launches nothing");
+        assert!(
+            walked.nodes.is_empty(),
+            "a walk that launches nothing reported {} node(s)",
+            walked.nodes.len()
+        );
+        // The template itself: a capture that had another handle could not have been ended, so its
+        // existence is the assertion the test is for.
+        let _template = walked.template;
     }
 }

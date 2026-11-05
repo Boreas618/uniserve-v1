@@ -239,9 +239,14 @@ pub struct KvPlanes {
     pub key: TensorView,
     /// `[pages, page_size, kv_heads, head_dim]` cached values.
     pub value: TensorView,
-    /// `[pages, 1, 1, 1]` i32, one flag per page of `key`.
+    /// `[pages, 1, 1, 1]` **u8**, one flag per page of `key`.
+    ///
+    /// One byte, not four: the plane is the layout and the Storage Server carries one
+    /// byte per page, so `cache_copy_region` refuses anything but `DType::U8`
+    /// (`prefix_cache.rs`). An `i32` view of this plane writes four bytes where one
+    /// belongs and clobbers three neighbouring pages' flags with zeros.
     pub key_initialized: TensorView,
-    /// `[pages, 1, 1, 1]` i32, one flag per page of `value`.
+    /// `[pages, 1, 1, 1]` **u8**, one flag per page of `value`; one byte for the same reason.
     pub value_initialized: TensorView,
     /// `[pages, 1, 1, 1]` f32: each page's key scale, present exactly when `key` is FP8.
     ///
@@ -637,12 +642,40 @@ pub struct Step {
     pub sigma_next: f32,
 }
 
+/// One clip's decoded raster extent, as the runtime states it.
+///
+/// Frames, rows and columns of the **decoded** media, which is what a runtime bucket is keyed by.
+/// A decoder's tables and its arena are keyed by the latents the raster decodes from, and the
+/// ratios between the two are the checkpoint's - so the map is the decoder's to state and the
+/// runtime never learns it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Clip {
+    /// Frames of the decoded raster.
+    pub frames: u32,
+    /// Rows of one decoded frame.
+    pub height: u32,
+    /// Columns of one decoded frame.
+    pub width: u32,
+}
+
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
-    /// `[frames, channels, height, width]` decoded frames.
+    /// `[channels, frames, height, width]` decoded frames, in the decoder's own channel order and
+    /// element type.
+    ///
+    /// Channels first, as the media this boundary carries is stated everywhere else: the latents, the
+    /// conditioning's pixels and its anchoring draw are all `[channels, frames, height, width]`, and
+    /// the layers that place a decoded tile - the unpatchify, the seam blends and the byte step - read
+    /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
+    /// `[frames, height, width, channels]` for a file converts once, where it writes.
     pub video: Option<TensorView>,
-    /// `[samples]` decoded audio.
+    /// `[samples, 2]` interleaved stereo PCM, `i16`, at the decoder's own sample rate.
+    ///
+    /// Two channels, interleaved: one row per sample frame, the left channel's value before the
+    /// right's. The wire format and the file format both want that order, so the decoder writes it and
+    /// no caller transposes. The channel count is fixed - `output::Pcm::CHANNELS` is two - because this
+    /// checkpoint's soundtrack is stereo.
     pub audio: Option<TensorView>,
 }
 
@@ -688,6 +721,26 @@ pub trait Encoder {
 pub trait Denoiser {
     /// The latent layout this request needs.
     fn layout(&self, request: &VideoRequest<'_>) -> Layout;
+
+    /// The denoising steps one request of `task` runs, in order.
+    ///
+    /// The runner executes one step per call and cannot derive the schedule: the steer belongs to
+    /// the model's checkpoint, and `Step::index` and `Step::count` are what a solver checks itself
+    /// against, so a runner holding its own sigma table would be a second source of truth for a
+    /// value the model states.
+    ///
+    /// The task is the key rather than a positional index because a request names its task: a
+    /// vector of schedules whose first element is the one a request starts with says which
+    /// schedule to take by position, and a second modality inserted at the front changes every
+    /// caller silently.
+    ///
+    /// A model that states no schedule for `task` refuses by name. Empty would be the same value
+    /// as a schedule that exists and has no steps, which is the opposite fact.
+    fn schedule(&self, task: VideoTask) -> Result<Vec<Step>> {
+        Err(Error::Unsupported(format!(
+            "a denoiser that states no schedule for {task:?}"
+        )))
+    }
 
     /// Draw the initial noise of `out` from `seed`, addressed within `layout`.
     ///
@@ -817,6 +870,37 @@ pub trait Decoder {
     /// already the right length; the executor uploads it. Host bytes only: no allocation, no
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+
+    /// The element type this decoder reads its latents in and writes its decoded media in.
+    ///
+    /// The runner allocates the latents column and the raster column before a graph exists, and a
+    /// buffer's width in bytes is irreversible into an element type: a `[voxels, channels]` column
+    /// of `u16` and of `bf16` are the same bytes. The design's `dtype = "auto"` reads this from the
+    /// checkpoint rather than choosing it, so the model states it here and no runner infers it from
+    /// a byte count or from its deployment's configuration.
+    ///
+    /// Required rather than defaulted: a decoder that does not say has no honest answer to give, and
+    /// the point of this boundary is that the alternative - guessing - is silent.
+    fn element_type(&self) -> DType;
+
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and
+    /// this decoder's tables, scratch and arena are keyed by its latents. The ratios between them
+    /// belong to the checkpoint, so the decoder states the map: a runtime that computed it would be
+    /// holding model knowledge, and the first deployment with another temporal or spatial
+    /// compression would find it in two places.
+    ///
+    /// A decoder whose decoded raster is not its latent layout scaled by ratios it knows refuses by
+    /// name, the way [`Decoder::splice`] does, rather than answering with a layout that reads as
+    /// one.
+    fn layout_of(&self, clip: Clip) -> Result<Layout> {
+        let _ = clip;
+        Err(Error::shape(
+            "Decoder",
+            "this decoder states no latent layout for a clip's raster".to_owned(),
+        ))
+    }
 
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(

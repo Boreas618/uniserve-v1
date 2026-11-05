@@ -188,10 +188,10 @@ impl ParallelLMHead {
     ) -> Result<ops::gemm::Descriptor> {
         Ok(Linear::descriptor_of(
             self.weight.shape().last() as u32,
+            input,
             self.weight.dtype(),
             ops::gemm::WeightOrder::NxK,
             false,
-            input,
             output,
         ))
     }

@@ -771,7 +771,7 @@ impl Statistics {
 /// Layout everywhere is `[batch, channels, samples]`, the form the one-dimensional convolutions take.
 /// The batch is two because the reference decodes a stereo pair of identical rows and interleaves them;
 /// nothing in the network mixes the rows, so both output channels carry the same signal.
-pub struct AudioDecoder {
+pub struct BigVgan {
     config: AudioVaeConfig,
     /// The latent statistics as one one-by-one convolution: a diagonal of the deviations and the means
     /// as its bias, which is `value · std + mean` per latent channel.
@@ -825,7 +825,7 @@ const PCM_CHANNELS: u32 = 2;
 
 /// Every parameter name the audio decoder's load binds, in the order it binds them.
 ///
-/// One source of truth for the load and its check: [`AudioDecoder::load`] binds exactly these names, and
+/// One source of truth for the load and its check: [`BigVgan::load`] binds exactly these names, and
 /// [`sources`] must name exactly the same set — a name in one and not the other is a load failure rather
 /// than a checkpoint field silently dropped or a tensor bound to the wrong layer.
 pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
@@ -868,7 +868,7 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
     Ok(names)
 }
 
-impl AudioDecoder {
+impl BigVgan {
     /// Every checkpoint tensor the audio decoder reads, by name.
     ///
     /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
@@ -1065,10 +1065,15 @@ impl AudioDecoder {
     /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
     ///
     /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
-    /// the descriptor, so they are stated once per stage width and per sample count the deployment
-    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
-    /// clip of another length replays the compiled program.
-    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+    /// the descriptor, so they are stated once per latent track length the deployment serves
+    /// (`tracks`, in **latent frames**). The per-channel ones do not: a convolution's key is its
+    /// geometry, and a clip of another length replays the compiled program.
+    ///
+    /// A track is stated in latent frames because that is the quantity a decode starts from
+    /// (`forward` takes the latent's frame count and multiplies it by each stage's rate); a sample
+    /// count is that number times the decoder's 800-fold upsampling, so passing one here would state
+    /// every stage's width 800 times too wide.
+    pub fn programs(config: &AudioVaeConfig, tracks: &[u32]) -> Result<Vec<(String, String)>> {
         use ops::audio_activation::AudioActivation as AudioActivationOp;
         use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
         use ops::pcm::PcmInterleave as PcmInterleaveOp;
@@ -1154,10 +1159,13 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
-        for bucket in buckets {
-            for stage in &stages {
-                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+        // The residual add at each stage's own buffers: `[PCM_CHANNELS, channels, length]` reshaped
+        // to `[PCM_CHANNELS · channels, length]`, so its width is the length the stage's upsampling
+        // leaves. That width is the operand's and reaches no compiled code, so one descriptor covers
+        // every stage of every track - a row per (track, stage) stated the request's duration in a key.
+        for _track in tracks {
+            for _stage in &stages {
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
             }
         }
         Ok(programs.finish())
@@ -1304,7 +1312,17 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
     Ok(())
 }
 
-impl Decoder for AudioDecoder {
+impl Decoder for BigVgan {
+    /// The element type this decoder computes in.
+    ///
+    /// `F32`: the audio decoder's arithmetic is single precision throughout - its weights are
+    /// stored in the checkpoint's type and stream at this one - so the latents column and the PCM
+    /// raster it writes are `f32` and `i16` respectively, and the PCM half states its own type at
+    /// the write (`DecodedMedia::audio`).
+    fn element_type(&self) -> nn::DType {
+        nn::DType::F32
+    }
+
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
@@ -1321,7 +1339,7 @@ impl Decoder for AudioDecoder {
             Ok(())
         } else {
             Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder has no layout tables; {} buffers were offered",
                     out.len()
@@ -1348,7 +1366,7 @@ impl Decoder for AudioDecoder {
     ) -> nn::Result<()> {
         if !state.is_empty() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder reads no layout table, {} were given",
                     state.len()
@@ -1356,18 +1374,18 @@ impl Decoder for AudioDecoder {
             });
         }
         let audio = out.audio.ok_or_else(|| nn::Error::Shape {
-            owner: "AudioDecoder",
+            owner: "BigVgan",
             problem: "an audio decode writes the request's PCM window".to_owned(),
         })?;
         if out.video.is_some() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: "the audio decoder writes no video raster".to_owned(),
             });
         }
         self.forward(f, latents, audio)
             .map_err(|error| nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!("{error}"),
             })
     }
@@ -1498,8 +1516,26 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
+    ///
+    /// **One entry may be sliced any number of times**, which is why this does not go through
+    /// [`Self::entry`]: that guard refuses a parameter bound twice, and a fused matrix is bound once
+    /// and read in three windows. What the guard protects is a parameter read twice *whole* - two
+    /// layers sharing one checkpoint tensor - and [`Self::region`] and [`Self::normalized`] still
+    /// refuse it.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
+        let index = self
+            .table
+            .iter()
+            .position(|source| source.parameter == parameter)
+            .ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "{}: {}",
+                    parameter.to_owned(),
+                    "the checkpoint's audio decoder has no such parameter".to_owned()
+                ))
+            })?;
+        self.used[index] = true;
+        match self.table[index].tensor.clone() {
             Tensor::Region(tensor) => {
                 let weight =
                     self.loader
@@ -1560,7 +1596,7 @@ pub(crate) mod tests {
     #[test]
     fn the_audio_decoders_names_are_the_checkpoints() {
         let config = audio_config();
-        let mut ours = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
         ours.sort_unstable();
         let fixture: Vec<&str> = include_str!("../tests/data/audio-decoder-names.txt")
             .lines()
@@ -1591,7 +1627,7 @@ pub(crate) mod tests {
     #[test]
     fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
         let config = audio_config();
-        let keys = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let keys = BigVgan::keys(&config).expect("the decoder's keys");
         let mut unique = keys.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -1672,7 +1708,7 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_states_its_programs_from_its_own_config() {
         let config = audio_config();
-        let programs = AudioDecoder::programs(&config, &[64, 256]).expect("the decoder's programs");
+        let programs = BigVgan::programs(&config, &[64, 256]).expect("the decoder's programs");
         assert!(!programs.is_empty());
         for (operator, key) in &programs {
             assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");

@@ -563,8 +563,14 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
     let mut store = Retaining::default();
     let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-    let partition = qwen3_moe::Partition::new(&qwen3_moe::Config::read(dir.path()).expect("the config"), 1, 0, 1, 0)
-        .expect("one rank");
+    let partition = qwen3_moe::Partition::new(
+        &qwen3_moe::Config::read(dir.path()).expect("the config"),
+        1,
+        0,
+        1,
+        0,
+    )
+    .expect("one rank");
     let model = qwen3_moe::load::load_checkpoint(
         dir.path(),
         partition,
@@ -583,14 +589,20 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
     // geometry between them — so three packed products per bucket, and no dense MLP's at all.
     assert_eq!(
-        named.iter().filter(|operator| **operator == "nvfp4_gemm").count(),
+        named
+            .iter()
+            .filter(|operator| **operator == "nvfp4_gemm")
+            .count(),
         3 * 2,
         "three attention geometries at two buckets, and no dense MLP's: {named:?}"
     );
     assert!(named.contains(&"nvfp4_quantize"), "{named:?}");
     assert!(named.contains(&"gather_gemm_nvfp4"), "{named:?}");
     assert!(named.contains(&"route_gemm_nvfp4"), "{named:?}");
-    assert!(named.contains(&"topk_softmax"), "the router is dense: {named:?}");
+    assert!(
+        named.contains(&"topk_softmax"),
+        "the router is dense: {named:?}"
+    );
 }
 
 /// The published block scales of `projection` at `rank`, in the product's arrangement, as the store
@@ -643,7 +655,11 @@ fn a_rank_one_packed_projection_reads_its_own_columns() {
     let file_blocks = (4 * PACKED_HEAD_DIM) / 16;
     for (rank, table) in tables.iter().enumerate() {
         // The padded 128x4 table: `rows` padded to 128, this rank's one block padded to four.
-        assert_eq!(table.len() as u64, rows.div_ceil(128) * 128 * 4, "rank {rank}'s table size");
+        assert_eq!(
+            table.len() as u64,
+            rows.div_ceil(128) * 128 * 4,
+            "rank {rank}'s table size"
+        );
 
         let mut published: Vec<u8> = table.iter().copied().filter(|byte| *byte != 0).collect();
         let mut expected: Vec<u8> = (0..rows)
@@ -651,7 +667,10 @@ fn a_rank_one_packed_projection_reads_its_own_columns() {
             .collect();
         published.sort_unstable();
         expected.sort_unstable();
-        assert_eq!(published, expected, "rank {rank} publishes exactly its own block scales");
+        assert_eq!(
+            published, expected,
+            "rank {rank} publishes exactly its own block scales"
+        );
 
         let mut row_major = vec![0_u8; table.len()];
         for row in 0..rows {
@@ -671,5 +690,8 @@ fn a_rank_one_packed_projection_reads_its_own_columns() {
 #[test]
 fn the_permutation_test_data_starts_at_one() {
     assert_eq!(scale_byte(0), 1, "the first scale is one, not zero");
-    assert!(scale_byte(254) != 0 && scale_byte(255) == 1, "the pattern wraps away from zero");
+    assert!(
+        scale_byte(254) != 0 && scale_byte(255) == 1,
+        "the pattern wraps away from zero"
+    );
 }

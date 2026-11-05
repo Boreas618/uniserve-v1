@@ -18,6 +18,7 @@ an extent is baked by construction, and their builds are minutes rather than sec
 """
 
 import argparse
+import sys
 import hashlib
 import importlib.util
 import pathlib
@@ -25,6 +26,11 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
+#: The row sets to audit. H3's dense rows come from `minimax-h3-keys.txt`, which the deployment's own
+#: generator writes and `key_coverage`/`build_store` certify; the file it replaced held the same rows
+#: under a second name, and one deployment with two names is the second statement of one truth this
+#: lane keeps removing. The sparse rows have no certified file yet, so they are audited where they
+#: stand.
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-keys.txt',
@@ -107,7 +113,10 @@ def audit(store, package, key, fields):
     reported = []
     with tempfile.TemporaryDirectory() as scratch:
         base = pathlib.Path(scratch) / "base"
-        failure = store.build(package, key, "sm_100a", base)
+        # The audit runs the same build the CLI does, so it passes what the CLI passes: the
+        # interpreter running this script is the one carrying the toolchain (Triton, CuTe DSL,
+        # nvcc), which is the rule `build_store.py --python` states.
+        failure = store.build(package, key, "sm_100a", base, sys.executable)
         if failure is not None:
             return [("base", key, "the fixture's key does not build: " + failure)]
         reference = digest(base)
@@ -119,7 +128,7 @@ def audit(store, package, key, fields):
                 if moved_key is None or moved_key == key:
                     continue
                 out = pathlib.Path(scratch) / f"moved-{field}"
-                failure = store.build(package, moved_key, "sm_100a", out)
+                failure = store.build(package, moved_key, "sm_100a", out, sys.executable)
                 if failure is not None:
                     reported.append((field, moved_key, "does not build: " + failure))
                     continue
@@ -144,15 +153,24 @@ def main() -> int:
     seen = set()
     unearned = 0
     audited = 0
+    unbuilt = 0
+    skipped = 0
+    first_failure = None
     for fixture in FIXTURES:
         for operator, key in rows_of(fixture):
             if arguments.operator and operator != arguments.operator:
                 continue
             if operator in seen:
                 continue
+            # The row names one backend, and only that backend's artefact can answer for it: the
+            # packages of one operator are different sources (`paged_attention` is `trtllm` for bf16
+            # and Triton for `kv_f8e4m3`), so building a row against another one reports "does not
+            # build" about a package that never claimed the row. `covers` is the store's own reader.
             candidates = [one for one in packages.get(operator, [])
-                          if one["manifest"]["source"]["kind"] == "triton"]
+                          if one["manifest"]["source"]["kind"] == "triton"
+                          and store.covers(one, key)]
             if not candidates:
+                skipped += 1
                 continue
             seen.add(operator)
             package = candidates[0]
@@ -162,9 +180,32 @@ def main() -> int:
                 print(f"  {field:12} {verdict}")
                 if "NOT EARNED" in verdict:
                     unearned += 1
+                if verdict.startswith("the fixture's key does not build"):
+                    unbuilt += 1
+                    if first_failure is None:
+                        first_failure = f"{operator}: {verdict}"
             if arguments.limit and audited >= arguments.limit:
-                return 0 if unearned == 0 else 1
-    print(f"{audited} operator(s) audited, {unearned} field value(s) not earned")
+                return report(audited, unbuilt, unearned, skipped, first_failure)
+    return report(audited, unbuilt, unearned, skipped, first_failure)
+
+
+def report(audited, unbuilt, unearned, skipped, first_failure):
+    """State what was measured, and refuse to pass over operators that could not be built.
+
+    An operator whose base key does not build contributes no evidence: a moved key could not be
+    compiled either, so "not earned" is unanswerable for it. Counting it as audited would put a
+    clean line over nothing — the failure this tool exists to detect in a key, one level out.
+    """
+    measured = audited - unbuilt
+    print(f"{audited} operator(s) read, {measured} whose base built, "
+          f"{unearned} field value(s) not earned")
+    if skipped:
+        print(f"{skipped} row(s) skipped: no Triton package covers them, so a field's cost is not "
+              f"this tool's question for them (a native backend's build is the store's)")
+    if unbuilt:
+        print(f"{unbuilt} operator(s) could not be measured: the interpreter running this script is "
+              f"the one that must carry the toolchain (Triton, CuTe DSL, nvcc). First: {first_failure}")
+        return 1
     return 0 if unearned == 0 else 1
 
 

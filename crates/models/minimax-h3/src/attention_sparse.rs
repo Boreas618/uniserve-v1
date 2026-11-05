@@ -127,6 +127,20 @@ impl Sparse {
         // asked what the stack was.
         let query_weight = matrix(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?;
         let stack = query_weight.dtype();
+        // One line, once per process: the type the walk read for the weight that decides the fine
+        // attention's output, named with the weight it came from. A launch key states this type, and
+        // a key that says `f32` is either a deployment converted to FP32 or a lookup that answered
+        // with something other than the checkpoint; the second is invisible without this print,
+        // because both produce a valid key.
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            let name = format!("{prefix}.to_q.weight");
+            ONCE.call_once(|| {
+                eprintln!(
+                    "# attention_sparse: {name} is {stack:?}, so the fine attention writes {stack:?}"
+                );
+            });
+        }
         let fine = SegmentAttention::new(
             u64::from(tile_rows),
             u64::from(local_heads),

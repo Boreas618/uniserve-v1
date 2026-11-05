@@ -180,6 +180,92 @@ def server(
         stop_server(process)
 
 
+RESIDENT_TOKENS = 512
+
+# The two sentences a wrong-kernel refusal can carry. The comparison's own
+# sentence names the element
+# that left tolerance and the bound it left; the idle sentence says no request
+# ran a step, which means
+# nothing was compared. A guard that accepts both cannot tell a refused kernel
+# from an update that
+# never ran one.
+COMPARED = "differ beyond tolerance"
+IDLE = "no resident request ran a step"
+
+
+class Resident:
+    """One streamed completion, held resident for a whole update window.
+
+    Shadow execution pairs a changed operator's kernel on one step of the
+    batches a scheduler forms from its **resident** requests. A closed loop of
+    short requests has moments with none in flight, and a precopy that lands in
+    one of them compares nothing and fails by name ("no resident request ran a
+    step"). Holding one request open for as long as the caller keeps it makes
+    the wrong-kernel assertion mean what it says.
+
+    The stream is drained on its own thread so the daemon is never blocked by
+    backpressure, and `close` ends it: the caller closes it after the update's
+    answer has arrived and before any failure is read, so a request in flight
+    never races the assertions.
+    """
+
+    def __init__(self, base_url: str, prompt: str) -> None:
+        self._closed = threading.Event()
+        self._client = httpx.Client(timeout=STEP_TIMEOUT_S)
+        request = self._client.build_request(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "qwen3-moe",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_completion_tokens": RESIDENT_TOKENS,
+                "stream": True,
+            },
+        )
+        self._response = self._client.send(request, stream=True)
+        if self._response.status_code != 200:
+            body = self._response.read()[:300]
+            self.close()
+            raise AssertionError(
+                "the resident request was refused: "
+                f"{self._response.status_code}: {body!r}"
+            )
+        self._lines = self._response.iter_lines()
+        # The first line proves the engine formed a batch for this request: it
+        # is resident, not waiting behind admission.
+        # An SSE comment or a blank line can precede the first frame, so a few
+        # are read before the stream is called silent.
+        first = ""
+        for _ in range(4):
+            first = next(self._lines, "")
+            if "data:" in first:
+                break
+        if "data:" not in first:
+            self.close()
+            raise AssertionError(
+                f"the resident request produced no stream: {first!r}"
+            )
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+
+    def _drain(self) -> None:
+        try:
+            for _ in self._lines:
+                if self._closed.is_set():
+                    return
+        except (httpx.HTTPError, OSError):
+            # A stream the client closed is the caller's own doing, not a
+            # failure of the deployment.
+            return
+
+    def close(self) -> None:
+        self._closed.set()
+        try:
+            self._response.close()
+        finally:
+            self._client.close()
+
+
 class Traffic:
     """A closed loop of requests that records every failure as it happens."""
 
@@ -434,8 +520,17 @@ def test_the_recapture_swap_and_the_policy_swap_keep_serving(
     install(program_server, package)
     install(program_server, policy)
 
-    assert apply_config(server).status_code == 200
-    wait_for_phases(server, PRECOPY)
+    # Shadow execution compares on a step of a resident request; without one the
+    # precopy refuses by name and the swap below would be asserted on an update
+    # that compared nothing.
+    resident = Resident(server, PROMPTS[0])
+    try:
+        assert apply_config(server).status_code == 200
+        wait_for_phases(server, PRECOPY)
+    finally:
+        # Closed after the update answered and before any failure is read: a
+        # request in flight here would race `assert_no_failures` below.
+        resident.close()
     after = epoch_record(server)
     assert after["kernels"] != before["kernels"], (
         "the recapture swap did not change the recorded kernel programs"
@@ -479,23 +574,40 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     before = epoch_record(server)
     install(program_server, package)
 
-    response = apply_config(server)
-    if response.status_code == 200:
-        events = wait_for_phases(server, ["precopy_failed"])
-        reasons = [
-            json.dumps(event)
-            for event in events
-            if _phase_of(event) == "precopy_failed"
-        ]
-        assert reasons, "precopy_failed carried no reason"
-    else:
-        assert (
-            "precopy" in response.text.lower()
-            or "tolerance" in response.text.lower()
-        ), (
-            "a wrong kernel was refused for the wrong reason: "
-            f"{response.text[:500]}"
-        )
+    # The comparison needs a request the scheduler is stepping when the precopy
+    # shadows: a wrong
+    # kernel can only be refused by a comparison that ran.
+    resident = Resident(server, PROMPTS[1])
+    try:
+        response = apply_config(server)
+        if response.status_code == 200:
+            events = wait_for_phases(server, ["precopy_failed"])
+            reasons = [
+                json.dumps(event)
+                for event in events
+                if _phase_of(event) == "precopy_failed"
+            ]
+            assert reasons, "precopy_failed carried no reason"
+            refusal = " ".join(reasons)
+        else:
+            refusal = response.text
+    finally:
+        resident.close()
+
+    # The comparison's own sentence, not a refusal for any reason at all: the
+    # element past tolerance and the bound it left, and never the sentence that
+    # says nothing was compared.
+    assert COMPARED in refusal, (
+        "a wrong kernel was refused without the comparison's sentence: "
+        f"{refusal[:800]}"
+    )
+    assert "tolerance atol" in refusal, (
+        f"the refusal names no tolerance: {refusal[:800]}"
+    )
+    assert IDLE not in refusal, (
+        "the wrong kernel was not compared at all: the update was refused "
+        f"because no resident request ran a step: {refusal[:800]}"
+    )
 
     after = epoch_record(server)
     assert after["kernels"] == before["kernels"], (

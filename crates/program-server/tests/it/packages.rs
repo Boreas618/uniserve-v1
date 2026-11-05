@@ -101,7 +101,6 @@ fn rows_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-
 #[test]
 fn every_qwen3_moe_key_of_the_slice_is_covered_by_its_operator_s_package() {
     let Some((_, text)) = slice_keys_text() else {
@@ -227,8 +226,15 @@ fn element_type_names() -> Vec<String> {
 /// value in one of these fields is examined only when it is not a bare integer —
 /// which is what tells an element type (`bf16`, and a package's mistake `float16`)
 /// from a width or an extent (`32`).
-const ELEMENT_TYPE_FIELDS: [&str; 7] =
-    ["dtype", "input", "weight", "output", "accumulate", "scores", "scales"];
+const ELEMENT_TYPE_FIELDS: [&str; 7] = [
+    "dtype",
+    "input",
+    "weight",
+    "output",
+    "accumulate",
+    "scores",
+    "scales",
+];
 
 #[test]
 fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
@@ -307,7 +313,10 @@ fn fixture_keys(path: &Path) -> Option<Vec<(String, String)>> {
 /// key, so a package cannot declare a field its operator never prints, and a key cannot
 /// carry a field its package never declared. A key that leaves a declared dimension
 /// unread is not a key of that package.
-fn parse_key(dimensions: &BTreeMap<String, Vec<String>>, key: &str) -> Option<Vec<(String, String)>> {
+fn parse_key(
+    dimensions: &BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<Vec<(String, String)>> {
     let mut names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
     names.sort_by_key(|name| std::cmp::Reverse(name.len()));
     let mut fields = Vec::new();
@@ -322,16 +331,19 @@ fn parse_key(dimensions: &BTreeMap<String, Vec<String>>, key: &str) -> Option<Ve
         let mut end = after.len();
         for (index, _) in after.match_indices('_') {
             let tail = &after[index + 1..];
-            if names
-                .iter()
-                .any(|candidate| tail.starts_with(*candidate) && tail[candidate.len()..].starts_with('_'))
-            {
+            if names.iter().any(|candidate| {
+                tail.starts_with(*candidate) && tail[candidate.len()..].starts_with('_')
+            }) {
                 end = index;
                 break;
             }
         }
         fields.push(((*name).to_owned(), after[..end].to_owned()));
-        rest = if end == after.len() { "" } else { &after[end + 1..] };
+        rest = if end == after.len() {
+            ""
+        } else {
+            &after[end + 1..]
+        };
     }
     Some(fields)
 }
@@ -346,14 +358,27 @@ fn parse_key(dimensions: &BTreeMap<String, Vec<String>>, key: &str) -> Option<Ve
 #[test]
 fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The H3 row set that belongs to a deployment: its own generator's file, which `key_coverage`
+    // and `build_store` certify. The deployment's list has one name now: it used to be written twice,
+    // and the second file asserted about rows the store was not built from.
+    // Both subject files are the committed ones: `.local/qwen3-moe-keys.txt` is a generator's
+    // output that exists only on a host that ran it, so naming it here made the Qwen3 half of this
+    // test skip silently on every other checkout — a check that is not reached is not a check.
+    // A named fixture that is absent is therefore a failure of its own: the same silence took this
+    // test's H3 half when the deployment's list was renamed and left `checked > 0` green on the
+    // rows of the other file.
     let fixtures = [
-        root.join("../../.local/qwen3-moe-keys.txt"),
+        root.join("../../notes/programs/qwen3-moe-keys.txt"),
         root.join("../../notes/programs/minimax-h3-keys.txt"),
     ];
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for fixture in &fixtures {
         let Some(keys) = fixture_keys(fixture) else {
+            failures.push(format!(
+                "{}: this test names the fixture and it is absent, so no row of it was parsed",
+                fixture.display()
+            ));
             continue;
         };
         // This fixture's declared-blocked rows: no package fills them yet, so a missing field is the
@@ -412,28 +437,31 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 // different work by a different actor.
                 let why: Vec<String> = declared
                     .iter()
-                    .map(|(package, dimensions)| match parse_key(dimensions, key.as_str()) {
-                        None => {
-                            let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
-                            format!("{package} names the fields [{}]", names.join(", "))
-                        }
-                        Some(fields) => {
-                            let missing: Vec<String> = fields
-                                .iter()
-                                .filter(|(name, value)| {
-                                    !dimensions
-                                        .get(name)
-                                        .is_some_and(|allowed| allowed.iter().any(|one| one == value))
-                                })
-                                .map(|(name, value)| format!("{name}_{value}"))
-                                .collect();
-                            if missing.is_empty() {
-                                format!("{package} declares every value")
-                            } else {
-                                format!("{package} does not declare {}", missing.join(", "))
+                    .map(
+                        |(package, dimensions)| match parse_key(dimensions, key.as_str()) {
+                            None => {
+                                let names: Vec<&str> =
+                                    dimensions.keys().map(String::as_str).collect();
+                                format!("{package} names the fields [{}]", names.join(", "))
                             }
-                        }
-                    })
+                            Some(fields) => {
+                                let missing: Vec<String> = fields
+                                    .iter()
+                                    .filter(|(name, value)| {
+                                        !dimensions.get(name).is_some_and(|allowed| {
+                                            allowed.iter().any(|one| one == value)
+                                        })
+                                    })
+                                    .map(|(name, value)| format!("{name}_{value}"))
+                                    .collect();
+                                if missing.is_empty() {
+                                    format!("{package} declares every value")
+                                } else {
+                                    format!("{package} does not declare {}", missing.join(", "))
+                                }
+                            }
+                        },
+                    )
                     .collect();
                 failures.push(format!(
                     "row {operator}\t{key} is not declared blocked and does not build: no package covers it; {}",
@@ -618,7 +646,10 @@ fn the_convolutions_are_one_source_in_three_packages() {
                 .join("cudnn")
                 .join(shared);
             std::fs::read(&path).unwrap_or_else(|error| {
-                panic!("{shared} of {op} is not readable at {}: {error}", path.display())
+                panic!(
+                    "{shared} of {op} is not readable at {}: {error}",
+                    path.display()
+                )
             })
         });
         assert!(
@@ -675,7 +706,10 @@ fn a_family_of_operators_shares_one_check() {
                     .join(op)
                     .join(shared);
                 std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                    panic!("{op}'s check is not readable at {}: {error}", path.display())
+                    panic!(
+                        "{op}'s check is not readable at {}: {error}",
+                        path.display()
+                    )
                 })
             })
             .collect();

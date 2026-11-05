@@ -79,9 +79,20 @@ DEFINES = [
 
 #: The vendor units the entry's runner resolves against. `PermuteGemm1::Runner` and
 #: `Gemm2::Runner` live in the first; the batched-GEMM runner they hold in the second.
+#: The runner units and the runtime they reference.
+#:
+#: A runner unit calls into TensorRT-LLM's commons - the exception class, the logger, the
+#: string formatting and the two NVFP4 environment flags - and those are sources in this
+#: distribution, not a library the host is assumed to have. Compiled here, the module has
+#: no unresolved reference; omitted, it builds, publishes and then cannot be loaded, and
+#: the failure arrives at the first launch naming no symbol at all.
 SOURCES = [
     "csrc/trtllm_fused_moe_runner.cu",
     "csrc/trtllm_batched_gemm_runner.cu",
+    "csrc/nv_internal/cpp/common/tllmException.cpp",
+    "csrc/nv_internal/cpp/common/stringUtils.cpp",
+    "csrc/nv_internal/cpp/common/logger.cpp",
+    "csrc/nv_internal/cpp/common/envUtils.cpp",
 ]
 
 

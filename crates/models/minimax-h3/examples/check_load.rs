@@ -181,10 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // column exists to make visible; a named exclusion is a decision, and a reader who cannot
         // see it cannot tell the two apart.
         for exclusion in load::excluded_names(component.name()) {
-            println!(
-                "  not asked for: {} ({})",
-                exclusion.name, exclusion.reason
-            );
+            println!("  not asked for: {} ({})", exclusion.name, exclusion.reason);
         }
         let mut budget = 0_u64;
         for directory in directories {
@@ -246,6 +243,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         println!("  {} weight regions published", store.len());
+
+        // **The two-sided check.** A load need not read every tensor a file holds; what it owes is to
+        // name the ones it does not. The published regions carry the checkpoint tensors' names, so
+        // this subtracts three sets - what the checkpoint holds, what the load asked for, and what
+        // the component names as excluded - and a name in the remainder is a weight the model
+        // silently skips. `1 087 tensors, two of them the spectral loss head` is a fact about this
+        // component; this line is what makes it a decision rather than a claim.
+        let mut asked: Vec<String> = store
+            .keys()
+            .flat_map(|key| key.region.tensors.iter().cloned())
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        for directory in directories {
+            let Ok(source) = checkpoint.component(directory) else {
+                continue;
+            };
+            let held: Vec<String> = source.names().map(str::to_owned).collect();
+            // The names are relative to the checkpoint's own directory, so the table is keyed by
+            // it: a component may hold two directories (`latent_encoder` holds `vae` and `audio_vae`).
+            let missing = load::unasked(directory, &asked, &held);
+            if missing.is_empty() {
+                println!("  {directory}: every tensor is asked for or named as excluded");
+            } else {
+                println!(
+                    "  {directory}: {} tensor(s) neither asked for nor named as excluded: {}",
+                    missing.len(),
+                    missing
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                failures.push(format!(
+                    "{} leaves {} tensor(s) of {directory} unaccounted: {}",
+                    component.name(),
+                    missing.len(),
+                    missing.join(", ")
+                ));
+            }
+        }
+
         // The types the load actually published, which is the statement a per-tensor pin makes: the
         // key of a retained region carries the type it was retained at, so a pin shows up here as a
         // type the component does not store (a conversion) or as two types side by side where the
