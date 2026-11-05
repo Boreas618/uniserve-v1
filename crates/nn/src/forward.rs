@@ -234,8 +234,12 @@ pub struct Forward<'a> {
 /// consumes it, on the stream that launched it, so an implementation that copies the bytes is ordered
 /// after the write.
 pub trait AttentionProbe {
-    /// Read one layer's attended output, as it stands after its own program wrote it.
-    fn attention_output(&self, layer: usize, out: TensorView, stream: &Stream);
+    /// Read one layer's query and its attended output, as they stand around its own launch.
+    ///
+    /// Both are read in one call because both are answered by one copy each: a zero output is either
+    /// what the program computed or a program that was handed nothing to read, and only the query
+    /// beside it can tell the two apart.
+    fn attention(&self, layer: usize, query: TensorView, out: TensorView, stream: &Stream);
 }
 
 impl<'a> Forward<'a> {

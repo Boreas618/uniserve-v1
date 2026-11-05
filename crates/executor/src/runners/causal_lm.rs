@@ -853,33 +853,47 @@ struct AttentionOutputs {
     written: std::cell::RefCell<Vec<(usize, String, usize)>>,
 }
 
-impl nn::AttentionProbe for AttentionOutputs {
-    fn attention_output(&self, layer: usize, out: nn::TensorView, stream: &platform::Stream) {
-        let bytes = usize::try_from(out.shape.numel())
+impl AttentionOutputs {
+    /// One digest of a view, read on the launching stream: `None` when the copy cannot be made.
+    fn digest(view: nn::TensorView, stream: &platform::Stream) -> Option<(String, usize)> {
+        let bytes = usize::try_from(view.shape.numel())
             .ok()
-            .zip(out.dtype.bytes())
-            .map(|(elements, width)| elements.saturating_mul(width as usize));
-        let Some(bytes) = bytes else {
-            return;
-        };
+            .zip(view.dtype.bytes())
+            .map(|(elements, width)| elements.saturating_mul(width as usize))?;
         if bytes == 0 {
-            return;
+            return None;
         }
         let mut raw = vec![0_u8; bytes];
-        // SAFETY: the buffer is this call's own and of `bytes`, and the source is the address the
-        // layer's program was just given. The copy is issued on the launching stream, so it is
-        // ordered after the write.
+        // SAFETY: the buffer is this call's own and of `bytes`, and the source is an address a launch
+        // was just given. The copy is issued on the launching stream, so it is ordered after the write.
         let copied = unsafe {
-            platform::memcpy_async(raw.as_mut_ptr() as u64, out.ptr.address(), bytes, stream)
+            platform::memcpy_async(raw.as_mut_ptr() as u64, view.ptr.address(), bytes, stream)
         };
         if copied.is_err() || stream.synchronize().is_err() {
-            return;
+            return None;
         }
         let nonzero = raw.iter().filter(|byte| **byte != 0).count();
+        Some((format!("{:016x}", platform::fnv1a(&raw)), nonzero))
+    }
+}
+
+impl nn::AttentionProbe for AttentionOutputs {
+    fn attention(
+        &self,
+        layer: usize,
+        query: nn::TensorView,
+        out: nn::TensorView,
+        stream: &platform::Stream,
+    ) {
+        let (Some((query_digest, query_nz)), Some((out_digest, out_nz))) =
+            (Self::digest(query, stream), Self::digest(out, stream))
+        else {
+            return;
+        };
         self.written.borrow_mut().push((
             layer,
-            format!("{:016x}", platform::fnv1a(&raw)),
-            nonzero,
+            format!("{query_digest} qnz={query_nz} o={out_digest} onz={out_nz}"),
+            0,
         ));
     }
 }
@@ -893,7 +907,7 @@ impl AttentionOutputs {
         }
         written
             .iter()
-            .map(|(layer, digest, nonzero)| format!("l{layer}={digest} nz={nonzero}"))
+            .map(|(layer, digest, _)| format!("l{layer}:{digest}"))
             .collect::<Vec<_>>()
             .join(" ")
     }
