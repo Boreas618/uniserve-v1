@@ -156,6 +156,7 @@ struct Staged {
     video: Vec<u8>,
     audio: Vec<u8>,
     text: Vec<u8>,
+    source: Vec<u8>,
     step: Vec<u8>,
 }
 
@@ -197,6 +198,13 @@ struct DenoiseColumns {
     audio: Column,
     /// `[requests x (text_rows + condition_rows) x width]` conditioning rows.
     text: Column,
+    /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
+    ///
+    /// A model with a conditioner between the encoder and the denoiser reads these and folds them
+    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]), so both buffers are the same
+    /// shape and both are the runner's: the conditioner runs inside a captured forward, and a buffer
+    /// it allocated would be a capture that allocates.
+    source: Column,
     /// `[1]` `i64`: the step index the coefficients are selected by (`Conditioning::step`).
     step: Column,
     /// The host side of each column.
@@ -217,6 +225,7 @@ impl DenoiseColumns {
             video: Column::new(device, shape.dtype, rows * video)?,
             audio: Column::new(device, shape.dtype, rows * audio)?,
             text: Column::new(device, shape.dtype, rows * text)?,
+            source: Column::new(device, shape.dtype, rows * text)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
         })
@@ -242,6 +251,10 @@ impl DenoiseColumns {
             .bytes()
             .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.dtype)))?;
         Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
+        // The conditioner folds these into `text`, so a warm capture must read defined features as
+        // well as defined rows: an uninitialised buffer would make the capture's output depend on
+        // whatever the allocator last held.
+        Staged::zero(&mut self.staged.source, rows * width * text * bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -266,6 +279,12 @@ pub struct Prepared {
     pub audio: Vec<u8>,
     /// The encoded conditioning rows, `[text_rows + condition_rows, width]`.
     pub text: Vec<u8>,
+    /// The text encoder's own features, the same shape as `text`: what a model's conditioner folds
+    /// into those rows before the first evaluation ([`nn::Denoiser::prepare_conditioning`]).
+    ///
+    /// It is a separate buffer and not a second name for `text` because the fold is in place over
+    /// `text` while reading these, so one buffer would have the conditioner overwrite its own input.
+    pub source: Vec<u8>,
 }
 
 /// The products one denoising step reads, in the order a refusal names them.
@@ -558,9 +577,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let text = view
             .at(view.offset_elements(u64::from(index) * rows * width))
             .reshape(Shape::new(&[rows, width]));
+        let features = self.columns.source.shaped(&[rows * width]);
+        let source = features
+            .at(features.offset_elements(u64::from(index) * rows * width))
+            .reshape(Shape::new(&[rows, width]));
         Ok(Conditioning {
             text,
-            source: None,
+            source: Some(source),
             media,
             images: None,
             audio: None,
@@ -624,16 +647,27 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             &request.text,
             "conditioning rows",
         )?;
+        if request.source.len() as u64 != bytes {
+            return Err(Error::Invalid(format!(
+                "a step of bucket {bucket} carries {} byte(s) of encoder features and the layout \
+                 states {bytes}, which is the conditioning rows' own extent",
+                request.source.len()
+            )));
+        }
+        Staged::place(
+            &mut self.columns.staged.source,
+            offset,
+            &request.source,
+            "encoder features",
+        )?;
         Ok(())
     }
 
-    /// Refuses a step whose request has no store, or whose store lacks one of the six products.
+    /// Refuses a step whose request has no store, or whose store lacks one of the kinds it reads.
     ///
-    /// The kinds a step reads are the model's own, so the list is stated once here rather than
-    /// discovered per call: the text rows and the encoder's features for the prompt, the reference
-    /// media for a conditioned task, and the trajectory every step updates. A store that answers
-    /// `None` for one of them is refused by name, naming the kind - which is the difference between a
-    /// step that fails because nobody ran the encoder and one that runs on zeros.
+    /// The kinds are [`STEP_PRODUCTS`], and they are what this file places into a `Conditioning`.
+    /// A store that answers `None` for one of them is refused by name - which is the difference
+    /// between a step that fails because nobody ran the encoder and one that runs on zeros.
     fn require_products(&self, request: ipc::RequestKey) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Err(products::no_store(request));
@@ -754,16 +788,19 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             video,
             audio,
             text,
+            source,
             step,
             staged,
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
         text.write(&staged.text)?;
+        source.write(&staged.source)?;
         step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
         self.columns.text.upload(&stream)?;
+        self.columns.source.upload(&stream)?;
         self.columns.step.upload(&stream)?;
         Ok(())
     }
