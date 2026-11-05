@@ -48,13 +48,12 @@ fi
 # the `17n + 5` rung. A clip set written here is a second statement of the deployment, which is the
 # defect this file has already been fixed for twice (a raster and a bound).
 samples=${SAMPLES:-260}
-# The six canvases the model serves, in the walk's own `HxW` order. **The authority is
-# `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
-# statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
-# canvas added to the model reaches every fixture without anyone editing this file. Until then, a
-# raster that is not in the model must not appear here: 480x832 was in this line for days and every
-# fixture it produced named a canvas no request asks for.
-rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
+# **No canvas list lives here.** The walk is the model's own generator, which reads the deployment's
+# canvases from `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`; a list typed in
+# this file would be a second statement of them, and the one this line used to carry named 480x832 -
+# a canvas no request asks for - for days, which every fixture it produced inherited. The probes below
+# take one literal canvas because they ask a yes/no question (`--rows` refused, `--types` accepted),
+# never a row set.
 tokens=4096
 conditioned=true
 elements=123456
