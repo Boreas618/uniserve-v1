@@ -29,11 +29,15 @@ struct Stage {
     tables: u32,
 }
 
+/// The decode type the stage table's arena column is stated at: the export's own video VAE, which
+/// this checkpoint holds as 703 F32 tensors.
+const TABLE_DECODE: nn::DType = nn::DType::F32;
+
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
@@ -43,17 +47,17 @@ const STAGES: &[Stage] = &[
     // the plan's own 10,129 MiB and not the sum - the runner's order is prepare -> condition in the
     // bump -> release -> capture -> replay, and a runner that captures first holds 17,041.
     Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 14 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
@@ -61,12 +65,12 @@ const STAGES: &[Stage] = &[
     // set at the global head width (`Attention::load` projects `heads * head_dim`, and `projection`
     // takes no rank), so this row is the one-rank row plus the four exchange entries' arena.
     Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
 ];
@@ -596,10 +600,40 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             arena,
             arena / (1 << 20)
         );
+        // The stage table's arena column is a restatement of this plan, and a restatement rots: it
+        // carried 13,035 MiB for a decoder whose plan is 1,313 MiB, because the plan moved and the
+        // table did not. So the table is checked against the plan it restates, at the one canvas the
+        // table is stated for, and a disagreement is refused rather than printed twice.
+        if canvas.width == 1536 {
+            let stated = STAGES
+                .iter()
+                .find(|stage| stage.stage == "video_decoder")
+                .ok_or("the stage table states no decoder to check the plan against")?
+                .arena;
+            let derived = arena / (1 << 20);
+            // The table's arena column is the export's own decode, which this checkpoint states
+            // (vae: 703 F32 tensors and no f16 one). A run at another type describes a deployment the
+            // table is not about, so it says so rather than reading as a stale row.
+            if decode != TABLE_DECODE {
+                println!(
+                    "the stage table's arena column is stated at {TABLE_DECODE} (this export's video \
+                     VAE); this run states {decode} and the table's decoder row is not it"
+                );
+            } else if stated != derived {
+                return Err(format!(
+                    "the stage table states a {stated} MiB decoder arena and the plan at \
+                     {canvas_width}x{canvas_height} is {derived} MiB: the table restates the plan, so \
+                     one of the two is stale",
+                    canvas_width = canvas.width,
+                    canvas_height = canvas.height
+                )
+                .into());
+            }
+        }
     }
     // A **still** request decodes one latent frame, and the decode plan's clip-level buffers are the
     // raster of what it decodes - so a deployment that serves only stills reserves a fraction of a
-    // clip's 10,897 MiB. The delta is printed here rather than left to a reader's arithmetic: the
+    // clip's plan. The delta is printed here rather than left to a reader's arithmetic: the
     // decoder's arena is the row that decides whether a decoding rank can be small.
     for canvas in NAMED_CANVASES {
         let latent = minimax_h3::video_vae::Canvas::clip(
