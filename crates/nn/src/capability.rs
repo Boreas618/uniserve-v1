@@ -119,7 +119,13 @@ pub struct TokenBatch {
     pub phase: PhaseKind,
     /// Tokens per cache page.
     pub page_size: u32,
-    /// Query tokens packed into this batch.
+    /// `[1]` i32 the tokens the batch really holds, before the padding a captured bucket appends.
+    ///
+    /// A graph states `num_tokens` as a constant of its capture, so a layer that must bound its
+    /// work by what the batch holds - the MoE sort writes a sentinel into every route row of a token
+    /// it does not own - reads this view on the device instead of a number the graph froze.
+    pub live_tokens: TensorView,
+    /// Query tokens packed into this batch, including the padding a bucket appends.
     pub num_tokens: u32,
     /// The bound on keys any row of this batch reads: the attention descriptor's reduction length.
     pub max_kv_len: u32,
@@ -164,6 +170,18 @@ impl TokenBatch {
             return Err(Error::shape(
                 "TokenBatch",
                 "a page of zero tokens cannot be addressed".to_owned(),
+            ));
+        }
+        // The live count is one i32 a kernel reads as a bound, so a view of another shape is a
+        // launch that reads the neighbouring bytes as the count.
+        if self.live_tokens.dtype != DType::I32 || self.live_tokens.numel() != 1 {
+            return Err(Error::shape(
+                "TokenBatch",
+                format!(
+                    "a live token count is one i32, found {} element(s) of {}",
+                    self.live_tokens.numel(),
+                    self.live_tokens.dtype
+                ),
             ));
         }
         if self.max_kv_len < self.page_size {
@@ -1048,6 +1066,7 @@ mod batch_tests {
             logits_rows: view(DType::I32, &[rows]),
             phase: PhaseKind::Decode,
             page_size: 64,
+            live_tokens: view(DType::I32, &[1]),
             num_tokens: u32::try_from(rows).unwrap(),
             max_kv_len: 4_096,
             draft_lens: None,

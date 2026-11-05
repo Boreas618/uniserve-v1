@@ -55,6 +55,9 @@ struct EncoderColumns {
     /// `[rows]` i32 the hidden rows whose logits are wanted: never written, and zeroed so a model
     /// that reads the column anyway reads a defined row rather than uninitialised memory.
     logits_rows: Column,
+    /// `[1]` i32 the tokens the batch really holds, before the padding to its bucket: the bucket's
+    /// own count is a constant of the capture, so a layer bounding its work reads this instead.
+    live_tokens: Column,
 }
 
 impl EncoderColumns {
@@ -67,6 +70,7 @@ impl EncoderColumns {
             seq_lens: Column::new(device, DType::I32, rows64)?,
             query_offsets: Column::new(device, DType::I32, rows64 + 1)?,
             logits_rows: Column::new(device, DType::I32, rows64)?,
+            live_tokens: Column::new(device, DType::I32, 1)?,
         })
     }
 }
@@ -251,6 +255,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             logits_rows: self.columns.logits_rows.extent(0..rows),
             phase: PhaseKind::Prefill,
             page_size: 0,
+            live_tokens: self.columns.live_tokens.device,
             num_tokens: bucket.tokens,
             max_kv_len: 0,
             draft_lens: None,
@@ -285,6 +290,10 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.query_offsets.write(&buffer)?;
         encode_i32(&mut buffer, &threads.logits_rows);
         self.columns.logits_rows.write(&buffer)?;
+        let live = i32::try_from(threads.tokens())
+            .map_err(|_| Error::Invalid("a batch of more tokens than an i32 counts".into()))?;
+        encode_i32(&mut buffer, &[live]);
+        self.columns.live_tokens.write(&buffer)?;
         self.staged = Some(bucket);
         // The columns are sized for the largest bucket the runner was bound with; a batch planned
         // into a smaller one writes exactly its own prefix and the graph reads only that far.
@@ -309,6 +318,10 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         encode_i32(&mut buffer, &vec![0i32; rows + 1]);
         self.columns.query_offsets.write(&buffer)?;
         self.columns.logits_rows.write(&buffer)?;
+        // A warm capture has no batch behind it: every token of the bucket is one the graph may
+        // read, so the live count is the bucket's own.
+        encode_i32(&mut buffer, &[i32::try_from(tokens).unwrap_or(i32::MAX)]);
+        self.columns.live_tokens.write(&buffer)?;
         self.staged = Some(bucket);
         Ok(())
     }
@@ -321,6 +334,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.seq_lens.upload(&self.stream)?;
         self.columns.query_offsets.upload(&self.stream)?;
         self.columns.logits_rows.upload(&self.stream)?;
+        self.columns.live_tokens.upload(&self.stream)?;
         Ok(())
     }
 
