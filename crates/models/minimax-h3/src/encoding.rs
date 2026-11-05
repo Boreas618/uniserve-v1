@@ -1812,8 +1812,12 @@ impl AudioEncoder {
             None,
             1.0 / (head_dim as f32).sqrt(),
         )?;
+        // The audio encoder's attention is the **unpacked** FP32 form: one track, no offsets table
+        // (`encoding.rs`'s launch passes none). The `f32` package serves exactly that key; the flash
+        // backend serves the packed form only, and no package serves f16 unpacked — which is why this
+        // row names `cu_seq_lens_false` and must.
         programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, LONGEST_TRACK, true,
+            dtype, dtype, dtype, LONGEST_TRACK, false,
         ));
         programs.launch::<PoolOp>(
             &AdaptivePool::new(
