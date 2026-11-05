@@ -930,6 +930,38 @@ mod tests {
         path
     }
 
+    /// A tensor's name is matched exactly as the checkpoint stores it.
+    ///
+    /// A layout states the names a checkpoint holds, so a name that differs by a `model.` prefix is a
+    /// different name: the map is keyed by the stored spelling and a load asks for that spelling. The
+    /// audit over a deployment may normalize the prefix, because it compares the checkpoint's names
+    /// against the model's key rules; this is the load's side of that distinction, and it is what makes
+    /// the audit's normalized count a statement a reader can check.
+    #[test]
+    fn a_tensor_name_is_matched_exactly_as_the_checkpoint_stores_it() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        // Four BF16 elements, eight bytes.
+        let halfs = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        shard(
+            root.path(),
+            &[("layers.0.attention.q_proj.weight", "BF16", &[2, 2], &halfs)],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        assert!(
+            checkpoint
+                .tensor("layers.0.attention.q_proj.weight")
+                .is_some(),
+            "the stored spelling resolves"
+        );
+        assert!(
+            checkpoint
+                .tensor("model.layers.0.attention.q_proj.weight")
+                .is_none(),
+            "a name that differs by the prefix is a different name, not a fallback"
+        );
+    }
+
     /// A shard's tensors read back **byte for byte at the payload-relative offsets the header
     /// states**, each with its own element type and extents, and a non-float tensor is named.
     ///
