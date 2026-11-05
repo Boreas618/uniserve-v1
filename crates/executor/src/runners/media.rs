@@ -74,10 +74,12 @@ pub enum Stage {
         width: u32,
     },
     /// The track's `[samples, 2]` integers into AAC.
-    Track {
-        /// Sample frames the track covers.
-        samples: usize,
-    },
+    ///
+    /// The count is the buffer's - `bytes / (2 * size_of::<i16>())` - rather than a number the
+    /// stage carries: the audio decoder states a window's length (`pcm_window`, the checkpoint's own
+    /// multiplication), so a second computation here would be a different number waiting to
+    /// disagree by one at the end of a request.
+    Track,
     /// The end of the request's assembly: the MP4's bytes are the stage's answer.
     Mux,
 }
@@ -138,8 +140,9 @@ impl HostAction for MediaWork {
                 )?;
                 Ok(None)
             }
-            Stage::Track { samples } => {
+            Stage::Track => {
                 let bytes = self.bytes()?;
+                let samples = bytes.len() / (2 * size_of::<i16>());
                 self.output.encode_track(self.request, bytes, samples)?;
                 Ok(None)
             }
@@ -158,22 +161,6 @@ impl HostAction for MediaWork {
     /// outstanding device work that could still address them.
     fn input_outcome(&self) -> Outcome {
         Outcome::Success(())
-    }
-}
-
-impl Rates {
-    /// The samples one request's soundtrack covers, from the unit list the request was opened with.
-    ///
-    /// **The unit list is the timeline's own** - `VideoPostprocessor::splices_of` is its one home -
-    /// so this reads it rather than recomputing a schedule: a units function here would be a second
-    /// statement of the checkpoint's `17 * n + 5`, and the muxer is assembled from the first one.
-    ///
-    /// The artifact's timeline is frames at the frame rate and samples at the audio rate, so the
-    /// two counts are one number read twice: a track shorter than this leaves the last frames
-    /// silent, and a longer one is samples the container has no place for.
-    pub fn samples(&self, units: &[u32]) -> usize {
-        let frames: u64 = units.iter().map(|&frames| u64::from(frames)).sum();
-        (frames * u64::from(self.audio_rate) / u64::from(self.frame_rate)) as usize
     }
 }
 
@@ -376,7 +363,14 @@ mod tests {
                 .encode_clip(request, &units, (frames, height, width), &pixels)
                 .expect("a unit encodes");
         }
-        let samples = output.rates.samples(&units);
+        // The track the session's timeline covers, by the container's own rule: the audio decoder
+        // states its window with its own arithmetic (`pcm_window`), so this test states the bytes
+        // and the stage counts them rather than dividing a frame count a second way.
+        let samples = media::codec::audio_samples(
+            units.iter().map(|&frames| frames as usize).sum::<usize>(),
+            24,
+            32_000,
+        );
         let pcm = vec![0_u8; samples * 2 * size_of::<i16>()];
         output
             .encode_track(request, &pcm, samples)
@@ -395,21 +389,6 @@ mod tests {
             mp4.len() < unit_bytes,
             "a compressed artifact is smaller than the frames it was made from"
         );
-    }
-
-    /// The soundtrack covers every frame of every unit at the artifact's rate.
-    ///
-    /// The two counts are one number read twice - the timeline is frames at the frame rate and
-    /// samples at the audio rate - so a track shorter than this leaves the last frames silent and a
-    /// longer one is samples the container has no place for.
-    #[test]
-    fn the_track_covers_every_frame_of_every_unit() {
-        let rates = Rates {
-            frame_rate: 24,
-            audio_rate: 32_000,
-        };
-        assert_eq!(rates.samples(&[17, 17, 22]), 56 * 32_000 / 24);
-        assert_eq!(rates.samples(&[]), 0);
     }
 
     /// A clip that is not `frames * height * width * 3` bytes is refused before an encoder sees it.
