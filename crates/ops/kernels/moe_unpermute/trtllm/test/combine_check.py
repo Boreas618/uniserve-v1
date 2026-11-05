@@ -8,7 +8,8 @@ compiled for one descriptor of the fixture —
 `hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16` — so every case runs those shapes
 and varies only the token count.
 
-The call is the operator's `moe::combine::Call` (600 bytes, `error` at 88), and the operator's
+The call is the operator's `moe::combine::Call` (608 bytes, `error` at 96, `layout` at 88 - the
+check runs the permuted order and states it), and the operator's
 arithmetic is one line:
 
 ```text
@@ -108,17 +109,30 @@ class Call(ctypes.Structure):
         ("input_dtype", ctypes.c_int64),
         ("scales_dtype", ctypes.c_int64),
         ("output_dtype", ctypes.c_int64),
+        ("layout", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
     ]
 
 
-#: `crates/ops/src/moe/combine.rs`, `UNPERMUTE_CALL_LAYOUT`'s size, which `entry.h` also pins.
-#: Measured rather than remembered: a field added to the operator's struct shifts every one after it.
-UNPERMUTE_CALL_SIZE = 600
-assert ctypes.sizeof(Call) == UNPERMUTE_CALL_SIZE, (
-    f"the check's Call mirror is {ctypes.sizeof(Call)} bytes, the operator's layout says "
-    f"{UNPERMUTE_CALL_SIZE} (crates/ops/src/moe/combine.rs)"
-)
+
+def declared_size(header, struct):
+    """The `sizeof` the package header's `static_assert` pins, read rather than restated."""
+    text = header.read_text()
+    marker = f"sizeof({struct}) =="
+    if marker not in text:
+        raise SystemExit(f"{header}: no `{marker}` static_assert")
+    digits = text.split(marker, 1)[1].lstrip(" =").split()[0].rstrip(",")
+    return int(digits)
+
+#: The two layouts the operator distinguishes: the routes read in permuted order, or in the order the
+#: expanded map gives. `entry.h` and `crates/ops/src/moe/combine.rs` pin the size; it is read here.
+PERMUTED, EXPANDED = 0, 1
+UNPERMUTE_CALL_SIZE = declared_size(pathlib.Path(__file__).resolve().parents[1] / "src" / "entry.h", "uniserve_unpermute_call")
+if ctypes.sizeof(Call) != UNPERMUTE_CALL_SIZE:
+    raise SystemExit(
+        f"the check's Call mirror is {ctypes.sizeof(Call)} bytes, the operator's header says "
+        f"{UNPERMUTE_CALL_SIZE}"
+    )
 
 
 def gamma(reduction, unit):
@@ -201,6 +215,7 @@ def run(
         input_dtype=in_code,
         scales_dtype=scales_code,
         output_dtype=out_code,
+        layout=PERMUTED,
         error=b"",
     )
     status = entry(ctypes.byref(call), stream)
