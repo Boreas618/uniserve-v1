@@ -683,7 +683,11 @@ async fn prepared_successor(
             .next()
             .context("the takeover lacks a descriptor")
     };
-    let handed = Listener::resume(listener, next()?)?;
+    // Each step of the successor names itself in the reason it gives the predecessor: a
+    // failure here is reported as `the successor took the service and gave up: <reason>`,
+    // and a transport error alone says what happened but not where.
+    let handed = Listener::resume(listener, next()?)
+        .context("resuming the handed-over HTTP listener")?;
     let listener = match rebound {
         Some(rebound) => {
             drop(handed);
@@ -698,7 +702,8 @@ async fn prepared_successor(
                 descriptor: next()?,
                 unix: replica.control.0,
                 received: replica.control.1.clone(),
-            })?;
+            })
+            .context("resuming a replica's engine control connection")?;
             Ok((replica, connection))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -714,7 +719,8 @@ async fn prepared_successor(
         Some((prepare.processes.clone(), socket)),
         service,
         service_fds,
-    )?;
+    )
+    .context("resuming the node's daemon service")?;
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
     let (updates, awake) = daemon
         .updates(
@@ -755,15 +761,18 @@ async fn prepared_successor(
     let (handed, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
     let adopted_world = served.world;
-    let leader = Arc::new(Leader::finish(
-        &config,
-        prepared,
-        Arc::clone(&control),
-        client,
-        served,
-        observer,
-        updates,
-    )?);
+    let leader = Arc::new(
+        Leader::finish(
+            &config,
+            prepared,
+            Arc::clone(&control),
+            client,
+            served,
+            observer,
+            updates,
+        )
+        .context("finishing the deployment the takeover names")?,
+    );
     // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
         let (record, process) = adopted_epoch(adopted_world, handed.engine, &options);
