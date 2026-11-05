@@ -2888,7 +2888,43 @@ mod tests {
         assert_eq!(
             fixed(&other),
             fixed(&programs),
-            "a raster changes the residuals' extent and the pads' columns, not the frame statistics"
+            "a raster changes the pads' columns, not the frame statistics"
+        );
+
+        // **The residuals are the levels' channel widths, and no raster can change them.** A block's add
+        // reshapes the level to `[frames · pixels, channels]` and the descriptor takes the last
+        // dimension, so the aligned packing of a raster reaches the pads and never the residuals - and a
+        // statement that keyed the element count instead would move with every raster, which is the
+        // shape of the defect this row replaced.
+        let residuals = |rows: &[(String, String)]| -> Vec<String> {
+            rows.iter()
+                .filter(|(name, _)| name == "scaled_add")
+                .map(|(_, key)| key.clone())
+                .collect()
+        };
+        assert_eq!(
+            residuals(&other),
+            residuals(&programs),
+            "the residual rows are channel widths: a raster cannot move one"
+        );
+        let stack = Stack::of(&config).expect("the stack");
+        for width in &stack.widths {
+            assert!(
+                residuals(&programs)
+                    .iter()
+                    .any(|key| key.contains(&format!("columns_{width}_"))),
+                "no residual row for a level's {width} channels: {:?}",
+                residuals(&programs)
+            );
+        }
+        // Two levels can share a width (`block_out_channels` repeats 256 and 512), and the rows are a
+        // set, so the count is over the **distinct** widths rather than over the levels.
+        let distinct: std::collections::BTreeSet<u32> = stack.widths.iter().copied().collect();
+        assert_eq!(
+            residuals(&programs).len(),
+            distinct.len(),
+            "one residual row per distinct level width: {:?}",
+            residuals(&programs)
         );
     }
 
