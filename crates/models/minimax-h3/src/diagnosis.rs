@@ -165,8 +165,17 @@ mod tests {
     /// A type this cannot widen exactly is refused by name rather than written as if converted.
     #[test]
     fn a_type_with_no_exact_widening_is_refused() {
-        let error = f32_bytes_of(DType::F8E4M3, &[0, 0]).unwrap_err();
-        assert!(error.contains("F8E4M3"), "{error}");
+        for refused in [DType::F8E4M3, DType::F4E2M1, DType::U8, DType::I32] {
+            let error = f32_bytes_of(refused, &[0, 0]).unwrap_err();
+            // The refusal must name the type it refused, in this crate's own spelling of it: the
+            // message is read by whoever has to act on it, so asserting a literal spelling would
+            // pin the assertion to one rendering rather than to the behaviour it states.
+            let name = refused.to_string();
+            assert!(
+                error.contains(&name),
+                "{refused:?} refused without its name: {error}"
+            );
+        }
     }
 
     /// An FP32 tensor passes through: the twin of an FP32 run is its own bytes.
