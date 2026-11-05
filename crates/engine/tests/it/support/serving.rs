@@ -7,6 +7,8 @@
 
 use std::sync::Mutex;
 
+use engine::EngineConfig;
+
 use executor::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
     SubmissionId,
@@ -186,4 +188,33 @@ pub(crate) fn pool(group: &str) -> Inventory {
         },
         max_model_len: 4096,
     }
+}
+
+/// A configuration for a handle over `pool`: the simulation's own facts, with
+/// the running-request count the pool can actually hold.
+///
+/// `SchedulerHandle::over_batches` refuses a config that asks for more running
+/// requests than the ranks hold rows, plus any guidance prefix rows a denoising
+/// rank needs. A test pool of one rank holds eight, and the sim configuration's
+/// default is 128, so a case that leaves the default is refused at
+/// construction. With the KV resources absent the same check is skipped
+/// (`uses_cache` is false), which is why these two defects hidden each other:
+/// the pool stripped its cache, and the row count it should have refused
+/// silently passed. The row count is read from the pool, so there is one
+/// authority for the number rather than a constant each case remembers.
+pub(crate) fn config(pool: &Serving, name: &str) -> EngineConfig {
+    let rows: usize = pool
+        .inventory()
+        .iter()
+        .map(|inventory| {
+            inventory
+                .ranks
+                .iter()
+                .map(|rank| rank.request_slots as usize)
+                .sum::<usize>()
+        })
+        .sum();
+    let mut config = EngineConfig::sim(name);
+    config.max_running_requests = rows.max(1);
+    config
 }

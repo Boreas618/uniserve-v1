@@ -44,14 +44,6 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
     }
 }
 
-/// The configuration a main process holds: the simulation's facts, since this
-/// test runs no device.
-fn config() -> EngineConfig {
-    let mut config = EngineConfig::sim("in-process-completion");
-    config.max_running_requests = 4;
-    config
-}
-
 /// A greedy text request of `prompt` tokens that generates at most `max_tokens`.
 fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
@@ -119,7 +111,7 @@ fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
 fn a_request_is_served_through_the_executors_own_batch_path() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(crate::support::serving::config(&serving, "in-process-completion"), batches).expect("the pool serves");
     install(&handle, &serving);
     // The kernels this epoch serves on, as the control thread's switchover arm
     // publishes it. The handle's stage command is not the arm that numbers a
@@ -203,7 +195,7 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let mut config = config();
+    let mut config = crate::support::serving::config(&serving, "in-process-completion");
     config.max_running_requests = 1;
     let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
     install(&handle, &serving);
@@ -254,7 +246,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 fn an_admitted_request_is_prefilled_on_the_next_step() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(crate::support::serving::config(&serving, "in-process-completion"), batches).expect("the pool serves");
     install(&handle, &serving);
     // The consumer is kept open for the case's length: a world whose client
     // went away ends its requests, which is not what is under test.
