@@ -1206,6 +1206,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A batch is homogeneous in its sampling path, and the check is about this batch's own
+        // rows: a warm pose has no request rows, so it is made here rather than in the capture.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
         // pooled table, so the row must state the request's own pages before the replay, and the
         // table states where the row begins (`start_page`) and how far it runs.
@@ -1234,6 +1237,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
@@ -2048,7 +2053,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
+        // The batch is checked where a real one is staged (`submit`, `shadow`): a capture has no
+        // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
+        // row - so the check here would refuse a sampled bucket its own capture.
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
