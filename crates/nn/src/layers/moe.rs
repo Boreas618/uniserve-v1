@@ -1496,7 +1496,7 @@ impl Moe {
             input,
             columns,
             layout,
-            block: ENCODE_CHUNK,
+            block: crate::layers::linear::Nvfp4Linear::encode_block(columns, ENCODE_CHUNK),
             pdl: crate::layers::launch::PDL,
         }
     }
