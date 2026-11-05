@@ -1339,14 +1339,17 @@ mod tests {
         }
     }
 
-    /// Every seam the deployment's offered canvases produce is in the blend table.
+    /// The blend table and the deployment's seams are one set, in both directions.
     ///
-    /// The table is a ladder of widths (from `MINIMUM_OVERLAP` up in alignment steps on both axes)
-    /// and a deployment launches only what its grids realize. **The ladder may be wider than the
-    /// deployment and must never be narrower**: a width this test cannot find is a seam a canvas
-    /// needs and the decoder has no module for, which stops a clip decode at the first seam of that
-    /// width rather than at a load. That is the error a ladder gets narrowed by - one class removed
-    /// because one request did not reach it - and it is invisible to every other check in the crate.
+    /// The table is derived from the offered canvases' own grids, so a width exists in it exactly
+    /// when a served canvas produces that width on that axis. This asserts both halves, because each
+    /// direction fails differently:
+    ///
+    /// - **A seam with no module** stops a clip decode at the first seam of that width rather than at
+    ///   a load, which is the error a table narrowed by hand produces - one width removed because one
+    ///   request did not reach it.
+    /// - **A module no seam reads** is a cell in a store that no launch asks for, which is what a
+    ///   ladder of alignment steps produced: 24 widths stated, 8 launched.
     #[test]
     fn every_seam_the_offered_canvases_produce_is_in_the_blend_table() {
         let config = crate::video_vae::tests::video_config();
@@ -1381,8 +1384,15 @@ mod tests {
                     .iter()
                     .any(|(width, side, _)| width == extent && side == axis),
                 "the deployment launches a {extent}-pixel seam along axis {axis} and the table is \
-                 {} widths on two axes: a narrowed ladder stops the clip decode here",
+                 {} widths on two axes: a missing module stops the clip decode here",
                 decoder.blends().len()
+            );
+        }
+        for (width, side, _) in decoder.blends() {
+            assert!(
+                realized.contains(&(*width, *side)),
+                "the table carries a {width}-pixel seam along axis {side} that no offered canvas \
+                 produces: a store cell no launch reads"
             );
         }
     }
