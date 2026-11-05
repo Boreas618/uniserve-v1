@@ -1141,7 +1141,8 @@ fn stage_encode(args: &Args) -> Result<()> {
                     "regions: {} published, {} measured, first difference {difference}\n         \
                      (a difference on a computed weight - a rotary table or a ones mask - is also what a\n         \
                      file from an older build reads as: those keys carry the producing crate and a digest,\n         \
-                     so re-run `--stage weights` from this binary)",
+                     so re-run `--stage weights` from this binary; a checkpoint weight that differs is not\n         \
+                     that, and wants its own look)",
                     weights.published.len(),
                     names.len()
                 ),
