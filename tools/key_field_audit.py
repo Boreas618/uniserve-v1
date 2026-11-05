@@ -18,6 +18,7 @@ an extent is baked by construction, and their builds are minutes rather than sec
 """
 
 import argparse
+import sys
 import hashlib
 import importlib.util
 import pathlib
@@ -107,7 +108,10 @@ def audit(store, package, key, fields):
     reported = []
     with tempfile.TemporaryDirectory() as scratch:
         base = pathlib.Path(scratch) / "base"
-        failure = store.build(package, key, "sm_100a", base)
+        # The audit runs the same build the CLI does, so it passes what the CLI passes: the
+        # interpreter running this script is the one carrying the toolchain (Triton, CuTe DSL,
+        # nvcc), which is the rule `build_store.py --python` states.
+        failure = store.build(package, key, "sm_100a", base, sys.executable)
         if failure is not None:
             return [("base", key, "the fixture's key does not build: " + failure)]
         reference = digest(base)
@@ -119,7 +123,7 @@ def audit(store, package, key, fields):
                 if moved_key is None or moved_key == key:
                     continue
                 out = pathlib.Path(scratch) / f"moved-{field}"
-                failure = store.build(package, moved_key, "sm_100a", out)
+                failure = store.build(package, moved_key, "sm_100a", out, sys.executable)
                 if failure is not None:
                     reported.append((field, moved_key, "does not build: " + failure))
                     continue

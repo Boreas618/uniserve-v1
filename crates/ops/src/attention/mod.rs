@@ -700,15 +700,7 @@ impl Op for PagedAttention {
         // of program, which is why the descriptor names no backend and the store decides.
         if kernel.is_cubin() {
             return Self::launch_program(
-                kernel,
-                descriptor,
-                &args,
-                batch,
-                q_heads,
-                kv_heads,
-                page_size,
-                tokens,
-                max_q_len,
+                kernel, descriptor, &args, batch, q_heads, kv_heads, page_size, tokens, max_q_len,
                 stream,
             );
         }
@@ -798,6 +790,7 @@ impl PagedAttention {
     /// makes them true: an E4M3 cache read without its scale, a window this program was not compiled
     /// for, a phase it does not serve. Each names what it refused, so a store that resolved the
     /// wrong program is a launch error rather than plausible attention.
+    #[allow(clippy::too_many_arguments)]
     fn launch_program(
         kernel: &Kernel,
         descriptor: &Descriptor,
@@ -835,7 +828,7 @@ impl PagedAttention {
                 ),
             ));
         }
-        if q_heads % kv_heads != 0 {
+        if !q_heads.is_multiple_of(kv_heads) {
             return Err(Error::argument(
                 Self::NAME,
                 format!("{q_heads} query heads do not divide into {kv_heads} key-value heads"),
@@ -880,7 +873,10 @@ impl PagedAttention {
             .i32(stride("the output's row stride", &args.out, 0)?)
             .i32(stride("the output's head stride", &args.out, 1)?)
             .i32(stride("the output's element stride", &args.out, 2)?)
-            .i32(word("the page table's width", args.page_table.shape.dim(1))?)
+            .i32(word(
+                "the page table's width",
+                args.page_table.shape.dim(1),
+            )?)
             .i32(word("the page size", page_size)?)
             .f32(args.scale);
         if descriptor.phase == Phase::Prefill {

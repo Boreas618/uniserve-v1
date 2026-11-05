@@ -101,23 +101,13 @@ use nn::layers::tiles::{
 use ops::DType;
 use ops::modulation::ModulatedRmsNormDescriptor;
 use ops::noise::NoiseDescriptor;
-use ops::residual::{ScaledResidualDescriptor, WeightedRmsNormDescriptor};
-
-/// Samples one `audio_resample` program produces: the package's `block` dimension, which the
-/// reference's resampler takes as its hop (`crates/ops/kernels/audio_resample/*/package.toml`).
-const RESAMPLE_BLOCK: u32 = 256;
+use ops::residual::ScaledResidualDescriptor;
 
 /// The audio VAE decoder's initial width (`decoder_dim`).
 const DECODER_DIM: u32 = 1024;
 
 /// The audio VAE decoder's upsampling rates: seven stages of the 800× total.
 const DECODER_RATES: [u32; 7] = [5, 5, 2, 2, 2, 2, 2];
-
-/// The audio VAE encoder's initial width (`encoder_dim`).
-const ENCODER_DIM: u32 = 64;
-
-/// The audio VAE encoder's strides: five blocks.
-const ENCODER_RATES: [u32; 5] = [2, 4, 4, 5, 5];
 
 /// The alias-free activation wrapper's upsampling ratio (`Activation1d(ratio=2)`).
 const ACTIVATION_RATIO: u32 = 2;
@@ -196,6 +186,12 @@ const VSA_MAX_TILES: u32 = 8192;
 const FFN: u32 = 14336;
 
 /// The audio encoder's attention: 8 heads over the 2048-wide latent, so 256 features per head.
+/// The clip lengths H3 is driven at, in video frames - **the deployment's statement**, not a property
+/// of the model: the model's frame rule says which lengths a request can be snapped to, and no source
+/// says which of those this deployment drives. The delivery's stages and the model's bound are the
+/// list; `--frames` states another, and it may not omit one of these.
+const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+
 const AUDIO_ATTENTION_HEADS: u32 = 8;
 const AUDIO_LATENT_DIM: u32 = 2048;
 
@@ -246,9 +242,28 @@ fn main() {
     let mut arguments = std::env::args().skip(1);
     let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut rasters: Vec<(u32, u32)> = Vec::new();
+    // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
+    // track length, so this is a deployment statement like `--rasters` and not a property of a model.
+    //
+    // The default is the lengths the delivery's stages drive and the model's own bound. The rows are
+    // transient by construction - when the residual add's extent stops being part of its key they
+    // collapse to one per add - so the ladder ships complete now and gets smaller later, and a
+    // request naming a length outside it is refused by name at its first audio row program.
+    let mut clip_frames: Vec<u32> = Vec::new();
+    // `--derived` prints the rows the model's own `programs` functions state, for the components
+    // whose arguments this generator already holds, and nothing else. It is the comparison the typed
+    // tables answer to: a row here that the list lacks is a launch the list forgot, and a row the
+    // list has that is absent here is typed drift. It exits before the header, so a diff of its
+    // output against the file is the review artifact.
+    let mut derived = false;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
+            "--frames" => {
+                for frames in value(&mut arguments, "--frames").split(',') {
+                    clip_frames.push(parse(frames.trim(), frames, "a clip length"));
+                }
+            }
             "--rasters" => {
                 for raster in value(&mut arguments, "--rasters").split(',') {
                     let Some((height, width)) = raster.trim().split_once('x') else {
@@ -260,6 +275,7 @@ fn main() {
                     ));
                 }
             }
+            "--derived" => derived = true,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -276,6 +292,50 @@ fn main() {
             root.display()
         ),
     };
+    if derived {
+        // Only the components whose whole argument is a config and an element type. A component
+        // that also needs a request extent (packed rows, tokens, a track, a trajectory length) is
+        // not asked here: its rows depend on a deployment dimension this tool has no flag for, and
+        // a guessed extent would produce a diff that reads as drift and is a different request.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        // The refiner is the stack's and takes the stack's element type; the decoder and the
+        // postprocessor are the video VAE's and take the VAE's. Handing either the other's type is
+        // how a row set grows a family no launch asks for - the first run of this mode did exactly
+        // that and produced 36 `cross_fade` rows at the stack's type.
+        let Some(base) = config.denoisers.values().next() else {
+            panic!("the checkpoint states no DiT, so no component's rows are derivable")
+        };
+        for deployment in DEPLOYMENTS {
+            rows.extend(
+                minimax_h3::conditioning::TokenRefiner::programs(&base.transformer, deployment)
+                    .unwrap_or_else(|error| {
+                        panic!("the token refiner states no rows at {deployment:?}: {error}")
+                    }),
+            );
+        }
+        for vae in VAES {
+            rows.extend(
+                minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, vae)
+                    .unwrap_or_else(|error| {
+                        panic!("the video decoder states no rows at {vae:?}: {error}")
+                    }),
+            );
+            rows.extend(minimax_h3::output::VideoPostprocessor::programs(
+                vae, &rasters,
+            ));
+        }
+        rows.sort();
+        rows.dedup();
+        eprintln!(
+            "{} derived row(s) from the token refiner, the video decoder and the postprocessor",
+            rows.len()
+        );
+        for (operator, key) in rows {
+            println!("{operator}\t{key}");
+        }
+        return;
+    }
+
     // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
@@ -283,6 +343,27 @@ fn main() {
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment));
+    }
+    // The two audio VAEs and the video VAE state their own rows from the deployment's canvases, its
+    // rungs and its element types - one statement in `programs::Deployment`, which the typed blocks
+    // above are being replaced by one component at a time. Emitting it beside them is a no-op today
+    // (a row is a set member) and is what makes the replacement checkable: the set must not move.
+    for vae in VAES {
+        let deployment = minimax_h3::programs::Deployment::new(
+            config.clone(),
+            minimax_h3::programs::Types {
+                text_encoder: DType::BF16,
+                transformer: DType::F32,
+                video: vae,
+                audio: DType::F32,
+            },
+            clip_frames.clone(),
+        )
+        .unwrap_or_else(|error| panic!("the deployment's VAE rows are not statable: {error}"));
+        match deployment.vae_rows() {
+            Ok(stated) => lines.extend(stated),
+            Err(error) => panic!("the audio VAE's rows are not statable: {error}"),
+        }
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -319,10 +400,92 @@ fn main() {
         },
     );
 
+    // ---- The video decoder and the postprocessor: derived, like the encoder, and for the same
+    // reason.
+    //
+    // Neither was called here, so the decoder's own rows were **launched and never listed** - twelve
+    // `scaled_add` widths at the decoder's stack, which a walk printed at every canvas and a check
+    // read as a disagreement about the canvas because the same shape survived a change of one. The
+    // decoder runs at the export's own element type, so both of the VAE's are stated
+    // (`VideoDecoder::programs` takes the type; the postprocessor takes the rasters too, because its
+    // `scaled_add` covers a whole frame).
+    //
+    // A component the generator does not call is a component whose rows are missing from every store
+    // built from this list, and nothing in the list can say so: the file reads complete.
+    for dtype in VAES {
+        match minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, dtype) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the video decoder states no programs at {dtype:?}: {error}"),
+        }
+        lines.extend(minimax_h3::output::VideoPostprocessor::programs(
+            dtype, &rasters,
+        ));
+    }
+
+    // ---- The audio decoder's and encoder's rows: derived from the clip lengths, for the reason the
+    // video decoder's are derived, and with one more.
+    //
+    // Their per-row programs carry `columns = inner × samples` in the **key**, so a track length is its
+    // own row set: a written set would be one length's and every other length would stop at a missing
+    // program. The conversion from video frames to sample counts is the crate's own arithmetic
+    // (`audio_latent_frames`, `track_samples`) rather than a constant here, because 44.1 kHz was
+    // written into a measurement once tonight and produced rows for a rate this checkpoint does not
+    // use.
+    // The audio operators state one row set per track length, because their residual adds carry the
+    // track's extent in the key: the ladder above is the deployment's clip lengths, converted here
+    // through the crate's own arithmetic so no sample count is written down twice.
+    // **The deployment's ladder, stated once, and `--frames` must not leave one of its rungs out:**
+    // a run with no flag and a run stating this list must produce one row set, and the check fails
+    // when a stated ladder and the deployment's part company - the one failure of this file that
+    // nothing else would notice. It covers **default against stated, not stated against legal**: the
+    // frame rule (`align_num_frames`) says which lengths a request snaps to, and the deployment says
+    // which of those it drives.
+    if clip_frames.is_empty() {
+        clip_frames = DEPLOYMENT_FRAMES.to_vec();
+    } else {
+        for frames in DEPLOYMENT_FRAMES {
+            if !clip_frames.contains(&frames) {
+                panic!(
+                    "the run states the ladder {clip_frames:?}, which omits {frames} - a clip the \
+                     deployment drives; state a superset of {DEPLOYMENT_FRAMES:?} or no --frames"
+                );
+            }
+        }
+    }
+    let audio = &config.audio_vae;
+    // A decode starts from a track's **latent frames** and the encoder's residual units are sized in
+    // **samples**: the two operators take the same clip in different units, and passing one where the
+    // other is meant was a whole ladder of wrong widths (the tallest 1.4e9 instead of 1,365,600).
+    let latents: Vec<u32> = clip_frames
+        .iter()
+        .map(|frames| minimax_h3::packing::audio_latent_frames(*frames))
+        .collect();
+    let samples: Vec<u32> = latents
+        .iter()
+        .map(
+            |latent| match u32::try_from(minimax_h3::audio_vae::track_samples(audio, *latent)) {
+                Ok(samples) => samples,
+                Err(_) => {
+                    panic!("a track of {latent} latent frames is longer than a u32 sample count")
+                }
+            },
+        )
+        .collect();
+    if !clip_frames.is_empty() {
+        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &latents) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the audio decoder states no programs: {error}"),
+        }
+        match minimax_h3::encoding::AudioEncoder::programs(audio, &samples) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the audio encoder states no programs: {error}"),
+        }
+    }
+
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines, &config.video_vae, &rasters);
+    header(&lines, &config.video_vae, &rasters, &clip_frames);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -338,6 +501,7 @@ fn header(
     lines: &[(String, String)],
     video_vae: &minimax_h3::config::VideoVaeConfig,
     rasters: &[(u32, u32)],
+    clip_frames: &[u32],
 ) {
     let operators = lines
         .iter()
@@ -359,6 +523,20 @@ fn header(
         "# rows are here because a launcher reaches them or because the construction requires them; \
          a row is removed only when the construction contradicts it, never because no walk has \
          produced it yet (`tools/walk_gaps.py --by-shape` reports a walk's shape the file lacks)."
+    );
+    // The rows are a statement over axes, not over one request: a walk at one canvas and one clip
+    // binds a strict subset of this file, and a count compared across the two is meaningless unless
+    // it names them. Every other list in this lane was compared without its axes at least once.
+    println!(
+        "# axes: {} canvases ({}) and the clip ladder {:?}; a walk at one canvas and one clip binds a \
+         subset of these rows by construction, so a count compared with this file must name its axes.",
+        rasters.len(),
+        rasters
+            .iter()
+            .map(|(height, width)| format!("{height}x{width}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        clip_frames,
     );
     println!(
         "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
@@ -423,81 +601,20 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         lines.push((operator.to_owned(), descriptor));
     };
 
-    // ---- Audio: the BigVGAN decoder's activations, at every width the seven stages produce.
+    // ---- Audio: the BigVGAN decoder's activations.
     //
-    // `snake_beta` is the decoder's: `MiniMaxH3AudioAMPBlock` and `activation_post` wrap
-    // `MiniMaxH3AudioSnakeBeta` (`autoencoder_kl_minimax_h3_audio.py:412`, `:470`), whose two
-    // parameters are log-space.
-    for stage in 0..DECODER_RATES.len() as u32 {
-        let channels = DECODER_DIM >> (stage + 1);
-        push(
-            "snake_beta",
-            ops::snake_beta::Descriptor {
-                dtype: DType::F32,
-                channels,
-                block: ELEMENTWISE_BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-    }
+    // `snake_beta` is **not** stated: this model's decoder runs the fused `audio_activation` for the
+    // same seven widths (its `act_and_mul` row), and nothing in the crate constructs a
+    // `snake_beta` descriptor - a row for it compiles a program no launch asks for.
 
-    // `snake` is the encoder's: one linear parameter, used by the DAC residual units and encoder
-    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). **A stage runs its
-    // Snake at the width it takes in and doubles on the way out** (`EncoderStage.inner` is "half the
-    // stage's output width"), and the network ends with one more Snake at the doubled width - six
-    // widths over five rates, not five. Doubling before the push lost the narrowest one, and with it
-    // the encoder's first stage.
-    let mut encoder_channels = ENCODER_DIM;
-    for _ in ENCODER_RATES {
-        push(
-            "snake",
-            ops::snake::Descriptor {
-                dtype: DType::F32,
-                channels: encoder_channels,
-                block: ELEMENTWISE_BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-        encoder_channels *= 2;
-    }
-    push(
-        "snake",
-        ops::snake::Descriptor {
-            dtype: DType::F32,
-            channels: encoder_channels,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // `snake` is the audio encoder's and `audio_activation` the decoder's; both are stated by
+    // `programs::Deployment::vae_rows`, which reads the widths from the networks' own rate ladders.
 
-    // The decoder's upsamplers are the reference's `Activation1d`: a replicate pad, a transposed
-    // convolution of stride 2, a `SnakeBeta`, then a low-pass of the same ratio — which is our
-    // `audio_resample` in both directions at the same width, ratio 2 and a 12-tap filter.
-    for stage in 0..DECODER_RATES.len() as u32 {
-        let channels = DECODER_DIM >> (stage + 1);
-        for mode in [
-            ops::audio_resample::Mode::Upsample,
-            ops::audio_resample::Mode::Downsample,
-        ] {
-            push(
-                "audio_resample",
-                ops::audio_resample::Descriptor {
-                    mode,
-                    dtype: DType::F32,
-                    channels,
-                    kernel: ACTIVATION_KERNEL,
-                    ratio: ACTIVATION_RATIO,
-                    block: RESAMPLE_BLOCK,
-                    pdl: PDL,
-                }
-                .to_string(),
-            );
-        }
-    }
-
+    // The decoder's upsamplers are the reference's `Activation1d` - a replicate pad, a transposed
+    // convolution of stride 2, a low-pass of the same ratio - and **this model states them as those
+    // three launches** (`conv_transpose1d`, `frame_pad`, `conv1d`), not as `audio_resample`: the
+    // operator exists in `ops` and nothing in the crate constructs its descriptor, so a row for it
+    // compiles a program no launch asks for.
     // ---- Media: the two programs whose variants do not depend on a resolution.
     //
     // Padding is not one of them: the video VAE's replicate and reflect pads are `frame_pad`'s
@@ -505,17 +622,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `audio_resample` and its convolutions. A general ATen `F.pad(mode="replicate")` over trailing
     // axes has no caller in the reference, so it is not declared.
     //
-    // The video path's antialiased downscale of a packed uint8 frame, three colour channels.
-    push(
-        "antialiased_resize_uint8",
-        ops::resize::Descriptor {
-            mode: ops::resize::Mode::Bicubic,
-            channels: 3,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The video path's antialiased downscale is **not** stated: no caller constructs
+    // `ops::resize`'s descriptor, and the postprocessor's resize is `position_interpolate` plus the
+    // packed `rgb_bytes` packing. A row here would compile a program no launch asks for.
 
     // ---- The DiT's projections: one key per distinct contraction length.
     //
@@ -786,16 +895,8 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    push(
-        "weighted_rms_norm",
-        WeightedRmsNormDescriptor {
-            dtype: deployment,
-            columns: HIDDEN,
-            tile: row_tile(HIDDEN),
-            absmax: false,
-        }
-        .to_string(),
-    );
+    // `weighted_rms_norm` is **not** stated: `nn` exports the layer and no model code constructs it -
+    // the DiT's norms are `modulated_rms_norm`, `rms_norm` and the plain final `RmsNorm` below.
     // The DiT's output norm, `norm_out.norm`, is a **plain** `RmsNorm` over the hidden state
     // (`transformer.rs`'s `load`, `RmsNorm::new(gain(...), eps)`) - the stack's own final
     // normalization, not the weighted one every block wears and not the modulated one it consumes.
@@ -896,29 +997,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     }
     // The sampler's own crossing: the velocity is FP32 like the sample it advances, so the head's
     // output unpatchifies without the decoder's per-channel denormalization.
-    push(
-        "unpatchify_video",
-        ops::unpatchify::Descriptor {
-            dtype: DType::F32,
-            affine: false,
-            block: UNPATCHIFY_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
-    // The register prefix and the zero tail around the caller's rows.
-    push(
-        "sequence_append",
-        ops::sequence_append::Descriptor {
-            dtype: deployment,
-            width: HIDDEN,
-            registers: 4,
-            tail: 12,
-            block: ops::sequence_append::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The register prefix and the zero tail are **not** `sequence_append`: the packed sequence is
+    // built by `rows` and `copy_block`, and nothing in the crate constructs `sequence_append`'s
+    // descriptor. A row for it compiles a program no launch asks for.
     // The seam between two decoded tiles - **every width the model can hand the operator**, on both
     // axes, because both are compiled loop bounds rather than launch values.
     //
@@ -1057,14 +1138,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // conditioner reads, through its FP16 round trip. One row: the chain is fixed and in f32 by the
     // reference, so the only thing the key can name is the operator's own tiling -- and the two
     // launches the conditioned path makes (it does not use programmatic dependent launch) share it.
-    push(
-        "posterior",
-        ops::posterior::Descriptor {
-            block: ops::posterior::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     //
     // One launch per block activation, and each stage's blocks run at the stage's own width - the
@@ -1205,15 +1278,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     );
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
-    push(
-        "pcm_interleave",
-        ops::pcm::Descriptor {
-            dtype: DType::F32,
-            block: ops::pcm::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The initial latent noise, in both element types: the request's draw is FP32 because the
     // reference's sample is (it refuses any other), and the conditioning path draws its own
     // conditions in the trace type.
@@ -1237,18 +1301,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // The pool is the projection's two fused reductions: `heads = num_attention_heads 8`, the head
     // width `latent_dim / heads = 256`, pooled to `latent_channels = 32` (`audio_vae.py:431-440`,
     // `audio_vae/config.json`).
-    push(
-        "adaptive_pool",
-        ops::adaptive_pool::Descriptor {
-            dtype: DType::F32,
-            heads: AUDIO_ATTENTION_HEADS,
-            width: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
-            output: AUDIO_LATENT_CHANNELS,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The audio encoder's projection block: a **causal** attention and a **tanh-GELU** gated unit.
     //
     // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
@@ -1434,6 +1486,16 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // Its learned position table, bilinearly resampled from the 48 × 48 it was trained on to the
     // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
     // output's grid is the args' extent.
+    // Its learned position table, bilinearly resampled from the 48 x 48 it was trained on to the
+    // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
+    // output's grid is the args' extent.
+    //
+    // **This row is stated here, not derived from the tower's `programs`**, because the tower keys it
+    // on a token count while its grid is a second dimension: `VisionTower::programs(dtype, sequence)`
+    // states the table for the sequence it is handed, and the deployment's own table is the trained
+    // 48 x 48 whatever the prompt length is. Passing the prompt length and calling the result the
+    // deployment's table was the composite-number error this crate names - measured when the typed
+    // block was removed and these two rows left the list (282 against 284).
     push(
         "position_interpolate",
         ops::position::Descriptor {
@@ -1707,18 +1769,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         );
     }
     // Its per-frame group statistics over `norm_num_groups 32` with `norm_eps 1e-6`.
-    push(
-        "frame_moments",
-        ops::frame::FrameMomentsDescriptor {
-            dtype: DType::F32,
-            // The encoder's widest frame: four channels per group over a 1344x768 raster. The class
-            // is a declared bound and not a compilation, so it does not reach the key - the launch
-            // refuses a frame outside it.
-            reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
-            epsilon: ops::descriptor::Float::from(1e-6_f32),
-        }
-        .to_string(),
-    );
     // Its normalize-then-pad, with the affine parameters the checkpoint carries (`centered` is the
     // form without them) and `spatial_padding_mode reflect`. `single_pixel` is the descriptor's form
     // for a one-pixel raster, which needs no padding at all: both are listed because which one a
@@ -2120,16 +2170,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `AudioVAEEncoder` holds `[batch, channels, frames]` and its attention attends over frames, so
     // frames move to the leading axis before the qkv projection and back after it. Both extents are
     // launch values, so one row covers every clip length.
-    push(
-        "transpose",
-        ops::transpose::Descriptor {
-            dtype: DType::F32,
-            block: ops::transpose::TILE,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
-
     // Placing the rows a tower contributes into the sequence that reserved them. Four call sites
     // exist and each is in a layer of `crates/models/minimax-h3`, all of them at the layer crate's
     // one element block (its `rows.rs`'s `BLOCK`, 1024) and none on a dependent launch:

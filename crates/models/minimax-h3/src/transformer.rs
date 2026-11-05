@@ -603,17 +603,30 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
+            // `SegmentAttention`'s fourth argument is the key **row** bound, not the tile bound:
+            // `keys` is "the largest key extent the compiled program serves, from the same
+            // packing", and the layer refuses a value that is not whole `tile`-row tiles. `tiles`
+            // is the reduction length in tiles, and passing it here compiled a program for
+            // `tiles` rows - 43x short of the deployment's packed bound - while passing the
+            // constructor's divisibility check whenever the tile bound happened to divide by the
+            // tile. The other call site (`attention_sparse.rs`) already passes `rows`.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles),
+                u64::from(rows),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
-            // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            // `[rows, heads, width]` contiguous, and a factor row of **rotated pairs, not rotated
+            // channels**. The arena allocates the two tables `[tokens, pairs]` with
+            // `pairs = rope_frequency_dim * 3` (`denoiser.rs`, the two `arena.tensor` calls), which
+            // is half the `rotated` this operator counts: 48 against 96. Stating the channel count
+            // here named a key no launch asks for, and the launch would have refused it - the
+            // descriptor's stride is the table's own (`nn/src/layers/segments.rs`).
+            let pairs = u64::from(rotated) / 2;
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, pairs),
             );
             programs.launch::<ops::segments::VsaZeroPadding>(
                 &tiles_layer.zero_padding_descriptor(dtype),
