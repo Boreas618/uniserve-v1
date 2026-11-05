@@ -577,18 +577,17 @@ impl Transformer {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
+        use nn::layers::{Attention, Rotary};
         use ops::activation::ActAndMul as ActAndMulOp;
-        use ops::attention::dense::DenseAttention;
+        use ops::activation::Silu as SiluOp;
         use ops::attention::SparseAttention;
+        use ops::attention::dense::DenseAttention;
         use ops::gemm::Gemm;
         use ops::modulation::GatedResidual as GatedResidualOp;
         use ops::modulation::ModulatedRmsNorm as ModulatedOp;
-        use ops::activation::Silu as SiluOp;
         use ops::norm::RmsNorm as RmsNormOp;
-        use nn::layers::{Attention, Rotary};
         use ops::rope::Rotation;
         use ops::rope::{QkNormRope, RotaryFactors};
-
 
         let hidden = config.hidden_size;
         let head = config.head_dim;
@@ -616,9 +615,13 @@ impl Transformer {
             programs.launch::<ops::segments::VsaPrepareTiles>(
                 &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
             );
-            programs.launch::<ops::segments::VsaZeroPadding>(&tiles_layer.zero_padding_descriptor(dtype));
+            programs.launch::<ops::segments::VsaZeroPadding>(
+                &tiles_layer.zero_padding_descriptor(dtype),
+            );
             programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
-            programs.launch::<ops::segments::VsaCompressPooled>(&tiles_layer.compress_descriptor(dtype));
+            programs.launch::<ops::segments::VsaCompressPooled>(
+                &tiles_layer.compress_descriptor(dtype),
+            );
             programs.launch::<ops::segments::VsaAddGatedTiles>(
                 &tiles_layer.add_gated_tiles_descriptor(dtype),
             );
@@ -643,10 +646,7 @@ impl Transformer {
         // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
         // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
         // types and the epilogue, not the width.
-        programs.launch::<SiluOp>(&Silu::descriptor_of(
-            dtype,
-            config.time_hidden_dim,
-        ));
+        programs.launch::<SiluOp>(&Silu::descriptor_of(dtype, config.time_hidden_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
@@ -720,9 +720,9 @@ impl Transformer {
                 1.0 / (head as f32).sqrt(),
             )
             .map_err(Error::from)?;
-            programs.launch::<DenseAttention>(&attention.dense_descriptor(
-                dtype, dtype, dtype, rows, true,
-            ));
+            programs.launch::<DenseAttention>(
+                &attention.dense_descriptor(dtype, dtype, dtype, rows, true),
+            );
         }
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
@@ -1263,12 +1263,7 @@ mod tests {
             0,
         )
         .expect("the stack's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("rms_norm"), 1);

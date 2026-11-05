@@ -322,7 +322,11 @@ impl Attention {
             head_dim: self.head_dim,
             q_heads: self.q_heads,
             kv_heads: self.kv_heads,
-            mask: if self.causal { Mask::Causal } else { Mask::Dense },
+            mask: if self.causal {
+                Mask::Causal
+            } else {
+                Mask::Dense
+            },
             windowed: self.window.is_some(),
             max_kv_len,
             cu_seq_lens,
