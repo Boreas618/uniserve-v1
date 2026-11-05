@@ -46,7 +46,7 @@ use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::AttentionKind;
 use minimax_h3::config::Config;
-use minimax_h3::denoiser::{Denoiser, Layouts};
+use minimax_h3::denoiser::{Denoiser, Layouts, denoise_arena};
 use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
 use minimax_h3::packing;
 use minimax_h3::partition::Partition;
@@ -1177,7 +1177,11 @@ fn stage_block(args: &Args) -> Result<()> {
 
     // 3. The request and its packed rows. The layout is the deployment's own rule, so the row count,
     //    the padding and the coordinates are the ones a served request would have.
-    let layouts = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?;
+    // The arrangement is kept beside the layouts rather than rebuilt: the arena's plan is priced at
+    // the deployment's own row capacities and sequence degree, and a second `partition.arrangement`
+    // call would agree with this one only as long as the partition did.
+    let arrangement = partition.arrangement(&denoiser)?;
+    let layouts = Layouts::new(denoiser.clone(), arrangement)?;
     let request = VideoRequest {
         task: VideoTask::TextToVideoAudio,
         width: args.width,
@@ -1308,12 +1312,25 @@ fn stage_block(args: &Args) -> Result<()> {
     let dtype = stack.dtype();
 
     // 5. The arena: the stack's own temporaries are reserved inside the forward, so the region must
-    //    cover the rows it holds twice, the attention's five buffers at the whole head count and the
-    //    feed-forward's packed projection. `Denoiser::denoise_arena` is the authority on that sum and
-    //    needs a loaded denoiser to ask; this harness over-reserves by a wide factor instead of
-    //    keeping a second copy of the plan, and the forward's own reservation refuses by name if the
-    //    estimate is ever short.
-    let bytes = tokens * hidden * 2 * 24 + (256 << 20);
+    //    cover one evaluation's plan. The plan is **the model's own statement of that sum** - the
+    //    same `denoise_arena` the loaded denoiser's `Denoiser::denoise_arena` calls, priced from this
+    //    stage's config, arrangement, group count, element type and layout - so the block stage and
+    //    the denoise stage reserve the same model number, and `denoise_plan` prices it on a host with
+    //    no device (`--check` proves the plan covers every request the forward makes).
+    //
+    //    What is added to it is what only this harness holds: the row coordinates, the groups, the
+    //    prefix source and the latents it writes are its own buffers, not the model's, and the plan
+    //    does not know them. The slack covers them; the arena's own reservation refuses by name if
+    //    it is short, so a case that outgrows it says so rather than writing past the region.
+    let plan = denoise_arena(
+        &denoiser,
+        &arrangement,
+        memory.groups.count(),
+        dtype,
+        &layout,
+    )?;
+    let planned: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+    let bytes = planned + (256 << 20);
     // The directory and the case go out before the arena: the case names the run, everything it
     // states is host data, and a stop in the allocation or in the forward then still leaves the
     // statement the reference producer and the comparator are run against.
@@ -1351,12 +1368,12 @@ fn stage_block(args: &Args) -> Result<()> {
 
     let arena_bytes = bytes.max(args.arena_gib << 30);
     let allocator = weights.allocator();
-    // The two numbers a pool refusal is about, printed **before** the reservation that can fail. The
-    // estimate is this stage's own (`bytes`), not `Denoiser::denoise_arena`'s plan, and the word says
-    // so: the plan belongs to a loaded denoiser and this stage keeps no second copy of it.
+    // The two numbers a pool refusal is about, printed **before** the reservation that can fail: the
+    // model's plan for one evaluation and the region this stage reserves for it.
     println!(
-        "arena {:.2} GiB estimated of {:.2} GiB reserved",
-        bytes as f64 / f64::from(1 << 30),
+        "arena {:.2} GiB planned ({} buffers) of {:.2} GiB reserved",
+        planned as f64 / f64::from(1 << 30),
+        plan.len(),
         arena_bytes as f64 / f64::from(1 << 30)
     );
     allocator.reserve(
