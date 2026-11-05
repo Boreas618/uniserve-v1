@@ -39,8 +39,8 @@
 //!   and the per-device counters `FromEngine::Device` that [`Self::send_metrics`]
 //!   fills (§2.3).
 //! - **builder03** (`crates/executor`): `capacity::plan(&CapacityRequest) ->
-//!   Result<Plan>`, whose producer is still `crates/worker/src/worker/planning.rs`
-//!   and still entangled with the launch machinery §4 deletes, and the Storage
+//!   Result<Plan>`, whose producer the retired worker held and which is still
+//!   entangled with the launch machinery §4 deletes, and the Storage
 //!   Server client's publish/map surface that a weight store stands on.
 //! - **nobody yet**: the `nn::RetainedWeights` production implementation. Its two
 //!   methods (`retained`, `publish`) are all a checkpoint load needs, and the

@@ -131,16 +131,15 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
         "base-transformer",
         "base-reference",
     }
-    # The launch's default dtype is bfloat16 and an empty quantization_config
+    # The launch's default dtype is bfloat16 and an empty quantization
     # loads the first precision preset, quality, so stating either would not
-    # change what the check set confirms; quantization_config retires, so a
-    # check cell names neither. No worker executable is pinned either, so a
+    # change what the check set confirms, so a check cell names neither. No worker executable is pinned either, so a
     # deployment launched with --executable runs the new build end to end.
     for name, server in raw["servers"].items():
         assert "--worker-executable" not in server["command"], name
         for value in server["command"]:
             assert not value.startswith("dtype="), name
-            assert not value.startswith("quantization_config."), name
+            assert not value.startswith("quantization."), name
     assert list(raw["suites"]["check-h3"]["points"]) == list(_CELLS)
     assert set(raw["benchmarks"]) == set(_CELLS)
     assert len(raw["benchmarks"]) == len(_CELLS)

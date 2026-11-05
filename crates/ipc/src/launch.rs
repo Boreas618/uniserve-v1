@@ -123,8 +123,6 @@ pub struct LaunchDescriptor {
     pub role: String,
     /// Concurrent microbatches of a disaggregated attention rank.
     pub expert_microbatches: u32,
-    /// Torch process-group backend override.
-    pub distributed_backend: Option<String>,
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's.
     pub mesh: Option<String>,
@@ -140,8 +138,8 @@ pub struct LaunchDescriptor {
     pub parallel_degrees: Vec<u32>,
     /// Compute dtype name.
     pub model_dtype: String,
-    /// Precision selectors, a JSON object.
-    pub quantization_config: serde_json::Value,
+    /// The precision policy, a JSON object.
+    pub quantization: serde_json::Value,
     pub prefix_cache_dtype: Option<String>,
     /// Fraction of device storage this rank may hold for static allocations,
     /// weights and prefix cache, in (0, 1].

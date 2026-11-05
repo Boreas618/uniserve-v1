@@ -18,7 +18,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --set cuda_graph_config.policy=off \
   --set video_config.text_capacities=1024,10240
 
-uniserve serve --config fasth3.toml --set quantization_config.mode=performance
+uniserve serve --config fasth3.toml --set quantization.mode=performance
 ```
 
 | Flag | Path |
@@ -41,9 +41,9 @@ A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode 
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
-Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host storage a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available storage less the reserve cannot hold is refused, unless the server runs a Mooncake connector, which has it stage pages through a pool of at most 256 MiB on each rank from its reserve), `--transfer-chunk-us N` sets how long one chunk of its Transfer Server's copies lasts at the link's bandwidth (1000 µs unless stated), `--nixl-library PATH` names NIXL's `libnixl_capi.so` (of the NIXL release the build binds, 1.5.1, with its UCX backend) that the Transfer Server loads for copies from other hosts, whose storage it registers pinned and outside UCX's registration cache; another host reads a read-only tensor in host storage only through a NIXL and UCX built with the read-only registration patches (`artifacts/native/build-ucx.sh` and `build-nixl.sh`, documented beside them) (the loader's search path finds the library unless stated; `UCX_NET_DEVICES` in the server's environment limits UCX to the host's usable RDMA ports), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the storage of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the storage it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, holding the token count the engine sizes its world's host KV cache at (`kv_cache_config.host_ratio` and `host_gib`), and a pool is allocated and pinned whole when the first worker maps it. A world shares the pools of the previous world whose pages have the same layout; a pool the host cannot hold first takes the place of the deployment's pools no world maps any more. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
+Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host storage a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available storage less the reserve cannot hold is refused, unless the server runs a Mooncake connector, which has it stage pages through a pool of at most 256 MiB on each rank from its reserve), `--transfer-chunk-us N` sets how long one chunk of its Transfer Server's copies lasts at the link's bandwidth (1000 µs unless stated), `--nixl-library PATH` names NIXL's `libnixl_capi.so` (of the NIXL release the build binds, 1.5.1, with its UCX backend) that the Transfer Server loads for copies from other hosts, whose storage it registers pinned and outside UCX's registration cache; another host reads a read-only tensor in host storage only through a NIXL and UCX built with the read-only registration patches (`artifacts/native/build-ucx.sh` and `build-nixl.sh`, documented beside them) (the loader's search path finds the library unless stated; `UCX_NET_DEVICES` in the server's environment limits UCX to the host's usable RDMA ports), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the storage of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the storage it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, holding the token count the engine sizes its epoch's host KV cache at (`kv_cache_config.host_ratio` and `host_gib`), and a pool is allocated and pinned whole when the first worker maps it. An epoch shares the pools of the previous epoch whose pages have the same layout; a pool the host cannot hold first takes the place of the deployment's pools no epoch maps any more. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
 
-Some tables configure one model family: `chat_config` and `image_fetch_config` chat models (Qwen3, SenseNova, BAGEL, DiffusionGemma); `video_config`, `media_config` and `video_job_config` MiniMax-H3; `readout_config` and `diffusion_generation_config` DiffusionGemma. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
+Some tables configure one model family: `chat_config` and `image_fetch_config` the text and chat models (Qwen3); `video_config`, `media_config` and `video_job_config` MiniMax-H3. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
 
 ## Configuration file
 
@@ -58,7 +58,7 @@ max_running_requests = 2
 [server_config]
 host = "0.0.0.0"
 
-[quantization_config]
+[quantization]
 mode = "quality"
 
 [cuda_graph_config]
@@ -73,7 +73,21 @@ retention = "30m"
 
 ## Options
 
+Each option's destination follows what its value is used for (§7.7 of `specs/worker.md`): a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the frontend or the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
+
+Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`).
+
 ### Top level
+
+| Destination | Options |
+| --- | --- |
+| Deployment identity, cannot change | `model`, `served_model_name` |
+| Build config | `max_model_len`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
+| Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
+| Host layer, frontend | `mm_processor_kwargs` |
+| Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase; read at `crates/daemon/src/epoch.rs:1293-1299` |
+| Program parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
+| Retired, refused by name | `quantization_config`: the option is stated as `quantization`, and the retired spelling is refused with the name to state instead |
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -81,22 +95,25 @@ retention = "30m"
 | `served_model_name` | `model` | The single model name the API serves |
 | `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; 16384 prompt tokens for a MiniMax-H3 pipeline | Longest sequence a request may reach, in tokens |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
-| `quantization_config` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the model's default |
+| `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the checkpoint's own quantization |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |
 | `attention_backend` | `"auto"` | Attention provider: `auto` selects a native kernel per call; `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` or `sgl_kernel` serves every call |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
-| `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's storage ledger, which both worlds of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
+| `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's storage ledger, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups; requests go to the scheduler with the fewest in flight. With `worker_groups`, the file's model groups form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
 | `host_identity` | `"localhost"` | This node's host name; its daemon runs the ranks assigned to this host |
-| `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor world there while the HTTP daemon remains on its node |
+| `engine_host` | This node's identity | The joined node that runs the engine and any ranks without an explicit host. Changing it starts a successor epoch there while the HTTP daemon remains on its node |
 | `nnodes` | `1` | Nodes of the deployment, each running one `uniserve serve` |
 | `node_rank` | `0` | This node's rank. The leader, rank 0, serves the API and requires `model`; the other node daemons join it and launch engines or workers assigned to their hosts |
 | `dist_init_addr` | Unset | The leader's `HOST:PORT`, which the other nodes' daemons join at and the leader binds on every interface; required with several nodes |
 
 ### `server_config`
+
+**Destination: host layer, frontend.**
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -111,15 +128,21 @@ retention = "30m"
 
 ### `load_config`
 
+**Destination: build config.**
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `format` | `"auto"` | Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer at a time) or `dummy` (no weights read) |
 | `download_dir` | Hugging Face default | Cache root for repository models |
 | `threads` | Loader default | Concurrent checkpoint file readers |
 | `weights` | unset | A plugin's weight source (`scheme://...`, `docs/plugins.md`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
-| `parallel_degrees` | every degree up to the GPUs a worker sees | The tensor- and expert-parallel degrees the deployment's configurations use. Retained weight storage is allocated in chunks cut where any of these degrees divides a logical tensor, so a world of another of them maps the chunks it shares with the world before it on the same GPU instead of copying them (`docs/architecture.md`, Weights). State them when the deployment may grow beyond the GPUs its workers see |
+| `parallel_degrees` | every degree up to the GPUs a worker sees | The tensor- and expert-parallel degrees the deployment's configurations use. Retained weight storage is allocated in chunks cut where any of these degrees divides a logical tensor, so an epoch of another of them maps the chunks it shares with the epoch before it on the same GPU instead of copying them (`docs/architecture.md`, Weights). State them when the deployment may grow beyond the GPUs its workers see |
 
 ### `kv_cache_config`
+
+**Destination: build config.**
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -128,13 +151,18 @@ retention = "30m"
 | `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |
 | `host_tier` | `true` | With `prefix_caching`, offload prompt pages to the host KV cache of each host's Storage Server and load them back when a later prompt's prefix continues past the device cache's match: every published page of a full-attention cache group, and a sliding-window group's window before each aligned boundary (`boundary_interval`) |
-| `host_ratio` | `2.0` | With `host_tier`, the host KV cache's token count over the device KV cache's, the same on every rank of a world (as SGLang's `--hicache-ratio`): each cache group's pool holds that many tokens' pages. Each host's Storage Server lowers the count for the whole world to what four fifths of its available storage hold (bounded by its storage cgroup limit, counting the deployment's pools no world maps, less what the pools have yet to allocate and its reserve) over the bytes a token takes on all of the world's ranks on the host |
-| `host_gib` | None | With `host_tier`, the deployment's host KV cache on each host, in GiB, in place of `host_ratio` (as SGLang's `--hicache-size`): every rank of a world holds as many tokens as this holds over the bytes a token takes on all of the world's ranks on the host, the least over the hosts. The host's Storage Server refuses a pool its available storage cannot hold |
-| `mooncake` | None | With `host_tier`, keep every page of the host KV cache in Mooncake, the KV storage, and prefetch hits of at least 256 tokens back into the host KV cache at admission; the pages a world change evicts from the device pass through the host KV cache into Mooncake even when it holds fewer of them than are evicted, and a host whose storage holds no pool stages them through pools of at most 256 MiB on each rank, admitted from its reserve: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host storage each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
+| `host_ratio` | `2.0` | With `host_tier`, the host KV cache's token count over the device KV cache's, the same on every rank of an epoch (as SGLang's `--hicache-ratio`): each cache group's pool holds that many tokens' pages. Each host's Storage Server lowers the count for the whole epoch to what four fifths of its available storage hold (bounded by its storage cgroup limit, counting the deployment's pools no epoch maps, less what the pools have yet to allocate and its reserve) over the bytes a token takes on all of the epoch's ranks on the host |
+| `host_gib` | None | With `host_tier`, the deployment's host KV cache on each host, in GiB, in place of `host_ratio` (as SGLang's `--hicache-size`): every rank of an epoch holds as many tokens as this holds over the bytes a token takes on all of the epoch's ranks on the host, the least over the hosts. The host's Storage Server refuses a pool its available storage cannot hold |
+| `mooncake` | None | With `host_tier`, keep every page of the host KV cache in Mooncake, the KV storage, and prefetch hits of at least 256 tokens back into the host KV cache at admission; the pages an epoch change evicts from the device pass through the host KV cache into Mooncake even when it holds fewer of them than are evicted, and a host whose storage holds no pool stages them through pools of at most 256 MiB on each rank, admitted from its reserve: an object with `master` (`host:port`, required), `metadata_server` (`"P2PHANDSHAKE"`), `protocol` (`"tcp"` or `"rdma"`), `device` (RDMA devices, automatic when empty), `global_segment_gib` (host storage each host contributes to Mooncake, `0`) and `library` (`libmooncake_store.so`, else `MOONCAKE_STORE_LIBRARY` or the loader's search path). It applies to the Storage Servers the deployment starts |
 | `boundary_interval` | `64` | With `host_tier`, the pages of the largest block size between the aligned boundaries a long prompt offloads its sliding windows before; a prompt also offloads them before the last boundary a reissue of it reuses and before its last full page. Larger intervals offload fewer windows, and a prompt that continues one offloaded earlier reuses less of it |
-| `state_interval` | `256` | For a model that keeps a recurrent state per request (Qwen3.5), the decoded tokens between two checkpoints of a request's state (as SGLang's `--mamba-track-interval`); a prompt call checkpoints the last page boundary it reaches whatever the interval. A request resumed by its tokens (a migration, a world change, a prefix reuse) recomputes at most this many decoded tokens; a checkpoint occupies the units of every recurrent layer's state |
+| `state_interval` | `256` | For a model that keeps a recurrent state per request (Qwen3.5), the decoded tokens between two checkpoints of a request's state (as SGLang's `--mamba-track-interval`); a prompt call checkpoints the last page boundary it reaches whatever the interval. A request resumed by its tokens (a migration, an epoch change, a prefix reuse) recomputes at most this many decoded tokens; a checkpoint occupies the units of every recurrent layer's state |
 
 ### `scheduler_config`
+
+**Destination, per field:** `policy` is a program backend name (the scheduling policy); `max_queued_requests`, `chunked_prefill_size` and `max_batch` are program parameters of that policy, bounded by the build config's limits.
+
+**Read at:** `policy` in `crates/daemon/src/epoch.rs:1235`; `chunked_prefill_size` `:1379`; `max_queued_requests` `:1383`; `max_batch` `:1372`, where the captured decode graphs' rows bound it. `max_num_batched_tokens` is read at `:1364-1366`, and a value above the catalog is refused at load rather than clamped.
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -145,42 +173,53 @@ retention = "30m"
 
 ### `speculative_config`
 
-Speculative decoding with the model's own drafter, the multi-token prediction layer of a Qwen3.5 checkpoint (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request a world change moved from a world that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / g` exceed the refill's tokens times `k`, both sides in decode steps, with `g` the speedup speculation gives a request and `k` the time of evaluating one context token. Each scheduler measures both from what its world executes, as averages over about the last sixteen observations: a verification carrying drafts commits `s` tokens, the workers' decoding step takes `v` with drafts and `d` without, and a prompt step `p` per token; speculating, a request takes `v / s` per token in place of `d`, so `g = s * d / v` and `k = p / d`, and while every step has carried drafts `d` is `v`. A world whose verification steps cost as many decode steps as they commit tokens (`g` at most `1`) refills nothing; until it has measured what it needs, a world refills, which measures it. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request (Qwen3.5) serves eagerly in any case.
+**Destination, per field:** `num_draft_tokens` is build config (it sizes the draft the main process builds); `expected_speedup` and `refill_token_cost` are program parameters of the scheduling policy.
+
+**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` `crates/daemon/src/epoch.rs:1388`; `refill_token_cost` `:1389`.
+
+
+Speculative decoding with the model's own drafter, the multi-token prediction layer of a Qwen3.5 checkpoint (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request an epoch change moved from an epoch that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / g` exceed the refill's tokens times `k`, both sides in decode steps, with `g` the speedup speculation gives a request and `k` the time of evaluating one context token. Each scheduler measures both from what its epoch executes, as averages over about the last sixteen observations: a verification carrying drafts commits `s` tokens, the workers' decoding step takes `v` with drafts and `d` without, and a prompt step `p` per token; speculating, a request takes `v / s` per token in place of `d`, so `g = s * d / v` and `k = p / d`, and while every step has carried drafts `d` is `v`. An epoch whose verification steps cost as many decode steps as they commit tokens (`g` at most `1`) refills nothing; until it has measured what it needs, an epoch refills, which measures it. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request (Qwen3.5) serves eagerly in any case.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `num_draft_tokens` | `0` | The most draft tokens a verification carries per request; `0` does not speculate. A world that speculates keeps the draft cache in its pool and runs the drafter, so setting or changing it is a world change (`PUT /admin/config`) |
+| `num_draft_tokens` | `0` | The most draft tokens a verification carries per request; `0` does not speculate. An epoch that speculates keeps the draft cache in its pool and runs the drafter, so setting or changing it is an epoch change (`PUT /admin/config`) |
 | `expected_speedup` | Measured | The refill policy's speedup `g`, stated in place of the measured one, at least `1`; applied in place by `PUT /admin/config` |
 | `refill_token_cost` | Measured | The refill policy's time `k` of evaluating one context token in a refill, in decode steps, stated in place of the measured one, not negative; applied in place by `PUT /admin/config` |
 
 ### `migration_config`
 
-A token request that generates text moves to the engine that serves next when its world parks for a world change or a rollback, or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
+**Destination: host layer, frontend.**
+
+
+A token request that generates text moves to the engine that serves next when its epoch parks for an epoch change or a rollback, or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_migrations` | `3` | Migrations caused by lost workers, a lost engine process or a failed world on trial that a request survives before it fails; migrations of a world change or a rollback are not counted |
+| `max_migrations` | `3` | Migrations caused by lost workers, a lost engine process or a failed epoch on trial that a request survives before it fails; migrations of an epoch change or a rollback are not counted |
 
 ### `update_config`
 
-How the deployment moves to a configuration that a new world executes (`PUT /admin/config`, [admin API](admin.md#configuration-changes-and-worlds)). An option that an update's own `set` states governs that update alone; the configuration keeps its own.
+**Destination: host layer, daemon.**
+
+
+How the deployment moves to a configuration that a new epoch executes (`PUT /admin/config`, [admin API](admin.md#configuration-changes-and-epochs)). An option that an update's own `set` states governs that update alone; the configuration keeps its own.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `previous_world` | `"parked"` | What the previous world keeps while its successor is on trial: `parked`, its processes, communicators, graph storage and weights, so that a rollback resumes it at once; `weights`, its weights alone, its processes exiting at the promotion, so that a rollback starts it again on them; `host`, as `weights` with the weights its successor does not map moved to host storage through each host's Transfer Server, so that the successor's cache grows into their device storage too, and a rollback returns them to the GPUs before it starts the previous world again. A host whose Storage Server runs no Transfer Server, or that cannot hold them under its host-storage rule, keeps them on its GPUs, and the trial's status reports the previous world kept as `weights` with each host's reason (`host_refused`) |
-| `preempt_after` | Unset | How long the serving world's requests that hold the tail of the KV cache a successor needs run on before they are recomputed on the cache left; unset lets them run to their end, except one that cannot get a unit to continue, which is recomputed at once |
+| `previous_world` | `"parked"` | What the previous epoch keeps while its successor is on trial: `parked`, its processes, communicators, graph storage and weights, so that a rollback resumes it at once; `weights`, its weights alone, its processes exiting at the promotion, so that a rollback starts it again on them; `host`, as `weights` with the weights its successor does not map moved to host storage through each host's Transfer Server, so that the successor's cache grows into their device storage too, and a rollback returns them to the GPUs before it starts the previous epoch again. A host whose Storage Server runs no Transfer Server, or that cannot hold them under its host-storage rule, keeps them on its GPUs, and the trial's status reports the previous epoch kept as `weights` with each host's reason (`host_refused`) |
+| `preempt_after` | Unset | How long the serving epoch's requests that hold the tail of the KV cache a successor needs run on before they are recomputed on the cache left; unset lets them run to their end, except one that cannot get a unit to continue, which is recomputed at once |
 | `cache_tail_tokens` | Largest source or target cache page | Maximum accepted tokens not yet warmed per request before promotion; a positive integer. Requests continue running while complete pages are copied in successive rounds |
 | `cache_prefill_tokens` | Largest source or target cache page | Source prefill tokens per scheduling step after the first warming round; a positive integer. Decode retains its ordinary budget, requests remain admitted, and promotion or preparation failure restores the configured prefill budget |
 | `transfer_slowdown` | `0.1` | How much longer than before the change a serving scheduler's step may take while the successor prepares, as a fraction (`0.1` for 10%), past which the leader halves the byte budgets of the links the change's transfers use on every node, each second while it lasts, and restores them once every scheduler's steps are back within it; the default is measured on GB200 (below) |
-| `eager_prepare` | `false` | Whether the serving world runs its forwards eagerly while its successor prepares, giving its CUDA graph storage (10% of each GPU) to the successor's captures: it steps slower meanwhile, and replays its graphs again if it serves on or a rollback resumes it. A world whose computations serve by their graphs alone (image, video and diffusion language models) refuses it |
+| `eager_prepare` | `false` | Whether the serving epoch runs its forwards eagerly while its successor prepares, giving its CUDA graph storage (10% of each GPU) to the successor's captures: it steps slower meanwhile, and replays its graphs again if it serves on or a rollback resumes it. An epoch whose computations serve by their graphs alone (image, video and diffusion language models) refuses it |
 | `rollback.failure_rate` | Unset | The share of the requests that end during the trial, in (0, 1], past which a trial whose requests failed rolls back |
-| `rollback.step_time_regression` | Unset | How much longer than the previous world's average step before its promotion the successor's may take, as a fraction (`0.2` for 20%), before the trial rolls back |
-| `rollback.throughput_regression` | Unset | How much lower than the previous world's token throughput before its promotion the successor's may fall, as a fraction, before the trial rolls back |
+| `rollback.step_time_regression` | Unset | How much longer than the previous epoch's average step before its promotion the successor's may take, as a fraction (`0.2` for 20%), before the trial rolls back |
+| `rollback.throughput_regression` | Unset | How much lower than the previous epoch's token throughput before its promotion the successor's may fall, as a fraction, before the trial rolls back |
 | `rollback.window` | Unset | The span step time and throughput are averaged over, before the promotion and during the trial; required with either regression |
 
 A trial also rolls back, whatever these state, on a fault of the successor: a worker error that leaves its workers unusable (an illegal memory access, a worker process's exit), a stalled job, non-finite logits, or its engine process's exit. None of the thresholds has a default: each is measured on the deployment's own workload.
 
-`transfer_slowdown` compares each scheduler's steps with its own steps of the same size and execution before the preparation (`crates/daemon/src/interference.rs`). A step's time is a once-a-second report's host-observed batch time over its batches, the step time the rollback thresholds read; a step's size is the power-of-two range of the report's query tokens per batch, since a step computing more tokens takes longer whatever the transfers do. A scheduler's baseline in a range is its batch time per batch over the minute before the preparation, once its reports there hold 20 batches; a report in a range without a baseline decides nothing. With `eager_prepare` the serving world's eager steps are slower than its graphs' whatever the transfers do, so its baseline holds only the reports of eager steps alone, those that arrive more than a second after the switch and before the preparation, and the successor starts once each scheduler made two of them with steps, about 2 to 3 s after the switch. A scheduler that runs no step for 2.5 s has nothing to protect: the successor starts without its baseline, the change's progress notes it (`GET /admin/config`), and its reports decide nothing. The change's report gives the wait (`eager_baseline_seconds`) and the halvings and restorations the leader sent (`transfer_halvings`, `transfer_restorations`). The halving takes every link a task of the deployment copies over at that moment (a deployment changes one world at a time), and the restoration every link a halving reduced, which the Transfer Server grows back by 1/8 of its bandwidth per second; the end of the preparation restores them too.
+`transfer_slowdown` compares each scheduler's steps with its own steps of the same size and execution before the preparation (`crates/daemon/src/interference.rs`). A step's time is a once-a-second report's host-observed batch time over its batches, the step time the rollback thresholds read; a step's size is the power-of-two range of the report's query tokens per batch, since a step computing more tokens takes longer whatever the transfers do. A scheduler's baseline in a range is its batch time per batch over the minute before the preparation, once its reports there hold 20 batches; a report in a range without a baseline decides nothing. With `eager_prepare` the serving epoch's eager steps are slower than its graphs' whatever the transfers do, so its baseline holds only the reports of eager steps alone, those that arrive more than a second after the switch and before the preparation, and the successor starts once each scheduler made two of them with steps, about 2 to 3 s after the switch. A scheduler that runs no step for 2.5 s has nothing to protect: the successor starts without its baseline, the change's progress notes it (`GET /admin/config`), and its reports decide nothing. The change's report gives the wait (`eager_baseline_seconds`) and the halvings and restorations the leader sent (`transfer_halvings`, `transfer_restorations`). The halving takes every link a task of the deployment copies over at that moment (a deployment changes one epoch at a time), and the restoration every link a halving reduced, which the Transfer Server grows back by 1/8 of its bandwidth per second; the end of the preparation restores them too.
 
 The default, 0.1, comes from a measurement on GB200 (`crates/storage-server/examples/transfer_interference.rs`; protocol, raw data and tables in `artifacts/transfer-interference/`): Qwen3-30B-A3B served on one GPU in BF16 under a closed-loop decode load of 64 concurrent requests of 128 prompt and 1024 output tokens (68 query tokens per step, 20.5 ms steps), while the Transfer Server copied into that GPU at a link's whole budget and at 1/4, 1/16 and 1/64 of it, 30 s per point, in three runs, each with a fresh server. The step time is the one the leader reads, per once-a-second report.
 
@@ -194,6 +233,9 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `placement_config`
 
+**Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there. §7.7's table does not list this section; the destination is stated here so no option is without one, and it is the one destination in this file that asks for confirmation rather than quoting the table.
+
+
 `device`, `devices`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
 
 | Option | Default | Meaning |
@@ -206,6 +248,11 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `moe_config`
 
+**Destination, per field:** `expert_parallel` and `microbatches` are build config; `exchange` is a program backend name (expert exchange).
+
+**Read at:** `exchange` in `crates/daemon/src/epoch.rs:1212`, where it becomes the expert-exchange operator's backend; `moe_runner_backend` `:1218`.
+
+
 [Expert parallelism](expert_parallelism.md) describes each exchange.
 
 | Option | Default | Meaning |
@@ -216,6 +263,9 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `cuda_graph_config`
 
+**Destination: build config.**
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `policy` | `"auto"` | Whether a worker group runs every call with CUDA graphs or every call eagerly, chosen when its workers load and never mixed: `auto` captures graphs unless serving does not capture the attention provider's calls or a module's (the gated delta attention of Qwen3.5 runs a host loop over its chunks), and then serves eagerly; `full` requires graphs; `off` serves every call eagerly (CPU workers always do). Under graphs the text buckets hold every decode and prefill batch the worker admits; prefill and image denoising are always captured, and a request whose shapes no captured graph holds is refused with the reason, never run eagerly: an image vision encoder must pack its images into fixed slots, and a video denoiser serving `ref2va` serves only with `off` |
@@ -224,6 +274,11 @@ Each entry is the median over the point's reports of the step time over its run'
 | `flow_shapes` | The model's default image size and its transpose | Distinct `HEIGHTxWIDTH` image sizes captured. Under graphs an image model generates only these sizes, encodes only the generated images of these sizes into latents (input images whose latent size is not among them are refused), and decodes only these sizes |
 
 ### `flashinfer_config`
+
+**Destination: program parameters** of the FlashInfer attention program.
+
+**Read at:** `crates/daemon/src/epoch.rs:1300`, which turns the section into the attention program's TOML arguments; an argument the program does not declare reaches it as data rather than being dropped here.
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -235,29 +290,37 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `worker_config`
 
+**Destination: build config**, every option of the table above. `distributed_backend` is retired and no longer listed: a configuration that builds no torch process group has nothing to name a backend for.
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `executable` | The daemon's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the workers run as (`uniserve worker`), and that starts a host's Storage Server; it runs workers in the Python environment it is installed in. It is also the executable every node's main process of the next epoch runs: a change of it changes the epoch's build config, so the change is applied by an epoch switch (§7.4) — the target executable starts as the next generation of the same group and rank, parks, is promoted in place, and serves once the previous epoch has drained — and the epoch's build identity is the one its first child reports |
 | `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled job after half of it |
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
-| `distributed_backend` | Torch default | Torch process-group backend for the workers' collectives |
-| `standby` | `false` | Keep a parked standby beside every node's main process of the serving epoch. The standby is a second child of the same group, rank and world at the next launch generation, with its own CUDA contexts: it maps the epoch's weights and cache read-only, captures its graphs on the warmup scratch units, keeps its graph pools, scratch and communicators resident or suspended per `standby_storage`, and parks; it reports `Parked` when it is ready, and `Promoted` when the promotion took effect: an update's target is parked by the switch that starts it and answers those reports to it, while the standby a serving epoch keeps parks while it starts and is promoted in place when its failure domain fails, without an update in flight. When the serving main process fails with a process-fatal fault, its whole failure domain — the node's main process plus every cross-node group it is in — promotes one parked child per node, every promotion issued before any answer is awaited, and each node then starts a new standby at the generation after the promoted one. A member of the domain without a parked standby makes the domain relaunch instead, and a GPU that needs a reset takes its node's standby with it, so only migration to another node or replica helps. No standby exists while the epoch is in precopy or on probation: a fault there reverts the update, and the epoch is started again rather than promoted. Each standby child holds a CUDA context, graph pools and workspaces of its own, which the device storage `mem_fraction_static` leaves must hold. `worker_config.executable` and the workers it still starts keep their standby by the same rule until the worker process is retired: a group that is its own failure domain and runs on one node keeps a standby rank group, and the groups of an expert world or on several nodes keep a standby world of the domain |
-| `standby_storage` | `auto` | How a parked standby (a node's standby child, a group's standby rank group or a failure domain's standby world) keeps the device storage of its graph pools, operator scratch, expert all-to-all workspaces and NCCL communicators: `resident`; `suspended`, released on the device and restored at the promotion, before its graphs run (the graph storage is copied to host storage and back with its contents at unchanged addresses; the `alltoall` exchange's MNNVL workspace is unmapped and mapped again at its addresses by every rank of the world together; NCCL communicators are suspended and resumed, and such a standby captures their collectives without NCCL graph buffer registration; the `deepep` exchange's windows and the colocated `megamoe` exchange's NVSHMEM heap, which cannot keep their addresses, are freed, and the promotion creates them again and captures the graphs that run expert steps anew); or `auto`, resident while every device keeps beside it a tenth of its storage, the share a serving worker leaves for graphs and activations, and suspended otherwise. The ranks of a world, group or domain take one mode: one rank's crowded device suspends them all. A standby that lacks that share even suspended is not kept |
+| `standby` | `false` | Keep a parked standby beside every node's main process of the serving epoch. The standby is a second child of the same group, rank and epoch at the next launch generation, with its own CUDA contexts: it maps the epoch's weights and cache read-only, captures its graphs on the warmup scratch units, keeps its graph pools, scratch and communicators resident or suspended per `standby_storage`, and parks; it reports `Parked` when it is ready, and `Promoted` when the promotion took effect: an update's target is parked by the switch that starts it and answers those reports to it, while the standby a serving epoch keeps parks while it starts and is promoted in place when its failure domain fails, without an update in flight. When the serving main process fails with a process-fatal fault, its whole failure domain — the node's main process plus every cross-node group it is in — promotes one parked child per node, every promotion issued before any answer is awaited, and each node then starts a new standby at the generation after the promoted one. A member of the domain without a parked standby makes the domain relaunch instead, and a GPU that needs a reset takes its node's standby with it, so only migration to another node or replica helps. No standby exists while the epoch is in precopy or on probation: a fault there reverts the update, and the epoch is started again rather than promoted. Each standby child holds a CUDA context, graph pools and workspaces of its own, which the device storage `mem_fraction_static` leaves must hold. `worker_config.executable` and the workers it still starts keep their standby by the same rule until the worker process is retired: a group that is its own failure domain and runs on one node keeps a standby rank group, and the groups of an expert world or on several nodes keep a standby epoch of the domain |
+| `standby_storage` | `auto` | How a parked standby (a node's standby child, a group's standby rank group or a failure domain's standby epoch) keeps the device storage of its graph pools, operator scratch, expert all-to-all workspaces and NCCL communicators: `resident`; `suspended`, released on the device and restored at the promotion, before its graphs run (the graph storage is copied to host storage and back with its contents at unchanged addresses; the `alltoall` exchange's MNNVL workspace is unmapped and mapped again at its addresses by every rank of the epoch together; NCCL communicators are suspended and resumed, and such a standby captures their collectives without NCCL graph buffer registration; the `deepep` exchange's windows and the colocated `megamoe` exchange's NVSHMEM heap, which cannot keep their addresses, are freed, and the promotion creates them again and captures the graphs that run expert steps anew); or `auto`, resident while every device keeps beside it a tenth of its storage, the share a serving worker leaves for graphs and activations, and suspended otherwise. The ranks of an epoch, group or domain take one mode: one rank's crowded device suspends them all. A standby that lacks that share even suspended is not kept |
 
 A worker compiles the kernels its model runs that its machine has not cached yet, on first use. The compilations run up to `MAX_JOBS` parallel jobs when the worker's environment, its host daemon's, sets it. Otherwise each worker takes an equal share, among the ranks of its launch on its host, of half of the host's available CPUs and of the host storage available as it starts, at 6.1 GiB per job (the peak of one compiler process of FlashInfer's fused-MoE kernels), and at least one job; its log states the number.
 
 ### `profiling_config`
+
+**Destination, per field:** `fence_components` and `graph_pc_sampling` are build config; `fence_probes` and `fence_probes_off` are profiling switches rather than deployment content and keep switching in place at a step boundary.
+
 
 The workers' always-on profiling: the fence probes at the entry and exit of the model's components, exported as per-step component durations (`uniserve:worker_fence_step_seconds`, [execution profiling](profiling.md#fence-probes)). Profiling sessions take their options with their request (`POST /admin/profile`).
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `fence_probes` | `true` | Whether the probes record; a change switches every worker's probes in place, at the engine's next step boundary |
-| `graph_pc_sampling` | `false` | Whether every worker enables CUPTI's PC sampling, stopped, before it captures its CUDA graphs and keeps it enabled for its life, so that `pc_sampling` sessions attribute the samples of the graphs' kernels. CUPTI cannot run PM sampling, the range profiler or whole-graph activity records beside it, so sessions of `pm_sampling`, `range_metrics` and timelines that trace graphs whole are then refused. Each worker holds CUPTI's sampling buffer and working storage as process host storage: about 129 MiB at the default period (131,584 KiB measured on GB200), and up to 512 MiB more while a session samples at a short period (`docs/profiling.md`). The enabled sampler slows serving even while no session samples: on GB200 serving Qwen3-30B-A3B to 1 and to 32 concurrent requests, the step time averaged 9.6% and 11.6% more than without the option (eight points of a minute each way, from two servers each; single points from 1% to 21% more), and the step time with the option varied more between points. The graphs are captured at a world's start, so a change takes a new world |
-| `fence_components` | `["*.Transformer"]` (each model's decoder stack, within the always-on budget `docs/profiling.md` states) | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into a world's CUDA graphs, so a change takes a new world. Empty for no probe |
+| `graph_pc_sampling` | `false` | Whether every worker enables CUPTI's PC sampling, stopped, before it captures its CUDA graphs and keeps it enabled for its life, so that `pc_sampling` sessions attribute the samples of the graphs' kernels. CUPTI cannot run PM sampling, the range profiler or whole-graph activity records beside it, so sessions of `pm_sampling`, `range_metrics` and timelines that trace graphs whole are then refused. Each worker holds CUPTI's sampling buffer and working storage as process host storage: about 129 MiB at the default period (131,584 KiB measured on GB200), and up to 512 MiB more while a session samples at a short period (`docs/profiling.md`). The enabled sampler slows serving even while no session samples: on GB200 serving Qwen3-30B-A3B to 1 and to 32 concurrent requests, the step time averaged 9.6% and 11.6% more than without the option (eight points of a minute each way, from two servers each; single points from 1% to 21% more), and the step time with the option varied more between points. The graphs are captured at an epoch's start, so a change takes a new epoch |
+| `fence_components` | `["*.Transformer"]` (each model's decoder stack, within the always-on budget `docs/profiling.md` states) | Name patterns (`*` matches any run) of the components whose module instances carry probes, a component being the `<component>` of the function its module class declares (`uniserve/numerics.py`); the probes are captured into an epoch's CUDA graphs, so a change takes a new epoch. Empty for no probe |
 | `fence_probes_off` | `[]` | Name patterns (`*` matches any run) of the probed components whose probes stay off while `fence_probes` is on, for components whose probes cost more than the always-on budget; a change switches every worker's probes in place, at the engine's next step boundary, as `fence_probes` does |
 
 ### `logging_config`
+
+**Destination: host layer, daemon.**
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -265,6 +328,9 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | `log_stats` | `true` | Log engine statistics periodically |
 
 ### `chat_config`
+
+**Destination: host layer, frontend.**
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -275,6 +341,9 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 
 ### `image_fetch_config`
 
+**Destination: host layer, frontend.**
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `timeout` | `"20s"` | Time to fetch one `http(s)` image URL, redirects and body included |
@@ -282,6 +351,9 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 | `allow_private` | `false` | Allow image URLs resolving to loopback, private, link-local, unique-local or cloud metadata addresses |
 
 ### `video_config`
+
+**Destination: build config.**
+
 
 The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how these options size startup and capacity.
 
@@ -295,6 +367,9 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 ### `media_config`
 
+**Destination: host layer, frontend.**
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `directory` | Unset | Directory `file://` condition media resolves under; `file://` is refused when unset |
@@ -304,24 +379,13 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 ### `video_job_config`
 
+**Destination: host layer, frontend.**
+
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `retention` | `"1h"` | Time a finished asynchronous job stays retrievable |
 | `max_bytes` | `"1GiB"` | Generated video the asynchronous jobs keep in shared memory |
-
-### `readout_config`
-
-The [DiffusionGemma serving guide](diffusion_gemma/serving.md) explains these options.
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `layout` | `"joint"` | `joint` packs System One questions into shared canvases; `independent` gives each its own prompt and canvas |
-| `canvas` | `"full"` | Canvas length: `full`, `compact`, or a positive multiple of 16 |
-| `candidates` | `"variants"` | `variants` sums supported answer spellings; `primary` reads the space-prefixed one |
-
-### `diffusion_generation_config`
-
-DiffusionGemma's block-diffusion sampling of every generated reply; each option stated replaces the checkpoint's `generation_config.json` value of the same name: `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold` and `stability_threshold`.
 
 ## Deployment files
 

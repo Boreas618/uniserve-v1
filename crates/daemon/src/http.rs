@@ -42,7 +42,7 @@ use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
-use crate::openai::{self, ApiError, chat_completions, images, videos};
+use crate::openai::{self, ApiError, chat_completions, videos};
 use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
@@ -486,9 +486,6 @@ pub(crate) fn router(
                     Arc::clone(&engine),
                     Arc::clone(&handoff),
                 ));
-            }
-            Task::ImageGeneration => {
-                generation = generation.merge(images::router(Arc::clone(&engine)));
             }
             Task::VideoGeneration => {
                 generation = generation.merge(videos::generation_router(

@@ -139,7 +139,7 @@ Each cell sends one unmeasured warmup at seed 42 and one measured request at see
 Every measured video is written to a fixed path under `artifacts/`, `artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4`, so a confirmed cell keeps the path a person watches and no cell writes into another's directory: `<checkpoint>` is `fasth3-dmd`, `fasth3-omniref` or `base`, `<task>` is `t2va`, `fl2va` or `ref2va`, and `<request id>` is the row's ID, such as `w1-measured-seed0`. Each point's bundle, with its requests, media index and summary, is under `artifacts/minimax_h3/check/results/<point>`.
 
 No server states a precision selector: the launch's default `dtype` is `bfloat16` and an empty
-`quantization_config` loads the model's first preset, `quality`, so every cell measures the
+`quantization` loads the model's first preset, `quality`, so every cell measures the
 representation the shipped performance profiles serve.
 
 `uniserve_eval/check_h3.toml` names the six cells **twice**, in two orders, and the two runs say

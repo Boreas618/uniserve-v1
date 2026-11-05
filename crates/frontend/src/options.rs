@@ -63,10 +63,6 @@ pub struct Options {
     pub media_config: MediaOptions,
     /// Finished video jobs (`video_job_config`).
     pub video_job_config: VideoJobOptions,
-    /// System One readouts (`readout_config`). The design retires it with the
-    /// model families that serve readouts; it is carried while that code
-    /// still exists.
-    pub readout_config: ReadoutOptions,
     /// Movement of token requests between epochs (`migration_config`).
     pub migration_config: MigrationOptions,
 }
@@ -90,7 +86,6 @@ impl Default for Options {
             video_config: VideoOptions::default(),
             media_config: MediaOptions::default(),
             video_job_config: VideoJobOptions::default(),
-            readout_config: ReadoutOptions::default(),
             migration_config: MigrationOptions::default(),
         }
     }
@@ -337,51 +332,6 @@ impl Default for VideoJobOptions {
             max_bytes: 1 << 30,
         }
     }
-}
-
-/// System One readouts (`readout_config`).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct ReadoutOptions {
-    /// `joint` packs questions into shared canvases; `independent` gives
-    /// each its own prompt and canvas.
-    pub layout: ReadoutLayout,
-    /// Canvas length.
-    pub canvas: CanvasMode,
-    /// Which supported answer spellings are summed.
-    pub candidates: CandidateTokens,
-}
-
-/// How a readout lays its questions out (`readout_config.layout`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReadoutLayout {
-    /// Pack questions into shared canvases.
-    #[default]
-    Joint,
-    /// Give each question its own prompt and canvas.
-    Independent,
-}
-
-/// The canvas length of a readout (`readout_config.canvas`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CanvasMode {
-    /// The canvas the questions fill.
-    #[default]
-    Full,
-    /// The compact canvas.
-    Compact,
-    /// A fixed multiple of 16 tokens, no longer than the checkpoint's
-    /// canvas.
-    Fixed(u32),
-}
-
-/// Which answer spellings a readout sums (`readout_config.candidates`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CandidateTokens {
-    /// Sum the variants of each answer.
-    #[default]
-    Variants,
-    /// Read the space-prefixed one.
-    Primary,
 }
 
 /// Movement of token requests between epochs (`migration_config`).
