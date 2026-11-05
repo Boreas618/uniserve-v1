@@ -2413,8 +2413,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        self.lifecycle.rebind(bucket, generation, walked?, &kernels)
     }
 
     /// The pool stream this runner's graphs are planned and replayed on.
