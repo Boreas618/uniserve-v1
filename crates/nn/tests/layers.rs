@@ -371,14 +371,71 @@ fn a_convolution_states_the_descriptor_its_launch_takes() {
         ConvTranspose1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
     );
 
-    let conv3d = Conv3d::new(spatial_weight, None, spatial, false).unwrap();
+    let conv3d = Conv3d::new(spatial_weight, None, spatial, false, false).unwrap();
     assert_eq!(
         conv3d.descriptor(DType::F32, DType::F32),
-        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false)
+        Conv3d::descriptor_of(
+            DType::F32,
+            DType::F32,
+            false,
+            DType::F32,
+            spatial,
+            false,
+            false
+        )
     );
     // A weight in another type is the descriptor's weight operand, not the launch's input.
     assert_ne!(
-        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false),
-        Conv3d::descriptor_of(DType::F32, DType::BF16, false, DType::F32, spatial, false)
+        Conv3d::descriptor_of(
+            DType::F32,
+            DType::F32,
+            false,
+            DType::F32,
+            spatial,
+            false,
+            false
+        ),
+        Conv3d::descriptor_of(
+            DType::F32,
+            DType::BF16,
+            false,
+            DType::F32,
+            spatial,
+            false,
+            false
+        )
     );
+
+    // The iteration order is a call's, not a module's. The two descriptors are different values -
+    // the entry derives different strides for each - and they select the **same** module, which is
+    // the property that keeps one store serving both: an order in the key would compile the same
+    // convolution twice and make the walk's row count depend on which sites use which order.
+    let channels_first = Conv3d::descriptor_of(
+        DType::F32,
+        DType::F32,
+        false,
+        DType::F32,
+        spatial,
+        false,
+        false,
+    );
+    let channels_last = Conv3d::descriptor_of(
+        DType::F32,
+        DType::F32,
+        false,
+        DType::F32,
+        spatial,
+        false,
+        true,
+    );
+    assert!(channels_last.channels_last && !channels_first.channels_last);
+    assert_eq!(
+        channels_last.to_string(),
+        channels_first.to_string(),
+        "the order keys no module"
+    );
+
+    // And the layer states it: a `Conv3d` built channels-last describes a channels-last call.
+    let ordered = Conv3d::new(spatial_weight, None, spatial, false, true).unwrap();
+    assert!(ordered.descriptor(DType::F32, DType::F32).channels_last);
 }
