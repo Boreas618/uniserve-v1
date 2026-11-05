@@ -953,6 +953,38 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
+/// Whether a block table view holds `bytes` readable bytes of page indices.
+///
+/// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
+/// shorter than the read names no plan a launch could have. The copy is refused rather than
+/// clamped: a read past the column leaves the driver's error on the runner's stream, and a read of
+/// the wrong type prints numbers that are not page indices.
+fn table_readback_fits(view: &ops::TensorView, bytes: usize) -> bool {
+    view.dtype == ops::DType::I32
+        && view.byte_len().is_ok_and(|length| length >= bytes as u64)
+}
+
+/// The bytes a page readback covers, or the reason there is none.
+///
+/// A device copy that reads outside the allocation it describes is not a lost diagnostic: the
+/// driver's error sticks to the runner's stream and the next batch fails on it (2.4). So the range
+/// is computed and checked before anything is issued, and this function is the whole of that rule:
+/// the unit must be in the plane, and the plane must hold the bytes read.
+fn page_readback_range(
+    unit: i64,
+    units: i64,
+    plane_bytes: i64,
+    bytes: usize,
+) -> std::result::Result<u64, String> {
+    if plane_bytes < bytes as i64 {
+        return Err(format!("plane holds {plane_bytes} bytes, a read wants {bytes}"));
+    }
+    if unit < 0 || unit >= units {
+        return Err(format!("unit {unit} outside {units}"));
+    }
+    u64::try_from(unit * plane_bytes).map_err(|_| "offset".to_owned())
+}
+
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
 ///
 /// The cache is the memory owner's (8's resident pages and its block tables); the runner only
@@ -2298,15 +2330,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         else {
             return "odd-plane".to_owned();
         };
-        let unit = i64::from(unit);
-        if unit < 0 || unit >= units {
-            return format!("unit {unit} outside {units}");
-        }
-        let offset = match u64::try_from(unit * plane_bytes) {
-            Ok(offset) => offset,
-            Err(_) => return "offset".to_owned(),
-        };
         const BYTES: usize = 16;
+        let offset = match page_readback_range(i64::from(unit), units, plane_bytes, BYTES) {
+            Ok(offset) => offset,
+            Err(reason) => return reason,
+        };
         let mut host = [0_u8; BYTES];
         // SAFETY: the source is this page's first `BYTES` bytes inside a plane whose extent the view
         // above states, and the destination is this function's own host buffer of that length.
@@ -2333,6 +2361,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .find(|(name, _)| name == "key.initialized")
         {
             Some((_, flags)) => {
+                // The flag plane holds one byte per page, and the read is bounded by the plane's
+                // own extent for the reason every read here is.
+                let in_range = flags.dtype().to_ops() == Some(ops::DType::U8)
+                    && flags.shape().first().is_some_and(|&pages| pages > unit as i64)
+                    && flags.byte_len().is_ok_and(|length| length as u64 > unit as u64);
+                if !in_range {
+                    out.push_str(" init=out-of-range");
+                    return out;
+                }
                 let mut flag = [0_u8; 1];
                 // SAFETY: the destination is this function's own one-byte host buffer and the
                 // source is the flag of a unit the view above states.
@@ -2424,6 +2461,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Ok(table) => {
                 let mut entries = [0_i32; 8];
                 let bytes = entries.len() * std::mem::size_of::<i32>();
+                // A copy is issued only over a range the view itself states: a device copy that
+                // reads outside its allocation is not a lost diagnostic, it is a sticky error on
+                // this stream and the batch after it fails (2.4).
+                if !table_readback_fits(&table, bytes) {
+                    out.push_str(&format!(
+                        " table={} first8=short-view({:?})",
+                        spelled(&table),
+                        table.dtype
+                    ));
+                    return out;
+                }
                 // SAFETY: the source is this view's first eight `i32`, whose extent the view
                 // states, and the destination is this function's own buffer of that length.
                 let copied = unsafe {
@@ -3116,6 +3164,68 @@ fn gather_indices(
 
 #[cfg(test)]
 mod tests {
+    /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
+    /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
+    /// a diagnostic, it would fail the batch after it.
+    #[test]
+    fn a_page_readback_is_confined_to_the_plane_it_reads() {
+        use super::page_readback_range;
+
+        // Page 3 of a plane whose pages are 4096 bytes: the offset is the page's own start.
+        assert_eq!(
+            page_readback_range(
+                3, 8, 4096, 16
+            ),
+            Ok(3 * 4096)
+        );
+        // A unit past the plane's count and a unit below zero are both refused by name.
+        assert_eq!(
+            page_readback_range(
+                8, 8, 4096, 16
+            ),
+            Err("unit 8 outside 8".to_owned())
+        );
+        assert_eq!(
+            page_readback_range(
+                -1, 8, 4096, 16
+            ),
+            Err("unit -1 outside 8".to_owned())
+        );
+        // A plane narrower than the read is refused rather than read past.
+        assert_eq!(
+            page_readback_range(
+                0, 8, 8, 16
+            ),
+            Err("plane holds 8 bytes, a read wants 16".to_owned())
+        );
+    }
+
+    /// The table readback is taken only from a view that holds that many page indices: a shorter
+    /// column, or one of another element type, names no plan a launch could have made.
+    #[test]
+    fn a_table_readback_is_taken_only_from_a_column_that_holds_page_indices() {
+        use super::table_readback_fits;
+        use ops::{DType, DevicePtr, Shape, TensorView, Strides};
+
+        let table = TensorView::new(
+            DevicePtr::new(0),
+            DType::I32,
+            Shape::new(&[2, 640]),
+        );
+        assert!(table_readback_fits(&table, 32));
+        // Eight entries from a two-entry column is a read past it.
+        let short = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[1, 2]));
+        assert!(!table_readback_fits(&short, 32));
+        // The same bytes in floats are not page indices.
+        let floats = TensorView::with_strides(
+            DevicePtr::new(0),
+            DType::F32,
+            Shape::new(&[2, 640]),
+            Strides::row_major(Shape::new(&[2, 640])),
+        );
+        assert!(!table_readback_fits(&floats, 32));
+    }
+
     /// A prefill's row is its whole prompt, and the sampler must read the row of the stack that
     /// token ends: the gather index is the last token of the row's own range, not the row's own
     /// index. A decode is the case where the two agree, which is why reading the row index fails
