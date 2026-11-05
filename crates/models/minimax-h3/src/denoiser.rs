@@ -2106,7 +2106,14 @@ impl Denoiser {
         programs.extend(Transformer::programs(
             config, attention, dtype, boundary, rows, groups, partition, tiles,
         )?);
-        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
+        // The refiner's stream is the boundary's type, not the stack's: it is handed the prompt's
+        // features where they are widened into the network, and every row it launches is keyed from
+        // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
+        // its per-head norms, its two modulation gathers and its attention - and lacks the four it
+        // does.
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config, dtype, boundary,
+        )?);
 
         let video = config.video_channels;
 

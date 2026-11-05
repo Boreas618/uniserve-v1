@@ -162,20 +162,24 @@ EOF
 fi
 rm -f "$probe"
 
-# 1. The walks. No `--dtype`: each component's own type, read from the checkpoint (or from `--types`
-#    where this host has no shards). `--rows` is passed only because the walk still takes it as a flag;
-#    the two values are what `rows_bound()` computes.
+# 1. The walks, from the **generator** and not from the `programs` example.
+#
+#    A fixture is one deployment's rows, and a deployment is a canvas set, a clip ladder and a task.
+#    The `programs` example takes those as one request's arguments - `--track` is a single number, so
+#    it cannot state a clip ladder at all (`--samples 124,192,243,362 --track 346400` is refused by
+#    name). Every fixture this tool cut before this line was changed was therefore a one-clip cut
+#    wearing a deployment's header, and no comparison could see it, because both sides were row sets.
+#
+#    `minimax_h3_keys` is the model's own enumeration: it reads the checkpoint, derives the canvases
+#    and the clip ladder from the deployment, and takes `--sparse` for the video-sparse deployment.
+#    The request arguments above stay on the recorder step, where they describe the one request it
+#    drives - which is what they are for.
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p minimax-h3 --example programs -- "$root" \
-    --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
-    --types "$types" >"$walk_dense"
+    cargo run -q -p minimax-h3 --example minimax_h3_keys -- --root "$root" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p minimax-h3 --example programs -- "$root" \
-    --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
-    --types "$types" --sparse "$sparse" >"$walk_sparse"
+    cargo run -q -p minimax-h3 --example minimax_h3_keys -- --root "$root" --sparse "$sparse" \
+    >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
