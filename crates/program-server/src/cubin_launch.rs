@@ -78,8 +78,8 @@ impl Recipe {
             .ok_or_else(|| format!("{}: a recipe names its module directory", path.display()))?;
         let entry = text_of(&value, "entry")
             .ok_or_else(|| format!("{}: a recipe names the entry to launch", path.display()))?;
-        let origin = std::path::absolute(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let origin =
+            std::path::absolute(path).map_err(|error| format!("{}: {error}", path.display()))?;
         let stated = PathBuf::from(module);
         let module = match stated.is_absolute() {
             true => stated,
@@ -694,7 +694,8 @@ mod tests {
         assert_eq!(recipe.module_dir(), directory.path().join("module"));
         assert!(recipe.module_dir().is_absolute());
         assert_eq!(recipe.dump_dir(), directory.path());
-        let baked = Baked::read(&recipe.module_dir()).expect("the constants beside the recipe read");
+        let baked =
+            Baked::read(&recipe.module_dir()).expect("the constants beside the recipe read");
         assert_eq!(baked.i32("experts"), Ok(128));
     }
 
@@ -732,8 +733,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir())
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(launch.words[0].len(), 8);
         assert_eq!(launch.words[0].buffer(), Some("scores"));
@@ -756,8 +756,7 @@ mod tests {
                 "signature": {"scores": "*bf16", "rows": "i32", "wide": "constexpr"},
             }),
         );
-        let baked = Baked::read(&recipe.module_dir())
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         let refused = launch.check_signature(&metadata);
         assert!(
@@ -776,8 +775,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir())
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(
             launch.check_signature(&metadata),
