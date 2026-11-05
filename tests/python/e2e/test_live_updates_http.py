@@ -610,15 +610,27 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
         trouble = []
         for line in _log_lines(log):
             if any(mark in line for mark in marks):
-                trouble.append(line)
+                # A repeated line is one fact, not many: a storm of the same
+                # warning evicted three runs' evidence, because a storm fills
+                # every line the excerpt has. Consecutive repeats collapse to
+                # one line and a count, so what differs from the storm still
+                # reaches the artifact.
+                if trouble and trouble[-1][0] == line:
+                    trouble[-1][1] += 1
+                else:
+                    trouble.append([line, 1])
     except OSError as error:
         return f"\n(server log unreadable at {log}: {error})"
     if not trouble:
         return f"\n--- no warning or error in {log} ---"
     shown = trouble[-limit:]
+    lines = [
+        line if count == 1 else f"{line} (repeated {count} times)"
+        for line, count in shown
+    ]
     return (
-        f"\n--- {len(shown)} warnings and errors of {log} ---\n"
-        + "\n".join(shown)
+        f"\n--- {len(lines)} warnings and errors of {log} ---\n"
+        + "\n".join(lines)
         + "\n--- end of excerpts ---"
     )
 
