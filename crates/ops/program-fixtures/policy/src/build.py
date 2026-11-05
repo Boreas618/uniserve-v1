@@ -16,11 +16,13 @@ The Program Server runs this with `UNISERVE_PACKAGE`, `UNISERVE_OUT`,
 and `MAX_JOBS` in the environment.
 """
 
+import hashlib
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 #: The crate that holds the policy this fixture installs: sched's `fcfs`.
 POLICY = "scheduling-policy-fcfs"
@@ -59,10 +61,11 @@ def main():
     # package more than once — the daemon resolves the epoch's policy, then the
     # main process prepares the modules it installs — and a cold wasm32 build of
     # the guest crate is minutes, longer than the bound the main process holds a
-    # prepare under. It sits inside the installed package, which is the store's
-    # own copy, so the tree the package was published from is never written to,
-    # and cargo reuses everything the first compile produced.
-    target_directory = package / ".cargo-target"
+    # prepare under. The cache is keyed by the package's directory and lives
+    # outside the tree, so the tree the package was published from is never
+    # written to and cargo still reuses everything the first compile produced.
+    key = hashlib.sha256(str(package).encode()).hexdigest()[:16]
+    target_directory = pathlib.Path(tempfile.gettempdir()) / f"uniserve-cargo-{key}"
     command = [
         cargo,
         "build",
