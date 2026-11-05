@@ -294,12 +294,14 @@ fn stage_weights(args: &Args) -> Result<()> {
             dtype,
             Shape::new(&[width, u64::from(config.video_vae.latent_channels)]),
             &weight,
+            "minimax-h3",
         )?;
         let bias = loader.constant(
             "video_decoder.input.bias",
             dtype,
             Shape::new(&[width]),
             &bias,
+            "minimax-h3",
         )?;
         let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
@@ -438,12 +440,14 @@ fn stage_decode(args: &Args) -> Result<()> {
             dtype,
             Shape::new(&[width, latent_channels]),
             &weight,
+            "minimax-h3",
         )?;
         let bias = loader.constant(
             "video_decoder.input.bias",
             dtype,
             Shape::new(&[width]),
             &bias,
+            "minimax-h3",
         )?;
         let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
@@ -480,6 +484,7 @@ fn stage_decode(args: &Args) -> Result<()> {
             tables[0].dtype,
             tables[0].shape,
             table,
+            "minimax-h3",
         )?;
         let positions = positions.view();
         (decoder, positions, rows)

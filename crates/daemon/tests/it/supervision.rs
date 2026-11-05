@@ -103,6 +103,26 @@ fn the_first_rank_serves_its_store_on_the_reserved_socket() {
 }
 
 #[test]
+fn a_reservation_serves_a_launch_another_connection_sends() {
+    // A worker group's client reserves a socket and launches the rank that
+    // inherits it; the two are separate connections of one deployment, and a
+    // client is filed under the deployment rather than under the number its
+    // arrival gave it. Filed by arrival, the launch would be refused as
+    // another group's — the reservation was made on the first connection and
+    // inherited through the second.
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = start(&directory, "node");
+    let mut first = Engine::connect(daemon.address().unwrap());
+    let reserved = first.reserve("node", "group", false);
+
+    let mut second = Engine::connect(daemon.address().unwrap());
+    let mut rank = launch("node", "group", 0, 1, "/bin/true", &[]);
+    rank.inherit = vec![reserved.reservation];
+    second.spawn(rank);
+    assert_eq!(second.exit().status, "exit status: 0");
+}
+
+#[test]
 fn a_stop_ends_every_generation_of_one_group_only() {
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");

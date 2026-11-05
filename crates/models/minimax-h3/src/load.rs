@@ -525,12 +525,14 @@ pub fn load(
                     nn::DType::F32,
                     shape,
                     &bytes(crate::output::PIXEL_MEAN),
+                    "minimax-h3",
                 )?;
                 let std = loader.constant(
                     "video_postprocessor.pixel_std",
                     nn::DType::F32,
                     shape,
                     &bytes(crate::output::PIXEL_STD),
+                    "minimax-h3",
                 )?;
                 let postprocessor =
                     Arc::new(crate::output::VideoPostprocessor::new(dtype, mean, std)?);
@@ -602,12 +604,14 @@ pub fn load(
                     dtype,
                     nn::Shape::new(&[width, latent]),
                     &weight,
+                    "minimax-h3",
                 )?;
                 let bias = loader.constant(
                     "video_decoder.input.bias",
                     dtype,
                     nn::Shape::new(&[width]),
                     &bias,
+                    "minimax-h3",
                 )?;
                 let input =
                     nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
