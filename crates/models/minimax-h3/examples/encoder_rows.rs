@@ -184,6 +184,7 @@ fn run() -> Result<(), String> {
     println!("# the VAE is F32 by the checkpoint's own storage, so every row is keyed f32");
 
     let mut short = 0usize;
+    let mut excess = 0usize;
     for (height, width) in canvases {
         // One arena per canvas: the arena never rewinds, and a driver of a whole canvas reserves most of a
         // gigabyte of views.
@@ -222,11 +223,44 @@ fn run() -> Result<(), String> {
             let whole = encoder.encode(&f, pixels, moments);
             capture::set_sink(None);
             whole.map_err(|error| format!("{height}x{width} frames {frames}: {error}"))?;
+            // The sampler is the encoder's other method and it is one row: the raster recording
+            // alone reports that row as stated and not launched, which reads as an over-statement.
+            let noise = f
+                .arena()
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        u64::from(config.latent_channels),
+                        u64::from(latency),
+                        rows,
+                        columns,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
+            let latent = f
+                .arena()
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        u64::from(config.latent_channels),
+                        u64::from(latency),
+                        rows,
+                        columns,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
+            capture::set_sink(Some(&mut recorded));
+            let sampled = encoder.posterior(&f, moments, noise, latent);
+            capture::set_sink(None);
+            sampled
+                .map_err(|error| format!("{height}x{width} frames {frames} sampler: {error}"))?;
+
             let stated = VideoEncoder::programs(&config, &[(height, width)])
                 .map_err(|error| error.to_string())?;
             let comparison = Comparison::of(&stated, &distinct(&recorded));
-            comparison.print((height, width), frames, "raster");
+            comparison.print((height, width), frames, "raster and sampler");
             short += comparison.launched_only.len();
+            excess += comparison.stated_only.len();
 
             // The tiled driver: the same raster cut into the grid the encoder states.
             let clip = ClipEncoder::new(height, width).map_err(|error| error.to_string())?;
@@ -277,6 +311,38 @@ fn run() -> Result<(), String> {
             );
             capture::set_sink(None);
             tiled.map_err(|error| format!("{height}x{width} frames {frames} tiled: {error}"))?;
+            // The tiled enumeration covers the encoder, not only the tile loop: the sampler's row is
+            // recorded here too, so the comparison is between two statements of the same extent.
+            let noise = f
+                .arena()
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        u64::from(config.latent_channels),
+                        u64::from(latency),
+                        rows,
+                        columns,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
+            let latent = f
+                .arena()
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        u64::from(config.latent_channels),
+                        u64::from(latency),
+                        rows,
+                        columns,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
+            capture::set_sink(Some(&mut recorded));
+            let sampled = encoder.posterior(&f, moments, noise, latent);
+            capture::set_sink(None);
+            sampled
+                .map_err(|error| format!("{height}x{width} frames {frames} sampler: {error}"))?;
+
             let stated = ClipEncoder::programs(&config, &[(height, width)], frames)
                 .map_err(|error| error.to_string())?;
             let comparison = Comparison::of(&stated, &distinct(&recorded));
@@ -285,14 +351,14 @@ fn run() -> Result<(), String> {
         }
     }
 
-    if short == 0 {
+    if short == 0 && excess == 0 {
         println!(
-            "# every launch is stated. A `posterior` row in the stated list is the sampler's: `VideoEncoder::posterior` launches it on the conditioning path."
+            "# every launch is stated and every stated row is launched, at every canvas and frame count."
         );
         Ok(())
     } else {
         Err(format!(
-            "{short} row(s) launched and not stated: the enumeration is short and a store built from it would refuse the launch"
+            "{short} row(s) launched and not stated, {excess} stated and not launched: the enumeration and the drivers disagree, and a store built from the enumeration would hold a cell no launch selects or lack one a launch asks for"
         ))
     }
 }
