@@ -768,7 +768,7 @@ impl TextEncoder {
         use ops::gemm::Gemm;
         use ops::norm::{AddRmsNorm, RmsNorm as RmsNormOp};
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, RotaryFactors};
+        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
         use ops::rows::{self, Rows as RowsOp};
 
         let rank = Rank::new(config, partition)?;

@@ -767,12 +767,12 @@ impl VisionTower {
         use ops::norm::LayerNorm as LayerNormOp;
         use ops::position::PositionInterpolate as PositionOp;
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::RopeApply;
+        use ops::rope::{RopeApply, Rotation};
 
         let hidden = config.hidden_size;
-        let head_dim = Geometry::head_dim(config)?;
+        let head_dim = BlockRows::head_dim(config)?;
         let heads = config.num_heads;
-        let merged = Geometry::merged_width(config);
+        let merged = BlockRows::merged_width(config);
         let mut programs = Programs::default();
 
         // Every projection of the tower — the patch embedding, the four of each block, the two of each
@@ -795,7 +795,7 @@ impl VisionTower {
         programs.launch::<PositionOp>(&PositionInterpolate::new(
             dtype,
             u64::from(hidden),
-            Geometry::position_grid(config)?,
+            BlockRows::position_grid(config)?,
         )?
         .descriptor());
         programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(hidden), false)?);
