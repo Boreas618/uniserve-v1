@@ -66,11 +66,17 @@ impl Function {
         let context = crate::context::PrimaryContext::retain(self.device.id())?;
         let _guard = context.enter()?;
         let mut text: *const std::ffi::c_char = std::ptr::null();
+        // A driver that does not export the entry point answers no name: the name is a diagnostic
+        // for the dump, and a dump that cannot read one kernel's name must not end the process.
+        let get_name = match driver.func_get_name {
+            Ok(get_name) => get_name,
+            Err(_) => return Ok(String::new()),
+        };
         driver.check(
             // SAFETY: the function is live and belongs to the context entered above, and the driver
             // writes a pointer to a NUL-terminated string the function owns.
-            unsafe { (driver.func_get_name)(&mut text, self.raw) },
-            "cuFuncGetName_v2",
+            unsafe { get_name(&mut text, self.raw) },
+            "cuFuncGetName",
         )?;
         if text.is_null() {
             return Ok(String::new());
