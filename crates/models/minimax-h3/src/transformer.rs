@@ -723,16 +723,18 @@ impl Transformer {
         // the group count, so a conditioned deployment's cache is a second program.
         //
         // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
-        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
-        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
-        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
-        // i32 for all three named two keys no launch binds.
-        for (dtype, columns) in [
+        // builds as i32; the other two read the AdaLN cache, and `forward` gathers them from the
+        // table's own view - `blocks.N.adaln_proj.linear.weight`, whose type is the checkpoint's under
+        // `dtype = "auto"` and is the boundary's here. So those two are stated at the **boundary's**
+        // type: `dtype = "auto"` narrows the activations a projection consumes, not the weight a gather
+        // reads. Stating i32 for all three named two keys no launch binds; stating the stack's type for
+        // these two named two more.
+        for (table, columns) in [
             (nn::DType::I32, u64::from(groups.count())),
             (boundary, 18 * u64::from(hidden)),
             (boundary, 2 * u64::from(hidden)),
         ] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(table, columns)?);
         }
 
         // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
@@ -1439,14 +1441,18 @@ mod tests {
             1,
             "only the group tag is i32: {gathers:?}"
         );
+        // **The boundary's type, not the stack's.** The gathered table is the modulation projection's
+        // weight, and `dtype = "auto"` narrows the activations that projection consumes, not the table
+        // the gather reads - the launch derives the key from the table's own view. A statement in the
+        // stack's type named two keys no launch binds.
         assert!(
             gathers
                 .iter()
-                .any(|key| key.contains("dtype_bf16_columns_96768"))
+                .any(|key| key.contains("dtype_f32_columns_96768"))
                 && gathers
                     .iter()
-                    .any(|key| key.contains("dtype_bf16_columns_10752")),
-            "the modulation tables are gathered at the stack's type: {gathers:?}"
+                    .any(|key| key.contains("dtype_f32_columns_10752")),
+            "the modulation tables are gathered at the boundary's type: {gathers:?}"
         );
 
         // The rotation's factor table: **contiguous** sections over the three axes (one spectrum

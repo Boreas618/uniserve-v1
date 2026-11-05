@@ -3169,9 +3169,14 @@ mod tests {
             "{programs:?}"
         );
 
-        // A longer track is another residual program, because the unit's whole output is its width.
+        // **A longer track is not another program.** The residual's extent is the operand's, so the
+        // whole row set is the same at every track length: the requests that differ are two launches
+        // of one program, and a key that named the length would be a set of rows per duration.
         let longer = AudioEncoder::programs(&config, &[88_200]).expect("a longer track");
-        assert_ne!(longer, programs);
+        assert_eq!(
+            longer, programs,
+            "one row set serves every track length: the extent is a launch value"
+        );
     }
     use super::*;
     use crate::video_vae::tests::video_config;
