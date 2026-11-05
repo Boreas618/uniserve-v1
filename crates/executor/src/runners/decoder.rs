@@ -34,6 +34,7 @@ use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -123,6 +124,14 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// The raster's element count for the bucket staged last: a clip's raster is a function of its
     /// bucket, and the column is sized for the largest one.
     raster_elements: u64,
+    /// The epoch's product store, or `None` when the executor attached none. A decode then writes
+    /// its clip and publishes nothing, and the read that expects a frame refuses by name rather
+    /// than reading whatever the column held before.
+    products: Option<Arc<dyn Products>>,
+    /// The request whose clip is staged. A decode bucket serves one clip (`clip_of` refuses two),
+    /// so one name covers a batch, and a later decode of the same request replaces it — which is
+    /// what a reader that copied in time expects.
+    staged_request: Option<ipc::RequestKey>,
 }
 
 impl<M: Decoder + Send + Sync> DecoderRunner<M> {
@@ -180,6 +189,8 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             columns,
             staged: None,
             raster_elements: 0,
+            products: None,
+            staged_request: None,
         })
     }
 
@@ -383,6 +394,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
         let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
+        // The batch names its requests, and a decode bucket serves one clip, so the name kept here
+        // is the one the replay's publish uses.
+        self.staged_request = Some(media.request(0)?.request);
         let buffers = Self::buffers_of(Self::clip_of(media)?, tables.len())?;
         self.columns.latents.write(&buffers[0])?;
         for (column, bytes) in self.columns.state.iter_mut().zip(&buffers[1..]) {
@@ -459,6 +473,38 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 u64::from(width),
             ]),
         ))
+    }
+
+    /// Publishes the clip a replay just wrote, so the transport can read it by the request's name.
+    ///
+    /// **A decoded clip has nowhere to go without this.** The raster is this runner's own column and
+    /// no call outside it can name the region; `BatchOutput` carries calls and timings, and `Runner`
+    /// has no accessor for a media output. The store is the tree's one way for a runner to hand
+    /// another call a region, so the clip is published like the encoded states are.
+    ///
+    /// The contract is the store's: the view names memory the **reader** must copy before this
+    /// runner's next decode of the bucket, and the copy is issued on the reader's stream. Publishing
+    /// nothing when no store was attached is deliberate — the consumer's read refuses by name, and a
+    /// decode that refused here would fail a step whose own work succeeded.
+    fn publish(&self, bucket: Bucket) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            return Ok(());
+        };
+        let Some(request) = self.staged_request else {
+            return Err(Error::Invariant(format!(
+                "a replay of bucket {bucket} publishes a clip and no request is staged: the batch \
+                 it served was never staged, so the clip has no name to publish under"
+            )));
+        };
+        let layout = self.layout(bucket)?;
+        let raster = self.raster(bucket, &layout)?;
+        products.publish(
+            request,
+            Product::Video,
+            self.device,
+            self.stream_id(),
+            &raster,
+        )
     }
 
     /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
@@ -597,6 +643,10 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
         self.lifecycle.discard(generation)
     }
 
+    fn attach_products(&mut self, products: Arc<dyn Products>) {
+        self.products = Some(products);
+    }
+
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(pools);
@@ -636,6 +686,9 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
+                // The clip is written by the graph that just launched, and the stream's order is
+                // what makes the view readable: a reader's copy is issued after this one.
+                self.publish(*bucket)?;
                 // The clip's raster is this runner's own column, written by the graph that just
                 // launched: the stream's order is what makes it readable, and the completion that
                 // turns it into an artifact is the transport's rather than this step's.
