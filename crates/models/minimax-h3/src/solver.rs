@@ -266,7 +266,7 @@ fn publish(
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     loader
-        .constant(name, DType::F32, shape, &bytes)
+        .constant(name, DType::F32, shape, &bytes, "minimax-h3")
         .map_err(Error::from)
 }
 

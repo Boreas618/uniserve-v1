@@ -457,12 +457,14 @@ impl FusedHeads {
                 nn::DType::F32,
                 Shape::new(&[blocks, per_head]),
                 &host_bytes(nn::DType::F32, &fused)?,
+                "minimax-h3",
             )?,
             bias: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.bias"),
                 nn::DType::F32,
                 Shape::new(&[blocks, out]),
                 &host_bytes(nn::DType::F32, &fused_bias)?,
+                "minimax-h3",
             )?,
             out: u32::try_from(out)
                 .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,

@@ -846,7 +846,7 @@ fn constants(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
+    Ok(loader.constant(name, DType::F32, shape, &bytes, "minimax-h3")?)
 }
 
 /// The geometry of one posterior sample: the positions it reads and the channels it writes.
