@@ -47,6 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deployment's element type is its own per component (the design's precision rule), so a single
     // `--dtype` handed to every component is the defect this flag replaces: the video VAE asked for
     // the stack's type states rows no launch asks for.
+    // The task the deployment serves. It is not cosmetic: the serving partition derives its capacity
+    // from it (`Partition::serving`), and the packed row bound - hence the gated activation's `wide`
+    // form and the sparse tile class - follows from that capacity. A walk that built the partition
+    // from `Partition::single()` stated a bound serving never asks for.
+    let mut task: Option<nn::VideoTask> = None;
     let mut types: Option<PathBuf> = None;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
@@ -140,6 +145,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
+            "--task" => {
+                task = Some(match value.as_str() {
+                    "t2va" => nn::VideoTask::TextToVideoAudio,
+                    "fl2va" => nn::VideoTask::FirstLastToVideoAudio,
+                    "ref2va" => nn::VideoTask::ReferenceToVideoAudio,
+                    other => {
+                        return Err(format!("{other} is not an H3 task (t2va, fl2va, ref2va)").into());
+                    }
+                })
+            }
             "--types" => types = Some(PathBuf::from(value.as_str())),
             // Refused, not ignored: a run that states an element type believes it chose one, and the
             // type is each component's own - the checkpoint's, or the table `--types` names.
@@ -216,12 +231,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let conditioned = conditioned.ok_or("--conditioned is the deployment's and has no default")?;
     let degree = tensor_parallel.ok_or("--tp is the deployment's and has no default")?;
-    let partition = Partition {
-        tensor_parallel: degree,
-        tensor_rank: 0,
-        ulysses_degree: ulysses.unwrap_or(1),
-        ..Partition::single()
-    };
+    let task = task.ok_or("--task is the deployment's and has no default")?;
+    // A task that conditions cannot be walked unconditioned, and the reverse: the capacity, the
+    // modulation cache's groups and the blocks a deployment holds are three statements of one fact.
+    let conditioned_task = !matches!(task, nn::VideoTask::TextToVideoAudio);
+    if conditioned_task != conditioned {
+        return Err(format!(
+            "--task {task:?} and --conditioned {conditioned} disagree: a task either holds the \
+             conditioner's cache or it does not"
+        )
+        .into());
+    }
+    let config = minimax_h3::Config::read(&root, None)?;
+    let partition = Partition::serving(
+        &config,
+        task,
+        ulysses.unwrap_or(1),
+        degree,
+        0,
+        0,
+    )?;
     // The sparse chain composes each layer's compression across the exchange's members, and that
     // exchange is not written: the model refuses it by name at load, and the walk refuses the same
     // deployment here rather than printing rows that read as served.
@@ -296,8 +325,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // number (`Layouts::rows_bound`), so a walk cut at a stated bound could describe a deployment no
     // request reaches - and every count it printed was about that request. The value is asked here
     // and a stated `--rows` is checked against it.
-    let deployment = Deployment::read(
-        &root,
+    let deployment = Deployment::new(
+        config.clone(),
         Types {
             text_encoder: text_type,
             transformer: stack_type,
