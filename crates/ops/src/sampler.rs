@@ -906,7 +906,6 @@ pub struct OrderArgs {
     /// space's, and the program owns it for the duration of the launch. It doubles as the rank
     /// counter — each candidate takes the value its id holds and increments it — so two candidates
     /// with one id land in consecutive slots instead of overwriting each other.
-
     pub counts: TensorView,
     /// The id space `counts` covers: the model's vocabulary.
     pub vocabulary: u64,
