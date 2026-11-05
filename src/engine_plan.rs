@@ -43,6 +43,22 @@ use program_server::Target;
 use crate::engine_main::Launch;
 
 /// One epoch's build config, resolved against the node the main process runs on.
+/// The catalogue of prefill buckets a rank captures, and where its bound came from (§4.5).
+///
+/// The bound is the largest token count any captured bucket holds, which is also the ceiling a
+/// policy's `max_num_batched_tokens` is checked against (§4.4): a policy that wants a wider step
+/// than the rank's graphs can serve is refused, and the refusal is only actionable when it says
+/// which figure came from which place. `stated` separates the deployment's own
+/// `cuda_graph.prefill_token_sizes` from the build's default catalogue, because a deployment that
+/// configured none cannot find its bound in its own launch file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillCatalogue {
+    /// The largest prefill token count any captured bucket holds.
+    pub(crate) bound: u32,
+    /// Whether the deployment stated the sizes rather than taking the build's default catalogue.
+    pub(crate) stated: bool,
+}
+
 pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
@@ -149,6 +165,20 @@ impl EpochPlan {
             watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             placement,
         })
+    }
+
+    /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
+    ///
+    /// `Buckets::bounds` answers the largest prefill token count among the buckets this rank
+    /// captures, skipping media computations whose extents are not a language-model batch size, so
+    /// the figure is the ceiling the mechanism admits and the one a policy's limit is checked
+    /// against - not the build config's, which may be wider than the bound that dropped it.
+    pub(crate) fn prefill_catalogue(&self) -> PrefillCatalogue {
+        let (_, bound) = self.buckets.bounds();
+        PrefillCatalogue {
+            bound,
+            stated: self.build.cuda_graph.prefill_token_sizes.is_some(),
+        }
     }
 
     /// The blocking pools' admission bounds, one lane per kind (§2.4).
