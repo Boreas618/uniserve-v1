@@ -97,10 +97,18 @@ struct TreePackage {
     script: Option<String>,
 }
 
-/// The operators the Qwen3-MoE slice names, in the order its fixture lists
-/// them; empty when the generated fixture is absent.
+/// The operators the Qwen3-MoE slice names, in the order its fixture lists them; empty when no
+/// fixture can be read.
+///
+/// The committed row set is the subject and is read first: `.local/qwen3-moe-keys.txt` is a
+/// generator's output that exists only on a host that ran it, so naming it alone made every witness
+/// that asks this question pick its package from an empty list on any other checkout — the same
+/// silent skip the fixture parse test had, in the third place it appeared.
 fn slice_operators() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = root.join("notes/programs/qwen3-moe-keys.txt");
+    let generated = root.join(".local/qwen3-moe-keys.txt");
+    let path = if committed.is_file() { committed } else { generated };
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
