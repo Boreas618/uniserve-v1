@@ -185,6 +185,7 @@ impl MoeGeometry {
             local_experts,
             tile_tokens: self.tile as u32,
             scales: DType::F32,
+            counted: true,
         }
     }
 

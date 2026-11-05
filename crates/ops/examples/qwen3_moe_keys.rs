@@ -189,6 +189,7 @@ fn main() {
             local_experts: EXPERTS,
             tile_tokens: SORT_TILE,
             scales: DType::F32,
+            counted: true,
         }),
     ));
     lines.push((

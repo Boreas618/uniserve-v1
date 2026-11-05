@@ -48,6 +48,16 @@ pub struct Descriptor {
     pub tile_tokens: u32,
     /// Element type of the route weights.
     pub scales: DType,
+    /// Whether this program reads a live token count.
+    ///
+    /// It is part of the key because it is part of the [`Call`] structure and of the program's
+    /// behaviour: a program built without the field compares no route against a count and marks
+    /// no route `-2`, so pairing it with one that does on a bucket wider than its batch produces a
+    /// difference that is the pair's rather than either program's. The value is always `true`
+    /// here - the count is an operand whose *value* is runtime data, while whether the program
+    /// reads one at all is what selects a compiled module - so the key gains a constant and no
+    /// cell doubles.
+    pub counted: bool,
 }
 
 impl fmt::Display for Descriptor {
@@ -58,6 +68,7 @@ impl fmt::Display for Descriptor {
             .field("local", self.local_experts)
             .field("tile", self.tile_tokens)
             .field("scales", self.scales)
+            .field("counted", self.counted)
             .finish(formatter)
     }
 }
