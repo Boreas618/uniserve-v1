@@ -40,7 +40,13 @@ fi
 
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
-samples=256
+# **A clip and its soundtrack are one fact.** A generated frame count has the form `17n + 5`, at least
+# 22, and a clip's soundtrack is `packing::audio_samples` of it - so `256` is not a clip and `44 100`
+# is no clip's track (`align_num_frames(256) = 260` would carry 346 400). The recorder derives the
+# track from the clip and refuses a stated pair that disagrees, so this line must state the same pair
+# the recording does, or the walk and the recording describe two deployments and a delta between them
+# measures the flags. The smallest legal clip: `audio_latent_frames(22) = 37`, `37 x 800 = 29 600`.
+samples=22
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -51,7 +57,7 @@ rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
 elements=123456
-track=44100
+track=29600
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
@@ -188,8 +194,11 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     # A key the fixture names, that no package declares, and that the blocked block does not excuse,
     # is the one state a store must not be built from. The blocked block is pasted from
     # `--declared-blocked` above, so an excused key never reaches this test.
+    # `key_coverage` states a clean file two ways — `# 0 of N keys are not covered` and, when the
+    # count is exactly nothing, `# every key is covered`. Both are a pass; accepting only the first
+    # made this tool abort on its own success.
     case "$coverage" in
-        *" 0 of "*) ;;
+        *" 0 of "*|*"every key is covered"*) ;;
         *)
             if [ ! -s "$staging/missing-$name.txt" ]; then
                 echo "  $name has uncovered keys and no block to excuse them" >&2
