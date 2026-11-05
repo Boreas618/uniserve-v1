@@ -96,9 +96,15 @@ def generate(*arguments: str) -> tuple[str, list[str]]:
         "--",
         *arguments,
     ]
-    result = subprocess.run(
-        command, cwd=ROOT, check=True, capture_output=True, text=True
-    )
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    # The generator refuses a ladder it cannot serve by name, and its message is
+    # the answer: a traceback would hide the sentence that says what to change.
+    if result.returncode != 0:
+        said = (result.stderr or result.stdout).strip().splitlines()
+        raise SystemExit(
+            "the generator refused this run: "
+            + (said[-1] if said else f"exit {result.returncode}")
+        )
     lines = result.stdout.splitlines()
     return (
         "\n".join(line for line in lines if line.startswith("#")),
