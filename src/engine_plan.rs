@@ -386,8 +386,8 @@ impl EpochPlan {
         // What a rank must be able to map to serve at all, which is every pool the allocator
         // books at its first capture: the graph range in full and the scratch. The graph range is
         // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
-        // streams and `Pools::pool` allocates a stream's share in one buffer, with one stream
-        // here - so a rank that holds room for one of the two pools and not both is refused here
+        // streams and `Pools::pool` allocates a stream's share in one buffer - so a rank that
+        // holds room for one of the two pools and not both is refused here
         // rather than at its first capture, after the model load. The resident pool is a
         // reservation of addresses and not of storage: its bytes are the KV cache the capacity
         // plan fitted into the same free bytes below, and they map through the Storage Server's
