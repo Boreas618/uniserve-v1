@@ -48,6 +48,16 @@ pub struct Descriptor {
     pub tile_tokens: u32,
     /// Element type of the route weights.
     pub scales: DType,
+    /// Whether this program reads a live token count.
+    ///
+    /// It is part of the key because it is part of the [`Call`] structure and of the program's
+    /// behaviour: a program built without the field compares no route against a count and marks
+    /// no route `-2`, so pairing it with one that does on a bucket wider than its batch produces a
+    /// difference that is the pair's rather than either program's. The value is always `true`
+    /// here - the count is an operand whose *value* is runtime data, while whether the program
+    /// reads one at all is what selects a compiled module - so the key gains a constant and no
+    /// cell doubles.
+    pub counted: bool,
 }
 
 impl fmt::Display for Descriptor {
@@ -58,6 +68,7 @@ impl fmt::Display for Descriptor {
             .field("local", self.local_experts)
             .field("tile", self.tile_tokens)
             .field("scales", self.scales)
+            .field("counted", self.counted)
             .finish(formatter)
     }
 }
@@ -105,6 +116,12 @@ pub struct SortArgs {
     /// graph, and a host value is read once at launch. `None` states no count, which every row live
     /// means here: a deployment that has not been given one behaves exactly as it did before the
     /// operand existed, and the kernel reads a null pointer as "all rows are live".
+    ///
+    /// It is a launch argument: the count's value changes per replay and changes no dimension,
+    /// dtype or tile. What the key states is the separate and constant fact that this source reads
+    /// a count at all ([`Descriptor::counted`]), so no cell doubles - and a module built before the
+    /// count existed cannot be paired with this one, because two programs that disagree about what
+    /// a padded row writes would report the pair's difference as a defect.
     pub live_tokens: Option<TensorView>,
     /// First logical expert this rank holds.
     pub local_offset: u32,
