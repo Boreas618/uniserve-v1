@@ -458,7 +458,6 @@ impl Nvfp4Linear {
             m: packed_rows(rows)?,
             n,
             k,
-            pdl: false,
         };
         // The walk's own statement of the pair, refused here if it ever stops being one: this is the
         // descriptor the key file and the fixture are built from.
@@ -482,7 +481,6 @@ impl Nvfp4Linear {
             m: packed_rows(rows)?,
             n: self.n,
             k: self.k,
-            pdl: false,
         };
         // The scale's type is the checkpoint's own statement, so a plane declared as anything but
         // E4M3 makes a key no store built - refused here, where the layer can say which plane.
