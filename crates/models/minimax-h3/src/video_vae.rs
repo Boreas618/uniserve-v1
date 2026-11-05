@@ -1765,6 +1765,82 @@ pub fn fold_input_affine(
 pub(crate) mod tests {
     use super::*;
 
+    /// The decoder is one canvas, and it refuses a clip of another by both extents.
+    ///
+    /// `VideoDecoder::load` binds a canvas because its registers, its row counts and its seam table
+    /// belong to one raster, and `layout_of` is where a runner learns that: a decode of another clip
+    /// would capture a graph whose constants belong to a different raster. Both refusals are asserted
+    /// by what they name, because a runner reads them to know which side was wrong, and a refusal that
+    /// fired for another reason would leave the mismatch to the first launch.
+    #[test]
+    fn the_decoder_states_its_own_canvas_and_refuses_another_by_both_extents() {
+        let config = video_config();
+        let ratio = config.spatial_compression();
+        // A latent canvas small enough to build from stated weights: the geometry is what is under
+        // test, and every extent below follows from it.
+        let canvas = Canvas::clip(&config, 2 * ratio, 2 * ratio);
+        let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
+        let mut loader = WeightLoader::stated(DType::F32, None);
+        let projection = loader
+            .load(&WeightRequest::region(
+                "virtual.proj_in.weight",
+                0,
+                Shape::new(&[u64::from(width), u64::from(config.latent_channels)]),
+            ))
+            .expect("a stated projection");
+        let bias = loader
+            .load(&WeightRequest::region(
+                "virtual.proj_in.bias",
+                0,
+                Shape::new(&[u64::from(width)]),
+            ))
+            .expect("a stated bias");
+        let input = Linear::new(projection, Some(bias), WeightOrder::NxK).expect("a linear");
+        let decoder = VideoDecoder::load(
+            &config,
+            canvas,
+            AttentionKind::Dense,
+            DType::F32,
+            input,
+            &mut loader,
+        )
+        .expect("the decoder");
+
+        let (out_width, out_height) = canvas.pixels(&config);
+        let frames = canvas.frames_out(&config);
+        let clip = nn::capability::Clip {
+            frames,
+            height: out_height,
+            width: out_width,
+        };
+        let layout = decoder.layout_of(clip).expect("its own canvas");
+        assert_eq!(
+            (layout.video.height, layout.video.width, layout.video.frames),
+            (canvas.height, canvas.width, canvas.frames),
+            "the layout is the canvas's own latent extents"
+        );
+
+        let wider = nn::capability::Clip {
+            width: out_width + ratio,
+            ..clip
+        };
+        let error = decoder.layout_of(wider).expect_err("a raster of another width");
+        assert!(
+            error.to_string().contains(&format!("{out_width}x{out_height}")),
+            "the refusal names the raster it decodes: {error}"
+        );
+
+        let longer = nn::capability::Clip {
+            frames: frames + 1,
+            ..clip
+        };
+        let error = decoder.layout_of(longer).expect_err("another frame count");
+        assert!(
+            error.to_string().contains(&format!("{frames} frame(s)")),
+            "the refusal names the frame count it decodes: {error}"
+        );
+    }
+
     fn seams(starts: &[u32], overlaps: &[u32], length: u32) -> Seams {
         Seams {
             starts: starts.to_vec(),
