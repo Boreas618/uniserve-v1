@@ -1038,6 +1038,13 @@ impl EngineClient {
         if self.detached.load(Ordering::Acquire) {
             return;
         }
+        // Which daemon tells which engine to end, and for what: a relaunched engine shut down
+        // within a second of connecting is a recovery that undid itself, and only the sender
+        // can say who asked.
+        tracing::info!(
+            engine = ?self.engine,
+            "this daemon shuts an engine down"
+        );
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Shutdown(wire::Shutdown {})),
