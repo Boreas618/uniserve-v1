@@ -61,7 +61,11 @@ mDtypeB = "E2m1"
 mDtypeC = "Bfloat16"
 mDtypeAcc = "Fp32"
 mSfLayoutA = "swizzled_128x4"
-mSfLayoutB = "linear"
+# The plain family this product selects is the one whose *activation* scales are the 128x4
+# swizzled form (`SfLayout(3)` on both operands); the gated family beside it takes them
+# linear. The model encodes this product's input with the swizzled layout, which is the
+# form the kernel reads.
+mSfLayoutB = "swizzled_128x4"
 mSfBlockSizeA = "16"
 mSfBlockSizeB = "16"
 mUsePerTokenSfA = "0"
