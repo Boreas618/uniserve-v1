@@ -2642,7 +2642,7 @@ impl MainProcess {
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
                     let policy =
-                        matches!(poll_answers(&precopy.policies), Some(StageFailure::Pending));
+                        matches!(poll_answers(&mut precopy.policies), Some(StageFailure::Pending));
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -2663,7 +2663,7 @@ impl MainProcess {
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
-                match poll_answers(&precopy.policies) {
+                match poll_answers(&mut precopy.policies) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Executors(submissions);
                         self.precopy = Some(precopy);
@@ -2827,7 +2827,7 @@ impl MainProcess {
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            PrecopyStage::Shadow(answers) => {
+            PrecopyStage::Shadow(mut answers) => {
                 // A shadow step runs inside a batch the scheduler forms from its resident requests.
                 // An engine with none forms no batch, so the step never runs and nothing is
                 // compared - and a comparison nobody made is how a wrong kernel reaches a
@@ -2844,7 +2844,7 @@ impl MainProcess {
                 }
                 // The shadow pass runs on the scheduler's own thread, one step of the batches it
                 // formed, so the serve pass polls it rather than waiting (§2.4).
-                match poll_answers(&answers) {
+                match poll_answers(&mut answers) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Shadow(answers);
                         self.precopy = Some(precopy);
@@ -4680,11 +4680,15 @@ fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
 /// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
 /// may not wait on a stage whose length the daemon's load decides (§2.4).
 fn poll_answers(
-    answers: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+    answers: &mut Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
 ) -> Option<StageFailure> {
-    for receiver in answers {
+    // An answer is taken once and its sender is gone after it, so a receiver that answered leaves
+    // the list: polling it again would read a scheduler that finished as one that was lost.
+    while let Some(receiver) = answers.first() {
         match receiver.try_recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                answers.remove(0);
+            }
             Ok(Err(reason)) => return Some(StageFailure::Failed(reason)),
             Err(crossbeam_channel::TryRecvError::Empty) => return Some(StageFailure::Pending),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
