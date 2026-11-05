@@ -143,6 +143,9 @@ pub(crate) struct SwitchTarget {
     pub(crate) config: ServeConfig,
     /// The programs the target takes before it is promoted.
     pub(crate) programs: crate::epoch::FilledPrograms,
+    /// The Program Servers that select those programs' revisions, and the host that leads them.
+    pub(crate) servers: Vec<crate::engine::control::ProgramServer>,
+    pub(crate) leader: String,
     /// The target's launch generation, the number its links state.
     pub(crate) engine: u64,
     /// The epoch the target serves.
@@ -1658,7 +1661,10 @@ impl Leader {
     /// Server's default socket on that host (§5.1, §6.3). The targets are the
     /// Program Server's own: the daemon does not query the devices of another
     /// host to name them.
-    fn program_servers(&self, config: &ServeConfig) -> Vec<crate::engine::control::ProgramServer> {
+    pub(crate) fn program_servers(
+        &self,
+        config: &ServeConfig,
+    ) -> Vec<crate::engine::control::ProgramServer> {
         let socket = config
             .program_server
             .clone()
@@ -1688,7 +1694,7 @@ impl Leader {
     /// which every other host is then asked for exactly: the epoch's engine
     /// host when the configuration names one, and otherwise the first host
     /// of the deployment.
-    fn program_leader_host(
+    pub(crate) fn program_leader_host(
         &self,
         config: &ServeConfig,
         servers: &[crate::engine::control::ProgramServer],
@@ -2007,6 +2013,8 @@ impl Replica {
             mut spec,
             config,
             programs,
+            servers,
+            leader,
             engine,
             epoch,
         } = target;
@@ -2038,7 +2046,21 @@ impl Replica {
             let host = config.host_identity.clone();
             let handing = Arc::clone(updates.epochs());
             let handed = tokio::task::spawn_blocking(move || {
-                handing.hand_target(&config.host_identity, engine, &config, &programs)
+                // The update names backends, and a revision is the Program Server's to select.
+                let steps = crate::engine::control::PrepareSteps::new();
+                let pinned = crate::engine::control::prepare_epoch(
+                    &servers,
+                    &leader,
+                    &programs,
+                    &[],
+                    &steps,
+                )
+                .map_err(|error| crate::epoch::Failure {
+                    kind: "prepare_failed".to_owned(),
+                    reason: format!("{error:#}"),
+                    device: None,
+                })?;
+                handing.hand_target(&config.host_identity, engine, &config, &pinned)
             })
             .await;
             match handed {
