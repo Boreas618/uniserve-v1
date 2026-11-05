@@ -17,6 +17,7 @@ use ops::Generation;
 
 use crate::Result;
 use crate::batch::{Batch, Jobs};
+use crate::Error;
 
 /// The executor's name for one runner on a device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -242,6 +243,62 @@ impl NamedRunner {
     /// Whether this runner serves `phase`.
     pub fn serves(&self, phase: PhaseId) -> bool {
         self.phases.contains(&phase)
+    }
+}
+
+/// The runner of a device that serves `computation` in `phase`.
+///
+/// A device's runners are chosen by **two** declarations, not one: the phase a batch names, which
+/// several runners may claim (a media deployment has one decoder per canvas, and a denoiser with one
+/// bucket per served layout has one runner per layout), and the plan a runner holds, which says
+/// which computations of that phase it can run. A rule that read only the phase would serve every
+/// clip of a device through the first decoder and every layout through the first denoiser, silently:
+/// both would be captured for a shape the batch does not have.
+///
+/// A computation that **two** runners claim is refused rather than resolved by order. Two claims
+/// mean the deployment double-booked a shape, and picking one is how a device serves a graph whose
+/// plan was sized for something else - the same failure the phase-only rule produced, only harder to
+/// see.
+pub fn server_of<'a>(
+    runners: &'a [NamedRunner],
+    phase: ipc::PhaseId,
+    computation: &crate::plan::Computation,
+) -> Result<&'a NamedRunner> {
+    let variant = computation.variant().ok_or_else(|| {
+        Error::Invalid(format!(
+            "a batch states computation {computation:?}, which is not a media computation: it has \
+             no variant, so no plan of any runner can hold it"
+        ))
+    })?;
+    let mut claims: Vec<&'a NamedRunner> = Vec::new();
+    for named in runners {
+        if !named.phases.contains(&phase) {
+            continue;
+        }
+        let holds = named.runner.media_plan().iter().any(|bucket| {
+            bucket.variant == variant
+                && bucket.extent == computation.extent
+                && bucket.rows >= computation.rows
+                && bucket.tokens >= computation.tokens
+        });
+        if holds {
+            claims.push(named);
+        }
+    }
+    match claims.as_slice() {
+        [one] => Ok(one),
+        [] => Err(Error::Invalid(format!(
+            "no runner of this device serves {variant:?} for computation {computation:?} in phase \
+             {phase}: the phase is served and no plan of it holds this extent"
+        ))),
+        many => Err(Error::Invalid(format!(
+            "runners {} all claim computation {computation:?} in phase {phase}: a computation is \
+             served by one plan, and two claims mean the deployment booked one shape twice",
+            many.iter()
+                .map(|named| named.id.0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
