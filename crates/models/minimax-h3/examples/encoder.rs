@@ -1132,8 +1132,16 @@ fn stage_encode(args: &Args) -> Result<()> {
                     weights.published.len(),
                     names.len()
                 ),
+                // A computed weight's key names the crate that produced it and a digest of the
+                // numbers it produced, so a change to that rule - or to one table's arithmetic -
+                // moves those keys without moving anything a run can see. A file from before such
+                // a change reads as a difference on exactly those names, which is why this line
+                // ends by naming the writer: the weights stage, from this build, is the fix.
                 Some(difference) => println!(
-                    "regions: {} published, {} measured, first difference {difference}",
+                    "regions: {} published, {} measured, first difference {difference}\n         \
+                     (a difference on a computed weight - a rotary table or a ones mask - is also what a\n         \
+                     file from an older build reads as: those keys carry the producing crate and a digest,\n         \
+                     so re-run `--stage weights` from this binary)",
                     weights.published.len(),
                     names.len()
                 ),
