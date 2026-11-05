@@ -1110,13 +1110,16 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The audio encoder's projection block, the refiner's own operators: a **causal** dense attention
-    // and a **tanh-GELU** gated unit, and neither shape existed anywhere in this list.
+    // The audio encoder's projection block: a **dense** attention and a **tanh-GELU** gated unit.
     //
     // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
-    // `num_attention_heads 8` heads of 256, with as many key heads as query heads; `Projection::load`
-    // passes `causal = true` and one sequence with no offsets, so the key carries the `mask_causal`
-    // and `cu_seq_lens_false` forms. The gated unit is `GatedActivation::new(GeluTanh)` over the
+    // `num_attention_heads 8` heads of 256, with as many key heads as query heads. The mask is
+    // `dense`, not `causal`: the encoder reads a whole waveform in one sequence
+    // (`encoding.rs`'s launch passes `false`) and `encoding.rs`'s own test names the key with
+    // `mask_dense ... cu_seq_lens_false`. This list stated `causal` for a release, so the launch had
+    // no row and the row had no launcher - a `causal` key here would silently compute over a mask the
+    // encoder never asks for, which is worse than the missing row because it runs. The gated unit is
+    // `GatedActivation::new(GeluTanh)` over the
     // latent channels, whose gate and value are **two separate** `[frames, 2 · 32]` buffers rather
     // than one packed one - so the row stride is the width, and this row is the `gelu_tanh`
     // activation the DiT's `silu` rows cannot stand in for.
@@ -1129,9 +1132,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             head_dim: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
             q_heads: AUDIO_ATTENTION_HEADS,
             kv_heads: AUDIO_ATTENTION_HEADS,
-            mask: ops::attention::Mask::Causal,
+            mask: ops::attention::Mask::Dense,
             windowed: false,
-            // A launch bound outside the key: the refiner attends one clip's frames as one sequence.
+            // A launch bound outside the key: the encoder attends one track's frames as one sequence.
             max_kv_len: 4096,
             cu_seq_lens: false,
         }
