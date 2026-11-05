@@ -14,6 +14,12 @@ Each call is one invocation, and its answer is held for the life of the
 process, because the rules are pure: the same call and arguments answer the
 same bytes. A caller that knows its whole batch should use :func:`answers`
 and pay one launch for all of it.
+
+The executable must be built from the tree that carries the ``rules``
+command. A binary that predates it answers an unknown command, and a shell
+reports that as the same exit code a refusal uses, so the failure reads as an
+unreadable answer rather than as a missing command: :func:`answers` names the
+executable, its exit code and its own message when that happens.
 """
 
 from __future__ import annotations
@@ -127,22 +133,27 @@ def answers(requests: Sequence[tuple[str, dict[str, Any]]]) -> list[Any]:
             {"call": name, "args": arguments} for name, arguments in requests
         ]
     }
+    program = executable()
     completed = subprocess.run(
-        [str(executable()), "rules"],
+        [str(program), "rules"],
         input=json.dumps(payload).encode(),
         capture_output=True,
         check=False,
     )
     if completed.returncode not in (0, REFUSED):
         raise RulesRuntimeError(
-            f"uniserve rules exited {completed.returncode}: "
+            f"{program} rules exited {completed.returncode}: "
             f"{completed.stderr.decode(errors='replace').strip()}"
         )
     try:
         document = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
+        # A binary built before the command existed exits with a usage error
+        # and no JSON, which reaches here as a refusal with nothing to read.
         raise RulesRuntimeError(
-            f"uniserve rules answered no JSON: {error}"
+            f"{program} rules answered no JSON (exit {completed.returncode}): "
+            f"{completed.stderr.decode(errors='replace').strip()}; build the "
+            f"binary from the tree carrying the rules command"
         ) from error
     answered = document.get("answers")
     if not isinstance(answered, list) or len(answered) != len(requests):
