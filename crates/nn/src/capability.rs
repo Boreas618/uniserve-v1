@@ -239,9 +239,14 @@ pub struct KvPlanes {
     pub key: TensorView,
     /// `[pages, page_size, kv_heads, head_dim]` cached values.
     pub value: TensorView,
-    /// `[pages, 1, 1, 1]` i32, one flag per page of `key`.
+    /// `[pages, 1, 1, 1]` **u8**, one flag per page of `key`.
+    ///
+    /// One byte, not four: the plane is the layout and the Storage Server carries one
+    /// byte per page, so `cache_copy_region` refuses anything but `DType::U8`
+    /// (`prefix_cache.rs`). An `i32` view of this plane writes four bytes where one
+    /// belongs and clobbers three neighbouring pages' flags with zeros.
     pub key_initialized: TensorView,
-    /// `[pages, 1, 1, 1]` i32, one flag per page of `value`.
+    /// `[pages, 1, 1, 1]` **u8**, one flag per page of `value`; one byte for the same reason.
     pub value_initialized: TensorView,
     /// `[pages, 1, 1, 1]` f32: each page's key scale, present exactly when `key` is FP8.
     ///
@@ -640,9 +645,24 @@ pub struct Step {
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
-    /// `[frames, channels, height, width]` decoded frames.
+    /// `[channels, frames, height, width]` decoded frames, channels on the leading axis.
+    ///
+    /// The decoder writes this through the view it is handed, so the axis order is a
+    /// contract between the executor's allocation and every decoder's write: a reader
+    /// who takes it for `[frames, channels, height, width]` addresses a correct buffer
+    /// at the wrong stride and nothing refuses it. `VideoDecoder::decode` states the
+    /// same order in its own refusal, and the two are one statement.
+    ///
+    /// A file's frames-major order is the writer's conversion, not the decoder's.
     pub video: Option<TensorView>,
-    /// `[samples]` decoded audio.
+    /// `[samples, 2]` interleaved stereo, one pair per sample.
+    ///
+    /// The decoder writes this through the view it is handed, so the order is the contract
+    /// and not a display choice: `AudioVaeDecoder`'s own doc calls `out.audio` "the
+    /// request's `[samples, 2]` window", and a `[channels, samples]` reading would put
+    /// sample `i` of the left channel where sample `0` of the right belongs.
+    ///
+    /// A file's layout is the writer's conversion, as with `video`.
     pub audio: Option<TensorView>,
 }
 
