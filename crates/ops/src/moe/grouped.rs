@@ -955,15 +955,14 @@ impl GatherGemmNvfp4 {
                 ),
             ));
         }
-        if args.hidden_scale.dtype != descriptor.scale {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "expected {} activation block scales, found {}",
-                    descriptor.scale, args.hidden_scale.dtype
-                ),
-            ));
-        }
+        // The activation's block scales are the encoder's output, whose element type is the
+        // encoder's declaration; `descriptor.scale` is the *weight* stack's, which is the
+        // checkpoint's. `require_byte_scale` states the property both share.
+        crate::fp4::require_byte_scale(
+            Self::NAME,
+            args.hidden_scale,
+            args.hidden_scale.shape.last(),
+        )?;
         args.hidden_token_scale
             .require_shape(Self::NAME, Shape::new(&[tokens]))?;
         if args.hidden_token_scale.dtype != DType::F32 {
@@ -1439,15 +1438,14 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-        if args.hidden_scale.dtype != descriptor.scale {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "expected {} activation block scales, found {}",
-                    descriptor.scale, args.hidden_scale.dtype
-                ),
-            ));
-        }
+        // The activation's block scales are the encoder's output, whose element type is the
+        // encoder's declaration; `descriptor.scale` is the *weight* stack's, which is the
+        // checkpoint's. `require_byte_scale` states the property both share.
+        crate::fp4::require_byte_scale(
+            Self::NAME,
+            args.hidden_scale,
+            args.hidden_scale.shape.last(),
+        )?;
         args.hidden_token_scale
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
         if args.hidden_token_scale.dtype != DType::F32 {
