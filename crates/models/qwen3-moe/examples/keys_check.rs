@@ -19,6 +19,15 @@
 //! - **the executor's rows**, which are listed and counted but not refused: their geometry is the
 //!   executor's request and schedule state, and the walk never names them.
 //!
+//! The first comparison is by **operator and row class**: the packed product's key carries the class
+//! its module was compiled for, that class is the deployment's bucket bound, and a fixture generated
+//! for one bound states a class no launch of another states. Comparing operator names alone is what
+//! let a fixture built for `--buckets 1,15` read as complete for a deployment whose bound is 512.
+//!
+//! The rest of a key is *not* compared, because this file holds three deployments (the bf16 one, the
+//! calibrated one and the E4M3-page one) and only the first is the walk's for a given run: their rows
+//! differ in fields that belong to each deployment's own declaration.
+//!
 //! The pages are asked twice, because a deployment's page type decides the cache write's operator
 //! (`kv_write` for a full-precision page, `kv_write_scaled` for E4M3) and the attention's key: the
 //! fixture states the full-precision deployment, and the E4M3 deployment differs only in those rows.
@@ -96,13 +105,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let present = match fixture_operators(&fixture) {
-        Ok(present) => present,
+    let present_rows = match fixture_rows(&fixture) {
+        Ok(rows) => rows,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::from(2);
         }
     };
+    let present: BTreeSet<String> = present_rows
+        .iter()
+        .map(|(operator, _)| operator.clone())
+        .collect();
 
     if print {
         match keys(
@@ -232,6 +245,22 @@ fn main() -> ExitCode {
                 "the fixture holds `{operator}`, which is neither the walk's nor the executor's"
             ));
         }
+        // An operator's presence is not its row set. The packed product's key carries the row class
+        // its module was compiled for, and the class is the deployment's bucket bound, so a store
+        // built for one bound serves no launch that states another - which is how a fixture
+        // generated for one bucket set read as complete for a deployment whose bound is larger.
+        let bound = buckets
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        for (operator, class) in class_gaps(&walked, &present_rows) {
+            failures.push(format!(
+                "the walk names `{operator}` at row class `m_{class}`, and the fixture states no \
+                 row for it: a module compiled for another class serves none of these launches, \
+                 whose bucket rows are {bound}"
+            ));
+        }
         let executor: Vec<&String> = present
             .iter()
             .filter(|operator| EXECUTOR_OWNED.contains(&operator.as_str()))
@@ -256,7 +285,7 @@ fn main() -> ExitCode {
 }
 
 /// The operators the fixture's rows name, comments and blank lines skipped.
-fn fixture_operators(path: &Path) -> Result<BTreeSet<String>, String> {
+fn fixture_rows(path: &Path) -> Result<Vec<(String, String)>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(text
@@ -264,9 +293,38 @@ fn fixture_operators(path: &Path) -> Result<BTreeSet<String>, String> {
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
         .filter_map(|line| {
             line.split_once('\t')
-                .map(|(operator, _)| operator.trim().to_owned())
+                .map(|(operator, key)| (operator.trim().to_owned(), key.trim().to_owned()))
         })
         .collect())
+}
+
+/// Every `(operator, row class)` the walk names that no row of the fixture holds.
+///
+/// The walk states one class per packed operator per deployment, so this is what a store must hold
+/// for the deployment's bucket bound: a fixture generated for another bound states a class nothing
+/// launches, and an operator-name comparison calls that complete.
+fn class_gaps(walked: &[(String, String)], held: &[(String, String)]) -> Vec<(String, String)> {
+    let classes = |rows: &[(String, String)]| -> BTreeSet<(String, String)> {
+        rows.iter()
+            .filter_map(|(operator, key)| Some((operator.clone(), row_class(key)?.to_owned())))
+            .collect()
+    };
+    let held = classes(held);
+    classes(walked)
+        .into_iter()
+        .filter(|entry| !held.contains(entry))
+        .collect()
+}
+
+/// The packed row class a key states, when it states one.
+///
+/// The class is a compile-time constant of the packed product's module, so two keys that differ
+/// only in it name two programs, and a store holding one of them serves no launch that states the
+/// other.
+fn row_class(key: &str) -> Option<&str> {
+    let rest = &key[key.find("_m_")? + 3..];
+    let end = rest.find('_')?;
+    Some(&rest[..end])
 }
 
 fn usage(problem: &str) -> ExitCode {
@@ -275,4 +333,45 @@ fn usage(problem: &str) -> ExitCode {
         "usage: keys_check [--checkpoint PATH] [--fixture PATH] [--capacity N] [--page-tokens N]"
     );
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::class_gaps;
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(operator, key)| ((*operator).to_owned(), (*key).to_owned()))
+            .collect()
+    }
+
+    const PACKED_128: &str = "packed_u8_scale_f8e4m3_layout_swizzled_128x4_m_128_n_2048_k_4096";
+    const PACKED_1024: &str = "packed_u8_scale_f8e4m3_layout_swizzled_128x4_m_1024_n_2048_k_4096";
+
+    #[test]
+    fn a_class_the_fixture_does_not_state_is_a_gap() {
+        let walked = rows(&[("nvfp4_gemm", PACKED_1024)]);
+        let held = rows(&[("nvfp4_gemm", PACKED_128)]);
+        assert_eq!(
+            class_gaps(&walked, &held),
+            vec![("nvfp4_gemm".to_owned(), "1024".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_class_the_fixture_states_is_not_a_gap() {
+        let walked = rows(&[
+            ("nvfp4_gemm", PACKED_1024),
+            ("gemm", "input_bf16_weight_bf16"),
+        ]);
+        let held = rows(&[("nvfp4_gemm", PACKED_1024)]);
+        assert!(class_gaps(&walked, &held).is_empty());
+    }
+
+    #[test]
+    fn a_key_that_states_no_class_is_outside_the_rule() {
+        let walked = rows(&[("gemm", "input_bf16_weight_bf16_accumulate_f32_order_nxk")]);
+        assert!(class_gaps(&walked, &[]).is_empty());
+    }
 }
