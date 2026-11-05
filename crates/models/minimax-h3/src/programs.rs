@@ -386,6 +386,18 @@ impl Deployment {
             &self.config.video_vae,
             rasters,
         )?);
+        // **The encoder's tiled driver, which is the one a large canvas takes.** `ClipEncoder` states
+        // the pass-through blend that places a run's first tile, the seam blends the tile grid
+        // produces at these canvases, and the frame operators at each tile's own extent - rows no
+        // whole-canvas call describes. It is stated here rather than in a written ladder because a
+        // ladder was a second answer to `Grid::blends` and would drift at the seventh canvas.
+        for frames in samples {
+            programs.extend(crate::tiled_encode::ClipEncoder::programs(
+                &self.config.video_vae,
+                rasters,
+                *frames,
+            )?);
+        }
         Ok(programs.finish())
     }
 
