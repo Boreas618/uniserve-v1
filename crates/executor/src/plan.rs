@@ -73,6 +73,14 @@ pub enum Variant {
     /// one-dimensional convolutions. One bucket cannot hold both, and a capture is keyed by the
     /// graph a bucket runs.
     AudioDecode,
+    /// One video unit encoded on the host: the postprocessor's `[frames, rows, columns, 3]` raster
+    /// into the encoded unit the assembly appends.
+    VideoEncode,
+    /// One request's audio track encoded on the host: the decoder's interleaved PCM into the track
+    /// the assembly carries.
+    AudioEncode,
+    /// One request's encoded units and track assembled into its MP4, on the host.
+    Mux,
 }
 
 impl Variant {
@@ -87,6 +95,9 @@ impl Variant {
             Self::Denoise => "denoise",
             Self::Decode => "decode",
             Self::AudioDecode => "audio_decode",
+            Self::VideoEncode => "video_encode",
+            Self::AudioEncode => "audio_encode",
+            Self::Mux => "mux",
         }
     }
 
@@ -98,8 +109,23 @@ impl Variant {
     pub const fn media(self) -> bool {
         matches!(
             self,
-            Self::Encode | Self::Denoise | Self::Decode | Self::AudioDecode
+            Self::Encode
+                | Self::Denoise
+                | Self::Decode
+                | Self::AudioDecode
+                | Self::VideoEncode
+                | Self::AudioEncode
+                | Self::Mux
         )
+    }
+
+    /// Whether this variant is performed in this process rather than on a device (§2.4).
+    ///
+    /// The artifact's three host calls capture no graph: their work is encoding and muxing, which
+    /// the process's media lane does. A bucket of one states which device serves the call and never
+    /// an extent, so no canvas narrows it.
+    pub const fn host(self) -> bool {
+        matches!(self, Self::VideoEncode | Self::AudioEncode | Self::Mux)
     }
 
     /// The computation a media call is, and `None` for a call no variant states yet.
@@ -118,11 +144,12 @@ impl Variant {
             // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
             // file mapped to nothing while the model served video alone.
             ipc::MediaCall::AudioDecoding => Some(Self::AudioDecode),
-            ipc::MediaCall::MediaReading
-            | ipc::MediaCall::LatentPreparation
-            | ipc::MediaCall::VideoEncoding
-            | ipc::MediaCall::AudioEncoding
-            | ipc::MediaCall::Muxing => None,
+            // The three host calls: their work is encoding and muxing in this process, and each is
+            // a phase of its own because each is a call the mechanism submits and waits on.
+            ipc::MediaCall::VideoEncoding => Some(Self::VideoEncode),
+            ipc::MediaCall::AudioEncoding => Some(Self::AudioEncode),
+            ipc::MediaCall::Muxing => Some(Self::Mux),
+            ipc::MediaCall::MediaReading | ipc::MediaCall::LatentPreparation => None,
         }
     }
 
@@ -334,6 +361,44 @@ impl Bucket {
             rows,
             tokens: 0,
             extent: Extent::Latents(layout),
+        }
+    }
+
+    /// Whether this bucket serves `computation`.
+    ///
+    /// **The one rule two places ask** — the plan's selection ([`Buckets::select_media`]) and the
+    /// device's routing of a media batch (`runners::runner_for_media`) — because two statements of
+    /// it disagreed: a host bucket states no extent, so the exact match refused the video encode the
+    /// device would have served.
+    ///
+    /// A stated extent is matched exactly; `Extent::None` on the caller's side is a caller that does
+    /// not know the shape, and the bucket's own extent is then the answer; and a host bucket holds
+    /// every canvas, because it captures no graph and so no canvas narrows it.
+    pub fn holds_computation(&self, computation: &Computation) -> bool {
+        let Some(variant) = computation.variant() else {
+            return false;
+        };
+        self.variant == variant
+            && self.rows >= computation.rows
+            && self.tokens >= computation.tokens
+            && (self.variant.host()
+                || computation.extent == Extent::None
+                || self.extent == computation.extent)
+    }
+
+    /// A host call's bucket: a computation no graph is captured for.
+    ///
+    /// The artifact's three host calls are served in this process (§2.4), so the device states
+    /// them without capturing anything: what the bucket answers is which device serves the call,
+    /// and one row is what one request of a media call is. It carries no extent because there is
+    /// no canvas to state - an audio track's samples come from the decoder's window and a mux
+    /// reads what the encodes already wrote.
+    pub const fn host(variant: Variant) -> Self {
+        Self {
+            variant,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::None,
         }
     }
 
@@ -555,8 +620,9 @@ impl Buckets {
             // A media computation is admitted by its own plan (`select_media`), and its rows and
             // tokens are not a language-model batch size: counting one here would let a decode
             // clip's single row or a denoising step's zero tokens move the admission bound a
-            // scheduler states for the token path.
-            if bucket.extent != Extent::None {
+            // scheduler states for the token path. **A host call's bucket states no extent either**
+            // - it captures no graph - so the variant is what keeps its one row out of the bound.
+            if bucket.extent != Extent::None || bucket.variant.host() {
                 continue;
             }
             rows = rows.max(bucket.rows);
@@ -622,20 +688,10 @@ impl Buckets {
     ///
     /// No bucket serving the computation is the executor stating it does not serve it.
     pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
-        let variant = computation.variant()?;
-        self.ascending.iter().copied().find(|bucket| {
-            bucket.variant == variant
-                && bucket.rows >= computation.rows
-                && bucket.tokens >= computation.tokens
-                // An extent a caller **states** is matched exactly; `Extent::None` is a caller that
-                // cannot state one, and the bucket's own extent is then the answer. Both halves are
-                // load-bearing: the engine forms every media computation with `None` because it does
-                // not know a denoising step's layout or a decode's clip until the runner answers, and
-                // requiring agreement there refused every bucket the runners planned. A direct caller
-                // that does state one must still be narrowed to the graph captured for it, or a
-                // 25-frame step would run in a 13-frame graph and only the numbers would notice.
-                && (computation.extent == Extent::None || bucket.extent == computation.extent)
-        })
+        self.ascending
+            .iter()
+            .copied()
+            .find(|bucket| bucket.holds_computation(computation))
     }
 
     /// The buckets in capture order: largest first, so smaller captures reuse the graph pool's
@@ -774,21 +830,121 @@ mod tests {
         );
 
         // The admission bound is the token path's: a media bucket's rows and tokens are not a
-        // language-model batch size and must not move it.
+        // language-model batch size and must not move it - and a host call's bucket states no
+        // extent at all, so the variant is what keeps its one row out of the bound too.
         assert_eq!(plan.bounds(), (1, 512));
+        assert_eq!(
+            Buckets::new([
+                Bucket::host(Variant::VideoEncode),
+                Bucket::host(Variant::Mux)
+            ])
+            .bounds(),
+            (0, 0),
+            "a plan of host calls states no token admission bound"
+        );
 
-        // A call no variant states is served nowhere, and the mechanism reads that as the
-        // capability it is.
-        for call in [ipc::MediaCall::AudioDecoding, ipc::MediaCall::Muxing] {
-            let computation = Computation {
+        // A track-only decode is a variant of its own whose whole extent is the layout: a `t2va`
+        // clip carries a soundtrack, and the decode of the track has no raster to name. Two
+        // canvases of one duration collapse onto one track, which is why the bucket is built from
+        // the layout rather than from the clip the denoiser took it from.
+        let track = Bucket::audio(
+            1,
+            nn::capability::Layout {
+                audio: Some(nn::capability::LatentShape {
+                    channels: 8,
+                    frames: 3,
+                    height: 2,
+                    width: 4,
+                }),
+                ..layout
+            },
+        );
+        let tracks = Buckets::new([track]);
+        let decode = Computation {
+            call: ipc::MediaCall::AudioDecoding,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::None,
+        };
+        assert_eq!(decode.variant(), Some(Variant::AudioDecode));
+        assert_eq!(
+            tracks.select_media(&decode),
+            Some(track),
+            "a track's decode is served by the bucket that states its layout"
+        );
+
+        // The clip's decode is not served by the track's bucket, though both name a layout in some
+        // form: the variant is what keeps them apart, and that is the whole reason the track could
+        // reuse `Extent::Latents` instead of putting a second shape in the extent.
+        let clip_decode = Computation {
+            call: ipc::MediaCall::VideoDecoding,
+            ..decode
+        };
+        assert_eq!(tracks.select_media(&clip_decode), None);
+
+        // The artifact's three host calls are computations of their own - the executor encodes and
+        // muxes them in this process - and no device bucket serves one: they state a variant so a
+        // batch reaches the runner that does, and they select no graph.
+        for (call, variant) in [
+            (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
+            (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
+            (ipc::MediaCall::Muxing, Variant::Mux),
+        ] {
+            let host = Computation {
                 call,
                 rows: 1,
                 tokens: 0,
                 extent: Extent::None,
             };
-            assert!(!computation.stated(), "{call:?} states no variant");
-            assert_eq!(plan.select_media(&computation), None);
+            assert_eq!(host.variant(), Some(variant));
+            assert!(variant.media());
+            assert_eq!(tracks.select_media(&host), None);
         }
+
+        // A host bucket captures no graph, so no canvas narrows it: a video encode states the clip
+        // it works at and the stage that serves it states no extent at all. A bucket captured for a
+        // canvas still holds that one and no other, which is the half of the rule that keeps a
+        // 25-frame step out of a 13-frame graph.
+        let host = Buckets::new([Bucket::host(Variant::VideoEncode)]);
+        let clip_encode = Computation {
+            call: ipc::MediaCall::VideoEncoding,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Clip {
+                frames: 17,
+                height: 2,
+                width: 2,
+            },
+        };
+        assert_eq!(
+            host.select_media(&clip_encode),
+            Some(Bucket::host(Variant::VideoEncode)),
+            "a call performed in this process is served whatever canvas it names"
+        );
+        assert_eq!(
+            plan.select_media(&Computation {
+                extent: Extent::Clip {
+                    frames: 25,
+                    height: 768,
+                    width: 1344,
+                },
+                ..clip
+            }),
+            None,
+            "a captured bucket holds the canvas it was captured for and no other"
+        );
+
+        // A call no variant states is served nowhere, and the mechanism reads that as the
+        // capability it is.
+        let unstated = Computation {
+            call: ipc::MediaCall::LatentPreparation,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::None,
+        };
+        assert!(!unstated.stated(), "a latent preparation states no variant");
+        assert_eq!(plan.select_media(&unstated), None);
+        assert_eq!(tracks.select_media(&unstated), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media

@@ -635,6 +635,10 @@ pub(crate) struct MainProcess {
     /// daemon is told the same state on the connection it gives (§7.5.1 step 2): a successor that
     /// is not told what this engine is never counts it as serving.
     reported_state: i32,
+    /// Whether the daemon that launched this process closed its front: at a handover the
+    /// predecessor leaves, and the attached daemons serve on. Stated once, and not polled
+    /// again, because a closed connection answers every pass with the same error.
+    daemon_closed: bool,
     /// What this process last announced it is, kept so that a daemon attaching mid-epoch is
     /// told it without asking the schedulers anything: the attach is a handover's step and a
     /// control thread blocked in a cache description cannot serve one.
@@ -867,7 +871,7 @@ impl MainProcess {
         let products: Arc<dyn executor::runners::products::Products> = Arc::new(Held::new());
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = plan.runners(*device, &model, &mut memory, &generation)?;
+            let runners = plan.runners(*device, &model, &mut memory, &generation, &blocking)?;
             let executor = Executor::spawn(
                 *device,
                 runners,
@@ -921,6 +925,7 @@ impl MainProcess {
             switchovers: 0,
             announced_at: None,
             reported_state: proto::request::wire::EngineState::Starting as i32,
+            daemon_closed: false,
             announced: None,
             noted_process_closed: false,
             commands_seen: 0,
@@ -1366,6 +1371,9 @@ impl MainProcess {
         // it came from, and so does every command for a request already admitted.
         let fronts = 1 + self.control.attached_fronts();
         for front in 0..fronts {
+            if front == 0 && self.daemon_closed {
+                continue;
+            }
             loop {
                 // A frame from a closed front ends that front and nothing else: its requests stay
                 // parked for the takeover that claims them (§7.5.1 step 4).
@@ -1376,8 +1384,19 @@ impl MainProcess {
                     Ok(Some(message)) => message,
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(%error, front, "reading a daemon front failed");
-                        if front > 0 {
+                        if front == 0 {
+                            // The launching daemon leaving is the handover's own step: the
+                            // attached daemons hold this process, and a front polled after it
+                            // closed answers every pass with the same error - which is a log
+                            // that hides the handover's own lines behind it.
+                            self.daemon_closed = true;
+                            tracing::warn!(
+                                %error,
+                                "the daemon that launched this process closed its front; the \
+                                 attached daemons serve on, so this front is not read again"
+                            );
+                        } else {
+                            tracing::warn!(%error, front, "reading a daemon front failed");
                             self.control.detach(front);
                         }
                         break;

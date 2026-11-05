@@ -18,6 +18,7 @@ pub(crate) mod diag;
 pub mod encoder;
 pub(crate) mod floor;
 pub mod lifecycle;
+pub mod media;
 pub(crate) mod tables;
 
 pub use audio::AudioDecoderRunner;
