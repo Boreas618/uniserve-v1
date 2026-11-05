@@ -1918,6 +1918,34 @@ impl AudioEncoder {
     /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
     ///
     /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
+    /// The batch the track must carry: **the stereo pair is the batch**, and a mono track is refused.
+    ///
+    /// The reference expands a mono track to two identical channels before the encoder
+    /// (`unpack_samples`: `waveform.expand(2, -1)`, refusing a channel count other than one or two),
+    /// and the encoder's own output is `2 * latent_frames` rows. A caller that hands a mono track
+    /// unexpanded gets **half a track of latent frames** with every count downstream still
+    /// consistent - `[1, 1, samples]` is a legal shape on its own - so the check is that the batch is
+    /// exactly the stereo pair, and it names the expansion the reference performs.
+    fn check_track(shape: Shape) -> Result<u64> {
+        if shape.rank() != 3 || shape.dim(1) != 1 {
+            return Err(Error::config(format!(
+                "the audio encoder reads a [batch, 1, samples] track, not {:?}",
+                shape.dims()
+            )));
+        }
+        let batch = shape.dim(0);
+        if batch != u64::from(crate::config::AUDIO_CHANNELS) {
+            return Err(Error::config(format!(
+                "the audio encoder reads the stereo pair ({} batch rows) and was given {batch}: a \
+                 mono track must be expanded to two identical channels before it, as the \
+                 reference's `unpack_samples` does - read as one row it encodes half a track of \
+                 latent frames, which every count downstream accepts",
+                crate::config::AUDIO_CHANNELS
+            )));
+        }
+        Ok(batch)
+    }
+
     /// own `unpack_samples` applies first: a track that is not a whole number of latent frames is
     /// **right-padded with zeros** to `ceil(samples / hop) · hop`, so every stage's strided convolution
     /// divides exactly and the last latent frame reads those zeros. A track of any positive length
@@ -2061,15 +2089,8 @@ impl AudioEncoder {
     /// widening convolution writes. The projection attends over frame 2, so it runs once per batch row
     /// and never mixes them.
     pub fn encode(&self, f: &Forward, samples: TensorView, out: TensorView) -> Result<()> {
-        let shape = samples.shape;
-        if shape.rank() != 3 || shape.dim(0) == 0 || shape.dim(1) != 1 {
-            return Err(Error::config(format!(
-                "the audio encoder reads a [batch, 1, samples] track, not {:?}",
-                shape.dims()
-            )));
-        }
-        let batch = shape.dim(0);
-        let length = shape.dim(2);
+        let batch = Self::check_track(samples.shape)?;
+        let length = samples.shape.dim(2);
         let frames = self.frames(length)?;
         // The network's stages divide the length exactly, so a track that is not a whole number of
         // latent frames must be right-padded with zeros to one - what the reference's `unpack_samples`
@@ -3470,4 +3491,26 @@ mod tests {
         config.temporal_downsample_factors[1] = 0;
         assert!(Stack::of(&config).is_err());
     }
+
+    #[test]
+    fn a_mono_track_is_refused_where_a_stereo_pair_passes() {
+        // The stereo pair is the batch. A mono track is legal as a shape and halves the latent
+        // frames, so nothing downstream notices - the reference expands it before the encoder and
+        // this refuses it here, naming that expansion.
+        assert_eq!(
+            AudioEncoder::check_track(Shape::new(&[2, 1, 44_100])).unwrap(),
+            2
+        );
+        let refused = AudioEncoder::check_track(Shape::new(&[1, 1, 44_100])).unwrap_err();
+        let message = refused.to_string();
+        assert!(message.contains("stereo pair"), "{message}");
+        assert!(message.contains("unpack_samples"), "{message}");
+        // And three batch rows are not "more stereo": the reference refuses a channel count that is
+        // neither one nor two, and so does this.
+        assert!(AudioEncoder::check_track(Shape::new(&[3, 1, 44_100])).is_err());
+        // The two shapes the encoder never took are still refused, and by the other message.
+        assert!(AudioEncoder::check_track(Shape::new(&[2, 3, 44_100])).is_err());
+        assert!(AudioEncoder::check_track(Shape::new(&[2, 44_100])).is_err());
+    }
+
 }
