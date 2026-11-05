@@ -620,8 +620,9 @@ impl Buckets {
             // A media computation is admitted by its own plan (`select_media`), and its rows and
             // tokens are not a language-model batch size: counting one here would let a decode
             // clip's single row or a denoising step's zero tokens move the admission bound a
-            // scheduler states for the token path.
-            if bucket.extent != Extent::None {
+            // scheduler states for the token path. **A host call's bucket states no extent either**
+            // - it captures no graph - so the variant is what keeps its one row out of the bound.
+            if bucket.extent != Extent::None || bucket.variant.host() {
                 continue;
             }
             rows = rows.max(bucket.rows);
@@ -829,8 +830,18 @@ mod tests {
         );
 
         // The admission bound is the token path's: a media bucket's rows and tokens are not a
-        // language-model batch size and must not move it.
+        // language-model batch size and must not move it - and a host call's bucket states no
+        // extent at all, so the variant is what keeps its one row out of the bound too.
         assert_eq!(plan.bounds(), (1, 512));
+        assert_eq!(
+            Buckets::new([
+                Bucket::host(Variant::VideoEncode),
+                Bucket::host(Variant::Mux)
+            ])
+            .bounds(),
+            (0, 0),
+            "a plan of host calls states no token admission bound"
+        );
 
         // A track-only decode is a variant of its own whose whole extent is the layout: a `t2va`
         // clip carries a soundtrack, and the decode of the track has no raster to name. Two
