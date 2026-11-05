@@ -167,3 +167,35 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     engine.shutdown();
     assert!(!engine.is_dead(), "media rejection killed the engine");
 }
+
+/// The same deployment serves text **before** any rejection: the probe that
+/// separates a rejection state which outlives the request from a construct
+/// that never serves text at all.
+///
+/// If this case passes while `unsupported_media_is_rejected_without_stopping_the_engine`
+/// fails, the engine serves and the rejection is what blocks the later
+/// request. If both fail, the construct starves and rejections are innocent.
+#[test]
+fn text_is_served_before_any_rejection() {
+    let pool = Arc::new(Serving::new(vec![support::pool("model")]));
+    let mut config = EngineConfig::sim("in-process-media-first");
+    config.max_batch = 8;
+    let engine = SchedulerHandle::over_batches(config, pool.clone() as Arc<dyn Batches>)
+        .expect("the text deployment serves");
+    install(&engine, &pool);
+
+    let mut served = engine
+        .submit(text_request(1, 8))
+        .expect("the text request is accepted");
+    let deadline = Instant::now() + ANSWER;
+    let mut finished = false;
+    while Instant::now() < deadline && !finished {
+        if let Ok(event) = served.try_recv() {
+            finished = matches!(event, Event::Finished { .. });
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(finished, "the deployment serves text before any rejection");
+    engine.shutdown();
+}
