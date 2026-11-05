@@ -520,7 +520,7 @@ mod tests {
             "--set",
             "video_config.aspect_ratios=[\"16:9\"]",
             "--set",
-            "quantization_config={\"mode\":\"balanced\"}",
+            "quantization={\"mode\":\"balanced\"}",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
@@ -539,7 +539,7 @@ mod tests {
             Some(vec![1024, 10240])
         );
         assert_eq!(config.video_config.aspect_ratios, ["16:9"]);
-        assert_eq!(config.quantization_config["mode"], "balanced");
+        assert_eq!(config.quantization["mode"], "balanced");
         assert!(config.moe_config.expert_parallel);
         assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
         assert_eq!(
@@ -585,6 +585,31 @@ mod tests {
             let error = resolved(&args).unwrap_err();
             assert!(format!("{error:#}").contains(named), "{args:?}: {error:#}");
         }
+    }
+
+    /// The precision policy's retired name is refused with the name to state
+    /// instead, whether it arrives as a table, as a path into one, or in the
+    /// configuration file.
+    #[test]
+    fn the_retired_quantization_option_is_refused_by_name() {
+        for args in [
+            vec!["m", "--set", "quantization_config.mode=performance"],
+            vec!["m", "--set", "quantization_config={ mode = \"performance\" }"],
+        ] {
+            let error = resolved(&args).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("`quantization_config` is retired"),
+                "{args:?}: {message}"
+            );
+            assert!(message.contains("`quantization.mode=...`"), "{args:?}: {message}");
+        }
+        let error = resolve_text("[quantization_config]\nmode = \"performance\"\n", &[])
+            .expect_err("the retired name is refused in a configuration file too");
+        assert!(
+            format!("{error:#}").contains("`quantization_config` is retired"),
+            "{error:#}"
+        );
     }
 
     /// The stated paths are what the invocation named, tables and options
@@ -948,7 +973,7 @@ mod tests {
         let (_, engine) = lowered(&[
             "m",
             "--set",
-            "quantization_config.mode=performance",
+            "quantization.mode=performance",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"dwdp\" }",
             "--set",
@@ -958,7 +983,7 @@ mod tests {
         ])
         .unwrap();
         let worker = &engine.worker_process;
-        assert_eq!(worker.quantization_config["mode"], "performance");
+        assert_eq!(worker.quantization["mode"], "performance");
         assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
         assert_eq!(engine.chunked_prefill_size, 512);

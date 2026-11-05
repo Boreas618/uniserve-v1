@@ -1392,7 +1392,7 @@ message Workers {
   string attention_backend = 6;
   string dtype = 7;
   // The precision policy, a JSON object.
-  string quantization_config = 8;
+  string quantization = 8;
   string load_format = 9;
   // Empty when unset.
   string download_dir = 10;
