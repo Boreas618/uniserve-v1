@@ -190,8 +190,11 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
 #[test]
 fn text_is_served_before_any_rejection() {
     let pool = Arc::new(Serving::new(vec![support::pool("model")]));
-    let mut config = EngineConfig::sim("in-process-media-first");
-    config.max_batch = 8;
+    // The differential against the failing media case: this one leaves
+    // `max_batch` at the configuration's own value, as the green
+    // `in_process_completion` case does. A probe that serves here and not
+    // there names the batching bound as the divergence.
+    let config = EngineConfig::sim("in-process-media-first");
     let engine = SchedulerHandle::over_batches(config, pool.clone() as Arc<dyn Batches>)
         .expect("the text deployment serves");
     install(&engine, &pool);
