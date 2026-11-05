@@ -381,10 +381,7 @@ mod tests {
     fn the_launch_refuses_a_raster_whose_row_is_its_channel_count() {
         let descriptor = latents();
         let mut launch = grid();
-        launch.tokens = contiguous(
-            DType::F16,
-            &[launch.tokens(), launch.token_width()],
-        );
+        launch.tokens = contiguous(DType::F16, &[launch.tokens(), launch.token_width()]);
         let per_channel = contiguous(DType::F16, &[u64::from(launch.channels)]);
         launch.scale = Some(per_channel);
         launch.bias = Some(per_channel);
