@@ -142,15 +142,23 @@ No server states a precision selector: the launch's default `dtype` is `bfloat16
 `quantization_config` loads the model's first preset, `quality`, so every cell measures the
 representation the shipped performance profiles serve.
 
-`check-base-ref2va` is the first point of `points`, and the order is part of the protocol. The cell's
-warmup fails with `invalid_video_output: nonzero_video_variance` — a constant frame and silence, no
-MP4 — when it runs after the other five on a host whose Storage Server still holds their retained
-pages and 61 GiB per GPU; the same cell passes on a fresh host and fails again once another cell has
-run. It inherits that retained state, not a selector: `base-transformer` and `base-reference` share
-the whole load identity on the same checkpoint, so retention alone separates them. Running it first
-measures it on the clean host every cell is promised, and the other five keep the order they were
-measured in; none of them is sensitive to the retention. The inheritance itself is a serving defect
-of the Storage Server's retention, not a property of this set.
+`uniserve_eval/check_h3.toml` names the six cells **twice**, in two orders, and the two runs say
+different things.
+
+`check-h3` is the order today's implementation is measured in: `check-base-ref2va` first, because that
+implementation shares one Storage Server key between the two base servers on one checkpoint and a weight
+its loader computes has no file, so whichever of them runs second inherits the first's pages. Measured:
+five cells pass under `--reuse-deployment`, the reference cell fails its warmup with
+`invalid_video_output: nonzero_video_variance` after them, passes alone on a fresh host, and fails again
+with the earlier servers' Storage Server alive and 61 GiB per GPU held. The ordering is how the baseline
+is measured; it is not a property the delivered service may need.
+
+`check-h3-reversed` is the same six points with the reference cell last, each writing its MP4 under
+`artifacts/minimax_h3/check-reversed/`: the evaluator never replaces a different MP4 at an existing
+fixed path, so two runs of the same cells need two paths to both exist. It is the
+candidate's obligation: the delivered service must pass every cell **in any order, on retained weights**.
+A `check-h3` run alone says the baseline still measures what it measured; a `check-h3-reversed` run that
+passes says the ordering requirement is gone.
 
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
@@ -159,6 +167,8 @@ The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` f
 ```bash
 .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3
 .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3 --reuse-deployment
+.venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3-reversed
+.venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3-reversed --reuse-deployment
 ```
 
 A run on a changed service moves `artifacts/minimax_h3/check/` and `artifacts/minimax_h3/check/results/` aside first: the evaluator refuses a non-empty result directory and never replaces a different MP4 at an existing fixed path.
