@@ -280,6 +280,11 @@ impl HotUpdate {
                     .ok_or(Error::State("probation kept no previous generation"))?;
                 self.current = previous;
                 self.previous = None;
+                // The generation the revert returns to **serves again**, so it is no generation
+                // awaiting a purge: the switchover listed it while it was being replaced, and a
+                // purge of it would release the kernels of what serves. Step 6's purge is for the
+                // generation the revert went back from.
+                self.purgeable.retain(|held| *held != previous);
                 self.purgeable.push(generation);
                 self.failure = Some(failure);
                 self.failed_generation = Some(generation);
@@ -635,13 +640,20 @@ mod tests {
         assert_eq!(update.previous(), None, "no generation was replaced");
         assert_eq!(update.purge_due(), None, "a discarded generation is not purged");
 
-        // The next update's purge still runs.
+        // The next update's purge waits for its commit: until then the generation the switchover
+        // replaced is what a revert would return to, and releasing its kernels would leave the
+        // update with nothing to go back to.
         update.begin_precopy(9).expect("a second update");
         update.precopied(9).expect("precopy finished");
         update.switchover(9, Instant::now()).expect("switchover");
         update
             .request_purge(7)
-            .expect("the generation the switchover replaced is purged");
+            .expect_err("the revert target is not purged on probation");
+        update.commit(9).expect("probation ends in a commit");
+        update
+            .request_purge(7)
+            .expect("the generation the commit replaced is purged");
+        assert_eq!(update.purge_due(), Some(7));
     }
 
     #[test]
