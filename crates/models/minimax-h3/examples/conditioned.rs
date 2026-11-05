@@ -1071,6 +1071,17 @@ fn encode(args: &Args) -> Result<(), String> {
     // shape, a maximum difference and the index of the worst element pair; never a pass or a fail.
     if let Some(diag) = &args.diag {
         let block = diag.join("latent_encoder");
+        // The page below writes a `case.json` into the same block directory, so naming the
+        // diagnosis' tree as the stage's own page would leave one of the two files silently
+        // overwritten - and the one that survived would carry the other's provenance.
+        if block == directory {
+            return Err(format!(
+                "`--diag {}` is this stage's own page directory ({}): the diagnosis and the page \
+                 write the same case.json there, so pass a separate tree",
+                diag.display(),
+                directory.display()
+            ));
+        }
         std::fs::create_dir_all(&block).map_err(|error| format!("{}: {error}", block.display()))?;
         minimax_h3::diagnosis::write_npy(
             &block.join("pixels.npy"),
