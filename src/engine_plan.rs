@@ -1640,20 +1640,50 @@ fn media_candidates(
     Ok(candidates)
 }
 
-/// The model class a checkpoint declares, as its `config.json` states it.
+/// The model class a checkpoint declares, as the checkpoint itself states it.
+///
+/// A transformers checkpoint states it in `config.json`'s `architectures`; a diffusers modular
+/// pipeline states it in `modular_model_index.json`'s `_class_name` and has no `config.json` at
+/// its root at all. Both are read here, so every caller keeps branching on the declared class
+/// rather than on which file a checkpoint happens to carry.
 fn architectural_class(checkpoint: &Path) -> Result<String> {
-    let path = checkpoint.join("config.json");
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let class = config
-        .get("architectures")
-        .and_then(|architectures| architectures.as_array())
-        .and_then(|architectures| architectures.first())
-        .and_then(|class| class.as_str())
-        .ok_or_else(|| anyhow::anyhow!("{} declares no model class", path.display()))?;
-    Ok(class.to_owned())
+    let config_path = checkpoint.join("config.json");
+    if config_path.is_file() {
+        let text = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?;
+        let config: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", config_path.display()))?;
+        let class = config
+            .get("architectures")
+            .and_then(|architectures| architectures.as_array())
+            .and_then(|architectures| architectures.first())
+            .and_then(|class| class.as_str())
+            .ok_or_else(|| anyhow::anyhow!("{} declares no model class", config_path.display()))?;
+        return Ok(class.to_owned());
+    }
+
+    let index_path = checkpoint.join("modular_model_index.json");
+    if index_path.is_file() {
+        let text = std::fs::read_to_string(&index_path)
+            .with_context(|| format!("reading {}", index_path.display()))?;
+        let index: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", index_path.display()))?;
+        let class = index
+            .get("_class_name")
+            .and_then(|class| class.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} declares no `_class_name`", index_path.display())
+            })?;
+        return Ok(class.to_owned());
+    }
+
+    bail!(
+        "{} declares no model class: it has neither {} (a transformers checkpoint's \
+         `architectures`) nor {} (a modular pipeline's `_class_name`)",
+        checkpoint.display(),
+        config_path.display(),
+        index_path.display()
+    )
 }
 
 /// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as the build config
@@ -1931,5 +1961,38 @@ mod tests {
         assert_eq!(limits.max_cfg_branches, 1);
         assert_eq!(limits.max_latent_units, 0);
         assert_eq!(limits.max_vit_grid_tokens, 0);
+    }
+}
+
+#[cfg(test)]
+mod class_tests {
+    use super::ModelClass;
+
+    /// A checkpoint's class is read from whichever file the checkpoint's own format states it in:
+    /// a transformers checkpoint in `config.json`, a diffusers modular pipeline in
+    /// `modular_model_index.json` with no `config.json` at its root.
+    #[test]
+    fn a_class_is_read_from_the_file_that_states_it() {
+        let root = std::env::temp_dir().join(format!("class-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        std::fs::write(
+            root.join("modular_model_index.json"),
+            r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#,
+        )
+        .unwrap();
+        assert_eq!(ModelClass::of(&root).unwrap(), ModelClass::Media);
+
+        std::fs::write(root.join("config.json"), r#"{"architectures": ["Qwen3MoeForCausalLM"]}"#)
+            .unwrap();
+        assert_eq!(ModelClass::of(&root).unwrap(), ModelClass::CausalLm);
+
+        std::fs::remove_file(root.join("config.json")).unwrap();
+        std::fs::remove_file(root.join("modular_model_index.json")).unwrap();
+        let error = ModelClass::of(&root).unwrap_err().to_string();
+        assert!(error.contains("declares no model class"), "{error}");
+        assert!(error.contains("modular_model_index.json"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
