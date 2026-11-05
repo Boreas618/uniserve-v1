@@ -3870,6 +3870,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn stage_warm(&mut self, bucket: Bucket) -> Result<Shape> {
         let tokens = bucket.tokens as usize;
         let rows = bucket.rows as usize;
+        let span = warm_span(bucket);
         let columns = BatchColumns {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
@@ -3878,32 +3879,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
                 // pose that gave every row one token would describe a batch of `rows` tokens wearing
                 // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
-                seq_lens: {
-                    let mut lengths = vec![1_i32; rows];
-                    if !bucket.variant.is_decode() {
-                        lengths[0] = bucket.tokens as i32;
-                    }
-                    lengths
-                },
-                query_offsets: {
-                    let mut offsets = if bucket.variant.is_decode() {
-                        // A decode row is one query token of its own sequence, so the partition is
-                        // the identity: row `i` holds `cum_seq_lens_q[i]..cum_seq_lens_q[i + 1]` and
-                        // that is one token. The prefill form below gives the first row the whole
-                        // run and the rest none, which for a decode bucket would say row 0 holds
-                        // every token while the query tensor holds one row per token - and a kernel
-                        // told that computes a partition no tensor has.
-                        (0..=rows as i32).collect::<Vec<i32>>()
-                    } else {
-                        let mut offsets = vec![bucket.tokens as i32; rows + 1];
-                        offsets[0] = 0;
-                        offsets
-                    };
-                    if rows == 0 {
-                        offsets = vec![0];
-                    }
-                    offsets
-                },
+                seq_lens: span.0,
+                query_offsets: span.1,
                 logits_rows: vec![-1; rows],
                 calls: vec![nn::BatchRow {
                     request: 0,
@@ -4086,6 +4063,33 @@ pub fn calls_output(
 /// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
 /// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
 /// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+/// The span a warm pose states: `seq_lens` per row, and `query_offsets` per row boundary.
+///
+/// A prefill row carries a multi-token run, so the first row holds the bucket's whole extent and the
+/// rest hold none - a partition of `num_tokens` into one run. **A decode row is one query token of
+/// its own sequence**, so its partition is the identity: row `i` holds `cum_seq_lens_q[i]..[i + 1]`,
+/// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
+/// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
+/// partition no tensor has computes a tiling and a mask that no buffer matches.
+fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
+    let rows = usize::try_from(bucket.rows).unwrap_or(0);
+    let tokens = bucket.tokens as i32;
+    let mut lengths = vec![1_i32; rows];
+    let offsets = if bucket.variant.is_decode() {
+        (0..=rows as i32).collect()
+    } else {
+        if let Some(first) = lengths.first_mut() {
+            *first = tokens;
+        }
+        let mut offsets = vec![tokens; rows + 1];
+        if let Some(first) = offsets.first_mut() {
+            *first = 0;
+        }
+        offsets
+    };
+    (lengths, offsets)
+}
+
 fn warm_parameters(rows: usize) -> Vec<f32> {
     let columns = ops::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
@@ -4169,6 +4173,33 @@ fn gather_indices(
 
 #[cfg(test)]
 mod tests {
+    use super::{Bucket, Variant, warm_span};
+
+    #[test]
+    fn a_decode_bucket_partitions_its_queries_one_per_row() {
+        // The defect this guards: the pose gave row 0 the whole run, which is the prefill partition,
+        // and the attention kernel then computed four queries in row 0 of a tensor holding one row
+        // per token - the launch that faulted at four rows and never at one.
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(
+            query_offsets,
+            vec![0, 1, 2, 3, 4],
+            "a decode row is one query token, so the partition is the identity"
+        );
+        assert_eq!(seq_lens, vec![1, 1, 1, 1], "one key per row in the warm pose");
+    }
+
+    #[test]
+    fn a_prefill_bucket_gives_its_first_row_the_whole_run() {
+        // A prefill row carries a multi-token run: the partition puts every token in row 0 and the
+        // reach of every other row at zero, which is what the kernel reads to split the run.
+        let bucket = Bucket::prefill(2, 512, Variant::PrefillOutput);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(query_offsets, vec![0, 512, 512]);
+        assert_eq!(seq_lens, vec![512, 1]);
+    }
+
     /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
     /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
     /// a diagnostic, it would fail the batch after it.
