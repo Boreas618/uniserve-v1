@@ -43,6 +43,22 @@ use program_server::Target;
 use crate::engine_main::Launch;
 
 /// One epoch's build config, resolved against the node the main process runs on.
+/// The catalogue of prefill buckets a rank captures, and where its bound came from (§4.5).
+///
+/// The bound is the largest token count any captured bucket holds, which is also the ceiling a
+/// policy's `max_num_batched_tokens` is checked against (§4.4): a policy that wants a wider step
+/// than the rank's graphs can serve is refused, and the refusal is only actionable when it says
+/// which figure came from which place. `stated` separates the deployment's own
+/// `cuda_graph.prefill_token_sizes` from the build's default catalogue, because a deployment that
+/// configured none cannot find its bound in its own launch file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillCatalogue {
+    /// The largest prefill token count any captured bucket holds.
+    pub(crate) bound: u32,
+    /// Whether the deployment stated the sizes rather than taking the build's default catalogue.
+    pub(crate) stated: bool,
+}
+
 pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
@@ -72,6 +88,42 @@ pub(crate) struct EpochPlan {
     watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
     placement: Placement,
+}
+
+/// The refusal a stated graph tier earns, if any (§4.4, §4.5).
+///
+/// The two bounds are not the same kind of thing, and this is where that is decided:
+///
+/// - **The token bound is a contract a policy is checked against.** `ceilings_of` gives the
+///   scheduler's policy `max_num_batched_tokens` from the catalogue's captured token bound
+///   (`crates/engine/src/scheduler/policy.rs`), and a policy that declares more is refused by the
+///   mechanism. A token tier capture drops therefore changes what a deployment's policy may
+///   declare, and the deployment would find that out at its precopy - after weights, from a
+///   sentence about two numbers its own file does not contain. It is refused here instead.
+/// - **The row bound only sizes a batch.** A decode tier above the request bound changes no
+///   policy's declaration: `Scheduler::new` lowers the limit, names both figures and keeps serving
+///   (`crates/engine/src/scheduler/run.rs`), which is what a deployment whose limits move in place
+///   relies on - its tiers outlive one setting of the bound. It refuses nothing.
+///
+/// A zero states no size at all and is dropped, as it always was.
+fn tier_refusal(
+    decode: Option<&[u32]>,
+    rows: u32,
+    prefill: &[u32],
+    longest: u32,
+) -> Option<String> {
+    // Named for the reader, decided as below: rows within the bound or not, this is not a refusal.
+    let _ = (decode, rows);
+    let stated = prefill
+        .iter()
+        .copied()
+        .find(|size| *size != 0 && *size > longest)?;
+    Some(format!(
+        "cuda_graph_config.prefill_token_sizes states {stated}, above the {longest} that \
+         max_model_len admits: the bucket would be captured and never filled, and the catalogue a \
+         policy's token budget is checked against is the one capture keeps - so this rank would \
+         refuse a policy against a bound the deployment never named"
+    ))
 }
 
 impl EpochPlan {
@@ -123,6 +175,15 @@ impl EpochPlan {
             Some(length) => length.get(),
             None => u32::MAX,
         };
+        // §4.5: a stated token tier above the bound that admits it is refused here, before the
+        // catalogue is built and long before any weight is mapped; a stated decode tier above the
+        // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
+        // that asymmetry is stated and argued.
+        if let (Some(sizes), Some(length)) = (&tokens, build.max_model_len) {
+            if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, length.get()) {
+                bail!("{refusal}");
+            }
+        }
         let buckets = Buckets::for_batch(
             rows.as_deref(),
             tokens.as_deref(),
@@ -149,6 +210,20 @@ impl EpochPlan {
             watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             placement,
         })
+    }
+
+    /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
+    ///
+    /// `Buckets::bounds` answers the largest prefill token count among the buckets this rank
+    /// captures, skipping media computations whose extents are not a language-model batch size, so
+    /// the figure is the ceiling the mechanism admits and the one a policy's limit is checked
+    /// against - not the build config's, which may be wider than the bound that dropped it.
+    pub(crate) fn prefill_catalogue(&self) -> PrefillCatalogue {
+        let (_, bound) = self.buckets.bounds();
+        PrefillCatalogue {
+            bound,
+            stated: self.build.cuda_graph.prefill_token_sizes.is_some(),
+        }
     }
 
     /// The blocking pools' admission bounds, one lane per kind (§2.4).
@@ -1091,6 +1166,45 @@ mod tests {
         assert!(
             message.contains("config.json"),
             "the refusal names the file that was read: {message}"
+        );
+    }
+
+    /// A deployment whose stated token tier is longer than its model is refused before weights,
+    /// and the refusal names all three figures: the option, the size it states and the bound.
+    #[test]
+    fn a_stated_prefill_tier_above_the_model_is_refused_naming_all_three_figures() {
+        let refusal = tier_refusal(None, 8, &[256, 512, 1024], 512)
+            .expect("a stated prefill tier above the model was accepted");
+
+        assert!(
+            refusal.contains("cuda_graph_config.prefill_token_sizes"),
+            "the option is not named: {refusal}"
+        );
+        assert!(
+            refusal.contains("states 1024"),
+            "the stated figure is not named: {refusal}"
+        );
+        assert!(
+            refusal.contains("above the 512 that max_model_len admits"),
+            "the captured figure or its key is not named: {refusal}"
+        );
+    }
+
+    /// A deployment whose stated decode tiers exceed its request bound still starts: that bound
+    /// sizes a batch, nothing checks a policy against it, and the limit moves in place.
+    #[test]
+    fn a_stated_decode_tier_above_the_request_bound_is_not_refused() {
+        assert_eq!(
+            tier_refusal(Some(&[1, 2, 4, 8, 16]), 4, &[], 4096),
+            None,
+            "a decode tier above the request bound was refused, which the live-update deployment \
+             states deliberately"
+        );
+        // And a zero in a stated catalogue is a size of nothing, not a refusal.
+        assert_eq!(
+            tier_refusal(None, 8, &[0, 4, 512], 512),
+            None,
+            "a zero in a stated prefill catalogue was refused"
         );
     }
 
