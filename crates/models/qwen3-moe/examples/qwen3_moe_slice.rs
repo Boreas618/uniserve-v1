@@ -1511,6 +1511,16 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    print_kv_digests(
+        &stream,
+        &planes,
+        &block_table,
+        page_size,
+        kv_heads,
+        head_dim,
+        page_dtype,
+        usize::try_from(count).unwrap_or(0),
+    )?;
     arena.release(prefill);
     if let Some(dir) = args.dump.as_deref() {
         write_npy(&dir.join("logits.npy"), &values, 1, vocabulary)?;
@@ -3637,6 +3647,53 @@ fn upload_i32(stream: &platform::Stream, arena: &Arena, values: &[i32]) -> Resul
 }
 
 /// Download `rows × columns` BF16 values as `f32`.
+/// One digest per layer of the keys and of the values the prefill wrote, for the prompt's first
+/// tokens.
+///
+/// The served runner prints the same number for the same tokens (`UNISERVE_RUNNER_DUMP=1`, the
+/// `layer0= k=…/… v=…/…` tail of a batch's `call=` field): `platform::fnv1a` over the bytes of the
+/// row's **first page**, covering the tokens that page holds of this prompt. The two halves of the
+/// comparison therefore state one quantity, and the first layer whose numbers differ is the layer
+/// where the served path stopped computing the slice's arithmetic - layer 0 names the inputs and
+/// the weights, a later layer that layer's attention or its experts.
+fn print_kv_digests(
+    stream: &platform::Stream,
+    planes: &[KvPlanes],
+    block_table: &[i32],
+    page_size: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    page_dtype: ops::DType,
+    tokens: usize,
+) -> Result<()> {
+    let element = page_dtype.bytes().unwrap_or(1).max(1);
+    let token_elements = kv_heads.saturating_mul(head_dim);
+    let page_elements = page_size.saturating_mul(token_elements);
+    let held = (tokens as u64).min(page_size);
+    let bytes = usize::try_from(held.saturating_mul(token_elements).saturating_mul(element))
+        .unwrap_or(0);
+    if bytes == 0 {
+        return Ok(());
+    }
+    let page = u64::try_from(block_table.first().copied().unwrap_or(0).max(0)).unwrap_or(0);
+    for (layer, plane) in planes.iter().enumerate() {
+        let mut digests = String::new();
+        for (name, view) in [("k", plane.key), ("v", plane.value)] {
+            let base = view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
+            let mut raw = vec![0_u8; bytes];
+            // SAFETY: `raw` is this function's own buffer of `bytes`, and the source is the plane's
+            // first page, which holds at least `held` tokens of the prompt the prefill wrote.
+            unsafe {
+                platform::memcpy_async(raw.as_mut_ptr() as u64, base, bytes, stream)?;
+            }
+            digests.push_str(&format!(" {name}={:016x}", platform::fnv1a(&raw)));
+        }
+        println!("kv layer{layer}:{digests}");
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
 fn download_bf16(
     stream: &platform::Stream,
     view: ops::TensorView,

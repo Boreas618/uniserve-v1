@@ -168,8 +168,15 @@ impl Layer {
             }
             (Self::Sparse(sparse), LayerScratch::Sparse(scratch)) => {
                 let views = segments.ok_or_else(|| {
+                    // The caller is the denoiser's step, and it states these views from the
+                    // deployment's attention kind (`Denoiser::step`). So this refusal is what a
+                    // deployment reads when the kind its step asked with and the kind this layer was
+                    // built with disagree - which one value cannot do, and a stale binary can.
                     Error::Unsupported(
-                        "a sparse deployment's layers need the segment views".to_owned(),
+                        "a sparse layer was handed no segment views: the caller states \
+                         `variable_block_sizes`, `tile_segments` and `segment_keep` from the \
+                         deployment's attention kind, and this layer was built sparse"
+                            .to_owned(),
                     )
                 })?;
                 sparse.forward(
