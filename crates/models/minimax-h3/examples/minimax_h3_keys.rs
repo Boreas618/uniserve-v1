@@ -419,7 +419,7 @@ fn main() {
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines, &config.video_vae, &rasters);
+    header(&lines, &config.video_vae, &rasters, &clip_frames);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -435,6 +435,7 @@ fn header(
     lines: &[(String, String)],
     video_vae: &minimax_h3::config::VideoVaeConfig,
     rasters: &[(u32, u32)],
+    clip_frames: &[u32],
 ) {
     let operators = lines
         .iter()
@@ -456,6 +457,20 @@ fn header(
         "# rows are here because a launcher reaches them or because the construction requires them; \
          a row is removed only when the construction contradicts it, never because no walk has \
          produced it yet (`tools/walk_gaps.py --by-shape` reports a walk's shape the file lacks)."
+    );
+    // The rows are a statement over axes, not over one request: a walk at one canvas and one clip
+    // binds a strict subset of this file, and a count compared across the two is meaningless unless
+    // it names them. Every other list in this lane was compared without its axes at least once.
+    println!(
+        "# axes: {} canvases ({}) and the clip ladder {:?}; a walk at one canvas and one clip binds a \
+         subset of these rows by construction, so a count compared with this file must name its axes.",
+        rasters.len(),
+        rasters
+            .iter()
+            .map(|(height, width)| format!("{height}x{width}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        clip_frames,
     );
     println!(
         "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
