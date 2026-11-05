@@ -1264,7 +1264,7 @@ fn constants(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
+    Ok(loader.constant(name, DType::F32, shape, &bytes, "minimax-h3")?)
 }
 
 /// The table and the load's own list must name the same parameters.

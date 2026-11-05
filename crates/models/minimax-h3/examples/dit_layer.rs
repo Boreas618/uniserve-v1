@@ -1414,6 +1414,7 @@ fn adaln_memory(
         DType::F32,
         Shape::new(&[entries, frequency]),
         &projections.frequencies(&times)?,
+        "minimax-h3",
     )?;
     let mut entry_bytes = Vec::with_capacity(table.len() * 4);
     for value in &table {
@@ -1435,6 +1436,7 @@ fn adaln_memory(
         DType::I32,
         Shape::new(&[rows, u64::from(groups.count())]),
         &entry_bytes,
+        "minimax-h3",
     )?;
     // The tables are the modulation projections' own type - the reference allocates them from the
     // product - so the harness follows the loaded weights rather than naming a type of its own.
@@ -1448,6 +1450,7 @@ fn adaln_memory(
             table_type,
             Shape::new(&[entries, columns]),
             &zeros,
+            "minimax-h3",
         )?);
     }
     let output = loader.constant(
@@ -1455,6 +1458,7 @@ fn adaln_memory(
         table_type,
         Shape::new(&[entries, 2 * hidden]),
         &vec![0_u8; usize::try_from(entries * 2 * hidden * unit).unwrap_or(0)],
+        "minimax-h3",
     )?;
     Ok(AdaLnMemory {
         groups,

@@ -539,7 +539,13 @@ fn frequencies(
     // served under the older name would be a cache hit on the wrong table.
     let name = format!("transformer.rotary.{pairs}x{axes}.{}", config.rope_theta);
     let half = u64::from(rotated / 2);
-    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half]), &bytes)?)
+    Ok(loader.constant(
+        &name,
+        nn::DType::F32,
+        Shape::new(&[half]),
+        &bytes,
+        "minimax-h3",
+    )?)
 }
 
 /// The factor table of `axes` coordinate axes: one spectrum of `pairs` frequencies, repeated.
