@@ -664,6 +664,36 @@ impl Transformer {
         // (`the refused gemm is input f32, weight bf16`). A single-typed component has
         // `boundary == dtype` and states nothing here.
         if boundary != dtype {
+            // Four products, and the recorder states all four: a boundary **weight** over an
+            // activation of either type, and a boundary activation over a stack weight. The
+            // checkpoint's four projections (`proj_in`, `proj_out`, `audio_proj_in`,
+            // `audio_proj_out`) and the timestep pair are F32 in weight *and* bias, so the product
+            // that reads them takes the stack's activation and writes the stack's type; the output
+            // projections carry no bias, which is the `epilogue_none` row.
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                WeightOrder::NxK,
+                true,
+                dtype,
+                dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                WeightOrder::NxK,
+                false,
+                dtype,
+                dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                WeightOrder::NxK,
+                true,
+                boundary,
+                dtype,
+            ));
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 hidden,
                 dtype,
