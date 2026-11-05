@@ -2,11 +2,14 @@
 # Qwen3MoeForCausalLM checkpoint. Three cells confirm the BF16 checkpoint,
 # its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
 #
-# Each cell runs twice through `uniserve-eval compare`: once against the
-# implementation accepted as the baseline and once against the candidate, on
-# the same 1319-row test split and the same sampling settings. The three
-# cells differ only in the checkpoint path and the KV cache dtype; every
-# other setting is identical, so a cell's two runs measure one change.
+# A confirmation compares two runs that differ only in the thing under test:
+# the BF16 cell of a run set is the reference, and the NVFP4 or FP8 KV cell of
+# the same set is what it is compared with, on the same 1319-row test split
+# and the same sampling settings. The three cells differ only in the
+# checkpoint path and the KV cache dtype; every other setting is identical, so
+# a comparison isolates precision. A BF16 accuracy measured in another run set
+# differs by whatever else changed between the runs and is history, not a
+# denominator.
 #
 # A server command names no `--worker-executable`: today's default worker
 # binary is the daemon's own executable, so `run --executable <new binary>`
