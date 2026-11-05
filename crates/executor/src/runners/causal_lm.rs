@@ -366,17 +366,35 @@ struct Columns {
     logits_row: platform::PinnedBuffer,
 }
 
+/// The width of the per-token columns and of the per-row columns, over the buckets a runner serves.
+///
+/// The two are maxima over **different** buckets and must not be read off one: a prefill bucket can
+/// be long and narrow while a decode bucket is short and wide, and a column sized from whichever
+/// bucket wins a tuple comparison would then be shorter than the batches that address it. Nothing
+/// bounds an [`Column::extent`] view against its column, so a column one bucket short is a silent
+/// read or write past the allocation rather than an error.
+fn column_extents(buckets: &Buckets) -> Result<(u64, u64)> {
+    if buckets.is_empty() {
+        return Err(Error::Invalid("the runner has no bucket to serve".into()));
+    }
+    let tokens = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.tokens))
+        .max()
+        .unwrap_or(0);
+    let rows = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.rows))
+        .max()
+        .unwrap_or(0);
+    Ok((tokens, rows))
+}
+
 impl Columns {
-    /// Allocates the columns for the largest bucket `buckets` holds, with `vocabulary` as the width
-    /// of the logits row the greedy first token is taken from.
+    /// Allocates the columns over the widest token count and row count `buckets` hold, with
+    /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
-        let largest = buckets
-            .iter()
-            .max_by_key(|bucket| (bucket.rows, bucket.tokens))
-            .copied()
-            .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
-        let tokens = largest.tokens as u64;
-        let rows = largest.rows as u64;
+        let (tokens, rows) = column_extents(buckets)?;
         let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
         Ok(Self {
             positions: Column::new(device, DType::I32, tokens)?,
@@ -2028,8 +2046,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
         )?;
-        nn::gather_rows(forward, hidden, self.columns.indices.device, gathered)
-            .map_err(Error::from)?;
+        // The indices are the same defect one operator earlier: `gather_rows` takes a flat `[count]`
+        // view and derives `count` from the gathered rows, so the column's own extent - the largest
+        // bucket's - is refused for every bucket narrower than it, before the sampler is reached.
+        nn::gather_rows(
+            forward,
+            hidden,
+            self.columns.indices.shaped(&[rows]),
+            gathered,
+        )
+        .map_err(Error::from)?;
         let logits = arena.tensor(
             self.geometry.logits_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
@@ -2874,6 +2900,35 @@ mod sampled_output_tests {
         );
     }
 
+    /// The columns are sized by the widest token count and the widest row count, which can come from
+    /// two different buckets: a plan holding a long narrow prefill bucket and a short wide decode
+    /// bucket has no bucket that is largest in both. A column sized from one bucket alone would be
+    /// shorter than the batches that address it, and nothing bounds an extent view against it.
+    ///
+    /// No constructor in the tree builds such a set - `Buckets::causal_lm` crosses every row size
+    /// with every token size - so this is the rule stated rather than a defect a deployment reached.
+    #[test]
+    fn the_columns_cover_both_maxima_and_not_one_bucket() {
+        let buckets = Buckets::new([
+            Bucket::prefill(1, 4096, Variant::PrefillWrite),
+            Bucket::decode(64, Variant::DecodeGreedy),
+        ]);
+        let (tokens, rows) = column_extents(&buckets).expect("a plan of two buckets");
+        assert_eq!(tokens, 4096, "the longest bucket names the token columns");
+        assert_eq!(rows, 64, "the widest bucket names the row columns");
+        // The mistake this states against: one bucket read for both figures.
+        let widest = buckets
+            .iter()
+            .max_by_key(|bucket| (bucket.rows, bucket.tokens))
+            .copied()
+            .expect("a bucket");
+        assert_ne!(
+            (widest.tokens as u64, widest.rows as u64),
+            (tokens, rows),
+            "no single bucket holds both maxima, which is why one is not read for both"
+        );
+    }
+
     /// A sampling row outside every call, or fewer sampled ids than sampling rows, is an invariant
     /// violation: silently dropping either would hand the mechanism the wrong request's token.
     #[test]
@@ -2912,8 +2967,17 @@ mod sampled_output_tests {
         let slots =
             Column::new(platform::DeviceId(0), DType::I32, largest).expect("the slots column");
         assert_eq!(slots.shaped(&[narrow]).shape.dims(), &[narrow]);
-        let draws = Column::new(platform::DeviceId(0), DType::F32, largest).expect("the draws column");
+        let draws =
+            Column::new(platform::DeviceId(0), DType::F32, largest).expect("the draws column");
         assert_eq!(draws.shaped(&[narrow]).shape.dims(), &[narrow]);
+        // The gather column is the same shape one operator earlier: `gather_rows` takes a flat
+        // `[count]` view and derives `count` from the rows it gathers, so a flat column states the
+        // largest bucket's row count and every narrower bucket is refused before the sampler.
+        let indices =
+            Column::new(platform::DeviceId(0), DType::I32, largest).expect("the indices column");
+        let gather = indices.shaped(&[narrow]);
+        assert_eq!(gather.shape.dims(), &[narrow]);
+        assert_eq!(gather.numel(), narrow, "the count the gather reads");
     }
 
 }
