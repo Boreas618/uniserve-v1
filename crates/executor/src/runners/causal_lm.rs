@@ -825,6 +825,17 @@ fn prompt_token(
     Ok(PromptToken::HostArgmax)
 }
 
+/// Whether this process was asked to state each batch's cache addresses (`UNISERVE_RUNNER_DUMP`).
+///
+/// Read once: a deployment either asks for the line or does not, and a step must not read the
+/// environment.
+fn runner_dump() -> bool {
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DUMP.get_or_init(|| {
+        std::env::var_os("UNISERVE_RUNNER_DUMP").is_some_and(|value| !value.is_empty())
+    })
+}
+
 /// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
@@ -1352,6 +1363,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // the same place, and with the same kind of error, as any other batch this device cannot
         // serve.
         self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
+        // What a batch says about where its tokens read and write their cache, when a deployment
+        // asks for it: the addresses a prefill wrote and a decode reads are compared from these
+        // numbers rather than guessed from a continuation's text.
+        if runner_dump() {
+            Self::dump_batch(self, bucket, &batch, &shape);
+        }
         // The columns are staged here, on the submitting thread; everything that touches the
         // device is the replay job, which this executor's device thread performs in `serve`: the
         // staged columns are uploaded, the bucket's graph is launched - the smallest captured
@@ -1989,6 +2006,124 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
     /// bucket, and the host-side encode indices and draw buffers are the runner's own: a step
     /// writes fixed addresses and allocates nothing (4.5).
+    /// One line per batch naming the cache addresses it will read and write.
+    ///
+    /// A prefill writes the pages its `slot_mapping` names and a decode reads them through its block
+    /// table; when a continuation ignores its context those two disagree, and every figure that
+    /// tells them apart is on the host before the replay: the positions, the row lengths, how many
+    /// tokens the batch holds, the pages each row states, and the sampler slot that carries the
+    /// sequence's own state. Printed at `info` because it is opt-in (`UNISERVE_RUNNER_DUMP`) and a
+    /// run that sets it is a run that wants the line.
+    fn dump_batch(&self, bucket: Bucket, batch: &Batch, shape: &Shape) {
+        let rows = shape.rows as usize;
+        let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+        let spelled = |values: &[i32], count: usize| -> String {
+            let take = values.len().min(count);
+            let mut out = String::new();
+            for (index, value) in values[..take].iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&value.to_string());
+            }
+            out
+        };
+        // One row's pages, as this batch installed them: the row the batch serves first, because a
+        // second row's table only repeats the same statement for another sequence.
+        let (first, units, allocated) = batch.block_tables.first().map_or((0, String::new(), 0), |table| {
+            let take = table.unit_ids.len().min(8);
+            let mut out = String::new();
+            for (index, unit) in table.unit_ids[..take].iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&unit.0.to_string());
+            }
+            (table.start_page, out, table.allocated_tokens)
+        });
+        tracing::info!(
+            bucket = %bucket,
+            variant = ?bucket.variant,
+            batch = batch.id.0,
+            rows,
+            tokens,
+            positions = %spelled(&self.staging.batch_rows().positions, 8),
+            seq_lens = %spelled(&self.staging.batch_rows().seq_lens, rows),
+            query_offsets = %spelled(&self.staging.batch_rows().query_offsets, rows + 1),
+            logits_rows = %spelled(&self.staging.batch_rows().logits_rows, rows),
+            slots = %spelled(self.staging.slots(rows), rows),
+            start_page = first,
+            units = %units,
+            allocated_tokens = allocated,
+            key_page = %self.dump_page_bytes(first, batch),
+            "a batch states where its tokens read and write the cache"
+        );
+    }
+
+    /// The first bytes of one page of the cache's key plane, as a device read sees them.
+    ///
+    /// A page's address is the unit the block table names, inside the plane the first field's view
+    /// describes (`[columns, units, plane_bytes]`, so column zero's unit `u` begins at
+    /// `u * plane_bytes`). Reading the same page at a prefill and at the decode that must attend to
+    /// it answers whether the values a prefill wrote are the values a decode reads, which no
+    /// continuation's text can.
+    ///
+    /// The copy is issued on the batch's stream and waited for: this runs once per batch, only when
+    /// a deployment asked for the dump, and a dump that read memory a launch had not finished with
+    /// would be a guess.
+    fn dump_page_bytes(&self, unit: u32, _batch: &Batch) -> String {
+        let Some(cache) = self.kv.cache() else {
+            return "no-cache".to_owned();
+        };
+        let planes = {
+            let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.views()
+        };
+        let Ok(planes) = planes else {
+            return "no-views".to_owned();
+        };
+        let Some((_, view)) = planes
+            .iter()
+            .find(|(name, _)| name == "prefix_cache.key.values")
+        else {
+            return "no-key-plane".to_owned();
+        };
+        let shape = view.shape().to_vec();
+        let (Some(&_columns), Some(&units), Some(&plane_bytes)) =
+            (shape.first(), shape.get(1), shape.get(2))
+        else {
+            return "odd-plane".to_owned();
+        };
+        let unit = i64::from(unit);
+        if unit < 0 || unit >= units {
+            return format!("unit {unit} outside {units}");
+        }
+        let offset = match u64::try_from(unit * plane_bytes) {
+            Ok(offset) => offset,
+            Err(_) => return "offset".to_owned(),
+        };
+        const BYTES: usize = 16;
+        let mut host = [0_u8; BYTES];
+        // SAFETY: the source is this page's first `BYTES` bytes inside a plane whose extent the view
+        // above states, and the destination is this function's own host buffer of that length.
+        let copied = unsafe {
+            platform::memcpy_async(
+                host.as_mut_ptr() as u64,
+                view.address() + offset,
+                BYTES,
+                &self.stream,
+            )
+        };
+        if copied.is_err() || self.stream.synchronize().is_err() {
+            return "copy-failed".to_owned();
+        }
+        let mut out = String::new();
+        for byte in host {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
     fn upload(&mut self, bucket: Bucket) -> Result<()> {
         let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
