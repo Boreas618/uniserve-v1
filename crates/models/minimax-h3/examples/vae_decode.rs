@@ -576,6 +576,23 @@ fn stage_decode(args: &Args) -> Result<()> {
         }
     );
 
+    // **Where each buffer will land.** A stop inside the arena names a size and an offset, and an
+    // offset is only readable against the placement that produced it - the harness's two buffers
+    // first, then the plan's entries at the arena's alignment. Printing it costs sixteen lines and
+    // turns "an arena that cannot give out" into a name and a number the moment it happens.
+    {
+        let mut at = held;
+        for buffer in &plan {
+            at = at.next_multiple_of(nn::forward::ALIGNMENT);
+            println!(
+                "  arena {:<22} {:>12} B at {at}",
+                buffer.name,
+                buffer.bytes()
+            );
+            at += buffer.bytes();
+        }
+    }
+
     // 6. The latents: the file the reference's own decoder is called with, packed into the rows this
     //    decoder reads. A missing file is generated from a fixed pattern instead, so the stage can run
     //    before the reference producer exists - and `case.json` says which of the two happened.
