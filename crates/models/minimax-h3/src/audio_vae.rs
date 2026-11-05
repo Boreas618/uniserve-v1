@@ -1154,10 +1154,15 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
+        // The residual add's width is the **sample count at that stage**, not the channel count:
+        // the stage's buffers are `[PCM_CHANNELS, channels, length]` and the add reshapes them to
+        // `[PCM_CHANNELS · channels, length]` (`rows`), so the descriptor's `columns` is the length
+        // the stage's upsampling leaves. Stating `channels × bucket` named keys no launch asks for.
         for bucket in buckets {
+            let mut length = u64::from(*bucket);
             for stage in &stages {
-                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+                length *= u64::from(stage.rate);
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, length)?);
             }
         }
         Ok(programs.finish())
