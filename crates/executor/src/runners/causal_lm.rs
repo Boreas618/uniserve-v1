@@ -679,6 +679,21 @@ impl CommitColumns {
         self.slots as usize
     }
 
+    /// The token slot `slot` feeds its next decode, as `slot_commit` last wrote it.
+    ///
+    /// The column is one mapped allocation, and the device thread reads this between batches, after
+    /// the batch that wrote it has completed.
+    fn next_input(&self, slot: usize) -> i32 {
+        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) }
+    }
+
+    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
+    fn set_next_input(&self, slot: usize, token: i32) {
+        // SAFETY: as in `next_input`, and no launch that reads this column is in flight.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) = token };
+    }
+
     /// The device address of the per-slot trajectory positions.
     fn sampling_ptr(&self) -> ops::DevicePtr {
         self.sampling.device.ptr
@@ -2673,6 +2688,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             unsafe {
                 *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
             }
+            // The graph committed its own draw as this slot's next input, and the next decode
+            // embeds what the client was told.
+            if let Ok(slot) = usize::try_from(slot) {
+                self.commit.set_next_input(slot, best as i32);
+            }
         }
         Ok(())
     }
@@ -4148,7 +4168,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.columns.positions.write(&self.encoded)?;
         // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
         // the model already holds, so embedding them is the runner's step, not the model's.
-        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
+        // A decode row's token is the slot's next input, which the step before it wrote. The
+        // mechanism plans a step ahead of its results, so the token it states lags by one: it is a
+        // stale value on every step and nothing at all on the first.
+        let mut ids = self.staging.input_ids(tokens).to_vec();
+        if bucket.variant.is_decode() {
+            let slots = self.staging.slots(rows);
+            for (row, id) in ids.iter_mut().enumerate().take(rows) {
+                if let Ok(slot) = usize::try_from(slots[row]) {
+                    *id = self.commit.next_input(slot);
+                }
+            }
+        }
+        encode_i32(&mut self.encoded, &ids);
         self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
