@@ -2151,25 +2151,25 @@ impl Denoiser {
         // narrowed into the packed rows at the hidden width, and the timestep pair's FP32 activation
         // is narrowed into the modulation's width at the start of every evaluation. Each is one
         // launch of the served path (`denoiser.rs`'s two projections and `modulation.rs`'s narrow).
-        let mut crossings = vec![
+        // **The crossings are derived from the two element types, not listed.** `ScaledAdd`'s key is
+        // the pair, so a triple whose two sides are the same type - or whose direction the operands
+        // cannot have - is a row nothing launches: the recorder ran every path of both deployments and
+        // never made the reverse narrows, the same-type adds or the audio feature width this list used
+        // to state. So the pairs are those the boundary actually has, and each is stated once:
+        //   the input projection widens the patched rows from the stack's type into FP32;
+        //   its FP32 output is narrowed back at the hidden width;
+        //   the timestep pair's FP32 activation is narrowed into the modulation's width.
+        // A dense stack (`dtype == F32`) has no crossing at all: every pair below is the same type and
+        // the loop emits nothing, which is what the model does.
+        let crossings = vec![
+            // The widened canvas the input projection writes, and the two narrows back into the
+            // stack: the packed rows at the hidden width and the modulation at the timestep's.
             (nn::DType::F32, dtype, 4 * u64::from(config.video_channels)),
+            (nn::DType::F32, dtype, u64::from(config.hidden_size)),
             (dtype, nn::DType::F32, u64::from(config.hidden_size)),
             (dtype, nn::DType::F32, u64::from(config.time_dim)),
         ];
-        // The projections' FP32 output is narrowed into the packed rows (f32 -> the stack's type),
-        // and the crossings above are the widening side of the same boundary.
-        for (target, source, columns) in [
-            (nn::DType::F32, dtype, u64::from(config.hidden_size)),
-            (nn::DType::F32, dtype, 1u64),
-        ] {
-            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
-                target, source, columns,
-            )?);
-        }
-        // A conditioned deployment carries audio, so its patched audio rows cross the boundary too.
-        if groups == crate::modulation::Groups::Conditioned {
-            crossings.push((nn::DType::F32, dtype, u64::from(config.audio_channels)));
-        }
+        let _ = groups;
         // The conditioner's own projection: its weight is one of the checkpoint's twelve FP32 tensors
         // (`modulation.rs` pins each projection matrix to `Some(DType::F32)`), so the launch is FP32
         // rows against an FP32 weight and **one rounding into the prefix's type** - a biased product
@@ -2200,7 +2200,12 @@ impl Denoiser {
                 ));
             }
         }
+        // One launch per pair the boundary has. A triple whose sides are equal is not a crossing and is
+        // not stated: the stack's own same-type adds are stated by the plan's ordinary columns, not here.
         for (target, source, columns) in crossings {
+            if target == source {
+                continue;
+            }
             programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
                 target, source, columns,
             )?);
@@ -3463,12 +3468,12 @@ mod tests {
             vec![
                 "target_bf16_source_f32_columns_2688_block_1024",
                 "target_bf16_source_f32_columns_5376_block_1024",
-                "target_f32_source_bf16_columns_1_block_1024",
-                "target_f32_source_bf16_columns_32_block_1024",
                 "target_f32_source_bf16_columns_5376_block_1024",
                 "target_f32_source_bf16_columns_96_block_1024",
             ],
-            "one program per crossing, keyed by the pair of element types"
+            "one program per crossing the boundary has: the packed rows at the hidden width in both \
+             directions, the input projection's widening at `channels · 4`, and the timestep's narrow. \
+             A pair whose sides are the same type is not a crossing and is not stated"
         );
     }
     use super::*;
