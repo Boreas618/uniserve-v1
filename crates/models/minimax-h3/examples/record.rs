@@ -465,12 +465,25 @@ fn run() -> Result<(), String> {
     let mut refused_names: Vec<&str> = refusals.iter().map(|(name, _)| name.as_str()).collect();
     refused_names.sort_unstable();
     refused_names.dedup();
+    // The denominator is this invocation's harness list, which is eight at either setting of
+    // `--conditioned` - seven fixed harnesses and one of two. The total therefore does not say which
+    // deployment it counts, and the eighth member is the base DiT on `t2va` and the conditioned one on
+    // `fl2va`; naming the setting in the same line is what makes the number quotable on its own.
     eprintln!(
-        "# {} data rows, {} operators, {} of {} components refused{}",
+        "# {} data rows, {} operators, {} of {} components refused{}{}",
         all.len(),
         operators.len(),
         refused_names.len(),
         harnesses.len(),
+        // Only `all` picks a deployment - the eighth harness is one of two - so only then does the
+        // setting belong beside the count. A single harness names itself in the denominator.
+        if component != "all" {
+            ""
+        } else if conditioned_deployment {
+            " conditioned"
+        } else {
+            " plain"
+        },
         if refused_names.is_empty() {
             String::new()
         } else {
