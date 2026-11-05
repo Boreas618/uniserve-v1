@@ -346,9 +346,13 @@ fn parse_key(dimensions: &BTreeMap<String, Vec<String>>, key: &str) -> Option<Ve
 #[test]
 fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The H3 row set that belongs to a deployment: its own generator's file, which `key_coverage`
+    // and `build_store` certify. `minimax-h3-keys.txt` is a walk print of the older enumeration and
+    // states rows whose fields no package has had since the key changed — reading it here asserted
+    // about a file the store is not built from.
     let fixtures = [
         root.join("../../.local/qwen3-moe-keys.txt"),
-        root.join("../../notes/programs/minimax-h3-keys.txt"),
+        root.join("../../notes/programs/minimax-h3-deployment-keys.txt"),
     ];
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
