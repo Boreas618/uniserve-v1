@@ -330,6 +330,11 @@ fn member_node(member: &Membership) -> Node {
 
 /// An engine connection to the leader.
 struct EngineConnection {
+    /// The engine whose process link this is, once it stated one: the number that link holds in
+    /// `process_links` until the connection closes.
+    process_of: Option<u64>,
+    /// The engine whose request link this is, once it stated one, held the same way.
+    requests_of: Option<u64>,
     connection: Connection,
     /// Whether its hello was answered.
     welcomed: bool,
@@ -600,6 +605,8 @@ pub(crate) fn run_leader(
                 EngineConnection {
                     connection,
                     welcomed: false,
+                    process_of: None,
+                    requests_of: None,
                     owner: next_engine,
                 },
             );
@@ -893,11 +900,17 @@ pub(crate) fn run_leader(
             }
         }
         for client in gone {
-            clients.remove(&client);
+            if let Some(number) = clients.remove(&client).and_then(|peer| peer.requests_of) {
+                request_links.remove(&number);
+            }
         }
 
         for (key, engine) in closed {
-            engines.remove(&key);
+            // A link ends with its connection: a process relaunched under the number of one that
+            // died states that number again, and a link kept here would refuse it.
+            if let Some(number) = engines.remove(&key).and_then(|peer| peer.process_of) {
+                process_links.remove(&number);
+            }
             if engine == EPOCH_ENGINE {
                 // A client of the socket owns no process: it goes, and takes
                 // nothing with it — not the epoch layer's processes, which
@@ -994,10 +1007,11 @@ pub(crate) fn run_leader(
         // a command names a launch's engine, and a client that happened to
         // arrive first must not be the connection it names.
         for (arrived, number) in request_links_new.drain(..) {
-            if let Some(peer) = engines.remove(&arrived) {
+            if let Some(mut peer) = engines.remove(&arrived) {
                 let client = next_client;
                 next_client += 1;
                 request_links.insert(number, arrived);
+                peer.requests_of = Some(number);
                 tracing::info!(
                     client,
                     engine = number,
@@ -1023,9 +1037,10 @@ pub(crate) fn run_leader(
         // commands go down, so a command the epoch layer sends right after a
         // process reported itself ready already reaches that process.
         for (arrived, number) in renumbered.drain(..) {
-            let Some(connection) = engines.remove(&arrived) else {
+            let Some(mut connection) = engines.remove(&arrived) else {
                 continue;
             };
+            connection.process_of = Some(number);
             if let Some(displaced) = engines.remove(&number) {
                 // Nothing addresses a peer that states no number: it is a
                 // worker's client or a client of this interface, and the
@@ -1452,6 +1467,8 @@ pub(crate) fn resume(
                         // its engine stated, which is the identity its
                         // requests are answered for; a peer still unfiled
                         // keeps the key it arrived under until it greets.
+                        process_of: None,
+                        requests_of: None,
                         owner: id,
                     },
                 );
