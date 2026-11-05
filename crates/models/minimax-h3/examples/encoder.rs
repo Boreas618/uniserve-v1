@@ -1267,10 +1267,20 @@ fn stage_encode(args: &Args) -> Result<()> {
     outcome?;
 
     // 8. The page: the rows and the case that says what they are. The walk is already on disk.
-    let rows = u64::from(layout.rows);
+    //
+    //    The file holds the *content* rows, because that is what the reference probe writes and what
+    //    the conditioner reads: a `[tokens, hidden]` prompt. The layout's rows are the batch's, which
+    //    is the same number for an unpadded case and larger once a case pads to a text capacity -
+    //    writing the batch's rows would then compare two different shapes, so the count is the
+    //    prompt's and the line below says which it wrote.
+    let rows = u64::from(tokens);
     let elements = usize::try_from(rows * hidden)
         .map_err(|_| Failure::message("the output is larger than this host addresses"))?;
     let payload = download(&stream, output, elements)?;
+    println!(
+        "prompt_hidden: {rows} content rows of the layout's {} ({hidden} columns)",
+        layout.rows
+    );
     println!(
         "walk: {} launches, {} distinct programs",
         walk.0.len(),
