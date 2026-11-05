@@ -1314,9 +1314,12 @@ mod tests {
                 .all(|key| key.starts_with(&format!("{PREFIX}."))),
             "a key lies outside {PREFIX}"
         );
-        // The tower is one patch embed, one position table, 27 blocks of six projections and two
-        // norms, and the merger with its three DeepStack copies.
-        assert_eq!(keys.len(), 12 * config().depth as usize + 15);
+        // The tower is one patch embed (weight and bias), one position table, `depth` blocks of six
+        // projections and two norms — twelve tensors each — and the merger with its DeepStack copies at
+        // three tensors apiece. The count is stated from the config rather than as a constant, because a
+        // constant here is a claim about one checkpoint's depth and merger count.
+        let mergers = 1 + config().deepstack_visual_indexes.len();
+        assert_eq!(keys.len(), 12 * config().depth as usize + 3 + 6 * mergers);
     }
 
     #[test]
