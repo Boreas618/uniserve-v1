@@ -396,22 +396,32 @@ mod tests {
             .validate(&descriptor)
             .expect("the raster the operator writes is admitted");
 
-        // The row read as the channel count — the shape a wrong-axis check demands — is refused,
-        // and the refusal names the width. With 24 channels this error is the only evidence that
-        // distinguishes the two axes, because a raster rowed by channels never reaches a kernel.
+        // The raster rowed by its channel count, which is what a check reading the outer axis
+        // demands, is refused — and the refusal names the raster the operator writes, not the one
+        // the check would have accepted. `require_shape` holds that shape before the row check, so
+        // the message a caller sees is the raster's own dimensions.
         launch.out = contiguous(DType::F16, &[24, 37, 48, 24]);
         let error = launch
             .validate(&descriptor)
             .expect_err("a raster whose row is the channel count");
         let text = error.to_string();
-        assert!(
-            text.contains("expected 84 elements on the last axis"),
-            "{text}"
+        assert!(text.contains("[24, 37, 48, 84]"), "{text}");
+
+        // The row check itself: the raster's shape is right and its innermost axis is not contiguous,
+        // so the program would address the wrong voxels. This is the branch `require_row` adds over
+        // `require_shape`, and it is the one a tile inside a larger raster would hit.
+        let shape = Shape::new(&[24, 37, 48, 84]);
+        launch.out = TensorView::with_strides(
+            crate::tensor::DevicePtr::new(0x3000),
+            DType::F16,
+            shape,
+            Strides::new(&[1, 24, 24 * 37, 24 * 37 * 48]),
         );
-        assert!(
-            !text.contains("expected 24 elements on the last axis"),
-            "{text}"
-        );
+        let error = launch
+            .validate(&descriptor)
+            .expect_err("a raster written column-major");
+        let text = error.to_string();
+        assert!(text.contains("last axis"), "{text}");
     }
 
     #[test]
