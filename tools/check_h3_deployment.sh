@@ -157,7 +157,19 @@ else
     done
     cut -f1,2 "$scratch/recorded.txt" | grep -v '^#' | sort -u >"$scratch/recorded.rows"
     cut -f1,2 "$fixture" | grep -v '^#' | sort -u >"$scratch/file.rows"
-    missing=$(comm -23 "$scratch/recorded.rows" "$scratch/file.rows" | grep -v 'columns_123456')
+    # Two fields are a request's, not a deployment's, and a row that differs only in one of them
+    # is not a missing row: `columns_<elements>` carries the request's trajectory width, and
+    # `wide_true|false` is `elements >= u32::MAX` - a launch at any real request is `wide_false`
+    # while the file states the form its bound requires. Both sides are legitimate; comparing
+    # them literally would report the file's own bound as a gap.
+    missing=$(comm -23 "$scratch/recorded.rows" "$scratch/file.rows" | grep -v 'columns_123456' \
+        | while read -r row; do
+            folded=$(printf '%s' "$row" | sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/')
+            if grep -qF "$(printf '%s' "$folded" | cut -f2)" <(sed 's/_wide_true/_wide_FOLDED/; s/_wide_false/_wide_FOLDED/' "$scratch/file.rows"); then
+                continue
+            fi
+            printf '%s\n' "$row"
+        done)
     echo "   $(wc -l <"$scratch/recorded.rows") row(s) recorded at $(echo "$points" | wc -w) point(s)"
     if [ -n "$missing" ]; then
         echo "$missing" | sed 's/^/     NOT IN THE FILE: /' | head -6
