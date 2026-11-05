@@ -159,6 +159,13 @@ pub trait Products: Send + Sync {
     ///
     /// `None` is the answer for a product no call of `request` produced: the caller refuses by name
     /// rather than reading a region nobody wrote.
+    ///
+    /// **No production caller today, and it stays for two reasons.** Both crossings a runner makes go
+    /// through [`Products::copy_into`] - the trajectory and the clip each land on their reader's
+    /// device - so this answers the case a same-stream placement would take; and the placement rules
+    /// it states (same device *and* same stream, else refused by name) are the only ones asserted
+    /// without a device. A caller arriving later gets the zero-copy read the moment its two calls are
+    /// on one stream, and nothing else in the store decides that.
     fn borrow(
         &self,
         request: RequestKey,

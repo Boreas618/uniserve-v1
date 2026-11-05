@@ -130,6 +130,42 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// time one is staged and reused after: the denoiser accumulates in FP32 and this decoder reads
     /// the checkpoint's type, so the crossing is one conversion per clip, on the host.
     crossing: Option<platform::PinnedBuffer>,
+    /// The request whose clip the raster column last held, so a decode of another can be refused
+    /// while the first is unread ([`clip_is_releasable`]).
+    published_for: Option<ipc::RequestKey>,
+}
+
+/// Whether a decode of `request` may start while a clip published under `published` is still held.
+///
+/// **One raster column, and a clip nobody has read yet.** A decode writes this runner's raster
+/// column, so decoding a second clip would overwrite the first before its artifact exists — silently,
+/// after the step that produced it, with no event that could order the read (the transport reads
+/// after the step, where a stream wait cannot reach). The first clip's life ends at
+/// `Products::forget`, which the transport calls once it has the bytes, so this asks the store and
+/// refuses by name: what a refusal means is *this request must wait for one read*, not *this
+/// deployment cannot serve two*.
+///
+/// A re-decode of the **same** request is allowed: its clip is its own, and the transport has either
+/// read it or not, in which case it is about to.
+fn clip_is_releasable(
+    request: ipc::RequestKey,
+    published: Option<ipc::RequestKey>,
+    still_held: bool,
+) -> Result<()> {
+    let Some(published) = published else {
+        return Ok(());
+    };
+    if published == request || !still_held {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "request {} asks for a decode and this runner's raster column still holds request {}'s \
+         clip: a decode writes the one column, so the second clip would replace the first before \
+         its artifact was read. The clip's life ends at `forget`, which the reader calls once it \
+         has the bytes; a second decode before that is a request that must wait, not a canvas this \
+         device cannot serve",
+        request.request_id.0, published.request_id.0
+    )))
 }
 
 impl<M: Decoder + Send + Sync> DecoderRunner<M> {
@@ -189,6 +225,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             products: None,
             staged_request: None,
             crossing: None,
+            published_for: None,
         })
     }
 
@@ -425,6 +462,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // The batch names its requests, and a decode bucket serves one clip, so the name kept here
         // is the one the replay's publish uses.
         let request = media.request(0)?.request;
+        // The column may still hold another request's clip: the store is where that clip's life
+        // ends, so the store is asked.
+        let still_held = match (self.products.as_deref(), self.published_for) {
+            (Some(store), Some(last)) if last != request => store.holds(last, Product::Video),
+            _ => false,
+        };
+        clip_is_releasable(request, self.published_for, still_held)?;
         self.staged_request = Some(request);
         // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
         // is the request's conditioning blob and its parameter record; the latent trajectory is
@@ -618,7 +662,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// runner's next decode of the bucket, and the copy is issued on the reader's stream. Publishing
     /// nothing when no store was attached is deliberate — the consumer's read refuses by name, and a
     /// decode that refused here would fail a step whose own work succeeded.
-    fn publish(&self, bucket: Bucket) -> Result<()> {
+    fn publish(&mut self, bucket: Bucket) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Ok(());
         };
@@ -638,7 +682,11 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.stream_id(),
             Some(written),
             &raster,
-        )
+        )?;
+        // The column now holds this request's clip until a reader forgets it: that is what a second
+        // decode of another request is refused against.
+        self.published_for = Some(request);
+        Ok(())
     }
 
     /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
@@ -878,6 +926,44 @@ mod tests {
     //! Nothing here needs a device: each behaviour is a function of the bucket and the model, which is
     //! why a model that refuses a canvas can be driven without one.
 
+    /// A clip still held under another request refuses a second decode, by both requests' names.
+    ///
+    /// The rule is one raster column's: a decode of another request would replace the clip before its
+    /// artifact was read, and nothing orders that read against the step that writes the column. What
+    /// the refusal must therefore carry is the pair — who holds the column, and who is asking — because
+    /// the reader that has to act on it is the holder's transport.
+    #[test]
+    fn a_second_clip_is_refused_while_the_first_is_unread() {
+        let first = ipc::RequestKey::new(0, ipc::RequestId(1), 0);
+        let second = ipc::RequestKey::new(0, ipc::RequestId(2), 0);
+
+        assert!(
+            clip_is_releasable(second, None, false).is_ok(),
+            "a runner that has published no clip decodes any request"
+        );
+        assert!(
+            clip_is_releasable(second, Some(first), false).is_ok(),
+            "a clip the reader forgot no longer holds the column"
+        );
+        assert!(
+            clip_is_releasable(first, Some(first), true).is_ok(),
+            "the holder decoding again reads its own clip, which the transport is about to take"
+        );
+
+        let error = clip_is_releasable(second, Some(first), true)
+            .expect_err("the column still holds the first request's clip");
+        let message = format!("{error}");
+        for expected in [
+            "request 2 asks for a decode",
+            "still holds request 1's clip",
+            "`forget`",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must name {expected:?}: {message}"
+            );
+        }
+    }
     use super::*;
     use nn::capability::StateTable;
 
