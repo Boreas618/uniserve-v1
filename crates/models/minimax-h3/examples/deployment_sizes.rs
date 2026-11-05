@@ -33,9 +33,9 @@ struct Stage {
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     // The encoder set and the conditioner's six buffers are a **bump released before the layout is
     // captured**: the conditioner runs once per request, writes the condition rows, and its buffers
@@ -43,32 +43,32 @@ const STAGES: &[Stage] = &[
     // the plan's own 10,129 MiB and not the sum - the runner's order is prepare -> condition in the
     // bump -> release -> capture -> replay, and a runner that captures first holds 17,041.
     Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 14 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     // The DiT's weights are not sliced by the Ulysses degree: every rank reads the whole 638-name
     // set at the global head width (`Attention::load` projects `heads * head_dim`, and `projection`
     // takes no rank), so this row is the one-rank row plus the four exchange entries' arena.
     Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 13035, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
 ];
 
 /// The deployments, in the note's order.
@@ -113,10 +113,30 @@ static PLAN_COLLISIONS: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root: Option<PathBuf> = None;
+    // The element type the decode plan is stated at. It is the **decode's own**, and this export's
+    // video VAE is FP32 (`43008 elements at f32` in the first decode that ran); the design's FP16
+    // decoder is a released preset's, so it is a flag rather than a constant - a plan stated at F16
+    // beside a block that allocates at FP32 was short by every typed buffer at once (`8e6f87bb3`).
+    let mut decode = nn::DType::F32;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
-        if argument == "--root" {
-            root = arguments.next().map(PathBuf::from);
+        match argument.as_str() {
+            "--root" => root = arguments.next().map(PathBuf::from),
+            "--decode-dtype" => {
+                let text = arguments.next().ok_or("--decode-dtype needs a type")?;
+                decode = match text.as_str() {
+                    "f32" => nn::DType::F32,
+                    "f16" => nn::DType::F16,
+                    "bf16" => nn::DType::BF16,
+                    other => {
+                        return Err(format!(
+                            "`{other}` is not a decode type; write f16, bf16 or f32"
+                        )
+                        .into());
+                    }
+                };
+            }
+            other => return Err(format!("`{other}` is not a flag of this tool").into()),
         }
     }
 
@@ -176,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(root) = root {
-        derived(&root)?;
+        derived(&root, decode)?;
     } else {
         println!(
             "\n(recomputed row bounds and decode plans need `--root <checkpoint>`; the stage table \
@@ -190,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Recompute the quantities the note marks as arithmetic, from a checkpoint's sidecars.
-fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std::error::Error>> {
     use minimax_h3::Dit;
     use minimax_h3::checkpoint::{Layout, Sidecars};
     use minimax_h3::config::{Config, NAMED_CANVASES};
@@ -199,6 +219,10 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let layout = Layout::detect(root)?;
     let sidecars = Sidecars::read(root, None, &layout)?;
     let config = Config::normalize(&layout, &sidecars)?;
+    println!(
+        "the decode plan is stated at {decode} (--decode-dtype; this export's video VAE is FP32, and \
+         the design's FP16 decoder is a released preset's)"
+    );
     let denoiser = &config.denoisers[&Dit::Base];
     let width = u64::from(denoiser.transformer.hidden_size);
 
@@ -512,7 +536,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, nn::DType::F16)?;
+        let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, decode)?;
         distinct_names("the splice plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
@@ -530,25 +554,58 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let decode = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?;
+        let plan = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?;
         distinct_names(
             &format!("the decode plan at {}x{}", canvas.width, canvas.height),
-            &decode,
+            &plan,
         );
-        let arena: u64 = decode.iter().map(|buffer| buffer.bytes()).sum();
+        let arena: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
-            for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
+            for buffer in &plan {
                 let bytes = buffer.bytes();
                 println!("    {} {} {} B", buffer.name, buffer.element, bytes);
             }
         }
         println!(
-            "decode plan {}x{}: {} bytes = {} MiB",
+            "decode plan {}x{} at {decode}: {} bytes = {} MiB",
             canvas.width,
             canvas.height,
             arena,
             arena / (1 << 20)
         );
+    }
+    // A **still** request decodes one latent frame, and the decode plan's clip-level buffers are the
+    // raster of what it decodes - so a deployment that serves only stills reserves a fraction of a
+    // clip's 10,897 MiB. The delta is printed here rather than left to a reader's arithmetic: the
+    // decoder's arena is the row that decides whether a decoding rank can be small.
+    for canvas in NAMED_CANVASES {
+        let latent = minimax_h3::video_vae::Canvas::clip(
+            &config.video_vae,
+            canvas.height / ratio,
+            canvas.width / ratio,
+        );
+        let still = minimax_h3::video_vae::Canvas {
+            frames: 1,
+            ..latent.clone()
+        };
+        let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+        let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &still, decode)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+        if canvas.width == 1344 || canvas.width == 1536 {
+            println!(
+                "decode plan {}x{}: one frame {} MiB, a {}-frame clip {} MiB at {decode}",
+                canvas.width,
+                canvas.height,
+                one / (1 << 20),
+                latent.frames,
+                clip / (1 << 20)
+            );
+        }
     }
     for frames in [124_u32, 362] {
         // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
@@ -670,7 +727,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
-    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
+    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile, decode)?
         .iter()
         .map(|buffer| buffer.bytes())
         .sum();
