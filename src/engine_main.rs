@@ -635,6 +635,14 @@ pub(crate) struct MainProcess {
     /// daemon is told the same state on the connection it gives (§7.5.1 step 2): a successor that
     /// is not told what this engine is never counts it as serving.
     reported_state: i32,
+    /// Whether the daemon that launched this process closed its front: at a handover the
+    /// predecessor leaves, and the attached daemons serve on. Stated once, and not polled
+    /// again, because a closed connection answers every pass with the same error.
+    daemon_closed: bool,
+    /// What this process last announced it is, kept so that a daemon attaching mid-epoch is
+    /// told it without asking the schedulers anything: the attach is a handover's step and a
+    /// control thread blocked in a cache description cannot serve one.
+    announced: Option<proto::request::wire::EngineInfo>,
     /// Whether the closing of the daemon's process interface has been reported: the interface
     /// stays closed, and the line is worth stating once.
     noted_process_closed: bool,
@@ -917,6 +925,8 @@ impl MainProcess {
             switchovers: 0,
             announced_at: None,
             reported_state: proto::request::wire::EngineState::Starting as i32,
+            daemon_closed: false,
+            announced: None,
             noted_process_closed: false,
             commands_seen: 0,
             command_wait: Wait::default(),
@@ -1361,6 +1371,9 @@ impl MainProcess {
         // it came from, and so does every command for a request already admitted.
         let fronts = 1 + self.control.attached_fronts();
         for front in 0..fronts {
+            if front == 0 && self.daemon_closed {
+                continue;
+            }
             loop {
                 // A frame from a closed front ends that front and nothing else: its requests stay
                 // parked for the takeover that claims them (§7.5.1 step 4).
@@ -1371,8 +1384,19 @@ impl MainProcess {
                     Ok(Some(message)) => message,
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(%error, front, "reading a daemon front failed");
-                        if front > 0 {
+                        if front == 0 {
+                            // The launching daemon leaving is the handover's own step: the
+                            // attached daemons hold this process, and a front polled after it
+                            // closed answers every pass with the same error - which is a log
+                            // that hides the handover's own lines behind it.
+                            self.daemon_closed = true;
+                            tracing::warn!(
+                                %error,
+                                "the daemon that launched this process closed its front; the \
+                                 attached daemons serve on, so this front is not read again"
+                            );
+                        } else {
+                            tracing::warn!(%error, front, "reading a daemon front failed");
                             self.control.detach(front);
                         }
                         break;
@@ -3675,8 +3699,13 @@ impl MainProcess {
                     .iter_mut()
                     .find(|served| served.request == command.request)
                 else {
-                    tracing::debug!(
+                    // A handover's takeover names a request this process kept running for it:
+                    // one it does not hold is either a request that ended first or a front that
+                    // named the wrong identity, and only the log can say which.
+                    tracing::warn!(
                         request = command.request,
+                        front,
+                        from = takeover.events,
                         "a takeover names a request this epoch no longer serves"
                     );
                     return Ok(());
@@ -4115,6 +4144,7 @@ impl MainProcess {
             | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
             _ => None,
         };
+        self.announced = info.clone();
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
@@ -4133,11 +4163,11 @@ impl MainProcess {
     /// What an attaching daemon is told this process is: the info it announced, for a state that
     /// carries one, and nothing otherwise.
     fn announced_info(&mut self) -> Option<proto::request::wire::EngineInfo> {
-        match proto::request::wire::EngineState::try_from(self.reported_state).ok()? {
-            proto::request::wire::EngineState::Ready
-            | proto::request::wire::EngineState::Standby => self.engine_info().ok(),
-            _ => None,
-        }
+        // The value announced, not a fresh one: describing the cache asks every scheduler for
+        // what it holds, and a scheduler that is busy does not answer for as long as the stall
+        // bound - which is a control thread that cannot serve the handover's own attach
+        // (`501fa5e6f`: the engine read the attach and then said nothing for sixty seconds).
+        self.announced.clone()
     }
 
     /// What the daemon records of this process: the limits every request is checked against, the

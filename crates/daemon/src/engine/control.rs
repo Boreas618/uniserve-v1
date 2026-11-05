@@ -723,6 +723,16 @@ impl EngineControl {
                     let hello: wire::Hello = reader
                         .recv(CONNECT_TIMEOUT)?
                         .context("the engine said no hello")?;
+                    // Whose dial this is: a successor waits for one engine's front, and a
+                    // connection it cannot use is otherwise indistinguishable from one that never
+                    // arrived — the difference between an engine that dialled the wrong daemon and
+                    // one that never dialled at all.
+                    tracing::info!(
+                        awaited = engine,
+                        stated = hello.engine,
+                        interface = hello.interface,
+                        "an engine connected to this daemon's request socket"
+                    );
                     if hello.engine == engine {
                         return Ok((reader, writer, hello));
                     }

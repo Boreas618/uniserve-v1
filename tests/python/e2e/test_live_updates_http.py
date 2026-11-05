@@ -596,8 +596,10 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "the successor owns it, so it is not relaunched here",
             "the engine read an engine command",
             "a serve pass took longer than five seconds",
+            "closed its front; the",
             "the daemon hands its service",
             "attaching a daemon failed",
+            "an engine connected to this daemon's request socket",
             "asked the engine to dial",
             "was not asked to dial",
             "a request was taken over",
@@ -608,15 +610,27 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
         trouble = []
         for line in _log_lines(log):
             if any(mark in line for mark in marks):
-                trouble.append(line)
+                # A repeated line is one fact, not many: a storm of the same
+                # warning evicted three runs' evidence, because a storm fills
+                # every line the excerpt has. Consecutive repeats collapse to
+                # one line and a count, so what differs from the storm still
+                # reaches the artifact.
+                if trouble and trouble[-1][0] == line:
+                    trouble[-1][1] += 1
+                else:
+                    trouble.append([line, 1])
     except OSError as error:
         return f"\n(server log unreadable at {log}: {error})"
     if not trouble:
         return f"\n--- no warning or error in {log} ---"
     shown = trouble[-limit:]
+    lines = [
+        line if count == 1 else f"{line} (repeated {count} times)"
+        for line, count in shown
+    ]
     return (
-        f"\n--- {len(shown)} warnings and errors of {log} ---\n"
-        + "\n".join(shown)
+        f"\n--- {len(lines)} warnings and errors of {log} ---\n"
+        + "\n".join(lines)
         + "\n--- end of excerpts ---"
     )
 
@@ -1419,7 +1433,9 @@ def _restart_while_streaming(
         zip(reads, dones, HANDED_STREAMS, strict=True)
     ):
         assert len(read) > before_restart[index], (
-            f"stream {index} ended at the restart"
+            f"stream {index} ended at the restart (reads={len(read)} of "
+            f"{before_restart[index]} before it, done={done.is_set()}, "
+            f"last={last}){_log_trouble(log)}"
         )
         # Every stream carries its count whole: a frame lost, repeated or
         # reordered at the boundary — the one thing the handoff must not do —

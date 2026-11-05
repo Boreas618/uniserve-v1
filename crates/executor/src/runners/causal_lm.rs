@@ -954,17 +954,56 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
-/// A 64-bit digest of `bytes`, so two ends of a comparison can state one number per page.
+/// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
 ///
-/// FNV-1a: it costs nothing, needs no table and is stable across processes, which is what makes it
-/// quotable between the slice's run and the runner's.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// The package hands `TllmGenFmhaRunnerParams` to the kernel **by value**, so the node's argument
+/// blob is that struct: every pointer it holds was resolved at capture and every scalar in it is
+/// what the replay uses, with no host-side figure of the batch anywhere in between. Offsets are
+/// `sizeof`/`offsetof` of the shipped header
+/// (`flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h`, 496 bytes), read with a
+/// three-line C++ probe compiled against that header rather than counted by hand.
+fn decode_fmha_params(bytes: &[u8]) -> String {
+    const SIZE: usize = 496;
+    if bytes.len() < SIZE {
+        return format!("blob={}B (not the {SIZE} of TllmGenFmhaRunnerParams)", bytes.len());
     }
-    hash
+    let pointer = |at: usize| -> u64 {
+        u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    let integer = |at: usize| -> i32 {
+        i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+    };
+    format!(
+        "fmha blob={} mask={} kernel={} sched={} multi_cta={} q={:#x} k={:#x} v={:#x} \
+         page_idx={:#x} seq_lens_kv={:#x} cum_q={:#x} out={:#x} batch={} max_q={} max_kv={} \
+         sum_q={} sum_kv={} pages_per_seq={} tokens_per_page={} pages_in_pool={} heads_q={} \
+         q_stride_tokens={} k_stride_kv={} pdl={} stream={:#x}",
+        bytes.len(),
+        integer(4),
+        integer(8),
+        integer(12),
+        bytes[16] != 0,
+        pointer(24),
+        pointer(32),
+        pointer(40),
+        pointer(152),
+        pointer(128),
+        pointer(136),
+        pointer(296),
+        integer(380),
+        integer(388),
+        integer(392),
+        integer(404),
+        integer(408),
+        integer(412),
+        integer(416),
+        integer(420),
+        integer(368),
+        integer(312),
+        integer(320),
+        bytes[488] != 0,
+        pointer(480)
+    )
 }
 
 /// Whether a block table view holds `bytes` readable bytes of page indices.
@@ -1191,6 +1230,13 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
     /// Submit therefore states which batch the rows belong to, and a replay of another batch
     /// refuses rather than installing the wrong request's pages.
+    /// The page the dump digests: the first unit of the batch's own staged table, remembered here
+    /// because a batch that installs no new rows (a decode step on pages it already addresses) has
+    /// no staged table to read, and the pages a request reads do not move between its batches.
+    ///
+    /// Only a diagnosis reads this; it costs one `Option<u64>` and is filled where the install sees
+    /// the table, so no step pays for it.
+    cache_page: Option<u64>,
     /// What the captured attention launch was given, read from the device after the replay and
     /// printed on the device thread (`UNISERVE_RUNNER_DUMP`).
     ///
@@ -1315,6 +1361,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            cache_page: None,
             pending_attention: None,
             pending_install: None,
             pending_dump: None,
@@ -1660,6 +1707,15 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // row `slot` of the cache's pooled table, so the row must state the request's own
                 // pages before the graph reads it, and the units must be this cache's before
                 // anything is copied into them.
+                // The page the batch's first row starts at, read from the staged table before the
+                // install consumes it: the dump digests the pages the replay has just written, and
+                // the row's own first page is where the prompt's first tokens live (4.5).
+                let first_page = self
+                    .pending_install
+                    .as_ref()
+                    .and_then(|install| install.tables.first())
+                    .and_then(|table| table.unit_ids.first())
+                    .map(|unit| u64::from(unit.0));
                 self.install_pending(*batch)?;
                 // Then the batch's columns are uploaded here, on the device thread, before the
                 // graph reads them: the scheduler hands over a `Batch` and the device thread
@@ -1693,9 +1749,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
+                // The captured launch's token bound is the pose the bucket was captured with, which
+                // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
+                // they differ the kernel is told to run work this batch does not hold, and that is a
+                // fact about the two numbers, so it is stated on every batch rather than only under
+                // the dump: a bound taken from the wrong pose leaves no trace in any figure the batch
+                // computes for itself.
+                let live = self.staging.live_tokens();
+                if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
+                    tracing::warn!(
+                        captured_tokens = bucket.tokens,
+                        live_tokens = live,
+                        "a prefill bucket's captured launch states more tokens than this batch \
+                         holds: the bound was taken from the pose the bucket was captured with"
+                    );
+                }
                 if runner_dump() {
-                    self.pending_attention =
-                        Some(self.dump_attention_call(captured));
+                    let call = self.dump_attention_call(captured, first_page.or(self.cache_page));
+                    self.pending_attention = Some(call);
                 }
                 if runner_dump() {
                     // What a replay launches, by node kind, and how many launches the recording
@@ -2447,6 +2518,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 install.batch.0, batch.0
             )));
         }
+        self.cache_page = install
+            .tables
+            .first()
+            .and_then(|table| table.unit_ids.first())
+            .map(|unit| u64::from(unit.0))
+            .or(self.cache_page);
         self.kv.install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)
     }
@@ -2462,7 +2539,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ///
     /// It runs on the device thread, after the replay that wrote the pages, and every failure is
     /// text: a diagnosis never fails the batch it describes.
-    fn dump_attention_call(&self, captured: &crate::captured::Captured) -> String {
+    fn dump_attention_call(
+        &self,
+        captured: &crate::captured::Captured,
+        first_page: Option<u64>,
+    ) -> String {
         use ops::attention::PAGED_ATTENTION_CALL_LAYOUT as LAYOUT;
         let Some((operator, key, launch)) = captured
             .nodes()
@@ -2478,14 +2559,82 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Ok(params) => params,
             Err(error) => return format!("params-refused({error})"),
         };
-        // The kernel's one argument is the pointer to its call struct.
+        // What the entry actually enqueued: a native package unpacks the call into the kernel's own
+        // arguments at capture time, so these blobs are the launch's whole input and every pointer
+        // among them was resolved then. Scanning them for this runner's own column addresses says
+        // whether the graph reads the vectors each batch uploads, or a copy taken from the warm
+        // pose at capture - the question no host-side figure answers, and one that needs no device
+        // read at all.
+        let known = [
+            ("seq_lens", self.columns.seq_lens.device.ptr.address()),
+            (
+                "cum_seq_lens_q",
+                self.columns.query_offsets.device.ptr.address(),
+            ),
+        ];
+        let mut shape = format!(
+            "attention {operator} {key} grid={:?} block={:?} shared={} params={}",
+            params.grid,
+            params.block,
+            params.shared_memory,
+            params.parameters.len()
+        );
+        // Each argument's own bytes, so a program order stated by another lane can be mapped onto
+        // what this launch carries without a second run: `p0=0x…` for a pointer-sized argument and
+        // `p3=512` for a scalar, which is the pair a slice's values are compared against.
+        let mut arguments = String::new();
+        for blob in &params.parameters {
+            let value = match blob.len() {
+                8 => u64::from_ne_bytes(blob[..8].try_into().unwrap_or([0; 8])),
+                4 => u64::from(u32::from_ne_bytes(blob[..4].try_into().unwrap_or([0; 4]))),
+                _ => 0,
+            };
+            arguments.push_str(&format!(" 0x{value:x}"));
+        }
+        shape.push_str(&format!(" args=[{}]", arguments.trim_start()));
+        for (index, blob) in params.parameters.iter().enumerate() {
+            shape.push_str(&format!(" p{index}({}B)", blob.len()));
+            for (name, address) in known {
+                let pattern = address.to_ne_bytes();
+                for at in 0..blob.len().saturating_sub(7) {
+                    if blob[at..at + 8] == pattern {
+                        shape.push_str(&format!(" {name}@{index}+{at}"));
+                    }
+                }
+            }
+        }
+        // A native package takes its parameters in one of two shapes, and only one of them is a
+        // pointer to the operator's call: the trtllm-gen entry passes `TllmGenFmhaRunnerParams` to
+        // the kernel by value, so the node's first argument **is** that struct. Decoding it names
+        // every bound the launch was given, which is what no host-side figure of the batch states.
         let Some(bytes) = params.parameters.first() else {
-            return "no-parameters".to_owned();
+            return format!("{shape} no-parameters");
         };
+        if bytes.len() != 8 {
+            // The two plane pointers the launch carries, beside the addresses this runner's own
+            // layer 0 has: a graph reading another plane is invisible from every host-side figure,
+            // and the digest below would then describe bytes the kernel never touched.
+            let key = u64::from_ne_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
+            let value = u64::from_ne_bytes(bytes[40..48].try_into().unwrap_or([0; 8]));
+            return format!(
+                "{shape} {}{}{}",
+                decode_fmha_params(bytes),
+                self.plane_verdict(key, value),
+                self.dump_cache_digests(first_page)
+            );
+        }
         let address = match bytes.as_slice() {
             [a, b, c, d, e, f, g, h] => u64::from_ne_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
-            _ => return "odd-parameter".to_owned(),
+            _ => return format!("{shape} odd-parameter"),
         };
+        // The parameter a native package passes is not always a device address: a host entry may
+        // enqueue the launch itself and bake the scalars into the node, in which case this is the
+        // address of a host structure that no longer exists. A device copy from there would fault
+        // and the driver's error sticks to this stream, so the read happens only inside the arena
+        // the bucket owns - and "outside" is itself the answer.
+        if !self.in_arena(address, LAYOUT.size) {
+            return format!("{shape} call={address:#x} outside-arena");
+        }
         let Some(call) = self.read_device(address, LAYOUT.size) else {
             return format!("call-unreadable({address:#x})");
         };
@@ -2538,7 +2687,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // layer above it then computes from zeros without any error anywhere.
         let out_pointer = word(LAYOUT.out);
         let out_digest = match self.read_device(out_pointer, 64) {
-            Some(raw) => format!("{:016x}", fnv(&raw)),
+            Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
             None => "unreadable".to_owned(),
         };
         out.push_str(&format!(" out={out_pointer:#x}/{out_digest}"));
@@ -2550,8 +2699,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ("cum_seq_lens_q", LAYOUT.cum_seq_lens_q, 8),
         ] {
             let pointer = word(offset);
+            let own = match name {
+                "seq_lens" => self.columns.seq_lens.device.ptr.address(),
+                _ => self.columns.query_offsets.device.ptr.address(),
+            };
             if pointer == 0 {
                 out.push_str(&format!(" {name}=[null]"));
+                continue;
+            }
+            if pointer != own {
+                // A vector this runner did not write: its contents are not ours to read, and a
+                // read out of range is a sticky device error.
+                out.push_str(&format!(" {name}=[foreign]"));
                 continue;
             }
             let Some(raw) = self.read_device(pointer, count * 4) else {
@@ -2581,7 +2740,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .nodes()
             .iter()
             .filter(|(operator, _, _)| *operator == "paged_attention")
-            .take(4)
             .enumerate()
         {
             let Some(node) = launch.first() else {
@@ -2605,21 +2763,135 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 u64::from_ne_bytes(eight)
             };
             let page_size = at(LAYOUT.page_size).max(1);
-            let page_bytes = at(LAYOUT.kv_stride_page).max(1);
+            // Elements between two pages and between two tokens of one page, and the element's
+            // width: the digest covers one page's own bytes, so both halves of a comparison state
+            // the same quantity.
+            let page_elements = at(LAYOUT.kv_stride_page).max(1);
+            let token_elements = at(LAYOUT.kv_stride_tokens).max(1);
+            let element_bytes = ops::DType::from_i64(at(LAYOUT.dtype_key_value) as i64)
+                .and_then(ops::DType::bytes)
+                .unwrap_or(1)
+                .max(1);
+            let live = self.staging.live_tokens().max(1);
+            let held = page_size.min(live);
             let mut digests = String::new();
             for (plane, offset) in [("k", LAYOUT.key), ("v", LAYOUT.value)] {
                 let base = at(offset);
-                let bytes = (page_size * page_bytes) as usize;
-                let digest = match self.read_device(base + pages as u64 * page_bytes as u64, bytes)
+                let pages_in_pool = at(LAYOUT.num_pages);
+                let bytes = (held * token_elements * element_bytes) as usize;
+                if base == 0 || pages as u64 >= pages_in_pool || bytes > (1 << 20) {
+                    digests.push_str(&format!(" {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"));
+                    continue;
+                }
+                let start = base + pages as u64 * page_elements * element_bytes;
+                let digest = match self.read_device(start, bytes)
                 {
-                    Some(raw) => format!("{:016x}", fnv(&raw)),
+                    Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
                     None => "unreadable".to_owned(),
                 };
                 digests.push_str(&format!(" {plane}={base:#x}/{digest}"));
             }
             out.push_str(&format!(" layer{layer}={digests}"));
         }
+        // The same digests taken from the runner's own planes and the table it installed, so the
+        // comparison with a slice's line does not depend on what the launch kept: a package that
+        // unpacks the call into host memory holds no pointer here, and the pages are the runner's
+        // whatever the kernel was handed.
+        out.push_str(&self.dump_cache_digests(first_page));
         out
+    }
+
+    /// Whether the plane pointers a launch carries are this runner's own layer 0 planes.
+    fn plane_verdict(&self, key: u64, value: u64) -> String {
+        let Ok(planes) = self.kv.planes(0) else {
+            return " planes=refused".to_owned();
+        };
+        let Some(first) = planes.first() else {
+            return " planes=empty".to_owned();
+        };
+        let mark = |at: u64, own: u64| if at == own { "own" } else { "OTHER" };
+        // The three statements of a page's length, side by side: what the batch declares, what the
+        // cache allocates, and what the plane's own view holds. A kernel that forms page addresses
+        // at one of them while the pages were written at another reads the wrong keys for every
+        // prompt, with no fault and no dependence on the prompt at all.
+        format!(
+            " planes=layer0:{} /{}(key,value) page_size={}/{}/{} (batch/cache/plane)",
+            mark(key, first.key.ptr.address()),
+            mark(value, first.value.ptr.address()),
+            self.geometry.page_size,
+            self.kv.page_size(),
+            first.key.shape.dim(1)
+        )
+    }
+
+    /// One digest per layer of the keys and values the replay just wrote into the batch's pages.
+    ///
+    /// The slice prints the same numbers for the same tokens (`crates/models/qwen3-moe/examples/
+    /// qwen3_moe_slice.rs`, `kv layer<n>: k=… v=…`): `platform::fnv1a` over the bytes of the row's
+    /// first page that hold this batch's tokens, so the first layer whose numbers differ is the
+    /// layer where the served path stopped computing the slice's arithmetic. Unlike the call
+    /// readback this needs nothing from the launch - the planes are this runner's resident cache
+    /// and the page is the one it installed - so it is printed even when the launch's arguments are
+    /// not addresses this runner may read.
+    fn dump_cache_digests(&self, first_page: Option<u64>) -> String {
+        let Some(page) = first_page else {
+            return " cache=no-page".to_owned();
+        };
+        let planes = match self.kv.planes(0) {
+            Ok(planes) => planes,
+            Err(error) => return format!(" cache=refused({error})"),
+        };
+        let page_size = u64::from(self.kv.page_size()).max(1);
+        let element = self.kv.dtype().bytes().unwrap_or(1).max(1);
+        let live = self.staging.live_tokens().max(1);
+        let held = page_size.min(live);
+        let mut out = String::from(" cache:");
+        for (layer, plane) in planes.iter().enumerate() {
+            let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
+            let page_elements = page_size.saturating_mul(token_elements);
+            let bytes = usize::try_from(
+                held.saturating_mul(token_elements).saturating_mul(element),
+            )
+            .unwrap_or(0);
+            if bytes == 0 || token_elements == 0 {
+                continue;
+            }
+            // A page outside this layer's plane is stated and not read: a device copy from past an
+            // allocation leaves the driver's error stuck to the stream, and the next batch would
+            // fail on a diagnosis.
+            let pages = plane.key.shape.dim(0);
+            if page >= pages {
+                out.push_str(&format!(" layer{layer}=(page {page} of {pages})"));
+                continue;
+            }
+            out.push_str(&format!(" layer{layer}="));
+            for (name, view) in [("k", plane.key), ("v", plane.value)] {
+                let start = view.ptr.address()
+                    + page.saturating_mul(page_elements).saturating_mul(element);
+                match self.read_device(start, bytes) {
+                    Some(raw) => out.push_str(&format!("{name}={:016x} ", platform::fnv1a(&raw))),
+                    None => out.push_str(&format!("{name}=unreadable ")),
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `[address, address + bytes)` lies inside the graph pool's arena.
+    ///
+    /// The only memory this runner may read back blindly is the arena its captured graphs address;
+    /// anything else is an address a launch named and a copy from it could fault, which the driver
+    /// leaves stuck to the stream for the next batch to fail on.
+    fn in_arena(&self, address: u64, bytes: usize) -> bool {
+        let Ok(mut pool) = self.pool() else {
+            return false;
+        };
+        let Ok(base) = pool.base(self.stream_id()) else {
+            return false;
+        };
+        let reserved = pool.reserved() as u64;
+        let start = base.address();
+        address >= start && (address - start).saturating_add(bytes as u64) <= reserved
     }
 
     /// `bytes` of device memory at `address`, read on this runner's stream, or `None`.
@@ -2830,13 +3102,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// `r · pages .. (r + 1) · pages`, which is what its block table states; so the new kernel's
     /// writes land in the row's own scratch pages and never in a page a served request reads (7.3).
     fn upload_scratch_slots(&mut self, bucket: Bucket, pages: u32) -> Result<()> {
-        let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
+        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let batch = self.staging.batch_rows();
-        let mapping = crate::shadow::scratch_slot_mapping(
-            &batch.positions[..tokens],
-            &batch.query_offsets[..rows + 1],
-            &batch.slot_mapping[..tokens],
+        let mapping = crate::shadow::scratch_column(
+            &batch.positions,
+            &batch.query_offsets,
+            &batch.slot_mapping,
+            live,
+            tokens,
             pages,
             self.geometry.page_size,
         )?;
