@@ -255,6 +255,39 @@ impl PhaseKind {
         }
     }
 
+    /// The id this kind is numbered with: the declaration order of [`PhaseKind`], which is what
+    /// "appended, never renumbered" protects. A rank's plan, a policy's `Plan` and a batch's phase
+    /// are all numbered here, so this is the one table they can agree on.
+    ///
+    /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
+    /// no phase of its own, so its id is `u32::MAX`.
+    pub const fn id(self) -> PhaseId {
+        PhaseId(match self {
+            Self::TextEncoding => 0,
+            Self::VisionEncoding => 1,
+            Self::LatentEncoding => 2,
+            Self::Prefill => 3,
+            Self::Decode => 4,
+            Self::Verify => 5,
+            Self::TokenDenoise => 6,
+            Self::Readout => 7,
+            Self::ImageDecode => 8,
+            Self::CacheInstall => 9,
+            Self::MediaRead => 10,
+            Self::Denoise => 11,
+            Self::VideoDecode => 12,
+            Self::AudioDecode => 13,
+            Self::VideoEncode => 14,
+            Self::AudioEncode => 15,
+            Self::Mux => 16,
+            Self::LatentPrepare => 17,
+            Self::TensorTransfer => 18,
+            Self::CacheExport => 19,
+            Self::Refill => 20,
+            Self::Other => u32::MAX,
+        })
+    }
+
     /// Whether a chunk of this phase writes the prefix cache. Only such a
     /// chunk draws on the prefill budget a warming epoch bounds (design §4.4).
     pub fn writes_prefix_cache(self) -> bool {

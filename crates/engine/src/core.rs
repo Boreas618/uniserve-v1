@@ -1502,7 +1502,7 @@ impl SchedulerHandle {
 
     /// The scheduler's serving signal, for a thread that waits on it without
     /// holding the handle ([`crate::warmup::after_serving`]).
-    pub(crate) fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
+    pub fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
         self.serving.clone()
     }
 
