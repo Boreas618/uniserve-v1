@@ -58,6 +58,18 @@ python3 "$gaps" --generator "$root" --fixture "$fixture" || fail "the file is no
 
 # 2. Does the file state what it holds?
 echo
+echo "== the sparse list against its generator"
+# The sparse file is a deployment of its own: its rows come from the generator run
+# with `--sparse`, and a file cut from a walk at another clip fails here by name
+# rather than by falling through to a walk comparison, which measures the walk.
+if [ -f "$sparse_fixture" ]; then
+    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9,8192 \
+        --fixture "$sparse_fixture" || fail "the sparse file is not the generator's sparse rows"
+else
+    echo "   skipped: $sparse_fixture is absent"
+fi
+
+echo
 echo "== the list against its own header"
 python3 "$gaps" --wellformed --fixture "$fixture" || fail "the list does not state what it holds"
 
