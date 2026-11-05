@@ -2879,7 +2879,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut out = format!(
             "kparams blob={} grid=[{},{},{}] batch={} window={} chunked_log2={} \
              out={:#x} cum_q={:#x} cum_kv={:#x} page_idx={:#x} seq_lens_kv={:#x} \
-             counter={:#x} partial_o={:#x} stats={:#x} tmaK={:#x} tmaV={:#x}",
+             counter={:#x} partial_o={:#x} stats={:#x} tmaQ={:#x} tmaK={:#x} \
+             tmaKsw={:#x} tmaV={:#x} tmaO={:#x} {}",
             bytes.len(),
             integer(896),
             integer(900),
@@ -2895,8 +2896,24 @@ impl<M: CausalLm> CausalLmRunner<M> {
             pointer(1000),
             pointer(1024),
             pointer(1112),
+            pointer(0),
             pointer(128),
-            pointer(384)
+            pointer(256),
+            pointer(384),
+            pointer(512),
+            // The kernel may store O through its own tensor map rather than through `ptrO`, and the
+            // two are different statements of where attention's output is. If they differ, the
+            // tensor the projection reads was never written - which is what an all-zero attention
+            // output looks like from the projection's end.
+            if pointer(512) == pointer(912) {
+                "out_view=tmaO==ptrO".to_string()
+            } else {
+                format!(
+                    "out_view=DIFFERS tmaO={:#x} ptrO={:#x}",
+                    pointer(512),
+                    pointer(912)
+                )
+            }
         );
         // The launch's own lengths, at the offsets `KernelParams` declares them: `mMaxSeqLenQ` 1172,
         // `mMaxSeqLenKv` 1176, the CTA bounds 1180 and 1184, `mMaxNumPagesPerSeqKv` 1188, and the
@@ -3228,7 +3245,34 @@ impl<M: CausalLm> CausalLmRunner<M> {
                         dirty.push((layer, value));
                     }
                 }
-                out.push_str(&format!(" attn{layer}={named}{written}{split}@{grid}{counted}"));
+                // Where the launch's own tensor map says the output is. A kernel may store O through
+                // `tmaO_` rather than through `ptrO`, and the two are different statements of one
+                // address: a zero `ptrO` beside a nonzero map is attention writing a tensor the
+                // projection never reads, which is what an all-zero attention output looks like from
+                // the projection's end.
+                let tma_o = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(512..520))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let mapped = if tma_o != 0 && tma_o != address && inside(tma_o) {
+                    match self.read_device(tma_o, width) {
+                        Some(raw) => format!(
+                            " map={:016x} mapnz={}",
+                            platform::fnv1a(&raw),
+                            raw.iter().filter(|byte| **byte != 0).count()
+                        ),
+                        None => " map=unreadable".to_owned(),
+                    }
+                } else if tma_o != 0 && tma_o != address {
+                    format!(" map={tma_o:#x}-outside")
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}"
+                ));
                 layer += 1;
             }
         }
@@ -3266,9 +3310,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         functions.sort_by(|left, right| right.1.cmp(&left.1));
+        // Every function of the graph, not the twelve most frequent: the question the histogram
+        // answers is which kernels are *absent* (a reduction node, a reduction's second launch), and
+        // a truncated list cannot answer it - a count of 1 at the end of the list is exactly what an
+        // absent kernel looks like from the top.
         let spelled: Vec<String> = functions
             .iter()
-            .take(12)
             .map(|(name, count)| format!("{name}:{count}"))
             .collect();
         out.push_str(&format!(" functions=[{}]", spelled.join(",")));
