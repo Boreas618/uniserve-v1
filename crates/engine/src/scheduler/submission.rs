@@ -21,10 +21,10 @@ use crate::WorkerGroupId;
 use crate::executor::ExecutionBatch;
 use crate::executor::{Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
-use executor::completion::Outcome;
 use executor::batch::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
 };
+use executor::completion::Outcome;
 use ipc::BatchCommand;
 
 /// What placement and the views ask of the world: the pools it serves, and
@@ -237,6 +237,25 @@ impl Submissions {
         }
     }
 
+    /// The bucket this executor would serve `computation` in, when it serves one (2.4).
+    ///
+    /// The mechanism asks before it forms a media batch, because the batch states the extent its
+    /// kernels were captured for and only the executor's own plan knows it: a bucket planned for
+    /// one canvas serves no other, and deriving the extent in the mechanism would be a second
+    /// statement of the runner's plan. `None` is the answer for a computation no device of this
+    /// rank serves, and for the worker-process arm, which serves media on its workers rather than
+    /// through the mechanism's own batch assembly.
+    pub(super) fn media(
+        &self,
+        phase: ipc::PhaseId,
+        computation: &executor::plan::Computation,
+    ) -> Option<executor::plan::Bucket> {
+        match &self.path {
+            Path::Workers(_) => None,
+            Path::InProcess(arm) => arm.batches.media(phase, computation).ok().flatten(),
+        }
+    }
+
     /// Runs `batch`'s paired forwards without serving them (7.3 step 2).
     ///
     /// Whether a shadow batch can be submitted through this door.
@@ -435,24 +454,25 @@ impl InProcess {
     /// tolerance rather than only the element that did.
     pub(super) fn shadow_status(&mut self) -> ShadowStatus {
         let mut failure: Option<String> = None;
-        self.shadows.retain(|submission| match submission.outcome() {
-            None => true,
-            Some(Outcome::Success(_)) => false,
-            Some(Outcome::Failed(error)) => {
-                let reason = match submission.failure_label() {
-                    Some(label) => format!("{label}: {error}"),
-                    None => error.to_string(),
-                };
-                failure.get_or_insert(reason);
-                false
-            }
-            Some(Outcome::Cancelled) => {
-                failure.get_or_insert_with(|| {
-                    "a shadow batch was cancelled before its comparison ran".to_owned()
-                });
-                false
-            }
-        });
+        self.shadows
+            .retain(|submission| match submission.outcome() {
+                None => true,
+                Some(Outcome::Success(_)) => false,
+                Some(Outcome::Failed(error)) => {
+                    let reason = match submission.failure_label() {
+                        Some(label) => format!("{label}: {error}"),
+                        None => error.to_string(),
+                    };
+                    failure.get_or_insert(reason);
+                    false
+                }
+                Some(Outcome::Cancelled) => {
+                    failure.get_or_insert_with(|| {
+                        "a shadow batch was cancelled before its comparison ran".to_owned()
+                    });
+                    false
+                }
+            });
         match failure {
             Some(reason) => ShadowStatus::Failed(reason),
             None if self.shadows.is_empty() => ShadowStatus::Settled,
@@ -543,18 +563,97 @@ impl InProcess {
         batch: &ExecutionBatch,
         generation: u64,
     ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
-        let columns = batch.columns.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "batch {} carries no columns: the mechanism could not state the layout its kernels read",
+        // One batch is one computation: a token batch is the typed columns the mechanism wrote,
+        // and a media batch is the computation its kernels were captured for beside the request's
+        // own stated parameters. A batch that states both would be served twice over, and one that
+        // states neither cannot be served at all.
+        if let Some(media) = batch.media.clone() {
+            anyhow::ensure!(
+                batch.columns.is_none(),
+                "batch {} states token columns and media columns: one batch is one computation",
                 batch.id
-            )
+            );
+            media
+                .check()
+                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
+            let mut calls = Vec::with_capacity(batch.requests.len());
+            let mut kind = None;
+            for (call, _) in &batch.requests {
+                anyhow::ensure!(
+                    matches!(call.kind, ipc::CallKind::Media(_)),
+                    "batch {} states media columns and carries a call no media phase serves: {:?}",
+                    batch.id,
+                    call.kind
+                );
+                let phase = wire_phase(call.kind).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "batch {} carries a call kind no device phase serves: {:?}",
+                        batch.id,
+                        call.kind
+                    )
+                })?;
+                anyhow::ensure!(
+                    kind.is_none_or(|served| served == phase),
+                    "batch {} mixes phases: one batch serves one phase",
+                    batch.id
+                );
+                kind = Some(phase);
+                calls.push((call.request_key, call.call_id));
+            }
+            let phase =
+                kind.ok_or_else(|| anyhow::anyhow!("batch {} carries no call to serve", batch.id))?;
+            let computation = media.computation;
+            let variant = computation.variant().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch {} states a {:?} computation no variant serves",
+                    batch.id,
+                    computation.call
+                )
+            })?;
+            let device = DeviceBatch {
+                id: DeviceBatchId(batch.id),
+                phase,
+                calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
+                shape: executor::plan::Shape {
+                    rows: computation.rows,
+                    tokens: computation.tokens,
+                    variant,
+                },
+                // A media computation reads none of the token columns, so its batch carries none:
+                // the fields the kernels read are the model's own, staged inside the runner.
+                columns: executor::batch::BatchColumns::default(),
+                generation,
+                cache_units: Vec::new(),
+                block_tables: Vec::new(),
+                media: Some(media),
+            };
+            return Ok((device, calls));
+        }
+        let columns = batch.columns.clone().ok_or_else(|| {
+            // A media batch that arrives without its own columns is a different fact from a token
+            // batch without a layout: the mechanism states a media computation's per-request buffers
+            // only for the families it has a record for, so the refusal names the family rather than
+            // the token layout that batch never had.
+            match batch.requests.first().map(|(call, _)| call.kind) {
+                Some(ipc::CallKind::Media(call)) => anyhow::anyhow!(
+                    "batch {} states no media columns: the mechanism stages no per-request buffers \
+                     for a {:?} computation",
+                    batch.id,
+                    call
+                ),
+                _ => anyhow::anyhow!(
+                    "batch {} carries no columns: the mechanism could not state the layout its \
+                     kernels read",
+                    batch.id
+                ),
+            }
         })?;
         let mut calls = Vec::with_capacity(batch.requests.len());
         let mut kind = None;
         for (call, _) in &batch.requests {
             anyhow::ensure!(
                 !matches!(call.kind, ipc::CallKind::Media(_)),
-                "in-process execution serves no media call yet (batch {}): {:?}",
+                "in-process execution serves no media call from a token batch (batch {}): {:?}",
                 batch.id,
                 call.kind
             );
@@ -598,8 +697,8 @@ impl InProcess {
                 .iter()
                 .flat_map(|(_, placement)| placement.block_tables.iter().cloned())
                 .collect(),
-            // A token forward carries no media columns; the media path states its own here when it
-            // forms a media batch, which is the commit that first builds one.
+            // A token forward carries no media columns: the media arm above is where a media
+            // batch's are passed through, and this arm refuses a media call by name.
             media: None,
         };
         Ok((device, calls))
@@ -611,7 +710,330 @@ impl InProcess {
 /// The mechanism names phases with `scheduling`'s ids and the executor with
 /// `ipc`'s; both are the same fixed vocabulary in the same order, and this is
 /// the one place the two meet, so neither type grows a second numbering.
-fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
+pub(super) fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
     let id = crate::scheduler::views::phase_id(crate::scheduler::views::call_phase(kind));
     u16::try_from(id.0).ok().map(ipc::PhaseId)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use executor::batch::SubmissionId;
+    use executor::batch::{BatchOutput, Inventory, MediaColumns, Placement, StagedRequest};
+    use executor::plan::{Bucket, Computation, Extent, Variant};
+    use ipc::{Call, CallKind, MediaCall};
+
+    /// What one in-process submission carried to the executor.
+    #[derive(Clone, Debug)]
+    struct Delivered {
+        phase: ipc::PhaseId,
+        generation: u64,
+        media: Option<MediaColumns>,
+    }
+
+    /// The executor's own devices, as a double: it states one pool, answers the bucket its plan
+    /// would serve, and records every batch the mechanism hands it.
+    struct Devices {
+        inventory: Vec<Inventory>,
+        bucket: Option<Bucket>,
+        delivered: Arc<Mutex<Vec<Delivered>>>,
+    }
+
+    impl Devices {
+        fn one(bucket: Option<Bucket>) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let inventory = Inventory {
+                group: "gpu".to_owned(),
+                ranks: vec![ipc::WorkerInfo::default()],
+                placement: Placement::default(),
+                max_model_len: 4096,
+            };
+            (
+                Arc::new(Self {
+                    inventory: vec![inventory],
+                    bucket,
+                    delivered: Arc::clone(&delivered),
+                }),
+                delivered,
+            )
+        }
+    }
+
+    impl Batches for Devices {
+        fn submit(&self, batch: DeviceBatch) -> executor::Result<Submission> {
+            self.delivered
+                .lock()
+                .expect("the recorder is not poisoned")
+                .push(Delivered {
+                    phase: batch.phase,
+                    generation: batch.generation,
+                    media: batch.media,
+                });
+            Ok(Submission::completed(
+                SubmissionId(1),
+                Outcome::Success(BatchOutput::default()),
+            ))
+        }
+
+        fn shadow(&self, batch: DeviceBatch) -> executor::Result<Submission> {
+            self.submit(batch)
+        }
+
+        fn media(
+            &self,
+            _phase: ipc::PhaseId,
+            _computation: &Computation,
+        ) -> executor::Result<Option<Bucket>> {
+            Ok(self.bucket)
+        }
+
+        fn inventory(&self) -> &[Inventory] {
+            &self.inventory
+        }
+    }
+
+    /// The bucket a denoise is planned into: one step over one request's layout.
+    fn denoise_bucket() -> Bucket {
+        Bucket::denoise(1, denoise_layout())
+    }
+
+    /// A layout of one small canvas: the extent a media batch states.
+    fn denoise_layout() -> nn::capability::Layout {
+        nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: 4,
+                frames: 2,
+                height: 8,
+                width: 8,
+            },
+            audio: None,
+            text_rows: 4,
+            condition_rows: 0,
+            condition_elements: 0,
+        }
+    }
+
+    fn staged() -> StagedRequest {
+        StagedRequest {
+            request: ipc::RequestKey::new(1, ipc::RequestId(9), 0),
+            conditioning: vec![1, 2, 3],
+            step: 2,
+            steps: 8,
+            seed: 0x5eed,
+            width: 768,
+            height: 768,
+            frames: 121,
+        }
+    }
+
+    /// One call as the plan hands it to the mechanism.
+    fn call(kind: CallKind, request_id: u64) -> (Call, crate::executor::RequestPlacement) {
+        let key = ipc::RequestKey::new(1, ipc::RequestId(request_id), 0);
+        let call = Call::new(key, ipc::CallId::new(0, 0), kind);
+        (
+            call,
+            crate::executor::RequestPlacement {
+                worker: WorkerGroupId("gpu".to_owned()),
+                request_pool_idx: None,
+                block_tables: Vec::new(),
+                new_cache_units: Vec::new(),
+                forward: Default::default(),
+                latent: None,
+                decode: None,
+                buffers: Vec::new(),
+                page_loads: Vec::new(),
+                readers: None,
+            },
+        )
+    }
+
+    /// A media batch as `batching::attach_media` stamps it: the computation the plan selected,
+    /// with the extent the executor answered.
+    fn media_batch(id: u64, call_kind: MediaCall, rows: u32) -> ExecutionBatch {
+        let computation = Computation {
+            call: call_kind,
+            rows,
+            tokens: 0,
+            extent: denoise_bucket().extent,
+        };
+        let mut batch = ExecutionBatch::new(
+            id,
+            (0..rows)
+                .map(|row| call(CallKind::Media(call_kind), u64::from(row)))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let staged = vec![staged(); rows as usize];
+        batch.media = Some(MediaColumns::staged(computation, &staged));
+        batch
+    }
+
+    /// The phase a call kind is served at, as the mechanism's one translation states it.
+    fn phase_of(kind: CallKind) -> ipc::PhaseId {
+        wire_phase(kind).expect("every call kind has a phase")
+    }
+
+    /// A media batch reaches the executor at the phase its call names, with the generation the
+    /// step read and the computation its kernels were captured for.
+    ///
+    /// The phase is checked against what the call kind states and against the token path's own
+    /// phase: a media arm that borrowed the token phase, or one that named a constant instead of
+    /// reading each call, would pass neither. Both are read here as facts of the call — the arm's
+    /// own translation is compared with itself elsewhere, because `views` is the crate's.
+    #[test]
+    fn a_media_batch_is_served_at_the_phase_its_call_names_and_the_step_generation() {
+        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+        let generation = 7;
+        submissions.set_generation(generation);
+
+        submissions
+            .submit(media_batch(11, MediaCall::Denoising, 1))
+            .expect("a media batch is served in process");
+        submissions
+            .submit(media_batch(12, MediaCall::ImageDecoding, 1))
+            .expect("a media batch is served in process");
+
+        let delivered = delivered.lock().expect("the recorder is not poisoned");
+        let [denoising, decoding] = delivered.as_slice() else {
+            panic!("two submissions were made, and {} arrived", delivered.len());
+        };
+        assert_eq!(
+            denoising.phase,
+            phase_of(CallKind::Media(MediaCall::Denoising)),
+            "a denoising call is served at the denoise phase"
+        );
+        assert_eq!(
+            decoding.phase,
+            phase_of(CallKind::Media(MediaCall::ImageDecoding)),
+            "a decoding call is served at the decode phase"
+        );
+        assert_ne!(
+            denoising.phase,
+            phase_of(CallKind::Forward(ipc::ForwardMode::Prefill)),
+            "a media batch does not borrow the token path's phase"
+        );
+        let one = denoising;
+        assert_eq!(
+            one.generation, generation,
+            "a batch runs on the generation the step read"
+        );
+        let media = one
+            .media
+            .as_ref()
+            .expect("a media batch arrives with its computation");
+        assert_eq!(media.computation.call, MediaCall::Denoising);
+        assert_eq!(media.computation.rows, 1);
+        assert!(
+            matches!(media.computation.extent, Extent::Latents(_)),
+            "the extent is the bucket's, which is what the executor answered: {:?}",
+            media.computation.extent
+        );
+    }
+
+    /// The generation is the step's, for every batch of the step: a switchover mid-step cannot
+    /// split one step across two worlds, so a token batch and a media batch of one step carry the
+    /// same number.
+    #[test]
+    fn every_batch_of_a_step_carries_the_same_generation() {
+        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+        submissions.set_generation(3);
+        submissions
+            .submit(media_batch(1, MediaCall::Denoising, 1))
+            .expect("a media batch is served in process");
+        submissions.set_generation(4);
+        submissions
+            .submit(media_batch(2, MediaCall::Denoising, 1))
+            .expect("a media batch is served in process");
+
+        let delivered = delivered.lock().expect("the recorder is not poisoned");
+        let generations: Vec<u64> = delivered.iter().map(|one| one.generation).collect();
+        assert_eq!(
+            generations,
+            vec![3, 4],
+            "each batch carries the generation its step read, in the order the steps ran"
+        );
+    }
+
+    /// A batch that carries neither token columns nor a media computation is refused by name: the
+    /// mechanism could not state what its kernels read, and it is not served on invented values.
+    #[test]
+    fn a_batch_the_mechanism_could_not_state_is_refused_by_name() {
+        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+        let batch = ExecutionBatch::new(
+            5,
+            vec![call(CallKind::Media(MediaCall::Denoising), 0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let refusal = submissions
+            .submit(batch)
+            .expect_err("a batch with no columns of either family is refused");
+        let text = format!("{refusal}");
+        assert!(
+            text.contains("states no media columns") && text.contains("Denoising"),
+            "the refusal names the family whose buffers nobody staged: {text}"
+        );
+        assert!(
+            delivered
+                .lock()
+                .expect("the recorder is not poisoned")
+                .is_empty(),
+            "nothing reaches the executor"
+        );
+    }
+
+    /// One batch is one computation: media columns beside token columns, or a media computation
+    /// carrying a token call, are each refused rather than served twice over.
+    #[test]
+    fn one_batch_is_one_computation() {
+        let (devices, _) = Devices::one(Some(denoise_bucket()));
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+
+        let mut both = media_batch(6, MediaCall::Denoising, 1);
+        both.columns = Some(executor::batch::BatchColumns::default());
+        let refusal = format!(
+            "{}",
+            submissions
+                .submit(both)
+                .expect_err("a batch states one layout or the other")
+        );
+        assert!(
+            refusal.contains("one batch is one computation"),
+            "the refusal names the rule: {refusal}"
+        );
+
+        let mut mixed = media_batch(7, MediaCall::Denoising, 1);
+        mixed
+            .requests
+            .push(call(CallKind::Forward(ipc::ForwardMode::Prefill), 9));
+        let refusal = format!(
+            "{}",
+            submissions
+                .submit(mixed)
+                .expect_err("a media computation carries media calls")
+        );
+        assert!(
+            refusal.contains("no media phase serves"),
+            "the refusal names the call: {refusal}"
+        );
+
+        let variant = Computation {
+            call: MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: denoise_bucket().extent,
+        };
+        assert_eq!(
+            variant.variant(),
+            Some(Variant::Denoise),
+            "a denoise computation is the variant the executor plans"
+        );
+    }
 }

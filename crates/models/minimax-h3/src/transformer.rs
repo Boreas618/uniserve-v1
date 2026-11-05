@@ -566,10 +566,12 @@ impl Transformer {
     /// deployment's tile bound — the sparse attention's reduction length — which the layouts state
     /// and a sparse deployment carries. **No collective is a program**: the Ulysses exchange issues a
     /// communication, so a partition's degree changes the shapes the attention reads and adds no row.
+    #[allow(clippy::too_many_arguments)]
     pub fn programs(
         config: &TransformerConfig,
         kind: AttentionKind,
         dtype: nn::DType,
+        boundary: nn::DType,
         rows: u32,
         groups: Groups,
         partition: &Partition,
@@ -603,21 +605,38 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
+            // `SegmentAttention`'s fourth argument is the key **row** bound, not the tile bound:
+            // `keys` is "the largest key extent the compiled program serves, from the same
+            // packing", and the layer refuses a value that is not whole `tile`-row tiles. `tiles`
+            // is the reduction length in tiles, and passing it here compiled a program for
+            // `tiles` rows - 43x short of the deployment's packed bound - while passing the
+            // constructor's divisibility check whenever the tile bound happened to divide by the
+            // tile. The other call site (`attention_sparse.rs`) already passes `rows`.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles),
+                u64::from(rows),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
-            // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            // `[rows, heads, width]` contiguous, and a factor row of **rotated pairs, not rotated
+            // channels**. The arena allocates the two tables `[tokens, pairs]` with
+            // `pairs = rope_frequency_dim * 3` (`denoiser.rs`, the two `arena.tensor` calls), which
+            // is half the `rotated` this operator counts: 48 against 96. Stating the channel count
+            // here named a key no launch asks for, and the launch would have refused it - the
+            // descriptor's stride is the table's own (`nn/src/layers/segments.rs`).
+            let pairs = u64::from(rotated) / 2;
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, pairs),
             );
-            programs.launch::<ops::segments::VsaZeroPadding>(
-                &tiles_layer.zero_padding_descriptor(dtype),
-            );
+            // `VsaZeroPadding` is launched by the fine attention (`SegmentAttention::forward`,
+            // `nn/src/layers/segment.rs:174`) to zero the rows past each tile's valid size in the
+            // rows it just wrote, so its descriptor is that layer's: the **output's** element type
+            // and the tile geometry the attention's own packing has, not the stack's type. The
+            // `VsaTiles` chain zeroes nothing - `prepare` writes the zeros it pools - so an
+            // accessor on it would state a row no launch reads, at a type no launch passes.
+            programs.launch::<ops::segments::VsaZeroPadding>(&fine.zero_descriptor());
             programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
             programs.launch::<ops::segments::VsaCompressPooled>(
                 &tiles_layer.compress_descriptor(dtype),
@@ -636,33 +655,86 @@ impl Transformer {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
             dtype,
+            dtype,
             WeightOrder::NxK,
             false,
             dtype,
-            dtype,
         ));
+        // **And the boundary products, which cross the two types.** The boundary tensors are the
+        // F32 side and the block weights are the stack's, so the product reads an activation of the
+        // boundary type over a weight of the stack's: the forward's own record says
+        // `input_f32_weight_bf16`, and a statement keyed from the stack alone names that pair's
+        // mirror - a cell the runtime never asks for, while the one it does ask for stops the run
+        // (`the refused gemm is input f32, weight bf16`). A single-typed component has
+        // `boundary == dtype` and states nothing here.
+        if boundary != dtype {
+            // Four products, and the recorder states all four: a boundary **weight** over an
+            // activation of either type, and a boundary activation over a stack weight. The
+            // checkpoint's four projections (`proj_in`, `proj_out`, `audio_proj_in`,
+            // `audio_proj_out`) and the timestep pair are F32 in weight *and* bias, so the product
+            // that reads them takes the stack's activation and writes the stack's type; the output
+            // projections carry no bias, which is the `epilogue_none` row.
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                dtype,
+                boundary,
+                WeightOrder::NxK,
+                true,
+                dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                dtype,
+                boundary,
+                WeightOrder::NxK,
+                false,
+                dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                boundary,
+                WeightOrder::NxK,
+                true,
+                dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                dtype,
+                WeightOrder::NxK,
+                true,
+                dtype,
+            ));
+        }
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
 
         // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
         // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
         // types and the epilogue, not the width.
-        programs.launch::<SiluOp>(&Silu::descriptor_of(dtype, config.time_hidden_dim));
+        // **At the boundary's type, not the stack's**: the activation reads the timestep embedder's
+        // output, and both of that pair's tensors are stored at the boundary type. A statement that
+        // named the stack's type was a row the forward never launches and, in the other direction,
+        // the row the forward does launch was missing.
+        programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_hidden_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
         //
         // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
-        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
-        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
-        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
-        // i32 for all three named two keys no launch binds.
-        for (dtype, columns) in [
+        // builds as i32; the other two read the AdaLN cache, and `forward` gathers them from the
+        // table's own view - `blocks.N.adaln_proj.linear.weight`, whose type is the checkpoint's under
+        // `dtype = "auto"` and is the boundary's here. So those two are stated at the **boundary's**
+        // type: `dtype = "auto"` narrows the activations a projection consumes, not the weight a gather
+        // reads. Stating i32 for all three named two keys no launch binds; stating the stack's type for
+        // these two named two more.
+        for (table, columns) in [
             (nn::DType::I32, u64::from(groups.count())),
-            (dtype, 18 * u64::from(hidden)),
-            (dtype, 2 * u64::from(hidden)),
+            (boundary, 18 * u64::from(hidden)),
+            (boundary, 2 * u64::from(hidden)),
         ] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(table, columns)?);
         }
 
         // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
@@ -755,15 +827,22 @@ impl Transformer {
         // width here instead would have been a second, wrong answer to a question the launch already
         // answers, and the walk that records the launch is what a store is built from.
         let packed_stride = 2 * u64::from(config.intermediate_size);
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-            dtype,
-            u64::from(config.intermediate_size),
-            nn::layers::Activation::Silu,
-            packed_stride,
-            packed_stride,
-            u64::from(rows) * u64::from(config.intermediate_size),
-            true,
-        )?);
+        // **Two rows, because `wide` is chosen by the launch's own element count and both classes
+        // are reachable.** The bound crosses `u32::MAX` at this stride (304,976 rows x 14,336), so
+        // the widest request a store serves launches the wide form - and every request below
+        // 299,593 packed rows launches the narrow one. A store that states only the bound is short
+        // the cell every ordinary request asks for, which is what the launch record reported.
+        for elements in [u64::from(rows) * u64::from(config.intermediate_size), 1] {
+            programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+                dtype,
+                u64::from(config.intermediate_size),
+                nn::layers::Activation::Silu,
+                packed_stride,
+                packed_stride,
+                elements,
+                true,
+            )?);
+        }
 
         Ok(programs.finish())
     }
@@ -1285,6 +1364,7 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &Partition::single(),
@@ -1293,7 +1373,14 @@ mod tests {
         .expect("the stack's programs");
         let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
-        assert_eq!(count("gemm"), 1);
+        // **Five products, not one**: the stack's own (`dtype` over `dtype`, no bias) and the four a
+        // deployment whose boundary type differs from the stack's crosses - a boundary weight with and
+        // without a bias, and a boundary activation over a stack weight and over a boundary one. The
+        // keys are distinct because the pair of element types and the epilogue are what select a
+        // module; the widths are launch values. A statement of one product named the direct product
+        // only and left every boundary cell unstated, which is a run that stops at its first
+        // projection.
+        assert_eq!(count("gemm"), 5);
         assert_eq!(count("rms_norm"), 1);
         assert_eq!(count("logits_gather"), 3);
         assert_eq!(count("modulated_rms_norm"), 2);
@@ -1354,14 +1441,18 @@ mod tests {
             1,
             "only the group tag is i32: {gathers:?}"
         );
+        // **The boundary's type, not the stack's.** The gathered table is the modulation projection's
+        // weight, and `dtype = "auto"` narrows the activations that projection consumes, not the table
+        // the gather reads - the launch derives the key from the table's own view. A statement in the
+        // stack's type named two keys no launch binds.
         assert!(
             gathers
                 .iter()
-                .any(|key| key.contains("dtype_bf16_columns_96768"))
+                .any(|key| key.contains("dtype_f32_columns_96768"))
                 && gathers
                     .iter()
-                    .any(|key| key.contains("dtype_bf16_columns_10752")),
-            "the modulation tables are gathered at the stack's type: {gathers:?}"
+                    .any(|key| key.contains("dtype_f32_columns_10752")),
+            "the modulation tables are gathered at the boundary's type: {gathers:?}"
         );
 
         // The rotation's factor table: **contiguous** sections over the three axes (one spectrum
@@ -1388,6 +1479,7 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(false),
             &Partition::single(),
@@ -1413,6 +1505,7 @@ mod tests {
                 reference_keep: Some(0.1),
             },
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &Partition::single(),

@@ -229,16 +229,30 @@ fn a_descriptor_key_too_long_to_name_a_directory_is_refused() {
     let longest = program_server::store::DESCRIPTOR_NAME_LIMIT;
     let at_limit = "d".repeat(longest);
     assert!(
-        ModulePath::new("attention_gather_rows", "triton", 0, "sm_100a", at_limit.clone()).is_ok(),
+        ModulePath::new(
+            "attention_gather_rows",
+            "triton",
+            0,
+            "sm_100a",
+            at_limit.clone()
+        )
+        .is_ok(),
         "a key of exactly the limit names a directory"
     );
 
     let over = format!("{at_limit}d");
-    let error = ModulePath::new("attention_gather_rows", "triton", 0, "sm_100a", over.clone())
-        .expect_err("a key over the limit names no directory");
+    let error = ModulePath::new(
+        "attention_gather_rows",
+        "triton",
+        0,
+        "sm_100a",
+        over.clone(),
+    )
+    .expect_err("a key over the limit names no directory");
     let message = error.to_string();
     assert!(
-        message.contains(&format!("{} bytes", over.len())) && message.contains(&longest.to_string()),
+        message.contains(&format!("{} bytes", over.len()))
+            && message.contains(&longest.to_string()),
         "the refusal states the key's length and the limit: {message}"
     );
 }

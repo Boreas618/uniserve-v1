@@ -1022,8 +1022,11 @@ fn audio_elements(layout: Layout) -> Result<u64> {
     Ok(u64::from(audio.channels) * u64::from(audio.frames))
 }
 
-/// The canvas a request renders, on the checkpoint's 32-pixel grid.
-fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
+/// The canvas a request is laid out at, rounded up to the model's 32-pixel grid.
+///
+/// Public for a caller that must size a stage before loading it: the canvas is what a case's rows,
+/// elements and tiles all follow from, and a second rounding is a second answer to it.
+pub fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
     let width = round_up(request.width, crate::CANVAS_MULTIPLE);
     let height = round_up(request.height, crate::CANVAS_MULTIPLE);
     let divisor = gcd(width, height);
@@ -1059,7 +1062,11 @@ fn frame_count(latent_frames: u32) -> Result<u32> {
 }
 
 /// The request's conditions in the geometry the packing places them by.
-fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
+///
+/// Public because a caller that must **size** a stage before loading it - a harness reserving its
+/// condition capacity from the case it will run - needs the same mapping the packing is given; a
+/// second construction of it is a second answer to "what rows does this case ask for".
+pub fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
     // The request states each condition's role and the encoded raster it arrives at; the packing
     // wants that raster as a canvas, which is the same reduction `canvas_of` makes of the request's
     // own width and height. A condition without pixels is an audio reference and carries none.
@@ -2080,6 +2087,7 @@ impl Denoiser {
         config: &crate::config::TransformerConfig,
         attention: crate::config::AttentionKind,
         dtype: nn::DType,
+        boundary: nn::DType,
         rows: u32,
         groups: Groups,
         partition: &Partition,
@@ -2096,9 +2104,16 @@ impl Denoiser {
 
         let mut programs = Programs::default();
         programs.extend(Transformer::programs(
-            config, attention, dtype, rows, groups, partition, tiles,
+            config, attention, dtype, boundary, rows, groups, partition, tiles,
         )?);
-        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
+        // The refiner's stream is the boundary's type, not the stack's: it is handed the prompt's
+        // features where they are widened into the network, and every row it launches is keyed from
+        // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
+        // its per-head norms, its two modulation gathers and its attention - and lacks the four it
+        // does.
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config, dtype, boundary,
+        )?);
 
         let video = config.video_channels;
 
@@ -2132,13 +2147,11 @@ impl Denoiser {
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
-        nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32, 4 * u64::from(video))?;
-        for columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
-            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
-                nn::DType::F32,
-                nn::DType::F32,
-                columns,
-            )?);
+        // One descriptor: the anchors' widths are the operands', and neither reaches the key.
+        for _columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
+            programs.launch::<ScaledAddOp>(
+                &nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32),
+            );
         }
 
         // The solver's step: one gated residual over the whole trajectory of each modality. The
@@ -3318,6 +3331,7 @@ mod tests {
             &denoiser.transformer,
             denoiser.attention,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &crate::partition::Partition::single(),

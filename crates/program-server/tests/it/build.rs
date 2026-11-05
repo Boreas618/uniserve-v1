@@ -97,10 +97,22 @@ struct TreePackage {
     script: Option<String>,
 }
 
-/// The operators the Qwen3-MoE slice names, in the order its fixture lists
-/// them; empty when the generated fixture is absent.
+/// The operators the Qwen3-MoE slice names, in the order its fixture lists them; empty when no
+/// fixture can be read.
+///
+/// The committed row set is the subject and is read first: `.local/qwen3-moe-keys.txt` is a
+/// generator's output that exists only on a host that ran it, so naming it alone made every witness
+/// that asks this question pick its package from an empty list on any other checkout — the same
+/// silent skip the fixture parse test had, in the third place it appeared.
 fn slice_operators() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = root.join("notes/programs/qwen3-moe-keys.txt");
+    let generated = root.join(".local/qwen3-moe-keys.txt");
+    let path = if committed.is_file() {
+        committed
+    } else {
+        generated
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -145,7 +157,12 @@ fn tree_package(kind: &str) -> Option<TreePackage> {
         })
     };
     from_slice(true)
-        .or_else(|| packages.iter().find(|package| plain(package)).map(repackage))
+        .or_else(|| {
+            packages
+                .iter()
+                .find(|package| plain(package))
+                .map(repackage)
+        })
         .or_else(|| from_slice(false))
         .or_else(|| packages.first().map(repackage))
 }
@@ -497,8 +514,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
     // The tree's package is written for one Triton version; this host's may be
     // another patch, which is a new revision and not a defect of the witness.
     let temporary = tempfile::tempdir().unwrap();
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
-    else {
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
         eprintln!("SKIPPED (provisioning): this host reports no Triton version to build with");
         return;
     };
@@ -603,8 +619,7 @@ fn a_cuda_package_builds_the_module_its_manifest_declares() {
     // A package of the tree declares one toolkit version, and a version change
     // is a new revision; the witness builds this host's toolkit instead.
     let temporary = tempfile::tempdir().unwrap();
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
-    else {
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
         eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
         return;
     };
@@ -690,8 +705,7 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries() {
         max_jobs: 2,
     };
     let temporary = tempfile::tempdir().unwrap();
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
-    else {
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
         eprintln!("SKIPPED (provisioning): this host reports no CuTe DSL version to build with");
         return;
     };
@@ -1026,7 +1040,8 @@ fn a_policy_is_built_when_it_is_installed_and_needs_no_compiler_after() {
     let precompiler = match std::env::var_os("SCHEDULING_PRECOMPILE") {
         Some(path) => PathBuf::from(path),
         None => {
-            let candidate = repository().join("target/programs-builder01/debug/scheduling-precompile");
+            let candidate =
+                repository().join("target/programs-builder01/debug/scheduling-precompile");
             if !candidate.is_file() {
                 eprintln!(
                     "SKIPPED (provisioning): no scheduling-precompile; \
@@ -1273,7 +1288,9 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler() {
     };
     let (_server, stop, thread) = start(&with_precompiler);
     let mut client = Client::connect(&with_precompiler.socket).unwrap();
-    let installed = client.install(&package).expect("the policy fixture installs");
+    let installed = client
+        .install(&package)
+        .expect("the policy fixture installs");
     assert_eq!(installed.package.op, "scheduling");
     assert_eq!(installed.package.backend, "fcfs");
     assert_eq!(installed.package.revision, 1);
@@ -1381,11 +1398,7 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
                 .expect("a wasm precompiler was named"),
         ),
     ] {
-        assert!(
-            path.is_absolute(),
-            "the {name} stayed {}",
-            path.display()
-        );
+        assert!(path.is_absolute(), "the {name} stayed {}", path.display());
     }
     // The interpreter must resolve against the directory the command was typed in, not
     // against whatever directory a build later runs in. This is path arithmetic and

@@ -36,7 +36,7 @@ use nn::{Block, BlockName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::audio_vae::AudioDecoder;
+use crate::audio_vae::BigVgan;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
 use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
@@ -66,7 +66,7 @@ pub struct MinimaxH3 {
     transformer_ref: Option<Arc<Denoiser>>,
     video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>>,
     video_decoder: Option<Arc<crate::video_vae::VideoDecoder>>,
-    audio_decoder: Option<Arc<AudioDecoder>>,
+    audio_decoder: Option<Arc<BigVgan>>,
 }
 
 impl std::fmt::Debug for MinimaxH3 {
@@ -99,7 +99,7 @@ impl std::fmt::Debug for MinimaxH3 {
             )
             .field(
                 "audio_decoder",
-                &self.audio_decoder.as_ref().map(|_| "AudioDecoder"),
+                &self.audio_decoder.as_ref().map(|_| "BigVgan"),
             )
             .finish()
     }
@@ -146,7 +146,7 @@ impl MinimaxH3 {
     }
 
     /// The audio decoder, when this rank places it.
-    pub fn audio_decoder(&self) -> Option<&Arc<AudioDecoder>> {
+    pub fn audio_decoder(&self) -> Option<&Arc<BigVgan>> {
         self.audio_decoder.as_ref()
     }
 }
@@ -437,6 +437,48 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
 /// bulk the layers compute in. The remainder are **crossings**, and a layer that narrows or widens
 /// states its own type at the site that does it (`modulation.rs`'s projections, the four boundary
 /// projections of the transformer), so asking this function never decides a crossing.
+/// The element type a component's **boundary tensors** are stored in, when it stores two.
+///
+/// A component whose weights are all one type has no boundary, and a row keyed from that one type
+/// is the row the forward launches. The transformer is the component this checkpoint stores in two -
+/// twelve F32 among 626 BF16 - and the twelve are the four boundary projections (`proj_in`,
+/// `proj_out`, `audio_proj_in`, `audio_proj_out`) and the timestep embedder's pair
+/// (`linear_1`, `linear_2`). They read a BF16 activation and are F32 weights, so a statement that
+/// names only the stack's type describes four products the runtime never makes.
+///
+/// The minority type is the boundary, by count and not by name: a component with one F32 tensor has
+/// no layers at that type to speak of, and the checkpoint's own counts say which reading is which.
+pub fn boundary_dtype(
+    stated: Option<&ElementTypes>,
+    checkpoint: Option<&nn::Checkpoint>,
+    component: &str,
+) -> Result<Option<nn::DType>> {
+    let counts: Vec<(String, usize)> = if let Some(types) = stated
+        && let Some(found) = types
+            .components
+            .iter()
+            .find(|entry| entry.component == component)
+    {
+        found.dtypes.clone()
+    } else if let Some(checkpoint) = checkpoint {
+        count_stored_types(checkpoint, component)?
+    } else {
+        return Ok(None);
+    };
+    if counts.len() < 2 {
+        return Ok(None);
+    }
+    let Some((dtype, _)) = counts.iter().min_by_key(|(_, count)| *count) else {
+        return Ok(None);
+    };
+    dtype_of(dtype).map(Some).ok_or_else(|| {
+        Error::checkpoint(format!(
+            "`{component}` states the element type `{dtype}`, which is not a type a weight can be \
+             stored in"
+        ))
+    })
+}
+
 pub fn deployment_dtype(
     stated: Option<&ElementTypes>,
     checkpoint: Option<&nn::Checkpoint>,
@@ -534,7 +576,9 @@ pub struct Exclusion {
     pub reason: &'static str,
 }
 
-/// The checkpoint tensors a component's load does not ask for, each with the reason it need not.
+/// The checkpoint tensors a **checkpoint directory's** load does not ask for, each with the reason it
+/// need not: the table is keyed by the directory a name is relative to, since one component may hold two
+/// (`latent_encoder` holds `vae` and `audio_vae`).
 ///
 /// **A load is not required to read every tensor a file holds** — a training head's weights sit in
 /// the checkpoint and no inference path evaluates them, so asking for them would be a requirement
@@ -546,8 +590,8 @@ pub fn excluded_names(component: &str) -> &'static [Exclusion] {
     match component {
         // The audio VAE's spectral loss head: `logs_proj` scores training audio through a mel
         // transform, and the decoder's forward reads the latent to samples and nothing else. The
-        // two tensors are 1 088 bytes of the component's 1 087 tensors, and `--names` measured the
-        // rest as asked for.
+        // two are a `[32, 32, 1]` weight and its `[32]` bias - 4 224 bytes at F32 out of the
+        // component's 1 087 tensors - and `--names` measured the rest as asked for.
         "audio_vae" => &[
             Exclusion {
                 name: "logs_proj.weight",
@@ -671,7 +715,7 @@ pub fn load(
     let mut transformer_ref: Option<Arc<Denoiser>> = None;
     let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
     let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
-    let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
+    let mut audio_decoder: Option<Arc<BigVgan>> = None;
     for component in partition.blocks.iter() {
         let block = match component {
             Component::TextEncoder => {
@@ -819,13 +863,13 @@ pub fn load(
                 let source = checkpoint.component("audio_vae")?;
                 require(
                     source,
-                    &AudioDecoder::keys(&config.audio_vae)?,
+                    &BigVgan::keys(&config.audio_vae)?,
                     component.name(),
                     "decoder",
                     "audio_vae",
                 )?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
+                let decoder = Arc::new(BigVgan::load(&config.audio_vae, &mut shards)?);
                 audio_decoder = Some(Arc::clone(&decoder));
                 Block::Decoder(decoder)
             }
@@ -998,7 +1042,11 @@ mod element_types_tests {
                 .collect::<Vec<_>>(),
             vec!["logs_proj.weight", "logs_proj.bias"]
         );
-        assert!(exclusions.iter().all(|exclusion| !exclusion.reason.is_empty()));
+        assert!(
+            exclusions
+                .iter()
+                .all(|exclusion| !exclusion.reason.is_empty())
+        );
 
         // The subtraction reports what neither list covers - the finding - and stays quiet about the
         // two cases that are decided: a tensor the load asks for, and one it names as excluded.

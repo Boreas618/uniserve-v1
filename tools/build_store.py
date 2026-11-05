@@ -16,6 +16,8 @@ import argparse
 import hashlib
 import json
 import os
+import ctypes
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -79,6 +81,18 @@ def covers_one(descriptors, key):
         return False
     return all(value in dimensions.get(name, []) for name, value in pairs)
 
+
+def prune_empty_directories(root: Path) -> None:
+    """Remove the empty ancestors a failed attempt leaves behind.
+
+    Only directories that hold nothing at all are removed, deepest first, so a store a failed build
+    touched is left as the build found it. Anything a cell wrote keeps its directory.
+    """
+    if not root.is_dir():
+        return
+    for directory in sorted((one for one in root.rglob("*") if one.is_dir()), reverse=True):
+        if not any(directory.iterdir()):
+            directory.rmdir()
 
 def covers(package, key):
     """Whether the package covers this key: it covers one of the shapes it declares."""
@@ -144,6 +158,26 @@ def build(package, key, target, out_dir, python):
         return "no module.cubin was written"
     if form == "native" and not any(out_dir.glob("*.so")):
         return "no shared object was written"
+    if form == "native":
+        # A shared object that references symbols no library provides still appears in the store:
+        # the file exists, the manifest names its entry, and "built N of N" reads as a complete
+        # store. The failure then arrives at the first launch as "cannot load native library",
+        # which names neither a symbol nor a package - and a run that stops there looks like a
+        # model defect. `RTLD_NOW` resolves the whole object at load, so an undefined reference
+        # is a build failure with the symbol in it.
+        for library in sorted(out_dir.glob("*.so")):
+            failure, unresolved = inspect_module(library)
+            if failure:
+                return failure
+            if unresolved:
+                # Loadable, and one call away from failing. Named rather than merged into the
+                # failure count: a store that cannot be built is a run that cannot start, and
+                # these are cells the engine loads today.
+                print(f"# warning: {library.name} loads lazily and references {unresolved}")
+        # The link inputs are not part of the module: an object file beside the library is build
+        # scratch, and a store is what a host loads rather than what a compiler read.
+        for scratch in out_dir.glob("*.o"):
+            scratch.unlink()
     # A native module's C entry is declared by its manifest and is not in the shared object; publish
     # it beside the library so the store directory is enough to load the module from.
     entries = manifest["module"].get("entries")
@@ -152,6 +186,47 @@ def build(package, key, target, out_dir, python):
             json.dumps({"name": entries.get("launch"), "entries": entries}, indent=1) + "\n"
         )
     return None
+
+
+def inspect_module(library: Path):
+    """Whether the runtime could load `library`, and which symbols it would leave unresolved.
+
+    Two questions, kept apart because they have different answers and different cures.
+
+    The first is what the runtime does: `platform::native` opens with `libloading::Library::new`,
+    which is `dlopen(RTLD_LAZY | RTLD_LOCAL)` in `libloading` 0.8.9. A module that fails THAT
+    fails for the engine too, and it is a build failure.
+
+    The second is `RTLD_NOW`: every reference resolved at load. A module can pass the first and
+    fail the second, and then it works until the unresolved path is taken. That is worth a
+    warning naming the symbol, and it is not worth failing a store the engine can load.
+
+    Each probe runs in its own process. A second `dlopen` of a file already loaded returns the
+    existing handle without re-resolving, so two modes measured in one process report the first
+    mode twice - a mistake that reads as "both load".
+    """
+    probe = (
+        "import ctypes, os, sys\n"
+        "ctypes.CDLL(sys.argv[1], mode=int(sys.argv[2]))\n"
+    )
+    def run(mode):
+        finished = subprocess.run(
+            [sys.executable, "-c", probe, str(library), str(mode)],
+            capture_output=True,
+            text=True,
+        )
+        if finished.returncode == 0:
+            return None
+        tail = (finished.stderr or finished.stdout).strip().splitlines()[-1:]
+        return tail[0] if tail else "the probe failed"
+
+    # `RTLD_LAZY` is named, not implied: `ctypes` forces `RTLD_NOW` when the mode carries no
+    # binding flag, so `RTLD_LOCAL` alone is an eager load wearing a lazy load's name.
+    fatal = run(os.RTLD_LAZY | os.RTLD_LOCAL)
+    if fatal:
+        return f"{library.name} does not load under the runtime's own mode: {fatal}", None
+    eager = run(os.RTLD_NOW | os.RTLD_LOCAL)
+    return None, eager
 
 
 def module_digest(directory):
@@ -167,6 +242,30 @@ def module_digest(directory):
         digest.update(data)
         total += len(data)
     return digest.hexdigest(), total
+
+
+def read_rows(fixture):
+    """The fixture's rows, as `(operator, key, backend-or-None)`.
+
+    A row is `op<TAB>descriptor`, and it may state a third field: the backend the deployment launches
+    this key on. That field is not decoration - `paged_attention` declares `bf16`/`f16` on `trtllm`
+    and `f8e4m3` on `triton`, so which package covers a key depends on the cache dtype, and a
+    deployment that names one backend while the fixture states no backend can be served a cell from
+    the other. A stated backend is held to: the store builds that package or refuses, and never
+    quietly substitutes the other.
+    """
+    rows = []
+    for number, line in enumerate(Path(fixture).read_text().splitlines(), start=1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) not in (2, 3) or not all(one.strip() for one in fields):
+            raise SystemExit(
+                f"{fixture}:{number} states {len(fields)} field(s); a row is `op<TAB>descriptor` "
+                f"or `op<TAB>descriptor<TAB>backend`"
+            )
+        rows.append((fields[0], fields[1], fields[2] if len(fields) == 3 else None))
+    return rows
 
 
 def main():
@@ -197,11 +296,7 @@ def main():
     root = Path(args.root)
     # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
     # inspects one read while the rows come from another cannot see an empty one.
-    rows = [
-        line.rstrip("\n").split("\t")
-        for line in Path(args.fixture).read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    rows = read_rows(args.fixture)
     # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
     # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
     if not rows:
@@ -217,10 +312,11 @@ def main():
     # fixture before anything compiles, because a build that succeeds differently on another host is
     # worse than one that stops.
     claims = {}
-    for op, key in rows:
+    for op, key, stated_backend in rows:
         claiming = [
             package for package in packages.get(op, [])
             if covers(package, key)
+            and (stated_backend is None or package["backend"] == stated_backend)
             and args.target in package["manifest"]["kernel"]["architectures"]
         ]
         if len(claiming) > 1:
@@ -239,14 +335,24 @@ def main():
         )
 
     built, skipped = [], []
-    for op, key in rows:
+    for op, key, stated_backend in rows:
         candidates = [
             package for package in packages.get(op, [])
             if covers(package, key)
             and args.target in package["manifest"]["kernel"]["architectures"]
+            and (stated_backend is None or package["backend"] == stated_backend)
         ]
         if not candidates:
-            skipped.append((op, key, "no package covers this key for the target"))
+            skipped.append(
+                (
+                    op,
+                    key,
+                    f"no package covers this key for the target (this row states the backend "
+                    f"{stated_backend!r})"
+                    if stated_backend
+                    else "no package covers this key for the target",
+                )
+            )
             continue
         # A package may cover a key by its dimensions and still refuse the descriptor's variant
         # (the FA4 attention backend serves prefill only), so every candidate is tried before the
@@ -254,8 +360,14 @@ def main():
         failures = []
         for package in candidates:
             directory = root / op / package["backend"] / str(args.revision) / args.target / key
+            # A cell exists only once it has committed. A failed attempt can leave a directory with
+            # a manifest and a source and no `.committed` mark, and a later reader cannot tell that
+            # from a cell built by an older revision — so an attempt that created one removes it.
+            existed = directory.exists()
             failure = build(package, key, args.target, directory, args.python)
             if failure:
+                if not existed:
+                    shutil.rmtree(directory, ignore_errors=True)
                 failures.append(f"{package['backend']}: {failure}")
                 continue
             (directory / ".committed").write_text("")
@@ -268,6 +380,7 @@ def main():
     # stops at it can carry on with an empty directory. The first failure is the evidence, and a
     # missing capability in the interpreter is the common cause.
     if not built:
+        prune_empty_directories(root)
         first = skipped[0][2] if skipped else "no candidate package"
         sys.exit(
             f"the store is empty: none of {len(rows)} keys built for {args.target} with "
@@ -282,6 +395,11 @@ def main():
     # fixtures built into one log read as one count, and a row of one fixture's failures then looks
     # like a failure of the other's deployment.
     print(f"# fixture: {args.fixture} ({len(rows)} rows)")
+    stated = sum(1 for _, _, backend in rows if backend)
+    if stated:
+        # A row that states its backend is the deployment's own statement, and the store held it: the
+        # count says how much of this store is that claim rather than a coverage choice.
+        print(f"# {stated} of {len(rows)} row(s) state the backend their deployment launches")
 
     # How many of those cells hold the same program. A key field that reaches no compiled word
     # writes an identical module under its own name (tools/key_field_audit.py proves which), so the
@@ -308,6 +426,9 @@ def main():
         print(f"built\t{op}\t{backend}\t{key}")
     for op, key, reason in skipped:
         print(f"SKIPPED\t{op}\t{reason}\t{key}")
+    # A skipped key may have left an empty chain behind; the store holds cells, not the shape of an
+    # attempt.
+    prune_empty_directories(root)
     return 0 if not skipped else 1
 
 

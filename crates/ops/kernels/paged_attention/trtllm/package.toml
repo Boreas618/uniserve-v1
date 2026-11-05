@@ -46,7 +46,7 @@ architectures = ["sm_100a", "sm_100f"]
 # operator's call carries one FP32 scale per page, so the module could not read
 # the scales the kernel asks for.
 [kernel.descriptors]
-dimensions = { phase = ["decode"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
 
 [parameters]
 # The trtllm-gen artifact: the pin its manifest is hashed by.

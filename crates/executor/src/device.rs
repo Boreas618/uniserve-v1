@@ -20,6 +20,7 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
+use crate::plan::Bucket;
 use crate::job::{Command, JobQueue, jobs_of, phase_of};
 use crate::runner::{NamedRunner, RunnerId};
 use crate::arena::Pools;
@@ -631,13 +632,35 @@ impl Device {
                 continue;
             }
             let result = self.serve(&entry);
-            if let Err(error) = &result {
-                tracing::warn!(%error, device = self.device.0, "a device command failed");
-            }
             if matches!(result, Ok(Step::Requeued)) {
                 // The entry put the rest of its command at the tail; its submission waits for the
                 // last step, so nothing completes here.
                 continue;
+            }
+            // What was in hand, read **after** the command: `perform` is what writes it, and it is
+            // taken when a command completes, so a string read before the command is the one the
+            // previous command left - empty. Reading it before the command therefore wrapped no
+            // fault at all, and every device failure in a run named only its batch number.
+            let detail = self
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            // The work in flight is this thread's knowledge alone and is gone once the command ends:
+            // it travels inside the failure, so every report of it - the device's line, the
+            // submission's outcome, the main process's reason - names the bucket, the rows, the
+            // generation and the operator without reaching back for state that is gone.
+            let result = result.map_err(|error| match &detail {
+                Some(detail) => Error::in_flight(detail.clone(), error),
+                None => error,
+            });
+            if let Err(error) = &result {
+                tracing::warn!(
+                    %error,
+                    in_flight = detail.as_deref().unwrap_or("no work in flight"),
+                    device = self.device.0,
+                    "a device command failed"
+                );
             }
             let result = match result {
                 Ok(Step::Done(output)) => Ok(output),
@@ -656,11 +679,6 @@ impl Device {
                     self.sticky = Some(sticky);
                 }
             }
-            let detail = self
-                .activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
             queue.complete(entry, result, detail);
         }
         events.set_submitter(None);
@@ -862,9 +880,45 @@ impl Device {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(format!("{label}, {}", job.describe()));
+            // A capture is minutes of device work with no batch to show for it, and the warmup is
+            // one capture per bucket in a row: the started line is what names the bucket a warmup
+            // is stuck in, because a started line with no finished one is the only shape a hang
+            // has. Every other job produces an answer a later line or a timeout already names.
+            let walked = Self::walked_bucket(&job);
+            if let Some(bucket) = walked {
+                tracing::info!(
+                    bucket = %bucket,
+                    job = %job.describe(),
+                    "a bucket's capture starts"
+                );
+            }
             let started = Instant::now();
-            let produced = self.runner_mut(runner)?.runner.serve(&job)?;
-            self.synchronize()?;
+            let outcome = match self.runner_mut(runner) {
+                Ok(named) => named.runner.serve(&job),
+                Err(error) => Err(error),
+            }
+            .and_then(|produced| self.synchronize().map(|()| produced));
+            if let Some(bucket) = walked {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                match &outcome {
+                    Ok(_) => {
+                        tracing::info!(
+                            bucket = %bucket,
+                            elapsed_ms,
+                            "the bucket's capture finished"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            bucket = %bucket,
+                            elapsed_ms,
+                            %error,
+                            "the bucket's capture failed"
+                        );
+                    }
+                }
+            }
+            let produced = outcome?;
             self.counters.time(started.elapsed());
             if !produced.calls.is_empty() {
                 if !output.calls.is_empty() {
@@ -876,6 +930,17 @@ impl Device {
             }
         }
         Ok(output)
+    }
+
+    /// The bucket a job walks, when it walks one.
+    ///
+    /// A capture and a rebind both record a walk of one bucket into a graph, and both are silent
+    /// device work of minutes; a replay and a shadow answer something the caller is waiting on.
+    fn walked_bucket(job: &Job) -> Option<Bucket> {
+        match job {
+            Job::Capture { bucket, .. } | Job::Rebind { bucket, .. } => Some(*bucket),
+            _ => None,
+        }
     }
 
     /// Waits for the streams this device's runners issued on.

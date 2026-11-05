@@ -296,6 +296,40 @@ impl MediaColumns {
         Ok(())
     }
 
+    /// The columns of a media batch, from the facts the mechanism states per request.
+    ///
+    /// The mechanism owns the computation and, per request, the request's own stated parameters:
+    /// its conditioning as the model family planned it, the diffusion step it runs, and the seed
+    /// and canvas its noise is drawn from. It does not own what the model prepares on the device
+    /// — the encoded conditioning rows, the latent trajectory — so a staged set carries the first
+    /// and never a placeholder for the second.
+    pub fn staged(
+        computation: crate::plan::Computation,
+        requests: &[StagedRequest],
+    ) -> MediaColumns {
+        MediaColumns {
+            computation,
+            inputs: requests.iter().map(StagedRequest::encode).collect(),
+        }
+    }
+
+    /// One request's staged inputs, as [`MediaColumns::staged`] wrote them.
+    ///
+    /// The rows are this batch's requests in batch order, so a runner reads the row the call it
+    /// serves was placed at. A row that does not carry the two buffers this spelling states, or
+    /// whose parameter record is the wrong width, is refused by name: a runner that read a
+    /// truncated record would run a step index nobody stated.
+    pub fn request(&self, index: usize) -> Result<StagedRequest> {
+        let Some(row) = self.inputs.get(index) else {
+            return Err(Error::Invalid(format!(
+                "a {:?} batch carries {} request(s); row {index} is not one of them",
+                self.computation.call,
+                self.inputs.len()
+            )));
+        };
+        StagedRequest::decode(row)
+    }
+
     /// The bytes of every request's every buffer: what the staging path allocates for.
     pub fn bytes(&self) -> usize {
         self.inputs
@@ -305,6 +339,124 @@ impl MediaColumns {
             .sum()
     }
 }
+
+/// One request's staged media inputs, as the mechanism states them (4.5).
+///
+/// The record is the mechanism-to-model seam for one request of a media computation, and it holds
+/// what the mechanism owns and nothing else: the request's conditioning exactly as the model family
+/// planned it, the diffusion step the batch is, the seed and canvas the request states, and the
+/// request's identity. The model's own device-side preparation (the encoded conditioning rows, the
+/// latent trajectory) is the model's and is not carried here, because a mechanism that filled it
+/// would be inventing either a tensor it cannot read or a shape the model never stated.
+///
+/// # The bytes
+///
+/// A staged request is two buffers, in this order:
+///
+/// - **0**, the conditioning blob, byte for byte as `DiffusionRequest::conditioning` holds it;
+/// - **1**, fifty-two bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
+///   `height: u32`, `frames: u32`, then the identity - `engine_id: u64`, `request_id: u64`,
+///   `request_epoch: u64`.
+///
+/// Little-endian and fixed width so that a worker and an engine of different architectures read one
+/// record, and so that a runner reads offsets rather than a parser.
+///
+/// # Why the identity travels with the row
+///
+/// An in-process batch numbers its calls by their position (`Batch::calls` is a list of indices), so
+/// a row tells a runner *where* a request is and never *which* request it is. A step that must find
+/// what the previous step of the same request left behind - a latent trajectory, an encoded
+/// conditioning - has nothing to key on without this, and a request whose row moved between two
+/// batches would take another request's state. The mechanism owns the key, so the mechanism states
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedRequest {
+    /// The request this row's state belongs to: the only name a step has for what it must find
+    /// again, since a batch numbers its calls by position.
+    pub request: ipc::RequestKey,
+    /// The request's conditioning, as the model family planned it.
+    pub conditioning: Vec<u8>,
+    /// The zero-based diffusion step this batch is.
+    pub step: u32,
+    /// The steps the request's schedule runs in total.
+    pub steps: u32,
+    /// The request's noise seed: the draw is addressed by it and the element's index.
+    pub seed: u64,
+    /// The output raster's width: the request's canvas.
+    pub width: u32,
+    /// The output raster's height.
+    pub height: u32,
+    /// The output frames after the model's alignment.
+    pub frames: u32,
+}
+
+impl StagedRequest {
+    /// The two buffers a staged request is (see the type's byte layout).
+    pub fn encode(&self) -> Vec<Vec<u8>> {
+        let mut record = Vec::with_capacity(PARAMETER_BYTES);
+        record.extend_from_slice(&self.step.to_le_bytes());
+        record.extend_from_slice(&self.steps.to_le_bytes());
+        record.extend_from_slice(&self.seed.to_le_bytes());
+        record.extend_from_slice(&self.width.to_le_bytes());
+        record.extend_from_slice(&self.height.to_le_bytes());
+        record.extend_from_slice(&self.frames.to_le_bytes());
+        record.extend_from_slice(&self.request.engine_id.to_le_bytes());
+        record.extend_from_slice(&self.request.request_id.0.to_le_bytes());
+        record.extend_from_slice(&self.request.request_epoch.to_le_bytes());
+        vec![self.conditioning.clone(), record]
+    }
+
+    /// Reads a staged request's two buffers.
+    pub fn decode(row: &[Vec<u8>]) -> Result<Self> {
+        let [conditioning, record] = row else {
+            return Err(Error::Invalid(format!(
+                "a media request's row carries {} buffer(s); a staged request is the conditioning \
+                 blob and its parameter record",
+                row.len()
+            )));
+        };
+        if record.len() != PARAMETER_BYTES {
+            // The refusal names the **shape**, not the width it expects: the width is
+            // `PARAMETER_BYTES`, which every column this record gains moves by a field, and a
+            // refusal that prints it states a fact about the build rather than about what was
+            // handed over. What the reader needs is which record this is and what arrived.
+            return Err(Error::Invalid(format!(
+                "a media request's parameter record is step, steps, seed, width, height, frames and \
+                 the request's three identities; this one is {} bytes, which is not that shape",
+                record.len()
+            )));
+        }
+        let word = |at: usize| {
+            u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+        };
+        let word64 = |at: usize| {
+            u64::from_le_bytes([
+                record[at],
+                record[at + 1],
+                record[at + 2],
+                record[at + 3],
+                record[at + 4],
+                record[at + 5],
+                record[at + 6],
+                record[at + 7],
+            ])
+        };
+        Ok(Self {
+            request: ipc::RequestKey::new(word64(28), ipc::RequestId(word64(36)), word64(44)),
+            conditioning: conditioning.clone(),
+            step: word(0),
+            steps: word(4),
+            seed: word64(8),
+            width: word(16),
+            height: word(20),
+            frames: word(24),
+        })
+    }
+}
+
+/// The width of a staged request's parameter record: `step`, `steps`, `seed`, `width`, `height` and
+/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`).
+const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8);
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
@@ -476,14 +628,12 @@ impl Job {
                 "replaying batch {} from the bucket of {} tokens and {} rows of generation {generation}",
                 batch.0, bucket.tokens, bucket.rows
             ),
-            Self::Capture { bucket, generation, .. } => format!(
-                "capturing the bucket of {} tokens and {} rows of generation {generation}",
-                bucket.tokens, bucket.rows
-            ),
-            Self::Rebind { bucket, generation, .. } => format!(
-                "rebinding the bucket of {} tokens and {} rows of generation {generation}",
-                bucket.tokens, bucket.rows
-            ),
+            Self::Capture {
+                bucket, generation, ..
+            } => format!("capturing bucket {bucket} of generation {generation}"),
+            Self::Rebind {
+                bucket, generation, ..
+            } => format!("rebinding bucket {bucket} of generation {generation}"),
             Self::Shadow {
                 operator,
                 key,
@@ -717,14 +867,14 @@ impl Executors {
             .iter()
             .find(|executor| executor.serves(phase))
             .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "no device of this rank serves phase {phase:?}; its {} device(s) serve {:?}",
-                    self.executors.len(),
-                    self.executors
+                route_refusal(
+                    phase,
+                    &self
+                        .executors
                         .iter()
                         .flat_map(|executor| executor.phases().iter().copied())
-                        .collect::<Vec<_>>()
-                ))
+                        .collect::<Vec<_>>(),
+                )
             })
     }
 
@@ -737,6 +887,24 @@ impl Executors {
     pub fn is_empty(&self) -> bool {
         self.executors.is_empty()
     }
+}
+
+/// The refusal of a batch whose phase no device of this rank serves.
+///
+/// A phase number is a plan's, and the plan that numbers the batches and the plan that splits the
+/// model must agree on it; when they do not, the batch reaches this rank and nothing here can serve
+/// it. Both numbers are named - the phase asked for and the phases this rank's devices serve -
+/// because the disagreement is between two plans and one figure alone cannot show it. The answer is
+/// `Invalid`: the batch is not servable here, which is a refusal rather than a broken device. What a
+/// reader of the number does with that distinction is the caller's - the in-process submission path
+/// currently wraps every executor error alike, so an `Invalid` and a broken context read the same
+/// there.
+fn route_refusal(phase: PhaseId, served: &[PhaseId]) -> Error {
+    Error::Invalid(format!(
+        "no device of this rank serves phase {}; its devices serve {:?}",
+        phase.0,
+        served.iter().map(|served| served.0).collect::<Vec<_>>()
+    ))
 }
 
 impl Batches for Executors {
@@ -888,9 +1056,11 @@ impl Submission {
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        outcome.clone().unwrap_or(Outcome::Failed(Arc::new(Error::State(
-            "a submission completed without an outcome",
-        ))))
+        outcome
+            .clone()
+            .unwrap_or(Outcome::Failed(Arc::new(Error::State(
+                "a submission completed without an outcome",
+            ))))
     }
 
     /// Waits at most `timeout` for the submission's completion.
@@ -1052,6 +1222,108 @@ mod media_tests {
             inputs: vec![vec![vec![1u8; 8]]],
         };
         assert_eq!(encode.computation.variant(), Some(Variant::Encode));
-        encode.check().expect("an encode is sized by rows and tokens");
+        encode
+            .check()
+            .expect("an encode is sized by rows and tokens");
+    }
+
+    /// A staged request is the mechanism's record of one request, and it round-trips through the
+    /// two buffers it is: the conditioning verbatim and the parameters little-endian at fixed
+    /// offsets, so a runner reads offsets rather than a parser. A row of the wrong shape is
+    /// refused by name - a truncated record would be a step index nobody stated.
+    #[test]
+    fn a_staged_request_is_the_conditioning_blob_and_its_parameter_record() {
+        let staged = StagedRequest {
+            request: ipc::RequestKey::new(7, ipc::RequestId(41), 3),
+            conditioning: vec![9, 8, 7],
+            step: 3,
+            steps: 12,
+            seed: 0x0102_0304_0506_0708,
+            width: 768,
+            height: 512,
+            frames: 121,
+        };
+        let row = staged.encode();
+        assert_eq!(row.len(), 2, "a staged request is two buffers");
+        assert_eq!(
+            row[0],
+            vec![9, 8, 7],
+            "the conditioning is carried verbatim"
+        );
+        assert_eq!(row[1].len(), PARAMETER_BYTES);
+        assert_eq!(&row[1][0..4], &3u32.to_le_bytes(), "step");
+        assert_eq!(&row[1][4..8], &12u32.to_le_bytes(), "steps");
+        assert_eq!(
+            &row[1][8..16],
+            &0x0102_0304_0506_0708u64.to_le_bytes(),
+            "seed"
+        );
+        let decoded = StagedRequest::decode(&row).expect("the record round-trips");
+        assert_eq!(decoded, staged);
+        assert_eq!(
+            decoded.request,
+            ipc::RequestKey::new(7, ipc::RequestId(41), 3),
+            "the identity is the row's name for what a step must find again"
+        );
+
+        let columns = MediaColumns::staged(
+            Computation {
+                call: ipc::MediaCall::Denoising,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::Latents(layout()),
+            },
+            std::slice::from_ref(&staged),
+        );
+        assert_eq!(columns.request(0).expect("one row"), staged);
+        let out_of_range = columns.request(1).expect_err("one row, asked for two");
+        assert!(
+            format!("{out_of_range}").contains("row 1 is not one of them"),
+            "{out_of_range}"
+        );
+    }
+
+    /// A staged request's two buffers are both load-bearing, and the refusals name which one is
+    /// wrong: a document's worth of buffers, or a record of another width, is not this record.
+    #[test]
+    fn a_staged_request_of_the_wrong_shape_is_refused_by_name() {
+        let short = vec![vec![0u8; 3], vec![0u8; PARAMETER_BYTES - 1]];
+        let error = StagedRequest::decode(&short).expect_err("a truncated record");
+        let text = format!("{error}");
+        assert!(
+            text.contains("step, steps, seed, width, height, frames"),
+            "the refusal does not name the record's shape: {text}"
+        );
+        assert!(
+            text.contains(&format!("{} bytes", PARAMETER_BYTES - 1)),
+            "the refusal does not name the record it was given: {text}"
+        );
+
+        let one = vec![vec![1u8; 3]];
+        let error = StagedRequest::decode(&one).expect_err("one buffer is not the record");
+        assert!(
+            format!("{error}").contains("carries 1 buffer(s)"),
+            "{error}"
+        );
+    }
+
+    /// A batch whose phase no device of this rank serves is refused where it is routed, and the
+    /// refusal names the phase the plan asked for and the phases this rank's devices serve: the
+    /// disagreement is between two plans, and one figure alone cannot show it. It is a refusal and
+    /// not a device failure - the batch is not servable here, which is not the same as a broken
+    /// device - and it is stated as such, because a reader that can tell the two apart can end one
+    /// batch instead of the epoch.
+    #[test]
+    fn a_phase_no_device_serves_is_refused_by_both_numbers() {
+        let refusal = route_refusal(ipc::PhaseId(3), &[ipc::PhaseId(0), ipc::PhaseId(1)]);
+        assert!(
+            matches!(refusal, Error::Invalid(_)),
+            "a batch nothing here can serve was refused as a device failure: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("phase 3") && text.contains("[0, 1]"),
+            "the refusal names neither the phase asked for nor the ones served: {text}"
+        );
     }
 }

@@ -845,6 +845,14 @@ impl<'a> WeightLoader<'a> {
     /// model's `load` driven by a **recording** forward (`Forward::recording`): the shapes a load
     /// derives are what decide the programs a model launches, and the values never reach a kernel. So
     /// a walk of a model's programs needs no shards and no device.
+    /// The checkpoint this loader reads, when it reads one.
+    ///
+    /// A shapes-only loader has none: it states extents and reads nothing, so a caller that needs a
+    /// fact only a shard holds must say what it does without it.
+    pub fn checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoint
+    }
+
     pub fn shapes(dtype: DType) -> Self {
         Self::stated(dtype, None)
     }
@@ -898,7 +906,8 @@ impl<'a> WeightLoader<'a> {
             let dtype = request.pinned.or(self.dtype).ok_or_else(|| {
                 Error::weight(
                     &request.tensor,
-                    "a shapes-only loader has no checkpoint to read the element type from".to_owned(),
+                    "a shapes-only loader has no checkpoint to read the element type from"
+                        .to_owned(),
                 )
             })?;
             let bytes = request
@@ -1003,7 +1012,9 @@ impl<'a> WeightLoader<'a> {
         }
 
         check_layout(&request.tensor, &request.source, request.layout)?;
-        let backing = self.retention()?.publish(&key, dtype, request.shape, &bytes)?;
+        let backing = self
+            .retention()?
+            .publish(&key, dtype, request.shape, &bytes)?;
         Ok(Weight {
             view: backing.view(dtype, request.shape)?,
             backing,
@@ -1125,7 +1136,9 @@ impl<'a> WeightLoader<'a> {
             normalized.extend(rows.iter().map(|value| value * scale));
         }
         let bytes = from_f32(dtype, &normalized, name)?;
-        let backing = self.retention()?.publish(&key, dtype, value.shape, &bytes)?;
+        let backing = self
+            .retention()?
+            .publish(&key, dtype, value.shape, &bytes)?;
         Ok(Weight {
             view: backing.view(dtype, value.shape)?,
             backing,
@@ -2327,7 +2340,13 @@ mod tests {
         // A computed weight states its extents too: the H3 loader publishes tables this way.
         let bytes = [0u8, 0, 0, 0, 1, 0, 0, 0];
         let constant = loader
-            .constant("video_vae.voxel_rows", DType::I32, Shape::new(&[2]), &bytes, "test")
+            .constant(
+                "video_vae.voxel_rows",
+                DType::I32,
+                Shape::new(&[2]),
+                &bytes,
+                "test",
+            )
             .expect("the stated constant");
         assert_eq!(constant.shape().dims(), &[2]);
         assert_eq!(constant.view().ptr.address(), 0);

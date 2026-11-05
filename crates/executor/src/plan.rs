@@ -28,6 +28,26 @@ use std::fmt;
 /// A bucket only ever holds a forward of its own variant: a decode row cannot be served by a
 /// prefill graph, and a prefill that projects logits has different outputs from one that only
 /// writes the KV cache.
+///
+/// # The catalog, as it is
+///
+/// | variant | writes | sampler |
+/// --- | --- | ---
+/// | [`Variant::PrefillWrite`] | the KV cache | runs over every row, and every row's draw is discarded (`logits_rows` are all `-1`) |
+/// | [`Variant::PrefillOutput`] | the KV cache **and** every sampling row's logits | runs over every row of the bucket; a row that ends a prompt keeps its token |
+/// | [`Variant::DecodeGreedy`] | one token per row | runs, greedily |
+/// | [`Variant::DecodeSampled`] | one token per row | runs, one draw per row |
+///
+/// A prefill bucket carries the sampler because the logits are computed anyway - the sampler is a
+/// tail over them, so its cost is not the forward's cost, and a greedy-only variant would double the
+/// largest graphs' memory to decide one token - and because it is what makes a sampled first token
+/// possible without a decode step spent only on drawing.
+///
+/// **One rule keeps the two paths of a prompt ending agreeing:** a captured draw is replaced on the
+/// host by the argmax of the row's own logits **only for a strictly greedy row whose slot held
+/// nothing before the step**. Every penalty is the identity over an empty history, so the draw and
+/// the argmax answer the same token there; a row with history is refused by name, because its token
+/// is the argmax of the *penalized* logits, which only the captured sampler computes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Variant {
     /// Decode rows drawn from the slot state, sampled greedily.
@@ -103,11 +123,16 @@ impl Variant {
         matches!(self, Self::DecodeGreedy)
     }
 
-    /// Whether a bucket of this variant samples a token for each of its sampling rows (4.4).
+    /// Whether a bucket of this variant runs the sampler (4.4).
     ///
-    /// A prefill bucket samples only on the batch that ends a prompt, which the mechanism says by
-    /// putting rows in `logits_rows`; the bucket still owns its sampler region and its nodes, so a
-    /// last chunk samples from the graph like a decode step.
+    /// Every bucket the causal-LM runner serves does, which is every variant this predicate is asked
+    /// about: a media bucket is refused by name before a graph is chosen for it (`Bucket::causal_lm`),
+    /// so it never reaches this question. A prefill's sampler is a tail over logits the forward
+    /// computes anyway, so it costs the graph almost nothing and makes a sampled first token possible
+    /// without a decode step spent only on drawing; the mechanism says which rows end a prompt by
+    /// putting them in `logits_rows`, and a row that ends none has its draw discarded. See
+    /// [`Variant`]'s catalog, and the one rule under which a captured draw may be replaced by the
+    /// host's argmax.
     pub const fn samples(self) -> bool {
         true
     }
@@ -983,11 +1008,31 @@ mod tests {
         // prefill: a prefill bucket is captured per row size, because rows bound the packing.
         assert_eq!(buckets.len(), 16, "16 buckets, so 16 captures");
 
-        // The catalogues are the default when a deployment names no size, and the plan is their
-        // cross product: 44 decode sizes and 110 prefill token counts give 44 x (2 + 220).
+        // With no configured size the catalogues are the plan, and every size they state is
+        // captured with each computation it admits. The count is derived from them here rather than
+        // written as a figure: a chunk never holds fewer tokens than its rows, so two catalogue
+        // entries can name one bucket and the set holds it once.
         let catalog = Buckets::for_batch(None, None, u32::MAX, u32::MAX, true)
             .expect("the catalogues");
-        assert_eq!(catalog.len(), 44 * (2 + 110 * 2), "the catalog's cross product");
+        let (rows, tokens) = (decode_catalog(), prefill_catalog());
+        let mut stated: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
+        for &row in &rows {
+            stated.insert(Bucket::decode(row, Variant::DecodeGreedy));
+            stated.insert(Bucket::decode(row, Variant::DecodeSampled));
+            for &count in &tokens {
+                for variant in [Variant::PrefillWrite, Variant::PrefillOutput] {
+                    stated.insert(Bucket::prefill(row, count.max(row), variant));
+                }
+            }
+        }
+        assert_eq!(
+            catalog.len(),
+            stated.len(),
+            "one bucket per (variant, rows, tokens) the catalogues state"
+        );
+        for bucket in &stated {
+            assert!(catalog.contains(bucket), "{bucket} is in the catalog's plan");
+        }
     }
 
     /// The catalog is clamped to what the batch plan admits, so nothing is captured that no batch

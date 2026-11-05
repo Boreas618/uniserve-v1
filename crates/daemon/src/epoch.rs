@@ -717,6 +717,67 @@ impl Epochs {
         *locked(&self.commands) = Some(commands);
     }
 
+    /// Hands the serving epoch's programs to a main process that joined it
+    /// after the epoch was installed — the process a relaunch starts — and
+    /// switches it to them (§2.5, §7.5).
+    ///
+    /// A main process starts with no programs: it resolves no kernel itself,
+    /// and its first request fails every operator it was never given. The
+    /// first start installs them through the same switch (`Leader::install_programs`);
+    /// a relaunched process has to be given the very programs its predecessor
+    /// ran, because the epoch they belong to is already serving and nothing
+    /// else sends them.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no epoch serves, when the daemon has no channel to its main
+    /// processes, and when the process refuses the programs or does not answer.
+    pub fn hand_to(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+    ) -> Result<(), Failure> {
+        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
+            kind: "no_command_channel".to_owned(),
+            reason: "the daemon has no channel to its main processes".to_owned(),
+            device: None,
+        })?;
+        let (_, record) = self.serving().ok_or_else(|| Failure {
+            kind: "no_epoch".to_owned(),
+            reason: "the daemon executes no epoch".to_owned(),
+            device: None,
+        })?;
+        let programs = FilledPrograms {
+            kernels: record.kernels.clone(),
+            policy: record.policy.clone(),
+        };
+        let deployment = Deployment {
+            config: config.clone(),
+            build_config: crate::epoch::BuildConfig::of(config),
+            programs,
+        };
+        let process = crate::engine::control::EpochProcess {
+            host: host.to_owned(),
+            engine,
+        };
+        let mut switch = crate::engine::control::ProgramSwitch::new(
+            &commands,
+            vec![process],
+            Update::new(0, deployment),
+        );
+        switch.precopy(&record.kernels, &record.policy)?;
+        switch.switchover()?;
+        switch.commit()?;
+        tracing::info!(
+            engine,
+            kernels = record.kernels.len(),
+            policy = %record.policy.backend,
+            "the joining main process took the epoch's programs"
+        );
+        Ok(())
+    }
+
     /// The program-layer update in flight, if there is one.
     pub fn program_update(&self) -> Option<ProgramUpdate> {
         locked(&self.program).clone()
@@ -1456,6 +1517,58 @@ mod tests {
             generation: None,
             world: 3,
         }
+    }
+
+    /// A main process that joins the serving epoch after it was installed — the
+    /// process a relaunch starts — is handed the epoch's own programs and
+    /// switched to them. A process that starts with none waits for a
+    /// program-layer command nothing sends, and answers 503 to every request,
+    /// so the epoch layer is what gives it them (§2.5, §7.5).
+    #[test]
+    fn a_joining_main_process_takes_the_epochs_own_programs() {
+        use crate::engine::stand_in::{Answer, Seen, main_processes_recording};
+
+        let (commands, seen, carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        epochs.record(0, record());
+        epochs.supervise(commands);
+
+        epochs
+            .hand_to("node-0", 9, &config)
+            .expect("the epoch's programs reached the joining process");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (9, Seen::Precopy),
+                (9, Seen::Switchover(12)),
+                (9, Seen::Commit)
+            ],
+            "the joining process prepares, switches to and commits the epoch's programs"
+        );
+        let carried = carried.lock().unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            carried[0].1.kernels, 1,
+            "the very operator the epoch's record names, not an empty set"
+        );
+        assert_eq!(
+            carried[0].1.revisions,
+            vec![("rms_norm".to_owned(), 1)],
+            "the revision the epoch installed, not the zero a program carries before a \
+             Program Server selects one: a name at revision zero is one the store never built"
+        );
+        assert_eq!(carried[0].1.policy, "fcfs");
+
+        // A daemon that executes no epoch has nothing to hand over, and says so
+        // rather than leaving the process waiting.
+        let (commands, _seen, _carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
+        let empty = Epochs::new();
+        empty.supervise(commands);
+        let failure = empty
+            .hand_to("node-0", 9, &config)
+            .expect_err("a daemon with no epoch hands nothing over");
+        assert_eq!(failure.kind, "no_epoch");
     }
 
     /// A program-layer update in flight is the epoch's probation: the record

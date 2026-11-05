@@ -68,6 +68,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    log_tail,
     require_uniserve_binary,
     server_process,
     start_server,
@@ -564,7 +565,13 @@ def _log_lines(log: Path) -> list[str]:
     return [colors.sub("", line) for line in log.read_text().splitlines()]
 
 
-def _chat(base_url: str, model: str, prompt: str, tokens: int = 16) -> dict:
+def _chat(
+    base_url: str,
+    model: str,
+    prompt: str,
+    tokens: int = 16,
+    timeout_s: float = 600,
+) -> dict:
     response = httpx.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -574,7 +581,7 @@ def _chat(base_url: str, model: str, prompt: str, tokens: int = 16) -> dict:
             "temperature": 0,
             "max_completion_tokens": tokens,
         },
-        timeout=600,
+        timeout=timeout_s,
     )
     response.raise_for_status()
     return response.json()
@@ -587,10 +594,34 @@ def _stream_count(
     done: threading.Event,
     reasons: list[str] | None = None,
     prompt: str = PROMPT,
+    errors: list[BaseException] | None = None,
 ) -> None:
     """Streams the count, appending each content delta to `read` and each
     finish reason to `reasons`.
+
+    Runs on a thread, where an exception would otherwise be printed to a log
+    the test's failure does not carry and read exactly like a stream that
+    produced nothing: a refusal, a timeout and a stall would all show as a
+    count of zero. `errors` keeps what went wrong so the failure states it.
     """  # noqa: D205
+    try:
+        _stream_count_body(base_url, model, read, reasons, prompt)
+    except BaseException as error:  # noqa: BLE001 - reported, never swallowed
+        if errors is not None:
+            errors.append(error)
+        else:
+            raise
+    finally:
+        done.set()
+
+
+def _stream_count_body(
+    base_url: str,
+    model: str,
+    read: list[str],
+    reasons: list[str] | None,
+    prompt: str,
+) -> None:
     with httpx.stream(
         "POST",
         f"{base_url}/v1/chat/completions",
@@ -616,7 +647,6 @@ def _stream_count(
                         read.append(content)
                     if reasons is not None and choice.get("finish_reason"):
                         reasons.append(choice["finish_reason"])
-    done.set()
 
 
 # How long the counters an engine reports every second take to include
@@ -1176,6 +1206,44 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
             _stop_pid(pid)
 
 
+def _first_stream_frame(
+    base_url: str, model: str, timeout_s: float = 120.0
+) -> None:
+    """Reads one streamed frame, or says why none arrived.
+
+    A stream that produces nothing for five minutes and one that produces
+    tokens slowly are the same failure to a test that waits for a count. One
+    frame tells them apart in a minute: it proves the streaming path carries a
+    frame end to end, and when it does not it reports the status, the content
+    type and the opening bytes instead of a timeout with no cause.
+    """
+    with httpx.stream(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Count from 1 to 20."}],
+            "temperature": 0,
+            "max_completion_tokens": 8,
+            "stream": True,
+        },
+        timeout=timeout_s,
+    ) as response:
+        content_type = response.headers.get("content-type", "")
+        if response.status_code != 200:
+            raise AssertionError(
+                "a streamed request was refused: "
+                f"{response.status_code}: {response.read()[:400]!r}"
+            )
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                return
+    raise AssertionError(
+        f"the stream carried no frame in {timeout_s:.0f} s "
+        f"(content-type {content_type!r})"
+    )
+
+
 def _restart_while_streaming(
     base_url: str, name: str, log: Path, successors: list[int]
 ) -> None:
@@ -1184,6 +1252,39 @@ def _restart_while_streaming(
     assert status["deployment"]["engine"] == "ready", status
     (old_daemon,) = _pids(log, "Daemon")
 
+    # One completion before any stream: a deployment that answers nothing says
+    # so here, in seconds and with its own body, instead of as a stream that
+    # produced no token in five minutes — a silence the two paths share and
+    # that therefore names neither. A refusal is the likelier failure (a
+    # relaunched process that was not handed the epoch's programs answers 503
+    # until it times out), and `raise_for_status` keeps the status but not the
+    # body, so the refusal's own `detail` is raised here as well.
+    probe = "Count from 1 to 3, separated by commas."
+    # Three numbers from a deployment that is serving take seconds; two
+    # minutes is generous and turns a deployment that answers nothing at all
+    # into a failure this test names, instead of ten minutes of silence.
+    try:
+        answered = _chat(base_url, name, probe, timeout_s=120)
+    except httpx.HTTPStatusError as error:
+        raise AssertionError(
+            "the deployment refused a completion: "
+            f"{error.response.status_code} {error.response.text[:2000]}"
+            f"{log_tail(log)}"
+        ) from error
+    choice = (answered.get("choices") or [{}])[0]
+    content = choice.get("message", {}).get("content")
+    assert content, (
+        f"the deployment answered no content: {answered}{log_tail(log)}"
+    )
+
+    # And one frame of one stream: the three streams below each need 32 counts,
+    # so a silent stream and a slow one are the same failure at 300 s. This
+    # says which in a minute.
+    try:
+        _first_stream_frame(base_url, name)
+    except AssertionError as error:
+        raise AssertionError(f"{error}{log_tail(log)}") from error
+
     # Three streams in flight at the restart, of different lengths so their
     # boundaries fall at different events of different requests.
     reads: list[list[str]] = [[] for _ in HANDED_STREAMS]
@@ -1191,6 +1292,9 @@ def _restart_while_streaming(
     # The finish reason each stream ends with: a response the successor closes
     # instead of finishing carries none, and the count alone would not say so.
     reasons: list[list[str]] = [[] for _ in HANDED_STREAMS]
+    # What each stream's thread raised, if anything: a refusal or a timeout
+    # otherwise reads as a count of zero, the same as a stall.
+    errors: list[BaseException] = []
     streaming = [
         threading.Thread(
             target=_stream_count,
@@ -1199,7 +1303,8 @@ def _restart_while_streaming(
                 "prompt": (
                     f"Count from 1 to {last}, separated by commas and spaces. "
                     "Write only the numbers."
-                )
+                ),
+                "errors": errors,
             },
         )
         for read, done, reason, last in zip(
@@ -1208,11 +1313,20 @@ def _restart_while_streaming(
     ]
     for thread in streaming:
         thread.start()
-    _wait_until(
-        lambda: all(len(read) >= 32 for read in reads),
-        300,
-        "the counts did not stream",
-    )
+    try:
+        _wait_until(
+            lambda: all(len(read) >= 32 for read in reads),
+            300,
+            "the counts did not stream",
+        )
+    except TimeoutError as error:
+        # Three streams open at once is the first place the deployment serves
+        # more than one request at a time; a stop here is the engine's own
+        # account of what it did with them, not a number of seconds.
+        raise AssertionError(
+            f"{error} (counts so far: {[len(read) for read in reads]}; "
+            f"stream errors: {[repr(one) for one in errors]}){log_tail(log, 200)}"
+        ) from error
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
     successor = restarted.json()["result"]["pid"]

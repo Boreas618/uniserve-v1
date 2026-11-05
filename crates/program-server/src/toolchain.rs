@@ -701,7 +701,7 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, parse_nvcc_version, resolve_in, ToolJob};
+    use super::{ToolJob, execute, parse_nvcc_version, resolve_in};
     use std::path::Path;
 
     /// A build whose compiler is not where the host said names the program, its
@@ -710,10 +710,8 @@ mod tests {
     /// a relative toolchain path cost an hour to diagnose.
     #[test]
     fn a_build_that_cannot_find_its_program_names_the_program_and_where_it_ran() {
-        let temporary = std::env::temp_dir().join(format!(
-            "uniserve-tooljob-{}",
-            std::process::id()
-        ));
+        let temporary =
+            std::env::temp_dir().join(format!("uniserve-tooljob-{}", std::process::id()));
         std::fs::create_dir_all(&temporary).unwrap();
         let log = temporary.join("build.log");
         let job = ToolJob::new(Path::new("/no-such-toolchain/python"), &temporary, &log)
@@ -749,7 +747,11 @@ mod tests {
             configured.display(),
             resolved.display()
         );
-        assert!(resolved.is_file(), "{} is not a program", resolved.display());
+        assert!(
+            resolved.is_file(),
+            "{} is not a program",
+            resolved.display()
+        );
         // The starting directory's own ancestors are searched, so a server started
         // inside the crate still finds it.
         let inside = resolve_in(configured, &root.join("crates/program-server"));
@@ -759,7 +761,6 @@ mod tests {
         let missing = resolve_in(Path::new("no-such-toolchain/nvcc"), root);
         assert!(missing.is_absolute(), "{}", missing.display());
     }
-
 
     #[test]
     fn nvcc_version_is_the_v_token() {

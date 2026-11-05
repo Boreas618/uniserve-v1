@@ -20,12 +20,19 @@ and the sum round there too. That is why the operator's tolerance is ``exact``: 
 computed the ramp in FP32 and rounded once would be a slightly different fade. This source rounds
 each step into the element type, which is what the reference's own arithmetic does.
 
-**One thread per output voxel.** The call gives the tile's four extents and the destination's three
-outer strides, so a program decodes its flat index into (channel, frame, row, column) and addresses
-the destination as ``channel · stride[0] + frame · stride[1] + row · stride[2] + column`` — one row
-is contiguous, which lets a tile land inside a larger raster. The sources are contiguous in the
-operator's ``[channels, frames, height, width]`` order, which is the only layout the call can
-express.
+**One thread per output voxel, and all three views are addressed by their strides.** The call gives
+the views' four extents and, for each of them, three outer strides, so a program decodes its flat
+index into (channel, frame, row, column) and addresses every operand as
+``channel · stride[0] + frame · stride[1] + row · stride[2] + column``. One row is contiguous and the
+three outer strides are the call's, which is what lets **a source** — not only the destination — be a
+view inside a larger raster: a tile the grid decoded sits at a stride of the raster's width, and the
+seam between two such tiles is a band whose rows are that same stride apart.
+
+**Both the tile and the seam are this one program.** Passed whole tiles, the leading ``extent``
+positions of the band axis blend and the rest copy; passed a seam — the views' band axis exactly
+``extent`` wide, which is what the decoder hands over — ``columns - extent`` is zero and every
+position is in the band. The arithmetic is the same expression either way, so one module serves both
+and the key does not move.
 
 **``out`` may alias ``current``.** Every element is read from ``current`` at the position it is
 written at, so one buffer serves as both; nothing here reads a neighbouring program's output.
@@ -46,6 +53,12 @@ def _cross_fade_kernel(
     frames,
     rows,
     columns,
+    previous_stride0,
+    previous_stride1,
+    previous_stride2,
+    current_stride0,
+    current_stride1,
+    current_stride2,
     out_stride0,
     out_stride1,
     out_stride2,
@@ -56,9 +69,12 @@ def _cross_fade_kernel(
 ):
     """Blend one block of the destination.
 
+    Each of the three views is addressed by the three outer strides the call states and a
+    unit-strided last axis, so a source may be a view inside the raster the tiles were decoded into.
+
     ``AXIS`` is the descriptor's, because the blend's position is a different coordinate of the
     index on each axis and both the read and the mask follow from it. ``extent``, ``channels``,
-    ``frames``, ``rows``, ``columns``, the three output strides, ``block`` and ``pdl`` are the
+    ``frames``, ``rows``, ``columns``, each view's three outer strides, ``block`` and ``pdl`` are the
     launch's words.
     """
     dtype = out_ptr.dtype.element_ty
@@ -81,14 +97,34 @@ def _cross_fade_kernel(
     frame = frame_plane % frames
     channel = frame_plane // frames
 
-    current_offset = index
+    # Every view is addressed the same way: three outer strides the call states and a unit-strided
+    # last axis. A source inside a larger raster differs from a contiguous one only in these numbers.
+    plane_offset = (
+        channel * previous_stride0.to(tl.int64) + frame * previous_stride1.to(tl.int64)
+    )
+    current_offset = (
+        channel * current_stride0.to(tl.int64)
+        + frame * current_stride1.to(tl.int64)
+        + row * current_stride2.to(tl.int64)
+        + column
+    )
     if AXIS == 3:
         # The band is the leading columns of every row; the previous tile's band is its last ones.
-        previous_offset = (plane * columns) + (columns - extent + column)
+        # A view whose band axis is exactly `extent` wide (the seam the decoder passes) makes the
+        # first term zero and reads the band it was handed.
+        previous_offset = (
+            plane_offset
+            + row * previous_stride2.to(tl.int64)
+            + (columns - extent + column)
+        )
         position = column
     else:
         # The band is the leading rows of every frame; the previous tile's band is its last rows.
-        previous_offset = (plane - row + (rows - extent + row)) * columns + column
+        previous_offset = (
+            plane_offset
+            + (rows - extent + row) * previous_stride2.to(tl.int64)
+            + column
+        )
         position = row
     out_offset = (
         channel * out_stride0.to(tl.int64)
