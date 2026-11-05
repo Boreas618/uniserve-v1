@@ -776,8 +776,23 @@ impl Device {
                 // shadow region and the snapshot takes its own figure, so the two tenants of one
                 // pool never claim each other's bytes.
                 pools.reserve_scratch(self.scratch)?;
+                // One region per runner, divided out of the one shadow figure the plan reserved:
+                // a device may serve several runners (a text one and a media one is the case that
+                // exposed this), and a region each of the WHOLE shadow asks the pool for more than
+                // it was reserved - the second runner's request is then exactly the reservation
+                // the first already took. The division is the plan's figure, divided here and
+                // nowhere else, and a device that cannot give each runner a byte refuses by name
+                // rather than failing at an allocator.
+                let runners = self.runners.len().max(1) as u64;
+                let each = self.shadow / runners;
+                if each == 0 && !self.runners.is_empty() {
+                    return Err(Error::Interface(format!(
+                        "device {} reserves a {} -byte shadow region for {} runner(s), which leaves none of them a region to compare in",
+                        self.device.0, self.shadow, runners,
+                    )));
+                }
                 for named in &mut self.runners {
-                    let twins = ops::Twins::new(pools.allocator(), self.shadow)
+                    let twins = ops::Twins::new(pools.allocator(), each)
                         .map_err(|error| Error::Interface(error.to_string()))?;
                     let shadow = crate::shadow::Shadow::new(self.device, twins)?;
                     named.runner.attach_shadow(shadow);

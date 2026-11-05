@@ -151,6 +151,16 @@ pub struct BlockTables {
 }
 
 impl BlockTables {
+    /// Pages per row: the widest block table a request of the model's length needs.
+    ///
+    /// An attention program addresses one row with the page count its own geometry states, so a
+    /// program that states more pages than a row holds reads past the row - into the next slot's
+    /// pages or past the table, which is a page index no unit answers for. The two numbers are one
+    /// contract, and this accessor is the row's half of it.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
     pub fn new(
         groups: Vec<GroupShape>,
         request_pool_size: u32,
