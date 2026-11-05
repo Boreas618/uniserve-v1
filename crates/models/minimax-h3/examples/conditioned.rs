@@ -1072,7 +1072,7 @@ fn encode(args: &Args) -> Result<(), String> {
     if let Some(diag) = &args.diag {
         let block = diag.join("latent_encoder");
         std::fs::create_dir_all(&block).map_err(|error| format!("{}: {error}", block.display()))?;
-        write_npy(
+        minimax_h3::diagnosis::write_npy(
             &block.join("pixels.npy"),
             &[
                 channels,
@@ -1082,7 +1082,7 @@ fn encode(args: &Args) -> Result<(), String> {
             ],
             &pixels_host,
         )?;
-        write_npy(
+        minimax_h3::diagnosis::write_npy(
             &block.join("condition_noise.npy"),
             &[
                 u64::from(dit.transformer.video_channels),
@@ -1096,7 +1096,7 @@ fn encode(args: &Args) -> Result<(), String> {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        write_npy(
+        minimax_h3::diagnosis::write_npy(
             &block.join("condition_rows.npy"),
             &[rows, hidden],
             &rows_bytes,
@@ -1261,42 +1261,6 @@ fn write_h3t(path: &Path, element: u8, extents: &[u64], payload: &[u8]) -> Resul
     for extent in extents {
         bytes.extend_from_slice(&extent.to_le_bytes());
     }
-    bytes.extend_from_slice(payload);
-    std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// A tensor in the container the python dumpers write: `.npy` 1.0, little-endian `f32`, C order.
-///
-/// The payload is the bytes the device produced, so a `.npy` and the `.h3t` beside it are the same
-/// numbers in two containers, and the reference's `numpy.save` output reads with this one.
-fn write_npy(path: &Path, shape: &[u64], payload: &[u8]) -> Result<(), String> {
-    let elements: u64 = shape.iter().product();
-    if payload.len() as u64 != elements * 4 {
-        return Err(format!(
-            "{}: {} bytes for {} elements of f32",
-            path.display(),
-            payload.len(),
-            elements
-        ));
-    }
-    let extents = shape
-        .iter()
-        .map(|extent| extent.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({extents},), }}");
-    // The header ends with a newline and the whole preamble is padded to a multiple of 64 bytes,
-    // which is what `numpy.load` expects rather than something a reader may omit.
-    let preamble = 10 + header.len() + 1;
-    let padding = (64 - preamble % 64) % 64;
-    header.push_str(&" ".repeat(padding));
-    header.push('\n');
-    let mut bytes = Vec::with_capacity(10 + header.len() + payload.len());
-    bytes.extend_from_slice(b"\x93NUMPY");
-    bytes.push(1);
-    bytes.push(0);
-    bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(payload);
     std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
