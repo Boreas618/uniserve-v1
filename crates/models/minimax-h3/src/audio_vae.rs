@@ -1498,8 +1498,24 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
+    ///
+    /// **A fused tensor is one binding with several views.** The anchor's attention stores query,
+    /// key and value as one `[3 * wide, wide]` matrix and the encoder reads each third as its own
+    /// layer; every third is a *slice of the same checkpoint tensor*, not a second binding. So the
+    /// first slice marks the entry used and later slices of it are views - while every other
+    /// accessor still refuses a repeated use, which is where a name bound twice would be a defect.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
+        let index = self
+            .table
+            .iter()
+            .position(|source| source.parameter == parameter)
+            .ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "{parameter}: the checkpoint's audio decoder has no such parameter"
+                ))
+            })?;
+        self.used[index] = true;
+        match self.table[index].tensor.clone() {
             Tensor::Region(tensor) => {
                 let weight =
                     self.loader
