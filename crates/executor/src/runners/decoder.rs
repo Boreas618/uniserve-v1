@@ -494,6 +494,12 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // The copy is ordered on this stream, so the host may read the bytes once the stream reaches
         // it. This is the one place in the media seam that waits on the device rather than ordering
         // more work after it, and it waits once per clip.
+        //
+        // **It waits on the decode stream, so it also waits for whatever that stream still holds** -
+        // and what it holds is one clip's launch, which is what the media path's one-in-flight
+        // admission rule guarantees is nothing. A deployment that ever admits two media requests at
+        // once makes this the place the second one queues, and the fix then is a stream of the
+        // runner's own for the crossing rather than a narrower wait.
         self.stream.synchronize()?;
         let crossing = self
             .crossing
