@@ -1500,6 +1500,41 @@ impl<M: CausalLm> CausalLmRunner<M> {
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
         let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
+        // One contract, checked once, before any bucket is captured: the attention program states
+        // how many pages a row of the block table holds (`ceil(max_kv_len / page_size)`), and the
+        // cache allocates rows of its own width. A program that states more pages than a row holds
+        // addresses entries the row does not own - the next slot's pages, or past the table - and
+        // the page index it reads there is a unit no descriptor covers. That reads as an illegal
+        // address in the FMHA kernel, one batch in, and nothing on the host can see it.
+        if let Some(cache) = kv.cache() {
+            let width = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tables()
+                .width();
+            let pages = usize::try_from(
+                geometry
+                    .max_kv_len
+                    .div_ceil(kv.page_size().max(1)),
+            )
+            .unwrap_or(usize::MAX);
+            if width < pages {
+                return Err(Error::Invariant(format!(
+                    "the cache's block-table rows are {width} pages wide and the attention \
+                     program's geometry needs {pages} (max_kv_len {} over {} tokens per page): a row \
+                     this program addresses reads pages it does not own",
+                    geometry.max_kv_len,
+                    kv.page_size()
+                )));
+            }
+            tracing::info!(
+                width,
+                pages,
+                max_kv_len = geometry.max_kv_len,
+                page_size = kv.page_size(),
+                "the block table is wide enough for the pages the attention program addresses"
+            );
+        }
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
         } else {
