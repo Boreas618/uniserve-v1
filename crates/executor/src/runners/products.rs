@@ -85,13 +85,16 @@ pub enum Product {
     VideoLatents,
     /// The audio latent trajectory, in the same sense.
     AudioLatents,
-    /// `[channels, frames, rows, columns]` the decoded clip: a decode writes it and the transport
-    /// that turns it into an artifact reads it.
+    /// The request's video frames: a decode writes them and the encoder that turns them into an
+    /// artifact's units reads them.
     ///
-    /// It is a product for the same reason the latents are: the region is a runner's own column, and
-    /// a value another call must read has nowhere to be unless it is named. The name is
-    /// `(request, kind)` like every other, so the transport reads one clip by the identity the
-    /// request was admitted under rather than by a position in a batch.
+    /// **The extent is the postprocessor's**, not the clip's: `[frames, rows, columns, 3]` bytes,
+    /// where a frame is one frame the timeline keeps. A deployment that serves no postprocessor
+    /// publishes the decoded clip instead, `[channels, frames, rows, columns]` in the model's own
+    /// element type. It is a product for the same reason the latents are: the region is a runner's
+    /// own column, and a value another call must read has nowhere to be unless it is named. The name
+    /// is `(request, kind)` like every other, so the encoder reads one request's frames by the
+    /// identity the request was admitted under rather than by a position in a batch.
     Video,
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
     ///

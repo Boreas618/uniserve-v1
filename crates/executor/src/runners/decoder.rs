@@ -1,4 +1,6 @@
-//! The decoder runner: one clip's latents, walked once per canvas and replayed (4.5).
+//! The decoder runner: one clip's latents, walked once per canvas and replayed (4.5), and the clip
+//! spliced into the request's timeline by the component's second block when the deployment serves
+//! one.
 //!
 //! A decoder is the encoder's mirror in every respect this runner cares about - one stream, a bucket
 //! per declared extent, a captured graph per bucket, and the generation lifecycle the hot update
@@ -133,6 +135,29 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// The request whose clip the raster column last held, so a decode of another can be refused
     /// while the first is unread ([`clip_is_releasable`]).
     published_for: Option<ipc::RequestKey>,
+    /// The `video_decoder` component's second block, when the deployment serves one: the
+    /// postprocessor that writes a clip's frames into the request's timeline with the seam fade and
+    /// the checkpoint's de-normalization. Without one the runner publishes the clip's own raster.
+    postprocessor: Option<Arc<dyn Decoder + Send + Sync>>,
+    /// `[frames, rows, columns, 3]` bytes: the frames a splice wrote for the clip staged last.
+    ///
+    /// Sized at bind for the bucket's own clip raster, which no splice exceeds - a splice keeps at
+    /// most the frames the decoder wrote, since the tail it adds is a subset of them.
+    frames: Option<Column>,
+    /// The predecessor clip's tail, `[channels, overlap, rows, columns]` in the model's type, which
+    /// the next clip's five-frame fade reads. Sized on the first splice from the schedule's own
+    /// overlap count, which is the model's number rather than this runner's, and reused after.
+    tail: Option<Column>,
+    /// How many clips of each request's timeline this runner has spliced, which is where the next
+    /// splice starts.
+    spliced: std::collections::HashMap<ipc::RequestKey, u32>,
+    /// The frames the staged request's timeline holds, from its own row
+    /// (`StagedRequest::frames`): the schedule's length, which is what the last clip's keep depends
+    /// on.
+    staged_frames: Option<u32>,
+    /// The frames the splice staged last wrote for the staged request's clip: the extent the product
+    /// states, taken from the schedule rather than recomputed here.
+    staged_keep: Option<u32>,
 }
 
 /// Whether a decode of `request` may start while a clip published under `published` is still held.
@@ -180,6 +205,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         model: Arc<M>,
         buckets: Buckets,
         generation: Arc<ops::Generation>,
+        postprocessor: Option<Arc<dyn Decoder + Send + Sync>>,
     ) -> Result<Self> {
         let mut layouts = std::collections::BTreeMap::new();
         let mut largest: Option<(Bucket, Layout)> = None;
@@ -226,6 +252,12 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             staged_request: None,
             crossing: None,
             published_for: None,
+            postprocessor,
+            frames: None,
+            tail: None,
+            spliced: std::collections::HashMap::new(),
+            staged_frames: None,
+            staged_keep: None,
         })
     }
 
@@ -378,6 +410,23 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.columns.raster = Column::new(self.device, self.dtype, elements)?;
             self.raster_elements = elements;
         }
+        // The frames a splice writes are bytes - `[frames, rows, columns, 3]` - and there are as
+        // many of them as the clip's own decoded frames at most: the body a splice keeps and the tail
+        // it adds both come out of that raster, never beside it.
+        if self.postprocessor.is_some() {
+            let frames = u64::from(frames)
+                .checked_mul(u64::from(height))
+                .and_then(|elements| elements.checked_mul(u64::from(width)))
+                .and_then(|elements| elements.checked_mul(3))
+                .ok_or_else(|| Error::Invalid("a splice's raster extent overflows".into()))?;
+            if self
+                .frames
+                .as_ref()
+                .is_none_or(|column| column.device.numel() < frames)
+            {
+                self.frames = Some(Column::new(self.device, DType::U8, frames)?);
+            }
+        }
         Ok(())
     }
 
@@ -470,6 +519,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         };
         clip_is_releasable(request, self.published_for, still_held)?;
         self.staged_request = Some(request);
+        self.staged_frames = Some(media.request(0)?.frames);
         // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
         // is the request's conditioning blob and its parameter record; the latent trajectory is
         // explicitly not the batch's (`MediaColumns::staged`: "It does not own what the model
@@ -673,7 +723,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )));
         };
         let layout = self.layout(bucket)?;
-        let raster = self.raster(bucket, &layout)?;
+        // With a postprocessor the request's product is the timeline's frames - `[frames, rows,
+        // columns, 3]` bytes, which is what an encoder takes - and without one it is the clip's own
+        // raster, which is all such a deployment has to publish.
+        let published = match self.postprocessor {
+            Some(_) => self.frames_view(bucket)?,
+            None => self.raster(bucket, &layout)?,
+        };
         let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
             request,
@@ -681,7 +737,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.device,
             self.stream_id(),
             Some(written),
-            &raster,
+            &published,
         )?;
         // The column now holds this request's clip until a reader forgets it: that is what a second
         // decode of another request is refused against.
@@ -726,11 +782,223 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
+        self.splice_clip(&forward, bucket, &layout)?;
         if first {
             self.pool()?
                 .record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
+    }
+
+    /// Writes the clip a replay just decoded into its request's timeline.
+    ///
+    /// **The component has two entry points and this is the second:** a decode turns latents into a
+    /// clip, and the postprocessor puts the clip's frames where the timeline holds them, fading its
+    /// first kept frames against the predecessor's tail and de-normalising the bytes. Without a
+    /// postprocessor there is no timeline - a deployment that serves none publishes the clip's own
+    /// raster, which is what the encoder of such a deployment reads.
+    ///
+    /// The schedule is the block's (`Decoder::splices`), so the frame count a timeline holds, the
+    /// body each clip keeps and the overlap the fade reads are all the checkpoint's arithmetic. This
+    /// runner states only where the clip is: **each clip gets its own raster**, so the splice's
+    /// destination starts at frame zero and the product names the frames this clip wrote.
+    fn splice_clip(
+        &mut self,
+        forward: &nn::Forward,
+        bucket: Bucket,
+        layout: &Layout,
+    ) -> Result<()> {
+        let Some(postprocessor) = self.postprocessor.clone() else {
+            return Ok(());
+        };
+        let request = self.staged_request.ok_or_else(|| {
+            Error::Invariant(
+                "a replay splices a clip and no request is staged: the splice would have no \
+                 timeline to write into"
+                    .into(),
+            )
+        })?;
+        let frames = self.staged_frames.ok_or_else(|| {
+            Error::Invariant(format!(
+                "request {} was staged without a timeline length, so the splice schedule cannot be \
+                 asked for",
+                request.request_id.0
+            ))
+        })?;
+        let index = self.spliced.get(&request).copied().unwrap_or(0);
+        let schedule = postprocessor.splices(frames).map_err(|error| {
+            Error::Invalid(format!(
+                "request {} asked for a timeline of {frames} frame(s) and the postprocessor serves \
+                 no such timeline: {error}",
+                request.request_id.0
+            ))
+        })?;
+        let Some(splice) = schedule.get(index as usize).copied() else {
+            return Err(Error::Invalid(format!(
+                "request {} asks for clip {index} of a timeline of {frames} frame(s), and the \
+                 timeline is {} clip(s)",
+                request.request_id.0,
+                schedule.len()
+            )));
+        };
+        let Extent::Clip { height, width, .. } = bucket.extent else {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is not a decode bucket and a clip was spliced"
+            )));
+        };
+        let channels = layout.video.channels;
+        self.size_tail(channels, height, width, splice.overlap)?;
+        let previous = match self.tail.as_ref() {
+            Some(tail) if splice.overlap > 0 => Some(TensorView::new(
+                tail.device.ptr,
+                self.dtype,
+                Shape::new(&[
+                    u64::from(channels),
+                    u64::from(splice.overlap),
+                    u64::from(height),
+                    u64::from(width),
+                ]),
+            )),
+            _ => None,
+        };
+        let clip = self.raster(bucket, layout)?;
+        let column = self.frames.as_ref().ok_or_else(|| {
+            Error::Invariant(
+                "a postprocessor is bound and no frames column was sized for the bucket".into(),
+            )
+        })?;
+        let video = TensorView::new(
+            column.device.ptr,
+            DType::U8,
+            Shape::new(&[
+                u64::from(splice.keep),
+                u64::from(height),
+                u64::from(width),
+                3_u64,
+            ]),
+        );
+        postprocessor
+            .splice(
+                forward,
+                previous,
+                clip,
+                nn::capability::Splice { first: 0, ..splice },
+                DecodedMedia {
+                    video: Some(video),
+                    audio: None,
+                },
+            )
+            .map_err(Error::from)?;
+        self.keep_tail(&clip, channels, height, width, splice.overlap)?;
+        // The timeline's last clip has no successor, so the request's place in it ends here: a
+        // decode after it would be a clip the timeline does not hold, which the schedule refuses
+        // above by naming the count.
+        if index + 1 == schedule.len() as u32 {
+            self.spliced.remove(&request);
+        } else {
+            self.spliced.insert(request, index + 1);
+        }
+        self.staged_keep = Some(splice.keep);
+        Ok(())
+    }
+
+    /// Sizes the tail column for an overlap of `overlap` frames, the first time one is needed.
+    ///
+    /// The count is the schedule's, not this runner's: a timeline whose fade reads five frames and one
+    /// that reads ten are one formula apart in the block and one column here.
+    fn size_tail(&mut self, channels: u32, height: u32, width: u32, overlap: u32) -> Result<()> {
+        if overlap == 0 {
+            return Ok(());
+        }
+        let elements = u64::from(channels)
+            .checked_mul(u64::from(overlap))
+            .and_then(|elements| elements.checked_mul(u64::from(height)))
+            .and_then(|elements| elements.checked_mul(u64::from(width)))
+            .ok_or_else(|| Error::Invalid("a clip's tail extent overflows".into()))?;
+        if self
+            .tail
+            .as_ref()
+            .is_none_or(|column| column.device.numel() < elements)
+        {
+            self.tail = Some(Column::new(self.device, self.dtype, elements)?);
+        }
+        Ok(())
+    }
+
+    /// Keeps the clip's last `overlap` frames for the next clip's fade.
+    ///
+    /// The tail is one contiguous run per channel of the clip's own raster (`[channels, frames, rows,
+    /// columns]`), so this is `channels` copies on the runner's stream and no arithmetic. It has to
+    /// happen before the next decode, which writes over the clip's column.
+    fn keep_tail(
+        &self,
+        clip: &TensorView,
+        channels: u32,
+        height: u32,
+        width: u32,
+        overlap: u32,
+    ) -> Result<()> {
+        let Some(tail) = self.tail.as_ref() else {
+            return Ok(());
+        };
+        if overlap == 0 {
+            return Ok(());
+        }
+        let element = self
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.dtype)))?;
+        let frames = clip.shape.dim(1);
+        let start = frames
+            .checked_sub(u64::from(overlap))
+            .ok_or_else(|| Error::Invalid("a clip is shorter than its own tail".into()))?;
+        let bytes = usize::try_from(
+            u64::from(overlap)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(u64::from(width))
+                .saturating_mul(u64::from(element)),
+        )
+        .map_err(|_| Error::Invalid("a clip's tail is larger than memory".into()))?;
+        let stride = u64::from(overlap)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(u64::from(width));
+        for channel in 0..u64::from(channels) {
+            let source = clip.element(&[channel, start, 0, 0]);
+            let destination = tail.device.element(&[channel * stride]);
+            // SAFETY: both regions are this runner's own buffers, the source's run of `bytes` lies
+            // inside the clip's raster (its frames axis is at least `overlap` long) and the
+            // destination's inside the tail column, sized for exactly this overlap; the copy is
+            // ordered on the runner's stream before the next clip's splice reads it.
+            unsafe {
+                platform::memcpy_async(
+                    destination.address(),
+                    source.address(),
+                    bytes,
+                    &self.stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The frames the splice wrote, `[frames, rows, columns, 3]` bytes, as the product states them.
+    fn frames_view(&self, bucket: Bucket) -> Result<TensorView> {
+        let Extent::Clip { height, width, .. } = bucket.extent else {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is not a decode bucket and its frames were asked for"
+            )));
+        };
+        let column = self.frames.as_ref().ok_or_else(|| {
+            Error::Invariant("no frames column was sized for a spliced bucket".into())
+        })?;
+        let keep = self.staged_keep.ok_or_else(|| {
+            Error::Invariant("a splice wrote frames and the schedule's keep was not staged".into())
+        })?;
+        Ok(TensorView::new(
+            column.device.ptr,
+            DType::U8,
+            Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64]),
+        ))
     }
 }
 
