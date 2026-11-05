@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """What a forward binds and the store list does not hold - both directions.
 
+**The deployment list must hold every shape any walk of any stage has produced.** A walk is one
+deployment's rows at one element type, so a file that serves several deployments holds each shape at
+more than one type - and the failure that matters is the shape that is absent at *every* type, because
+that key cannot be built by any run. `--by-shape` compares walks and file with the element type
+normalised to `<t>` and takes any number of `--walk` files, which is the union rule: the union of the
+walks each stage has produced, against the file. The other half of the rule - rows no walk states but
+the construction requires - is `check_manifests.py`'s question, not this one's.
+
 The store a caller builds comes from a fixture under `notes/programs/`, one per deployment, and it is
 a **walk's rows**: `cargo run -p minimax-h3 --example programs -- <root> --dtype <t> ...` prints them
 from the model's own layers, and `h3_fixture --walk <print> --commit <rev>` writes the file with the
@@ -57,9 +65,71 @@ def read_lines(path):
     return pairs
 
 
+ELEMENTS = ("bf16", "f16", "f32", "f64")
+
+
+def shape_of(operator, key):
+    """One key with its element types normalised, so the same shape compares across deployments."""
+    for element in ELEMENTS:
+        key = key.replace(element, "<t>")
+    return (operator, key)
+
+
+def types_of(key):
+    """The element types a key names, in the order they appear."""
+    return [element for element in ELEMENTS if element in key]
+
+
+def by_shape(args):
+    """Every shape the walks produced, against the shapes the file holds at any element type."""
+    shapes = {}
+    total = 0
+    for path in args.walk:
+        walked = read_lines(path)
+        total += sum(walked.values())
+        for operator, key in walked:
+            shapes.setdefault(shape_of(operator, key), {}).setdefault(path, set()).update(
+                types_of(key)
+            )
+    fixture = read_lines(args.fixture)
+    held = {shape_of(operator, key) for operator, key in fixture}
+
+    print(f"walks: {len(args.walk)} file(s), {total} launches, {len(shapes)} shapes")
+    for path in args.walk:
+        print(f"  {path}")
+    print(f"fixture: {len(fixture)} keys, {len(held)} shapes")
+    missing = sorted(set(shapes) - held)
+    for operator, key in missing:
+        where = sorted(shapes[(operator, key)])
+        launched_at = sorted(
+            {element for path in where for element in shapes[(operator, key)][path]}
+        )
+        print(f"  MISSING at every type: {operator}\t{key}")
+        print(f"    launched at {', '.join(launched_at)} by {', '.join(where)}")
+    if missing:
+        print(
+            f"\n{len(missing)} shape(s) a walk produced and the file cannot build at any element "
+            "type: every one of them stops a run at `no kernel`"
+        )
+        return 1
+    print("\nevery shape any walk produced is in the fixture, at some element type")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--walk", required=True, help="what the forward reported, one launch a line")
+    parser.add_argument(
+        "--walk",
+        required=True,
+        action="append",
+        help="what the forward reported, one launch a line; repeat it to take a union of stages",
+    )
+    parser.add_argument(
+        "--by-shape",
+        action="store_true",
+        help="compare with the element type normalised, so a walk of one deployment checks the "
+        "shapes a file serving several deployments must hold; fails on a shape absent at every type",
+    )
     parser.add_argument("--fixture", required=True, help="the store list the caller builds from")
     parser.add_argument(
         "--unbound",
@@ -69,7 +139,9 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    walk = read_lines(args.walk)
+    if args.by_shape:
+        return by_shape(args)
+    walk = read_lines(args.walk[0])
     fixture = read_lines(args.fixture)
 
     bound = sorted(walk)
