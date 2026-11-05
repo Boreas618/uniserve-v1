@@ -361,56 +361,21 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(buffers)
     }
 
-    /// One clip's buffers, refused unless their count is the model's: one latents column and one per
-    /// table, in [`Decoder::layout_tables`]' order.
+    /// Stages `bucket`'s columns: the model's tables, and the clip's latents when a batch states
+    /// them.
     ///
-    /// The count is the model's statement, not the runner's - a decode whose batch carried two
-    /// latents columns, or one table short, would write a column from another's bytes and read the
-    /// missing table as whatever the previous clip left there.
-    fn buffers_of<'a>(buffers: &'a Vec<Vec<u8>>, tables: usize) -> Result<&'a [Vec<u8>]> {
-        let expected = tables + 1;
-        if buffers.len() != expected {
-            return Err(Error::Invalid(format!(
-                "the decoder states {expected} buffer(s) for a clip - one latents and {tables} \
-                 table(s) - and the batch carries {}",
-                buffers.len()
-            )));
-        }
-        Ok(buffers)
-    }
-
-    /// Stages a batch's buffers into the columns `bucket`'s graph reads.
+    /// **Every table is the model's, computed here.** `Decoder::prepare_layout` writes them from the
+    /// layout, and `layout_tables` states their count and shapes - the executor copies bytes it did
+    /// not compute. A batch that carried the tables as well would state the model's layout
+    /// arithmetic a second time, which `MediaColumns::staged` already rules out: "It does not own
+    /// what the model prepares on the device - the encoded conditioning rows, the latent
+    /// trajectory".
     ///
-    /// The buffers are the model's own: `prepare_layout` states the first as the clip's latents and
-    /// the rest as the tables `layout_tables` names, in order. This function checks their count and
-    /// their byte lengths against what the model declared and copies them; it reads no header and
-    /// interprets no value, which is what keeps a decoder's input format out of the executor.
-    fn stage(&mut self, batch: &Batch, bucket: Bucket) -> Result<()> {
-        let media = batch.media.as_ref().ok_or_else(|| {
-            Error::Invalid(
-                "a decoder runner serves a media batch; this one states no computation".into(),
-            )
-        })?;
-        self.size_raster(bucket)?;
-        let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        // The batch names its requests, and a decode bucket serves one clip, so the name kept here
-        // is the one the replay's publish uses.
-        self.staged_request = Some(media.request(0)?.request);
-        let buffers = Self::buffers_of(Self::clip_of(media)?, tables.len())?;
-        self.columns.latents.write(&buffers[0])?;
-        for (column, bytes) in self.columns.state.iter_mut().zip(&buffers[1..]) {
-            column.write(bytes)?;
-        }
-        self.staged = Some(bucket);
-        Ok(())
-    }
-
-    /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
-    fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
-        if self.staged == Some(bucket) {
-            return Ok(());
-        }
+    /// A warm capture passes no latents, so the graph reads the model's own clip (`prepare_layout`'s
+    /// first buffer) rather than whatever the column held. A replay passes the batch's: a staged row
+    /// is the request's conditioning blob and its parameter record, and for a decode the blob is the
+    /// clip's latents.
+    fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
         let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
@@ -418,12 +383,56 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.model
             .prepare_layout(&layout, &mut host)
             .map_err(Error::from)?;
-        self.columns.latents.write(&host[0])?;
+        match latents {
+            Some(bytes) => {
+                // The column is the model's extent for this layout, so a blob of another length is
+                // a request for another clip: refused by name rather than copied over a prefix.
+                let expected = self.columns.latents.host.len();
+                if bytes.len() != expected {
+                    return Err(Error::Invalid(format!(
+                        "a decode of bucket {bucket} states {expected} byte(s) of latents and the \
+                         batch carries {}: the clip is not this bucket's",
+                        bytes.len()
+                    )));
+                }
+                self.columns.latents.write(bytes)?;
+            }
+            None => self.columns.latents.write(&host[0])?,
+        }
         for (column, bytes) in self.columns.state.iter_mut().zip(&host[1..]) {
             column.write(bytes)?;
         }
         self.staged = Some(bucket);
         Ok(())
+    }
+
+    /// Stages a batch's clip into the columns `bucket`'s graph reads.
+    fn stage(&mut self, batch: &Batch, bucket: Bucket) -> Result<()> {
+        let media = batch.media.as_ref().ok_or_else(|| {
+            Error::Invalid(
+                "a decoder runner serves a media batch; this one states no computation".into(),
+            )
+        })?;
+        // The batch names its requests, and a decode bucket serves one clip, so the name kept here
+        // is the one the replay's publish uses.
+        self.staged_request = Some(media.request(0)?.request);
+        let row = Self::clip_of(media)?;
+        let Some(latents) = row.first() else {
+            return Err(Error::Invalid(
+                "a staged decode row carries no buffer: a media row is the request's conditioning \
+                 blob and its parameter record"
+                    .into(),
+            ));
+        };
+        self.stage_columns(bucket, Some(latents))
+    }
+
+    /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
+    fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
+        if self.staged == Some(bucket) {
+            return Ok(());
+        }
+        self.stage_columns(bucket, None)
     }
 
     /// Uploads the staged columns, in one place, so a capture and a replay agree on what the graph
@@ -894,25 +903,30 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_carries_one_latents_buffer_and_one_per_table() {
-        // The count is the model's: the stub declares two tables, so a clip is three buffers, and a
-        // batch carrying one fewer would read the missing table as whatever the last clip left.
-        let buffers = vec![vec![0_u8; 8], vec![0_u8; 4], vec![0_u8; 4]];
+    fn a_staged_row_is_the_conditioning_blob_the_batch_was_built_with() {
+        // The row's shape is the engine's, not this file's: `MediaColumns::staged` writes the
+        // request's conditioning blob and its parameter record, one row per request. The blob is the
+        // clip's latents and the record is read by `media.request`, so the first buffer is the only
+        // one this runner stages from a batch.
+        let media = crate::batch::MediaColumns {
+            computation: crate::plan::Computation {
+                call: ipc::MediaCall::VideoDecoding,
+                rows: 1,
+                tokens: 0,
+                extent: crate::plan::Extent::Clip {
+                    frames: SERVED.0,
+                    height: SERVED.1,
+                    width: SERVED.2,
+                },
+            },
+            inputs: vec![vec![vec![7_u8; 32], vec![0_u8; 40]]],
+        };
+        let row = DecoderRunner::<Fixed>::clip_of(&media).expect("one clip");
+        assert_eq!(row.len(), 2, "a staged row is the blob and the record");
         assert_eq!(
-            DecoderRunner::<Fixed>::buffers_of(&buffers, 2)
-                .expect("one latents and two tables")
-                .len(),
-            3
-        );
-
-        let short = vec![vec![0_u8; 8], vec![0_u8; 4]];
-        let error =
-            DecoderRunner::<Fixed>::buffers_of(&short, 2).expect_err("one table is missing");
-        let message = format!("{error}");
-        assert!(
-            message.contains("states 3 buffer(s) for a clip")
-                && message.contains("the batch carries 2"),
-            "the refusal names both counts: {message}"
+            row.first().map(Vec::len),
+            Some(32),
+            "the first buffer is the clip's latents"
         );
     }
 
