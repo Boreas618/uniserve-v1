@@ -323,6 +323,20 @@ impl Bucket {
         }
     }
 
+    /// An audio decode bucket: one track of one layout's audio, decoded to interleaved PCM.
+    ///
+    /// The layout is the extent for the reason a denoise step's is: the track's latent shape, and
+    /// the window it decodes to, are the model's own arithmetic, and there is no raster here for a
+    /// clip-shaped extent to name - a track-only decode has no clip at all.
+    pub const fn audio(rows: u32, layout: nn::capability::Layout) -> Self {
+        Self {
+            variant: Variant::AudioDecode,
+            rows,
+            tokens: 0,
+            extent: Extent::Latents(layout),
+        }
+    }
+
     /// A decode bucket: one clip of `frames` raster frames at `height` by `width`.
     pub const fn clip(frames: u32, height: u32, width: u32) -> Self {
         Self {
@@ -592,27 +606,35 @@ impl Buckets {
         })
     }
 
-    /// The smallest captured bucket that serves a media computation, if the set has one.
-    ///
-    /// A media computation is planned by what it is, not by a `Shape`: a denoising step is served
-    /// only by a graph captured for its own latent layout and a decode only by one captured for its
-    /// own clip, so the extent is matched exactly while rows (and an encode's tokens) are room to
-    /// spare. No bucket serving the computation is the executor stating it does not serve it.
     /// The one bucket a media computation runs in, or `None` when this rank has none for it.
     ///
-    /// **The extent is the bucket's, not the computation's.** A media computation cannot state one:
-    /// a denoising step's extent is its latent layout and a decode's is its clip, and the caller
-    /// forming the computation knows neither until the runner that planned the bucket has answered.
-    /// The engine states `Extent::None` for exactly that reason and says so where it forms the
-    /// computation; requiring agreement here would refuse every bucket the runners planned, while
-    /// the variant, the rows and the tokens already identify it. The bucket's own extent is still
-    /// what decides what the runner does with the batch, and it is copied back into the answer.
+    /// A media computation is planned by what it is, not by a `Shape`: the variant says which kind of
+    /// graph it needs, and rows and tokens are room to spare.
+    ///
+    /// **An extent a caller states narrows the search; one it cannot state does not.** A caller that
+    /// states a `Latents` layout or a `Clip` is matched to the graph captured for exactly that, so a
+    /// 25-frame step cannot run in a 13-frame graph. `Extent::None` is the caller saying it does not
+    /// know: a denoising step's extent is its latent layout and a decode's is its clip, and the engine
+    /// that forms the computation knows neither until the runner that planned the bucket has
+    /// answered, so requiring agreement would refuse every bucket the runners planned. The bucket's
+    /// own extent is still what decides what the runner does with the batch, and it is copied back
+    /// into the answer.
+    ///
+    /// No bucket serving the computation is the executor stating it does not serve it.
     pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
         let variant = computation.variant()?;
         self.ascending.iter().copied().find(|bucket| {
             bucket.variant == variant
                 && bucket.rows >= computation.rows
                 && bucket.tokens >= computation.tokens
+                // An extent a caller **states** is matched exactly; `Extent::None` is a caller that
+                // cannot state one, and the bucket's own extent is then the answer. Both halves are
+                // load-bearing: the engine forms every media computation with `None` because it does
+                // not know a denoising step's layout or a decode's clip until the runner answers, and
+                // requiring agreement there refused every bucket the runners planned. A direct caller
+                // that does state one must still be narrowed to the graph captured for it, or a
+                // 25-frame step would run in a 13-frame graph and only the numbers would notice.
+                && (computation.extent == Extent::None || bucket.extent == computation.extent)
         })
     }
 
@@ -699,6 +721,21 @@ mod tests {
         };
         assert_eq!(plan.select_media(&other), None);
 
+        // The engine forms every media computation with `Extent::None`: a step's layout is the
+        // model's and a clip is the request's, and the mechanism knows neither until the runner that
+        // planned the bucket answers. The bucket's own extent is the answer then, and this is the
+        // case a served frame dies without - the batch matched no bucket and the only trace was a
+        // debug line.
+        let from_engine = Computation {
+            extent: Extent::None,
+            ..denoise
+        };
+        assert_eq!(
+            plan.select_media(&from_engine),
+            Some(Bucket::denoise(1, layout)),
+            "a computation that cannot state its extent is served by the bucket that states one"
+        );
+
         let clip = Computation {
             call: ipc::MediaCall::VideoDecoding,
             rows: 1,
@@ -711,6 +748,16 @@ mod tests {
         };
         assert_eq!(clip.variant(), Some(Variant::Decode));
         assert_eq!(plan.select_media(&clip), Some(Bucket::clip(48, 768, 1344)));
+
+        // The same for a decode: the engine states `Extent::None` and the clip's bucket answers.
+        let clip_from_engine = Computation {
+            extent: Extent::None,
+            ..clip
+        };
+        assert_eq!(
+            plan.select_media(&clip_from_engine),
+            Some(Bucket::clip(48, 768, 1344))
+        );
 
         // An encode is sized by rows and tokens like a prefill, so it is the one media computation
         // whose extent says nothing.
