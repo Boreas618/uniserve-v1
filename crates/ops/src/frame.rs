@@ -524,6 +524,11 @@ impl Op for FrameMoments {
 }
 
 /// One compilation of `frame_norm_pad`.
+///
+/// The entry derives the output's order from the strides the call carries and branches between the
+/// two store paths itself (`frame.cu`, `channels_last ? launch(<true>) : launch(<false>)`), so the
+/// order is **not** what a compilation is chosen by: `channels_last` is a claim the launch checks
+/// against the view, and the key states only what the object is built for.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FrameNormPadDescriptor {
     /// Element type of the values, the parameters and the output.
@@ -532,6 +537,10 @@ pub struct FrameNormPadDescriptor {
     /// above `channels_per_group · height · width`, which the launch checks.
     pub reduction: u32,
     /// The output's storage: channel-first (`false`) or channels-last (`true`).
+    ///
+    /// A checked claim, not a dimension: the program reads the order off the call and a launch whose
+    /// view disagrees is refused, so this field never selects a compilation and does not sit in the
+    /// key. Two launches that differ only here run one object.
     pub channels_last: bool,
     /// Normalize with the affine parameters (`false`), or with none (`true`).
     pub centered: bool,
@@ -541,9 +550,10 @@ pub struct FrameNormPadDescriptor {
 
 impl fmt::Display for FrameNormPadDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `channels_last` is absent on purpose: the object derives the order at run time, so the
+        // key would name two cells for one program.
         Key::new()
             .field("dtype", self.dtype)
-            .field("channels_last", self.channels_last)
             .field("centered", self.centered)
             .field("single_pixel", self.single_pixel)
             .finish(formatter)

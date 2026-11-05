@@ -37,6 +37,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["f32"], channels_last = ["true", "false"], centered = ["true", "false"], single_pixel = ["true", "false"] }
+dimensions = { dtype = ["f32"], centered = ["true", "false"], single_pixel = ["true", "false"] }
 
 [parameters]
