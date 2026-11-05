@@ -360,7 +360,17 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
             ]),
         ))
         .map_err(|error| error.to_string())?;
-    let input = Linear::new(projection, None, WeightOrder::NxK).map_err(|error| error.to_string())?;
+    // The checkpoint's first affine carries a bias (`decoder.proj_in.bias`), which the loader reads
+    // beside the weight; a harness without it records the no-epilogue gemm the model never launches.
+    let bias = loader
+        .load(&WeightRequest::region(
+            "virtual.proj_in.bias",
+            0,
+            Shape::new(&[u64::from(model_width)]),
+        ))
+        .map_err(|error| error.to_string())?;
+    let input =
+        Linear::new(projection, Some(bias), WeightOrder::NxK).map_err(|error| error.to_string())?;
     let decoder = VideoDecoder::load(
         &config,
         canvas,
@@ -380,9 +390,11 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
             Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
         )
         .map_err(|error| error.to_string())?;
+    // The layout declares `video_positions` as FP32 (`video_vae::table_specs`), so the decode step
+    // reads the table at that type; a harness that hands it i32 records a rotation nothing launches.
     let positions = arena
         .tensor(
-            DType::I32,
+            DType::F32,
             Shape::new(&[3, canvas.rows()]),
         )
         .map_err(|error| error.to_string())?;

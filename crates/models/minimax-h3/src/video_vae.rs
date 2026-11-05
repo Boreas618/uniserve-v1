@@ -798,13 +798,25 @@ impl VideoDecoder {
 
         let mut programs = Programs::default();
 
-        // The clip's latents in, the clip's pixels out.
+        // The clip's latents in, the clip's pixels out. The projection in, the attention's four, the
+        // final one out carry a bias; the feed-forward's packed pair does not, and its row is the
+        // second shape of the same program rather than a sixth one.
         for k in [config.latent_channels, width, ffn, width, patch] {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 k,
                 dtype,
                 WeightOrder::NxK,
                 bias,
+                dtype,
+                dtype,
+            ));
+        }
+        for k in [width, ffn] {
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                k,
+                dtype,
+                WeightOrder::NxK,
+                false,
                 dtype,
                 dtype,
             ));
@@ -2172,9 +2184,11 @@ pub(crate) mod tests {
                 .count()
         };
 
-        // Every projection this decoder has, whatever its contraction: the key carries the element
-        // types and the order, and the contraction length is a descriptor field of one program.
-        assert_eq!(count("gemm"), 1);
+        // Every projection this decoder has, by the two forms it launches: the key carries the
+        // element types, the order and the epilogue, and the contraction length is a descriptor field
+        // of one program. The projection in, the attention's four and the one out carry a bias; the
+        // feed-forward's packed pair does not, and those are the second row.
+        assert_eq!(count("gemm"), 2);
         assert_eq!(count("rows"), 1, "three placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
