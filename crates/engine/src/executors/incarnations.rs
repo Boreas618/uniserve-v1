@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use ipc::WorkerEndpoint;
+use ipc::MainProcessEndpoint;
 
 use crate::ExecutorGroupId;
 
@@ -30,7 +30,7 @@ impl IncarnationRegistry {
     pub(crate) fn assign<'a>(
         &self,
         worker: &ExecutorGroupId,
-        endpoints: impl IntoIterator<Item = &'a WorkerEndpoint>,
+        endpoints: impl IntoIterator<Item = &'a MainProcessEndpoint>,
     ) {
         let mut positions = self
             .positions
@@ -44,7 +44,7 @@ impl IncarnationRegistry {
 
     /// Returns the executor and rank `endpoint`'s incarnation serves, or `None`
     /// when it is not a live incarnation of this deployment.
-    pub(crate) fn position(&self, endpoint: &WorkerEndpoint) -> Option<(ExecutorGroupId, u32)> {
+    pub(crate) fn position(&self, endpoint: &MainProcessEndpoint) -> Option<(ExecutorGroupId, u32)> {
         self.positions
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -57,8 +57,8 @@ impl IncarnationRegistry {
 mod tests {
     use super::*;
 
-    fn endpoint(incarnation: &str) -> WorkerEndpoint {
-        WorkerEndpoint {
+    fn endpoint(incarnation: &str) -> MainProcessEndpoint {
+        MainProcessEndpoint {
             host: "host".to_owned(),
             address_space: format!("{incarnation}-process"),
             incarnation: incarnation.to_owned(),

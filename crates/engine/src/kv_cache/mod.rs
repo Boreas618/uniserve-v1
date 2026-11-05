@@ -33,7 +33,7 @@
 //!   any later reader needs.
 //! - Prefix identity: a published page is keyed by a chained 64-bit hash per
 //!   group, but a match also requires equal tokens, the same group and the
-//!   same loaded `WorkerEndpoint`. The token comparison guards against hash
+//!   same loaded `MainProcessEndpoint`. The token comparison guards against hash
 //!   collisions, and the endpoint comparison confines reuse to the loaded
 //!   executor incarnation that computed and retains the page.
 //! - Reuse: each group's attention type has a manager ([`manager`]) that
@@ -63,7 +63,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use ipc::WorkerEndpoint;
+use ipc::MainProcessEndpoint;
 use ipc::{CacheGroup, UnitId};
 
 use crate::lock;
@@ -165,7 +165,7 @@ struct PublishedPage {
     /// Exact token content used to disambiguate equal prefix hashes.
     tokens: Vec<u32>,
     /// Loaded Executor whose rank group retains the page.
-    source: Arc<WorkerEndpoint>,
+    source: Arc<MainProcessEndpoint>,
     /// The same immutable bytes may serve public reuse and several private
     /// continuations. `None` names the public alias; no alias copies units.
     aliases: Vec<Option<proto::request::CacheResume>>,
@@ -184,7 +184,7 @@ struct PublishedPage {
 pub(crate) struct IdlePage {
     pub(crate) page: PageRef,
     pub(crate) group: u32,
-    pub(crate) source: Arc<WorkerEndpoint>,
+    pub(crate) source: Arc<MainProcessEndpoint>,
     pub(crate) host_key: Option<storage::Key>,
 }
 
@@ -396,7 +396,7 @@ impl PoolInner {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<u32> {
         self.hash_to_pages.get(&hash)?.iter().copied().find(|head| {
@@ -754,7 +754,7 @@ impl BlockPool {
         &self,
         pages: &[IndexedPage],
         offset: u32,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> usize {
         let mut inner = lock(&self.inner);
         let mut imported = 0;
@@ -971,7 +971,7 @@ impl BlockPool {
         group: u32,
         hash: u64,
         tokens: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
     ) {
         let mut inner = lock(&self.inner);
@@ -1040,7 +1040,7 @@ impl BlockPool {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<(UnitId, bool)> {
         let inner = lock(&self.inner);
@@ -1060,7 +1060,7 @@ impl BlockPool {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<PageRef> {
         let mut inner = lock(&self.inner);
@@ -1241,7 +1241,7 @@ impl BlockPool {
     /// Referenced units keep their owners and reference counts; only their
     /// prefix identity is removed. Unreferenced units turn from `Cached` into
     /// `Free` without changing the free capacity.
-    pub(crate) fn invalidate_source(&self, source: &WorkerEndpoint) {
+    pub(crate) fn invalidate_source(&self, source: &MainProcessEndpoint) {
         let mut inner = lock(&self.inner);
         let heads = inner
             .pages
@@ -2363,7 +2363,7 @@ impl PrefixCacheCoordinator {
         pool: &BlockPool,
         prompt: &[u32],
         hashes: &[Vec<u64>],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         scope: PrefixScope,
         public: bool,
     ) -> PrefixSelection {
@@ -2542,7 +2542,7 @@ impl PrefixCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         scope: PrefixScope,
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
     ) -> PrefixHit {
         // Public keys cover tokens only. A private continuation reuses its
         // own held state even when shared caching is disabled or the prompt
@@ -2610,7 +2610,7 @@ impl PrefixCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         scope: PrefixScope,
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
     ) -> Option<PrefixLookup> {
         if !self.matches(allocation)
             || allocation
@@ -2779,7 +2779,7 @@ impl PrefixCacheCoordinator {
         computed: usize,
         scope: PrefixScope,
         public: bool,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) {
         if (!public && scope.resume.is_none()) || !self.matches(allocation) {
             return;
@@ -2845,7 +2845,7 @@ impl PrefixCacheCoordinator {
         draft_tokens: usize,
         published: &mut Vec<usize>,
         cache_write: bool,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
     ) -> bool {
         let public = self.prefix_enabled && cache_write;
@@ -2951,8 +2951,8 @@ impl<'a> CachedTokens<'a> {
 mod tests {
     use super::*;
 
-    fn endpoint() -> Arc<WorkerEndpoint> {
-        Arc::new(ipc::WorkerInfo::default().endpoint)
+    fn endpoint() -> Arc<MainProcessEndpoint> {
+        Arc::new(ipc::MainProcessInfo::default().endpoint)
     }
 
     #[test]
@@ -3350,7 +3350,7 @@ mod tests {
         coordinator: &PrefixCacheCoordinator,
         pool: &BlockPool,
         prompt: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> CacheAllocation {
         let mut allocation = coordinator.empty();
         let lookup = coordinator
@@ -3391,7 +3391,7 @@ mod tests {
         prompt: &[u32],
         group: usize,
         pages: &[usize],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> Vec<PageRef> {
         let shape = coordinator.groups()[group];
         let hashes = coordinator.prefix_hashes(prompt, PrefixScope::default());
@@ -4231,7 +4231,7 @@ mod tests {
     fn pages_past_a_filler(
         coordinator: &PrefixCacheCoordinator,
         prompt: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> BlockPool {
         let pool = BlockPool::new(16, 0);
         let filler = pool.allocate(7, 1).unwrap();
@@ -4332,7 +4332,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
-        let second = Arc::new(WorkerEndpoint {
+        let second = Arc::new(MainProcessEndpoint {
             incarnation: "replica-loaded".into(),
             ..first.as_ref().clone()
         });
@@ -4346,7 +4346,7 @@ mod tests {
             );
             allocation
         });
-        let replacement = WorkerEndpoint {
+        let replacement = MainProcessEndpoint {
             incarnation: "reloaded".into(),
             ..first.as_ref().clone()
         };

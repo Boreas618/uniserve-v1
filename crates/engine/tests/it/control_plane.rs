@@ -16,7 +16,7 @@
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The cache block size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//! - The cache block size is 64 tokens, one unit per page (`MainProcessInfo::default`),
 //!   unless a test calls `SimEngine::set_block_size` or `set_groups`, and
 //!   generated images default to 512x512 (`ImageParams::default`).
 //! - The `general` request gauges and the `prefix_cache` and `encoder` counters in
@@ -830,7 +830,7 @@ fn image_events_cover_declared_denoise_steps() {
 }
 
 #[test]
-fn scheduler_clamps_max_batch_to_worker_info() {
+fn scheduler_clamps_max_batch_to_main_process_info() {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().max_batch_calls = 3;
     let sched = support::scheduler(Box::new(SimExecutor::new(sim)), special_tokens(), 32).unwrap();

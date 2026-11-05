@@ -21,7 +21,7 @@ use ipc::{ForwardMode, MediaCall};
 /// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: crate::GenerationLimits,
-    info: &WorkerInfo,
+    info: &MainProcessInfo,
 ) -> crate::GenerationLimits {
     let supports = |kind| info.supported_calls.contains(&kind);
     let mut available = crate::GenerationFeatures::empty();
@@ -77,10 +77,10 @@ pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 2;
 /// A cache runtime with denoising keeps a row for a running request's
 /// text-unconditional guidance prefix, and another for its
 /// image-unconditional prefix when the worker states one for its model
-/// (`WorkerInfo::image_unconditional_token_ids`): each prefix
+/// (`MainProcessInfo::image_unconditional_token_ids`): each prefix
 /// (`Scheduler::ensure_guidance_prefix`) allocates its own row from the same
 /// request pool. Other runtimes keep none.
-pub(crate) fn guidance_prefix_rows(info: &WorkerInfo) -> usize {
+pub(crate) fn guidance_prefix_rows(info: &MainProcessInfo) -> usize {
     let denoises = info.uses_cache()
         && info
             .supported_calls
@@ -212,7 +212,7 @@ impl Scheduler {
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = PrefixCacheManager::from_worker_info(&info);
+        let cache = PrefixCacheManager::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
             cache.as_ref().map_or(0, PrefixCacheManager::usable_units),
@@ -664,7 +664,7 @@ impl Scheduler {
     }
 
     /// Returns the executor's aggregate worker capabilities.
-    pub fn info(&self) -> &WorkerInfo {
+    pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 

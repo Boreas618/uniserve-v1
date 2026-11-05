@@ -14,7 +14,7 @@ use executor::batch::{
     SubmissionId,
 };
 use executor::completion::Outcome;
-use ipc::{ComponentConfig, TimingCounters, WorkerEndpoint, WorkerInfo};
+use ipc::{ComponentConfig, TimingCounters, MainProcessEndpoint, MainProcessInfo};
 
 /// The token this pool samples for the `index`th call of every batch.
 pub(crate) const SAMPLED: u32 = 1000;
@@ -142,9 +142,9 @@ impl Batches for Serving {
 
 /// One rank of a text pool: prefill and decode, eight request rows, a prefix
 /// cache, and the batch bounds a launch states.
-pub(crate) fn rank(host: &str) -> WorkerInfo {
-    WorkerInfo {
-        endpoint: WorkerEndpoint {
+pub(crate) fn rank(host: &str) -> MainProcessInfo {
+    MainProcessInfo {
+        endpoint: MainProcessEndpoint {
             host: host.to_owned(),
             address_space: format!("{host}-space"),
             incarnation: format!("{host}-rank"),
@@ -156,14 +156,14 @@ pub(crate) fn rank(host: &str) -> WorkerInfo {
         request_slots: 8,
         max_batch_calls: 16,
         max_batch_tokens: 512,
-        // No `prefix_cache` here on purpose: `WorkerInfo::default` states the
+        // No `prefix_cache` here on purpose: `MainProcessInfo::default` states the
         // paged KV pool every token-serving rank advertises, and setting it to
         // `None` makes the engine refuse every generation request with
         // "generation request requires executor KV resources"
         // (`scheduler/admission.rs`). A media-only rank is the one that states
         // none, and that is not this pool.
         buffer_pool_bytes: 1 << 20,
-        ..WorkerInfo::default()
+        ..MainProcessInfo::default()
     }
 }
 

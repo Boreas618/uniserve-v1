@@ -63,9 +63,9 @@ impl Placement {
     pub(super) fn worker_candidates<'a>(
         &'a self,
         world: &'a dyn super::submission::World,
-        info: &'a WorkerInfo,
+        info: &'a MainProcessInfo,
         kind: CallKind,
-    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -88,7 +88,7 @@ impl Placement {
         world: &'a dyn super::submission::World,
         kind: CallKind,
         component: &'a str,
-    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)> {
         world.info().workers.iter().filter_map(move |(id, info)| {
             if !info.supported_calls.contains(&kind) {
                 return None;
@@ -206,7 +206,7 @@ impl Placement {
     pub(super) fn worker_target<'a>(
         &'a self,
         world: &'a dyn super::submission::World,
-        info: &'a WorkerInfo,
+        info: &'a MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
         choice: &Choice,
@@ -230,7 +230,7 @@ impl Placement {
     pub(super) fn place(
         &mut self,
         world: &dyn super::submission::World,
-        info: &WorkerInfo,
+        info: &MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
     ) -> Option<crate::ExecutorGroupId> {
@@ -253,7 +253,7 @@ impl Placement {
     pub(super) fn select_worker(
         &mut self,
         world: &dyn super::submission::World,
-        info: &WorkerInfo,
+        info: &MainProcessInfo,
         call: &Call,
         choice: &Choice,
     ) -> Option<(crate::ExecutorGroupId, String)> {

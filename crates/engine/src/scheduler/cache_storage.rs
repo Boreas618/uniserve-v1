@@ -812,7 +812,7 @@ impl Scheduler {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return 0;
         };
-        let workers: Vec<(ExecutorGroupId, ipc::WorkerEndpoint)> = self
+        let workers: Vec<(ExecutorGroupId, ipc::MainProcessEndpoint)> = self
             .executor
             .info()
             .workers

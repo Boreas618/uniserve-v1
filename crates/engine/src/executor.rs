@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo};
+use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, MainProcessInfo};
 
 mod batch;
 pub(crate) mod inventory;
@@ -56,7 +56,7 @@ pub struct PoolPlacement {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
-    pub workers: Vec<(ExecutorGroupId, WorkerInfo)>,
+    pub workers: Vec<(ExecutorGroupId, MainProcessInfo)>,
     /// The longest sequence the model was built for: the attention
     /// descriptor's static bound on the keys one row reads, from the launch
     /// arguments every group was started with. Zero when not stated.
@@ -95,7 +95,7 @@ pub struct ExecutorInfo {
     pub rank_caches: BTreeMap<ExecutorGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
     /// For each pool, each rank's host latent pool as the rank reported it,
     /// and the rank's host, in rank order: the video denoising ranks report
-    /// one, every other rank none (`ipc::WorkerInfo::latent_pool`).
+    /// one, every other rank none (`ipc::MainProcessInfo::latent_pool`).
     ///
     /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no preempted trajectory, and a
@@ -104,7 +104,7 @@ pub struct ExecutorInfo {
     /// For each pool, each rank's host encoder pool as the rank reported it,
     /// and the rank's host, in rank order: the ranks that execute video
     /// encoder calls report one, every other rank none
-    /// (`ipc::WorkerInfo::encoder_pool`).
+    /// (`ipc::MainProcessInfo::encoder_pool`).
     ///
     /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no encoder output, and a simulated
@@ -122,7 +122,7 @@ impl ExecutorInfo {
     /// Each rank validated the report it built, so the records are taken as
     /// they are. Fails when `pools` is empty, repeats a pool id, or holds
     /// replicas of one component that expose different numerical outputs.
-    pub fn from_workers(pools: Vec<(ExecutorGroupId, WorkerInfo)>) -> anyhow::Result<Self> {
+    pub fn from_workers(pools: Vec<(ExecutorGroupId, MainProcessInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
             "executor info must contain at least one pool"
@@ -285,8 +285,8 @@ impl ExecutorInfo {
     /// video reports no video denoiser, when pools describe the denoiser
     /// differently, when cache pools disagree on cache layout or a routed cache pool
     /// has no cache, when summed capacities overflow `u32`, or when the merged
-    /// record fails `WorkerInfo::validate`.
-    pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
+    /// record fails `MainProcessInfo::validate`.
+    pub fn runtime_info(&self) -> anyhow::Result<MainProcessInfo> {
         anyhow::ensure!(
             !self.workers.is_empty(),
             "executor exposes no physical pools"
@@ -512,7 +512,7 @@ impl ExecutorInfo {
 /// A conditioned task reads its media on a host component and encodes its
 /// conditions before denoising, so a deployment serving one must place the
 /// media reader and both condition encoders as well as the generation calls.
-fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
+fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     let Some(denoiser) = info.video_denoiser.as_ref() else {
         return Ok(());
     };
@@ -1165,7 +1165,7 @@ impl TransferConfig {
         incarnations: &crate::executors::IncarnationRegistry,
         products: &mut [ipc::TensorExport],
         cache_inputs: &mut [ipc::CacheTransfer],
-        destination: &ipc::WorkerEndpoint,
+        destination: &ipc::MainProcessEndpoint,
     ) -> Result<(), UnroutableInputs> {
         let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
@@ -1206,7 +1206,7 @@ impl TransferConfig {
         &self,
         incarnations: &crate::executors::IncarnationRegistry,
         tensor: &mut ipc::TensorTransfer,
-        destination: &ipc::WorkerEndpoint,
+        destination: &ipc::MainProcessEndpoint,
         destination_position: Option<&(ExecutorGroupId, u32)>,
     ) -> bool {
         use ipc::TransferTransport;
@@ -1420,7 +1420,7 @@ pub struct ExecuteError {
     /// Execution phase in which the failure occurred, when known.
     pub phase: Option<String>,
     /// Call kind of the failed batch or numerical call, when the failure
-    /// belongs to a batch with calls (see `WorkerResponseError::route`).
+    /// belongs to a batch with calls (see `MainProcessResponseError::route`).
     pub route: Option<String>,
     /// Calls affected by the executor failure.
     pub calls: Vec<ipc::ErrorCallIdentity>,
@@ -1461,7 +1461,7 @@ pub struct ExecutorFailure {
     /// Executor group reporting the failure.
     pub worker_id: ExecutorGroupId,
     /// Invalidated incarnations; empty when the group retains its allocations.
-    pub endpoints: Vec<ipc::WorkerEndpoint>,
+    pub endpoints: Vec<ipc::MainProcessEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
     /// The requests among `requests` that an executor refused, each with the
@@ -1612,9 +1612,9 @@ mod tests {
 
     /// An executor serving `routes`; the one that denoises describes the
     /// deployment's fixed schedule.
-    fn media_info(routes: &[(MediaCall, &str)]) -> WorkerInfo {
+    fn media_info(routes: &[(MediaCall, &str)]) -> MainProcessInfo {
         let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
-        WorkerInfo {
+        MainProcessInfo {
             media_components: routes
                 .iter()
                 .map(|(call, component)| (*call, (*component).to_owned()))
@@ -1631,7 +1631,7 @@ mod tests {
                 denoise_steps: 4,
                 description: b"{}".to_vec(),
             }),
-            ..WorkerInfo::default()
+            ..MainProcessInfo::default()
         }
     }
 
@@ -1639,7 +1639,7 @@ mod tests {
         id: &str,
         routes: &[(MediaCall, &str)],
         request_slots: u32,
-    ) -> (ExecutorGroupId, WorkerInfo) {
+    ) -> (ExecutorGroupId, MainProcessInfo) {
         let mut info = media_info(routes);
         info.request_slots = request_slots;
         info.components = routes
@@ -1655,7 +1655,7 @@ mod tests {
         (ExecutorGroupId(id.to_owned()), info)
     }
 
-    fn media_replica(id: &str, request_slots: u32) -> (ExecutorGroupId, WorkerInfo) {
+    fn media_replica(id: &str, request_slots: u32) -> (ExecutorGroupId, MainProcessInfo) {
         media_pool(
             id,
             &[
@@ -1777,7 +1777,7 @@ mod tests {
             )
         };
         let round_units =
-            |pools: Vec<((ExecutorGroupId, WorkerInfo), (ExecutorGroupId, PoolPlacement))>| {
+            |pools: Vec<((ExecutorGroupId, MainProcessInfo), (ExecutorGroupId, PoolPlacement))>| {
                 let (workers, placements) = pools.into_iter().unzip();
                 ExecutorInfo {
                     workers,
@@ -1998,7 +1998,7 @@ mod tests {
     fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
         use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
         };
 
         // A device product that did not fit its producer's pool is published
@@ -2072,7 +2072,7 @@ mod tests {
     fn a_replaced_worker_incarnation_no_longer_binds_to_its_edge() {
         use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
         };
 
         // Rank 1 of the denoiser sends to the decoder over shared storage,

@@ -299,7 +299,7 @@ impl Dispatcher {
             .iter()
             .map(|(id, worker)| {
                 let bytes = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| info.buffer_pool_bytes)
                     .collect();
                 (id.clone(), bytes)
@@ -310,7 +310,7 @@ impl Dispatcher {
             .iter()
             .map(|(id, worker)| {
                 let caches = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| (info.endpoint.host.clone(), info.prefix_cache.clone()))
                     .collect();
                 (id.clone(), caches)
@@ -321,7 +321,7 @@ impl Dispatcher {
             .iter()
             .map(|(id, worker)| {
                 let pools = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| {
                         (
                             info.endpoint.host.clone(),
@@ -338,7 +338,7 @@ impl Dispatcher {
             .iter()
             .map(|(id, worker)| {
                 let pools = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| (info.endpoint.host.clone(), info.encoder_pool.clone()))
                     .collect();
                 (id.clone(), pools)
@@ -402,7 +402,7 @@ impl Dispatcher {
                 (edge.destination_rank, destination),
             ] {
                 anyhow::ensure!(
-                    rank.is_none_or(|rank| worker.worker_info(rank as usize).is_some()),
+                    rank.is_none_or(|rank| worker.main_process_info(rank as usize).is_some()),
                     "transfer edge names an unbound rank"
                 );
             }
@@ -411,7 +411,7 @@ impl Dispatcher {
                     continue;
                 }
                 let source_on_cuda = source.rank_on_cuda(source_rank as usize);
-                let source = source.worker_info(source_rank as usize).with_context(|| {
+                let source = source.main_process_info(source_rank as usize).with_context(|| {
                     format!("transfer edge source has no rank {source_rank} in its world")
                 })?;
                 for destination_rank in 0..destination.world_size() as u32 {
@@ -423,7 +423,7 @@ impl Dispatcher {
                     }
                     let destination_on_cuda = destination.rank_on_cuda(destination_rank as usize);
                     let destination = destination
-                        .worker_info(destination_rank as usize)
+                        .main_process_info(destination_rank as usize)
                         .with_context(|| {
                             format!(
                                 "transfer edge destination has no rank {destination_rank} in its world"
@@ -818,7 +818,7 @@ impl Dispatcher {
                 .map(|route| held(route.worker_index))
                 .unwrap_or_default();
             let ranks = (0..)
-                .map_while(|rank| self.workers[worker_index].1.worker_info(rank))
+                .map_while(|rank| self.workers[worker_index].1.main_process_info(rank))
                 .count();
             let spans = dependency_spans(held(worker_index), produced, ranks as u32);
             anyhow::ensure!(

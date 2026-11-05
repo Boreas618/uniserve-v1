@@ -25,7 +25,7 @@ use executor::batch::{
 };
 use executor::completion::Outcome;
 use ipc::{
-    ComponentConfig, ImageParams, SamplingParams, TimingCounters, WorkerEndpoint, WorkerInfo,
+    ComponentConfig, ImageParams, SamplingParams, TimingCounters, MainProcessEndpoint, MainProcessInfo,
 };
 
 /// How long a command answer may take.
@@ -53,9 +53,9 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
 
 /// One rank of a text pool: prefill and decode, eight request rows, and the
 /// batch bounds the launch stated.
-fn rank(host: &str) -> WorkerInfo {
-    WorkerInfo {
-        endpoint: WorkerEndpoint {
+fn rank(host: &str) -> MainProcessInfo {
+    MainProcessInfo {
+        endpoint: MainProcessEndpoint {
             host: host.to_owned(),
             address_space: format!("{host}-space"),
             incarnation: format!("{host}-rank"),
@@ -68,11 +68,11 @@ fn rank(host: &str) -> WorkerInfo {
         max_batch_calls: 16,
         max_batch_tokens: 512,
         // A text pool serves token generation, so it advertises the paged KV
-        // pool every such executor has (`WorkerInfo::default`): an executor with no
+        // pool every such executor has (`MainProcessInfo::default`): an executor with no
         // prefix cache is refused a token request at submission, which is the
         // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,
-        ..WorkerInfo::default()
+        ..MainProcessInfo::default()
     }
 }
 

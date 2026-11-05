@@ -267,7 +267,7 @@ impl ExecutorGroup {
     /// Each rank's description as a rank that replaces it must report it
     /// (`validate_replacement_info`): its startup report, with what the
     /// group's planes hold now ([`holding`]).
-    pub(super) fn replacement_infos(&self) -> Vec<ipc::WorkerInfo> {
+    pub(super) fn replacement_infos(&self) -> Vec<ipc::MainProcessInfo> {
         let planes = self.info.prefix_cache.as_ref();
         self.workers
             .iter()

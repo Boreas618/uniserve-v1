@@ -1015,7 +1015,7 @@ impl Scheduler {
 
     /// Why the image denoiser cannot denoise `req`'s images, if so: under
     /// CUDA graphs it denoises only the steps it captured
-    /// (`WorkerInfo::captured_images`), and a request's steps evaluate one
+    /// (`MainProcessInfo::captured_images`), and a request's steps evaluate one
     /// guidance branch up to its own branch count.
     fn uncaptured_image(&self, req: &GenerationRequest) -> Option<String> {
         let captured = self.info.captured_images.as_ref()?;
@@ -1055,7 +1055,7 @@ impl Scheduler {
     /// Why the image denoiser's step cannot hold `req`'s images, if so: a
     /// step evaluates one framed latent sequence (the image's latent rows
     /// and its `commit_marker_tokens`) per guidance branch, within the rows
-    /// and tokens the workers' step serves (`WorkerInfo::image_capacity`).
+    /// and tokens the workers' step serves (`MainProcessInfo::image_capacity`).
     fn exceeded_image_step(&self, req: &GenerationRequest) -> Option<String> {
         let capacity = self.info.image_capacity.as_ref()?;
         if !req.generates_images() || capacity.max_step_tokens == 0 {
@@ -1086,7 +1086,7 @@ impl Scheduler {
 
     /// Why the latent encoder cannot encode one of `req`'s input images, if
     /// so: under CUDA graphs it encodes only the image sizes it captured
-    /// (`WorkerInfo::captured_latents`), and a latent block states the size
+    /// (`MainProcessInfo::captured_latents`), and a latent block states the size
     /// its image resizes to.
     fn uncaptured_latent(&self, req: &GenerationRequest) -> Option<String> {
         let captured = self.info.captured_latents.as_ref()?;
@@ -1879,7 +1879,7 @@ impl Scheduler {
 /// Resources a token request holds from the moment admission commits it.
 pub(super) struct AdmissionReservation {
     /// The prefill worker's endpoint, which keys its prefix-cache residency.
-    source: ipc::WorkerEndpoint,
+    source: ipc::MainProcessEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
 }
@@ -1955,7 +1955,7 @@ fn acquire_cached_prefix(
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
-    source: &ipc::WorkerEndpoint,
+    source: &ipc::MainProcessEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images() || state.rebuilds_images();

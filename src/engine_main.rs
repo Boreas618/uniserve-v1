@@ -6645,7 +6645,7 @@ fn schedulers(
     memory: &Memory,
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
-    rank: &ipc::WorkerInfo,
+    rank: &ipc::MainProcessInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());

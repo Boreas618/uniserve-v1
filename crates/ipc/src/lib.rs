@@ -1,11 +1,11 @@
 //! Scheduler-to-worker protocol and its rank transports.
 //!
 //! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
-//! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
+//! [`BatchOutput`] returns completions and products. [`MainProcessInfo`] describes a
 //! loaded worker before execution begins. Numeric request, call, point,
 //! and generation identities remain stable across serialization.
 //!
-//! [`WorkerRequest`] and [`WorkerResponse`] are the envelopes exchanged per
+//! [`MainProcessRequest`] and [`MainProcessResponse`] are the envelopes exchanged per
 //! rank, each as the one message of a [`Frame`]: a length followed by the
 //! message in the binary encoding its `serde` derive describes. These message
 //! types are the only definition of the protocol, so the engine and the worker

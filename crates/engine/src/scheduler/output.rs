@@ -2070,7 +2070,7 @@ fn offloads(
     allocation: &CacheAllocation,
     published: PublishedPages<'_>,
     boundaries: std::ops::Range<usize>,
-    source: &Arc<ipc::WorkerEndpoint>,
+    source: &Arc<ipc::MainProcessEndpoint>,
 ) -> Vec<(usize, Vec<storage::Key>, Vec<PageRef>, OffloadKind)> {
     let managers = kv_offload.managers(worker);
     let hit = kv_offload.hit_pages(request);

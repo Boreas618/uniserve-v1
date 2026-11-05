@@ -32,7 +32,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ipc::philox;
 use ipc::{
     BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, NewRequest,
-    SamplingState, TensorRef, TimingCounters, WorkerInfo,
+    SamplingState, TensorRef, TimingCounters, MainProcessInfo,
 };
 use ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
 
@@ -1149,7 +1149,7 @@ impl SimSpeculation {
 }
 
 pub struct SimEngine {
-    info: WorkerInfo,
+    info: MainProcessInfo,
     /// What the simulated pool is launched with: its queue depth and its
     /// components' placement, which `SimExecutor` states to the scheduler as
     /// the engine's own launch, as `Dispatcher` does.
@@ -1326,10 +1326,10 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         // Unset fields, including the prefix cache, come from
-        // `WorkerInfo::default`. One latent page is the reserved sentinel
+        // `MainProcessInfo::default`. One latent page is the reserved sentinel
         // page that `latent_capacity_units` excludes. The pool is launched
         // with a queue depth of one and no placed components.
-        let info = WorkerInfo {
+        let info = MainProcessInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
             latent_pages: 1_025,
@@ -1341,7 +1341,7 @@ impl SimEngine {
             // One batch in flight (`queue_depth` 1) of up to
             // `max_batch_calls` calls, each holding one transfer entry.
             transfer_tickets: 1024,
-            ..WorkerInfo::default()
+            ..MainProcessInfo::default()
         };
         Self {
             info,
@@ -2199,7 +2199,7 @@ impl SimEngine {
     }
 
     /// Returns mutable access to the simulator's advertised capabilities.
-    pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
+    pub fn mut_info_for_test(&mut self) -> &mut MainProcessInfo {
         &mut self.info
     }
 
@@ -2450,7 +2450,7 @@ impl Default for SimEngine {
 
 impl SimEngine {
     /// Returns the executor metadata.
-    fn info(&self) -> &WorkerInfo {
+    fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 

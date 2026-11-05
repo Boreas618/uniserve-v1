@@ -13,7 +13,7 @@
 //! logged while serving continues — a device that cannot run these shapes fails
 //! the first client request that needs them, in the open. The scheduler and its allocators form every batch
 //! as they form a client's; a rank states only the shapes
-//! (`WorkerInfo::image_warmups`, `diffusion_lm_step_rows`) and takes no part
+//! (`MainProcessInfo::image_warmups`, `diffusion_lm_step_rows`) and takes no part
 //! in forming them. The ranks warmed their kernels and captured their graphs
 //! before they reported; these requests warm the serving path around them.
 //!
@@ -66,7 +66,7 @@ const IMAGE_STEPS: u16 = 2;
 /// rank without holding the handle the engine serves with.
 pub(crate) struct Warm {
     /// The rank's reported capabilities, which state the shapes to warm.
-    pub(crate) info: ipc::WorkerInfo,
+    pub(crate) info: ipc::MainProcessInfo,
     /// The generation limits its requests are admitted under.
     pub(crate) generation_limits: crate::GenerationLimits,
     /// The scheduler's request ids, shared with the handle that owns them.
@@ -81,7 +81,7 @@ pub(crate) struct Warm {
 
 impl Warm {
     /// The rank's reported capabilities.
-    fn info(&self) -> &ipc::WorkerInfo {
+    fn info(&self) -> &ipc::MainProcessInfo {
         &self.info
     }
 
@@ -171,7 +171,7 @@ pub(crate) struct Group {
 /// could not reach is left out here as well.
 pub(crate) fn groups(
     config: &EngineConfig,
-    info: &ipc::WorkerInfo,
+    info: &ipc::MainProcessInfo,
     limits: &crate::GenerationLimits,
     mut next_id: impl FnMut() -> ipc::RequestId,
 ) -> anyhow::Result<Vec<Group>> {

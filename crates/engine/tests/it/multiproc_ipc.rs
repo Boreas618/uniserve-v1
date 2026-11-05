@@ -1729,7 +1729,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 fn media_worker() -> anyhow::Result<()> {
     use ipc::{
         ArtifactHandle, BatchOutput, CallOutput, Channel, LaunchDescriptor, MediaOutput,
-        Registration, WorkerRequest, WorkerResponse,
+        Registration, MainProcessRequest, MainProcessResponse,
     };
 
     let Ok(arguments) = std::env::var(MEDIA_WORKER_ARGS) else {
@@ -1760,7 +1760,7 @@ fn media_worker() -> anyhow::Result<()> {
         server.wait(Duration::from_secs(60))?;
     };
     let case = std::env::var(MEDIA_WORKER_CASE)?;
-    let mut info: ipc::WorkerInfo =
+    let mut info: ipc::MainProcessInfo =
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_WORKER_INFO)?)?)?;
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
@@ -1787,22 +1787,22 @@ fn media_worker() -> anyhow::Result<()> {
     };
     loop {
         let request = loop {
-            if let Some(request) = server.try_recv::<WorkerRequest>()? {
+            if let Some(request) = server.try_recv::<MainProcessRequest>()? {
                 break request;
             }
             server.wait(Duration::from_secs(1))?;
         };
         let response = match request {
-            WorkerRequest::Info { message_id } => WorkerResponse::Info {
+            MainProcessRequest::Info { message_id } => MainProcessResponse::Info {
                 message_id,
                 info: info.clone(),
             },
-            WorkerRequest::Close { message_id } => {
-                server.send(&WorkerResponse::Ok { message_id })?;
+            MainProcessRequest::Close { message_id } => {
+                server.send(&MainProcessResponse::Ok { message_id })?;
                 return Ok(());
             }
-            WorkerRequest::Promote { message_id } => WorkerResponse::Ok { message_id },
-            WorkerRequest::Hook {
+            MainProcessRequest::Promote { message_id } => MainProcessResponse::Ok { message_id },
+            MainProcessRequest::Hook {
                 message_id,
                 name,
                 payload,
@@ -1816,14 +1816,14 @@ fn media_worker() -> anyhow::Result<()> {
                     .as_mut()
                     .context("the template reports no KV cache")?;
                 cache.held_segments = cache.held_segments.min(u32::try_from(from)?);
-                WorkerResponse::Hooked {
+                MainProcessResponse::Hooked {
                     message_id,
                     result: serde_json::json!({ "held": cache.held_segments }).to_string(),
                 }
             }
-            WorkerRequest::Hook { message_id, .. } => WorkerResponse::Error {
+            MainProcessRequest::Hook { message_id, .. } => MainProcessResponse::Error {
                 message_id,
-                error: ipc::WorkerResponseError {
+                error: ipc::MainProcessResponseError {
                     message: "this worker runs no hooks".into(),
                     code: None,
                     fatal: false,
@@ -1832,7 +1832,7 @@ fn media_worker() -> anyhow::Result<()> {
                     calls: Vec::new(),
                 },
             },
-            WorkerRequest::Submit { message_id, batch } => {
+            MainProcessRequest::Submit { message_id, batch } => {
                 let mut completions: Vec<CallOutput> = batch
                     .calls
                     .iter()
@@ -1873,7 +1873,7 @@ fn media_worker() -> anyhow::Result<()> {
                         completion.call_id.request_index = 1000;
                     }
                 }
-                WorkerResponse::Result {
+                MainProcessResponse::Result {
                     message_id,
                     result: BatchOutput {
                         batch_id: batch.batch_id,
