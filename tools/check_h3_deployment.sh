@@ -81,6 +81,58 @@ python3 "$ladder" || fail "the file serves a clip the rule refuses, or the defau
 #    element - it prints every axis in its header and binds one - so the
 #    deployment's offered points are walked one at a time and the unions taken.
 echo
+echo "== every (canvas, clip) the file states, one point at a time"
+# A file whose header states six canvases and four clips is the rows of all
+# twenty-four points, and a walk reaches one point's rows: a file cut at a single
+# point is walk-equal there and short everywhere else - a shape that has looked
+# right once.
+points=$(python3 - "$fixture" <<'PYHDR'
+import re, sys
+
+# Both fixtures state their axes in the header, in two wordings: the walk's own
+# ("raster sizes: [(h, w), ...]" with "clip lengths: [...]") and the deployment
+# file's ("axes: 6 canvases (hxw, ...) and the clip ladder [...]"). Read either.
+header = " ".join(l for l in open(sys.argv[1]) if l.startswith("#"))
+rasters = re.search(r"raster sizes: \[(.*?)\]", header)
+if rasters:
+    canvases = [f"{h}x{w}" for h, w in re.findall(r"\((\d+), (\d+)\)", rasters.group(1))]
+else:
+    canvases = re.findall(r"\b(\d+x\d+)\b", re.search(r"canvases \((.*?)\)", header).group(1))
+clips = re.search(r"clip lengths: \[(.*?)\]", header) or re.search(r"clip ladder \[(.*?)\]", header)
+print(" ".join(f"{c}:{k}" for k in clips.group(1).split(", ") for c in canvases))
+PYHDR
+)
+unbuildable=""
+for point in $points; do
+    p_canvas=${point%%:*}
+    p_clip=${point##*:}
+    cargo run -q -p minimax-h3 --example programs -- "$root" \
+        --samples "$p_clip" --track "$(python3 -c "print(round($p_clip * 40 / 24) * 800)")" \
+        --tokens 4096 --elements 123456 --tp 1 --types "$types" \
+        --rasters "$p_canvas" --task ref2va --conditioned true \
+        >"$scratch/point.txt" 2>/dev/null || true
+    answer=$(python3 "$gaps" --by-shape --fixture "$fixture" --walk "$scratch/point.txt" | tail -1)
+    # A point passes on one of the tool's two closing sentences: nothing to
+    # explain, or every absence explained as the walk's own sample row (a
+    # request's number, not a deployment's). Anything else is a shape the file
+    # cannot build, and the reading is kept so the failure names the shape.
+    case "$answer" in
+    *"every shape any walk produced is in the fixture"*) ;;
+    *"0 raster-class, 1 the walk's own sample"*) ;;
+    *)
+        unbuildable="$unbuildable $point"
+        [ -f "$scratch/point-reading.txt" ] || echo "$answer" >"$scratch/point-reading.txt"
+        ;;
+    esac
+done
+if [ -n "$unbuildable" ]; then
+    echo "   the file cannot build every shape these points launch:$unbuildable"
+    [ -f "$scratch/point-reading.txt" ] && sed 's/^/     /' "$scratch/point-reading.txt"
+    fail "the file is the rows of some points and not of the ones its header states"
+fi
+echo "   $(echo "$points" | wc -w) point(s) walked singly, each one buildable from the file"
+
+echo
 echo "== four walks: one per task, and a sparse one"
 run() {
     name=$1
@@ -118,7 +170,8 @@ for walk in t2va fl2va ref2va sparse; do
     # raster-class absence, or one no raster explains, is a real gap.
     # The reading ends "... 0 at any raster (...), 0 raster-class, 1 the walk's own
     # sample": the sample row is a request's number, and any other absence is a gap.
-    case $answer in
+    case "$answer" in
+    *"every shape any walk produced is in the fixture"*) ;;
     *"0 raster-class, 1 the walk's own sample") ;;
     *) fail "the $walk walk states a shape the file cannot build at any element type" ;;
     esac
@@ -145,13 +198,16 @@ for clip in 124 192 243 362; do
     done
 done
 echo "   24 points, $(cut -f1,2 "$scratch/union.txt" | sort -u | wc -l) rows bound"
-python3 "$gaps" --walk "$scratch/union.txt" --fixture "$fixture" \
-    | grep -E '^(  MISSING|[0-9]+ key)' || true
-# A row keyed by the walk's own `--elements` is the walk's sample, not a deployment row:
-# the same rule `--by-shape` applies to the sample count.
-if python3 "$gaps" --walk "$scratch/union.txt" --fixture "$fixture" \
-    | grep 'MISSING from the fixture' | grep -qv 'columns_123456'; then
+# A row keyed by the walk's own `--elements` is the walk's sample, not a deployment row: the
+# same rule `--by-shape` applies to the sample count. It is printed and excluded, so a reader
+# does not have to know the rule to read the line below it.
+python3 "$gaps" --walk "$scratch/union.txt" --fixture "$fixture" >"$scratch/union-reading.txt" 2>&1 || true
+grep -E '^(  MISSING|[0-9]+ key)' "$scratch/union-reading.txt" | sed 's/^/   /' || true
+if grep 'MISSING from the fixture' "$scratch/union-reading.txt" | grep -qv 'columns_123456'; then
     fail "a row the model binds at an offered point is not in the file"
+fi
+if grep -q 'MISSING from the fixture.*columns_123456' "$scratch/union-reading.txt"; then
+    echo "   the one above is the walk's sample row (its own \`--elements\`), a request's number - not a row to add"
 fi
 
 echo
