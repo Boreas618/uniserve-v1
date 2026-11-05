@@ -549,7 +549,6 @@ impl<S: ResponseSink> GenerationRun<S> {
             .map(decode_options)
             .unwrap_or_default();
         let parser = lowering.parser.clone().unwrap_or_default();
-        let mut decode_options = options.clone();
         let kind = handoff::parser::Kind::try_from(parser.kind)
             .unwrap_or(handoff::parser::Kind::ParserKindNone);
         let mut processor = match kind {
