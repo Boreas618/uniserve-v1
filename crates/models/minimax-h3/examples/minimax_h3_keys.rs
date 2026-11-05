@@ -341,11 +341,14 @@ fn main() {
         )
         .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
         let partition = minimax_h3::Partition::single();
-        let Some(dies) = config.denoisers.values().next() else {
-            panic!("the checkpoint states no DiT, so its arrangement is not statable")
-        };
         let arrangement = partition
-            .arrangement(dies)
+            .arrangement(
+                config
+                    .denoisers
+                    .values()
+                    .next()
+                    .expect("the checkpoint states a DiT"),
+            )
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
         match deployment.denoiser_rows(
             &partition,
@@ -466,6 +469,19 @@ fn main() {
     // rungs and its element types - one statement in `programs::Deployment`, which the typed blocks
     // above are being replaced by one component at a time. Emitting it beside them is a no-op today
     // (a row is a set member) and is what makes the replacement checkable: the set must not move.
+    // The partition the deployment states, and the packed bound the rows are cut at. Both are stated
+    // once, outside the VAE loop: `Layouts::rows_bound` derives the bound from the arrangement, and
+    // the header states it because two rows are reachable only at it.
+    let partition = minimax_h3::Partition::single();
+    let Some(dies) = config.denoisers.values().next() else {
+        panic!("the checkpoint states no DiT, so its arrangement is not statable")
+    };
+    let arrangement = partition
+        .arrangement(dies)
+        .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
+    let bound = minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement)
+        .and_then(|rules| rules.rows_bound())
+        .unwrap_or_else(|error| panic!("the deployment's packed bound is not statable: {error}"));
     for vae in VAES {
         let deployment = minimax_h3::programs::Deployment::new(
             config.clone(),
@@ -534,7 +550,7 @@ fn main() {
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines, &config.video_vae, &rasters, &clip_frames);
+    header(&lines, &config.video_vae, &rasters, &clip_frames, bound);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -551,6 +567,7 @@ fn header(
     video_vae: &minimax_h3::config::VideoVaeConfig,
     rasters: &[(u32, u32)],
     clip_frames: &[u32],
+    bound: u32,
 ) {
     let operators = lines
         .iter()
@@ -572,6 +589,14 @@ fn header(
         "# rows are here because a launcher reaches them or because the construction requires them; \
          a row is removed only when the construction contradicts it, never because no walk has \
          produced it yet (`tools/walk_gaps.py --by-shape` reports a walk's shape the file lacks)."
+    );
+    // The packed bound the rows were cut at, because two of them are reachable only at it: the gated
+    // activation's `wide` form is `elements >= u32::MAX`, so a deployment packed below 299 593 rows
+    // needs only the narrow form and one packed at this bound needs both. A reader who compared two
+    // lists cut at different bounds would find a row missing from one and be right about neither.
+    println!(
+        "# bound: packed rows [{bound}], which is the largest layout this deployment reaches; the \
+         rows a class boundary crosses (the gated activation's `wide` form) are stated at it."
     );
     // The rows are a statement over axes, not over one request: a walk at one canvas and one clip
     // binds a strict subset of this file, and a count compared across the two is meaningless unless
