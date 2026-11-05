@@ -1212,7 +1212,7 @@ fn stage_audio(args: &Args) -> Result<()> {
     };
     let planned = decoder.arena_bytes(&layout)?;
     let held = 4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames
-        + 2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples);
+        + 2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * samples;
     let arena_bytes = (planned + held).max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
@@ -1257,10 +1257,7 @@ fn stage_audio(args: &Args) -> Result<()> {
     // The window's own shape: `[samples, 2]`, interleaved, which is what `DecodedMedia.audio` is.
     let out = arena.tensor(
         DType::I16,
-        Shape::new(&[
-            u64::from(samples),
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-        ]),
+        Shape::new(&[samples, u64::from(minimax_h3::audio_vae::PCM_CHANNELS)]),
     )?;
 
     // 6. The decode, with the recorder installed for its duration: the walk is what says which programs
@@ -1321,15 +1318,11 @@ fn stage_audio(args: &Args) -> Result<()> {
     let pcm = download(
         &stream,
         out,
-        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples))
-            .unwrap_or(0),
+        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * samples).unwrap_or(0),
     )?;
     write_h3t(
         &directory.join("pcm.h3t"),
-        &[
-            u64::from(samples),
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-        ],
+        &[samples, u64::from(minimax_h3::audio_vae::PCM_CHANNELS)],
         CONTAINER_I16,
         &pcm,
     )?;

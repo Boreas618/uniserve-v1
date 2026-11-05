@@ -661,16 +661,29 @@ fn main() {
     header(
         &lines,
         &config.video_vae,
-        &rasters,
-        &clip_frames,
-        bound,
-        serving.tensor_parallel,
-        serving.ulysses_degree,
-        commit.as_deref(),
+        &Deployment {
+            rasters: &rasters,
+            clip_frames: &clip_frames,
+            bound,
+            tensor_parallel: serving.tensor_parallel,
+            ulysses_degree: serving.ulysses_degree,
+            commit: commit.as_deref(),
+        },
     );
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
+}
+
+/// The deployment a header describes: the rasters and clip lengths the fixture covers, the packed-token
+/// bound they were cut at, the partition it serves at, and the commit the rows came from.
+struct Deployment<'a> {
+    rasters: &'a [(u32, u32)],
+    clip_frames: &'a [u32],
+    bound: u32,
+    tensor_parallel: usize,
+    ulysses_degree: usize,
+    commit: Option<&'a str>,
 }
 
 /// What the rows below are: which deployment, which checkpoint, and which program produced them.
@@ -682,13 +695,19 @@ fn main() {
 fn header(
     lines: &[(String, String)],
     video_vae: &minimax_h3::config::VideoVaeConfig,
-    rasters: &[(u32, u32)],
-    clip_frames: &[u32],
-    bound: u32,
-    tensor_parallel: usize,
-    ulysses_degree: usize,
-    commit: Option<&str>,
+    deployment: &Deployment<'_>,
 ) {
+    // One destructuring line rather than eight parameters: the body names these values in prose and
+    // in format strings, and the set is what a header is *about* - a deployment's shapes and the
+    // partition it serves at - not eight incidental numbers.
+    let Deployment {
+        rasters,
+        clip_frames,
+        bound,
+        tensor_parallel,
+        ulysses_degree,
+        commit,
+    } = *deployment;
     let operators = lines
         .iter()
         .map(|(operator, _)| operator.as_str())
@@ -866,7 +885,7 @@ fn deployment_bound(
         };
         let mut network = dies.clone();
         if let Some(kind) = &sparse {
-            network.attention = kind.clone();
+            network.attention = *kind;
         }
         let reached = minimax_h3::Partition::serving(config, task, 1, 1, 0, 0)
             .and_then(|partition| partition.arrangement(&network))
