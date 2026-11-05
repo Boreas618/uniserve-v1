@@ -59,6 +59,59 @@ pub(crate) struct PrefillCatalogue {
     pub(crate) stated: bool,
 }
 
+/// The model class a checkpoint declares, and the deployment this build serves it as (4.3, 9).
+///
+/// **One place maps a checkpoint's `architectures` entry to a class.** The class is the checkpoint's
+/// own statement (`config.json`), not the deployment's name for it, and every other site branches on
+/// this value rather than on a string: a second `match` on a model name would be a second statement
+/// of which deployments this build serves, and the two would drift the first time one changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelClass {
+    /// A causal language model: prefill and decode forwards over a paged key/value cache.
+    CausalLm,
+    /// The media pipeline: an encode of a request's conditions, denoising steps of a latent layout,
+    /// and a clip decoded from latents. It keeps no paged key/value cache.
+    Media,
+}
+
+impl ModelClass {
+    /// The class `checkpoint` declares, or the refusal that names what it declares.
+    fn of(checkpoint: &std::path::Path) -> Result<Self> {
+        let declared = architectural_class(checkpoint)?;
+        match declared.as_str() {
+            "Qwen3MoeForCausalLM" => Ok(Self::CausalLm),
+            "MiniMaxH3ModularPipeline" => Ok(Self::Media),
+            other => Err(anyhow::anyhow!(
+                "{} declares model class {other}, which this build cannot serve: it serves \
+                 Qwen3MoeForCausalLM as a causal language model and MiniMaxH3ModularPipeline as the \
+                 media pipeline",
+                checkpoint.display()
+            )),
+        }
+    }
+}
+
+/// What a rank of a class holds, once its model is loaded and its resident memory opened.
+///
+/// The class was resolved at the same moment, so the value carries both: a caller that has a
+/// [`Served`] cannot ask it for a figure of the other class, which a bare `Arc<…>` would allow.
+pub(crate) enum Served {
+    /// The causal language model, one `Arc` per rank: every device's runner reads the same weights.
+    Text(Arc<qwen3_moe::Qwen3Moe>),
+    /// The media pipeline, whose blocks the runners take one `Arc` each.
+    Media(Arc<minimax_h3::load::MinimaxH3>),
+}
+
+impl Served {
+    /// The checkpoint-named class this value was loaded as.
+    pub(crate) fn class(&self) -> ModelClass {
+        match self {
+            Self::Text(_) => ModelClass::CausalLm,
+            Self::Media(_) => ModelClass::Media,
+        }
+    }
+}
+
 pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
@@ -398,8 +451,15 @@ impl EpochPlan {
     pub(crate) fn rank_facts(
         &self,
         memory: &Memory,
-        model: &qwen3_moe::Qwen3Moe,
+        served: &Served,
     ) -> Result<engine::RankFacts> {
+        let Served::Text(model) = served else {
+            bail!(
+                "this rank's class is {:?} and its scheduler facts are derived for a causal \
+                 language model only",
+                served.class()
+            );
+        };
         let (rows, tokens) = self.buckets.bounds();
         let control = checkpoint_tokens(&self.checkpoint)?;
         // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
@@ -483,10 +543,17 @@ impl EpochPlan {
     pub(crate) fn runners(
         &self,
         device: DeviceId,
-        model: Arc<qwen3_moe::Qwen3Moe>,
+        served: &Served,
         memory: &mut Memory,
         generation: &Arc<Generation>,
     ) -> Result<Vec<NamedRunner>> {
+        let Served::Text(model) = served else {
+            bail!(
+                "this rank's class is {:?} and its runners are built for a causal language model \
+                 only",
+                served.class()
+            );
+        };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
         // second device would read the first device's addresses: a node whose rank serves two
@@ -520,7 +587,7 @@ impl EpochPlan {
                     // A plan that disagrees with the model's stated page size is refused here,
                     // naming both figures, rather than served.
                     page_size: cache_page_size(memory, &model)?,
-                    max_kv_len: self.max_kv_len(&model)?,
+                    max_kv_len: self.max_kv_len(served)?,
                 };
                 let stream = platform::Stream::new(device)
                     .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -537,7 +604,7 @@ impl EpochPlan {
                         device,
                         stream,
                     },
-                    Shared::new(model),
+                    Shared::new(Arc::clone(model)),
                     Arc::clone(generation),
                     self.buckets.clone(),
                     geometry,
@@ -565,16 +632,10 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(
-        Arc<qwen3_moe::Qwen3Moe>,
-        Memory,
-        ipc::WorkerInfo,
-        GraphStorage,
-    )> {
+    ) -> Result<(Served, Memory, ipc::WorkerInfo, GraphStorage)> {
         let placement = &self.placement;
-        let class = architectural_class(&self.checkpoint)?;
-        match class.as_str() {
-            "Qwen3MoeForCausalLM" => {
+        match ModelClass::of(&self.checkpoint)? {
+            ModelClass::CausalLm => {
                 // §8: the checkpoint's own representation stands unless the deployment fixed
                 // another, which is the build config's `dtype` and `quantization`.
                 let opened = nn::Checkpoint::open(&self.checkpoint)?;
@@ -593,35 +654,13 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let (memory, info, graph) = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory, info, graph))
+                let served = Served::Text(Arc::new(model));
+                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                Ok((served, memory, info, graph))
             }
-            // The media class is stated rather than left to the refusal below, so the line names
-            // what is missing instead of "cannot serve". Its runners are not built into this
-            // process yet, and they are what a binding needs: the model's three capabilities -
-            // `nn::capability::Encoder` for the encode of a prompt's conditions,
-            // `nn::capability::Denoiser` for one denoising step of a latent layout and
-            // `nn::capability::Decoder` for one clip decoded from latents - plus the partition the
-            // checkpoint's own layout declares.
-            //
-            // This class keeps no paged key/value cache: the package holds no cache view and no
-            // page table, and the one cache in it is the denoiser's AdaLN modulation table, which
-            // is model memory the weight loader allocates (4.1's retained weights). So the resident
-            // pool holds no KV units for it - but it is not empty either: a model's state tables
-            // book there, sized at plan time from the layouts the checkpoint declares
-            // (`Encoder::state_tables` and the denoiser's own), filled at the load and retired with
-            // the generation, never allocated on the request path. The state group's snapshot, when
-            // the denoiser allocates one, comes from the cache plan beside it. Until the runners
-            // exist nothing can bind a `MiniMaxH3` model, and the update and serving paths must not
-            // pretend otherwise.
-            "MiniMaxH3ModularPipeline" => bail!(
-                "{} declares model class {class}: the deployment selects MiniMaxH3ModularPipeline \
-                 and its runners (encoder, denoiser, decoder) are not built into this process, so \
-                 nothing can bind it",
-                self.checkpoint.display()
-            ),
-            other => bail!(
-                "{} declares model class {other}, which this build cannot serve",
+            ModelClass::Media => bail!(
+                "{} declares model class MiniMaxH3ModularPipeline: this build resolves the class \
+                 and has no media load path yet, so nothing can bind it",
                 self.checkpoint.display()
             ),
         }
@@ -637,9 +676,16 @@ impl EpochPlan {
     /// owners carve their storage from it and the runner is built from them.
     pub(crate) fn open_memory(
         &self,
-        model: &qwen3_moe::Qwen3Moe,
+        served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
     ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
+        let Served::Text(model) = served else {
+            bail!(
+                "this rank's class is {:?} and its resident memory is planned for a causal \
+                 language model only",
+                served.class()
+            );
+        };
         let device = *self
             .devices
             .first()
@@ -670,7 +716,7 @@ impl EpochPlan {
             max_batch_calls: rows as usize,
             max_batch_tokens: tokens as usize,
             max_request_pool_size: self.build.max_running_requests.get(),
-            max_model_len: self.max_kv_len(model)? as usize,
+            max_model_len: self.max_kv_len(served)? as usize,
             mem_fraction_static: self.build.mem_fraction_static,
             cache,
             kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
@@ -739,11 +785,18 @@ impl EpochPlan {
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    pub(crate) fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
-        match self.build.max_model_len {
-            Some(length) => Ok(length.get()),
-            None => u32::try_from(model.config().max_position_embeddings)
+    pub(crate) fn max_kv_len(&self, served: &Served) -> Result<u32> {
+        if let Some(length) = self.build.max_model_len {
+            return Ok(length.get());
+        }
+        match served {
+            Served::Text(model) => u32::try_from(model.config().max_position_embeddings)
                 .context("the checkpoint's context length is wider than the protocol's"),
+            Served::Media(_) => bail!(
+                "this rank serves the media class and the deployment states no `max_model_len`: \
+                 the pipeline keeps no key/value cache, so a length that decides one is the \
+                 deployment's to state rather than a checkpoint's to imply"
+            ),
         }
     }
 }

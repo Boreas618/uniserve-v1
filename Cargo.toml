@@ -51,6 +51,7 @@ ops.workspace = true
 platform.workspace = true
 proto.workspace = true
 qwen3-moe.workspace = true
+minimax-h3.workspace = true
 crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true

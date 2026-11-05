@@ -863,7 +863,7 @@ impl MainProcess {
         let products: Arc<dyn executor::runners::products::Products> = Arc::new(Held::new());
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
+            let runners = plan.runners(*device, &model, &mut memory, &generation)?;
             let executor = Executor::spawn(
                 *device,
                 runners,
@@ -6566,7 +6566,7 @@ fn schedulers(
     plan: &EpochPlan,
     launch: &Launch,
     memory: &Memory,
-    model: &qwen3_moe::Qwen3Moe,
+    model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::WorkerInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
