@@ -344,20 +344,38 @@ impl Lifecycle {
             Vec::with_capacity(walked.nodes.len());
         let mut ordinal_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
-        for (operator, _, launch) in &walked.nodes {
+        for ((operator, _, launch), (_, _, held)) in walked.nodes.iter().zip(served.nodes()) {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
-            for node in launch {
+            // Only a launch the walk states differently is set: the executable starts from the
+            // template, so every other node already holds what it should, and a node that is
+            // rewritten for nothing is a chance to disturb a kernel the update never touched.
+            let mut differs = false;
+            for (node, serving) in launch.iter().zip(held) {
                 if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(walked.template.kernel_node_params(&node.node)?);
+                let walked_params = walked.template.kernel_node_params(&node.node)?;
+                differs |= walked_params != template.kernel_node_params(&serving.node)?;
+                params.push(walked_params);
             }
-            launches.push((*operator, *ordinal, params));
+            if differs {
+                launches.push((*operator, *ordinal, params));
+            }
             *ordinal += 1;
         }
         let held = hold_kernels(kernels, &walked.nodes)?;
-        let prepared = Captured::from_template(template, walked.nodes, held)?;
+        // The prepared executable is the serving template's, so its node table is too: the walk's
+        // nodes belong to the graph the walk captured, and no executable of this template can be
+        // set through them. The two tables have one shape, which the comparison above established,
+        // and each launch keeps the descriptor key the walk stated for it.
+        let nodes = served
+            .nodes()
+            .iter()
+            .zip(&walked.nodes)
+            .map(|((operator, _, launch), (_, key, _))| (*operator, key.clone(), launch.clone()))
+            .collect();
+        let prepared = Captured::from_template(template, nodes, held)?;
         let mut applied = 0usize;
         for (operator, ordinal, params) in launches {
             applied += prepared.rebind_launch(operator, ordinal, &params)?;
