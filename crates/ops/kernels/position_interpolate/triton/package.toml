@@ -18,6 +18,7 @@ packages = []
 
 [module]
 form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"

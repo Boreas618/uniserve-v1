@@ -579,11 +579,13 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
 
 /// Plans a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` cache
-/// tokens together, with a sampled-token output when the request `samples`
-/// from its prompt, unless it is a readout or the context ends with a block
-/// of this call. A request samples nothing from its prompt on a deployment
-/// that generates canvases, or while it rebuilds a migrated context, until
-/// it resumes.
+/// tokens together, with a sampled-token output when this call ends the prompt
+/// and the request `samples` from its prompt, unless it is a readout or the
+/// context ends with a block of this call. A chunk before the prompt's end
+/// only writes the cache: it draws nothing from the request's stream, so a
+/// prompt split over several batches draws its first token once. A request
+/// samples nothing from its prompt on a deployment that generates canvases, or
+/// while it rebuilds a migrated context, until it resumes.
 ///
 /// The prompt of a readout or of a canvas-generating request only conditions
 /// its canvases, so its prefill samples nothing. A context that ends with an
@@ -619,7 +621,8 @@ pub(super) fn plan_prompt(
         .is_some_and(|block| block.offset == end.saturating_sub(start))
         && end as usize == request.prompt_token_ids.len();
     call.vision_inputs = blocks;
-    if request.is_readout() || !samples || ends_with_block {
+    let ends_prompt = end as usize == request.prompt_token_ids.len();
+    if request.is_readout() || !samples || !ends_prompt || ends_with_block {
         return finish_plan(request, call, 0);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
@@ -2030,4 +2033,51 @@ pub(crate) struct ContextAdvance {
     pub(crate) prefix_cache: u32,
     /// The block cursor after the call.
     pub(crate) cursor: BlockCursor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::request::{GenerationConstraint, ImageParams};
+
+    fn request(prompt: u32) -> GenerationRequest {
+        GenerationRequest {
+            request_id: RequestId(7),
+            prompt_token_ids: (0..prompt).collect(),
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
+            constraint: GenerationConstraint::UndOnly,
+            sampling: Default::default(),
+            image: ImageParams::default(),
+            max_images: 1,
+            max_und_tokens: 16,
+            include_stop_token: false,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 3,
+            cache: Default::default(),
+            image_generation: Default::default(),
+            readout: Vec::new(),
+            generated_token_ids: Vec::new(),
+            generated_images: Vec::new(),
+            trajectory: Default::default(),
+            adapter: 0,
+        }
+    }
+
+    /// A prompt longer than one batch's budget is split, and only the chunk that ends it draws. The
+    /// chunk before it used to declare a token output too: its draw advanced the request's sampling
+    /// position, so the chunk that ended the prompt read as a row with a committed token behind it
+    /// and the runner refused it (GSM8K at `355a8c564`, `a greedy row of slot 6 ends a prompt that
+    /// already holds 1 committed token(s)`).
+    #[test]
+    fn only_the_chunk_that_ends_a_prompt_samples() {
+        let request = request(700);
+        let plan = |start, end| {
+            plan_prompt(&request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
+        };
+        assert!(plan(0, 512).token_output.is_none(), "a chunk before the end draws nothing");
+        assert!(plan(512, 700).token_output.is_some(), "the last chunk draws the first token");
+        assert!(plan(0, 700).token_output.is_some(), "a whole prompt is its own last chunk");
+    }
 }

@@ -679,6 +679,21 @@ impl CommitColumns {
         self.slots as usize
     }
 
+    /// The token slot `slot` feeds its next decode, as `slot_commit` last wrote it.
+    ///
+    /// The column is one mapped allocation, and the device thread reads this between batches, after
+    /// the batch that wrote it has completed.
+    fn next_input(&self, slot: usize) -> i32 {
+        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) }
+    }
+
+    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
+    fn set_next_input(&self, slot: usize, token: i32) {
+        // SAFETY: as in `next_input`, and no launch that reads this column is in flight.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) = token };
+    }
+
     /// The device address of the per-slot trajectory positions.
     fn sampling_ptr(&self) -> ops::DevicePtr {
         self.sampling.device.ptr
@@ -1456,11 +1471,29 @@ pub trait KvProvider: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<TensorView>;
 
+    /// The same table's view over `slots`' rows, with no copy issued.
+    ///
+    /// A capture records every copy with the addresses it had, so a gather inside a recording bakes
+    /// the pose's pool rows into the graph, and each replay would then overwrite the batch's table
+    /// with them. A recording addresses the table through this view, and `block_table` fills it
+    /// before each launch.
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView>;
+
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
 
-    /// A scratch page set of `pages` pages for `group`, and its table over `slots`
-    /// (`block_table`'s order and `-1` rule).
+    /// Gives the provider the bytes of the device's scratch pool its page set may map.
+    fn attach_scratch_bytes(&mut self, bytes: u64) {
+        let _ = bytes;
+    }
+
+    /// The pages a paired forward's rows may use between them.
+    fn scratch_capacity(&self) -> u32 {
+        0
+    }
+
+    /// A scratch page set of `pages` pages per row for `group`, and its table over `slots`
+    /// (`block_table`'s order and `-1` rule), holding each row's first `lengths` cached keys.
     ///
     /// The planes carry their own scales, as the resident ones do: an FP8 group's scratch pages are
     /// FP8 pages with a scale each, so the paired forward's kernels read a page set shaped exactly
@@ -1469,6 +1502,7 @@ pub trait KvProvider: Send + Sync {
         &self,
         group: usize,
         slots: &[i32],
+        lengths: &[i32],
         pages: u32,
         stream: &platform::Stream,
     ) -> Result<(TensorView, Vec<nn::KvPlanes>)>;
@@ -2039,8 +2073,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
     }
 
-    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow) {
+    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow, page_set_bytes: u64) {
         self.set_shadow(shadow);
+        self.kv.attach_scratch_bytes(page_set_bytes);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -2091,6 +2126,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                // The graph holds no gather: the table it reads is filled here, on the stream the
+                // launch follows, from this batch's own slots.
+                let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+                for group in 0..self.kv.groups() {
+                    self.kv.block_table(group, &slots, &self.stream)?;
+                }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -2399,8 +2440,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        self.lifecycle.rebind(bucket, generation, walked?, &kernels)
     }
 
     /// The pool stream this runner's graphs are planned and replayed on.
@@ -2455,9 +2498,23 @@ impl<M: CausalLm> CausalLmRunner<M> {
         harness.reset();
         let stream = self.stream.clone();
         let walked = self.walk_paired(bucket, &next, &previous, operator, key, harness.twins());
+        // A batch whose rows' context does not fit the page set cannot be replayed beside the served
+        // one, and that says nothing about the kernel: the update's answer names what it has no
+        // evidence for, and another batch of the bucket may still be compared.
+        if let Ok(Some(reason)) = &walked {
+            let reason = reason.clone();
+            harness.reset();
+            self.shadow = Some(harness);
+            self.note_uncompared(format!(
+                "operator {operator} {key} of generation {generation} in the bucket of {} tokens \
+                 and {} rows: {reason}",
+                bucket.tokens, bucket.rows
+            ));
+            return Ok(());
+        }
         // The operator's tolerance is the one its paired forward recorded: `Forward::operate`
         // calls `O::tolerance(descriptor)` when it shadows, and the harness compares with it.
-        let compared = walked.and_then(|()| {
+        let compared = walked.and_then(|_| {
             let tolerance = harness.tolerance().ok_or_else(|| {
                 Error::Invariant(format!(
                     "the paired forward of {operator} recorded no tolerance: was it shadowed?"
@@ -2519,7 +2576,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         operator: &'static str,
         key: &str,
         twins: &mut ops::Twins,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let stream = self.stream.clone();
         match self.staging.staged() {
             Some(staged) if staged == bucket => {}
@@ -2528,11 +2585,32 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         self.upload(bucket)?;
-        // Every row writes its own scratch pages: the paired forward must not write a resident one.
-        let pages = bucket
-            .tokens
+        // Every row writes its own scratch pages, and holds a copy of its context there: the paired
+        // forward must not write a resident page, and it reads the keys the served row read. So a
+        // row's width is the row's longest reach, the keys it reads and the positions it writes.
+        let rows = bucket.rows as usize;
+        let lengths: Vec<i32> = self.staging.batch_rows().seq_lens[..rows].to_vec();
+        let reach = {
+            let batch = self.staging.batch_rows();
+            let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+            let written = batch.positions[..live]
+                .iter()
+                .zip(&batch.slot_mapping[..live])
+                .filter(|(_, slot)| **slot >= 0)
+                .map(|(position, _)| position.saturating_add(1));
+            lengths.iter().copied().chain(written).max().unwrap_or(0)
+        };
+        let pages = u32::try_from(reach)
+            .unwrap_or(0)
             .div_ceil(self.geometry.page_size.max(1))
             .max(1);
+        let capacity = self.kv.scratch_capacity();
+        if bucket.rows.saturating_mul(pages) > capacity {
+            return Ok(Some(format!(
+                "its {} rows of {pages} pages do not fit the page set's {capacity} pages",
+                bucket.rows
+            )));
+        }
         self.upload_scratch_slots(bucket, pages)?;
         let base = self.pool()?.base(self.stream_id())?;
         let arena = nn::Arena::new(
@@ -2553,16 +2631,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
         )?;
-        let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+        let slots: Vec<i32> = self.staging.slots(rows).to_vec();
         let ids = self.input_ids(bucket);
-        self.with_kv(&slots, Some(pages), |cache| {
+        self.with_kv(&slots, Some((pages, &lengths)), |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
                 .map_err(Error::from)?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
                 .map_err(Error::from)
-        })
+        })?;
+        Ok(None)
     }
 
     /// Reads the step's device results back and states what each call did (4.4).
@@ -2656,6 +2735,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
                 *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
+            }
+            // The graph committed its own draw as this slot's next input, and the next decode
+            // embeds what the client was told.
+            if let Ok(slot) = usize::try_from(slot) {
+                self.commit.set_next_input(slot, best as i32);
             }
         }
         Ok(())
@@ -2884,9 +2968,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let gather = spelled(&gather, rows);
         let line = format!(
             "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
-             positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
+             ids={} positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
              slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
             bucket.variant,
+            spelled(self.staging.input_ids(tokens.min(8)), 8),
             spelled(&self.staging.batch_rows().positions, 8),
             spelled(&self.staging.batch_rows().seq_lens, rows),
             spelled(&self.staging.batch_rows().query_offsets, rows + 1),
@@ -3750,8 +3835,55 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 } else {
                     String::new()
                 };
+                // The launch's **input**, which nothing so far has read. Q travels inside
+                // `tmaQ_`'s first word, and that word encodes the base address with alignment and
+                // swizzle bits, so the raw word is tried first and then with its low bits cleared:
+                // whichever lands inside the arena is the buffer the kernel reads. An output nobody
+                // wrote has two causes and this separates them - an input that never arrived, or an
+                // input that did and a kernel that did not write.
+                let read = if layer < 2 {
+                    let tma_q = params
+                        .as_ref()
+                        .and_then(|params| params.parameters.first())
+                        .and_then(|blob| blob.get(0..8))
+                        .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                        .unwrap_or(0);
+                    let q_address = [tma_q, tma_q & !0x7F, tma_q & !0xF, tma_q & !0x3]
+                        .into_iter()
+                        .find(|candidate| *candidate != 0 && inside(*candidate))
+                        .unwrap_or(0);
+                    match self.read_device(q_address, width) {
+                        Some(raw) if q_address != 0 => format!(
+                            " q={:016x} qnz={}",
+                            platform::fnv1a(&raw),
+                            raw.iter().filter(|byte| **byte != 0).count()
+                        ),
+                        _ => format!(" q=nomap({tma_q:#x})"),
+                    }
+                } else {
+                    String::new()
+                };
+                // The node's own identity, so the capture's line and a serving line can be compared
+                // word for word: a replay that launches a *different* function, or the same function
+                // with different arguments buried where the pointer table does not reach, is visible
+                // as two digests that disagree - and nothing else in the dump compares them.
+                let launched = match params.as_ref() {
+                    Some(params) => {
+                        let name = params
+                            .function
+                            .name()
+                            .unwrap_or_else(|error| format!("unnamed({error})"));
+                        let blob = params
+                            .parameters
+                            .first()
+                            .map(|blob| platform::fnv1a(blob))
+                            .unwrap_or(0);
+                        format!(" fn={name} blob={blob:016x}")
+                    }
+                    None => " fn=unreadable".to_owned(),
+                };
                 out.push_str(&format!(
-                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}"
+                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}{read}{launched}"
                 ));
                 if layer0_out != 0 && address == layer0_out && layer > 0 {
                     out.push_str("(shared)");
@@ -4014,7 +4146,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.max_kv_len,
         );
         // The page table's row, from the column the kernel addresses.
-        match self.kv.block_table(0, &slots, &self.stream) {
+        match self.kv.block_table_view(0, &slots) {
             Ok(table) => {
                 let mut entries = [0_i32; 8];
                 let bytes = entries.len() * std::mem::size_of::<i32>();
@@ -4084,7 +4216,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.columns.positions.write(&self.encoded)?;
         // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
         // the model already holds, so embedding them is the runner's step, not the model's.
-        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
+        // A decode row's token is the slot's next input, which the step before it wrote. The
+        // mechanism plans a step ahead of its results, so the token it states lags by one: it is a
+        // stale value on every step and nothing at all on the first.
+        let mut ids = self.staging.input_ids(tokens).to_vec();
+        if bucket.variant.is_decode() {
+            let slots = self.staging.slots(rows);
+            for (row, id) in ids.iter_mut().enumerate().take(rows) {
+                if let Ok(slot) = usize::try_from(slots[row]) {
+                    *id = self.commit.next_input(slot);
+                }
+            }
+        }
+        encode_i32(&mut self.encoded, &ids);
         self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
@@ -4214,7 +4358,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn with_kv<R>(
         &self,
         slots: &[i32],
-        scratch_pages: Option<u32>,
+        scratch_pages: Option<(u32, &[i32])>,
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
         let groups = self.kv.groups();
@@ -4224,10 +4368,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
             match scratch_pages {
                 None => {
                     layers.push(self.kv.planes(group)?);
-                    tables.push(self.kv.block_table(group, slots, &self.stream)?);
+                    tables.push(if self.capturing {
+                        self.kv.block_table_view(group, slots)?
+                    } else {
+                        self.kv.block_table(group, slots, &self.stream)?
+                    });
                 }
-                Some(pages) => {
-                    let (table, planes) = self.kv.scratch(group, slots, pages, &self.stream)?;
+                Some((pages, lengths)) => {
+                    let (table, planes) =
+                        self.kv.scratch(group, slots, lengths, pages, &self.stream)?;
                     layers.push(planes);
                     tables.push(table);
                 }

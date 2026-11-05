@@ -49,6 +49,10 @@ use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
+/// Bytes at the head of the attention workspace that can hold the decode's arrival count: four
+/// bytes per row and query head, at least one per multiprocessor, for any bucket this serves.
+const ATTENTION_COUNTER_BYTES: u64 = 1 << 20;
+
 /// What a deployment sets when it loads a Qwen3-MoE model.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadOptions {
@@ -913,6 +917,12 @@ impl Qwen3Moe {
             .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
         self.factors(f, batch.positions, cosine, sine)?;
         let buffers = Buffers::reserve(f.arena, &plan, self.dtype)?;
+        // The decode kernel splits a row's keys over CTAs and counts their arrivals in the head of
+        // this workspace, and it needs that count at zero on entry and resets it itself. The arena
+        // is not zero here: every bucket's extents share one range, so another bucket's tensors
+        // were written over these bytes, and a stale count reduces a row before its CTAs are in.
+        // One fill per forward is enough, because the layers leave the count as they found it.
+        f.zero(buffers.workspace, plan.workspace.min(ATTENTION_COUNTER_BYTES))?;
         let mut residual = hidden;
         let mut input = hidden;
         for (offset, layer) in self.layers[start..=last].iter().enumerate() {
