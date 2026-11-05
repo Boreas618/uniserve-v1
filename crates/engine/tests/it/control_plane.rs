@@ -2238,6 +2238,78 @@ fn logprobs_flow_to_events() {
     );
 }
 
+/// The first token's reported distribution: the engine reports the model's
+/// most likely candidates with the model's log probabilities, and a nucleus
+/// cutoff changes which of them may be *sampled*, not which are *reported*.
+///
+/// The launched case states this with the stub model, whose successor holds
+/// nearly all mass; here the sample distribution is the simulator's, and the
+/// property under test is the same: the reported candidates and their
+/// log probabilities do not depend on the nucleus.
+#[test]
+fn logprobs_report_the_model_distribution_under_a_cutoff() {
+    let candidates = |top_p: f32| {
+        let sampling = SamplingParams {
+            n_logprobs: 5,
+            top_p,
+            ..Default::default()
+        };
+        first_token_logprobs(sampling)
+    };
+    let cut = candidates(0.5);
+    let whole = candidates(1.0);
+    assert_eq!(cut.len(), 5, "five candidates are reported: {cut:?}");
+    assert!(
+        cut.iter().all(|(_, logprob)| logprob.is_finite()),
+        "every reported log probability is finite: {cut:?}"
+    );
+    assert_eq!(
+        cut, whole,
+        "a nucleus cutoff changes what may be sampled, not what is reported"
+    );
+}
+
+/// One request's first token's reported candidates, in the order reported.
+fn first_token_logprobs(sampling: SamplingParams) -> Vec<(u32, f32)> {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(8);
+    let executor = Box::new(SimExecutor::new(sim));
+    let sched = support::scheduler(executor, special_tokens(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let req = generation_request(
+        RequestId(1),
+        text_input(vec![1, 2, 3]),
+        sampling,
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    let mut erx = handle.submit(req).unwrap();
+    let mut reported = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reported.is_none() && Instant::now() < deadline {
+        match erx.try_recv() {
+            Ok(Event::TokenLogprobs { candidates, .. }) => {
+                reported = Some(
+                    candidates
+                        .into_iter()
+                        .map(|candidate| (candidate.token_id, candidate.logprob))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Ok(Event::Finished { .. }) => break,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    reported.expect("the request reports its first token's candidates")
+}
+
 #[test]
 fn allowed_tokens_restricts_output() {
     let sp = SamplingParams {
