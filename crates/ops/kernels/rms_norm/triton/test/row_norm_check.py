@@ -241,6 +241,68 @@ def check(operator, case):
     return outside
 
 
+#: A hand-computed case: two rows of four with fixed operands and the expected values written
+#: out as decimals. The randomized cases compare a launch against a reference this same file
+#: computes, so a mistake both share — a row read as a column, a dropped `eps`, a `columns` of
+#: the wrong length — is invisible to them. These numbers were computed once by hand from
+#: `x·rsqrt(mean(x²) + eps)·weight` (mean squares `7.5` and `1.875`) and are literals here.
+HAND = {
+    "x": [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 1.5]],
+    "weight": [1.0, 0.5, -1.0, 2.0],
+    "eps": 1e-6,
+    "expect": [
+        [
+            0.3651483473268884,
+            0.3651483473268884,
+            -1.0954450419806652,
+            2.921186778615107,
+        ],
+        [
+            0.3651482742972506,
+            -0.3651482742972506,
+            -1.4605930971890024,
+            2.1908896457835034,
+        ],
+    ],
+}
+
+
+def check_hand(operator, tile):
+    """Normalize the hand-computed rows and compare every element with its literal."""
+    if operator != "rms_norm":
+        print(f"hand: {operator} has no hand-computed case; its forms are checked above")
+        return 0
+    import rms_norm as kernels
+
+    rows, columns = len(HAND["x"]), len(HAND["x"][0])
+    if tile < columns:
+        print(f"hand: skipped, a tile of {tile} cannot cover {columns} columns")
+        return 0
+    x = torch.tensor(HAND["x"], dtype=torch.float32)
+    weight = torch.tensor(HAND["weight"], dtype=torch.float32)
+    out = torch.full((rows, columns), float("nan"), dtype=torch.float32)
+    kernels._rms_norm_kernel[(rows,)](
+        x,
+        weight,
+        out,
+        columns,
+        HAND["eps"],
+        0,
+        BLOCK=tile,
+        PDL=False,
+    )
+    expected = torch.tensor(HAND["expect"], dtype=torch.float64)
+    difference = (out.double() - expected).abs()
+    relative = bound(columns, "f32", 0) * expected.abs()
+    outside = (~(difference <= relative)).sum().item()
+    print(
+        f"{'exact' if outside == 0 else 'FAIL'}: hand-computed {rows} x {columns} of tile "
+        f"{tile}, f32 — max absolute {difference.max().item():.3e}, bound "
+        f"{bound(columns, 'f32', 0):.3e} ({outside} outside)"
+    )
+    return outside
+
+
 def cases(flags):
     """The cases one run checks, cheapest and most diverse first."""
     common = {
@@ -332,7 +394,7 @@ def main() -> int:
     if arguments.expect_key is not None and arguments.expect_key != key:
         parser.error(f"the flags name {key}, not {arguments.expect_key}")
 
-    failures = 0
+    failures = check_hand(arguments.op, arguments.tile)
     for case in cases(arguments):
         # The interpreter's narrow store truncates; simulate it only where it is known.
         case["truncate"] = arguments.interpreter and arguments.dtype == "bf16"
