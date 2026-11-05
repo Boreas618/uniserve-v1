@@ -149,8 +149,12 @@ constexpr int32_t kComputeFloat = 0;
 // `CUDNN_HEUR_MODE_A`: cuDNN's own heuristic, which measures nothing.
 constexpr int32_t kHeuristicModeA = 3;
 // `CUDNN_HEUR_MODE_B`: the exhaustive list of the engines this cuDNN implements for the graph,
-// where mode A is the performance shortlist. Asked only when the shortlist names nothing.
+// where mode A is the performance shortlist.
 constexpr int32_t kHeuristicModeB = 1;
+// `CUDNN_HEUR_MODE_FALLBACK`: the list guaranteed to be non-empty for a valid graph, for shapes
+// where both the shortlist and the exhaustive list name nothing. Asked last, so a shape this
+// library can compute at all is never refused.
+constexpr int32_t kHeuristicModeFallback = 2;
 // `CUDNN_CROSS_CORRELATION`: the convolution PyTorch's `Conv*d` computes.
 constexpr int32_t kCrossCorrelation = 1;
 // The number of engine configurations one heuristic query returns.
@@ -477,18 +481,19 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     // shape with no shortlist entry can still have an engine, and the video VAE's first
     // convolution at [1, 3, 19, 258, 258] f32 is one. The shape is planned once per program load,
     // so the price is a build's, not a call's.
-    if (built && !listed) {
-      int32_t exhaustive = kHeuristicModeB;
+    const int32_t wider[2] = {kHeuristicModeB, kHeuristicModeFallback};
+    for (int32_t at_mode = 0; at_mode < 2 && built && !listed; ++at_mode) {
+      int32_t mode = wider[at_mode];
       count = 0;
-      listed = set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &exhaustive) &&
+      listed = set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &mode) &&
                library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor,
                                    kMaxEngineConfigs, &count, configs) == kSuccess &&
                count > 0;
     }
     if (built && !listed) {
       *status = refuse(error,
-                       "cuDNN proposes no engine for this convolution in either heuristic mode: "
-                       "neither the performance shortlist nor the exhaustive list names one for "
+                       "cuDNN proposes no engine for this convolution in any heuristic mode: the "
+                       "shortlist, the exhaustive list and the fallback list all name none for "
                        "this shape, these tensor descriptors and this cuDNN version");
       built = false;
     }
