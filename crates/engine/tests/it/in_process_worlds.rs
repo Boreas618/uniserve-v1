@@ -26,7 +26,14 @@ use ipc::{ImageParams, RequestId, SamplingParams};
 use crate::support::{self, Serving};
 
 /// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(60);
+/// How long a command answer may take.
+///
+/// The first answer of each world is its policy's precopy, which compiles the
+/// `fcfs` module inside a debug build; this case builds three worlds, and a
+/// bound that does not cover the compile reports a timeout for a world that is
+/// booting. The margin is the compile's, not the mechanism's: a mechanism that
+/// stopped answering still fails here, only later.
+const ANSWER: Duration = Duration::from_secs(180);
 
 /// How many tokens the running world generates before it parks.
 const GENERATED: usize = 3;
@@ -84,15 +91,18 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
     };
     let source: Arc<dyn engine::PolicySource + Send + Sync> =
         Arc::new(engine::PolicyBytes::new(support::policy_module()));
-    answer(handle.precopy_policy(program, source)).expect("the policy is precopied");
-    answer(handle.stage(Stage::Switchover)).expect("the policy serves");
+    answer("the precopy", handle.precopy_policy(program, source)).expect("the policy is precopied");
+    answer("the switchover", handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
 /// Waits for a command's answer.
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+fn answer<T>(
+    what: &str,
+    receiver: crossbeam_channel::Receiver<Result<T, String>>,
+) -> Result<T, String> {
     receiver
         .recv_timeout(ANSWER)
-        .expect("the scheduler answers within the bound")
+        .unwrap_or_else(|error| panic!("the scheduler did not answer {what} within {ANSWER:?}: {error}"))
 }
 
 /// Collects a request's terminal event, answering what ended it.
@@ -173,7 +183,8 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     );
 
     // Its successor starts beside it, under the same claim, with its cache.
-    let caches = answer(running.describe_cache()).expect("the running world states its cache");
+    let caches = answer("the running world's cache", running.describe_cache())
+        .expect("the running world states its cache");
     let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
     let mut successor_config = support::config(&successor_pool, "worlds");
     successor_config.world = 2;
@@ -200,12 +211,13 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
 
     // The running world parks, the successor is promoted with its index, and
     // the running world closes.
-    let index = answer(running.park(true)).expect("the running world parks");
+    let index =
+        answer("the running world's park", running.park(true)).expect("the running world parks");
     successor
         .promote(index, false, false)
         .expect("the successor is promoted with the parked index");
     running.shutdown();
-    answer(successor.commit()).expect("the successor commits");
+    answer("the successor's commit", successor.commit()).expect("the successor commits");
 
     // The continuation samples what the uninterrupted request sampled next.
     let mut continuation = successor
