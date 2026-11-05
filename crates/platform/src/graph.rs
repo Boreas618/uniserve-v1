@@ -140,6 +140,50 @@ impl Graph {
     /// can execute, calls [`Capture::record`] after issuing that operation:
     /// the capture knows which nodes are new, and returns them in order. That
     /// is the record a rebind is issued against.
+    /// The nodes that depend directly on `node`, in the driver's order
+    /// (`cuGraphNodeGetDependentNodes`).
+    ///
+    /// A captured graph holds only the edges the recording saw, and a launch that another stream
+    /// issued leaves none: within a graph the work is ordered by its edges, so an edge nobody
+    /// recorded is work that runs in whatever order the driver chooses. This is the only reading
+    /// that answers "does the node after this one actually wait for it".
+    pub fn dependents(&self, node: &GraphNode) -> Result<Vec<GraphNode>> {
+        Ok(self
+            .dependents_with_edges(node)?
+            .into_iter()
+            .map(|(dependent, _)| dependent)
+            .collect())
+    }
+
+    /// The nodes that depend directly on `node`, each with what its edge says.
+    ///
+    /// An edge is normally "after the producer completed", and a **programmatic** edge says the
+    /// consumer may start early, from a point inside the producer - which only holds if the consumer
+    /// waits for the producer's data itself. A graph that recorded such an edge for a launch that
+    /// did not ask for one is a consumer reading its input early, and the scalars of both launches
+    /// still agree.
+    pub fn dependents_with_edges(&self, node: &GraphNode) -> Result<Vec<(GraphNode, Edge)>> {
+        if !Arc::ptr_eq(&self.core, &node.core) {
+            return Err(Error::invalid("the node belongs to another graph"));
+        }
+        let _context = self.core.context.enter()?;
+        Ok(dependent_edges(node.raw)?
+            .into_iter()
+            .map(|(raw, data)| {
+                (
+                    GraphNode {
+                        core: Arc::clone(&self.core),
+                        raw,
+                    },
+                    Edge {
+                        port: data.from_port,
+                        kind: data.kind,
+                    },
+                )
+            })
+            .collect())
+    }
+
     pub fn nodes(&self) -> Result<Vec<GraphNode>> {
         let handles = self.node_handles()?;
         Ok(handles
@@ -316,6 +360,23 @@ impl GraphNode {
             CU_GRAPH_NODE_TYPE_EMPTY => GraphNodeKind::Empty,
             other => GraphNodeKind::Other(other),
         })
+    }
+}
+
+/// What one recorded edge says about when its consumer may start (`CUgraphEdgeData`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Edge {
+    /// When, inside the producer, the dependency triggers.
+    pub port: u8,
+    /// `CUgraphDependencyType`: zero is "after the producer completed", one is programmatic.
+    pub kind: u8,
+}
+
+impl Edge {
+    /// Whether the consumer may start before its producer completed (a programmatic dependent
+    /// launch), which is only correct if the consumer synchronises with the producer itself.
+    pub const fn is_programmatic(&self) -> bool {
+        self.kind == 1
     }
 }
 

@@ -22,7 +22,7 @@
 //!   identity against the in-flight window before any completion is applied,
 //!   stages completions, and applies them in request-local dependency order.
 //! - Failure reconciliation: `on_executor_error` retires only the work a
-//!   `WorkerFailure` invalidates. Any other executor error, and a worker
+//!   `ExecutorFailure` invalidates. Any other executor error, and a worker
 //!   failure classified as a control-plane invariant violation, is
 //!   engine-fatal.
 //!
@@ -65,7 +65,7 @@ impl Scheduler {
     /// handed to `on_executor_error` and stops dispatching.
     fn dispatch_submissions(
         &mut self,
-        blocked_workers: &mut HashSet<crate::WorkerGroupId>,
+        blocked_workers: &mut HashSet<crate::ExecutorGroupId>,
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be
@@ -1186,7 +1186,7 @@ impl Scheduler {
 ///
 /// Image generation chains its state calls on one denoising component: text
 /// features feed latent preparation, which feeds the denoising steps.
-/// `WorkerGroup::consumer_slots` reads this for a media call whose placement
+/// `ExecutorGroup::consumer_slots` reads this for a media call whose placement
 /// names no readers; a video request's calls name theirs from the request's
 /// graph (`plan_media_call`).
 pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {

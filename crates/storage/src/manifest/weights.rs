@@ -213,7 +213,7 @@ pub struct Sources {
     pub links: Vec<LinkBandwidth>,
 }
 
-/// A daemon's executable weight redistribution plan. Workers consume this
+/// A daemon's executable weight redistribution plan. Main processes consume this
 /// exact request and manifest; they do not independently choose another plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {

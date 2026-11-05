@@ -29,7 +29,7 @@ pub(super) struct Storage {
     pub(super) buffer_pool: BufferPool,
     /// Per-worker row address spaces and per-rank buffer address spaces of
     /// the media workers.
-    pub(super) media_storage: HashMap<crate::WorkerGroupId, MediaStorage>,
+    pub(super) media_storage: HashMap<crate::ExecutorGroupId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
     pub(super) encoder_buffers: HashMap<ipc::BufferId, BufferSpan>,
@@ -45,7 +45,7 @@ pub(super) struct Storage {
 /// Media storage exists for every loaded worker that serves a media call and
 /// every media allocation is taken from it, so this reports a scheduler defect.
 #[derive(Debug)]
-pub(super) struct UnknownMediaWorker(pub(super) crate::WorkerGroupId);
+pub(super) struct UnknownMediaWorker(pub(super) crate::ExecutorGroupId);
 
 impl std::fmt::Display for UnknownMediaWorker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,7 +60,7 @@ impl std::fmt::Display for UnknownMediaWorker {
 impl Storage {
     pub(super) fn free_media_request(
         &mut self,
-        worker: &crate::WorkerGroupId,
+        worker: &crate::ExecutorGroupId,
         allocation: RequestSlot,
     ) -> Result<(), UnknownMediaWorker> {
         self.media_storage
@@ -74,7 +74,7 @@ impl Storage {
     /// Returns `allocation` to the buffer pool of `rank` of `worker`.
     pub(super) fn free_media_buffer(
         &mut self,
-        worker: &crate::WorkerGroupId,
+        worker: &crate::ExecutorGroupId,
         rank: u32,
         allocation: BufferSpan,
     ) -> Result<(), UnknownMediaWorker> {
@@ -233,7 +233,7 @@ pub(super) struct MediaAllocations {
     /// Declared results keyed by component name and output index.
     pub(super) tensors: HashMap<(String, u32), MediaTensorAllocation>,
     /// The request's row on each worker of its route.
-    pub(super) request_slots: HashMap<crate::WorkerGroupId, RequestSlot>,
+    pub(super) request_slots: HashMap<crate::ExecutorGroupId, RequestSlot>,
 }
 
 /// A request reserves each declared result in the buffer pool of every rank
@@ -241,12 +241,12 @@ pub(super) struct MediaAllocations {
 /// slices of the temporal result, independent of decoder Worker width.
 pub(super) struct MediaTensorAllocation {
     /// The span on each backing rank, keyed by worker and rank.
-    pub(super) allocations: HashMap<(crate::WorkerGroupId, u32), BufferSpan>,
+    pub(super) allocations: HashMap<(crate::ExecutorGroupId, u32), BufferSpan>,
     pub(super) dtype: DType,
     pub(super) shape_bound: ShapeBound,
 }
 
-/// Independent scheduler address spaces for one physical media WorkerGroup.
+/// Independent scheduler address spaces for one physical media ExecutorGroup.
 /// Replicas intentionally reuse row numbers and byte offsets in their own
 /// processes; the worker identity keeps those physical addresses distinct.
 ///
@@ -336,7 +336,7 @@ impl MediaTensorAllocation {
         &self,
         product: &TensorRef,
         start_unit: u32,
-        worker: &crate::WorkerGroupId,
+        worker: &crate::ExecutorGroupId,
     ) -> Vec<RankBuffer> {
         let unit_bytes = match product.shape_bound.dims.first() {
             Some(DimBound::Static(units)) if start_unit > 0 => {
@@ -379,7 +379,7 @@ impl MediaAllocations {
     }
 
     /// Returns the request row assigned in one physical worker address space.
-    pub(super) fn request_slot(&self, worker: &crate::WorkerGroupId) -> u32 {
+    pub(super) fn request_slot(&self, worker: &crate::ExecutorGroupId) -> u32 {
         self.request_slots[worker].index()
     }
 

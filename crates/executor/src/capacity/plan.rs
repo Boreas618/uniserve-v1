@@ -1,5 +1,5 @@
 //! Startup capacity planning: block size, request slots, cache units, latent
-//! pages and the [`WorkerInfo`] the rank reports.
+//! pages and the [`MainProcessInfo`] the rank reports.
 //!
 //! Planning runs after the model is loaded, so measured device storage
 //! includes the weights. Every quantity the engine schedules against must be
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ipc::{
-    CallKind, ComponentInfo, MediaCall, OutputInfo, VideoDenoiserInfo, WorkerEndpoint, WorkerInfo,
+    CallKind, ComponentInfo, MediaCall, OutputInfo, VideoDenoiserInfo, MainProcessEndpoint, MainProcessInfo,
 };
 
 use super::{
@@ -201,7 +201,7 @@ impl LatentPlan {
 
 /// Model-independent values of the report.
 pub struct Report {
-    pub endpoint: WorkerEndpoint,
+    pub endpoint: MainProcessEndpoint,
     /// The rank publishes device products over CUDA VMM, which keeps an
     /// export pool on its primary device.
     pub device_exports: bool,
@@ -253,7 +253,7 @@ pub struct TokenFacts {
 /// memory from.
 pub struct Plan {
     /// The capacity the rank reports to the engine.
-    pub info: WorkerInfo,
+    pub info: MainProcessInfo,
     /// The host and device arenas of its calls: read where a rank's arenas are
     /// built, which is inside this crate.
     pub(crate) arena: ArenaCapacity,
@@ -274,8 +274,8 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::Invalid(format!("{name} exceeds the protocol range")))
 }
 
-fn base_info(report: Report, request: &CapacityRequest) -> Result<WorkerInfo> {
-    Ok(WorkerInfo {
+fn base_info(report: Report, request: &CapacityRequest) -> Result<MainProcessInfo> {
+    Ok(MainProcessInfo {
         media_components: report.media_components,
         video_denoiser: None,
         endpoint: report.endpoint,
@@ -312,7 +312,7 @@ fn base_info(report: Report, request: &CapacityRequest) -> Result<WorkerInfo> {
 
 /// A token worker's layout before the cache pool is fitted.
 pub(crate) struct TokenLayout {
-    info: WorkerInfo,
+    info: MainProcessInfo,
     arena: ArenaCapacity,
     fixed: BTreeMap<Device, u64>,
     feature_bytes: u64,
@@ -824,7 +824,7 @@ impl TokenLayout {
         })
     }
 
-    pub(crate) fn info(&self) -> &WorkerInfo {
+    pub(crate) fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
@@ -1209,7 +1209,7 @@ mod tests {
 
     fn report() -> Report {
         Report {
-            endpoint: ipc::WorkerEndpoint {
+            endpoint: ipc::MainProcessEndpoint {
                 host: "rank".to_owned(),
                 address_space: "space".to_owned(),
                 incarnation: "incarnation".to_owned(),

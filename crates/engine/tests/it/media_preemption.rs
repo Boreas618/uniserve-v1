@@ -3,7 +3,7 @@
 //! simulator and a Storage Server in the test's process.
 //!
 //! The simulator copies no bytes: what the tests observe is what the
-//! scheduler asks of the workers at the executor boundary (the trajectory
+//! scheduler asks of the executors at the executor boundary (the trajectory
 //! offloads a batch carries, the stored pages a latent preparation restores,
 //! the denoising calls a request runs) and the events its requests end
 //! with. A preemption in normal serving (a sleep) and a world change (a
@@ -25,7 +25,7 @@ use crossbeam_channel::Receiver;
 use engine::{
     BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
     ExecutorError, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig, SimEngine,
-    SimExecutor, Trajectory, WorkerGroupId,
+    SimExecutor, Trajectory, ExecutorGroupId,
 };
 use ipc::{
     CallKind, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,
@@ -107,11 +107,11 @@ impl Executor for GatedExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         !self
             .gate
             .as_ref()
@@ -511,7 +511,7 @@ fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
     serving.stop();
 }
 
-/// What the workers were asked of a request's admissions, each in order of
+/// What the executors were asked of a request's admissions, each in order of
 /// admission (its request epoch): the trajectory pages its batches
 /// offloaded, the stored trajectory its latent preparation restored, and its
 /// denoising calls.
@@ -639,10 +639,10 @@ fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory
     (stored, seed, preempted)
 }
 
-/// A sleep, which gives back the workers' storage in normal serving,
+/// A sleep, which gives back the executors' storage in normal serving,
 /// preempts a denoising video request at its next step boundary: the
 /// trajectory's pages reach the host latent pool, and the request leaves
-/// with the steps it took. Submitted again once the workers woke, it
+/// with the steps it took. Submitted again once the executors woke, it
 /// continues from that step: its latent preparation restores every page and
 /// only the steps left are denoised, and it completes with its video.
 #[test]

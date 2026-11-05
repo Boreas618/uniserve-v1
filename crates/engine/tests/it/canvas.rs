@@ -2,7 +2,7 @@
 //!
 //! A canvas-generating request prefills its prompt without sampling, then
 //! generates text one block at a time: token-denoising steps run on the
-//! worker-resident canvas of the block until a step stops it and reports the
+//! executor-resident canvas of the block until a step stops it and reports the
 //! block's tokens, which are published and, unless they end the request,
 //! committed to the context by a causal prefill before the next block
 //! starts. The simulator stops block `b` of request `r` at step
@@ -11,7 +11,7 @@
 //! known exactly. A step may be queued behind the one still in flight,
 //! predicated on its completion; behind the step that stops the block it is
 //! a no-op. Tests observe calls at the executor boundary, the protocol the
-//! worker consumes.
+//! executor consumes.
 
 use crate::support;
 
@@ -53,7 +53,7 @@ fn config() -> SchedulerConfig {
     }
 }
 
-/// A block-diffusion worker with 16-token cache pages whose synthetic text
+/// A block-diffusion executor with 16-token cache pages whose synthetic text
 /// holds `text_len` tokens before EOS.
 fn worker(text_len: usize) -> SimEngine {
     let mut sim = SimEngine::new();

@@ -2,7 +2,7 @@
 //! reuse.
 //!
 //! The scheduler chooses every physical cache unit before a call is dispatched;
-//! workers read and write only the units named in a call's block tables.
+//! executors read and write only the units named in a call's block tables.
 //! [`BlockPool`] owns physical unit availability and prefix-cache metadata.
 //! [`BlockTable`] maps one sequence's logical pages of one cache group to
 //! reference-counted pages of units. Dropping the final reference returns the
@@ -11,13 +11,13 @@
 //!
 //! Key concepts:
 //!
-//! - Unit pool: the worker stores every cache group in one pool of equally
+//! - Unit pool: the executor stores every cache group in one pool of equally
 //!   sized units. A group's logical page holds `block_size` tokens of every
 //!   layer in the group and occupies `units_per_page` units, so groups with
 //!   different page shapes share one free queue and one capacity, and
 //!   admission and growth compare the sum of every group's unit demand with
 //!   the free units.
-//! - Unit zero: the worker treats unit zero as its padding sentinel, valid
+//! - Unit zero: the executor treats unit zero as its padding sentinel, valid
 //!   storage in every plane, so the pool never allocates it and excludes it
 //!   from capacity.
 //! - Free queue: an intrusive doubly linked queue of unreferenced units.
@@ -27,22 +27,22 @@
 //!   allocation reaches it; allocation then evicts the whole page. A prefix
 //!   hit on an unreferenced page unlinks its units from wherever they sit.
 //! - Sliding windows: a table of a sliding-window group keeps pages from its
-//!   `start_page` on. Pages before it are retired, and a worker never reads
+//!   `start_page` on. Pages before it are retired, and an executor never reads
 //!   them. After a call completes, [`PrefixCacheCoordinator::release_window`]
 //!   retires the pages that lie entirely before the oldest history position
 //!   any later reader needs.
 //! - Prefix identity: a published page is keyed by a chained 64-bit hash per
 //!   group, but a match also requires equal tokens, the same group and the
-//!   same loaded `WorkerEndpoint`. The token comparison guards against hash
+//!   same loaded `MainProcessEndpoint`. The token comparison guards against hash
 //!   collisions, and the endpoint comparison confines reuse to the loaded
-//!   worker incarnation that computed and retains the page.
+//!   executor incarnation that computed and retains the page.
 //! - Reuse: each group's attention type has a manager ([`manager`]) that
 //!   says which pages a reuse at a boundary needs: every full-attention
 //!   page before it, and each sliding-window group's window of pages just
 //!   before it. The same managers decide reuse in the device cache and,
 //!   through [`KvOffloadManager`], in the host KV cache and the KV storage.
 //! - State checkpoints: a state group (`CacheGroupKind::State`) holds the
-//!   checkpoints of the layers a worker keeps per request slot, such as a
+//!   checkpoints of the layers an executor keeps per request slot, such as a
 //!   recurrent state: page `k` holds the state after token `(k + 1) *
 //!   block_size - 1`, so a reuse at a boundary needs the page that ends
 //!   there, as a one-token window does. A table holds units only for the
@@ -63,7 +63,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use ipc::WorkerEndpoint;
+use ipc::MainProcessEndpoint;
 use ipc::{CacheGroup, UnitId};
 
 use crate::lock;
@@ -151,7 +151,7 @@ pub(crate) struct BlockPoolStats {
     /// Successful `BlockPool::allocate` calls, not units.
     pub(crate) allocations: u64,
     /// Pages removed from the prefix index, whether by allocation reuse,
-    /// republication, or worker invalidation.
+    /// republication, or executor invalidation.
     pub(crate) evictions: u64,
     /// Pages published to the prefix index for reuse across requests; a
     /// request's private continuation alias does not count.
@@ -164,8 +164,8 @@ struct PublishedPage {
     group: u32,
     /// Exact token content used to disambiguate equal prefix hashes.
     tokens: Vec<u32>,
-    /// Loaded Worker whose rank group retains the page.
-    source: Arc<WorkerEndpoint>,
+    /// Loaded Executor whose rank group retains the page.
+    source: Arc<MainProcessEndpoint>,
     /// The same immutable bytes may serve public reuse and several private
     /// continuations. `None` names the public alias; no alias copies units.
     aliases: Vec<Option<proto::request::CacheResume>>,
@@ -179,12 +179,12 @@ struct PublishedPage {
 
 /// An idle cached page held while a withdrawal evicts it, so that its units
 /// keep their bytes until its host KV cache copy is verified or made: its
-/// reference, cache group, the worker that retains it and its key in the
+/// reference, cache group, the executor that retains it and its key in the
 /// host KV cache, when it was offloaded there.
 pub(crate) struct IdlePage {
     pub(crate) page: PageRef,
     pub(crate) group: u32,
-    pub(crate) source: Arc<WorkerEndpoint>,
+    pub(crate) source: Arc<MainProcessEndpoint>,
     pub(crate) host_key: Option<storage::Key>,
 }
 
@@ -209,7 +209,7 @@ struct PoolInner {
     /// they went: the step's `Freed` events.
     freed_log: Vec<u32>,
     /// First units of every published page copy of a hash. Copies differ by
-    /// group, source worker or, after a hash collision, by tokens.
+    /// group, source executor or, after a hash collision, by tokens.
     hash_to_pages: HashMap<u64, Vec<u32>>,
     stats: BlockPoolStats,
     /// Units `1..=scratch`, which the pool never allocates.
@@ -218,13 +218,13 @@ struct PoolInner {
     /// units from it on is given back (`BlockPool::withdraw`); the unit
     /// count while none is.
     withdrawn: u32,
-    /// The units the workers map read-only from the predecessor world's
+    /// The units the executors map read-only from the predecessor world's
     /// planes (`BlockPool::inherit`): never queued or allocated, their
     /// imported pages acquired and released, until the world takes them
     /// (`BlockPool::take_inherited`).
     inherited: std::ops::Range<u32>,
     /// Of the inherited units, those the predecessor lent this world for
-    /// its trial (`BlockPool::borrow`): the workers map them writable and
+    /// its trial (`BlockPool::borrow`): the executors map them writable and
     /// the pool allocates them as its own.
     borrowed: Vec<std::ops::Range<u32>>,
     /// The units this world lent its successor at its park
@@ -396,7 +396,7 @@ impl PoolInner {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<u32> {
         self.hash_to_pages.get(&hash)?.iter().copied().find(|head| {
@@ -472,8 +472,8 @@ pub(crate) struct BlockPool {
 
 impl BlockPool {
     /// Creates a pool of `num_units` units, including the unit-zero sentinel.
-    /// Units `1..=scratch` are never allocated: they are the workers' warmup
-    /// scratch, which a standby worker warms up on while the pool's units
+    /// Units `1..=scratch` are never allocated: they are the executors' warmup
+    /// scratch, which a standby executor warms up on while the pool's units
     /// serve (`PrefixCacheInfo::scratch_units`).
     ///
     /// # Panics
@@ -504,7 +504,7 @@ impl BlockPool {
             lent: Vec::new(),
         };
 
-        // Unit zero is the worker's padding sentinel and is never queued,
+        // Unit zero is the executor's padding sentinel and is never queued,
         // nor are the scratch units after it.
         for unit in scratch + 1..num_units {
             inner.fq_push_back(unit);
@@ -602,7 +602,7 @@ impl BlockPool {
         inner.recount();
     }
 
-    /// Takes units `range` out of allocation: the workers map them
+    /// Takes units `range` out of allocation: the executors map them
     /// read-only from the predecessor world's planes, whose pages the pool
     /// imports ([`Self::import`]) and which the world never writes until it
     /// takes them ([`Self::take_inherited`]).
@@ -632,7 +632,7 @@ impl BlockPool {
     }
 
     /// Returns the inherited units to allocation: the predecessor world is
-    /// gone and the workers took its storage. Their pages stay published.
+    /// gone and the executors took its storage. Their pages stay published.
     pub(crate) fn take_inherited(&self) {
         let mut inner = lock(&self.inner);
         let range = std::mem::replace(&mut inner.inherited, 0..0);
@@ -648,7 +648,7 @@ impl BlockPool {
     }
 
     /// Borrows the inherited units `ranges` for the world's trial: its
-    /// predecessor lent them at its park ([`Self::lend`]) and the workers
+    /// predecessor lent them at its park ([`Self::lend`]) and the executors
     /// map them writable. The pool queues them behind its own free units and
     /// allocates them as its own; the predecessor's pages they hold stay
     /// published until allocation reaches them. Units outside the inherited
@@ -754,7 +754,7 @@ impl BlockPool {
         &self,
         pages: &[IndexedPage],
         offset: u32,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> usize {
         let mut inner = lock(&self.inner);
         let mut imported = 0;
@@ -957,10 +957,10 @@ impl BlockPool {
         lock(&self.inner).meta[unit.0 as usize].state
     }
 
-    /// Publishes one physical prefix page of `group` under its loaded Worker
+    /// Publishes one physical prefix page of `group` under its loaded Executor
     /// identity.
     ///
-    /// Callers publish only pages whose contents the worker has already
+    /// Callers publish only pages whose contents the executor has already
     /// computed. The call does nothing when `source` already publishes these
     /// exact tokens under `hash` in `group` on some page. Otherwise any
     /// earlier numerical identity of the page is removed first. Equal bytes
@@ -971,7 +971,7 @@ impl BlockPool {
         group: u32,
         hash: u64,
         tokens: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
     ) {
         let mut inner = lock(&self.inner);
@@ -1027,7 +1027,7 @@ impl BlockPool {
         }
     }
 
-    /// Finds a prefix page of `group` retained by this exact loaded Worker.
+    /// Finds a prefix page of `group` retained by this exact loaded Executor.
     ///
     /// Returns the page's first unit and whether the free queue holds it:
     /// the page is unreferenced and allocatable, and its units count as free
@@ -1040,7 +1040,7 @@ impl BlockPool {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<(UnitId, bool)> {
         let inner = lock(&self.inner);
@@ -1060,7 +1060,7 @@ impl BlockPool {
         hash: u64,
         group: u32,
         tokens: &[u32],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         resume: Option<proto::request::CacheResume>,
     ) -> Option<PageRef> {
         let mut inner = lock(&self.inner);
@@ -1241,7 +1241,7 @@ impl BlockPool {
     /// Referenced units keep their owners and reference counts; only their
     /// prefix identity is removed. Unreferenced units turn from `Cached` into
     /// `Free` without changing the free capacity.
-    pub(crate) fn invalidate_source(&self, source: &WorkerEndpoint) {
+    pub(crate) fn invalidate_source(&self, source: &MainProcessEndpoint) {
         let mut inner = lock(&self.inner);
         let heads = inner
             .pages
@@ -1360,7 +1360,7 @@ impl GroupShape {
         }
     }
 
-    /// Derives the scheduler shape of a worker-reported group.
+    /// Derives the scheduler shape of an executor-reported group.
     pub(crate) fn from_group(group: &CacheGroup) -> Self {
         let state = group.kind.is_state();
         Self {
@@ -1402,7 +1402,7 @@ impl GroupShape {
 #[derive(Debug)]
 struct TablePage {
     /// The page's units; `None` for a state group's page that holds no
-    /// checkpoint, which workers see as the padding sentinel and never read.
+    /// checkpoint, which executors see as the padding sentinel and never read.
     page: Option<PageRef>,
     /// `None` for a page acquired from the prefix cache, which already holds
     /// computed keys and values; otherwise the owning allocation's unit serial at the
@@ -1431,7 +1431,7 @@ impl Growth {
 /// One sequence's logical-page to physical-unit mapping in one cache group.
 ///
 /// Logical pages `start_page..end_page` are held; earlier pages are retired
-/// tombstones that no worker reads, which only a sliding-window group and a
+/// tombstones that no executor reads, which only a sliding-window group and a
 /// state group produce. A state group's table holds units only for its
 /// pages that hold a checkpoint.
 #[derive(Debug)]
@@ -1440,7 +1440,7 @@ pub(crate) struct BlockTable {
     shape: GroupShape,
     start_page: usize,
     pages: VecDeque<TablePage>,
-    /// `(start_page, end_page)` most recently declared to workers, or `None`
+    /// `(start_page, end_page)` most recently declared to executors, or `None`
     /// before the first declaration, after a rollback, or once a page the
     /// table held without units took them.
     sent: Option<(usize, usize)>,
@@ -1524,7 +1524,7 @@ impl BlockTable {
     }
 
     /// Returns the units of fresh pages allocated at or after `serial`, which
-    /// a worker must reset before any call uses them.
+    /// an executor must reset before any call uses them.
     pub(crate) fn fresh_units(&self, serial: u64) -> Vec<UnitId> {
         self.pages
             .iter()
@@ -1544,7 +1544,7 @@ impl BlockTable {
         pool.activate(self.pages.iter().filter_map(|entry| entry.page.as_ref()));
     }
 
-    /// Records the held page interval as declared to workers.
+    /// Records the held page interval as declared to executors.
     pub(crate) fn mark_sent(&mut self) {
         self.sent = Some((self.start_page, self.end_page()));
     }
@@ -1826,11 +1826,11 @@ impl<'a> PrefixScope<'a> {
     }
 }
 
-/// The seed of the prefix hash chains of the pages a worker computes, from
+/// The seed of the prefix hash chains of the pages an executor computes, from
 /// the identity it reports of its model and of what its forwards compute
 /// (`PrefixCacheInfo::identity`): the first eight bytes of its SHA-256, so
 /// that every build derives the same seed from the same identity. Zero for
-/// a worker that reports none.
+/// an executor that reports none.
 pub(crate) fn prefix_seed(identity: &str) -> u64 {
     use sha2::Digest as _;
     if identity.is_empty() {
@@ -2363,7 +2363,7 @@ impl PrefixCacheCoordinator {
         pool: &BlockPool,
         prompt: &[u32],
         hashes: &[Vec<u64>],
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         scope: PrefixScope,
         public: bool,
     ) -> PrefixSelection {
@@ -2542,7 +2542,7 @@ impl PrefixCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         scope: PrefixScope,
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
     ) -> PrefixHit {
         // Public keys cover tokens only. A private continuation reuses its
         // own held state even when shared caching is disabled or the prompt
@@ -2600,7 +2600,7 @@ impl PrefixCacheCoordinator {
     /// empty.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one lookup's prompt, cache policy and source worker"
+        reason = "one lookup's prompt, cache policy and source executor"
     )]
     pub(crate) fn acquire_prefix(
         &self,
@@ -2610,7 +2610,7 @@ impl PrefixCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         scope: PrefixScope,
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
     ) -> Option<PrefixLookup> {
         if !self.matches(allocation)
             || allocation
@@ -2779,7 +2779,7 @@ impl PrefixCacheCoordinator {
         computed: usize,
         scope: PrefixScope,
         public: bool,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) {
         if (!public && scope.resume.is_none()) || !self.matches(allocation) {
             return;
@@ -2821,7 +2821,7 @@ impl PrefixCacheCoordinator {
     /// [`PrefixCacheCoordinator::acquire_prefix`], the generated tokens'
     /// through [`PrefixCacheCoordinator::extend_hashes`]), and `published`
     /// records per group how many leading pages were already published; both
-    /// advance together. A page is published once the worker has computed
+    /// advance together. A page is published once the executor has computed
     /// all of its tokens (`computed_tokens`) and while the table still holds
     /// it, so a caller that publishes after every forward, before releasing
     /// any window page, publishes every page of a sliding-window group before
@@ -2833,7 +2833,7 @@ impl PrefixCacheCoordinator {
     /// `false` when the tables or hashes do not match the groups.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one request's computed blocks, publication policy and source worker"
+        reason = "one request's computed blocks, publication policy and source executor"
     )]
     pub(crate) fn publish_computed(
         &self,
@@ -2845,7 +2845,7 @@ impl PrefixCacheCoordinator {
         draft_tokens: usize,
         published: &mut Vec<usize>,
         cache_write: bool,
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
         resume: Option<proto::request::CacheResume>,
     ) -> bool {
         let public = self.prefix_enabled && cache_write;
@@ -2951,8 +2951,8 @@ impl<'a> CachedTokens<'a> {
 mod tests {
     use super::*;
 
-    fn endpoint() -> Arc<WorkerEndpoint> {
-        Arc::new(ipc::WorkerInfo::default().endpoint)
+    fn endpoint() -> Arc<MainProcessEndpoint> {
+        Arc::new(ipc::MainProcessInfo::default().endpoint)
     }
 
     #[test]
@@ -3350,7 +3350,7 @@ mod tests {
         coordinator: &PrefixCacheCoordinator,
         pool: &BlockPool,
         prompt: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> CacheAllocation {
         let mut allocation = coordinator.empty();
         let lookup = coordinator
@@ -3391,7 +3391,7 @@ mod tests {
         prompt: &[u32],
         group: usize,
         pages: &[usize],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> Vec<PageRef> {
         let shape = coordinator.groups()[group];
         let hashes = coordinator.prefix_hashes(prompt, PrefixScope::default());
@@ -4143,9 +4143,9 @@ mod tests {
         assert_eq!(hit.cached_free_units, 3);
     }
 
-    /// Pages are rooted at the seed of what the workers that computed them
-    /// compute: a pool whose workers compute otherwise hits none of them,
-    /// but a request continuing the state those workers reached finds them
+    /// Pages are rooted at the seed of what the executors that computed them
+    /// compute: a pool whose executors compute otherwise hits none of them,
+    /// but a request continuing the state those executors reached finds them
     /// under their seed.
     #[test]
     fn a_request_continuing_another_worlds_state_finds_its_pages() {
@@ -4231,7 +4231,7 @@ mod tests {
     fn pages_past_a_filler(
         coordinator: &PrefixCacheCoordinator,
         prompt: &[u32],
-        source: &Arc<WorkerEndpoint>,
+        source: &Arc<MainProcessEndpoint>,
     ) -> BlockPool {
         let pool = BlockPool::new(16, 0);
         let filler = pool.allocate(7, 1).unwrap();
@@ -4332,7 +4332,7 @@ mod tests {
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let prompt = [1, 2, 3, 4, 5];
         let first = endpoint();
-        let second = Arc::new(WorkerEndpoint {
+        let second = Arc::new(MainProcessEndpoint {
             incarnation: "replica-loaded".into(),
             ..first.as_ref().clone()
         });
@@ -4346,7 +4346,7 @@ mod tests {
             );
             allocation
         });
-        let replacement = WorkerEndpoint {
+        let replacement = MainProcessEndpoint {
             incarnation: "reloaded".into(),
             ..first.as_ref().clone()
         };

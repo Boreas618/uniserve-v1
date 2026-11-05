@@ -1,7 +1,7 @@
 //! Host page pools (L2): equal slots of one memfd per NUMA node and page
 //! shape, and the state of every slot.
 //!
-//! The server never touches the slots' bytes. Workers map a pool and copy
+//! The server never touches the slots' bytes. Main processes map a pool and copy
 //! pages between their device cache and the slots on their own streams, at
 //! the head's direction; the server keeps which page each slot holds and
 //! who may write or read it:

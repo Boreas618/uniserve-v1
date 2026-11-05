@@ -247,7 +247,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
 
 /// Encodes `batch` as a submit request, decodes it, and returns the decoded batch.
 fn execute_round_trip(batch: Batch) -> Batch {
-    let request = WorkerRequest::submit(batch);
+    let request = MainProcessRequest::submit(batch);
     let decoded = round_trip(&request);
     decoded.batch().unwrap().clone()
 }
@@ -469,7 +469,7 @@ fn a_readout_and_its_candidate_logprobs_round_trip() {
     record.committed_tokens.clear();
     record.candidate_logprobs = vec![-0.25, -3.5, -17.75];
     let report = batch_output(5, vec![record], Vec::new(), None, None);
-    let decoded = round_trip(&WorkerResponse::result(report.clone()));
+    let decoded = round_trip(&MainProcessResponse::result(report.clone()));
     assert_eq!(decoded.output().unwrap(), &report);
 }
 
@@ -553,7 +553,7 @@ fn a_canvas_step_its_sampling_and_its_block_round_trip() {
     record.prompt_logprobs.clear();
     record.committed_tokens = (0..256).collect();
     let report = batch_output(6, vec![record], Vec::new(), None, None);
-    let decoded = round_trip(&WorkerResponse::result(report.clone()));
+    let decoded = round_trip(&MainProcessResponse::result(report.clone()));
     assert_eq!(decoded.output().unwrap(), &report);
 }
 
@@ -790,7 +790,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
                     tensor: TensorTransfer {
                         shape: vec![4],
                         locations: vec![Locator {
-                            source: WorkerInfo::default().endpoint,
+                            source: MainProcessInfo::default().endpoint,
                             transport,
                             nbytes: 16,
                             dtype: "float32".into(),
@@ -819,7 +819,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
         assert!(original.merge_locations(&stale).is_err());
         assert_eq!(*original, before);
         original.merge_locations(&replica).unwrap();
-        let decoded = round_trip(&WorkerResponse::result(report.clone()));
+        let decoded = round_trip(&MainProcessResponse::result(report.clone()));
         assert_eq!(decoded.output().unwrap(), &report);
 
         // Other product dtypes round-trip with locator byte sizes that follow
@@ -836,7 +836,7 @@ fn export_round_trips_its_registered_view_and_endpoint() {
                 location.dtype = storage_dtype.into();
                 location.nbytes = nbytes;
             }
-            let decoded = round_trip(&WorkerResponse::result(typed_report.clone()));
+            let decoded = round_trip(&MainProcessResponse::result(typed_report.clone()));
             assert_eq!(decoded.output().unwrap(), &typed_report);
         }
     }
@@ -866,7 +866,7 @@ fn tensor_export_preserves_static_axes_within_dynamic_capacity() {
                 tensor: TensorTransfer {
                     shape: shape.clone(),
                     locations: vec![Locator {
-                        source: WorkerInfo::default().endpoint,
+                        source: MainProcessInfo::default().endpoint,
                         transport: TransferTransport::PosixShm {
                             endpoint: "tensor-publisher".into(),
                             name: "bounded-tensor".into(),
@@ -917,7 +917,7 @@ fn unchanged_cache_export_round_trips_without_physical_tensors() {
         None,
         None,
     );
-    let decoded = round_trip(&WorkerResponse::result(report.clone()));
+    let decoded = round_trip(&MainProcessResponse::result(report.clone()));
     assert_eq!(decoded.output().unwrap(), &report);
 
     // A grown extent must carry the tensors of its suffix.
@@ -935,7 +935,7 @@ fn unchanged_cache_export_round_trips_without_physical_tensors() {
 #[test]
 fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
     let shard = |offset: Vec<u64>, shape: Vec<u64>| Locator {
-        source: WorkerInfo::default().endpoint,
+        source: MainProcessInfo::default().endpoint,
         transport: TransferTransport::PosixShm {
             endpoint: "tensor-publisher".into(),
             name: "tensor-shard".into(),
@@ -971,7 +971,7 @@ fn raw_cache_export_round_trips_page_representation_and_exact_request() {
     let tensor = |name: &str, dtype: &str, shape: Vec<u64>, itemsize: u64| TensorTransfer {
         shape: shape.clone(),
         locations: vec![Locator {
-            source: WorkerInfo::default().endpoint,
+            source: MainProcessInfo::default().endpoint,
             transport: TransferTransport::PosixShm {
                 endpoint: "uniserve-cache-publisher".into(),
                 name: name.into(),
@@ -1039,7 +1039,7 @@ fn raw_cache_export_round_trips_page_representation_and_exact_request() {
             None,
             None,
         );
-        let decoded = round_trip(&WorkerResponse::result(report.clone()));
+        let decoded = round_trip(&MainProcessResponse::result(report.clone()));
         assert_eq!(decoded.output().unwrap(), &report);
 
         // Zero generations, a zero block size, a group starting before the
@@ -1080,7 +1080,7 @@ fn error_completion_round_trips_with_its_error_code() {
     record.status = CallStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
     let report = batch_output(6, vec![record.clone()], Vec::new(), None, None);
-    let decoded = round_trip(&WorkerResponse::result(report));
+    let decoded = round_trip(&MainProcessResponse::result(report));
     assert_eq!(
         decoded.output().unwrap().completions().next().unwrap(),
         &record
@@ -1096,7 +1096,7 @@ fn a_refused_completion_round_trips_with_its_reason() {
     record.error_code = Some(ErrorCode::InputError);
     record.error_message = Some("the conditions take 7808 denoiser rows".to_owned());
     let report = batch_output(6, vec![record.clone()], Vec::new(), None, None);
-    let decoded = round_trip(&WorkerResponse::result(report));
+    let decoded = round_trip(&MainProcessResponse::result(report));
     assert_eq!(
         decoded.output().unwrap().completions().next().unwrap(),
         &record
@@ -1217,7 +1217,7 @@ fn a_media_admission_without_conditioning_is_refused() {
 fn maximum_media_prompt_round_trips() {
     let prompt_token_ids = (0..16_384_u32).map(|index| 100_000 + index).collect();
     let admission = media_admission(prompt_token_ids);
-    let request = WorkerRequest::submit(batch_with_calls(
+    let request = MainProcessRequest::submit(batch_with_calls(
         5,
         vec![admission.clone()],
         vec![call_for(
@@ -1286,7 +1286,7 @@ fn batch_inputs_require_a_consumer_for_their_payload_kind() {
             tensor: TensorTransfer {
                 shape: vec![2],
                 locations: vec![Locator {
-                    source: WorkerInfo::default().endpoint,
+                    source: MainProcessInfo::default().endpoint,
                     transport: TransferTransport::Local {
                         endpoint: "encoder".into(),
                         key: 1,
@@ -1415,7 +1415,7 @@ fn call_sampling_state_preserves_whitelist_presence() {
             transition_token_ids: vec![13, 29],
             force_finish: true,
         });
-        let request = WorkerRequest::submit(batch_with_calls(1, Vec::new(), vec![call]));
+        let request = MainProcessRequest::submit(batch_with_calls(1, Vec::new(), vec![call]));
         assert_eq!(round_trip(&request), request);
     }
 }
@@ -1484,14 +1484,14 @@ fn batch_allows_a_duplicate_identical_command() {
 }
 
 #[test]
-fn worker_info_round_trips() {
-    let info = WorkerInfo {
+fn main_process_info_round_trips() {
+    let info = MainProcessInfo {
         prefix_cache: Some(PrefixCacheInfo {
             groups: vec![CacheGroup {
                 layer_ids: (11..20).collect(),
-                ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
+                ..MainProcessInfo::default().prefix_cache.unwrap().groups[0].clone()
             }],
-            ..WorkerInfo::default().prefix_cache.unwrap()
+            ..MainProcessInfo::default().prefix_cache.unwrap()
         }),
         components: vec![ComponentInfo {
             name: "denoiser".into(),
@@ -1530,9 +1530,9 @@ fn worker_info_round_trips() {
         }],
         ..Default::default()
     };
-    let response = WorkerResponse::info(info.clone());
+    let response = MainProcessResponse::info(info.clone());
     let decoded = round_trip(&response);
-    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+    let MainProcessResponse::Info { info: decoded, .. } = decoded else {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
@@ -1589,8 +1589,8 @@ fn a_component_round_trips_with_every_sequence_parallel_strategy() {
 }
 
 #[test]
-fn cache_free_worker_info_round_trips() {
-    let info = WorkerInfo {
+fn cache_free_main_process_info_round_trips() {
+    let info = MainProcessInfo {
         media_components: video_components(),
         supported_calls: video_components()
             .into_keys()
@@ -1599,19 +1599,19 @@ fn cache_free_worker_info_round_trips() {
         prefix_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
-        ..WorkerInfo::default()
+        ..MainProcessInfo::default()
     };
-    let response = WorkerResponse::info(info.clone());
+    let response = MainProcessResponse::info(info.clone());
     let decoded = round_trip(&response);
-    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+    let MainProcessResponse::Info { info: decoded, .. } = decoded else {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
 }
 
 #[test]
-fn worker_info_rejects_duplicate_set_members() {
-    let info = WorkerInfo {
+fn main_process_info_rejects_duplicate_set_members() {
+    let info = MainProcessInfo {
         supported_calls: vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::Decode),
@@ -1626,7 +1626,7 @@ fn worker_info_rejects_duplicate_set_members() {
 /// two dividing the largest one; a layer belongs to one group; heads stay
 /// within their logical bounds.
 #[test]
-fn worker_info_rejects_inconsistent_cache_groups() {
+fn main_process_info_rejects_inconsistent_cache_groups() {
     let valid = full_caps();
     assert!(valid.clone().validate().is_ok());
     let cases: [fn(&mut PrefixCacheInfo); 5] = [
@@ -1851,19 +1851,19 @@ fn comprehensive_batches() -> Vec<Batch> {
 }
 
 /// One fixture per `RequestKind`, plus call-id coverage on the submit frame.
-fn request_fixtures() -> Vec<WorkerRequest> {
-    let mut submit = WorkerRequest::submit(
+fn request_fixtures() -> Vec<MainProcessRequest> {
+    let mut submit = MainProcessRequest::submit(
         comprehensive_batches()
             .into_iter()
             .next()
             .expect("one batch per call kind"),
     );
     submit.set_message_id(Some(91));
-    vec![WorkerRequest::info(), submit, WorkerRequest::close()]
+    vec![MainProcessRequest::info(), submit, MainProcessRequest::close()]
 }
 
-fn full_caps() -> WorkerInfo {
-    WorkerInfo {
+fn full_caps() -> MainProcessInfo {
+    MainProcessInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
         media_components: video_components(),
@@ -1875,17 +1875,17 @@ fn full_caps() -> WorkerInfo {
             groups: vec![
                 CacheGroup {
                     layer_ids: (0..14).collect(),
-                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
+                    ..MainProcessInfo::default().prefix_cache.unwrap().groups[0].clone()
                 },
                 CacheGroup {
                     kind: CacheGroupKind::SlidingWindow { window: 4096 },
                     block_size: 32,
                     units_per_page: 2,
                     layer_ids: (14..28).collect(),
-                    ..WorkerInfo::default().prefix_cache.unwrap().groups[0].clone()
+                    ..MainProcessInfo::default().prefix_cache.unwrap().groups[0].clone()
                 },
             ],
-            ..WorkerInfo::default().prefix_cache.unwrap()
+            ..MainProcessInfo::default().prefix_cache.unwrap()
         }),
         max_batch_calls: 64,
         max_batch_tokens: 4096,
@@ -1893,7 +1893,7 @@ fn full_caps() -> WorkerInfo {
         max_unresolved_calls: 3,
         latent_page_units: 64,
         latent_pages: 17,
-        ..WorkerInfo::default()
+        ..MainProcessInfo::default()
     }
 }
 
@@ -2033,26 +2033,26 @@ fn full_run_result() -> BatchOutput {
 
 /// One fixture per `ResponseKind`, plus a second info frame that
 /// exercises non-default worker information.
-fn response_fixtures() -> Vec<WorkerResponse> {
+fn response_fixtures() -> Vec<MainProcessResponse> {
     vec![
-        WorkerResponse::Info {
+        MainProcessResponse::Info {
             message_id: None,
-            info: WorkerInfo::default(),
+            info: MainProcessInfo::default(),
         },
-        WorkerResponse::Info {
+        MainProcessResponse::Info {
             message_id: Some(17),
             info: full_caps(),
         },
-        WorkerResponse::Result {
+        MainProcessResponse::Result {
             message_id: Some(17),
             result: full_run_result(),
         },
-        WorkerResponse::Ok {
+        MainProcessResponse::Ok {
             message_id: Some(17),
         },
-        WorkerResponse::Error {
+        MainProcessResponse::Error {
             message_id: Some(17),
-            error: WorkerResponseError {
+            error: MainProcessResponseError {
                 message: "device fault on decode".into(),
                 code: Some(ErrorCode::ComputeError),
                 fatal: false,
@@ -2070,7 +2070,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
                 ],
             },
         },
-        WorkerResponse::Stalled {
+        MainProcessResponse::Stalled {
             stall: Stall {
                 batch_id: Some(12),
                 route: Some("decode".into()),
@@ -2131,7 +2131,7 @@ fn every_response_kind_round_trips_through_ipc() {
 
 #[test]
 fn a_frame_states_the_length_of_the_message_it_carries() {
-    let frame = Frame::encode(&WorkerRequest::info()).unwrap();
+    let frame = Frame::encode(&MainProcessRequest::info()).unwrap();
     let (field, message) = frame.as_bytes().split_at(Frame::LENGTH_BYTES);
 
     assert_eq!(Frame::message_len(field.try_into().unwrap()), message.len());
@@ -2139,16 +2139,16 @@ fn a_frame_states_the_length_of_the_message_it_carries() {
 
 #[test]
 fn a_frame_decodes_only_as_the_message_it_carries() {
-    let request = Frame::encode(&WorkerRequest::info()).unwrap();
+    let request = Frame::encode(&MainProcessRequest::info()).unwrap();
     assert!(matches!(
-        request.decode::<WorkerResponse>(),
+        request.decode::<MainProcessResponse>(),
         Err(IpcError::Encoding(_))
     ));
 
     // A message cut short, as a frame of another build may be, is refused:
     // the frame's length field counts the shortened message, so a channel
     // receives it whole and its decoding fails.
-    let mut cut = Frame::encode(&WorkerResponse::ok()).unwrap().into_bytes();
+    let mut cut = Frame::encode(&MainProcessResponse::ok()).unwrap().into_bytes();
     cut.pop();
     let length = u32::try_from(cut.len() - Frame::LENGTH_BYTES).unwrap();
     cut[..Frame::LENGTH_BYTES].copy_from_slice(&length.to_le_bytes());
@@ -2160,7 +2160,7 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let received = loop {
-        match channel.try_recv::<WorkerResponse>() {
+        match channel.try_recv::<MainProcessResponse>() {
             Ok(None) => {
                 assert!(Instant::now() < deadline, "the cut frame did not arrive");
                 channel.wait(Duration::from_millis(50)).unwrap();
