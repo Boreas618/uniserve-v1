@@ -51,6 +51,7 @@ fn run() -> Result<(), String> {
     let mut width = 768_u32;
     let mut extents_path: Option<PathBuf> = None;
     let mut arena_bytes: Option<u64> = None;
+    let mut check = false;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -64,6 +65,7 @@ fn run() -> Result<(), String> {
             "--height" => height = count(&value()?, "--height")?,
             "--width" => width = count(&value()?, "--width")?,
             "--extents" => extents_path = Some(PathBuf::from(value()?)),
+            "--check" => check = true,
             "--arena" => {
                 arena_bytes = Some(
                     value()?
@@ -235,6 +237,32 @@ fn run() -> Result<(), String> {
                 std::cmp::Ordering::Less => format!("{} B of slack", reserved - asked),
             }
         );
+        // The set is the encoder's own share: the caller's pixels and latent are planned beside it, so
+        // the comparison is `reserve` against the tile plan alone. A plan is an upper bound - every
+        // buffer's bytes are rounded up to the arena's alignment and the last one's trailing pad is
+        // never read - so up to `ALIGNMENT - 1` bytes of slack are expected. Anything shorter is a
+        // request the plan cannot fund, and any allocation a tile makes beyond the set is the class of
+        // defect the plan exists to prevent.
+        let set_plan = arena_reservation(&tile_plan);
+        if set_bytes > set_plan {
+            return Err(format!(
+                "`reserve` asks {set_bytes} B of a {set_plan}-byte tile plan: {} B of buffers the plan does not state",
+                set_bytes - set_plan
+            ));
+        }
+        if tile_bytes != 0 {
+            return Err(format!(
+                "one tile allocates {tile_bytes} B beyond the set it was reserved: a layer is taking buffers from the arena inside a forward"
+            ));
+        }
+        if check && set_plan - set_bytes > nn::forward::ALIGNMENT - 1 {
+            return Err(format!(
+                "the tile plan reserves {} B more than `reserve` takes, past the {} B an alignment step explains: a buffer nothing reads",
+                set_plan - set_bytes,
+                nn::forward::ALIGNMENT - 1
+            ));
+        }
+        let _ = &asked;
     }
 
     println!(
@@ -242,10 +270,9 @@ fn run() -> Result<(), String> {
         plan.len()
     );
     println!(
-        "a device run at this canvas reserved 4500302336 B for 54 buffer(s) and then asked for\n\
-         4761421312 B: the region is this plan and the requests are the forward's, so the shortfall\n\
-         is {} B of requests this list does not state",
-        4761421312_u64.saturating_sub(reserved)
+        "the region a run allocates is this plan and the requests are the forward's, so the two are one\n\
+         list: `--extents` measures them against each other, and `--check` exits non-zero when they\n\
+         disagree - a plan short by any request, or a tile that allocates inside its forward."
     );
     Ok(())
 }
