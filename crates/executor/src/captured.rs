@@ -29,7 +29,15 @@ use crate::{Error, Result};
 ///
 /// The vector is in the order the model launched the operators during capture, so a rebind walk
 /// that launches the same operators in the same order can pair the two launch by launch.
-pub type Nodes = Vec<(&'static str, String, Vec<GraphNode>)>;
+/// One walk's launches: the operator, the descriptor key it was walked under, and the nodes the
+/// launch added - each with the kinds of the edges that order it (`platform::WalkedNode`).
+///
+/// The edge kinds are part of the structure a rebind may reuse (4.5): the executable a rebind builds
+/// is instantiated from the *serving* graph's template, so it keeps that graph's edges, and a
+/// programmatic edge - which lets a downstream node start before its upstream one finishes - is not
+/// interchangeable with a completion edge. Comparing nodes alone would call two different orders the
+/// same structure.
+pub type Nodes = Vec<(&'static str, String, Vec<platform::WalkedNode>)>;
 
 /// One captured graph executable and what it was captured from.
 pub struct Captured {
@@ -88,8 +96,8 @@ impl Captured {
         }
         let mut kernel_nodes = 0u64;
         for (_, _, launch) in &nodes {
-            for node in launch {
-                if node.kind()? == platform::GraphNodeKind::Kernel {
+            for walked in launch {
+                if walked.node.kind()? == platform::GraphNodeKind::Kernel {
                     kernel_nodes += 1;
                 }
             }
@@ -187,9 +195,9 @@ impl Captured {
         // Only kernel nodes carry launch parameters: a capture also adds the empty nodes that hold
         // dependencies, and the walk's parameters were collected from the kernels alone.
         let mut kernels = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            if node.kind()? == platform::GraphNodeKind::Kernel {
-                kernels.push(node);
+        for walked in nodes {
+            if walked.node.kind()? == platform::GraphNodeKind::Kernel {
+                kernels.push(&walked.node);
             }
         }
         if kernels.len() != params.len() {
@@ -207,31 +215,76 @@ impl Captured {
     }
 
     /// Whether `nodes` is the same launch structure as this graph's: the same launches, in the
-    /// same order, each adding the same number of graph nodes.
+    /// same order, each adding the same number of graph nodes of the same kinds, ordered by the same
+    /// kinds of edges.
     ///
     /// This is 4.5's rebind condition. A launch that added a different number of nodes - a
     /// split-K reduction kernel beside the main one, a native library that launched more than one
     /// kernel inside - is a structure change, and its bucket is recaptured instead of rebound.
     /// Descriptor keys are not compared: a new program under a new key of the same operator is
     /// exactly the rebind case, and the parameters are what the walk recomputes.
+    ///
+    /// **The edges are part of the structure.** A rebind instantiates a fresh executable from the
+    /// *serving* graph's template and sets node parameters on it, so the prepared generation keeps
+    /// the serving graph's edges; a programmatic edge lets a downstream node start before its
+    /// upstream node has finished, so a structure in which one kind replaced the other is a
+    /// structure in which the two graphs do not order their work alike. It is recaptured.
     pub fn same_structure(&self, nodes: &Nodes) -> Result<bool> {
+        Ok(self.structure_mismatch(nodes)?.is_none())
+    }
+
+    /// Why `nodes` is not this graph's launch structure, or `None` when it is.
+    ///
+    /// The reason a recapture states, so a bucket that was recaptured says which fact decided it:
+    /// a count, a node's kind, or an edge that became programmatic.
+    pub fn structure_mismatch(&self, nodes: &Nodes) -> Result<Option<String>> {
         if self.nodes.len() != nodes.len() {
-            return Ok(false);
+            return Ok(Some(format!(
+                "the walk launched {} operator(s) and the serving graph {}",
+                nodes.len(),
+                self.nodes.len()
+            )));
         }
-        for ((operator, _, mine), (walked, _, theirs)) in self.nodes.iter().zip(nodes) {
-            if operator != walked || mine.len() != theirs.len() {
-                return Ok(false);
+        for (launch, ((operator, _, mine), (walked, _, theirs))) in
+            self.nodes.iter().zip(nodes).enumerate()
+        {
+            if operator != walked {
+                return Ok(Some(format!(
+                    "launch {launch} is {walked} in the walk and {operator} in the serving graph"
+                )));
+            }
+            if mine.len() != theirs.len() {
+                return Ok(Some(format!(
+                    "launch {launch} of {operator} added {} node(s) in the walk and {} when the \
+                     serving graph was captured",
+                    theirs.len(),
+                    mine.len()
+                )));
             }
             // The kinds matter as much as the count: a rebind carries each kernel node's
             // parameters over to the live graph by position, so a launch whose nodes changed from
             // kernel-then-empty to empty-then-kernel has the same length and a different meaning.
-            for (live, fresh) in mine.iter().zip(theirs) {
-                if live.kind()? != fresh.kind()? {
-                    return Ok(false);
+            for (index, (live, fresh)) in mine.iter().zip(theirs).enumerate() {
+                let kind = live.node.kind()?;
+                if kind != fresh.node.kind()? {
+                    return Ok(Some(format!(
+                        "launch {launch} of {operator} node {index} is {:?} in the walk and {:?} \
+                         when the serving graph was captured",
+                        fresh.node.kind()?,
+                        kind
+                    )));
+                }
+                if live.incoming != fresh.incoming {
+                    return Ok(Some(format!(
+                        "launch {launch} of {operator} node {index} is ordered by {:?} edges in \
+                         the walk and by {:?} when the serving graph was captured: an edge kind \
+                         decides how much the two nodes may overlap",
+                        fresh.incoming, live.incoming
+                    )));
                 }
             }
         }
-        Ok(true)
+        Ok(None)
     }
 
     /// How many launches of `operator` the capture recorded.
