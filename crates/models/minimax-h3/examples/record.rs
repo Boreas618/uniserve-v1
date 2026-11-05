@@ -155,11 +155,18 @@ fn run() -> Result<(), String> {
             "--clip" => clip = value()?.parse().map_err(|_| "clip is a count of frames")?,
             "--raster" => {
                 let stated = value()?;
-                let (w, h) = stated.split_once('x').ok_or("--raster is <width>x<height>")?;
+                // **The walk's own order: height first.** `programs.rs --rasters` splits `HxW`, and
+                // the first axis here is the one the pixel tensor's rows are (`--raster`'s message
+                // said the opposite for a while, which is how a portrait canvas got recorded against
+                // a landscape walk).
+                let (h, w) = stated
+                    .split_once('x')
+                    .ok_or("--raster is <height>x<width>, as the walk's --rasters")?;
                 let pair = (
                     w.parse().map_err(|_| "--raster's width is a count")?,
                     h.parse().map_err(|_| "--raster's height is a count")?,
                 );
+                let pair = (pair.1, pair.0);
                 claimed.push(pair);
                 if claimed.len() == 1 {
                     raster = pair;
