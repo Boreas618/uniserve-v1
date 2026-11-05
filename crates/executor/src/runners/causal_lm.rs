@@ -1647,6 +1647,15 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // row `slot` of the cache's pooled table, so the row must state the request's own
                 // pages before the graph reads it, and the units must be this cache's before
                 // anything is copied into them.
+                // The page the batch's first row starts at, read from the staged table before the
+                // install consumes it: the dump digests the pages the replay has just written, and
+                // the row's own first page is where the prompt's first tokens live (4.5).
+                let first_page = self
+                    .pending_install
+                    .as_ref()
+                    .and_then(|install| install.tables.first())
+                    .and_then(|table| table.unit_ids.first())
+                    .map(|unit| u64::from(unit.0));
                 self.install_pending(*batch)?;
                 // Then the batch's columns are uploaded here, on the device thread, before the
                 // graph reads them: the scheduler hands over a `Batch` and the device thread
@@ -1696,7 +1705,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 if runner_dump() {
-                    let call = self.dump_attention_call(captured);
+                    let call = self.dump_attention_call(captured, first_page);
                     self.pending_attention = Some(call);
                 }
                 if runner_dump() {
@@ -2458,7 +2467,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ///
     /// It runs on the device thread, after the replay that wrote the pages, and every failure is
     /// text: a diagnosis never fails the batch it describes.
-    fn dump_attention_call(&self, captured: &crate::captured::Captured) -> String {
+    fn dump_attention_call(
+        &self,
+        captured: &crate::captured::Captured,
+        first_page: Option<u64>,
+    ) -> String {
         use ops::attention::PAGED_ATTENTION_CALL_LAYOUT as LAYOUT;
         let Some((operator, key, launch)) = captured
             .nodes()
@@ -2691,6 +2704,56 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 digests.push_str(&format!(" {plane}={base:#x}/{digest}"));
             }
             out.push_str(&format!(" layer{layer}={digests}"));
+        }
+        // The same digests taken from the runner's own planes and the table it installed, so the
+        // comparison with a slice's line does not depend on what the launch kept: a package that
+        // unpacks the call into host memory holds no pointer here, and the pages are the runner's
+        // whatever the kernel was handed.
+        out.push_str(&self.dump_cache_digests(first_page));
+        out
+    }
+
+    /// One digest per layer of the keys and values the replay just wrote into the batch's pages.
+    ///
+    /// The slice prints the same numbers for the same tokens (`crates/models/qwen3-moe/examples/
+    /// qwen3_moe_slice.rs`, `kv layer<n>: k=… v=…`): `platform::fnv1a` over the bytes of the row's
+    /// first page that hold this batch's tokens, so the first layer whose numbers differ is the
+    /// layer where the served path stopped computing the slice's arithmetic. Unlike the call
+    /// readback this needs nothing from the launch - the planes are this runner's resident cache
+    /// and the page is the one it installed - so it is printed even when the launch's arguments are
+    /// not addresses this runner may read.
+    fn dump_cache_digests(&self, first_page: Option<u64>) -> String {
+        let Some(page) = first_page else {
+            return " cache=no-page".to_owned();
+        };
+        let planes = match self.kv.planes(0) {
+            Ok(planes) => planes,
+            Err(error) => return format!(" cache=refused({error})"),
+        };
+        let page_size = u64::from(self.kv.page_size()).max(1);
+        let element = self.kv.dtype().bytes().unwrap_or(1).max(1);
+        let live = self.staging.live_tokens().max(1);
+        let held = page_size.min(live);
+        let mut out = String::from(" cache:");
+        for (layer, plane) in planes.iter().enumerate() {
+            let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
+            let page_elements = page_size.saturating_mul(token_elements);
+            let bytes = usize::try_from(
+                held.saturating_mul(token_elements).saturating_mul(element),
+            )
+            .unwrap_or(0);
+            if bytes == 0 || token_elements == 0 {
+                continue;
+            }
+            out.push_str(&format!(" layer{layer}="));
+            for (name, view) in [("k", plane.key), ("v", plane.value)] {
+                let start = view.ptr.address()
+                    + page.saturating_mul(page_elements).saturating_mul(element);
+                match self.read_device(start, bytes) {
+                    Some(raw) => out.push_str(&format!("{name}={:016x} ", platform::fnv1a(&raw))),
+                    None => out.push_str(&format!("{name}=unreadable ")),
+                }
+            }
         }
         out
     }
