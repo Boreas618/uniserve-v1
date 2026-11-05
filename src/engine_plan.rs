@@ -1242,7 +1242,7 @@ impl EpochPlan {
             info.video_denoiser = Some(denoiser_report(
                 pipeline,
                 &self.build.video,
-                &config.tasks(),
+                &config.serving(),
             )?);
         }
         Ok((memory, info, graph))
