@@ -100,6 +100,7 @@ enum Stage {
     Weights,
     Decode,
     Raster,
+    Plan,
 }
 
 #[derive(Clone)]
@@ -172,9 +173,10 @@ impl Args {
                         "weights" => Stage::Weights,
                         "decode" => Stage::Decode,
                         "raster" => Stage::Raster,
+                        "plan" => Stage::Plan,
                         other => {
                             return Err(Failure::message(format!(
-                                "unknown stage `{other}`; expected weights, decode or raster"
+                                "unknown stage `{other}`; expected weights, decode, raster or plan"
                             )));
                         }
                     };
@@ -268,6 +270,7 @@ fn run() -> Result<()> {
         Stage::Weights => stage_weights(&args),
         Stage::Decode => stage_decode(&args),
         Stage::Raster => stage_raster(&args),
+        Stage::Plan => stage_plan(&args),
     }
 }
 
@@ -981,6 +984,59 @@ fn stage_decode(args: &Args) -> Result<()> {
 /// The input is the container `--stage decode` writes as `<out>/video_decoder/raster.h3t` -
 /// `[frames, rows, columns, channels]` FP32 - so the two stages chain without a conversion nobody
 /// recorded.
+/// Print the decoder's arena plan, and the tile grid it is derived from, with no device and no weights.
+///
+/// The plan is what the executor sizes the arena by, so a plan that is wrong is a run that stops with
+/// "the arena cannot give out" partway through a clip - the most expensive place to learn it. Every
+/// entry here is computed from the config and the canvas alone, so this stage answers on a host with no
+/// GPU, no store and no checkpoint shards, and it answers for a canvas the caller names rather than for
+/// the one this machine happens to serve.
+fn stage_plan(args: &Args) -> Result<()> {
+    let config = args.configuration()?;
+    let canvas = {
+        let mut canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
+        if let Some(frames) = args.frames {
+            canvas.frames = frames;
+        }
+        canvas
+    };
+    // The video VAE is F32 in every export this model serves (`component-tensors.json`: 703 tensors,
+    // all F32), and `--stage decode` pins the latent container to the checkpoint's own type for the
+    // same reason. The plan's element types follow the decode's, so the plan is stated at that type.
+    let dtype = nn::DType::F32;
+    let (height, width) = canvas.pixels(&config.video_vae);
+    let tiles = minimax_h3::video_vae::Tiles::of(&config.video_vae, &canvas)?;
+    let grid = tiles.tiles(&config.video_vae, &canvas);
+    println!(
+        "canvas: {} latent frames of {} x {} -> {} frames of {} x {} pixels, {} tile(s)",
+        canvas.frames,
+        canvas.height,
+        canvas.width,
+        canvas.frames_out(&config.video_vae),
+        height,
+        width,
+        grid.len()
+    );
+    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
+    let mut total = 0_u64;
+    for buffer in &plan {
+        let bytes = buffer.bytes();
+        total += buffer.reservation();
+        println!(
+            "  {:<14} {:<4} {:>12} elements {:>14} bytes",
+            buffer.name, buffer.element, buffer.elements, bytes
+        );
+    }
+    println!(
+        "plan: {} buffer(s), {} bytes = {} MiB (reserved {} MiB in the arena)",
+        plan.len(),
+        total,
+        total / (1 << 20),
+        plan.iter().map(|b| b.reservation()).sum::<u64>() / (1 << 20)
+    );
+    Ok(())
+}
+
 fn stage_raster(args: &Args) -> Result<()> {
     let (latent_frames, latent_height, latent_width, latent_path) = encode_raster(args)?;
     // The decode is the `decode` stage, unchanged: the same arithmetic, the same page, the same
