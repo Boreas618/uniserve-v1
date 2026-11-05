@@ -630,10 +630,23 @@ impl InProcess {
             return Ok((device, calls));
         }
         let columns = batch.columns.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "batch {} carries no columns: the mechanism could not state the layout its kernels read",
-                batch.id
-            )
+            // A media batch that arrives without its own columns is a different fact from a token
+            // batch without a layout: the mechanism states a media computation's per-request buffers
+            // only for the families it has a record for, so the refusal names the family rather than
+            // the token layout that batch never had.
+            match batch.requests.first().map(|(call, _)| call.kind) {
+                Some(ipc::CallKind::Media(call)) => anyhow::anyhow!(
+                    "batch {} states no media columns: the mechanism stages no per-request buffers \
+                     for a {:?} computation",
+                    batch.id,
+                    call
+                ),
+                _ => anyhow::anyhow!(
+                    "batch {} carries no columns: the mechanism could not state the layout its \
+                     kernels read",
+                    batch.id
+                ),
+            }
         })?;
         let mut calls = Vec::with_capacity(batch.requests.len());
         let mut kind = None;
@@ -964,8 +977,8 @@ mod tests {
             .expect_err("a batch with no columns of either family is refused");
         let text = format!("{refusal}");
         assert!(
-            text.contains("no columns"),
-            "the refusal says which statement is missing: {text}"
+            text.contains("states no media columns") && text.contains("Denoising"),
+            "the refusal names the family whose buffers nobody staged: {text}"
         );
         assert!(
             delivered
