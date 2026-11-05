@@ -2,14 +2,12 @@
 
 use std::sync::Arc;
 
-use tokenizers::models::bpe::{BPE, Vocab};
+use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use crate::tokenizer::DynTokenizer;
 
-use super::{
-    DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser,
-};
+use super::{DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser};
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
 /// and `<|im_end|>`, which stands in for a chat-turn boundary.
