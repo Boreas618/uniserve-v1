@@ -99,7 +99,7 @@ impl Scheduler {
             // submitted beside the serving one (7.3 step 2). The copy is made
             // only when an update asked, and before the serving submit takes the
             // batch.
-            let shadow = self.shadow_generation();
+            let shadow = self.shadow_generation(&batch);
             let shadow_batch = shadow.map(|_| batch.clone());
             // The `Finish` commands this batch carries close the rows of the
             // requests they name once it is submitted: batches reach a rank in
@@ -137,8 +137,12 @@ impl Scheduler {
                     // as the serving submit does. A refused pass is answered at
                     // once, because waiting will not shadow it.
                     if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
+                        let shape = shadow_batch
+                            .columns
+                            .as_ref()
+                            .map(crate::scheduler::batching::columns::batch_shape);
                         match self.executor.shadow(shadow_batch, generation) {
-                            Ok(()) => self.note_shadowed(),
+                            Ok(()) => self.note_shadowed(shape),
                             Err(ExecutorSubmitError::Failed(error)) => {
                                 self.shadow_failed(format!("{error:#}"));
                             }
@@ -342,6 +346,9 @@ impl Scheduler {
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
+        if progressed {
+            self.progress.wake();
+        }
         progressed
     }
 
@@ -897,6 +904,7 @@ impl Scheduler {
                 );
                 self.policy_report = Some(report);
                 self.policy = Some(policy);
+                self.seed_from_policy();
             }
             Err(fatal) => {
                 // Both failures are named: the one that ended the policy, which
@@ -1110,6 +1118,15 @@ impl Scheduler {
                 && self.inflight.pending_submissions.is_empty(),
             "a policy is adopted at a batch boundary"
         );
+        self.policy = Some(policy);
+        self.seed_from_policy();
+    }
+
+    /// States the page table and the recorder from the instance that serves
+    /// now, which every change of instance does: a mechanism that kept the
+    /// table of the instance before it would judge the new one's answers by a
+    /// state it was never told.
+    pub(super) fn seed_from_policy(&mut self) {
         // The epoch's page table is walked once, here, so every later step costs
         // what changed: the policy was handed the same table in its snapshot.
         self.pages = views::page_index(self);
@@ -1118,9 +1135,10 @@ impl Scheduler {
         // observed. Seeding the recorder from that same snapshot is what keeps
         // the next step's events proportional to what changed after it, rather
         // than one `Updated` per live request to a policy that already knows.
-        let snapshot = policy.instantiated_on().clone();
-        self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
-        self.policy = Some(policy);
+        if let Some(policy) = self.policy.as_ref() {
+            let snapshot = policy.instantiated_on().clone();
+            self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
+        }
     }
 
     /// Tells the policy that the encoder entry `key` is live, with the last use

@@ -836,6 +836,9 @@ impl MainProcess {
         // the reports of §7.3, and every command of the program layer - travels on this one.
         let mut process =
             ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
+        // Every command of the program layer arrives on this socket, and a stage waits for the
+        // command before it: the control thread sleeps on it as it does on the request socket.
+        control.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -940,7 +943,15 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
+        let schedulers = schedulers(
+            &plan,
+            launch,
+            &memory,
+            &model,
+            &executors,
+            &inventory,
+            control.wake(),
+        )?;
 
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
@@ -1177,6 +1188,13 @@ impl MainProcess {
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
+            // A transition moves one stage a pass, and what ends a stage is a device, a Program
+            // Server or a scheduler rather than a socket. Passes run back to back while one is in
+            // flight, so each stage costs what its work costs: a recovery is made of these stages,
+            // and a client's stream stands still for all of them.
+            if self.precopy.is_some() || !self.warming.is_empty() || self.draining.is_some() {
+                due = due.min(Instant::now() + TRANSITION_POLL);
+            }
             let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
@@ -1202,7 +1220,8 @@ impl MainProcess {
                             return Ok(Some(failure));
                         }
                     }
-                    Ready::Woken | Ready::Idle => {}
+                    // What these announce is read by the pass below, whatever woke it.
+                    Ready::Process | Ready::Woken | Ready::Idle => {}
                 }
             }
 
@@ -1223,6 +1242,7 @@ impl MainProcess {
             // successor holds the deployment: this process is still serving it, and ending here
             // would leave the successor with a front into nothing (§7.5.1).
             if self.process.closed() {
+                self.control.watch_process(None);
                 let serving = self.control.live_attached();
                 if serving == 0 {
                     self.stopping = true;
@@ -2056,7 +2076,7 @@ impl MainProcess {
                 continue;
             };
             return Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend: backend.clone(),
                     revision: *revision,
@@ -2073,7 +2093,7 @@ impl MainProcess {
         // holds, which reads as a store defect and is not one.
         match declared_program(&self.listing()?.packages, operator) {
             Some((op, backend, revision)) => Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend,
                     revision,
@@ -2169,6 +2189,17 @@ impl MainProcess {
                 keys = declared;
             }
             keys.append(&mut known);
+            // A slot of a divided operator holds its own package's descriptors alone: a generation
+            // that launched the operator states all of them.
+            if slot.part.is_some() {
+                if listing.is_none() {
+                    listing = Some(self.listing().map_err(invalid)?);
+                }
+                if let Some(store) = listing.as_ref() {
+                    let built = built_keys(store, &slot.op, program, &self.targets);
+                    keys.retain(|key| built.contains(key));
+                }
+            }
             keys.sort_unstable();
             keys.dedup();
             let group = groups
@@ -3603,6 +3634,7 @@ impl MainProcess {
             self.serving = true;
             return Ok(());
         };
+        let bound = self.watchdog.stall_bound();
         for (scheduler, cache) in self.schedulers.iter().zip(parked) {
             // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
             // from a predecessor: it is the same world, and the requests it ended at the drain are
@@ -3610,6 +3642,13 @@ impl MainProcess {
             scheduler
                 .promote(cache, true, false)
                 .context("resuming a scheduler")?;
+            // The promotion states the cache; it is the resume that ends the park. A scheduler left
+            // parked takes requests into its queue and admits none of them.
+            match scheduler.resume(true).recv_timeout(bound) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => bail!("resuming a scheduler: {reason}"),
+                Err(error) => bail!("resuming a scheduler: no answer within {bound:?}: {error}"),
+            }
         }
         self.serving = true;
         Ok(())
@@ -4987,6 +5026,9 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
 /// seconds, so the poll costs a wake per tenth of a second for the length of the window.
 const PROBATION_POLL: Duration = Duration::from_millis(100);
+
+/// How long a serve pass sleeps while a precopy, a warmup or a drain is in flight.
+const TRANSITION_POLL: Duration = Duration::from_millis(1);
 
 /// How often a device that is busy delays the question asked of the policy slots: a probe that finds
 /// a device running proves nothing about whether a policy serves, so it is asked again after this.
@@ -6410,6 +6452,13 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
 }
 
 fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+    // An epoch switch commits its target, whose programs were committed when the daemon handed them
+    // over: the generation it names already serves with nothing on trial, so the answer is that.
+    if update.current() == generation
+        && matches!(update.phase(), executor::hot_update::Phase::Serving)
+    {
+        return ProgramStatus::Committed { generation };
+    }
     match update.commit(generation) {
         Ok(()) => ProgramStatus::Committed { generation },
         Err(error) => {
@@ -6608,12 +6657,30 @@ fn operator_slots(
     let slot = |phase: Option<PhaseKind>| ProgramSlot {
         op: op.to_owned(),
         phase,
+        part: None,
     };
     let (claims, refusal) = split_claims(holders);
     if refusal.is_none() && claims.len() > 1 {
         return claims
             .into_iter()
             .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
+            .collect();
+    }
+    // Packages whose built keys share none divide the operator by descriptor - a bf16 module and an
+    // f32 one, whose keys state no phase - so each holds a slot of its own: one program would serve
+    // its own keys and refuse the other's at the first capture that launches them.
+    if divides_descriptors(holders) {
+        return holders
+            .iter()
+            .map(|(program, _)| {
+                (
+                    ProgramSlot {
+                        part: Some(program.backend.clone()),
+                        ..slot(None)
+                    },
+                    program.clone(),
+                )
+            })
             .collect();
     }
     // The fallback is right - a wrong split would have a package asked for a key it cannot build -
@@ -6637,6 +6704,19 @@ fn operator_slots(
         Some(program) => vec![(slot(None), program.clone())],
         None => Vec::new(),
     }
+}
+
+/// Whether every package built keys of its own, none of them shared: then each one's descriptors are
+/// its alone, and the generation needs them all.
+fn divides_descriptors(holders: &[(Program, Vec<String>)]) -> bool {
+    if holders.len() < 2 || holders.iter().any(|(_, keys)| keys.is_empty()) {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    holders
+        .iter()
+        .flat_map(|(_, keys)| keys)
+        .all(|key| seen.insert(key))
 }
 
 /// The phases an operator's packages claim, and - when they cannot be split across them - why.
@@ -6786,6 +6866,7 @@ fn resolve_slots(
                     ProgramSlot {
                         op: op.clone(),
                         phase: *phase,
+                        part: None,
                     },
                     program.clone(),
                 );
@@ -6931,6 +7012,7 @@ fn schedulers(
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
+    control: ipc::Wake,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -6967,7 +7049,10 @@ fn schedulers(
         executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
             .stating(vec![inventory]),
     );
-    let handle = engine::SchedulerHandle::over_batches(config, batches)?;
+    // The control thread forwards what a scheduler produced, so it sleeps until a step says there
+    // is something: a request's tokens reach the daemon when they exist, not at the next pass.
+    let progress = engine::CommandWaker::new(move || control.wake());
+    let handle = engine::SchedulerHandle::over_batches_telling(config, batches, progress)?;
     Ok(vec![handle])
 }
 
@@ -7158,6 +7243,7 @@ mod tests {
             program_server::program::ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7180,6 +7266,7 @@ mod tests {
         let slot = |op: &str| program_server::program::ProgramSlot {
             op: op.to_owned(),
             phase: None,
+            part: None,
         };
         let program = |backend: &str, revision: u32| Program {
             backend: backend.to_owned(),
@@ -7434,6 +7521,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -7472,6 +7560,7 @@ mod tests {
                 .get(&ProgramSlot {
                     op: "paged_attention".to_owned(),
                     phase: Some(PhaseKind::Prefill),
+                    part: None,
                 })
                 .map(|program| program.backend.as_str()),
             Some("fa4"),
@@ -7480,6 +7569,7 @@ mod tests {
         let decode_slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: Some(PhaseKind::Decode),
+            part: None,
         };
         let Some(decode_program) = programs.get(&decode_slot).cloned() else {
             panic!("the decode phase bound no program");
@@ -7507,6 +7597,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7540,6 +7631,7 @@ mod tests {
         let slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: None,
+            part: None,
         };
         assert_eq!(
             programs.get(&slot).map(|program| program.backend.as_str()),
@@ -7643,6 +7735,7 @@ mod tests {
         let slot = |phase: Option<PhaseKind>| ProgramSlot {
             op: "paged_attention".to_owned(),
             phase,
+            part: None,
         };
         // What serves: one package filling both phases.
         let mut serving = Programs::new();
@@ -7677,6 +7770,7 @@ mod tests {
         let slot = |op: &str, phase: Option<PhaseKind>| ProgramSlot {
             op: op.to_owned(),
             phase,
+            part: None,
         };
 
         let mut group: (Vec<ProgramRequest>, Vec<Descriptors>) = (Vec::new(), Vec::new());
@@ -7986,6 +8080,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -8049,6 +8144,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -8129,6 +8225,19 @@ mod tests {
             )
             .expect("the revert lands");
         update
+    }
+
+    /// An epoch switch's commit reaches a target whose programs were committed at their handover:
+    /// the generation it names serves with nothing on trial, so it is answered as committed. A
+    /// refusal here left the switch waiting for an acknowledgement, and the previous epoch's process
+    /// running, for good.
+    #[test]
+    fn a_commit_of_the_generation_that_serves_is_committed() {
+        let mut update = update_on_probation_then_reverted();
+        match answer_commit(&mut update, 1) {
+            ProgramStatus::Committed { generation } => assert_eq!(generation, 1),
+            other => panic!("a commit of what serves answered {other:?}"),
+        }
     }
 
     /// A commit that races the revert is answered with the state that holds, and the process keeps

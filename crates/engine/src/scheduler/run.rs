@@ -267,6 +267,7 @@ impl Scheduler {
             expert_load_new: false,
             policy_precopy: None,
             policy_prepared: None,
+            progress: crate::CommandWaker::noop(),
             policy_stage: None,
             recorder: mechanism::Recorder::default(),
             pages: std::collections::BTreeMap::new(),
@@ -790,6 +791,9 @@ impl Scheduler {
                 break;
             }
 
+            if handled {
+                self.progress.wake();
+            }
             let progressed = self.step_nonblocking() || handled;
             // An update's shadow pass is answered once the step that ran it has
             // ended (§7.3 step 2): the answer never claims a comparison the
@@ -1031,7 +1035,10 @@ impl Scheduler {
             IDLE_LIVENESS_POLL
         };
         match self.executor.poll(timeout) {
-            Ok(Some(result)) => self.apply_result(result),
+            Ok(Some(result)) => {
+                self.apply_result(result);
+                self.progress.wake();
+            }
             Ok(None) => {}
             Err(error) => self.on_executor_error(error),
         }
@@ -1040,6 +1047,11 @@ impl Scheduler {
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
+    }
+
+    /// States what the step tells when it produced something (`progress`).
+    pub(crate) fn set_progress(&mut self, progress: crate::CommandWaker) {
+        self.progress = progress;
     }
 }
 
