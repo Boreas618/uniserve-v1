@@ -57,8 +57,8 @@ def device(request):
 @pytest.mark.parametrize(
     "dtype", (torch.bfloat16, torch.float16, torch.float32)
 )
-# 2112 and 4304 are DiffusionGemma's dense and vision MLP widths; 1 and 1025
-# leave partial column blocks.
+# 2112 and 4304 are the dense and vision MLP widths of the block-diffusion
+# model; 1 and 1025 leave partial column blocks.
 @pytest.mark.parametrize("width", (1, 1025, 2112, 4304))
 def test_packed_gating_matches_the_fp32_formula(
     device, activation, dtype, width

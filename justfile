@@ -57,9 +57,9 @@ test-python-sanitizer: build-debug
     UNISERVE_E2E_TIME_SCALE=20 \
     {{python}} -m pytest -m "e2e and gpu and missing_state"
 
-# End-to-end Python tests (GPU, sensenova)
+# End-to-end Python tests (GPU)
 test-python-gpu: build-debug
-    UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu and sensenova"
+    UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu"
 
 # Run all checks
 test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e

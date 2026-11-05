@@ -1,7 +1,7 @@
 """The image half of an executor: image models' media work, by computation.
 
-An image model (BAGEL, SenseNova, and any model with a vision tower that is
-not a video model) serves its media calls on prepared computations of the
+An image model (any model with a vision tower that is not a video model)
+serves its media calls on prepared computations of the
 rank's executor: the worker asks first what each call of a batch reads and
 writes (:meth:`ImageExecutor.prepare`), reserves it, and then has the
 executor compute the batch on what it reserved

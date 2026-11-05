@@ -1,6 +1,6 @@
 """SigLIP-NaViT visual tower and checkpoint definitions.
 
-This package is not a catalog model. A composing model package (BAGEL) uses
+This package is not a catalog model. A composing model package uses
 ``Encoder`` as its vision tower, builds ``Config`` from its own checkpoint
 metadata, and merges ``assignments`` into its checkpoint mapping under the
 tower's key prefix.
