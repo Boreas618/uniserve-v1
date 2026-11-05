@@ -596,6 +596,8 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "the successor owns it, so it is not relaunched here",
             "the daemon hands its service",
             "attaching a daemon failed",
+            "asked the engine to dial",
+            "was not asked to dial",
             "a request was taken over",
             "the successor took the responses in flight over",
             "the service goes on from the previous daemon",
