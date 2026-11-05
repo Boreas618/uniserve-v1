@@ -1,37 +1,37 @@
-//! Submission of explicitly targeted calls to worker groups.
+//! Submission of explicitly targeted calls to executor groups.
 //!
-//! `WorkerExecutor` is the `Executor` the scheduler drives over a set of
-//! `WorkerGroup`s. It splits each logical `ExecutionBatch` into one
-//! `WorkerSubmission` per target worker, delivers each request's `Start` with
-//! its first call on a worker and every other lifecycle command to the workers
-//! that hold what it releases, and joins the workers' reports back into
+//! `Dispatcher` is the `Executor` the scheduler drives over a set of
+//! `ExecutorGroup`s. It splits each logical `ExecutionBatch` into one
+//! `GroupSubmission` per target executor, delivers each request's `Start` with
+//! its first call on an executor and every other lifecycle command to the executors
+//! that hold what it releases, and joins the executors' reports back into
 //! `BatchResult`s: call completions are published as they arrive, command
-//! receipts once every worker has finished the batch.
+//! receipts once every executor has finished the batch.
 //!
-//! Each destination has independent bounded capacity. Every worker has its own
+//! Each destination has independent bounded capacity. Every executor has its own
 //! FIFO of submissions whose head waits until the products it depends on are
-//! published. A blocked queue does not hold back other workers, and each
-//! worker receives its batches, and therefore a request's commands, in
+//! published. A blocked queue does not hold back other executors, and each
+//! executor receives its batches, and therefore a request's commands, in
 //! submission order.
 //!
-//! The executor also holds the engine's copy of every cross-worker product
+//! The executor also holds the engine's copy of every cross-executor product
 //! export until the scheduler frees the buffer or its request finishes
-//! without retaining it, and on a `WorkerFailure` computes the calls,
+//! without retaining it, and on a `ExecutorFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
 
 pub(crate) mod codecs;
 mod failure;
 mod results;
 
-use crate::executor::WorkerResult;
+use crate::executor::ExecutorResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use super::{BatchSubmitError, IncarnationRegistry, WorkerGroup};
+use super::{BatchSubmitError, IncarnationRegistry, ExecutorGroup};
 use crate::CommandWaker;
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerGroupId,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, ExecutorFailure, ExecutorGroupId,
 };
 use anyhow::Context;
 use ipc::{
@@ -41,14 +41,14 @@ use ipc::{
 
 pub(crate) use codecs::video_unit_codecs;
 
-/// One worker's outstanding submission; returned calls leave this record.
+/// One executor's outstanding submission; returned calls leave this record.
 struct PendingGroup {
-    /// Whether the `WorkerGroup` accepted the submission and still owes its
+    /// Whether the `ExecutorGroup` accepted the submission and still owes its
     /// report. False while the submission waits in
-    /// `WorkerExecutor::worker_submissions`, and cleared by failure
+    /// `Dispatcher::worker_submissions`, and cleared by failure
     /// reconciliation when the group will send no report.
     submitted: bool,
-    /// Calls whose completion this worker has not yet returned, with each
+    /// Calls whose completion this executor has not yet returned, with each
     /// call's kind, which the completion is checked against when it is
     /// joined with its call.
     calls: HashMap<(RequestKey, ipc::CallId), ipc::CallKind>,
@@ -56,7 +56,7 @@ struct PendingGroup {
 
 /// Dispatch and receipts for one scheduler batch.
 struct PendingBatch {
-    /// Workers, by index into `WorkerExecutor::workers`, that have not yet
+    /// Executors, by index into `Dispatcher::executors`, that have not yet
     /// finished their part of the batch. The batch is terminal when empty.
     workers: HashMap<usize, PendingGroup>,
     /// The batch's lifecycle commands without `Start` admissions, so a
@@ -84,25 +84,25 @@ impl PendingBatch {
     }
 }
 
-/// One worker's part of a logical batch, queued until it can be dispatched.
+/// One executor's part of a logical batch, queued until it can be dispatched.
 #[derive(Clone)]
-struct WorkerSubmission {
-    /// The calls routed to this worker, with its commands and the external
+struct GroupSubmission {
+    /// The calls routed to this executor, with its commands and the external
     /// exports it reads.
     batch: ExecutionBatch,
-    /// Products this worker reads that another worker, or a component of this
-    /// worker that does not share the reader's storage, produces. The
+    /// Products this executor reads that another executor, or a component of this
+    /// executor that does not share the reader's storage, produces. The
     /// submission stays at its queue head until each has an export in
     /// `transfer_products` or `cache_transfers`.
     dependencies: Vec<BufferId>,
 }
 
-impl WorkerSubmission {
-    /// Builds the one submission a worker receives for this batch.
+impl GroupSubmission {
+    /// Builds the one submission an executor receives for this batch.
     ///
-    /// A batch carries one call kind to one component, so a worker receives
+    /// A batch carries one call kind to one component, so an executor receives
     /// it once, under one identity, and answers it once. Product inputs the
-    /// worker does not yet hold travel as dependencies and hold the submission
+    /// executor does not yet hold travel as dependencies and hold the submission
     /// in its queue until they resolve. Inputs, cache inputs, and dependencies
     /// that none of `calls` reads are dropped.
     fn build(
@@ -139,7 +139,7 @@ impl WorkerSubmission {
     }
 }
 
-/// What became of one queued submission offered to its worker.
+/// What became of one queued submission offered to its executor.
 enum Dispatch {
     /// The group accepted the submission.
     Submitted,
@@ -148,10 +148,10 @@ enum Dispatch {
     /// The group refused inputs that no configured edge carries to the rank
     /// reading them; nothing was recorded. The failure names the requests
     /// whose calls read those inputs.
-    Refused(Box<WorkerFailure>),
+    Refused(Box<ExecutorFailure>),
 }
 
-/// The worker and component whose call produces a buffer.
+/// The executor and component whose call produces a buffer.
 #[derive(Clone)]
 struct BufferRoute {
     worker_index: usize,
@@ -166,50 +166,50 @@ struct BufferRoute {
 
 /// Dispatch targeted calls and track their independently completed results.
 ///
-/// Worker indices used throughout are positions in `workers`.
-pub struct WorkerExecutor {
-    /// Worker identity to its index in `workers`.
-    routing: HashMap<WorkerGroupId, usize>,
-    workers: Vec<(WorkerGroupId, WorkerGroup)>,
-    /// The worker and rank of every live rank incarnation, which the groups
+/// Executor indices used throughout are positions in `executors`.
+pub struct Dispatcher {
+    /// Executor identity to its index in `executors`.
+    routing: HashMap<ExecutorGroupId, usize>,
+    workers: Vec<(ExecutorGroupId, ExecutorGroup)>,
+    /// The executor and rank of every live rank incarnation, which the groups
     /// keep current as they replace ranks.
     incarnations: IncarnationRegistry,
     executor_info: ExecutorInfo,
-    /// Sum of the workers' queue depths; `submit` refuses a batch with
+    /// Sum of the executors' queue depths; `submit` refuses a batch with
     /// `WouldBlock` while this many logical batches are pending.
     depth: usize,
-    /// Command-channel wake, polled beside the workers' progress descriptors.
+    /// Command-channel wake, polled beside the executors' progress descriptors.
     command_wake: crate::handle::WakeSignal,
     /// Logical batches that have not yet published their terminal result.
     pending: BTreeMap<u64, PendingBatch>,
     /// Results `poll` returns in order.
     ready: VecDeque<BatchResult>,
     /// Admission descriptor of every started request until its `Finish`
-    /// completes; a worker receives it as a `Start` with the request's first
+    /// completes; an executor receives it as a `Start` with the request's first
     /// call there.
     admissions: HashMap<RequestKey, NewRequest>,
-    /// (worker, request) pairs whose `Start` the worker has accepted.
+    /// (executor, request) pairs whose `Start` the executor has accepted.
     admitted_workers: HashSet<(usize, RequestKey)>,
-    /// Producing worker and component of each output buffer of a submitted
+    /// Producing executor and component of each output buffer of a submitted
     /// call, until the buffer is freed or its request finishes without
     /// retaining it.
     buffer_routes: HashMap<BufferId, BufferRoute>,
     /// Persistent buffer addresses are local to the buffer pool of one rank of
-    /// a physical Worker, keyed by worker index, rank, and buffer.
+    /// a physical Executor, keyed by executor index, rank, and buffer.
     buffer_allocations: HashMap<(usize, u32, BufferId), BufferAllocation>,
-    /// Every worker that produces or reads a buffer: the targets of its `Free`.
+    /// Every executor that produces or reads a buffer: the targets of its `Free`.
     buffer_workers: HashMap<BufferId, HashSet<usize>>,
-    /// Tensor exports returned by producing workers, merged across the
+    /// Tensor exports returned by producing executors, merged across the
     /// ranks that publish parts of one product. A `channel` locator carries
     /// the product's bytes, which the engine therefore holds until the buffer
     /// is freed or its request finishes without retaining it.
     transfer_products: HashMap<BufferId, TensorExport>,
-    /// Cache exports returned by producing workers.
+    /// Cache exports returned by producing executors.
     cache_transfers: HashMap<BufferId, CacheTransfer>,
-    /// Per-worker FIFO of submissions the `WorkerGroup` has not yet accepted.
-    worker_submissions: Vec<VecDeque<WorkerSubmission>>,
-    /// Last collective sequence each worker accepted. It must strictly
-    /// increase per worker: a multi-rank worker treats a batch with calls
+    /// Per-executor FIFO of submissions the `ExecutorGroup` has not yet accepted.
+    worker_submissions: Vec<VecDeque<GroupSubmission>>,
+    /// Last collective sequence each executor accepted. It must strictly
+    /// increase per executor: a multi-rank executor treats a batch with calls
     /// whose sequence does not advance as a fatal invariant violation.
     worker_collective_seqs: Vec<u64>,
     /// A command wake was drained; the next `poll` returns `Ok(None)` so the
@@ -217,7 +217,7 @@ pub struct WorkerExecutor {
     command_wake_pending: bool,
     /// A failure reconciled inside `submit`. `submit` refuses further batches
     /// with `WouldBlock` until `poll` returns it.
-    pending_failure: Option<WorkerFailure>,
+    pending_failure: Option<ExecutorFailure>,
     closed: bool,
 }
 
@@ -250,36 +250,36 @@ fn dependency_spans(
         .collect()
 }
 
-impl WorkerExecutor {
-    /// Binds launched worker groups into one executor.
+impl Dispatcher {
+    /// Binds launched executor groups into one executor.
     ///
-    /// Fails when the command wake cannot be created, `workers` is empty, a
-    /// worker identity repeats, a group was initialized with transfer
-    /// bindings other than `transfer`, the workers expose different outputs for
+    /// Fails when the command wake cannot be created, `executors` is empty, a
+    /// executor identity repeats, a group was initialized with transfer
+    /// bindings other than `transfer`, the executors expose different outputs for
     /// a replicated component, the media routing or video codec pairing is
-    /// refused, a transfer edge names an unbound worker or rank, repeats a
+    /// refused, a transfer edge names an unbound executor or rank, repeats a
     /// physical rank pair, or uses a mechanism that cannot serve the edge's
-    /// endpoints, or no runtime capacity view can be derived from the workers.
+    /// endpoints, or no runtime capacity view can be derived from the executors.
     /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
-        mut workers: Vec<(WorkerGroupId, WorkerGroup)>,
+        mut workers: Vec<(ExecutorGroupId, ExecutorGroup)>,
         transfer: TransferConfig,
     ) -> anyhow::Result<Self> {
         let command_wake = crate::handle::WakeSignal::new()?;
         anyhow::ensure!(
             !workers.is_empty(),
-            "WorkerExecutor needs at least one worker"
+            "Dispatcher needs at least one executor"
         );
 
         let mut routing = HashMap::new();
         for (index, (id, executor)) in workers.iter().enumerate() {
             anyhow::ensure!(
                 executor.transfer_config() == &transfer,
-                "WorkerGroup {id} was initialized with different transfer bindings"
+                "ExecutorGroup {id} was initialized with different transfer bindings"
             );
             anyhow::ensure!(
                 routing.insert(id.clone(), index).is_none(),
-                "worker identity {id} is repeated"
+                "executor identity {id} is repeated"
             );
         }
         let mut executor_info = ExecutorInfo::from_workers(
@@ -299,7 +299,7 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let bytes = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| info.buffer_pool_bytes)
                     .collect();
                 (id.clone(), bytes)
@@ -310,7 +310,7 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let caches = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| (info.endpoint.host.clone(), info.prefix_cache.clone()))
                     .collect();
                 (id.clone(), caches)
@@ -321,7 +321,7 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let pools = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| {
                         (
                             info.endpoint.host.clone(),
@@ -338,13 +338,13 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let pools = (0..)
-                    .map_while(|rank| worker.worker_info(rank))
+                    .map_while(|rank| worker.main_process_info(rank))
                     .map(|info| (info.endpoint.host.clone(), info.encoder_pool.clone()))
                     .collect();
                 (id.clone(), pools)
             })
             .collect();
-        // The video graph may span workers, so each group learns the whole
+        // The video graph may span executors, so each group learns the whole
         // deployment's routing to name the ranks that read its products.
         let media_routing = executor_info.media_routing()?;
         let placements = workers
@@ -377,7 +377,7 @@ impl WorkerExecutor {
             })
             .collect();
         // Every group registers its live incarnations in one table, so a
-        // publication's source resolves to its worker and rank whichever
+        // publication's source resolves to its executor and rank whichever
         // group produced it.
         let incarnations = IncarnationRegistry::default();
         for (_, worker) in &mut workers {
@@ -386,14 +386,14 @@ impl WorkerExecutor {
         }
 
         // Every edge expands to the physical (source rank, destination rank)
-        // pairs it names; an omitted rank names all ranks of its worker. A
+        // pairs it names; an omitted rank names all ranks of its executor. A
         // pair may be bound by only one edge.
         let mut physical_edges = HashSet::new();
         for edge in &transfer.edges {
             anyhow::ensure!(
                 routing.contains_key(&edge.source_worker)
                     && routing.contains_key(&edge.destination_worker),
-                "transfer edge names an unbound WorkerGroup"
+                "transfer edge names an unbound ExecutorGroup"
             );
             let source = &workers[routing[&edge.source_worker]].1;
             let destination = &workers[routing[&edge.destination_worker]].1;
@@ -402,7 +402,7 @@ impl WorkerExecutor {
                 (edge.destination_rank, destination),
             ] {
                 anyhow::ensure!(
-                    rank.is_none_or(|rank| worker.worker_info(rank as usize).is_some()),
+                    rank.is_none_or(|rank| worker.main_process_info(rank as usize).is_some()),
                     "transfer edge names an unbound rank"
                 );
             }
@@ -411,7 +411,7 @@ impl WorkerExecutor {
                     continue;
                 }
                 let source_on_cuda = source.rank_on_cuda(source_rank as usize);
-                let source = source.worker_info(source_rank as usize).with_context(|| {
+                let source = source.main_process_info(source_rank as usize).with_context(|| {
                     format!("transfer edge source has no rank {source_rank} in its world")
                 })?;
                 for destination_rank in 0..destination.world_size() as u32 {
@@ -423,7 +423,7 @@ impl WorkerExecutor {
                     }
                     let destination_on_cuda = destination.rank_on_cuda(destination_rank as usize);
                     let destination = destination
-                        .worker_info(destination_rank as usize)
+                        .main_process_info(destination_rank as usize)
                         .with_context(|| {
                             format!(
                                 "transfer edge destination has no rank {destination_rank} in its world"
@@ -493,7 +493,7 @@ impl WorkerExecutor {
             }
         }
         // The derived runtime view is discarded; the call only refuses
-        // workers from which it cannot be derived.
+        // executors from which it cannot be derived.
         executor_info.runtime_info()?;
 
         let depth = workers.iter().map(|worker| worker.1.queue_depth()).sum();
@@ -527,7 +527,7 @@ impl WorkerExecutor {
         self.executor_info.workers[index].1 = self.workers[index].1.info().clone();
     }
 
-    /// The command wake descriptor followed by every worker's progress
+    /// The command wake descriptor followed by every executor's progress
     /// descriptors, for `park_descriptors`.
     fn progress_fds(&self) -> Vec<libc::pollfd> {
         std::iter::once(libc::pollfd {
@@ -544,7 +544,7 @@ impl WorkerExecutor {
     }
 }
 
-impl WorkerExecutor {
+impl Dispatcher {
     /// Records the admission descriptor of each request a batch starts.
     ///
     /// A request handed from a prefill group to a decode group is admitted
@@ -580,8 +580,8 @@ impl WorkerExecutor {
 
     /// Returns the `Start` descriptors `worker_index` needs before `calls`.
     ///
-    /// One descriptor per request in `calls` that the worker has not yet
-    /// accepted a `Start` for, carrying the placement's worker-local request
+    /// One descriptor per request in `calls` that the executor has not yet
+    /// accepted a `Start` for, carrying the placement's executor-local request
     /// row when it names one and the admission's canonical row otherwise.
     /// Fails when a request has no recorded admission or its calls name
     /// different rows.
@@ -601,7 +601,7 @@ impl WorkerExecutor {
             }
             let admission = self.admissions.get(&call.request_key).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "worker {worker_index} has no admission for request {:?}",
+                    "executor {worker_index} has no admission for request {:?}",
                     call.request_key
                 )
             })?;
@@ -611,7 +611,7 @@ impl WorkerExecutor {
             if let Some(existing) = rows.insert(call.request_key, row) {
                 anyhow::ensure!(
                     existing == row,
-                    "worker {worker_index} received conflicting request rows for {:?}",
+                    "executor {worker_index} received conflicting request rows for {:?}",
                     call.request_key
                 );
                 continue;
@@ -655,8 +655,8 @@ impl WorkerExecutor {
 
     /// Routes buffer release to its storage owners and request closure to every physical owner.
     ///
-    /// Returns sorted worker indices. `Start` has no target of its own: a
-    /// worker receives it with the request's first call (`admissions_for`).
+    /// Returns sorted executor indices. `Start` has no target of its own: a
+    /// executor receives it with the request's first call (`admissions_for`).
     fn command_workers(&self, command: &BatchCommand) -> Vec<usize> {
         match command {
             BatchCommand::Start { .. } => Vec::new(),
@@ -675,13 +675,13 @@ impl WorkerExecutor {
 
     /// Keep resident references direct when producer and consumer execute in
     /// the same address spaces. Different multi-rank components require published
-    /// layouts, including when both components belong to this WorkerGroup.
+    /// layouts, including when both components belong to this ExecutorGroup.
     ///
-    /// The caller has established that both run on the producer's worker.
+    /// The caller has established that both run on the producer's executor.
     /// Returns true for the producing component itself when each of its ranks
     /// holds its own copy of the buffer, or for two components on the same
     /// single rank; false otherwise, including when either component of a
-    /// pair is not loaded on the worker.
+    /// pair is not loaded on the executor.
     fn shares_product_storage(&self, producer: &BufferRoute, consumer_entry: &str) -> bool {
         let (_, entries) = self.workers[producer.worker_index].1.placement();
         let source = entries.get(&producer.component);
@@ -707,9 +707,9 @@ impl WorkerExecutor {
             })
     }
 
-    /// Submits or queues one worker-local batch while preserving collective order.
+    /// Submits or queues one executor-local batch while preserving collective order.
     ///
-    /// Prepends the `Start` of every request among its calls that the worker
+    /// Prepends the `Start` of every request among its calls that the executor
     /// has not yet admitted, attaches the exports of the submission's
     /// dependencies, which the caller has checked are published, and lowers
     /// the batch to the wire. Returns `Deferred` when the group refuses it
@@ -719,11 +719,11 @@ impl WorkerExecutor {
     /// `Submitted` records the submission, its collective sequence, and the
     /// admissions it carried. Errors come from resolving admissions, from
     /// building or validating the wire batch, or from the group; a group that
-    /// replaced its ranks reports a `WorkerFailure`.
+    /// replaced its ranks reports a `ExecutorFailure`.
     fn submit_worker(
         &mut self,
         worker_index: usize,
-        submission: &WorkerSubmission,
+        submission: &GroupSubmission,
     ) -> anyhow::Result<Dispatch> {
         let batch = &submission.batch;
         let admissions = self.admissions_for(worker_index, &batch.requests)?;
@@ -777,10 +777,10 @@ impl WorkerExecutor {
             cache_inputs,
             page_offloads: batch.page_offloads.clone(),
             // The columns are the mechanism's statement to an in-process
-            // executor; a worker projection carries no device layout. A media
+            // executor; an executor projection carries no device layout. A media
             // computation is served in process for the same reason: its
             // buffers are the executor's own, and `into_protocol` refuses one
-            // rather than sending a worker a media call with no inputs.
+            // rather than sending an executor a media call with no inputs.
             columns: None,
             media: None,
         }
@@ -818,7 +818,7 @@ impl WorkerExecutor {
                 .map(|route| held(route.worker_index))
                 .unwrap_or_default();
             let ranks = (0..)
-                .map_while(|rank| self.workers[worker_index].1.worker_info(rank))
+                .map_while(|rank| self.workers[worker_index].1.main_process_info(rank))
                 .count();
             let spans = dependency_spans(held(worker_index), produced, ranks as u32);
             anyhow::ensure!(
@@ -855,7 +855,7 @@ impl WorkerExecutor {
         }
 
         // Routing stays on the engine: the group names each call's reading
-        // ranks from the workers its request was routed to.
+        // ranks from the executors its request was routed to.
         let readers = batch
             .requests
             .iter()
@@ -886,15 +886,15 @@ impl WorkerExecutor {
         let worker = pending
             .workers
             .get_mut(&worker_index)
-            .context("submitted worker is not pending")?;
-        anyhow::ensure!(!worker.submitted, "worker batch was submitted twice");
+            .context("submitted executor is not pending")?;
+        anyhow::ensure!(!worker.submitted, "executor batch was submitted twice");
         worker.submitted = true;
         self.admitted_workers
             .extend(request_keys.into_iter().map(|key| (worker_index, key)));
         Ok(Dispatch::Submitted)
     }
 
-    /// The failure of the requests whose calls read inputs a worker refused.
+    /// The failure of the requests whose calls read inputs an executor refused.
     ///
     /// A product with no location on an edge to its consumer is a property of
     /// that product and that edge, such as a device product that fell back to
@@ -914,7 +914,7 @@ impl WorkerExecutor {
         worker_index: usize,
         batch: &ExecutionBatch,
         refusal: UnroutableInputs,
-    ) -> anyhow::Result<WorkerFailure> {
+    ) -> anyhow::Result<ExecutorFailure> {
         let requests = batch
             .requests
             .iter()
@@ -928,7 +928,7 @@ impl WorkerExecutor {
             !requests.is_empty(),
             "refused input products are read by no call: {refusal}"
         );
-        Ok(WorkerFailure {
+        Ok(ExecutorFailure {
             worker_id: self.workers[worker_index].0.clone(),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
@@ -940,7 +940,7 @@ impl WorkerExecutor {
         })
     }
 
-    /// Dispatches each worker's queued batches in order, as far as they are ready.
+    /// Dispatches each executor's queued batches in order, as far as they are ready.
     ///
     /// Batch ids are dispatched in order, so a rank sees a strictly increasing
     /// subsequence and cooperative ranks launch their collectives in the same
@@ -964,7 +964,7 @@ impl WorkerExecutor {
                 }
                 let submission = self.worker_submissions[worker_index]
                     .pop_front()
-                    .ok_or_else(|| anyhow::anyhow!("ready worker submission disappeared"))?;
+                    .ok_or_else(|| anyhow::anyhow!("ready executor submission disappeared"))?;
                 match self.submit_worker(worker_index, &submission)? {
                     Dispatch::Submitted => progressed = true,
                     Dispatch::Deferred => {
@@ -985,10 +985,10 @@ impl WorkerExecutor {
         }
     }
 
-    /// Advances worker command execution until no immediate progress remains.
+    /// Advances executor command execution until no immediate progress remains.
     ///
     /// Latches a command wake, dispatches ready submissions, drains every
-    /// worker's available reports without blocking, and dispatches again for
+    /// executor's available reports without blocking, and dispatches again for
     /// the dependencies those reports published.
     fn pump(&mut self) -> anyhow::Result<()> {
         self.command_wake_pending |= self.command_wake.drain()?;
@@ -1012,7 +1012,7 @@ impl WorkerExecutor {
     }
 }
 
-impl WorkerExecutor {
+impl Dispatcher {
     /// Returns the command-channel waker.
     pub fn command_waker(&self) -> CommandWaker {
         self.command_wake.waker()
@@ -1020,9 +1020,9 @@ impl WorkerExecutor {
 
     /// Runs `action` on every group, the groups together, and returns each
     /// group's identity with its ranks' results.
-    fn groups_together<F>(&mut self, action: F) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>>
+    fn groups_together<F>(&mut self, action: F) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>>
     where
-        F: Fn(&mut WorkerGroup) -> anyhow::Result<Vec<String>> + Sync,
+        F: Fn(&mut ExecutorGroup) -> anyhow::Result<Vec<String>> + Sync,
     {
         std::thread::scope(|scope| {
             let running = self
@@ -1039,16 +1039,16 @@ impl WorkerExecutor {
                 .map(|handle| {
                     handle
                         .join()
-                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))?
+                        .map_err(|_| anyhow::anyhow!("executor hook thread panicked"))?
                 })
                 .collect()
         })
     }
 }
 
-impl Executor for WorkerExecutor {
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
-        // Submissions already queued for the worker claim its free group slots.
+impl Executor for Dispatcher {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+        // Submissions already queued for the executor claim its free group slots.
         self.routing.get(worker).is_some_and(|&index| {
             self.workers[index].1.available_slots() > self.worker_submissions[index].len()
         })
@@ -1060,28 +1060,28 @@ impl Executor for WorkerExecutor {
             .all(|index| self.has_capacity(&self.workers[index].0))
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.routing
             .get(worker)
             .is_some_and(|&index| self.workers[index].1.is_ready())
     }
 
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         self.routing
             .get(worker)
             .is_none_or(|&index| self.workers[index].1.is_closed())
     }
 
-    /// Returns the worker metadata.
+    /// Returns the executor metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
-    /// Partitions a logical batch across owning workers and registers aggregate completion state.
+    /// Partitions a logical batch across owning executors and registers aggregate completion state.
     ///
     /// Returns `WouldBlock` while a reconciled failure awaits `poll`, while
-    /// `depth` logical batches are pending, or when a target worker has no
-    /// free slot. A `WorkerFailure` raised while dispatching is reconciled and
+    /// `depth` logical batches are pending, or when a target executor has no
+    /// free slot. A `ExecutorFailure` raised while dispatching is reconciled and
     /// held for the next `poll`, and the batch counts as submitted: its fate
     /// arrives through that failure and the batch's results. A reconciliation
     /// error is returned as `Failed`. Any other error while partitioning or
@@ -1106,7 +1106,7 @@ impl Executor for WorkerExecutor {
         for (_, placement) in &batch.requests {
             let Some(&index) = self.routing.get(&placement.worker) else {
                 return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                    "unknown target worker {}",
+                    "unknown target executor {}",
                     placement.worker
                 )));
             };
@@ -1124,7 +1124,7 @@ impl Executor for WorkerExecutor {
         let batch_id = batch.id;
         if self.pending.contains_key(&batch_id) {
             return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                "worker router already has batch {batch_id} in flight"
+                "executor router already has batch {batch_id} in flight"
             )));
         }
         let admissions = batch.admissions().cloned().collect::<Vec<_>>();
@@ -1132,7 +1132,7 @@ impl Executor for WorkerExecutor {
             .map_err(ExecutorSubmitError::Failed)?;
 
         let submit_result = (|| -> anyhow::Result<()> {
-            // Each per-worker vector is indexed by worker index.
+            // Each per-executor vector is indexed by executor index.
             let mut worker_ops = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<(Call, RequestPlacement)>>>();
@@ -1147,9 +1147,9 @@ impl Executor for WorkerExecutor {
             let mut call_routes = HashMap::with_capacity(batch.requests.len());
             let mut input_routes = HashMap::new();
 
-            // Route each call to its worker, check the worker can run it, and
+            // Route each call to its executor, check the executor can run it, and
             // register the producer and holders of its outputs and the
-            // worker-local buffer allocations its placement names.
+            // executor-local buffer allocations its placement names.
             for (call, placement) in &batch.requests {
                 let variant = call.kind;
                 let call_worker =
@@ -1157,7 +1157,7 @@ impl Executor for WorkerExecutor {
                         .get(&placement.worker)
                         .copied()
                         .ok_or_else(|| {
-                            anyhow::anyhow!("call targets unknown worker {}", placement.worker)
+                            anyhow::anyhow!("call targets unknown executor {}", placement.worker)
                         })?;
                 anyhow::ensure!(
                     self.workers[call_worker]
@@ -1165,7 +1165,7 @@ impl Executor for WorkerExecutor {
                         .info()
                         .supported_calls
                         .contains(&variant),
-                    "target worker does not support call {variant:?}"
+                    "target executor does not support call {variant:?}"
                 );
                 let (_, entries) = self.workers[call_worker].1.placement();
                 anyhow::ensure!(
@@ -1188,7 +1188,7 @@ impl Executor for WorkerExecutor {
                         anyhow::ensure!(
                             existing.worker_index == route.worker_index
                                 && existing.component == route.component,
-                            "product identity was routed to conflicting workers"
+                            "product identity was routed to conflicting executors"
                         );
                     } else {
                         self.buffer_routes.insert(output, route);
@@ -1231,14 +1231,14 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            // External exports go to every worker with a call reading them.
+            // External exports go to every executor with a call reading them.
             for payload in &batch.input_transfers {
                 let worker_indices =
                     input_routes
                         .get(&payload.product.buffer_id())
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "WorkerExecutor cannot route undeclared input product {:?}",
+                                "Dispatcher cannot route undeclared input product {:?}",
                                 payload.product
                             )
                         })?;
@@ -1257,7 +1257,7 @@ impl Executor for WorkerExecutor {
 
             // Resolve every input: supplied externally, read in place from a
             // producer sharing the reader's storage, or a dependency the
-            // worker's submission waits on until its producer publishes it.
+            // executor's submission waits on until its producer publishes it.
             for (call, _) in &batch.requests {
                 let consumer_worker = call_routes[&(call.request_key, call.call_id)];
                 for input in call.input_buffers() {
@@ -1290,7 +1290,7 @@ impl Executor for WorkerExecutor {
                             && !worker_cache_inputs[consumer_worker]
                                 .iter()
                                 .any(|export| export.source == input),
-                        "transfer descriptor must be supplied by its producing worker"
+                        "transfer descriptor must be supplied by its producing executor"
                     );
                     if !worker_dependencies[consumer_worker].contains(&input) {
                         worker_dependencies[consumer_worker].push(input);
@@ -1298,7 +1298,7 @@ impl Executor for WorkerExecutor {
                 }
             }
 
-            // A batch's page offloads belong to the one worker group that
+            // A batch's page offloads belong to the one executor group that
             // runs all of its calls (`ExecutionBatch::page_offloads`).
             let mut page_offloads = (0..self.workers.len())
                 .map(|_| None)
@@ -1307,13 +1307,13 @@ impl Executor for WorkerExecutor {
                 let worker = *self
                     .routing
                     .get(&writes.worker)
-                    .context("page offloads name an unknown worker group")?;
+                    .context("page offloads name an unknown executor group")?;
                 anyhow::ensure!(
                     batch
                         .requests
                         .iter()
                         .all(|(call, _)| call_routes[&(call.request_key, call.call_id)] == worker),
-                    "a batch carrying page offloads spans several workers"
+                    "a batch carrying page offloads spans several executors"
                 );
                 page_offloads[worker] = Some(writes);
             }
@@ -1323,8 +1323,8 @@ impl Executor for WorkerExecutor {
                 worker_ops[worker].push((call, placement));
             }
 
-            // `Start` reaches a worker with the request's first call there;
-            // other commands go to every worker holding what they release.
+            // `Start` reaches an executor with the request's first call there;
+            // other commands go to every executor holding what they release.
             let mut worker_commands = (0..self.workers.len())
                 .map(|_| Vec::new())
                 .collect::<Vec<Vec<BatchCommand>>>();
@@ -1347,14 +1347,14 @@ impl Executor for WorkerExecutor {
 
                 anyhow::ensure!(
                     !targets.is_empty(),
-                    "worker router has no destination for command {command:?}"
+                    "executor router has no destination for command {command:?}"
                 );
                 for worker_index in targets {
                     worker_commands[worker_index].push(command.clone());
                 }
             }
 
-            // Queue one submission per worker that has calls, commands or
+            // Queue one submission per executor that has calls, commands or
             // page offloads, and register the batch before dispatching any of
             // them.
             let mut pending_workers = HashMap::new();
@@ -1369,7 +1369,7 @@ impl Executor for WorkerExecutor {
                 {
                     anyhow::ensure!(
                         dependencies.is_empty(),
-                        "product dependency has no consuming worker submission"
+                        "product dependency has no consuming executor submission"
                     );
                     continue;
                 }
@@ -1385,7 +1385,7 @@ impl Executor for WorkerExecutor {
                 );
                 // Keep call-owned resources together while dependencies wait.
                 // Rank indices and collective order are derived at physical submission.
-                self.worker_submissions[worker_index].push_back(WorkerSubmission::build(
+                self.worker_submissions[worker_index].push_back(GroupSubmission::build(
                     batch_id,
                     calls,
                     commands,
@@ -1410,14 +1410,14 @@ impl Executor for WorkerExecutor {
             );
             self.dispatch_ready()?;
 
-            // A batch with no worker part, such as one whose commands have no
+            // A batch with no executor part, such as one whose commands have no
             // remaining holder, completes at once.
             if self
                 .pending
                 .get(&batch_id)
                 .is_some_and(|pending| pending.workers.is_empty())
             {
-                self.publish_result(WorkerResult {
+                self.publish_result(ExecutorResult {
                     batch_id,
                     done: true,
                     results: Vec::new(),
@@ -1444,7 +1444,7 @@ impl Executor for WorkerExecutor {
         })();
         match submit_result {
             Ok(()) => Ok(()),
-            Err(error) if error.is::<WorkerFailure>() => {
+            Err(error) if error.is::<ExecutorFailure>() => {
                 self.pending_failure = Some(
                     self.reconcile_worker_failure(error)
                         .map_err(ExecutorSubmitError::Failed)?,
@@ -1458,12 +1458,12 @@ impl Executor for WorkerExecutor {
         }
     }
 
-    /// Drives worker progress and returns the next completed logical batch.
+    /// Drives executor progress and returns the next completed logical batch.
     ///
     /// A failure held by `submit` is returned first. A drained command wake
     /// makes the call return `Ok(None)` at once, before or after waiting, so
-    /// the scheduler can read its commands. A worker failure found while
-    /// pumping is reconciled and returned as a `WorkerFailure`; any other
+    /// the scheduler can read its commands. An executor failure found while
+    /// pumping is reconciled and returned as a `ExecutorFailure`; any other
     /// error is returned unchanged.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if let Some(loss) = self.pending_failure.take() {
@@ -1484,7 +1484,7 @@ impl Executor for WorkerExecutor {
         if timeout.is_zero() {
             return Ok(None);
         }
-        crate::worker::park_descriptors(&self.progress_fds(), timeout)?;
+        crate::executors::park_descriptors(&self.progress_fds(), timeout)?;
         if let Err(error) = self.pump() {
             return Err(self.reconcile_worker_failure(error)?.into());
         }
@@ -1494,7 +1494,7 @@ impl Executor for WorkerExecutor {
         Ok(self.ready.pop_front())
     }
 
-    /// Closes every worker group and refuses later submissions.
+    /// Closes every executor group and refuses later submissions.
     ///
     /// Groups can share expert communicators, so each must receive shutdown
     /// before another waits for collective retirement. Every group is joined
@@ -1511,7 +1511,7 @@ impl Executor for WorkerExecutor {
             for handle in closing {
                 let result = handle
                     .join()
-                    .map_err(|_| anyhow::anyhow!("worker shutdown thread panicked"))
+                    .map_err(|_| anyhow::anyhow!("executor shutdown thread panicked"))
                     .and_then(|result| result);
                 if let Err(error) = result
                     && first_error.is_none()
@@ -1523,8 +1523,8 @@ impl Executor for WorkerExecutor {
         })
     }
 
-    /// Runs the worker hook on every group, the groups together
-    /// (`WorkerGroup::hook`), and returns every rank's result, group by
+    /// Runs the executor hook on every group, the groups together
+    /// (`ExecutorGroup::hook`), and returns every rank's result, group by
     /// group.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         std::thread::scope(|scope| {
@@ -1538,7 +1538,7 @@ impl Executor for WorkerExecutor {
                 results.extend(
                     handle
                         .join()
-                        .map_err(|_| anyhow::anyhow!("worker hook thread panicked"))??,
+                        .map_err(|_| anyhow::anyhow!("executor hook thread panicked"))??,
                 );
             }
             Ok(results)
@@ -1631,24 +1631,24 @@ impl Executor for WorkerExecutor {
             .unwrap_or_default()
     }
 
-    /// Runs the worker hook on every group, the groups together, and
+    /// Runs the executor hook on every group, the groups together, and
     /// returns each group's identity with its ranks' results.
     fn hook_groups(
         &mut self,
         name: &str,
         payload: &str,
-    ) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
+    ) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>> {
         self.groups_together(|group| group.hook(name, payload))
     }
 
     /// Maps the host KV cache on every group, the groups together
-    /// (`WorkerGroup::map_host_cache`), and returns each group's identity
+    /// (`ExecutorGroup::map_host_cache`), and returns each group's identity
     /// with its ranks' pools.
-    fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
+    fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>> {
         self.groups_together(|group| group.map_host_cache(tokens))
     }
 
-    /// Commits every group's world together (`WorkerGroup::commit`), and
+    /// Commits every group's world together (`ExecutorGroup::commit`), and
     /// returns every rank's report, group by group.
     fn commit(&mut self) -> anyhow::Result<Vec<String>> {
         std::thread::scope(|scope| {
@@ -1662,7 +1662,7 @@ impl Executor for WorkerExecutor {
                 results.extend(
                     handle
                         .join()
-                        .map_err(|_| anyhow::anyhow!("worker commit thread panicked"))??,
+                        .map_err(|_| anyhow::anyhow!("executor commit thread panicked"))??,
                 );
             }
             Ok(results)

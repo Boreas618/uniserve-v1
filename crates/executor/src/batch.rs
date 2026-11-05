@@ -20,7 +20,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, WorkerInfo};
+use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, MainProcessInfo};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -807,10 +807,10 @@ pub trait Batches: Send + Sync {
 /// One pool of the deployment an executor serves (4.2, 7.3).
 #[derive(Clone, Debug, Default)]
 pub struct Inventory {
-    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
+    /// The deployment's name for the pool, the identity the mechanism's `ExecutorGroupId` carries.
     pub group: String,
     /// The pool's ranks in launch order, each with what it reported at handshake.
-    pub ranks: Vec<WorkerInfo>,
+    pub ranks: Vec<MainProcessInfo>,
     /// What the deployment launched the pool with; the ranks' reports do not carry it back.
     pub placement: Placement,
     /// The longest sequence the pool's model was built for: the attention descriptor's static bound

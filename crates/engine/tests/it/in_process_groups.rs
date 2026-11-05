@@ -60,7 +60,7 @@ fn an_engine_serves_once_its_only_group_is_relaunched() {
     sim.set_text_len(16);
     let executor = SimExecutor::new(sim);
     let loss = executor.loss();
-    let group = engine::WorkerGroupId("sim".to_owned());
+    let group = engine::ExecutorGroupId("sim".to_owned());
     let scheduler = support::scheduler(Box::new(executor), SimEngine::special_tokens(), 8)
         .expect("the scheduler is built over the simulated executor");
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -118,14 +118,14 @@ fn an_engine_serves_once_its_only_group_is_relaunched() {
 /// serving the other group while that launch starts.
 #[test]
 fn a_relaunching_group_leaves_its_executor_serving_the_others() {
-    use engine::{Executor, WorkerGroupId};
+    use engine::{Executor, ExecutorGroupId};
 
     let mut sim = SimEngine::new();
     sim.name_groups(&["model", "vision"]);
     let executor = SimExecutor::new(sim);
     let loss = executor.loss();
-    let model = WorkerGroupId("model".to_owned());
-    let vision = WorkerGroupId("vision".to_owned());
+    let model = ExecutorGroupId("model".to_owned());
+    let vision = ExecutorGroupId("vision".to_owned());
 
     assert!(executor.is_ready(&model) && executor.is_ready(&vision));
     assert!(executor.has_capacity(&model) && executor.has_capacity(&vision));

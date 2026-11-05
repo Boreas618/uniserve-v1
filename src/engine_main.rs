@@ -1,4 +1,4 @@
-//! `uniserve engine`: a node's main process for one epoch (`specs/worker.md`
+//! `uniserve engine`: a node's main process for one epoch (`specs/executor.md`
 //! §2.1, §2.3, §2.4, §4).
 //!
 //! The daemon starts one main process per node and epoch, from the epoch's build
@@ -39,7 +39,7 @@
 //!   and the per-device counters `FromEngine::Device` that [`Self::send_metrics`]
 //!   fills (§2.3).
 //! - **builder03** (`crates/executor`): `capacity::plan(&CapacityRequest) ->
-//!   Result<Plan>`, whose producer the retired worker held and which is still
+//!   Result<Plan>`, whose producer the retired executor held and which is still
 //!   entangled with the launch machinery §4 deletes, and the Storage
 //!   Server client's publish/map surface that a weight store stands on.
 //! - **nobody yet**: the `nn::RetainedWeights` production implementation. Its two
@@ -173,7 +173,7 @@ pub(crate) struct Launch {
     pub program_server: String,
     /// The devices this rank serves, as CUDA ordinals.
     pub devices: Vec<u32>,
-    /// This rank's worker group, which keys its storage claims.
+    /// This rank's executor group, which keys its storage claims.
     pub group: String,
     /// This rank's ordinal inside its group.
     pub rank: u32,
@@ -196,7 +196,7 @@ pub(crate) struct Launch {
     /// not judge it, so the field is read where the epoch is decided and not here.
     #[serde(default)]
     pub rollback_s: Option<u64>,
-    /// The placement's queue depth for this rank's worker groups: how many batches the rank's
+    /// The placement's queue depth for this rank's executor groups: how many batches the rank's
     /// schedulers keep in flight, which the capacity plan relays through (§4.1).
     ///
     /// Required, not defaulted: a zero depth plans a rank with no relay and silently halves the
@@ -427,7 +427,7 @@ impl ProcessInterface {
     fn file(&mut self, event: proto::process::Event) {
         match event.kind {
             Some(proto::process::event::Kind::Command(command)) => self.pending.push_back(command),
-            // A group's exit is a worker's report; this process supervises no group.
+            // A group's exit is an executor's report; this process supervises no group.
             Some(proto::process::event::Kind::Exit(exit)) => {
                 tracing::warn!(
                     group = %exit.group,
@@ -726,7 +726,7 @@ pub(crate) struct MainProcess {
     /// last submission finishes (`advance_warmup`), and a `Drain` drops what was owed (§4.5).
     admission_owed: bool,
     /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
-    /// worker's row count includes the guidance prefix, which is not a request.
+    /// executor's row count includes the guidance prefix, which is not a request.
     max_running_requests: u32,
     /// The catalogue of prefill buckets this rank captures and whether the deployment stated it
     /// (§4.5): the ceiling a policy's `max_num_batched_tokens` is refused against (§4.4), named
@@ -1802,7 +1802,7 @@ impl MainProcess {
         }
 
         // A `Precopy` that names no kernel program is the startup switch: the daemon states the
-        // scheduling policy alone, because on a host that runs the worker path there is no kernel
+        // scheduling policy alone, because on a host that runs the executor path there is no kernel
         // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
         // installs what it can actually launch, so the store's listing is read first, on the module
         // lane, rather than capturing an empty generation.
@@ -3785,7 +3785,7 @@ impl MainProcess {
         // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
         // aborted and the owners close in the order they need (`close`).
         //
-        // The rest are the engine surface of the worker era, and the daemon's migration, expert
+        // The rest are the engine surface of the executor era, and the daemon's migration, expert
         // and admin paths still send them here. Each is answered with what it needs instead of
         // being dropped: a command a process does not serve is otherwise a caller waiting for a
         // reply that never comes, which is a hang with no name in it.
@@ -3850,7 +3850,7 @@ impl MainProcess {
                     error: WORKER_ERA.to_owned(),
                 }),
             ),
-            // The worker era's park, resume and trial commit move a worker world between
+            // The executor era's park, resume and trial commit move an executor world between
             // processes. The epoch parks, resumes and commits through the process connection, in
             // front of the frontend rather than behind it (§2.5, §7.4).
             Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
@@ -3903,7 +3903,7 @@ impl MainProcess {
             // What the prefix cache holds is answered here, from what this process announced.
             //
             // A standby that starts on these devices maps the serving epoch's segments read-only
-            // (`specs/worker.md` 7.4 step 1), so reading them moves nothing and is not a lifecycle
+            // (`specs/executor.md` 7.4 step 1), so reading them moves nothing and is not a lifecycle
             // command. The answer is the description this process gave the daemon when it became
             // ready: the segments are the pool's, and they are the same for as long as the epoch
             // serves. Asking every scheduler afresh is what cannot be done from here - a scheduler
@@ -3954,7 +3954,7 @@ impl MainProcess {
     }
 
     /// Sends the engine's counters to the daemon, one report a second and a
-    /// final flush when the process ends (`specs/worker.md` §2.3).
+    /// final flush when the process ends (`specs/executor.md` §2.3).
     ///
     /// The executor states its own figures: the launches and device nanoseconds
     /// its runners counted, the jobs in flight the control thread's watchdog
@@ -4196,11 +4196,11 @@ impl MainProcess {
     }
 
     /// What the daemon records of this process: the limits every request is checked against, the
-    /// batch the workers were started for, and the KV cache segments a successor on the same
+    /// batch the executors were started for, and the KV cache segments a successor on the same
     /// devices maps (§7.3 step 1).
     ///
-    /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
-    /// each scheduler describes for itself: a successor needs what the workers hold now, not what
+    /// The figures are the executors' own (`SchedulerHandle::info`), except the cache segments, which
+    /// each scheduler describes for itself: a successor needs what the executors hold now, not what
     /// this process planned.
     fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
         let first = self
@@ -4221,7 +4221,7 @@ impl MainProcess {
             {
                 Ok(Ok(groups)) => groups,
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "a worker group did not describe its cache");
+                    tracing::warn!(%error, "an executor group did not describe its cache");
                     continue;
                 }
                 Err(error) => {
@@ -4261,7 +4261,7 @@ impl MainProcess {
             capacity: Some(proto::request::wire::BatchCapacity {
                 max_batch: info.max_batch_calls,
                 max_num_batched_tokens: u64::from(info.max_batch_tokens),
-                // The launch's own figure, not the worker's row count: the rows include the
+                // The launch's own figure, not the executor's row count: the rows include the
                 // guidance prefix, which is not a request.
                 max_running_requests: self.max_running_requests,
             }),
@@ -4614,7 +4614,7 @@ fn answer(
     }
 }
 
-/// What the engine answers a command of the worker era's surface: the operation named a worker
+/// What the engine answers a command of the executor era's surface: the operation named an executor
 /// world of its own, and this epoch executes batches itself (§2.4).
 const WORKER_ERA: &str = "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
      executors are the process's own";
@@ -4917,7 +4917,7 @@ impl Unavailable {
     }
 }
 
-/// One module the Program Server resolved, held open while its kernel loads (`specs/worker.md`
+/// One module the Program Server resolved, held open while its kernel loads (`specs/executor.md`
 /// §4.2, §6.3).
 ///
 /// The server sends the module's files as open handles rather than as paths, so the image is read
@@ -6630,7 +6630,7 @@ fn device_command(
 }
 
 /// The handshake with the daemon, which answers with the epoch this node serves
-/// (`specs/worker.md` §2.3).
+/// (`specs/executor.md` §2.3).
 ///
 /// This node's scheduler threads, one per DP rank (§2.4, §4.4).
 ///
@@ -6645,7 +6645,7 @@ fn schedulers(
     memory: &Memory,
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
-    rank: &ipc::WorkerInfo,
+    rank: &ipc::MainProcessInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -6671,7 +6671,7 @@ fn schedulers(
         placement: executor::batch::Placement {
             queue_depth: plan.queue_depth(),
             ranks: plan.world_size(),
-            components: engine::WorkerGroupConfig::single_component(
+            components: engine::ExecutorGroupConfig::single_component(
                 ipc::DEFAULT_COMPONENT,
                 plan.world_size(),
             ),

@@ -16,7 +16,7 @@
 //! - `SimEngine::set_queue_depth` bounds the batches the scheduler may keep
 //!   unresolved. Depth 1 is the serial oracle that the depth-invariance tests
 //!   compare depth 2 against.
-//! - The cache block size is 64 tokens, one unit per page (`WorkerInfo::default`),
+//! - The cache block size is 64 tokens, one unit per page (`MainProcessInfo::default`),
 //!   unless a test calls `SimEngine::set_block_size` or `set_groups`, and
 //!   generated images default to 512x512 (`ImageParams::default`).
 //! - The `general` request gauges and the `prefix_cache` and `encoder` counters in
@@ -37,7 +37,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use engine::{
     BatchEvent, BatchResult, CommandSender, EVENT_BUFFER_CAPACITY, ExecutionBatch, Executor,
     ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine, SimExecutor,
-    SpecialTokenIds, WorkerGroupId,
+    SpecialTokenIds, ExecutorGroupId,
 };
 use engine::{Event, FinishReason};
 use engine::{
@@ -53,7 +53,7 @@ fn special_tokens() -> SpecialTokenIds {
     SimEngine::special_tokens()
 }
 
-/// Advertised generation features follow the worker's supported calls: image
+/// Advertised generation features follow the executor's supported calls: image
 /// generation needs the complete latent-preparation, denoising, and
 /// image-decoding path (video decoding does not substitute), and each encoder
 /// call enables only its own feature.
@@ -122,9 +122,9 @@ fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
     }
 }
 
-/// Encoder feature byte limits clamp to the smaller of the worker's encoder
+/// Encoder feature byte limits clamp to the smaller of the executor's encoder
 /// cache entry size and buffer pool size, and the encoder cache entry count
-/// clamps to the worker's advertised entries.
+/// clamps to the executor's advertised entries.
 #[test]
 fn encoder_products_obey_worker_entry_capacity() {
     let mut sim = SimEngine::new();
@@ -148,7 +148,7 @@ type Row = (u32, u32, u32, bool);
 type Read = (u32, u32);
 
 /// Serves one two-step guided image request with `negative` prompt tokens on
-/// a simulator whose worker states `image_unconditional` for its
+/// a simulator whose executor states `image_unconditional` for its
 /// image-unconditional branch, and returns the forward rows of the first
 /// denoising call.
 fn first_denoising_rows(
@@ -234,9 +234,9 @@ fn prefixes_and_branches(rows: &[Row]) -> (Vec<Read>, Vec<Read>) {
 
 /// Each guidance branch reads the prefix it attends to: the
 /// text-unconditional branch the request's negative prompt tokens, and the
-/// image-unconditional branch the prefix its worker states for the model,
+/// image-unconditional branch the prefix its executor states for the model,
 /// each in its own slot and prefilled there; a branch with the same tokens
-/// shares a prefix, and a branch the worker states no prefix for reads the
+/// shares a prefix, and a branch the executor states no prefix for reads the
 /// request's own context.
 #[test]
 fn each_guidance_branch_reads_the_prefix_it_attends_to() {
@@ -298,7 +298,7 @@ fn each_guidance_branch_reads_the_prefix_it_attends_to() {
 }
 
 /// A generated image reserves its latent at the model's bytes per latent
-/// unit, whichever worker capacity clamps the latent feature bytes. A worker
+/// unit, whichever executor capacity clamps the latent feature bytes. An executor
 /// whose encoder entries hold a quarter of the simulator's feature bytes
 /// leaves the latent of a 512x512 image (1,024 units of 16x16 pixels) at
 /// 1,024 units of `SimEngine::generation_limits().latent_bytes_per_unit`.
@@ -830,7 +830,7 @@ fn image_events_cover_declared_denoise_steps() {
 }
 
 #[test]
-fn scheduler_clamps_max_batch_to_worker_info() {
+fn scheduler_clamps_max_batch_to_main_process_info() {
     let mut sim = SimEngine::new();
     sim.mut_info_for_test().max_batch_calls = 3;
     let sched = support::scheduler(Box::new(SimExecutor::new(sim)), special_tokens(), 32).unwrap();
@@ -839,7 +839,7 @@ fn scheduler_clamps_max_batch_to_worker_info() {
 }
 
 /// Serves four concurrent requests that open their image branches on the
-/// same step, on a simulator whose worker reports `transfer_tickets`, and
+/// same step, on a simulator whose executor reports `transfer_tickets`, and
 /// returns how many cache export calls each submitted batch carried, after
 /// checking that every request finished.
 fn cache_export_batch_calls(transfer_tickets: u32) -> Vec<usize> {
@@ -908,7 +908,7 @@ fn cache_export_batch_calls(transfer_tickets: u32) -> Vec<usize> {
 }
 
 /// The scheduler keeps no more transfer calls reserved than the transfer
-/// entries the workers report: with one entry, concurrent requests export
+/// entries the executors report: with one entry, concurrent requests export
 /// their cache one call at a time and still all finish, while a wider report
 /// lets the same requests share a batch.
 #[test]
@@ -926,7 +926,7 @@ fn transfer_calls_in_flight_stay_within_the_workers_tickets() {
     );
 }
 
-/// Prefill and decode batches hold at most the calls the workers report one
+/// Prefill and decode batches hold at most the calls the executors report one
 /// batch may hold: eight concurrent generations prefill and decode at most
 /// three at a time and all finish.
 #[test]
@@ -995,7 +995,7 @@ fn forward_batches_hold_at_most_the_workers_batch_calls() {
     );
 }
 
-/// Single-worker results must be identical regardless of queue depth:
+/// Single-executor results must be identical regardless of queue depth:
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn queue_depth_is_token_identical() {
@@ -1447,7 +1447,7 @@ fn stop_string_cutoff_is_request_local() {
     ));
 }
 
-/// Text requests complete on a worker whose unit pool holds a full-attention
+/// Text requests complete on an executor whose unit pool holds a full-attention
 /// group and a sliding-window group with different page shapes. The prompt
 /// is several times the window, so the sliding group retires pages while the
 /// request runs and its declared tables carry only in-window pages, and a
@@ -1533,7 +1533,7 @@ fn hybrid_groups_share_one_unit_pool() {
         "reused {reused} tokens"
     );
 
-    // A finished request's units retire until its workers acknowledge the
+    // A finished request's units retire until its executors acknowledge the
     // queued finish, so the pool drains while the engine keeps running, not
     // at the moment `Finished` is observed; shutdown would abort that ack.
     let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
@@ -1656,7 +1656,7 @@ fn prefix_cache_configuration_controls_reuse() {
     assert_eq!(outputs[0], outputs[1]);
 }
 
-/// Workers that denoise images under CUDA graphs report the steps they
+/// Executors that denoise images under CUDA graphs report the steps they
 /// captured; the engine admits an image request only when its size is
 /// captured at every guidance branch count up to its own, and refuses the
 /// others with the sizes it serves.
@@ -1750,7 +1750,7 @@ fn image_requests_are_admitted_only_at_captured_steps() {
     }
 }
 
-/// Workers report the rows and tokens their image denoising step holds;
+/// Executors report the rows and tokens their image denoising step holds;
 /// the engine admits an image request only when every guidance branch's
 /// framed latent sequence fits them, and refuses the others naming the
 /// exceeded extent.
@@ -1837,7 +1837,7 @@ fn image_requests_are_admitted_only_within_the_step_capacity() {
     }
 }
 
-/// Workers that encode latents under CUDA graphs report the image sizes
+/// Executors that encode latents under CUDA graphs report the image sizes
 /// they captured; the engine admits an input image's latent block only at
 /// one of them, and refuses a block of another size, or of no stated size,
 /// with the sizes it serves.
@@ -1915,7 +1915,7 @@ fn latent_blocks_are_admitted_only_at_captured_sizes() {
     }
 }
 
-/// Workers that keep cache layers per request slot (a recurrent state)
+/// Executors that keep cache layers per request slot (a recurrent state)
 /// checkpoint them in a state group: a request of the same prompt reuses the
 /// prefix up to the checkpoint the first request's prompt kept at its last
 /// page boundary, and no deeper.
@@ -2774,8 +2774,8 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
     );
 }
 
-/// A request's worker admission carries the number of input images the
-/// request holds, which worker image preprocessing reads when it divides a
+/// A request's executor admission carries the number of input images the
+/// request holds, which executor image preprocessing reads when it divides a
 /// pixel budget among them.
 #[test]
 fn admission_carries_the_request_input_image_count() {
@@ -3893,8 +3893,8 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
-/// Executor whose worker process can be lost: once `lost` is set, every poll
-/// reports an executor failure, as a worker exit does, and the scheduler
+/// Executor whose executor process can be lost: once `lost` is set, every poll
+/// reports an executor failure, as an executor exit does, and the scheduler
 /// latches engine-fatal. Everything else is the simulator.
 struct LosableExecutor {
     inner: SimExecutor,
@@ -3906,11 +3906,11 @@ impl Executor for LosableExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 
@@ -3934,7 +3934,7 @@ impl Executor for LosableExecutor {
     }
 }
 
-/// A worker failure that stops the engine still delivers `Finished { Aborted }`
+/// An executor failure that stops the engine still delivers `Finished { Aborted }`
 /// to a running request whose event channel is full, after every event it
 /// published before the failure.
 #[test]
@@ -4002,7 +4002,7 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
     }
 }
 
-/// A scheduler takes scheduling limits in place within its workers' batch
+/// A scheduler takes scheduling limits in place within its executors' batch
 /// and refuses limits beyond it, keeping its own. A change of policy orders
 /// the requests already waiting by it.
 #[test]
@@ -4094,9 +4094,9 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     let _ = jh.join();
 }
 
-/// An engine whose only worker group is lost, with nothing to replace it,
+/// An engine whose only executor group is lost, with nothing to replace it,
 /// stops admitting work: its scheduler thread ends, and a submission after
-/// that is refused rather than queued for workers that will never exist.
+/// that is refused rather than queued for executors that will never exist.
 ///
 /// The launched-path case this states kills a rank process and makes its
 /// relaunch fail at the OS boundary. The loss here is the same event told to
@@ -4118,7 +4118,7 @@ fn losing_every_worker_stops_request_admission() {
 
     // The deployment's only group is lost, and nothing can replace it.
     loss.lose(
-        WorkerGroupId("sim".to_owned()),
+        ExecutorGroupId("sim".to_owned()),
         "the simulated launch could not be replaced",
     );
 

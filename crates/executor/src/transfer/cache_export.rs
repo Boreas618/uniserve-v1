@@ -582,7 +582,7 @@ fn export_group(
 mod tests {
     use std::collections::HashSet;
 
-    use ipc::{BlockTable, RequestKey, TransferTransport, WorkerEndpoint};
+    use ipc::{BlockTable, RequestKey, TransferTransport, MainProcessEndpoint};
     use ipc::{CallId, PrefixCacheDtype, RequestId, UnitId};
 
     use super::*;
@@ -725,7 +725,7 @@ mod tests {
             Arc::new(TransferCapacity::new(1 << 24, 8)?),
             EventPool::new(),
             &TransportOptions {
-                source: WorkerEndpoint {
+                source: MainProcessEndpoint {
                     host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
@@ -879,7 +879,7 @@ mod tests {
                 Arc::clone(&capacity),
                 Arc::clone(&events),
                 &TransportOptions {
-                    source: WorkerEndpoint {
+                    source: MainProcessEndpoint {
                         host: "host".into(),
                         address_space: "space".into(),
                         incarnation: "incarnation".into(),
