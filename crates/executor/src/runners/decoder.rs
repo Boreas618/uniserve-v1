@@ -322,6 +322,24 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(buffers)
     }
 
+    /// One clip's buffers, refused unless their count is the model's: one latents column and one per
+    /// table, in [`Decoder::layout_tables`]' order.
+    ///
+    /// The count is the model's statement, not the runner's - a decode whose batch carried two
+    /// latents columns, or one table short, would write a column from another's bytes and read the
+    /// missing table as whatever the previous clip left there.
+    fn buffers_of<'a>(buffers: &'a Vec<Vec<u8>>, tables: usize) -> Result<&'a [Vec<u8>]> {
+        let expected = tables + 1;
+        if buffers.len() != expected {
+            return Err(Error::Invalid(format!(
+                "the decoder states {expected} buffer(s) for a clip - one latents and {tables} \
+                 table(s) - and the batch carries {}",
+                buffers.len()
+            )));
+        }
+        Ok(buffers)
+    }
+
     /// Stages a batch's buffers into the columns `bucket`'s graph reads.
     ///
     /// The buffers are the model's own: `prepare_layout` states the first as the clip's latents and
@@ -337,17 +355,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
         let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        let buffers = Self::clip_of(media)?;
-        let expected = tables.len() + 1;
-        if buffers.len() != expected {
-            return Err(Error::Invalid(format!(
-                "the decoder states {} buffer(s) for a clip - one latents and {} table(s) - and the \
-                 batch carries {}",
-                expected,
-                tables.len(),
-                buffers.len()
-            )));
-        }
+        let buffers = Self::buffers_of(Self::clip_of(media)?, tables.len())?;
         self.columns.latents.write(&buffers[0])?;
         for (column, bytes) in self.columns.state.iter_mut().zip(&buffers[1..]) {
             column.write(bytes)?;
@@ -806,6 +814,29 @@ mod tests {
                 .len(),
             1,
             "one request carries the clip's one set of buffers"
+        );
+    }
+
+    #[test]
+    fn a_clip_carries_one_latents_buffer_and_one_per_table() {
+        // The count is the model's: the stub declares two tables, so a clip is three buffers, and a
+        // batch carrying one fewer would read the missing table as whatever the last clip left.
+        let buffers = vec![vec![0_u8; 8], vec![0_u8; 4], vec![0_u8; 4]];
+        assert_eq!(
+            DecoderRunner::<Fixed>::buffers_of(&buffers, 2)
+                .expect("one latents and two tables")
+                .len(),
+            3
+        );
+
+        let short = vec![vec![0_u8; 8], vec![0_u8; 4]];
+        let error =
+            DecoderRunner::<Fixed>::buffers_of(&short, 2).expect_err("one table is missing");
+        let message = format!("{error}");
+        assert!(
+            message.contains("states 3 buffer(s) for a clip")
+                && message.contains("the batch carries 2"),
+            "the refusal names both counts: {message}"
         );
     }
 
