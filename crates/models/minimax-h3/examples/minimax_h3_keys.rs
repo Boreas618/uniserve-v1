@@ -193,27 +193,32 @@ const FFN: u32 = 14336;
 /// clips at all: 17, 25, 49, 121 and 1024 are counts the video *encoder* accepts (a condition is cut
 /// and padded) and the sampler does not. [`deployment_clips`] is the model's own rounding of them,
 /// and that is what the rows are keyed for.
-const DEPLOYMENT_STAGES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
-
-/// The clips a delivery's stage lengths snap to, by the model's own rule.
+/// The durations the delivery serves, in **seconds** - the eval workloads' own four.
 ///
-/// `align_num_frames` rounds a request up to the next generated clip and floors it at 22, so the six
-/// stages are five clips - 22, 39, 56, 124 and 1008 - and two stages that snap to one clip state one
-/// clip's rows. Deriving the ladder this way means the row set cannot describe a timeline no request
-/// can be handed, which is what a list of stage lengths read as clips did for days.
+/// `uniserve_eval/workloads/minimax_h3/` asks for 5, 8, 10 and 15 seconds, so those are the requests a
+/// store has to answer and nothing else is inventory worth carrying. A duration is what a request
+/// states; the frame count is what the model makes of it, and the clip is what the packing accepts.
+const DELIVERY_SECONDS: [u32; 4] = [5, 8, 10, 15];
+
+/// The clips the delivery's durations snap to, by the model's own rule.
+///
+/// Three steps, each one function: seconds to frames at the model's rate, frames to the next generated
+/// timeline (`align_num_frames`: `17n + 5`, at least 22, and no longer than the rule's last rung), and
+/// one clip per distinct result. At 24 fps and one canvas that is 120, 192, 240 and 360 frames and
+/// **124, 192, 243 and 362** clips - two of the four are exactly producible and two are not, which is
+/// why a list of durations is not a list of clips.
 fn deployment_clips() -> Vec<u32> {
     // The largest clip the model generates, which is the last rung of its rule and **not** `MAX_FRAMES`:
     // a request of `MAX_FRAMES` rounds up past it, so a ladder built by rounding alone would state one
     // clip longer than the model has (1025 against a 1024-frame maximum).
-    let Some(longest) = minimax_h3::programs::Deployment::generated()
+    let longest = minimax_h3::programs::Deployment::generated()
         .last()
         .copied()
-    else {
-        unreachable!("the rule has rungs")
-    };
-    let mut clips: Vec<u32> = DEPLOYMENT_STAGES
+        .unwrap_or(minimax_h3::config::MAX_FRAMES);
+    let mut clips: Vec<u32> = DELIVERY_SECONDS
         .iter()
-        .map(|frames| minimax_h3::packing::align_num_frames(*frames).min(longest))
+        .map(|seconds| seconds * minimax_h3::config::FPS)
+        .map(|frames| minimax_h3::packing::align_num_frames(frames).min(longest))
         .collect();
     clips.sort_unstable();
     clips.dedup();
