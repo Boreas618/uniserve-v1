@@ -593,6 +593,10 @@ pub(crate) struct MainProcess {
     /// node's warmup.
     command_wait: Wait,
     warmup_wait: Wait,
+    /// A switchover whose answer is owed to the warmup it queued: the generation, and the peer to
+    /// answer when admission opens. `Switched` means this process serves, so it waits for the
+    /// buckets a batch would be planned into; a warmup that fails answers the switchover instead.
+    pending_switch: Option<(u64, Option<u32>)>,
     /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
     ///
     /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
@@ -861,6 +865,7 @@ impl MainProcess {
             commands_seen: 0,
             command_wait: Wait::default(),
             warmup_wait: Wait::default(),
+            pending_switch: None,
             policy_probe_at: None,
             policy_missing_since: None,
             prepared: Vec::new(),
@@ -1561,7 +1566,12 @@ impl MainProcess {
                     step = step.unwrap_or_default(),
                     "received the daemon's switchover"
                 );
-                self.switchover(generation, step)?
+                match self.switchover(generation, step, reply)? {
+                    Some(status) => status,
+                    // The answer is owed to the warmup: it is sent from `advance_warmup` when
+                    // admission opens, or replaced by the failure that keeps admission shut.
+                    None => return Ok(None),
+                }
             }
             ProgramCommand::Commit { generation } => self.commit(generation)?,
             // The operator's rollback is the daemon's decision, and its reason - when the
@@ -2170,6 +2180,17 @@ impl MainProcess {
                         ),
                         batch: None,
                     };
+                    // A switchover whose answer is still owed is answered with this failure: the
+                    // daemon must not read the epoch as served after a warmup that did not finish.
+                    if let Some((owed, owed_reply)) = self.pending_switch.take() {
+                        self.answer(
+                            owed_reply,
+                            ProgramStatus::Failed {
+                                generation: owed,
+                                failure: failure.clone(),
+                            },
+                        );
+                    }
                     // The table decides, as it does for every other failure: on probation this
                     // reverts the generation, and an update the daemon already committed leaves a
                     // device that cannot run it, which ends the epoch rather than serving on.
@@ -2183,6 +2204,14 @@ impl MainProcess {
             // into exists. A warmup that failed returns above and its revert clears what was owed.
             self.open_admission()
                 .context("opening admission after the warmup")?;
+        }
+        // The switchover's answer is owed to the warmup, and it is sent here - after admission
+        // opened - so that `Switched` states the one thing it means: this process can serve.
+        if self.warming.is_empty() {
+            if let Some((generation, reply)) = self.pending_switch.take() {
+                tracing::info!(generation, "answering the switchover now that admission is open");
+                self.answer(reply, ProgramStatus::Switched { generation });
+            }
         }
         Ok(None)
     }
@@ -2804,7 +2833,12 @@ impl MainProcess {
 
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
     /// the command at; an expert group's ranks switch at the same step.
-    fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
+    fn switchover(
+        &mut self,
+        generation: u64,
+        step: Option<u64>,
+        reply: Option<u32>,
+    ) -> Result<Option<ProgramStatus>> {
         // A switchover to a generation this process never prepared cannot succeed, and cutting the
         // devices over to try it costs a live graph rebuild to end where it started: it is refused
         // before any device is touched, and the generation that serves keeps serving.
@@ -2835,10 +2869,10 @@ impl MainProcess {
             })
         };
         if let Some(reason) = refused {
-            return Ok(ProgramStatus::PrecopyFailed {
+            return Ok(Some(ProgramStatus::PrecopyFailed {
                 generation,
                 failure: UpdateFailure::Precopy { reason },
-            });
+            }));
         }
         self.switchover_policy(generation, step);
         for executor in &self.executors {
@@ -2854,7 +2888,7 @@ impl MainProcess {
                     error: error.to_string(),
                     batch: None,
                 };
-                return self.revert(generation, failure);
+                return self.revert(generation, failure).map(Some);
             }
         }
         // The record moves before the warmup: probation begins the moment every device serves the
@@ -2873,7 +2907,7 @@ impl MainProcess {
                     "the switchover names a generation that is not on probation: {error}"
                 ),
             };
-            return self.revert(generation, failure);
+            return self.revert(generation, failure).map(Some);
         }
         self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
         // The programs move with the generations, as one record: the next precopy's changed set is
@@ -2905,12 +2939,12 @@ impl MainProcess {
                         batch: None,
                     };
                     if let Some(ending) = self.failure(failure)? {
-                        return Ok(ProgramStatus::Failed {
+                        return Ok(Some(ProgramStatus::Failed {
                             generation,
                             failure: ending,
-                        });
+                        }));
                     }
-                    return Ok(ProgramStatus::Switched { generation });
+                    return Ok(Some(ProgramStatus::Switched { generation }));
                 }
             }
         }
@@ -2949,7 +2983,17 @@ impl MainProcess {
         if self.switchovers == 1 {
             self.policy_probe_at = Some(Instant::now());
         }
-        Ok(ProgramStatus::Switched { generation })
+        match switchover_answer(self.warming.len(), generation) {
+            SwitchoverAnswer::Now(status) => Ok(Some(status)),
+            // `Switched` states that this process serves, and it cannot serve until the buckets a
+            // batch may be planned into exist - admission opens in `advance_warmup`. So the answer
+            // waits for it: a warmup that fails then answers with the failure, and the daemon never
+            // opens a frontend onto a process that cannot take a request.
+            SwitchoverAnswer::AfterTheWarmup => {
+                self.pending_switch = Some((generation, reply));
+                Ok(None)
+            }
+        }
     }
 
     /// §7.3 step 5: probation ended in a commit; the previous generation is kept
@@ -3279,6 +3323,10 @@ impl MainProcess {
         // stopped describing serving, and a failure read from a stale entry would revert an update
         // that is over.
         self.warming.clear();
+        // The answer owed to that warmup goes with it: the daemon's switchover wait is answered by
+        // the revert's own report, and a later `Switched` would state a generation that does not
+        // serve.
+        self.pending_switch = None;
         // What the update's warmup still owed is owed no longer. An epoch that kept the generation
         // which served before it goes on serving, and that generation's buckets are captured - a
         // cancelled warmup of the update's is nothing to wait for. A revert of the epoch's first
@@ -5635,6 +5683,26 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 /// one message behind the revert that its own rollback threshold caused, so its commit arrives after
 /// the update ended. The state that holds is the one before the update - it serves, nothing was
 /// committed - and that is the answer. A protocol message never ends a process that can still serve.
+/// What a switchover answers: the status now, or nothing until its warmup has run.
+///
+/// `Switched` states that this process serves, and it cannot serve a batch before the buckets that
+/// batch may be planned into exist - so a switchover that queued a warmup answers after admission
+/// opens, and a warmup that fails answers the switchover with the failure instead. A switchover with
+/// nothing to warm has nothing to wait for.
+#[derive(Debug)]
+enum SwitchoverAnswer {
+    Now(ProgramStatus),
+    AfterTheWarmup,
+}
+
+fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
+    if warming == 0 {
+        SwitchoverAnswer::Now(ProgramStatus::Switched { generation })
+    } else {
+        SwitchoverAnswer::AfterTheWarmup
+    }
+}
+
 fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
     match update.commit(generation) {
         Ok(()) => ProgramStatus::Committed { generation },
@@ -7267,6 +7335,26 @@ mod tests {
             update.current(),
             1,
             "the serving generation moved under commands it could not apply"
+        );
+    }
+
+
+    /// A switchover answers `Switched` only when it can serve: a warmup still running means the
+    /// buckets a batch would be planned into do not exist yet, so the answer waits for admission.
+    /// The run this is written from answered first and the daemon opened a frontend onto a process
+    /// whose warmup then failed.
+    #[test]
+    fn a_switchover_answers_after_its_warmup_not_before() {
+        match switchover_answer(0, 3) {
+            SwitchoverAnswer::Now(ProgramStatus::Switched { generation }) => assert_eq!(generation, 3),
+            SwitchoverAnswer::Now(other) => panic!("a switchover with nothing to warm answered {other:?}"),
+            SwitchoverAnswer::AfterTheWarmup => {
+                panic!("a switchover with nothing to warm deferred its answer forever")
+            }
+        }
+        assert!(
+            matches!(switchover_answer(2, 3), SwitchoverAnswer::AfterTheWarmup),
+            "a switchover answered before the warmup it queued had run"
         );
     }
 
