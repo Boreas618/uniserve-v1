@@ -192,19 +192,32 @@ impl Deployment {
     /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
     /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
     /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
-    pub fn text_rows(&self, partition: &Partition, tokens: u32) -> Result<Vec<(String, String)>> {
+    /// The prompt lengths a walk states.
+    ///
+    /// The tower is stated **at the longest of them**, because its learned position table is compiled
+    /// for a bound rather than for one prompt: the table does not change with a shorter prompt, and a
+    /// row per prompt length would state a table the deployment compiles once.
+    pub fn text_rows(
+        &self,
+        partition: &Partition,
+        tokens: &[u32],
+    ) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        programs.extend(crate::text_encoder::TextEncoder::programs(
-            &self.config.text_encoder,
-            partition,
-            self.types.text_encoder,
-            tokens,
-        )?);
-        programs.extend(crate::vision::VisionTower::programs(
-            &self.config.text_encoder.vision,
-            self.types.text_encoder,
-            tokens,
-        )?);
+        for length in tokens {
+            programs.extend(crate::text_encoder::TextEncoder::programs(
+                &self.config.text_encoder,
+                partition,
+                self.types.text_encoder,
+                *length,
+            )?);
+        }
+        if let Some(sequence) = tokens.iter().copied().max() {
+            programs.extend(crate::vision::VisionTower::programs(
+                &self.config.text_encoder.vision,
+                self.types.text_encoder,
+                sequence,
+            )?);
+        }
         Ok(programs.finish())
     }
 

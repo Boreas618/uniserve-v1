@@ -20,18 +20,14 @@
 use std::path::PathBuf;
 
 use minimax_h3::audio_vae::BigVgan;
-use minimax_h3::config::{
-    AttentionKind, AudioVaeConfig, TextEncoderConfig, TransformerConfig, VideoVaeConfig,
-};
+use minimax_h3::config::{AttentionKind, AudioVaeConfig, TransformerConfig, VideoVaeConfig};
 use minimax_h3::denoiser::Denoiser;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
 use minimax_h3::partition::Partition;
 use minimax_h3::programs::{Deployment, Types};
-use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::VideoDecoder;
-use minimax_h3::vision::VisionTower;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
@@ -383,25 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("not walked: {} has no video VAE config", root.display());
     }
 
-    let encoder = root.join("text_encoder/config.json");
-    if encoder.exists() {
-        let metadata = read(&encoder)?;
-        let processor = read(&root.join("text_encoder/preprocessor_config.json"))?;
-        let config = TextEncoderConfig::parse(&metadata, &processor)?;
-        // One row per prompt length: the attention's key bound is the deployment's, and the gated
-        // activation's `wide` form follows from it.
-        for tokens in &tokens {
-            rows.extend(TextEncoder::programs(
-                &config, &partition, text_type, *tokens,
-            )?);
-        }
-        // The tower attends grids of the deployment's largest image; its programs do not depend on
-        // them beyond the bound the module is accepted for.
-        let sequence = tokens.iter().copied().max().unwrap_or(0);
-        rows.extend(VisionTower::programs(&config.vision, text_type, sequence)?);
-    } else {
-        eprintln!("not walked: text_encoder");
-    }
+    // The text encoder and its tower, from the deployment rather than from the component directory:
+    // a walk that parsed `text_encoder/config.json` itself was the last place this tool answered a
+    // deployment question with a second parser.
+    rows.extend(deployment.text_rows(&partition, &tokens)?);
 
     // The two DiT partitions, each stated from its own `config.json`. The attention kind is a
     // deployment's contract (a sparse contract is a student's), so this walks the base form and the
