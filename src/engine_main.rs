@@ -931,10 +931,15 @@ impl MainProcess {
                  mapped"
             );
         }
+        // The launch generation, which is what `Parked` states: the daemon files a report by it
+        // (`supervision/roster.rs:236-244` reads `launch_of(engine, parked.generation)`), and the
+        // program generation is zero here - a standby parks before any `Precopy` names one - so a
+        // report stating that would name a launch that does not exist and be dropped. The `Park`
+        // command states the same number for the same reason.
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Parked(
                 proto::process::Parked {
-                    generation: self.update.current(),
+                    generation: self.control.engine(),
                 },
             )),
         });
