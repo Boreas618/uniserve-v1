@@ -3,21 +3,18 @@
 //! [`ChatOutputProcessor`] parses one request's decoded text, as vLLM's
 //! default chat output processor does: an optional reasoning parser splits
 //! reasoning from visible text, and an optional tool parser extracts tool
-//! calls from the visible text (`tool`). Each model family chooses its
-//! parsers: Qwen3 `<think>` reasoning and JSON tool calls, Gemma-4 thought
-//! channels and native tool calls, SenseNova's delimited reasoning, and no
-//! parser for Bagel. `output::assembly` feeds the processor and frames its
-//! [`AssistantEvent`]s as content blocks and tool calls (`structured`).
+//! calls from the visible text (`tool`). Qwen3 chooses its parsers:
+//! `<think>` reasoning and JSON tool calls. `output::assembly` feeds the
+//! processor and frames its [`AssistantEvent`]s as content blocks and tool
+//! calls (`structured`).
 
 use proto::handoff;
 use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
-use crate::output::reasoning::{
-    Gemma4ReasoningParser, Qwen3ReasoningParser, ReasoningDelta, ReasoningParser,
-};
+use crate::output::reasoning::{Qwen3ReasoningParser, ReasoningDelta, ReasoningParser};
 use crate::output::text::TextDecodeOptions;
-use crate::output::tools::{Gemma4ToolParser, Qwen25ToolParser, Tool, ToolParser};
+use crate::output::tools::{Qwen25ToolParser, Tool, ToolParser};
 use crate::tokenizer::DynTokenizer;
 
 use super::tool::ToolStage;
@@ -139,53 +136,6 @@ impl ChatOutputProcessor {
         );
         processor.parser = handoff::Parser {
             kind: handoff::parser::Kind::ParserKindQwen3 as i32,
-            parse_reasoning,
-            parse_tools,
-        };
-        Ok(processor)
-    }
-
-    /// The Gemma-4 processor of a request: thought channels when
-    /// `parse_reasoning` is set, and native tool calls when `parse_tools` is.
-    ///
-    /// The thinking mode needs no separate input: the prompt suffix decides
-    /// whether generation starts inside a thought channel, and otherwise the
-    /// model's own channel delimiters mark reasoning. Sets
-    /// `decode.skip_special_tokens` to `false`: Gemma-4
-    /// delimits thought channels, tool calls, and string arguments with
-    /// special tokens, which the parsers must see and which stream verbatim
-    /// as content when parsing is disabled. DiffusionGemma commits output in
-    /// blocks of tokens, so one decoded delta can hold a whole thought
-    /// channel, visible text, and complete tool calls; both parsers accept
-    /// any number of delimiters per delta, as well as delimiters split across
-    /// deltas.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::ParserInitialization` when the tokenizer lacks the
-    /// `<|channel>` or `<channel|>` token.
-    pub fn gemma4(
-        parse_tools: bool,
-        decode: &mut TextDecodeOptions,
-        tokenizer: DynTokenizer,
-        parse_reasoning: bool,
-    ) -> Result<Self> {
-        decode.skip_special_tokens = false;
-        let reasoning = parse_reasoning
-            .then(|| Gemma4ReasoningParser::new(tokenizer))
-            .transpose()
-            .map_err(|error| Error::ParserInitialization {
-                kind: "reasoning",
-                name: "gemma4".to_string(),
-                error: Box::new(error),
-            })?;
-        let tools = parse_tools.then(Gemma4ToolParser::new);
-        let mut processor = Self::new(
-            reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
-            tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        );
-        processor.parser = handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindGemma4 as i32,
             parse_reasoning,
             parse_tools,
         };

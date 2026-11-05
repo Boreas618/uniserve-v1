@@ -3,18 +3,14 @@
 //!
 //! [`InputProcessor`] renders and tokenizes a request against the loaded
 //! model: chat templates (`chat`), sampling controls (`sampling`), images
-//! (`media`), and the lowering of each model family's requests (`omni`,
-//! `diffusion_gemma`, `video`, the System One readout `readout`). Each
+//! (`media`), and the lowering of each model family's requests (`video`). Each
 //! request leaves with its engine request and the parameters its output
 //! processing takes (`OutputParams`, `crate::output`).
 
 pub mod chat;
-pub(crate) mod diffusion_gemma;
 mod error;
 pub mod media;
-mod omni;
 pub(crate) mod processor;
-pub mod readout;
 mod request;
 mod sampling;
 pub mod video;

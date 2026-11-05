@@ -14,8 +14,7 @@
 //!
 //! Some options configure one model family: the token batch budgets,
 //! `chat_config` and `image_fetch_config` token models, `video_config`,
-//! `media_config` and `video_job_config` MiniMax-H3, `readout_config` and
-//! `diffusion_generation_config` DiffusionGemma. Startup refuses such an
+//! `media_config` and `video_job_config` MiniMax-H3. Startup refuses such an
 //! option stated for a checkpoint of another family rather than ignoring it
 //! ([`Stated::refuse_foreign_options`]).
 
@@ -40,12 +39,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use models::ModelDescription;
-use models::diffusion_gemma::DenoisingOverrides;
 
 pub use args::{FLAG_PATHS, ServeArgs, Stated, overridden, printed, resolve_text};
-pub use values::{
-    CandidateTokens, CanvasMode, ChatTemplateContentFormatOption, ImageSize, ReadoutLayout,
-};
+pub use values::{ChatTemplateContentFormatOption, ImageSize};
 
 /// Environment variable read for the API key when `server_config.api_key`
 /// is unset.
@@ -64,9 +60,9 @@ const PLACEMENT_SHORTHAND: [&str; 5] = [
 /// options by configuration path.
 ///
 /// Token models schedule token batches and render chat prompts, which a
-/// video pipeline does neither of; the video and DiffusionGemma tables
-/// configure behavior only their family has.
-const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
+/// video pipeline does neither of; the video tables configure behavior only
+/// their family has.
+const FAMILY_OPTIONS: [(Family, &[&str]); 2] = [
     (
         Family::TokenModels,
         &[
@@ -81,10 +77,6 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
         Family::MiniMaxH3,
         &["video_config", "media_config", "video_job_config"],
     ),
-    (
-        Family::DiffusionGemma,
-        &["readout_config", "diffusion_generation_config"],
-    ),
 ];
 
 /// A group of model families some options belong to.
@@ -92,7 +84,6 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
 enum Family {
     TokenModels,
     MiniMaxH3,
-    DiffusionGemma,
 }
 
 impl Family {
@@ -101,7 +92,6 @@ impl Family {
         match self {
             Self::TokenModels => !description.is_pipeline(),
             Self::MiniMaxH3 => description == ModelDescription::MiniMaxH3,
-            Self::DiffusionGemma => description == ModelDescription::DiffusionGemma,
         }
     }
 
@@ -110,7 +100,6 @@ impl Family {
         match self {
             Self::TokenModels => "token models",
             Self::MiniMaxH3 => "MiniMax-H3 video generation",
-            Self::DiffusionGemma => "DiffusionGemma",
         }
     }
 }
@@ -122,8 +111,8 @@ impl Stated {
     /// # Errors
     ///
     /// Fails, naming the first such option and the served model, when a
-    /// video pipeline states a token-model option, or another model states
-    /// a MiniMax-H3 or DiffusionGemma table.
+    /// video pipeline states a token-model option, or a token model states a
+    /// MiniMax-H3 table.
     pub fn refuse_foreign_options(&self, description: ModelDescription) -> anyhow::Result<()> {
         for (family, paths) in FAMILY_OPTIONS {
             if family.serves(description) {
@@ -245,8 +234,6 @@ pub struct ServeConfig {
     pub video_config: VideoOptions,
     pub media_config: MediaOptions,
     pub video_job_config: VideoJobOptions,
-    pub readout_config: ReadoutOptions,
-    pub diffusion_generation_config: DenoisingOverrides,
 }
 
 impl Default for ServeConfig {
@@ -293,8 +280,6 @@ impl Default for ServeConfig {
             video_config: VideoOptions::default(),
             media_config: MediaOptions::default(),
             video_job_config: VideoJobOptions::default(),
-            readout_config: ReadoutOptions::default(),
-            diffusion_generation_config: DenoisingOverrides::default(),
         }
     }
 }
@@ -793,7 +778,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: Qwen3, SenseNova, BAGEL and DiffusionGemma (`chat_config`).
+/// Chat models: Qwen3 (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatOptions {
@@ -928,10 +913,8 @@ pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> Serve
         image_fetch_config: target.image_fetch_config.clone(),
         media_config: target.media_config.clone(),
         video_job_config: target.video_job_config.clone(),
-        readout_config: target.readout_config,
         migration_config: target.migration_config.clone(),
         mm_processor_kwargs: target.mm_processor_kwargs.clone(),
-        diffusion_generation_config: target.diffusion_generation_config,
         ..current.clone()
     }
 }
@@ -947,10 +930,8 @@ pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> boo
         || current.image_fetch_config != target.image_fetch_config
         || current.media_config != target.media_config
         || current.video_job_config != target.video_job_config
-        || current.readout_config != target.readout_config
         || current.migration_config != target.migration_config
         || current.mm_processor_kwargs != target.mm_processor_kwargs
-        || current.diffusion_generation_config != target.diffusion_generation_config
         // Where this host's Program Server listens: the daemon reads it
         // alone, and an epoch's programs are prepared against it (§5.1).
         || current.program_server != target.program_server
@@ -1121,20 +1102,6 @@ impl Default for VideoJobOptions {
             max_bytes: 1 << 30,
         }
     }
-}
-
-/// DiffusionGemma System One readouts (`readout_config`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReadoutOptions {
-    /// `joint` packs questions into shared canvases; `independent` gives
-    /// each its own prompt and canvas.
-    pub layout: ReadoutLayout,
-    /// Canvas length: `full`, `compact`, or a positive multiple of 16.
-    pub canvas: CanvasMode,
-    /// `variants` sums supported answer spellings; `primary` reads the
-    /// space-prefixed one.
-    pub candidates: CandidateTokens,
 }
 
 impl ServeConfig {

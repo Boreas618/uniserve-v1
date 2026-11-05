@@ -1026,17 +1026,26 @@ pub fn segment_extent(
     tile: u32,
     token_multiple: u32,
 ) -> Result<SegmentExtent> {
-    if tile_shape(tile).is_err()
-        || text_rows < tile
-        || !text_rows.is_multiple_of(tile)
-        || !condition_rows.is_multiple_of(tile)
-        || token_multiple < tile
-        || !token_multiple.is_multiple_of(tile)
-    {
-        return Err(Error::config(
-            "a segment layout needs a known tile size, whole-tile text and condition capacities and a whole-tile alignment"
-                .to_owned(),
-        ));
+    // A segment layout is built from whole tiles: the tile size is one the video grid holds, and the
+    // text, condition and alignment capacities are whole tiles of it. The refusal names the value
+    // that failed rather than the five conditions, because they point at three different capacities
+    // of a deployment - and a reader sent to all three has to find the four numbers to tell them
+    // apart, which is what a partial run cannot show.
+    let failing = if let Err(error) = tile_shape(tile) {
+        error.to_string()
+    } else if text_rows < tile || !text_rows.is_multiple_of(tile) {
+        format!("the {text_rows} text rows are not whole {tile}-row tiles")
+    } else if !condition_rows.is_multiple_of(tile) {
+        format!("the {condition_rows} condition rows are not whole {tile}-row tiles")
+    } else if token_multiple < tile || !token_multiple.is_multiple_of(tile) {
+        format!("the {token_multiple}-row alignment is not a whole number of {tile}-row tiles")
+    } else {
+        String::new()
+    };
+    if !failing.is_empty() {
+        return Err(Error::config(format!(
+            "a sparse layout of this case cannot be built: {failing}"
+        )));
     }
     let raster = latent_raster(canvas)?;
     let grid = video_grid(video_latent_frames(num_frames)?, raster);
@@ -1985,15 +1994,20 @@ mod tests {
         assert_eq!(extent.video_rows_below(54144).expect("a boundary"), 37296);
         assert!(extent.video_rows_below(8100).is_err());
 
-        for (text, conditions, tile, multiple) in [
-            (7039, 512, 128, 128),
-            (7040, 512, 96, 96),
-            (7040, 512, 128, 64),
-            (7040, 513, 128, 128),
+        // Each refusal names the capacity that failed, because the five conditions point at three
+        // different capacities of a deployment and a reader has to be able to tell them apart from
+        // one line.
+        for (text, conditions, tile, multiple, named) in [
+            (7039, 512, 128, 128, "the 7039 text rows"),
+            (7040, 512, 96, 96, "an H3 sparse tile holds"),
+            (7040, 512, 128, 64, "the 64-row alignment"),
+            (7040, 513, 128, 128, "the 513 condition rows"),
         ] {
+            let error = segment_extent(124, &canvas(), text, conditions, tile, multiple)
+                .expect_err("a layout off the tile grid");
             assert!(
-                segment_extent(124, &canvas(), text, conditions, tile, multiple).is_err(),
-                "{text} {conditions} {tile} {multiple}"
+                error.to_string().contains(named),
+                "{text} {conditions} {tile} {multiple}: {error}"
             );
         }
     }

@@ -10,14 +10,11 @@
 //!
 //! - [`ModelDescription`]: the served families and how a checkpoint names
 //!   its family;
-//! - `omni`: the multimodal generation families (SenseNova, Bagel): prompt
-//!   framing, image slots, encoder sizing and output filters;
-//! - `diffusion_gemma`: DiffusionGemma's block-diffusion canvases, control
-//!   tokens and image patch budget;
+//! - `omni`: the multimodal prompt and image geometry rules that outlive any
+//!   one family;
 //! - `video`: MiniMax-H3 video requests.
 
 mod description;
-pub mod diffusion_gemma;
 mod facts;
 pub mod omni;
 pub mod video;
