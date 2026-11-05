@@ -16,6 +16,8 @@ pub(crate) mod executor;
 mod group;
 mod incarnations;
 mod process;
+
+pub(crate) use process::stall_failure;
 pub(crate) mod processes;
 pub(crate) mod registry;
 

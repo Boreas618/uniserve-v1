@@ -210,6 +210,12 @@ message Stopped {}
 message Reserve {
   string host = 1;
   string group = 2;
+  // The engine that will spawn the process inheriting this socket. A
+  // reservation is filed under this number rather than under the connection
+  // that asked for it: the asking connection may be the deployment's planning
+  // client, which is not the engine that spawns, and it may be re-established
+  // between the reservation and the launch without changing whose socket it is.
+  uint64 engine = 4;
   // Whether processes on other nodes connect to it: it then binds every
   // interface, and loopback otherwise.
   bool routable = 3;
