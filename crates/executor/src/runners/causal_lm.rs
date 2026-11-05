@@ -2354,9 +2354,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         for byte in host {
             out.push_str(&format!("{byte:02x}"));
         }
-        // The page's `initialized` flag, which decides whether a reader of this page sees its keys
-        // at all: a page whose values are right and whose flag is zero masks every key it holds,
-        // and a decode that attends to nothing is a continuation driven by its own last token.
+        // The page's `initialized` flag, as `kv_write` left it.
+        //
+        // It is a fact about the page, not a mask: the only reader of this plane in the tree is the
+        // FP8 scale update (`ops::kv`'s scale arguments), and the attention operator takes no
+        // pointer to it. A page a decode must not read is excluded by construction instead - the
+        // table names only the request's own pages, and the row's `seq_lens` bounds the read - so
+        // a zero flag beside a wrong token says the page was never written, not that it was
+        // masked.
         match planes
             .iter()
             .find(|(name, _)| name == "key.initialized")
