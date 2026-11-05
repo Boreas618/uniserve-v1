@@ -11,7 +11,8 @@
 //!
 //! **What it reads and writes.** The denoiser publishes the request's audio latent trajectory under
 //! `Product::AudioLatents` at every step, so a decode copies that region into this runner's latents
-//! column and publishes the PCM window it wrote under `Product::Audio`. Both crossings go through
+//! column and publishes the PCM window it wrote under `Product::Track`: `Audio` is a
+//! reference audio condition, and the decoded track is what an audio encode then reads. Both crossings go through
 //! the store, which is the tree's one way for one runner to hand another a device region, and the
 //! copy is issued on this runner's stream so it is ordered after the producing step's write.
 //!
@@ -277,7 +278,7 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
         // overwrite it before its artifact exists. The first track's life ends at
         // `Products::forget`, which the transport calls once it has the bytes.
         if let (Some(store), Some(published)) = (self.products.as_deref(), self.published_for) {
-            if published != request && store.holds(published, Product::Audio) {
+            if published != request && store.holds(published, Product::Track) {
                 return Err(Error::Invalid(format!(
                     "request {} asks for an audio decode and this runner's PCM column still holds \
                      request {}'s track: a decode writes the one column, so the second track would \
@@ -340,7 +341,7 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
         let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
             request,
-            Product::Audio,
+            Product::Track,
             self.device,
             self.stream_id(),
             Some(written),
