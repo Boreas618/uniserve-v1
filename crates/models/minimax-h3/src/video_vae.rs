@@ -982,18 +982,25 @@ impl VideoDecoder {
                 "the decoder canvas has the trailing zero row".to_owned(),
             ));
         }
+        // **A tile's rows, not the clip's.** These two tables say where a decode's register tokens and
+        // its trailing zero row go, and a decode writes them into a **tile's** token buffer
+        // (`decode_clip` hands `decode` one tile at a time). A table whose positions started past the
+        // clip's voxels therefore indexed a tile-sized buffer with a clip-sized offset - a write past
+        // the buffer for every tile but the last, which is the defect `voxel_rows` was corrected for.
+        // The grid's tiles are uniform, so one tile's offsets serve every tile and every canvas.
+        let tile = largest_tile(config, canvas.height, canvas.width)?;
         let register_rows = indices(
             loader,
             &declared_sizes,
             "video_vae.register_rows",
-            canvas.voxels() as u32,
+            tile.voxels() as u32,
             canvas.registers,
         )?;
         let zero_rows = indices(
             loader,
             &declared_sizes,
             "video_vae.zero_rows",
-            (canvas.voxels() + u64::from(canvas.registers)) as u32,
+            (tile.voxels() + u64::from(canvas.registers)) as u32,
             canvas.tail,
         )?;
 
