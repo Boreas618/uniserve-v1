@@ -148,10 +148,6 @@ pub struct Module {
     /// (design section 4.2): [`LAUNCH_ENTRY`](crate::manifest::LAUNCH_ENTRY)
     /// and any lifecycle entries around it.
     pub entries: std::collections::BTreeMap<String, String>,
-    /// A native module's shared object among [`Self::files`], which the engine
-    /// loads with `dlopen`. `None` when the module does not name one; the
-    /// engine must then not guess it by position.
-    pub library: Option<String>,
 }
 
 /// One module a listing names.
@@ -711,7 +707,6 @@ impl Client {
                         files,
                         metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
                         entries: resolved.entries.into_iter().collect(),
-                        library: (!resolved.library.is_empty()).then_some(resolved.library),
                     });
                 }
                 wire::server_message::Message::Refused(refused) => {
