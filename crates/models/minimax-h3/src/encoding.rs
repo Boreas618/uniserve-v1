@@ -1803,7 +1803,30 @@ impl AudioEncoder {
     /// **FP32 throughout and no dtype argument**: the encoder's convolutions, its Snake activations and
     /// its whole attention are the design's declared FP32 rows, not the checkpoint's representation.
     /// `samples` states the residual units' reach: each unit's output is one operator, so its width is
-    /// `inner · samples` and a longer track is a different program.
+    /// the unit's **sample count** and a longer track is a different program.
+    ///
+    /// # Each row, the launch that asks for it, and the line the number comes from
+    ///
+    /// A row is written here because a launch elsewhere computes the same key; the pair has to be
+    /// read together or a wrong number looks like a wrong list. The launches are all in
+    /// [`Self::encode`] and the projection it calls, and every number below is read from the
+    /// configuration or from the layer the load built - never restated:
+    ///
+    /// | row | asked for by | the number's source |
+    /// | --- | --- | --- |
+    /// | `conv1d` (three element types) | `self.input.forward` (input), each unit's two `convs[i].forward`, `stage.widen.forward`, `self.output.forward` | `crate::audio_vae::geometry(7, 1, 3)` and `dilated_geometry(7, 1, 3 · dilation, dilation)` at [`Self::load`] - **one row, because `conv1d/cudnn/package.toml` declares only `input`, `weight` and `output`: the geometry travels as a launch argument, dilation included** |
+    /// | `snake` per width | each unit's two snakes and the stage's tail snake (`unit.snakes[i].forward`, `stage.snake.forward`) | [`Self::load`]'s `widths`: `config.encoder_dim` doubled once per `config.encoder_rates` entry, then once more for the tail |
+    /// | `layer_norm` at `width` and at `channels` | the projection's three normalizations | `width` = the last entry of [`Self::load`]'s `widths`; `channels` = `config.latent_channels` |
+    /// | `gemm` | `self.projection`'s four dense products | `Linear::descriptor_of(config.latent_channels, ..., WeightOrder::NxK, ...)` |
+    /// | `dense_attention` (causal, unpacked) | `Projection`'s attention | bound `LONGEST_TRACK`; `head_dim = width / config.num_attention_heads`; `causal = true` because `Projection::load` builds it so |
+    /// | `adaptive_pool` | `self.mean` | `(heads, width / heads, config.latent_channels)` |
+    /// | `transpose` | the three `self.transpose.forward` calls that move the latent layout | `Transpose::new(dtype)` - element type only |
+    /// | `act_and_mul` at `2 · channels` | the projection's gated product | `2 · config.latent_channels`, read three times in `GatedActivation::descriptor_of` because the gate's three views are all that width |
+    /// | `scaled_add` per track length | `ScaledAdd.forward(f, residual, matrix(second)?, 1.0, 1.0)` in each unit | **`length` of the track**, i.e. `samples` - the view it adds is the unit's `[channels, samples]` convolution output, so `columns` is the sample count and the channel count is the row count (a launch extent, not a key) |
+    ///
+    /// The one row whose extent is *not* the track's is `dense_attention`: it is compiled for
+    /// `LONGEST_TRACK` and a longer track is refused by [`Self::frames`] before a launch, which is why
+    /// the bound appears here once rather than per request.
     pub fn programs(
         config: &crate::AudioVaeConfig,
         samples: &[u32],
