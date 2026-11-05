@@ -117,6 +117,19 @@ def arrangements(ref: pathlib.Path, got: pathlib.Path) -> tuple[dict, dict]:
             " and step count are not stated cannot be shown to be the same schedule as the"
             " other side's, so it is refused rather than tabulated"
         )
+    # Half a statement is worse than none: a reference tree that names its grid but not how much of
+    # it ran would be read as agreeing about the step count. Both producers state all three
+    # (`dump_denoiser.py` since `7e2571c07`), so a partial one is refused as a stale or hand-edited
+    # tree rather than completed by assumption.
+    unstated_theirs = [name for name in SCHEDULE_FIELDS if name not in theirs]
+    if unstated_theirs:
+        raise SystemExit(
+            f"the reference's layout statement omits {', '.join(unstated_theirs)}: a trajectory"
+            " whose grid and step count are not stated cannot be shown to be the same schedule as"
+            " this one's, and an absent statement is not a matching one - the reference producer"
+            " (`dump_denoiser.py`) states schedule, evaluations and num_steps, so a tree without"
+            " them predates that and is regenerated rather than compared"
+        )
     differ = [name for name in LAYOUT_FIELDS if theirs[name] != ours[name]]
     # The schedule: refused where both sides state it and they disagree, which is the pair a
     # student's block grid and the base uniform grid make.
@@ -142,8 +155,8 @@ def layout_line(side: str, stated: dict[str, object]) -> str:
         f"layout  {side:<9} {stated['packed_rows']} packed rows = {stated['video_rows']} video"
         f" + {stated['audio_rows']} audio + {stated['text_rows']} text"
         f" + {stated['condition_rows']} condition ({stated['frames']} frames,"
-        f" canvas {height}x{width}, {stated.get('schedule', 'grid not stated')} grid"
-        f" {stated.get('evaluations', '?')} of {stated.get('num_steps', '?')} evaluations)"
+        f" canvas {height}x{width}, {stated['schedule']} grid"
+        f" {stated['evaluations']} of {stated['num_steps']} evaluations)"
     )
 
 
@@ -446,21 +459,35 @@ def self_test() -> int:
             checks.append(
                 ("a grid mismatch is refused", "schedule" in str(error))
             )
-        # A side that states no grid can only be compared on its layout, and the line says so.
+        # A reference tree that predates its producer stating the grid is refused by name: an
+        # absent statement is not a matching one.
         (ref / "layout.json").write_text(json.dumps(stated) + "\n")
         (got / "layout.json").write_text(json.dumps(student) + "\n")
         try:
-            theirs, ours = arrangements(ref, got)
+            arrangements(ref, got)
+            checks.append(("an unstated reference grid is refused", False))
+        except SystemExit as error:
+            checks.append(
+                ("an unstated reference grid is refused", "omits schedule" in str(error))
+            )
+        # Half a statement is refused too: a tree naming its grid but not its step count would be
+        # read as agreeing about the steps.
+        (ref / "layout.json").write_text(
+            json.dumps(dict(stated, schedule="blocks")) + "\n"
+        )
+        try:
+            arrangements(ref, got)
+            checks.append(("a partial reference statement is refused", False))
+        except SystemExit as error:
             checks.append(
                 (
-                    "an unstated grid on the reference side is not taken for agreement",
-                    "schedule" not in theirs and "grid not stated" in layout_line("reference", theirs),
+                    "a partial reference statement is refused",
+                    "omits evaluations" in str(error),
                 )
             )
-        except SystemExit as error:
-            checks.append((f"an unstated grid is tolerated, not refused: {error}", False))
         # And this side must state its own grid: a trajectory that does not say what it ran is
         # refused rather than tabulated.
+        (ref / "layout.json").write_text(json.dumps(full) + "\n")
         (got / "layout.json").write_text(json.dumps(stated) + "\n")
         try:
             arrangements(ref, got)
