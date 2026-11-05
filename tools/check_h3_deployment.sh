@@ -157,15 +157,21 @@ if [ ! -f "$extents" ]; then
     echo "   skipped: $extents is absent, and without it audio-encoder, audio-decoder"
     echo "   and conditioned refuse and their rows would read as absent"
 else
+    # Both paths are recorded. The conditioned path builds the text encoder's own harness
+    # and states a weight's element type from its own loader, so a loader that reports the
+    # wrong type keys a row this pass alone can contradict - it is the only instrument that
+    # would have caught a harness stating the audio VAE's F32 for every DiT weight.
     : >"$scratch/recorded.txt"
+    for cond in false true; do
     for point in $points; do
         r_canvas=${point%%:*}
         r_clip=${point##*:}
         cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
             --clip "$r_clip" --raster "$r_canvas" --tokens 4096 \
             --track "$(python3 -c "print(round($r_clip * 40 / 24) * 800)")" \
-            --elements 123456 --types "$types" --extents "$extents" --conditioned false \
+            --elements 123456 --types "$types" --extents "$extents" --conditioned "$cond" \
             2>/dev/null | grep -P '\t' >>"$scratch/recorded.txt" || true
+    done
     done
     cut -f1,2 "$scratch/recorded.txt" | grep -v '^#' | sort -u >"$scratch/recorded.rows"
     cut -f1,2 "$fixture" | grep -v '^#' | sort -u >"$scratch/file.rows"
