@@ -709,6 +709,20 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
                     if self.sink.done() {
                         return Poll::Ready(Step::Ended);
                     }
+                    // The engine dropped the request rather than answering it,
+                    // and its own log is where the reason is. This is the last
+                    // place the daemon sees the request at all, so it says
+                    // which one and which engine, and the two logs can be read
+                    // together.
+                    error!(
+                        replica = self.replica,
+                        engine_request_id = self
+                            .events
+                            .engine_request_id()
+                            .map(|id| id.0.to_string())
+                            .unwrap_or_default(),
+                        "an engine ended a response before its terminal event"
+                    );
                     return Poll::Ready(self.failed(ApiError::server_error(
                         "the response ended before its terminal output",
                     )));
