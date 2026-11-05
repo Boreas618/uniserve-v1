@@ -969,12 +969,16 @@ impl Sample {
 ///
 /// **`channels_last` is the operand's storage, not a preference.** The kernel derives every
 /// operand's strides from the flag, so a convolution declared channels-last over a channels-first
-/// buffer is wrong numbers rather than a refusal (`nn::Conv3d::forward` refuses it). The reference's
-/// stride-1 padded convolutions read channels-last because PyTorch's `memory_format` runs them so;
-/// this encoder keeps every activation channels-first, because the tree has no permutation between
-/// the two orders and the reference states that the order selects the same algorithm and leaves the
-/// encoding unchanged. So the flag is `false` here, and it becomes `true` for the block
-/// convolutions and `conv_in` the day a permute exists to back it.
+/// buffer is wrong numbers rather than a refusal (`nn::Conv3d::forward` refuses it).
+///
+/// **Every convolution here is channel-first, and the reference says why that costs no number.**
+/// Its stride-1 padded convolutions run under `torch.channels_last_3d` as a cuDNN speed path: "it
+/// selects the same algorithm for either order, which leaves the encoding unchanged"
+/// (`uniserve/models/minimax_h3/video_vae.py:950-959`). The order is therefore a throughput choice
+/// rather than a fidelity one, and this encoder takes it only against a measured encode-convolution
+/// time. The same comment is why its strided downsamplers stay channel-first even there: under
+/// channels-last cuDNN picks another algorithm "whose rounding differs", so the reference keeps
+/// those two out of the speed path itself.
 fn convolution(
     loader: &mut WeightLoader,
     name: &str,
