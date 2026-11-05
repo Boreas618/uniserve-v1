@@ -323,6 +323,15 @@ struct EngineConnection {
     connection: Connection,
     /// Whether its hello was answered.
     welcomed: bool,
+    /// The owner this connection's requests are answered for: the engine
+    /// number a process link states, or `EPOCH_ENGINE` for a peer that is no
+    /// process of the deployment — a worker's client, the daemon's own client.
+    ///
+    /// It is set by the hello and never by arrival: a reservation one
+    /// connection makes is inherited by a spawn another connection sends, so
+    /// the two must be answered for the same owner even though the daemon
+    /// accepted them under different arrival numbers.
+    owner: u64,
 }
 
 /// The owner id of the main processes the epoch layer starts: it is no
@@ -581,6 +590,7 @@ pub(crate) fn run_leader(
                 EngineConnection {
                     connection,
                     welcomed: false,
+                    owner: next_engine,
                 },
             );
             next_engine += 1;
@@ -614,7 +624,7 @@ pub(crate) fn run_leader(
                 })
                 .is_err()
             {
-                closed.push(engine);
+                closed.push((engine, peer.owner));
             }
         }
 
@@ -714,10 +724,23 @@ pub(crate) fn run_leader(
                                 nodes: nodes.clone(),
                             };
                             if peer.connection.send(&welcome).is_err() || refusal.is_some() {
-                                closed.push(engine);
+                                closed.push((engine, peer.owner));
                                 break;
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
+                            // What this connection's requests are answered
+                            // for: the number it states when it is a process
+                            // of the deployment, and the epoch's own owner
+                            // when it is a client. A frontend states no
+                            // number and is commanded by the epoch layer, so
+                            // it keeps the one its arrival gave it.
+                            peer.owner = match (frontend, link, stated) {
+                                (false, Interface::Process | Interface::Requests, Some(number)) => {
+                                    number
+                                }
+                                (true, _, _) => engine,
+                                _ => EPOCH_ENGINE,
+                            };
                             tracing::info!(
                                 engine,
                                 stated = stated.unwrap_or(0),
@@ -769,7 +792,7 @@ pub(crate) fn run_leader(
                             // sends no report, and takes no greeting.
                             if frontend || link == Interface::Process {
                                 let _ = greetings.send((
-                                    stated.unwrap_or(engine),
+                                    peer.owner,
                                     Greeting {
                                         build: hello.build.clone(),
                                         frontend,
@@ -782,7 +805,7 @@ pub(crate) fn run_leader(
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            closed.push(engine);
+                            closed.push((engine, peer.owner));
                             break;
                         }
                     }
@@ -792,7 +815,7 @@ pub(crate) fn run_leader(
                         kind: Some(upstream::Kind::Request(request)),
                     })) => {
                         if let Some(reply) = route(
-                            engine,
+                            peer.owner,
                             &request,
                             host,
                             &mut local,
@@ -801,7 +824,7 @@ pub(crate) fn run_leader(
                             &mut stops,
                         ) && peer.connection.send(&downstream_reply(reply)).is_err()
                         {
-                            closed.push(engine);
+                            closed.push((engine, peer.owner));
                             break;
                         }
                     }
@@ -810,13 +833,13 @@ pub(crate) fn run_leader(
                     })) => {
                         // Reports go to the daemon's switch (§7.3); a
                         // daemon that stopped reading them drops them.
-                        let _ = reports.send((engine, report));
+                        let _ = reports.send((peer.owner, report));
                         let _ = wake.send(());
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => {
-                        closed.push(engine);
+                        closed.push((engine, peer.owner));
                         break;
                     }
                 }
@@ -860,8 +883,15 @@ pub(crate) fn run_leader(
             clients.remove(&client);
         }
 
-        for engine in closed {
-            engines.remove(&engine);
+        for (key, engine) in closed {
+            engines.remove(&key);
+            if engine == EPOCH_ENGINE {
+                // A client of the socket owns no process: it goes, and takes
+                // nothing with it — not the epoch layer's processes, which
+                // are named by the same owner (§2.3, §2.5).
+                tracing::info!(client = key, "a client of the process socket disconnected");
+                continue;
+            }
             stops.retain(|&(owner, _), _| owner != engine);
             tracing::info!(engine, "an engine disconnected; ending its processes");
             local.supervisor.release(engine);
@@ -1399,6 +1429,11 @@ pub(crate) fn resume(
                     EngineConnection {
                         connection: connection.resume(next()?)?,
                         welcomed,
+                        // A handed-over process link is filed under the number
+                        // its engine stated, which is the identity its
+                        // requests are answered for; a peer still unfiled
+                        // keeps the key it arrived under until it greets.
+                        owner: id,
                     },
                 );
             }
