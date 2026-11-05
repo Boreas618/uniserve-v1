@@ -2161,13 +2161,14 @@ impl Denoiser {
         //   the timestep pair's FP32 activation is narrowed into the modulation's width.
         // A dense stack (`dtype == F32`) has no crossing at all: every pair below is the same type and
         // the loop emits nothing, which is what the model does.
+        // **One width, both directions.** The boundary is the packed rows: they are widened into FP32
+        // for the projections and narrowed back into the stack, and everything else the walk used to
+        // state here is a same-type add the forward already makes - the canvas at `channels · 4` is
+        // FP32 on both sides (`denoise`: `patch.forward` writes an FP32 buffer, and the anchor mix adds
+        // two of them), and the timestep pair is narrowed once, into the modulation's hidden width.
         let crossings = vec![
-            // The widened canvas the input projection writes, and the two narrows back into the
-            // stack: the packed rows at the hidden width and the modulation at the timestep's.
-            (nn::DType::F32, dtype, 4 * u64::from(config.video_channels)),
             (nn::DType::F32, dtype, u64::from(config.hidden_size)),
             (dtype, nn::DType::F32, u64::from(config.hidden_size)),
-            (dtype, nn::DType::F32, u64::from(config.time_dim)),
         ];
         let _ = groups;
         // The conditioner's own projection: its weight is one of the checkpoint's twelve FP32 tensors
@@ -3466,14 +3467,13 @@ mod tests {
         assert_eq!(
             crossed,
             vec![
-                "target_bf16_source_f32_columns_2688_block_1024",
                 "target_bf16_source_f32_columns_5376_block_1024",
                 "target_f32_source_bf16_columns_5376_block_1024",
-                "target_f32_source_bf16_columns_96_block_1024",
             ],
-            "one program per crossing the boundary has: the packed rows at the hidden width in both \
-             directions, the input projection's widening at `channels · 4`, and the timestep's narrow. \
-             A pair whose sides are the same type is not a crossing and is not stated"
+            "the boundary is the packed rows and nothing else: one program each way at the hidden \
+             width. The canvas at `channels · 4` is FP32 on both sides and the timestep pair is \
+             narrowed into the modulation's hidden width, so neither is a crossing - a pair of one \
+             type is not a pair"
         );
     }
     use super::*;
