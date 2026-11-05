@@ -729,6 +729,52 @@ fn committed_before(readback: i32) -> usize {
     usize::try_from(readback).unwrap_or(0).saturating_sub(1)
 }
 
+/// How a prompt-ending row's first token is decided (4.4), from the batch's own staged figures.
+///
+/// A prefill bucket's job is the KV cache; the sampler is a decode operator, and the prompt ending
+/// is the one token a prefill can owe the mechanism. Three cases, and only the first needs the host:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptToken {
+    /// The row ends no prompt: whatever the graph drew for it is discarded.
+    Discarded,
+    /// A greedy row that has committed nothing: the host takes the argmax of its own logits row,
+    /// which is the same token the captured sampler would take - every penalty is a no-op for a
+    /// slot with no history.
+    HostArgmax,
+    /// A sampled row: its first token is the graph's draw over its penalized logits, not an argmax.
+    Draw,
+}
+
+/// The decision for one row, and the refusal when the row cannot be decided here.
+///
+/// `readback` is the slot's sampling position **after** this batch, and this batch committed the
+/// row's own token, so the figure the decision needs is [`committed_before`] of it. A greedy row
+/// with earlier commits is refused by name: its token is the argmax of *penalized* logits, which
+/// only the captured sampler computes, and argmaxing the raw row would silently answer a different
+/// request's token.
+fn prompt_token(
+    samples_nothing: bool,
+    temperature: f32,
+    slot: i32,
+    readback: i32,
+) -> Result<PromptToken> {
+    if samples_nothing {
+        return Ok(PromptToken::Discarded);
+    }
+    if temperature != 0.0 {
+        return Ok(PromptToken::Draw);
+    }
+    let committed = committed_before(readback);
+    if committed > 0 {
+        return Err(Error::Invalid(format!(
+            "a greedy row of slot {slot} ends a prompt that already holds {committed} \
+             committed token(s): its token is the argmax of its penalized logits, which only \
+             the captured sampler computes"
+        )));
+    }
+    Ok(PromptToken::HostArgmax)
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best = 0_usize;
     for (index, value) in values.iter().enumerate() {
@@ -1692,27 +1738,21 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         let columns = ops::sampler::PARAMETER_COLUMNS as usize;
         for row in 0..rows {
-            let samples_nothing = self.staging.logits_rows()[row] < 0;
-            let greedy = self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize]
-                == 0.0;
-            if samples_nothing || !greedy {
-                continue;
-            }
             let slot = self.staging.slots(rows)[row];
-            // The readback is the slot's sampling position *after* this batch committed, and this
-            // batch committed the row's own token: a prompt ending reads 1 here, not 0. The figure
-            // the check needs is what the slot held before the step, so the row's own commit is
-            // taken out. Refusing on the raw readback refused every deployment's first token.
-            let position = usize::try_from(slot)
+            let readback = usize::try_from(slot)
                 .ok()
                 .and_then(|slot| sampling.get(slot).copied())
-                .map_or(0, committed_before);
-            if position > 0 {
-                return Err(Error::Invalid(format!(
-                    "a greedy row of slot {slot} ends a prompt that already holds {position} \
-                     committed token(s): its token is the argmax of its penalized logits, which only \
-                     the captured sampler computes"
-                )));
+                .unwrap_or(0);
+            let decision = prompt_token(
+                self.staging.logits_rows()[row] < 0,
+                self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize],
+                slot,
+                readback,
+            )?;
+            // A drawn row keeps the graph's token, and a row that ends no prompt keeps nothing: the
+            // host answers only the greedy prompt ending.
+            if decision != PromptToken::HostArgmax {
+                continue;
             }
             let source = logits.ptr.address() + row as u64 * width * 4;
             // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
@@ -3164,6 +3204,69 @@ mod sampled_output_tests {
         assert_eq!(committed_before(5), 4, "four tokens before this step's");
         assert_eq!(committed_before(0), 0, "an unread slot has none");
         assert_eq!(committed_before(-1), 0, "a readback that never ran has none");
+    }
+
+    /// **A greedy prompt ending is argmaxed on the host.** The row is greedy (temperature zero), it
+    /// ends a prompt (the readback states the position after its own commit, so one means none
+    /// before it), and its token is the argmax of its own logits row - the same token the captured
+    /// sampler would take, because every penalty is a no-op for a slot with no history.
+    ///
+    /// The device half - the copy of the row out of the arena and the readback the mechanism reads -
+    /// is the caller's run; what is stated here is the decision and the argmax it rests on.
+    #[test]
+    fn a_greedy_prompt_ending_is_argmaxed_on_the_host() {
+        assert_eq!(
+            prompt_token(false, 0.0, 3, 1).expect("a prompt ending that committed only its own"),
+            PromptToken::HostArgmax
+        );
+        // The token is the largest value of the row, and a tie is the lowest index.
+        assert_eq!(argmax(&[0.5, 9.0, 9.0, -3.0]), 1);
+        // A non-finite value is never the largest: the first finite value wins over a NaN before it,
+        // and a row with no finite value has no largest candidate to name.
+        assert_eq!(argmax(&[f32::NAN, 2.0, 1.5]), 1);
+        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY]), 0);
+        assert_eq!(argmax(&[f32::NAN, f32::NEG_INFINITY, f32::NAN]), 0);
+    }
+
+    /// **A sampled prompt ending is NOT argmaxed**: its first token is the graph's draw over the
+    /// penalized logits. The host leaves the drawn token alone, and the decision is taken before any
+    /// history is consulted - a sampled slot may hold as much history as it has decoded, because the
+    /// captured sampler is what applies the penalties.
+    #[test]
+    fn a_sampled_prompt_ending_is_drawn_and_not_argmaxed() {
+        for readback in [1, 9, -1] {
+            assert_eq!(
+                prompt_token(false, 0.7, 3, readback).expect("a sampled row is decided by the draw"),
+                PromptToken::Draw,
+                "a sampled prompt ending was argmaxed on the host, which would answer the largest                  candidate instead of a token of its distribution"
+            );
+        }
+        // A row that ends no prompt is discarded whatever its temperature: the graph drew for it in
+        // a bucket that draws, and the draw belongs to no call.
+        for temperature in [0.0, 1.0] {
+            assert_eq!(
+                prompt_token(true, temperature, 3, 1).expect("a row that ends no prompt"),
+                PromptToken::Discarded
+            );
+        }
+    }
+
+    /// **A greedy row with a committed history is refused by name.** Its token is the argmax of the
+    /// *penalized* logits, which only the captured sampler computes; argmaxing the raw row would
+    /// answer a different request's token, so the row is refused with both figures rather than
+    /// served with the wrong one.
+    #[test]
+    fn a_greedy_row_with_a_committed_history_is_refused_by_name() {
+        let refusal = prompt_token(false, 0.0, 7, 5).expect_err("four tokens before this step's");
+        assert!(
+            matches!(refusal, Error::Invalid(_)),
+            "a row that cannot be decided here was not stated as a refusal: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("slot 7") && text.contains("4 committed token"),
+            "the refusal names neither the slot nor the history it found: {text}"
+        );
     }
 
 }
