@@ -112,6 +112,65 @@ mod tests {
     use super::*;
     use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 
+    /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
+    ///
+    /// `DType::as_i64()` is the numbering every packed word uses, and a C++ header cannot call it, so
+    /// each native entry copies the numbers it names. A copy drifts: `gather_gemm_nvfp4` and
+    /// `route_gemm_nvfp4` carried `bf16 = 3` and `e2m1 = 10` while the crate numbered them 4 and 7,
+    /// and the refusal that surfaced named the *output's* dtype — a run of the slice cost, and the
+    /// constant was the defect. Every `entry.h` under `kernels/` is read, so a new entry is covered
+    /// without being listed.
+    #[test]
+    fn a_cpp_entry_states_the_operator_crates_dtype_numbers() {
+        let kernels = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+        let mut read = 0_usize;
+        let mut constants = 0_usize;
+        for package in std::fs::read_dir(&kernels).expect("kernels/").flatten() {
+            for backend in std::fs::read_dir(package.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let header = backend.path().join("src/entry.h");
+                let Ok(text) = std::fs::read_to_string(&header) else {
+                    continue;
+                };
+                read += 1;
+                for (name, dtype) in [
+                    ("uniserve_dtype_bf16", DType::BF16),
+                    ("uniserve_dtype_e4m3", DType::F8E4M3),
+                    ("uniserve_dtype_e2m1", DType::F4E2M1),
+                ] {
+                    let Some(after) = text.split(&format!("constexpr int64_t {name} = ")).nth(1)
+                    else {
+                        continue;
+                    };
+                    let stated: i64 = after
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            panic!("{}: {name} states no number", header.display())
+                        });
+                    constants += 1;
+                    assert_eq!(
+                        stated,
+                        dtype.as_i64(),
+                        "{}: {name} is {stated}, and the operator crate numbers {dtype} as {}",
+                        header.display(),
+                        dtype.as_i64()
+                    );
+                }
+            }
+        }
+        assert!(read >= 2, "only {read} entry header(s) were read");
+        assert!(
+            constants >= 4,
+            "only {constants} dtype constant(s) were stated"
+        );
+    }
+
     /// A plan's tile and route lists are as long as the plan says.
     ///
     /// The metadata check demanded a row width of one on these lists, which is true only of a plan
