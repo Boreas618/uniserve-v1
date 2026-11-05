@@ -2251,13 +2251,33 @@ impl MainProcess {
             .note(self.announced_at.is_some() && self.commands_seen == 0, now);
         self.command_wait
             .report("the daemon's first program-layer command", 0, bound, now);
+        // The report is due inside the daemon's own window for the switchover this warmup answers: a
+        // wait reported later is a wait nobody reads, because the daemon gives up first and the log
+        // says only that something timed out.
+        let warmup_bound = bound.min(DAEMON_COMMAND_WINDOW / 2);
         self.warmup_wait.note(!self.warming.is_empty(), now);
         let generation = self
             .warming
             .first()
             .map_or(0, |(_, _, generation)| *generation);
-        self.warmup_wait
-            .report("this node's warmup", generation, bound, now);
+        if self
+            .warmup_wait
+            .report("this node's warmup", generation, warmup_bound, now)
+        {
+            // The thread that is stuck cannot say what it is stuck in, so each device states the job
+            // it performs: a bucket's capture and a launch look identical from outside and are
+            // different defects.
+            for executor in &self.executors {
+                tracing::warn!(
+                    device = executor.device().0,
+                    performing = executor
+                        .performing()
+                        .unwrap_or_else(|| "between commands".to_owned()),
+                    captures = executor.capturing(),
+                    "a device that has not finished its warmup"
+                );
+            }
+        }
     }
 
     /// The operators this node's devices could not compare, each with its reason, in device order
@@ -4043,7 +4063,15 @@ impl MainProcess {
     /// §7.3 step 3's policy half: every scheduler's next batch boundary answers from the prepared
     /// policy. `step` is the boundary the epoch's schedulers agreed on, which only the scheduler
     /// node can name; the control thread does not choose one.
-    fn switchover_policy(&self, _generation: u64, _step: Option<u64>) {
+    fn switchover_policy(&self, generation: u64, _step: Option<u64>) {
+        // Before the switch, how many schedulers hold a prepared candidate: a first switchover with
+        // none adopts nothing, serves nothing, raises nothing, and the run says only that no policy
+        // was installed - which names the symptom and not the side of the switch it came from.
+        let prepared = self
+            .schedulers
+            .iter()
+            .filter(|scheduler| scheduler.policy_mut().prepared().is_some())
+            .count();
         for scheduler in &self.schedulers {
             if let Err(error) = answer(
                 scheduler.switchover_policy(),
@@ -4052,6 +4080,27 @@ impl MainProcess {
             ) {
                 tracing::error!(%error, "switching the scheduling policy failed");
             }
+        }
+        let serving = self
+            .schedulers
+            .iter()
+            .filter(|scheduler| scheduler.policy_mut().running().is_some())
+            .count();
+        if serving == self.schedulers.len() {
+            tracing::info!(
+                generation,
+                prepared,
+                serving,
+                "the switchover's policy serves every scheduler"
+            );
+        } else {
+            tracing::warn!(
+                generation,
+                prepared,
+                serving,
+                schedulers = self.schedulers.len(),
+                "the policy switchover left a scheduler without a serving policy"
+            );
         }
     }
 
@@ -4337,6 +4386,12 @@ const PROBATION_POLL: Duration = Duration::from_millis(100);
 /// How often a device that is busy delays the question asked of the policy slots: a probe that finds
 /// a device running proves nothing about whether a policy serves, so it is asked again after this.
 const POLICY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The window a daemon gives one program-layer command before it gives up on it, as this process
+/// must assume it (`crates/daemon/src/engine/control.rs`'s `COMMAND_TIMEOUT`): the engine does not
+/// know that constant, it knows that its own reports must arrive inside the window or a run says
+/// nothing but a timeout.
+const DAEMON_COMMAND_WINDOW: Duration = Duration::from_secs(120);
 
 /// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
 /// pass that waited longer than this would be reporting what the next pass reports anyway.
