@@ -17,7 +17,7 @@ uniserve:scheduler_domain_time_us_total{domain="prefill",phase="queue"} 50
 uniserve:request_prefill_time_seconds_sum{model_name="m"} 1.5
 uniserve:request_prefill_time_seconds_count{model_name="m"} 3
 uniserve:kv_cache_usage_perc{model_name="m"} 0.25
-http_requests_total{path="/v1/systemone",reason="a b"} 4
+http_requests_total{path="/v1/chat/completions",reason="a b"} 4
 # EOF
 """
 
@@ -28,7 +28,7 @@ uniserve:scheduler_domain_time_us_total{domain="denoise",phase="device"} 40 17
 uniserve:request_prefill_time_seconds_sum{model_name="m"} 2.5
 uniserve:request_prefill_time_seconds_count{model_name="m"} 5
 uniserve:kv_cache_usage_perc{model_name="m"} 0.75
-http_requests_total{path="/v1/systemone",reason="a b"} 9
+http_requests_total{path="/v1/chat/completions",reason="a b"} 9
 # EOF
 """
 
@@ -38,7 +38,7 @@ def test_counter_deltas_cover_counters_that_advanced_in_the_window() -> None:
     # first appears after the window opened started from zero, and its
     # trailing timestamp is not its value.
     assert counter_deltas(_BEFORE, _AFTER) == {
-        'http_requests_total{path="/v1/systemone",reason="a b"}': 5.0,
+        'http_requests_total{path="/v1/chat/completions",reason="a b"}': 5.0,
         'uniserve:request_prefill_time_seconds_count{model_name="m"}': 2.0,
         'uniserve:request_prefill_time_seconds_sum{model_name="m"}': 1.0,
         'uniserve:scheduler_domain_time_us_total{domain="denoise",'

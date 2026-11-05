@@ -1,11 +1,18 @@
 """Canvas denoising primitives follow the reference block-diffusion sampler.
 
-The reference is the pinned Transformers DiffusionGemma generation code; the
+``uniserve/diffusion/canvas.py`` is a general block-diffusion mechanism, and
+this test is its independent check: each primitive is compared against the
+pinned Transformers implementation of that sampler. The module and class names
+below carry the model family Transformers ships it in; they are the upstream
+reference's names, and this repository names no model family by them. The
 random bits follow the published Philox4x32-10 definition.
 """
 
 import pytest
 import torch
+
+# The pinned upstream reference: Transformers' name for the block-diffusion
+# sampler this repository's canvas mechanism is checked against.
 from transformers.models.diffusion_gemma import (
     generation_diffusion_gemma as reference,
 )
