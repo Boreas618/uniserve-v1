@@ -1940,8 +1940,13 @@ fn media_parallel(
         .iter()
         .find(|candidate| candidate.id.0 == group)
         .with_context(|| {
+            // Both sides as a pair: the launch's name is the daemon's roster label and the page's
+            // ids are the deployment's groups, and a reader who sees only one side cannot tell
+            // which of the two statements to correct.
             format!(
-                "this rank serves worker group {group:?} and the deployment places {}",
+                "the launch file states worker group {group:?} and the deployment page places {}: \
+                 a rank's group is the page's, because the page is the one statement of the \
+                 parallel shape",
                 groups
                     .iter()
                     .map(|group| group.id.0.as_str())
