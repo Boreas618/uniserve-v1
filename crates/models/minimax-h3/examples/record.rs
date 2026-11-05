@@ -219,7 +219,13 @@ fn run() -> Result<(), String> {
                 let stated = value()?;
                 let parts: Vec<&str> = stated.split(',').collect();
                 if parts.len() != 2 && parts.len() != 3 {
-                    return Err("--sparse is `tile,sparsity[,reference_keep]`".to_owned());
+                    return Err(
+                        "--sparse is `tile,sparsity[,reference_keep]` here: the recorder derives the \
+                         tile bound (`Layouts::tiles_bound`) as the deployment's own, so unlike the \
+                         walk's `tile,sparsity,tiles[,reference_keep]` there is no tile count to \
+                         state - and a third value is the keep rate, which must lie in (0, 1]"
+                            .to_owned(),
+                    );
                 }
                 sparse = Some((
                     parts[0]
