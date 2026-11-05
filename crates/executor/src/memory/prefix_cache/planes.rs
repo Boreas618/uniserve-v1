@@ -1280,17 +1280,14 @@ impl CachePlanes {
     /// units are those the group's layers lie in, so the page count is the
     /// allocated units divided by that.
     pub fn pages(&self, group: usize) -> Result<u32> {
-        let plan = self
-            .plan
-            .groups
-            .get(group)
-            .ok_or_else(|| Error::Invalid(format!("cache group {group} is not in the plan")))?;
-        if plan.units_per_page == 0 {
-            return Err(Error::Invariant(format!(
-                "cache group {group} holds no unit per page"
-            )));
-        }
-        Ok(self.num_units / plan.units_per_page)
+        // The units one page occupies are the figure `units_per_page` derives
+        // from the group's layers, not the plan's own field, which a plan may
+        // leave unstated: reading the field here answered "holds no unit per
+        // page" for a group whose page holds one, and every accessor that needs
+        // the page count - a layer's scales, its flags, its values - goes
+        // through here.
+        let units_per_page = self.units_per_page(group)?;
+        Ok(self.num_units / units_per_page)
     }
 
     /// How many attention groups the plan holds.
