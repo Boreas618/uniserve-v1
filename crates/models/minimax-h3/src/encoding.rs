@@ -1664,17 +1664,7 @@ impl VideoEncoder {
                     0 => buffers.first,
                     _ => buffers.second,
                 };
-                self.block(
-                    f,
-                    block,
-                    source,
-                    target,
-                    buffers.working,
-                    buffers.projected,
-                    &buffers.norms,
-                    buffers.mean,
-                    buffers.rstd,
-                )?;
+                self.block(f, block, source, target, buffers)?;
                 source = target;
             }
             if let Some(downsample) = &level.downsample {
@@ -1779,20 +1769,23 @@ impl VideoEncoder {
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
+    ///
+    /// The level's own buffers come in as one argument because they are one thing: `set` holds, for a
+    /// level, the pair of alternating outputs, the scratch its first convolution writes, the projection
+    /// a widening block needs, and the normalization state (`norms`, `mean`, `rstd`) its convolutions
+    /// share. Passing them one by one made a ten-argument call whose argument list was the struct's
+    /// field list - `clippy::too_many_arguments` was reporting a fact about the signature rather than a
+    /// style preference.
     fn block(
         &self,
         f: &Forward,
         block: &Block,
         values: TensorView,
         out: TensorView,
-        working: TensorView,
-        projected: Option<TensorView>,
-        norms: &[(u32, TensorView)],
-        mean: TensorView,
-        rstd: TensorView,
+        set: &LevelSet,
     ) -> Result<()> {
         let pad_of = |normalized: &Normalized| -> Result<TensorView> {
-            norms
+            set.norms
                 .iter()
                 .find(|(count, _)| *count == normalized.channels)
                 .map(|(_, view)| *view)
@@ -1803,13 +1796,23 @@ impl VideoEncoder {
                     ))
                 })
         };
-        block
-            .first
-            .run(f, values, pad_of(&block.first)?, mean, rstd, working)?;
-        block
-            .second
-            .run(f, working, pad_of(&block.second)?, mean, rstd, out)?;
-        let residual = match (&block.shortcut, projected) {
+        block.first.run(
+            f,
+            values,
+            pad_of(&block.first)?,
+            set.mean,
+            set.rstd,
+            set.working,
+        )?;
+        block.second.run(
+            f,
+            set.working,
+            pad_of(&block.second)?,
+            set.mean,
+            set.rstd,
+            out,
+        )?;
+        let residual = match (&block.shortcut, set.projected) {
             (Some(shortcut), Some(projected)) => {
                 shortcut.forward(f, values, projected)?;
                 projected

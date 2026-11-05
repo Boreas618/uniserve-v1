@@ -365,6 +365,26 @@ const _: () = assert!(
     "the call's size moved without the package's header"
 );
 
+/// The operand pair an NVFP4 product requires, checked where a descriptor can be built.
+///
+/// The truth here is the descriptor's alone — the packed weight is E2M1 pairs carried as bytes and
+/// its block scale is E4M3, two element types by construction. A check that compared one type
+/// against both refused every real product, and because it sat in `launch` only a run could say so.
+/// Called from `launch` as a backstop and from the layer that builds the descriptor, which is where
+/// a test can reach it.
+pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
+    if descriptor.packed != DType::U8 || descriptor.scale != DType::F8E4M3 {
+        return Err(Error::argument(
+            Nvfp4Gemm::NAME,
+            format!(
+                "an NVFP4 product takes U8 packed bytes and an f8e4m3 block scale, not {} and {}",
+                descriptor.packed, descriptor.scale
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// A dense product over NVFP4 operands.
 pub struct Nvfp4Gemm;
 
@@ -380,15 +400,9 @@ impl Op for Nvfp4Gemm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        if descriptor.packed != DType::U8 || descriptor.scale != DType::U8 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "NVFP4 operands are U8 bytes, not {} and {}",
-                    descriptor.packed, descriptor.scale
-                ),
-            ));
-        }
+        // The descriptor's own truth, refused here as a backstop for a caller that built one by
+        // hand; the layer that builds it calls the same check (`fp4::check_gemm`).
+        check_gemm(descriptor)?;
         let m = args.input.rows();
         let n = args.weight.rows();
         let k = args.input.last();
@@ -519,6 +533,47 @@ mod tests {
             ScaleLayout::Swizzled128X4.shape(129, 64),
             Shape::new(&[256, 4])
         );
+    }
+
+    /// The two operands of an NVFP4 product are two element types, and the pair is the descriptor's.
+    ///
+    /// The defect this pins: the check demanded `U8` for both, so every real product was refused
+    /// before its launch and one run was spent finding it.
+    #[test]
+    fn a_product_takes_byte_weights_and_an_e4m3_scale() {
+        let descriptor = |packed, scale| GemmDescriptor {
+            packed,
+            scale,
+            accumulate: DType::F32,
+            output: DType::BF16,
+            layout: ScaleLayout::Swizzled128X4,
+            epilogue: Epilogue::None,
+            m: 128,
+            n: 4096,
+            k: 2048,
+            pdl: false,
+        };
+        assert!(
+            check_gemm(&descriptor(DType::U8, DType::F8E4M3)).is_ok(),
+            "the operands a checkpoint states"
+        );
+        for (packed, scale, what) in [
+            (DType::U8, DType::U8, "an E4M3 scale declared as bytes"),
+            (
+                DType::F8E4M3,
+                DType::F8E4M3,
+                "packed pairs declared as floats",
+            ),
+        ] {
+            let error = check_gemm(&descriptor(packed, scale))
+                .err()
+                .unwrap_or_else(|| panic!("{what} was accepted"));
+            let text = error.to_string();
+            assert!(
+                text.contains("U8 packed bytes") && text.contains("f8e4m3 block scale"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

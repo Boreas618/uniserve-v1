@@ -658,13 +658,22 @@ pub fn dense_tables(
         .iter()
         .map(|segment| segment.video_rows() + segment.audio_rows())
         .sum();
-    if num_text_tokens < 1
-        || num_text_tokens > packing.text_rows
-        || condition_rows > packing.condition_rows
-    {
-        return Err(Error::config(
-            "the prompt and conditions must fit their layout's prefix segment".to_owned(),
-        ));
+    // One refusal per subject, and each names its own count: the two limits are independent - a
+    // prompt's rows and a case's condition rows - and a single sentence covering both makes a caller
+    // compare two numbers against a message that does not say which of them was too large.
+    if num_text_tokens < 1 || num_text_tokens > packing.text_rows {
+        return Err(Error::config(format!(
+            "a prompt of {num_text_tokens} row(s) does not fit the {} text rows of the layout's prefix \
+             segment",
+            packing.text_rows
+        )));
+    }
+    if condition_rows > packing.condition_rows {
+        return Err(Error::config(format!(
+            "the case's {condition_rows} condition row(s) do not fit the {} the layout's prefix \
+             segment reserves: the reservation is the task's own, and a `t2va` deployment reserves none",
+            packing.condition_rows
+        )));
     }
     if vision_spans
         .iter()
@@ -1868,9 +1877,12 @@ mod tests {
         let plan = dense_packing(124, &canvas(), 1935, 0, 64).expect("a dense plan");
         let error = dense_tables(&plan, 124, &canvas(), 1936, &[], &[])
             .expect_err("the prompt exceeds the text capacity");
+        // The prompt's half names the prompt's own count, so a caller reading one refusal cannot
+        // mistake it for the condition half's.
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("prefix segment")),
-            "{error}"
+            matches!(error, Error::Config(ref problem)
+                if problem.contains("prefix segment") && problem.contains("1936 row(s)")),
+            "the text half names the prompt's count: {error}"
         );
 
         let keyframe = Segment {
@@ -1885,9 +1897,14 @@ mod tests {
         };
         let error = dense_tables(&plan, 124, &canvas(), 1935, &[keyframe], &[])
             .expect_err("no condition row fits");
+        // And the condition half names conditions and never the prompt - the distinction the two
+        // refusals exist for.
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("prefix segment")),
-            "{error}"
+            matches!(error, Error::Config(ref problem)
+                if problem.contains("prefix segment")
+                    && problem.contains("condition row")
+                    && !problem.contains("prompt of")),
+            "the condition half names conditions: {error}"
         );
 
         let capacity = dense_packing(124, &canvas(), 1935, 2048, 64).expect("a plan");

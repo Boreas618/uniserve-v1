@@ -26,7 +26,9 @@ use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::batch::{
+    Batch, BatchColumns, BatchId, BatchOutput, CallId, CallOutput, Job, Jobs, RowState,
+};
 use crate::plan::{Bucket, Buckets, Shape};
 /// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
 ///
@@ -189,10 +191,11 @@ impl Staging {
             }
         }
         // A row the batch does not fill is an **empty sequence**, not a short one: it owns no token,
-        // its block-table row is `-1`, and it therefore has no key to attend to. `seq_lens` states
-        // that as a length of zero - a length of one would tell the attention kernel that the row
-        // the table left absent has a page of keys at page `-1`, which is a read the pool never
-        // reserved. The row count itself stays the bucket's: inside a captured graph every per-row
+        // its gathered block-table row names the pool's padding page, and it therefore has no key
+        // to attend to. `seq_lens` states that as a length of zero - a length of one would tell the
+        // attention kernel that an absent row has a page of keys. The row names a page rather than
+        // a sentinel because a vendor kernel forms a page's address before it checks the length,
+        // and a `-1` there is an address before the pool's first byte. The row count itself stays the bucket's: inside a captured graph every per-row
         // operand has the bucket's extent and the batch's width is a mask over it (`logits_rows`
         // below, and the loader's `-1` slots), never the extent of an operand.
         self.rows.seq_lens.resize(bucket_rows, 0);
@@ -951,6 +954,38 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
+/// Whether a block table view holds `bytes` readable bytes of page indices.
+///
+/// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
+/// shorter than the read names no plan a launch could have. The copy is refused rather than
+/// clamped: a read past the column leaves the driver's error on the runner's stream, and a read of
+/// the wrong type prints numbers that are not page indices.
+fn table_readback_fits(view: &ops::TensorView, bytes: usize) -> bool {
+    view.dtype == ops::DType::I32
+        && view.byte_len().is_ok_and(|length| length >= bytes as u64)
+}
+
+/// The bytes a page readback covers, or the reason there is none.
+///
+/// A device copy that reads outside the allocation it describes is not a lost diagnostic: the
+/// driver's error sticks to the runner's stream and the next batch fails on it (2.4). So the range
+/// is computed and checked before anything is issued, and this function is the whole of that rule:
+/// the unit must be in the plane, and the plane must hold the bytes read.
+fn page_readback_range(
+    unit: i64,
+    units: i64,
+    plane_bytes: i64,
+    bytes: usize,
+) -> std::result::Result<u64, String> {
+    if plane_bytes < bytes as i64 {
+        return Err(format!("plane holds {plane_bytes} bytes, a read wants {bytes}"));
+    }
+    if unit < 0 || unit >= units {
+        return Err(format!("unit {unit} outside {units}"));
+    }
+    u64::try_from(unit * plane_bytes).map_err(|_| "offset".to_owned())
+}
+
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
 ///
 /// The cache is the memory owner's (8's resident pages and its block tables); the runner only
@@ -1063,6 +1098,21 @@ pub trait KvProvider: Send + Sync {
     ) -> Result<(TensorView, Vec<nn::KvPlanes>)>;
 }
 
+/// A batch's cache installation, carried from the submitting thread to the device thread.
+///
+/// The `block_tables` are the rows the gather reads and the `units` the pages the mechanism
+/// allocated this batch; both are issued on the runner's stream by the replay, which is the one
+/// thread that may issue there (2.4).
+#[derive(Debug)]
+struct PendingInstall {
+    /// The batch the rows belong to: a replay of any other batch must not install them.
+    batch: BatchId,
+    /// The batch's slot rows, `[rows, max_pages]` in the cache's pooled table.
+    tables: Vec<ipc::BlockTable>,
+    /// The units the mechanism allocated for this batch's pages, with their copies.
+    units: Vec<ipc::CacheUnitAllocation>,
+}
+
 /// A causal language model's runner: one block's decode and prefill phases.
 pub struct CausalLmRunner<M: CausalLm> {
     /// The executor's name for this runner.
@@ -1120,6 +1170,15 @@ pub struct CausalLmRunner<M: CausalLm> {
     kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
+    /// The batch's cache rows and page copies, staged at submit and performed by the device
+    /// thread before the replay reads them (2.4).
+    ///
+    /// A table's installation is work on this runner's stream exactly as a column's upload is, and
+    /// only the device thread issues there. Installed from the submitting thread it races the
+    /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
+    /// Submit therefore states which batch the rows belong to, and a replay of another batch
+    /// refuses rather than installing the wrong request's pages.
+    pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
     /// by the device thread, which is the only thread that may issue to this runner's stream.
@@ -1236,6 +1295,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            pending_install: None,
             pending_dump: None,
             last_prefill: None,
             enqueue_ms: 0.0,
@@ -1364,16 +1424,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // rows: a warm pose has no request rows, so it is made here rather than in the capture.
         refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))
             .map_err(refused)?;
-        // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
-        // pooled table, so the row must state the request's own pages before the replay, and the
-        // table states where the row begins (`start_page`) and how far it runs.
-        self.kv.install_block_tables(&batch.block_tables, &self.stream)?;
-        // Then what the mechanism allocated for this batch's pages, on the same stream: the units
-        // must be this cache's before anything is copied into them, and the copies must be in place
-        // when the graph reads those pages. A batch that cannot be applied is refused at submit -
-        // the same place, and with the same kind of error, as any other batch this device cannot
-        // serve.
-        self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
+        // The batch's slot rows and page copies are the replay's first work, not this thread's:
+        // both are operations on this runner's stream and only the device thread issues there
+        // (2.4). A table installed from here races the previous batch's replay, and the pages this
+        // batch writes land in the row that batch is reading - which reads as a model defect and is
+        // a cache one. They travel with the job like the staged columns do.
+        self.pending_install = Some(PendingInstall {
+            batch: batch.id,
+            tables: batch.block_tables.clone(),
+            units: batch.cache_units.clone(),
+        });
         // What a batch says about where its tokens read and write their cache, when a deployment
         // asks for it: the addresses a prefill wrote and a decode reads are compared from these
         // numbers rather than guessed from a continuation's text.
@@ -1575,10 +1635,15 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     "a bucket is replayed"
                 );
                 let stream = self.stream.clone();
-                // The batch's columns are uploaded here, on the device thread, before the graph
-                // reads them: the scheduler hands over a `Batch` and the device thread stages and
-                // uploads it, so a replay that skipped the upload would serve the pose the bucket
-                // was captured with.
+                // The batch's cache rows and page copies first, on this thread: the gather reads
+                // row `slot` of the cache's pooled table, so the row must state the request's own
+                // pages before the graph reads it, and the units must be this cache's before
+                // anything is copied into them.
+                self.install_pending(*batch)?;
+                // Then the batch's columns are uploaded here, on the device thread, before the
+                // graph reads them: the scheduler hands over a `Batch` and the device thread
+                // stages and uploads it, so a replay that skipped the upload would serve the pose
+                // the bucket was captured with.
                 self.upload(*bucket)?;
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
@@ -2006,8 +2071,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if let Some((page, line)) = self.pending_dump.take() {
             let bytes = self.dump_page_bytes(page);
             let prefill = self.last_prefill.clone().unwrap_or_else(|| "none".to_owned());
+            let arguments = self.dump_kernel_arguments(bucket);
             tracing::info!(
                 %line,
+                %arguments,
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
@@ -2017,7 +2084,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
-                self.last_prefill = Some(format!("{line} page={page} key_page={bytes}"));
+                // The prefill's own arguments travel beside the decode's, so one run compares the
+                // two ends of one request's cache without a second launch.
+                self.last_prefill = Some(format!(
+                    "{line} page={page} key_page={bytes} arguments={arguments}"
+                ));
             }
         }
         let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
@@ -2260,15 +2331,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         else {
             return "odd-plane".to_owned();
         };
-        let unit = i64::from(unit);
-        if unit < 0 || unit >= units {
-            return format!("unit {unit} outside {units}");
-        }
-        let offset = match u64::try_from(unit * plane_bytes) {
-            Ok(offset) => offset,
-            Err(_) => return "offset".to_owned(),
-        };
         const BYTES: usize = 16;
+        let offset = match page_readback_range(i64::from(unit), units, plane_bytes, BYTES) {
+            Ok(offset) => offset,
+            Err(reason) => return reason,
+        };
         let mut host = [0_u8; BYTES];
         // SAFETY: the source is this page's first `BYTES` bytes inside a plane whose extent the view
         // above states, and the destination is this function's own host buffer of that length.
@@ -2287,14 +2354,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
         for byte in host {
             out.push_str(&format!("{byte:02x}"));
         }
-        // The page's `initialized` flag, which decides whether a reader of this page sees its keys
-        // at all: a page whose values are right and whose flag is zero masks every key it holds,
-        // and a decode that attends to nothing is a continuation driven by its own last token.
+        // The page's `initialized` flag, as `kv_write` left it.
+        //
+        // It is a fact about the page, not a mask: the only reader of this plane in the tree is the
+        // FP8 scale update (`ops::kv`'s scale arguments), and the attention operator takes no
+        // pointer to it. A page a decode must not read is excluded by construction instead - the
+        // table names only the request's own pages, and the row's `seq_lens` bounds the read - so
+        // a zero flag beside a wrong token says the page was never written, not that it was
+        // masked.
         match planes
             .iter()
             .find(|(name, _)| name == "key.initialized")
         {
             Some((_, flags)) => {
+                // The flag plane holds one byte per page, and the read is bounded by the plane's
+                // own extent for the reason every read here is.
+                let in_range = flags.dtype().to_ops() == Some(ops::DType::U8)
+                    && flags.shape().first().is_some_and(|&pages| pages > unit as i64)
+                    && flags.byte_len().is_ok_and(|length| length as u64 > unit as u64);
+                if !in_range {
+                    out.push_str(" init=out-of-range");
+                    return out;
+                }
                 let mut flag = [0_u8; 1];
                 // SAFETY: the destination is this function's own one-byte host buffer and the
                 // source is the flag of a unit the view above states.
@@ -2313,6 +2394,129 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 }
             }
             None => out.push_str(" init=no-flags"),
+        }
+        out
+    }
+
+    /// Installs the staged batch's cache rows and page copies on this runner's stream.
+    ///
+    /// A refusal is now the replay's, not submit's: the work itself is on the device's stream, and
+    /// a batch whose pages cannot be installed fails as that batch - the operator the cache could
+    /// not describe is named by the error either way.
+    fn install_pending(&mut self, batch: BatchId) -> Result<()> {
+        let Some(install) = self.pending_install.take() else {
+            return Ok(());
+        };
+        if install.batch != batch {
+            return Err(Error::Invariant(format!(
+                "the cache rows staged for batch {} are not batch {}'s: a replay installs only its \
+                 own batch's pages",
+                install.batch.0, batch.0
+            )));
+        }
+        self.kv.install_block_tables(&install.tables, &self.stream)?;
+        self.kv.apply_cache_units(&install.units, &self.stream)
+    }
+
+    /// The cache description the attention kernel is handed, read from the device (2.4, 4.5).
+    ///
+    /// The batch's own line states what its rows *mean*; this states what the kernel is *given*,
+    /// and the two can disagree. The block table is read back from the column the launch points at
+    /// rather than from the batch's `unit_ids`, because a row's units are the engine's statement
+    /// and the column is what a kernel reads. The plane views are the ones `KvProvider::planes`
+    /// hands `nn`, so the shape and strides printed here are the numbers the attention `Call`
+    /// carries (`kv_stride_page`, `kv_stride_tokens`, `kv_stride_heads` are strides 0, 1 and 2).
+    ///
+    /// It reads memory, so it runs only under the dump and only on the device thread, and every
+    /// failure becomes text: a diagnosis never fails the batch it describes.
+    fn dump_kernel_arguments(&self, bucket: Bucket) -> String {
+        let rows = bucket.rows as usize;
+        let spelled = |view: &ops::TensorView| {
+            let mut shape = String::from("[");
+            for axis in 0..view.shape.rank() {
+                if axis > 0 {
+                    shape.push(',');
+                }
+                shape.push_str(&view.shape.dim(axis).to_string());
+            }
+            shape.push(']');
+            let mut strides = String::from("[");
+            for axis in 0..view.strides.rank() {
+                if axis > 0 {
+                    strides.push(',');
+                }
+                strides.push_str(&view.strides.get(axis).to_string());
+            }
+            strides.push(']');
+            format!("{:#x} {:?} shape={shape} strides={strides}", view.ptr.address(), view.dtype)
+        };
+        if self.kv.groups() == 0 {
+            return "groups=0".to_owned();
+        }
+        let slots = self.staging.slots(rows).to_vec();
+        let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
+        let live = seq_lens.iter().filter(|&&length| length > 0).count();
+        let mut out = format!(
+            "rows={rows} live_rows={live} seq_lens={seq_lens:?} slots={slots:?} page_size={} \
+             max_kv_len={}",
+            self.kv.page_size(),
+            self.geometry.max_kv_len,
+        );
+        // The page table's row, from the column the kernel addresses.
+        match self.kv.block_table(0, &slots, &self.stream) {
+            Ok(table) => {
+                let mut entries = [0_i32; 8];
+                let bytes = entries.len() * std::mem::size_of::<i32>();
+                // A copy is issued only over a range the view itself states: a device copy that
+                // reads outside its allocation is not a lost diagnostic, it is a sticky error on
+                // this stream and the batch after it fails (2.4).
+                if !table_readback_fits(&table, bytes) {
+                    out.push_str(&format!(
+                        " table={} first8=short-view({:?})",
+                        spelled(&table),
+                        table.dtype
+                    ));
+                    return out;
+                }
+                // SAFETY: the source is this view's first eight `i32`, whose extent the view
+                // states, and the destination is this function's own buffer of that length.
+                let copied = unsafe {
+                    platform::memcpy_async(
+                        entries.as_mut_ptr() as u64,
+                        table.ptr.address(),
+                        bytes,
+                        &self.stream,
+                    )
+                };
+                let first = if copied.is_ok() && self.stream.synchronize().is_ok() {
+                    format!("{entries:?}")
+                } else {
+                    "read-failed".to_owned()
+                };
+                out.push_str(&format!(" table={} first8={first}", spelled(&table)));
+            }
+            Err(error) => out.push_str(&format!(" table=refused({error})")),
+        }
+        // The planes the kernel reads K and V out of, for the group's first layer: the group's
+        // layers share the pool, so one layer's views describe every layer's addressing.
+        match self.kv.planes(0) {
+            Ok(layers) => match layers.first() {
+                Some(layer) => {
+                    out.push_str(&format!(" key={} value={}", spelled(&layer.key), spelled(&layer.value)));
+                    let key = &layer.key;
+                    if key.shape.rank() == 4 {
+                        out.push_str(&format!(
+                            " num_pages={} pages_per_row={} kv_heads={} head_dim={}",
+                            key.shape.dim(0),
+                            key.shape.dim(1),
+                            key.shape.dim(2),
+                            key.shape.dim(3),
+                        ));
+                    }
+                }
+                None => out.push_str(" planes=none"),
+            },
+            Err(error) => out.push_str(&format!(" planes=refused({error})")),
         }
         out
     }
@@ -2966,6 +3170,68 @@ fn gather_indices(
 
 #[cfg(test)]
 mod tests {
+    /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
+    /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
+    /// a diagnostic, it would fail the batch after it.
+    #[test]
+    fn a_page_readback_is_confined_to_the_plane_it_reads() {
+        use super::page_readback_range;
+
+        // Page 3 of a plane whose pages are 4096 bytes: the offset is the page's own start.
+        assert_eq!(
+            page_readback_range(
+                3, 8, 4096, 16
+            ),
+            Ok(3 * 4096)
+        );
+        // A unit past the plane's count and a unit below zero are both refused by name.
+        assert_eq!(
+            page_readback_range(
+                8, 8, 4096, 16
+            ),
+            Err("unit 8 outside 8".to_owned())
+        );
+        assert_eq!(
+            page_readback_range(
+                -1, 8, 4096, 16
+            ),
+            Err("unit -1 outside 8".to_owned())
+        );
+        // A plane narrower than the read is refused rather than read past.
+        assert_eq!(
+            page_readback_range(
+                0, 8, 8, 16
+            ),
+            Err("plane holds 8 bytes, a read wants 16".to_owned())
+        );
+    }
+
+    /// The table readback is taken only from a view that holds that many page indices: a shorter
+    /// column, or one of another element type, names no plan a launch could have made.
+    #[test]
+    fn a_table_readback_is_taken_only_from_a_column_that_holds_page_indices() {
+        use super::table_readback_fits;
+        use ops::{DType, DevicePtr, Shape, TensorView, Strides};
+
+        let table = TensorView::new(
+            DevicePtr::new(0),
+            DType::I32,
+            Shape::new(&[2, 640]),
+        );
+        assert!(table_readback_fits(&table, 32));
+        // Eight entries from a two-entry column is a read past it.
+        let short = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[1, 2]));
+        assert!(!table_readback_fits(&short, 32));
+        // The same bytes in floats are not page indices.
+        let floats = TensorView::with_strides(
+            DevicePtr::new(0),
+            DType::F32,
+            Shape::new(&[2, 640]),
+            Strides::row_major(Shape::new(&[2, 640])),
+        );
+        assert!(!table_readback_fits(&floats, 32));
+    }
+
     /// A prefill's row is its whole prompt, and the sampler must read the row of the stack that
     /// token ends: the gather index is the last token of the row's own range, not the row's own
     /// index. A decode is the case where the two agree, which is why reading the row index fails

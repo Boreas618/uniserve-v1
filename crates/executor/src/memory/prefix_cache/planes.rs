@@ -1267,14 +1267,19 @@ impl CachePlanes {
         // A sleeping rank gives segments back from `released_from` on, and the
         // storages keep their size while their segments are absent, so the
         // value planes count what is still mapped rather than what was reserved.
+        // The parts describe one value plane's runs, and a segment is given
+        // back from every value plane: a released run therefore takes its bytes
+        // out of each of them, and counting it once left the figure reporting
+        // storage the owner no longer maps.
         let released = match &self.segmenting {
             Some(segmenting) => {
                 let from = segmenting.released_from.load(Ordering::Acquire);
-                segmenting
+                let plane: u64 = segmenting
                     .parts_of(from..segmenting.count())
                     .into_iter()
                     .map(|part| segmenting.parts[part].length as u64)
-                    .sum::<u64>()
+                    .sum();
+                plane * self.values.len() as u64
             }
             None => 0,
         };
@@ -1927,14 +1932,15 @@ mod layer_view_tests {
         pool.segmenting = Some(segmenting);
         assert_eq!(pool.mapped_bytes(), full);
 
-        // The second segment is given back: one column's worth of its two
-        // columns is no longer mapped.
+        // The second segment is given back: its part in each of the two
+        // columns, out of each of the two value planes, is no longer mapped,
+        // and the flags and scales it never owned are untouched.
         pool.segmenting
             .as_ref()
             .expect("just set")
             .released_from
             .store(1, Ordering::Release);
-        assert_eq!(pool.mapped_bytes(), full - 2 * 128);
+        assert_eq!(pool.mapped_bytes(), full - 2 * 2 * 128);
         Ok(())
     }
 
