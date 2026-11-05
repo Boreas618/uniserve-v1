@@ -130,11 +130,7 @@ impl ScaledResidual {
     /// `dtype` is the caller's: the hidden states' element type is the deployment's, while the
     /// layer's width and its bias's presence are its own.
     pub fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
-        Self::descriptor_of(
-            dtype,
-            self.scale.shape().numel(),
-            self.bias.is_some(),
-        )
+        Self::descriptor_of(dtype, self.scale.shape().numel(), self.bias.is_some())
     }
 
     /// The descriptor a residual over `columns`-wide rows launches, stated without its weights.

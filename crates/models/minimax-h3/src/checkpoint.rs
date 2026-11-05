@@ -304,7 +304,8 @@ impl Contract {
                     None | Some(Value::Null) => None,
                     Some(value) => Some(value.as_f64().ok_or_else(|| {
                         Error::checkpoint(
-                            "fastvideo_inference.json vsa_ref_keep_rate must be a number".to_owned(),
+                            "fastvideo_inference.json vsa_ref_keep_rate must be a number"
+                                .to_owned(),
                         )
                     })?),
                 },
@@ -832,7 +833,8 @@ mod tests {
             }"#,
         )
         .expect("json");
-        let contract = Contract::parse(silent.as_object().expect("object")).expect("a base release");
+        let contract =
+            Contract::parse(silent.as_object().expect("object")).expect("a base release");
         assert_eq!(contract.backend, AttentionBackend::Dense);
         assert_eq!(contract.attention, None);
 
@@ -892,7 +894,9 @@ mod tests {
             tile,
             sparsity,
             reference_keep,
-        } = contract.attention.expect("an OmniRef export states its sparse attention");
+        } = contract
+            .attention
+            .expect("an OmniRef export states its sparse attention");
         assert_eq!((tile, sparsity, reference_keep), (128, 0.9, Some(0.1)));
     }
 

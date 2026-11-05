@@ -713,9 +713,13 @@ fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Genera
             installed += 1;
         }
     }
+    // The path is on the line as well as the counts: a stage that stops on a missing program is
+    // answered by *which* store it opened, and a store name in the runner's command is not the
+    // directory a harness resolved.
     println!(
-        "store: {installed} committed modules of {} operators",
-        operators.len()
+        "store: {installed} committed modules of {} operators from {}",
+        operators.len(),
+        root.display()
     );
     Ok(ops::Generation::new(1, entries))
 }
