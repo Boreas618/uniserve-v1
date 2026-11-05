@@ -54,6 +54,9 @@ CONSTANT = re.compile(
 # The ladder the generator states when no `--frames` is given:
 # `const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, .., MAX_FRAMES];`. A rung written
 # as a constant's name is resolved from `config/mod.rs`, never typed here.
+FIXTURE = pathlib.Path("notes/programs/minimax-h3-deployment-keys.txt")
+AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
+
 GENERATOR = pathlib.Path("crates/models/minimax-h3/examples/minimax_h3_keys.rs")
 DEFAULT_LADDER = re.compile(
     r"const DEPLOYMENT_FRAMES: \[u32; \d+\] = \[(?P<list>[^\]]*)\];"
@@ -159,6 +162,19 @@ def requestable(
     return refused, allowed
 
 
+def served(path: pathlib.Path) -> list[int]:
+    """The clips the row set states it serves, from its own `axes:` line."""
+    if not path.exists():
+        return []
+    for line in path.read_text().splitlines():
+        if not line.startswith("#"):
+            break
+        found = AXES.search(line)
+        if found:
+            return [int(v) for v in found["list"].split(",") if v.strip()]
+    return []
+
+
 def ladder(header: str) -> list[int]:
     """The clip lengths the header says it served."""
     found = LADDER.search(header)
@@ -241,6 +257,31 @@ def main(argv: list[str] | None = None) -> int:
             "cannot answer an audio request, and that is a statement to make "
             "on purpose"
         )
+    # The row set states a ladder in its own `axes:` line, and that statement is
+    # what a store serves: a rung the model cannot produce is a row set for clips
+    # no request can name, whatever the generator's default happens to be.
+    file_rungs = served(FIXTURE)
+    if file_rungs:
+        file_refused, _ = requestable(file_rungs, clause)
+        if file_refused:
+            print(
+                f"{FIXTURE} serves {len(file_rungs)} clip(s) and "
+                f"{len(file_refused)} of them are not clips the model can "
+                "produce:"
+            )
+            for rung in file_refused:
+                print(f"  {rung:>5}")
+            print(
+                "a row set served at clips no request can name is the "
+                "defect this check exists for; the file must be cut at "
+                "clips from the rule"
+            )
+            return 1
+        print(
+            f"{FIXTURE} serves {len(file_rungs)} clip(s), every one a clip "
+            "the model can produce"
+        )
+
     stated_rungs = defaults()
     refused, allowed = requestable(stated_rungs, clause)
     if refused:
@@ -286,6 +327,9 @@ def self_test() -> int:
     assert report(base, set(base)) == 0
     assert report(base, {"a\t1"}) == 1
     assert report(base, {"a\t1", "b\t2", "c\t3"}) == 1
+    axes = "# axes: 6 canvases (a, b) and the clip ladder [5, 17, 1024]"
+    parsed = AXES.search(axes)
+    assert [int(v) for v in parsed["list"].split(",")] == [5, 17, 1024]
     stated = "# deployment: ... clip lengths: [22, 39, 56]."
     assert ladder(stated) == [22, 39, 56], ladder(stated)
     # The rule as the model states it: `17n + 5`, at least one clip, to
