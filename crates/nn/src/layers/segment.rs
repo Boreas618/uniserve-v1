@@ -12,10 +12,12 @@
 //! Two zeroing rules keep the padded rows out of the result, and they belong on different sides:
 //!
 //! - invalid **key** rows of a partial tile are zeroed by the caller before the call
-//!   (`VsaTiles::zero_padding` on k and v), so no mask exists and none is needed;
+//!   ([`vsa_zero_padding`](ops::segments::vsa_zero_padding) on k and v), so no mask exists and
+//!   none is needed;
 //! - invalid **query** rows of a partial tile are the packed sequence's padding, and their output
 //!   must be zero so nothing leaks into a later residual. The layer zeroes them after the attention,
-//!   inside the same captured launch ([`VsaTiles::zero_padding`] on the output).
+//!   inside the same captured launch ([`vsa_zero_padding`](ops::segments::vsa_zero_padding) on the
+//!   output).
 //!
 //! The compressed-tile branch is deliberately not here: it is one elementwise gate the model folds
 //! in with [`Rows::add`](crate::layers::Rows), where its arithmetic stays visible.

@@ -43,6 +43,6 @@ architectures = ["sm_100a", "sm_100f"]
 
 # `experts_128_top_8_local_128_tile_128_scales_f32`.
 [kernel.descriptors]
-dimensions = { experts = ["128", "256", "64"], top = ["8", "4", "2"], local = ["128", "256", "64"], tile = ["128", "64", "256"], scales = ["f32", "bf16", "f16"] }
+dimensions = { experts = ["128", "256", "64"], top = ["8", "4", "2"], local = ["128", "256", "64"], tile = ["128", "64", "256"], scales = ["f32", "bf16", "f16"], counted = ["true"] }
 
 [parameters]

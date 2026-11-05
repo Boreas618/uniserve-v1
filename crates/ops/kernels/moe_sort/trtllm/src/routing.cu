@@ -55,8 +55,25 @@ __device__ __forceinline__ int64_t tiles_of(int64_t count, int64_t tile_tokens) 
 }
 
 /// The local expert of one route, or -1 when this rank does not hold it.
+/// Whether `route` belongs to a token row the batch fills.
+///
+/// A captured bucket is wider than the batch that fills it, so a route of a row past the batch's
+/// extent belongs to no token: it is not counted into a tile, it receives no permuted row, and the
+/// map states it as `-2` rather than letting a reader dereference an index that names nothing.
+__device__ __forceinline__ bool route_is_live(const uniserve_moe_sort_call& call, int64_t route) {
+  // A null count states no count: every row is live, which is the behaviour before the operand.
+  if (call.live_tokens == nullptr) {
+    return true;
+  }
+  return route < call.live_tokens[0] * call.top;
+}
+
 __device__ __forceinline__ int64_t local_expert_of(const uniserve_moe_sort_call& call,
                                                    int64_t route) {
+  // Padding dominates rank ownership: a row that is not live has no route for any rank to own.
+  if (!route_is_live(call, route)) {
+    return -1;
+  }
   const int64_t local = static_cast<int64_t>(call.ids[route]) - call.local_offset;
   return (local >= 0 && local < call.local_experts) ? local : -1;
 }
@@ -69,12 +86,17 @@ __device__ __forceinline__ void count_routes(const uniserve_moe_sort_call& call,
     const int64_t local = local_expert_of(call, route);
     if (local >= 0) {
       atomicAdd(reinterpret_cast<unsigned long long*>(&counts[local]), 1ull);
+    } else {
+      // A route this rank does not hold is stated absent here, by the pass that already computes
+      // the predicate, so no caller has to pre-fill the map and none can forget to. A route of a
+      // token row the batch does not fill is a different absence and says so: -2, not -1.
+      call.expanded_to_permuted[route] = route_is_live(call, route) ? -1 : -2;
     }
   }
 }
 
-/// The first pass: counts, the tile metadata, the two scalars, and the -1 an
-/// out-of-window route keeps.
+/// The first pass: counts, the tile metadata, the two scalars, and the -1 this
+/// rank writes for a route it does not hold.
 __global__ void sort_metadata_kernel(uniserve_moe_sort_call call) {
   extern __shared__ int64_t shared[];
   int64_t* counts = shared;
