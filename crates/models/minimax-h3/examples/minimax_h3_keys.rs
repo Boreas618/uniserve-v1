@@ -350,6 +350,27 @@ fn main() {
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment));
     }
+    // The two audio VAEs and the video VAE state their own rows from the deployment's canvases, its
+    // rungs and its element types - one statement in `programs::Deployment`, which the typed blocks
+    // above are being replaced by one component at a time. Emitting it beside them is a no-op today
+    // (a row is a set member) and is what makes the replacement checkable: the set must not move.
+    for vae in VAES {
+        let deployment = minimax_h3::programs::Deployment::new(
+            config.clone(),
+            minimax_h3::programs::Types {
+                text_encoder: DType::BF16,
+                transformer: DType::F32,
+                video: vae,
+                audio: DType::F32,
+            },
+            clip_frames.clone(),
+        )
+        .unwrap_or_else(|error| panic!("the deployment's VAE rows are not statable: {error}"));
+        match deployment.vae_rows() {
+            Ok(stated) => lines.extend(stated),
+            Err(error) => panic!("the audio VAE's rows are not statable: {error}"),
+        }
+    }
     // ---- The video encoder's rows, **derived rather than written**.
     //
     // Its frame operators key on classes the raster derives - `frame_pad`'s tile is a function of the
