@@ -759,6 +759,8 @@ pub(crate) struct MainProcess {
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
     parked: Option<Vec<engine::ParkedCache>>,
+    /// A drain in progress: its schedulers park on the passes that follow (`advance_drain`).
+    draining: Option<Draining>,
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
     /// refused while it is held, and no request in flight is ended by it.
     paused: bool,
@@ -984,6 +986,7 @@ impl MainProcess {
             standby: launch.standby,
             promoted: false,
             parked: None,
+            draining: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
             released: std::collections::BTreeSet::new(),
@@ -1224,6 +1227,7 @@ impl MainProcess {
             // its builds or its devices (§7.3 step 2).
             self.note_waits();
             self.advance_precopy()?;
+            self.advance_drain()?;
             if let Some(failure) = self.advance_warmup()? {
                 return Ok(Some(failure));
             }
@@ -3220,10 +3224,53 @@ impl MainProcess {
         // drained epoch reaches none, so what the precopy built is given back now rather than left
         // prepared for a boundary that cannot come.
         self.drop_prepared("the epoch drained before its switchover")?;
-        self.park_schedulers("draining the epoch")?;
+        // A scheduler parks once its requests have ended, and a request ends only when the daemon
+        // acknowledges it through this thread, so the answers are polled from the serve pass:
+        // waiting here would hold the acknowledgement the park is waiting for.
+        self.draining = Some(Draining {
+            epoch,
+            answers: self.schedulers.iter().map(|scheduler| scheduler.park(false)).collect(),
+            parked: Vec::with_capacity(self.schedulers.len()),
+            since: Instant::now(),
+        });
+        self.advance_drain()
+    }
+
+    /// Takes the answers of a drain in progress, and states `Drained` when every scheduler parked.
+    fn advance_drain(&mut self) -> Result<()> {
+        let bound = self.watchdog.stall_bound();
+        let Some(mut draining) = self.draining.take() else {
+            return Ok(());
+        };
+        while let Some(answer) = draining.answers.first() {
+            match answer.try_recv() {
+                Ok(Ok(cache)) => {
+                    draining.parked.push(cache);
+                    draining.answers.remove(0);
+                }
+                Ok(Err(reason)) => bail!("draining the epoch: a scheduler did not park: {reason}"),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if draining.since.elapsed() > bound {
+                        bail!("draining the epoch: a scheduler did not park within {bound:?}");
+                    }
+                    self.draining = Some(draining);
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    bail!("draining the epoch: a scheduler is gone");
+                }
+            }
+        }
+        self.parked = Some(draining.parked);
+        self.serving = false;
+        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
+        // owed to nothing: the `Serve` that names the epoch again opens the next one.
+        self.admission_owed = false;
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Drained(
-                proto::process::Drained { epoch },
+                proto::process::Drained {
+                    epoch: draining.epoch,
+                },
             )),
         });
         Ok(())
@@ -4767,6 +4814,18 @@ fn poll_answers(
         }
     }
     None
+}
+
+/// A drain whose schedulers have not all parked yet.
+struct Draining {
+    /// The epoch `Drained` names.
+    epoch: u64,
+    /// The schedulers still to answer, in order.
+    answers: Vec<crossbeam_channel::Receiver<std::result::Result<engine::ParkedCache, String>>>,
+    /// What the ones that answered parked with, in the schedulers' order.
+    parked: Vec<engine::ParkedCache>,
+    /// When the drain began, which the stall bound is measured from.
+    since: Instant,
 }
 
 /// Logs one scheduler's answer to a policy step when it comes, off the control thread.
