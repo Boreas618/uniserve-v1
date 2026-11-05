@@ -477,34 +477,40 @@ fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // `--raster <height>x<width>` is the walk's own convention (`programs.rs --rasters`), so the pixel
     // tensor's two spatial axes are the pair in that order.
     let (height, width) = request.raster;
-    let frames = 1u32;
-    let latency = encoder.latent_frames(frames).map_err(|error| error.to_string())?;
-    // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a bias and an
-    // output that disagree, which is what a mixed operand reads as).
-    let pixels = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[1, 3, u64::from(frames), u64::from(height), u64::from(width)]),
-        )
-        .map_err(|error| error.to_string())?;
-    let compression = u64::from(config.spatial_compression());
-    let moments = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[
-                2 * u64::from(config.latent_channels),
-                u64::from(latency),
-                u64::from(height) / compression,
-                u64::from(width) / compression,
-            ]),
-        )
-        .map_err(|error| error.to_string())?;
-
+    // **Both frame counts the walk states.** The encoder reads one still or one clip, and its
+    // temporal stack's levels exist only for the clip: a harness that drives a single frame records
+    // no launch of them, which is how the walk's `for frames in [1, clip.frames]` came to state
+    // levels nothing confirmed. The stack states the clip's length.
+    let stack = minimax_h3::encoding::Stack::of(&config).map_err(|error| error.to_string())?;
     let mut recorded = Recorded::default();
-    ops::capture::set_sink(Some(&mut recorded));
-    let run = encoder.encode(&forward, pixels, moments);
-    ops::capture::set_sink(None);
-    run.map_err(|error| error.to_string())?;
+    for frames in [1, stack.clip.frames] {
+        let latency = encoder.latent_frames(frames).map_err(|error| error.to_string())?;
+        // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a
+        // bias and an output that disagree, which is what a mixed operand reads as).
+        let pixels = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[1, 3, u64::from(frames), u64::from(height), u64::from(width)]),
+            )
+            .map_err(|error| error.to_string())?;
+        let compression = u64::from(config.spatial_compression());
+        let moments = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[
+                    2 * u64::from(config.latent_channels),
+                    u64::from(latency),
+                    u64::from(height) / compression,
+                    u64::from(width) / compression,
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+
+        ops::capture::set_sink(Some(&mut recorded));
+        let run = encoder.encode(&forward, pixels, moments);
+        ops::capture::set_sink(None);
+        run.map_err(|error| error.to_string())?;
+    }
     Ok(recorded.0)
 }
 
