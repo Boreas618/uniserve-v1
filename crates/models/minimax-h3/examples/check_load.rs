@@ -34,7 +34,7 @@ use minimax_h3::config::Config;
 use minimax_h3::denoiser::ConditionEncoders;
 use minimax_h3::load;
 use minimax_h3::load::stored_types;
-use minimax_h3::partition::{Component, Components, Partition};
+use minimax_h3::partition::{Component, Components, Partition, Ulysses};
 
 /// The task a deployment serves, by the name its deployment file gives it.
 fn task(name: &str) -> Result<VideoTask, String> {
@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The deployment's own placement decides which blocks exist and which directory each reads;
     // `--component` narrows to a subset, which is how a caller keeps one load inside host memory.
-    let serving = Partition::serving(&config, task, 1, 1, 0, 0)?;
+    let serving = Partition::serving(&config, task, Ulysses::single(), 1, 0, 0)?;
     let placed = serving.blocks.iter().collect::<Vec<_>>();
     println!(
         "{task_name} places {}",
@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ConditionEncoders::load(&config, &checkpoint, &mut loader).map(|_| ())
             } else {
                 let tile = minimax_h3::video_vae::TILE_PIXELS;
-                load(&checkpoint, partition, stated, (tile, tile), &mut loader).map(|_| ())
+                load(&checkpoint, partition, stated, &[(tile, tile)], &mut loader).map(|_| ())
             }
         };
         if let Err(error) = outcome {

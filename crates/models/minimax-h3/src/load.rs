@@ -640,7 +640,7 @@ pub fn load(
     checkpoint: &nn::Checkpoint,
     partition: Partition,
     dtype: Option<nn::DType>,
-    canvas: (u32, u32),
+    canvases: &[(u32, u32)],
     loader: &mut nn::weights::WeightLoader<'_>,
 ) -> Result<MinimaxH3> {
     let (layout, sidecars) = sidecars(checkpoint)?;
@@ -895,20 +895,8 @@ pub fn load(
                 // pixels: the decoder's register rows, its voxel-row table and its sequence offsets
                 // are that raster's constants, published here at load, and the seam blends are
                 // built here too so that no layer is built on a request's path.
-                let spatial = config.video_vae.spatial_compression();
-                let (pixel_width, pixel_height) = canvas;
-                if pixel_width % spatial != 0 || pixel_height % spatial != 0 {
-                    return Err(Error::checkpoint(format!(
-                        "the deployment's canvas is {pixel_width}x{pixel_height} pixels and this \
-                         checkpoint's decoder compresses {spatial} pixels into one latent cell, so \
-                         the raster is not a whole number of cells"
-                    )));
-                }
-                let canvas = crate::video_vae::Canvas::clip(
-                    &config.video_vae,
-                    pixel_height / spatial,
-                    pixel_width / spatial,
-                );
+                // The decoder converts the deployment's pixel rasters to its latent canvases and
+                // checks each is whole cells; this file only passes them through.
                 // The clip's rows are packed in the attention's order, so the decoder needs it at
                 // load. It is the denoisers' and it must be one: two partitions that attend
                 // differently would pack one clip two ways, and one table can only gather one.
@@ -956,7 +944,7 @@ pub fn load(
                 let mut shards = loader.reborrow(source)?;
                 let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,
-                    canvas,
+                    canvases,
                     attention,
                     dtype,
                     input,
