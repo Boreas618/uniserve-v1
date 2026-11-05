@@ -154,7 +154,11 @@ pub struct ServeConfig {
     pub dtype: ModelDtype,
     /// Precision policy, such as `mode = "balanced"` or per-component
     /// selections under `components`; empty selects the model's default.
-    pub quantization_config: serde_json::Map<String, Value>,
+    pub quantization: serde_json::Map<String, Value>,
+    /// The retired name of `quantization`. A configuration that states it is
+    /// refused with the name to state instead, and it is never written back.
+    #[serde(rename = "quantization_config", skip_serializing)]
+    pub retired_quantization_config: Option<Value>,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
@@ -243,7 +247,8 @@ impl Default for ServeConfig {
             served_model_name: None,
             max_model_len: None,
             dtype: ModelDtype::BFloat16,
-            quantization_config: serde_json::Map::new(),
+            quantization: serde_json::Map::new(),
+            retired_quantization_config: None,
             mm_processor_kwargs: serde_json::Map::new(),
             attention_backend: "auto".to_owned(),
             prefill_attention_backend: None,
@@ -678,8 +683,6 @@ pub struct WorkerOptions {
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
     pub mesh: Option<String>,
-    /// Torch process-group backend for the ranks' collectives.
-    pub distributed_backend: Option<String>,
     /// Keep a standby beside every worker group: it maps the group's
     /// retained weights and cache, captures its graphs and parks, and
     /// replaces the group when it fails instead of a relaunch. A group whose
@@ -711,7 +714,6 @@ impl Default for WorkerOptions {
             executable: default_executable(),
             watchdog_timeout: Duration::from_secs(300),
             mesh: None,
-            distributed_backend: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
         }
@@ -778,7 +780,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: Qwen3 (`chat_config`).
+/// Chat models: `Qwen3` (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatOptions {
@@ -1135,6 +1137,16 @@ impl ServeConfig {
     /// `video_config.max_seconds` lies outside the durations the video API
     /// admits.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
+        // The precision policy's retired option name. It is parsed into a field
+        // of its own rather than left unknown so that a deployment which has not
+        // been updated learns the name to state, instead of a table that nothing
+        // reads: an unknown option would be refused as "unknown field", which
+        // names the mistake but not the way out.
+        anyhow::ensure!(
+            self.retired_quantization_config.is_none(),
+            "`quantization_config` is retired: state the precision policy as `quantization` \
+             (`--set quantization.mode=...`, or `[quantization]` in --config)"
+        );
         anyhow::ensure!(
             self.node_rank < self.nnodes.get(),
             "`node_rank` {} lies outside the {} nodes `nnodes` states",
@@ -1442,11 +1454,10 @@ impl ServeConfig {
                 watchdog_timeout_ms: u64::try_from(worker.watchdog_timeout.as_millis())
                     .unwrap_or(u64::MAX),
                 mesh: worker.mesh.clone().unwrap_or_default(),
-                distributed_backend: worker.distributed_backend.clone().unwrap_or_default(),
                 standby: worker.standby,
                 attention_backend: self.attention_backend.clone(),
                 dtype: word(&self.dtype),
-                quantization_config: Value::Object(self.quantization_config.clone()).to_string(),
+                quantization: Value::Object(self.quantization.clone()).to_string(),
                 load_format: word(&self.load_config.format),
                 download_dir: text(&self.load_config.download_dir),
                 load_threads: self.load_config.threads.map(NonZeroU32::get),

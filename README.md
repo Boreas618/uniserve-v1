@@ -111,7 +111,7 @@ UniServe's options form one tree, following TensorRT-LLM's serving configuration
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set cuda_graph_config.policy=off \
-  --set quantization_config.mode=balanced
+  --set quantization.mode=balanced
 ```
 
 | Flags | Options |

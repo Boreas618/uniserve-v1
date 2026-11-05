@@ -278,7 +278,7 @@ fn reloads(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static
             ("the dtype", old.dtype == new.dtype),
             (
                 "the quantization",
-                old.quantization_config == new.quantization_config,
+                old.quantization == new.quantization,
             ),
             ("the load format", old.load_format == new.load_format),
             ("the weight source", old.weights == new.weights),
@@ -304,7 +304,7 @@ fn kv_encoding(spec: &wire::EngineSpec) -> (String, String, String) {
         .workers
         .as_ref()
         .map_or_else(Default::default, |workers| {
-            (workers.dtype.clone(), workers.quantization_config.clone())
+            (workers.dtype.clone(), workers.quantization.clone())
         });
     (configured, compute, quantization)
 }

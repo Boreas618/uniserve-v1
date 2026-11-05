@@ -3875,23 +3875,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
                 slot_mapping: vec![-1; tokens],
-                // One row carries the bucket's whole token run and the rest carry none: a prefill
-                // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
-                // pose that gave every row one token would describe a batch of `rows` tokens wearing
-                // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
+                // The partition the launch reads, and the calls below are the same shape a serving
+                // batch states: `warm_span` and `warm_calls` state each rule once, with the reason
+                // beside it, because both were once the prefill form applied to a decode bucket.
                 seq_lens: span.0,
                 query_offsets: span.1,
                 logits_rows: vec![-1; rows],
-                calls: vec![nn::BatchRow {
-                    request: 0,
-                    kind: if bucket.variant.is_decode() {
-                        nn::RowKind::Decode
-                    } else {
-                        nn::RowKind::Prefill
-                    },
-                    cache_group: 0,
-                    rows: 0..bucket.tokens,
-                }],
+                calls: warm_calls(bucket),
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
@@ -3906,7 +3896,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
-            commit: inert_commit(1),
+            commit: inert_commit(if bucket.variant.is_decode() { rows } else { 1 }),
             // The geometry the upload hands the model, and the same two values the serving pose
             // states (`token_batch_with`): a captured node's page size and key bound are its own,
             // so a warm pose that stated its own would freeze a page of one token and a reduction
@@ -3917,7 +3907,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             max_kv_len: self.geometry.max_kv_len,
         };
         self.staging
-            .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
+            .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
     }
 
 }
@@ -4071,6 +4061,48 @@ pub fn calls_output(
 /// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
 /// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
 /// partition no tensor has computes a tiling and a mask that no buffer matches.
+/// The calls a warm pose states: one per row for a decode bucket, one over the run for a prefill.
+///
+/// A decode row is one request's one token, and `Staging::stage` extends a batch to one call per
+/// padded row in exactly this form, so a decode pose that stated one call holding the whole token run
+/// would describe a batch no serving batch has - and a capture states its pose to the model for the
+/// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
+/// bucket's tokens.
+/// The call ids of a bucket's warm pose: one per call `warm_calls` states.
+///
+/// `Staging::stage` refuses a pose whose call ids do not name every call of its rows, and a decode
+/// bucket's warm pose states one call per row - so a single `CallId(0)` is a pose of one call
+/// wearing eight. The ids are positional: a call's id names its slot in the batch's tables, and a
+/// warm pose has no request to carry one.
+fn warm_call_ids(bucket: Bucket) -> Vec<CallId> {
+    warm_calls(bucket)
+        .into_iter()
+        .enumerate()
+        .map(|(index, _)| CallId(index as u64))
+        .collect()
+}
+
+fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
+    let rows = bucket.rows;
+    if bucket.variant.is_decode() {
+        (0..rows)
+            .map(|row| nn::BatchRow {
+                request: 0,
+                kind: nn::RowKind::Decode,
+                cache_group: 0,
+                rows: row..row + 1,
+            })
+            .collect()
+    } else {
+        vec![nn::BatchRow {
+            request: 0,
+            kind: nn::RowKind::Prefill,
+            cache_group: 0,
+            rows: 0..bucket.tokens,
+        }]
+    }
+}
+
 fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
     let rows = usize::try_from(bucket.rows).unwrap_or(0);
     let tokens = bucket.tokens as i32;
@@ -4188,6 +4220,24 @@ mod tests {
             "a decode row is one query token, so the partition is the identity"
         );
         assert_eq!(seq_lens, vec![1, 1, 1, 1], "one key per row in the warm pose");
+    }
+
+    #[test]
+    fn a_decode_bucket_states_one_call_per_row() {
+        // The second pose defect: one call holding the bucket's whole token run is a shape no
+        // serving decode batch has, and a capture states its pose to the model for the bucket's
+        // life. A decode row is one request's one token.
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let calls = super::warm_calls(bucket);
+        assert_eq!(calls.len(), 4, "one call per decode row");
+        for (row, call) in calls.iter().enumerate() {
+            assert_eq!(call.kind, nn::RowKind::Decode);
+            assert_eq!(
+                call.rows,
+                row as u32..row as u32 + 1,
+                "a decode call holds one token"
+            );
+        }
     }
 
     #[test]

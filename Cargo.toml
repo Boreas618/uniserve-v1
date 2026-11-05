@@ -28,7 +28,6 @@ members = [
     "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",
-    "crates/worker",
 ]
 
 [package]
@@ -108,7 +107,6 @@ scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
 scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }
-worker = { path = "crates/worker" }
 
 # ---- engine third-party deps ----
 crossbeam-channel = "0.5"
