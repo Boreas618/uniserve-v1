@@ -1259,16 +1259,13 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
         clip.blend_extents().len()
     );
 
-    // 5. The arena: the encoder's own set per tile extent, one pixel buffer per tile (the scene reads
-    //    every tile's pixels in one call, so the plan's single tile buffer is multiplied by the tile
-    //    count), the conditioning buffers the stint produces, and the latent this stage reads back.
-    let mut arena_plan = Vec::new();
-    for extent in &tile_extents {
-        arena_plan.extend(minimax_h3::encoding::video_encoder_tile_arena(
-            &config.video_vae,
-            *extent,
-        )?);
-    }
+    // 5. The arena: what a **run** of tiles reserves, which is one set for the grid and not one per tile
+    //    (the driver hoists the reservation out of its loop, `tiled_encode.rs:319`), one pixel buffer per
+    //    tile because the scene reads every tile's pixels in one call, the conditioning buffers the stint
+    //    produces, and the latent this stage reads back. Summing the tile arena over the grid instead
+    //    states the tile count times the run - 65,360 MiB against 6,150 MiB at 17 frames of 768x768.
+    let mut arena_plan =
+        minimax_h3::encoding::video_encoder_run_arena(&config.video_vae, &tile_extents)?;
     arena_plan.extend(minimax_h3::encoding::conditioning_arena(
         &config.video_vae,
         frames,

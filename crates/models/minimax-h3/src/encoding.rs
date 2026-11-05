@@ -2456,6 +2456,29 @@ pub fn video_encoder_tile_arena(
     Ok(plan)
 }
 
+/// The buffers a **run** of tiles encodes in: one set per distinct tile extent, not one per tile.
+///
+/// A driver reserves once before its loop and hands the same set to every tile
+/// ([`VideoEncoder::reserve`], called from `tiled_encode::ClipEncoder::encode`), because the arena
+/// never rewinds: a reservation inside the loop is multiplied by the tile count, and one tile's buffers
+/// are most of a gigabyte at the served canvas. A plan that sums [`video_encoder_tile_arena`] over the
+/// grid therefore states the tile count times what the run reserves - at 17 frames of 768x768 that is
+/// 65,360 MiB against the 6,150 MiB the run actually holds.
+///
+/// A run's tiles are uniform at the served grids (`Seams::split` keeps every tile at the raster's tile
+/// size and spends the slack on wider seams), so the list is usually one extent and the answer is one
+/// set. It is passed whole because a raster smaller than a tile is the case where they differ.
+pub fn video_encoder_run_arena(
+    config: &VideoVaeConfig,
+    extents: &[Extent],
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    for extent in distinct(extents) {
+        plan.extend(video_encoder_tile_arena(config, extent)?);
+    }
+    Ok(plan)
+}
+
 /// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
 ///
 /// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
@@ -3339,6 +3362,43 @@ mod tests {
             distinct(&[tile(192, 192), tile(256, 256)]),
             vec![tile(192, 192), tile(256, 256)],
             "the order is the order they are named"
+        );
+    }
+
+    #[test]
+    fn a_run_of_tiles_reserves_one_set_and_not_one_per_tile() {
+        let config = video_config();
+        // Sixteen tiles of one extent - the served grids' shape - reserve exactly one tile's set,
+        // because the driver hoists the reservation out of its loop and hands the same buffers to every
+        // tile. A plan that summed the tile arena over the grid would state sixteen times the memory a
+        // run holds, and the caller would meet it as an arena of 65,360 MiB for a 768x768 raster.
+        let tile = Extent {
+            frames: 17,
+            height: 256,
+            width: 256,
+        };
+        let grid = vec![tile; 16];
+        let run = video_encoder_run_arena(&config, &grid).expect("the run's plan");
+        let one = video_encoder_tile_arena(&config, tile).expect("one tile's plan");
+        assert_eq!(
+            run, one,
+            "sixteen tiles of one extent are one set of buffers"
+        );
+        // A raster smaller than a tile is the case where a run's tiles are not uniform: two distinct
+        // extents are two sets, and neither is dropped.
+        let small = Extent {
+            frames: 17,
+            height: 192,
+            width: 192,
+        };
+        let mixed = video_encoder_run_arena(&config, &[tile, small, tile]).expect("the mixed plan");
+        assert_eq!(mixed.len(), run.len() + one.len());
+        assert_eq!(
+            mixed.len(),
+            video_encoder_tile_arena(&config, small)
+                .expect("the small tile's plan")
+                .len()
+                + one.len()
         );
     }
 
