@@ -16,6 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 # A checkpoint shard is mapped, not loaded: the loader reads the bytes of one tensor at a time.
 memmap2 = "0.9"
+# A computed weight has no file to name it, so its key carries a digest of the bytes it produced.
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

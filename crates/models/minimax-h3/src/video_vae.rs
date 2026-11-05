@@ -604,6 +604,7 @@ fn pack_voxel_rows(
         DType::I32,
         Shape::new(&[rows.len() as u64]),
         &bytes,
+        "minimax-h3",
     )?)
 }
 
@@ -1066,6 +1067,7 @@ impl VideoDecoder {
                     DType::I32,
                     Shape::new(&[2]),
                     &bytes,
+                    "minimax-h3",
                 )?
             },
             attention: Attention::dense(
@@ -1161,7 +1163,7 @@ fn zeroes(
 ) -> Result<Weight> {
     let bytes = vec![0u8; (width as usize) * dtype.bytes().unwrap_or(4) as usize];
     declared(declared_sizes, name, bytes.len())?;
-    Ok(loader.constant(name, dtype, Shape::new(&[1, width]), &bytes)?)
+    Ok(loader.constant(name, dtype, Shape::new(&[1, width]), &bytes, "minimax-h3")?)
 }
 
 /// A constant index table: `count` rows starting at `start`.
@@ -1177,7 +1179,13 @@ fn indices(
     for index in 0..count {
         bytes.extend_from_slice(&(start + index).to_le_bytes());
     }
-    Ok(loader.constant(name, DType::I32, Shape::new(&[u64::from(count)]), &bytes)?)
+    Ok(loader.constant(
+        name,
+        DType::I32,
+        Shape::new(&[u64::from(count)]),
+        &bytes,
+        "minimax-h3",
+    )?)
 }
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
@@ -1224,7 +1232,13 @@ fn frequencies(
     }
     let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
     declared(declared_sizes, &name, bytes.len())?;
-    Ok(loader.constant(&name, DType::F32, Shape::new(&[table.len() as u64]), &bytes)?)
+    Ok(loader.constant(
+        &name,
+        DType::F32,
+        Shape::new(&[table.len() as u64]),
+        &bytes,
+        "minimax-h3",
+    )?)
 }
 
 impl VideoDecoder {

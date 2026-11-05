@@ -515,6 +515,7 @@ fn identity(loader: &mut WeightLoader<'_>) -> Result<ScaledResidual> {
         nn::DType::F32,
         Shape::new(&[1]),
         &one,
+        "minimax-h3",
     )?;
     Ok(ScaledResidual::new(scale, None)?)
 }
