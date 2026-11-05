@@ -319,6 +319,43 @@ fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (
     (rows, width)
 }
 
+/// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
+///
+/// A row is the layout's **capacity** - `text_rows + condition_rows` rows of `width` - and a
+/// product holds the request's own rows, which the encoder wrote. The prefix's rows past the
+/// request's are the padding the packing names, and its value is zeros
+/// (`packing::DensePacking::zero_row`). So a short product fills the row's front and the rest is
+/// zeroed rather than refused.
+///
+/// **A product longer than the row is refused**, and by name: it is not padding, it is a plan
+/// disagreement - the store holds more of the request's rows than the layout those rows are copied
+/// into can carry - and truncating it would drop states the denoiser was told are there.
+fn fills(
+    request: ipc::RequestKey,
+    kind: Product,
+    available: u64,
+    bytes: u64,
+) -> Result<(u64, u64)> {
+    if available == 0 {
+        return Err(Error::Invalid(format!(
+            "request {} presents no byte(s) of {} where a row of {bytes} bytes must be filled: an \
+             empty region is a product no call wrote",
+            request.request_id.0,
+            kind.name()
+        )));
+    }
+    if available > bytes {
+        return Err(Error::Invalid(format!(
+            "request {} presents {available} byte(s) of {} where a row holds {bytes}: the store's \
+             region is longer than the conditioning block it is copied into, so the deployment's \
+             text capacity is below the rows the request was encoded with",
+            request.request_id.0,
+            kind.name()
+        )));
+    }
+    Ok((available, bytes - available))
+}
+
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
 /// A free function so the presence rule is testable without a runner: constructing one takes a
@@ -655,7 +692,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// A view shorter than the row it must fill is refused by name: a short copy would leave the
     /// tail of the row holding the previous request's values, which is worse than a refusal because
     /// the graph runs either way.
-    fn seed(&self, bucket: Bucket) -> Result<()> {
+    fn seed(&mut self, bucket: Bucket) -> Result<()> {
         // A replay always follows the `submit` that produced it, and that submit is what names the
         // rows: an empty set means the batch was served already, or a job outlived its submit. The
         // graph would then read the host columns - which are a warm capture's zeros - so this is
@@ -668,48 +705,63 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                  rather than a request's conditioning"
             )));
         }
-        let Some(products) = self.products.as_ref() else {
+        let Some(products) = self.products.clone() else {
             return Ok(());
         };
+        // The rows and the stream are copied out before the columns are borrowed mutably: the
+        // padding below writes a column's host side, which is the memory its graph reads.
+        let pending = self.pending.clone();
+        let stream = self.stream.clone();
+        let (device, stream_id) = (self.device, self.stream_id());
         let layout = layout_of(bucket)?;
         let (rows, width) = conditioning_row(&self.shape, &layout);
         let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
         })?);
         let bytes = rows * width * element;
-        for row in &self.pending {
+        for row in &pending {
             let (request, index) = (row.request, row.index);
             for (kind, column) in [
-                (Product::Text, &self.columns.text),
-                (Product::Source, &self.columns.source),
+                (Product::Text, &mut self.columns.text),
+                (Product::Source, &mut self.columns.source),
             ] {
-                let Some(view) = products.borrow(request, kind, self.device, self.stream_id())?
-                else {
+                let Some(view) = products.borrow(request, kind, device, stream_id)? else {
                     return Err(products::absent(request, kind));
                 };
-                let available = view.byte_len()?;
-                if available < bytes {
-                    return Err(Error::Invalid(format!(
-                        "request {} presents {} byte(s) of {} where a row of bucket {bucket} needs \
-                         {bytes}: the store's region is shorter than the row it must fill",
-                        request.request_id.0,
-                        available,
-                        kind.name()
-                    )));
-                }
-                // SAFETY: both ranges are device memory that outlives this copy - the column is the
-                // runner's, allocated for the largest bucket it serves, and the span being written
-                // is one row inside it; the store's region belongs to the request, which is in
-                // flight until the executor forgets it. The copy is on the runner's own stream, so
-                // the graph that reads it is ordered after it.
+                let (copied, zeroed) = fills(request, kind, view.byte_len()?, bytes)?;
+                let destination = column.host.address() + u64::from(index) * bytes;
+                // SAFETY: both ranges outlive this copy - the column is the runner's, allocated for
+                // the largest bucket it serves, and the span being written is one row inside it; the
+                // store's region belongs to the request, which is in flight until the executor
+                // forgets it. The copy is on the runner's own stream, so the graph that reads it is
+                // ordered after it.
                 unsafe {
                     platform::memcpy_async(
-                        column.host.address() + u64::from(index) * bytes,
+                        destination,
                         view.ptr.address(),
-                        usize::try_from(bytes)
+                        usize::try_from(copied)
                             .map_err(|_| Error::Invalid("a row is larger than memory".into()))?,
-                        &self.stream,
+                        &stream,
                     )?;
+                }
+                // The rest of the row is the packing's zero row. A layout's prefix is the
+                // **deployment's capacity** (`DensePacking::text_rows` - "a layout holds every
+                // prompt that fits it") while the encoder publishes the request's own rows, so the
+                // tail is the padding the packing names and its value is zeros
+                // (`DensePacking::zero_row`). It is written here, on the host side of the column,
+                // because that is the memory the captured graph reads: a column's device view is
+                // its pinned buffer's address (`columns.rs`), so these bytes are the graph's.
+                if zeroed > 0 {
+                    let start = usize::try_from(u64::from(index) * bytes + copied)
+                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
+                    let end = usize::try_from(u64::from(index) * bytes + bytes)
+                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
+                    // SAFETY: `start..end` is inside this column's row `index`, which the column
+                    // was sized for, and no copy or launch writes it concurrently: the front copy
+                    // is issued on the stream before the launch and covers `..start` alone.
+                    unsafe {
+                        column.host.as_mut_slice()[start..end].fill(0);
+                    }
                 }
             }
         }
@@ -1485,6 +1537,40 @@ mod product_tests {
 
     fn request() -> ipc::RequestKey {
         ipc::RequestKey::new(1, ipc::RequestId(41), 0)
+    }
+
+    /// The capacity rule a served request depends on: the layout's conditioning block is the
+    /// **deployment's** capacity, the product holds the request's own rows, and the difference is
+    /// the packing's zero row.
+    ///
+    /// Both directions matter. A short product is padded rather than refused - refusing it is every
+    /// request, because a prompt is shorter than the prefix capacity a deployment plans for. A long
+    /// one is refused by name: it is not padding but a plan disagreement, and truncating it would
+    /// drop states the denoiser was told are there.
+    #[test]
+    fn a_short_product_fills_the_rows_front_and_a_long_one_is_refused() {
+        let (copied, zeroed) = fills(request(), Product::Text, 300, 512).expect("a short product");
+        assert_eq!((copied, zeroed), (300, 212));
+
+        let exact = fills(request(), Product::Text, 512, 512).expect("an exact product");
+        assert_eq!(exact, (512, 0));
+
+        let refusal = fills(request(), Product::Text, 640, 512)
+            .expect_err("a product longer than the block")
+            .to_string();
+        assert!(
+            refusal.contains("640"),
+            "the refusal names what it got: {refusal}"
+        );
+        assert!(
+            refusal.contains("512"),
+            "and what the block holds: {refusal}"
+        );
+
+        let empty = fills(request(), Product::Text, 0, 512)
+            .expect_err("a product no call wrote")
+            .to_string();
+        assert!(empty.contains("no byte(s)"), "{empty}");
     }
 
     /// The rule a step depends on: the refusal names **the first kind the store lacks, in the
