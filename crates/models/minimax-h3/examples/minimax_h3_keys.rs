@@ -196,6 +196,12 @@ const VSA_MAX_TILES: u32 = 8192;
 const FFN: u32 = 14336;
 
 /// The audio encoder's attention: 8 heads over the 2048-wide latent, so 256 features per head.
+/// The clip lengths H3 is driven at, in video frames - **the deployment's statement**, not a property
+/// of the model: the model's frame rule says which lengths a request can be snapped to, and no source
+/// says which of those this deployment drives. The delivery's stages and the model's bound are the
+/// list; `--frames` states another, and it may not omit one of these.
+const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+
 const AUDIO_ATTENTION_HEADS: u32 = 8;
 const AUDIO_LATENT_DIM: u32 = 2048;
 
@@ -253,12 +259,11 @@ fn main() {
     // transient by construction - when the residual add's extent stops being part of its key they
     // collapse to one per add - so the ladder ships complete now and gets smaller later, and a
     // request naming a length outside it is refused by name at its first audio row program.
-    let mut clip_frames: Vec<u32> = vec![5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+    let mut clip_frames: Vec<u32> = Vec::new();
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
             "--frames" => {
-                clip_frames.clear();
                 for frames in value(&mut arguments, "--frames").split(',') {
                     clip_frames.push(parse(frames.trim(), frames, "a clip length"));
                 }
@@ -367,6 +372,24 @@ fn main() {
     // The audio operators state one row set per track length, because their residual adds carry the
     // track's extent in the key: the ladder above is the deployment's clip lengths, converted here
     // through the crate's own arithmetic so no sample count is written down twice.
+    // **The deployment's ladder, stated once, and `--frames` must not leave one of its rungs out:**
+    // a run with no flag and a run stating this list must produce one row set, and the check fails
+    // when a stated ladder and the deployment's part company - the one failure of this file that
+    // nothing else would notice. It covers **default against stated, not stated against legal**: the
+    // frame rule (`align_num_frames`) says which lengths a request snaps to, and the deployment says
+    // which of those it drives.
+    if clip_frames.is_empty() {
+        clip_frames = DEPLOYMENT_FRAMES.to_vec();
+    } else {
+        for frames in DEPLOYMENT_FRAMES {
+            if !clip_frames.contains(&frames) {
+                panic!(
+                    "the run states the ladder {clip_frames:?}, which omits {frames} - a clip the \
+                     deployment drives; state a superset of {DEPLOYMENT_FRAMES:?} or no --frames"
+                );
+            }
+        }
+    }
     let audio = &config.audio_vae;
     // A decode starts from a track's **latent frames** and the encoder's residual units are sized in
     // **samples**: the two operators take the same clip in different units, and passing one where the
