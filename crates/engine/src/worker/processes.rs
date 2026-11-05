@@ -185,6 +185,11 @@ impl ExitReports {
 /// The engine's connection to the leader daemon.
 pub(crate) struct ProcessClient {
     connection: Connection,
+    /// The number this process greets the daemon under, and the number a
+    /// reservation it asks for is filed under: zero for a client that is not a
+    /// main process (the leader's planning client), which reserves nothing that
+    /// a launch inherits.
+    engine: u64,
     /// Every node of the deployment, as the leader knows it.
     nodes: Vec<Node>,
     /// The leader's minor version: which additions it answers.
@@ -235,6 +240,7 @@ impl ProcessClient {
         tracing::info!(daemon = %address, nodes = welcome.nodes.len(), build = %welcome.build, "connected to the deployment's daemons");
         let processes = Arc::new(Mutex::new(Self {
             connection,
+            engine,
             nodes: welcome.nodes,
             minor: welcome.minor,
             next_request: 1,
@@ -331,6 +337,7 @@ impl ProcessClient {
             host: host.to_owned(),
             group: group.to_owned(),
             routable,
+            engine: self.engine,
         }))? {
             reply::Kind::Reserved(reserved) => Ok(Reservation {
                 address: reserved.address,

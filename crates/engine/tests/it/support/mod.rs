@@ -6,8 +6,44 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod serving;
 pub(crate) mod storage;
 pub(crate) mod video;
+
+pub(crate) use serving::{config, pool, rank, Serving, SAMPLED};
+
+/// Waits for `want` generated tokens, or for the request's terminal event.
+///
+/// The engine publishes generated tokens as `TextTokens` carrying the ids a
+/// step produced; a single `TextToken` is the one-id form of the same event. A
+/// wait that matches one variant alone reads a served request as a starved one
+/// and burns its whole bound doing it, which is why both forms are matched
+/// here, in the one place that knows the pair.
+///
+/// Returns the tokens collected and the terminal event when the request ended
+/// first; reaching `want` tokens returns them with `None`. Panics by name if
+/// neither happens within `deadline`.
+pub(crate) fn wait_for_tokens(
+    events: &mut engine::EventRx,
+    want: usize,
+    deadline: std::time::Duration,
+) -> (Vec<u32>, Option<engine::Event>) {
+    let end = std::time::Instant::now() + deadline;
+    let mut tokens = Vec::new();
+    while std::time::Instant::now() < end {
+        match events.try_recv() {
+            Ok(engine::Event::TextToken { id, .. }) => tokens.push(id),
+            Ok(engine::Event::TextTokens { ids }) => tokens.extend(ids),
+            Ok(event) if event.is_terminal() => return (tokens, Some(event)),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+        if tokens.len() >= want {
+            return (tokens, None);
+        }
+    }
+    panic!("the request did not reach {want} tokens within {deadline:?}: it produced {tokens:?}")
+}
 
 /// The digest of test image `id` (`ImageInput::digest`): its little-endian
 /// bytes, then zeros, so that images of distinct ids differ.

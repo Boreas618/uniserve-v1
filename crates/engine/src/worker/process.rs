@@ -308,6 +308,36 @@ impl PendingWorker {
     }
 }
 
+/// The failure a rank's stall report amounts to, naming the forward the job
+/// belongs to and the calls it held.
+///
+/// Shared with the simulated executor (`crate::sim`), which reports the same
+/// failure for a job it never finishes: one statement of what a stall is
+/// called, whichever executor saw it.
+pub(crate) fn stall_failure(stall: &ipc::Stall) -> anyhow::Error {
+    let calls = stall
+        .calls
+        .iter()
+        .map(|call| format!("{}/{:?}", call.request_key.request_id.0, call.call_id))
+        .collect::<Vec<_>>();
+    let forward = match stall.batch_id {
+        Some(batch_id) => format!(
+            "a job of batch {batch_id} ({}, method {}, calls [{}])",
+            stall.route.as_deref().unwrap_or("no calls"),
+            stall.method.as_deref().unwrap_or("none"),
+            calls.join(", "),
+        ),
+        None => format!(
+            "a job of no batch (method {})",
+            stall.method.as_deref().unwrap_or("none")
+        ),
+    };
+    anyhow::anyhow!(
+        "the builder thread stalled: it has performed {forward} for {:.1} s without completing it",
+        Duration::from_millis(stall.running_ms).as_secs_f64()
+    )
+}
+
 impl WorkerProcess {
     /// Asks the rank for its startup report.
     ///
@@ -652,22 +682,7 @@ impl WorkerProcess {
             "a rank reports its builder thread stalled inside one job"
         );
 
-        let forward = match stall.batch_id {
-            Some(batch_id) => format!(
-                "a job of batch {batch_id} ({}, method {}, calls [{}])",
-                stall.route.as_deref().unwrap_or("no calls"),
-                stall.method.as_deref().unwrap_or("none"),
-                calls.join(", "),
-            ),
-            None => format!(
-                "a job of no batch (method {})",
-                stall.method.as_deref().unwrap_or("none")
-            ),
-        };
-        anyhow::anyhow!(
-            "the builder thread stalled: it has performed {forward} for {:.1} s without completing it",
-            Duration::from_millis(stall.running_ms).as_secs_f64()
-        )
+        stall_failure(stall)
     }
 
     /// Returns the descriptors that signal this rank's progress: its
