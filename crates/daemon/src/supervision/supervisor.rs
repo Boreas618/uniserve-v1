@@ -569,6 +569,15 @@ impl Supervisor {
             read: next()?,
             write: next()?,
         };
+        // The lifeline is the processes': a supervised process ends when every write
+        // end of the pipe closes, so a successor that did not take these would let the
+        // engine die the moment the predecessor exits — silently, on stderr no one
+        // reads any more.
+        tracing::info!(
+            processes = supervisor.children.len(),
+            "a supervisor adopted the processes the previous daemon supervised, with their \
+             lifeline"
+        );
         supervisor.next_reservation = handed.next_reservation;
         Ok(supervisor)
     }

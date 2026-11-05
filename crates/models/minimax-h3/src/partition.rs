@@ -431,6 +431,12 @@ impl Partition {
     /// `ref2va`'s references and keyframes - and not for `t2va`, whose request has none.
     /// `sequence_rank` is this rank's place in the denoiser's Ulysses group; it is not the text
     /// encoder's (`tensor_rank`), and a deployment must state both.
+    ///
+    /// This block set is the **port's** statement of the components a task places. The placement a
+    /// rank acts on is the model package's own declarations (`crates/worker`'s `Declarations`), so
+    /// a deployment that calls this constructor is also the place where the two statements can be
+    /// held against each other: equal components are a proof the two agree, and a difference is a
+    /// defect found at load rather than at the first rank that lacks a block.
     pub fn serving(
         config: &Config,
         task: VideoTask,
