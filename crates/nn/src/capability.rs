@@ -722,6 +722,30 @@ pub trait Denoiser {
     /// The latent layout this request needs.
     fn layout(&self, request: &VideoRequest<'_>) -> Layout;
 
+    /// The bytes this request's forward needs, as the model's own plan computes them.
+    ///
+    /// This is the one number a caller cannot derive and must not transcribe: it is the total of
+    /// the model's plan for the layout this request names, so a caller allocating from a literal
+    /// beside the plan holds a second statement of a value only the model owns. The plan is derived
+    /// here from `request` in the order the executor already uses - [`layout`](Self::layout) and
+    /// then the model's own plan - so a caller never has two ways to name the same plan.
+    ///
+    /// It is a pure function of the request: two requests with one layout answer the same bytes,
+    /// because the executor caches a capture by bucket and a plan that varied inside a layout would
+    /// be an allocation that fits one request and not the next. It allocates nothing and touches no
+    /// device: the model states what its forward needs and the runtime owner allocates to it.
+    ///
+    /// A request outside the deployment's bound - a canvas it does not serve, a row count past the
+    /// packed ladder - is refused by name, never answered with a number for a layout the forward
+    /// cannot run. A denoiser that states no plan refuses, as it does for a schedule it does not
+    /// have: a zero would be the same value as an arena of no bytes.
+    fn arena_bytes(&self, request: &VideoRequest<'_>) -> Result<u64> {
+        Err(Error::Unsupported(format!(
+            "a denoiser that states no arena plan for a layout of {:?}",
+            self.layout(request)
+        )))
+    }
+
     /// The denoising steps one request of `task` runs, in order.
     ///
     /// The runner executes one step per call and cannot derive the schedule: the steer belongs to
