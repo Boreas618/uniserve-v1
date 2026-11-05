@@ -453,10 +453,22 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         for plan in &plans {
             let needed = match self.model.arena_bytes(&plan.warm.view()) {
                 Ok(bytes) => bytes,
-                // A model that states no plan is not a shortfall: the pool is then the only figure
-                // there is, and a capture that outgrows it refuses at its own launch by name. The
-                // refusal is not turned into a pass, which would be the same value as "it fits".
-                Err(_) => continue,
+                // **A model that states no plan is not a shortfall**: the pool is then the only
+                // figure there is, and a capture that outgrows it refuses at its own launch by
+                // name. The refusal is not turned into a pass, which would be the same value as
+                // "it fits".
+                //
+                // **A model whose plan refuses for any other reason is a refusal, not an absence**:
+                // a canvas it does not serve, a row count past its ladder. Swallowing those would
+                // read a deployment the model cannot run as one whose arena fits - so only the
+                // absence is passed over, and the two are told apart by the error they come in.
+                Err(nn::Error::Unsupported(_)) => continue,
+                Err(other) => {
+                    return Err(Error::Invalid(format!(
+                        "bucket {} states no arena for its own warm request: {other}",
+                        plan.bucket
+                    )));
+                }
             };
             if needed > offered {
                 return Err(Error::Invalid(format!(
