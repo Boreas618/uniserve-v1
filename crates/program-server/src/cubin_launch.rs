@@ -680,6 +680,47 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_module_resolves_against_the_recipes_own_directory() {
+        // The module a recipe names relatively is a directory beside the recipe. It is resolved
+        // when the recipe is read, and nowhere else: a reader that passed the path again could
+        // pass a bare file name, whose parent is the empty path, and the module would then be
+        // sought under the process's working directory. That is a directory, so the constants
+        // read as an empty set rather than as a missing file.
+        let (directory, recipe, _metadata) = plan_of(
+            serde_json::json!({"module": "module", "entry": "entry"}),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(recipe.module_dir(), directory.path().join("module"));
+        assert!(recipe.module_dir().is_absolute());
+        assert_eq!(recipe.dump_dir(), directory.path());
+        let baked = Baked::read(&recipe.module_dir()).expect("the constants beside the recipe read");
+        assert_eq!(baked.i32("experts"), Ok(128));
+    }
+
+    #[test]
+    fn an_absolute_module_is_taken_as_it_stands() {
+        let module = tempfile::tempdir().expect("a temporary module");
+        std::fs::write(module.path().join("metadata.json"), "{}").expect("the metadata is written");
+        let recipe_directory = tempfile::tempdir().expect("a temporary recipe directory");
+        let recipe_path = recipe_directory.path().join("case.json");
+        std::fs::write(
+            &recipe_path,
+            serde_json::json!({
+                "module": module.path().to_str().expect("a temporary path is text"),
+                "entry": "entry",
+            })
+            .to_string(),
+        )
+        .expect("the recipe is written");
+
+        let recipe = Recipe::read(&recipe_path).expect("the recipe reads");
+
+        assert_eq!(recipe.module_dir(), module.path());
+        assert_eq!(recipe.dump_dir(), recipe_directory.path());
+    }
+
+    #[test]
     fn a_baked_constant_reaches_the_word_the_recipe_names() {
         let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
