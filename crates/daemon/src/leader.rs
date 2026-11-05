@@ -694,10 +694,17 @@ impl Leader {
             policy = %prepared.policy.backend,
             "the epoch's programs are resolved; sending them to the main processes"
         );
+        // The record states the programs the main processes took, revisions
+        // included — the ones `prepare_epoch` selected — and not the ones the
+        // configuration asked for: a filled program's revision is zero until a
+        // Program Server selects one, so recording the request would leave
+        // `GET /admin/config` naming numbers no package has and a later
+        // handover to a joining process (`Epochs::hand_to`) sending a revision
+        // the store never built.
         let deployment = crate::epoch::Deployment {
             config: config.clone(),
             build_config: crate::epoch::BuildConfig::of(config),
-            programs: filled,
+            programs: prepared.clone(),
         };
         let processes: Vec<crate::engine::control::EpochProcess> = engines
             .into_iter()
