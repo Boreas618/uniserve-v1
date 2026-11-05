@@ -133,6 +133,8 @@ fn run() -> Result<(), String> {
     let mut extents: Option<PathBuf> = None;
     let mut types: Option<PathBuf> = None;
     let mut sparse: Option<(u32, f64, Option<f64>)> = None;
+    // Which deployment this recording states: the walk's own flag and the walk's own default.
+    let mut conditioned_deployment = true;
     let mut list = false;
     let mut names = false;
     while let Some(argument) = arguments.next() {
@@ -154,6 +156,15 @@ fn run() -> Result<(), String> {
             "--track" => track = value()?.parse().map_err(|_| "--track is a count of samples")?,
             "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
+            "--conditioned" => {
+                conditioned_deployment = match value()?.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!("--conditioned takes true or false, not {other}"));
+                    }
+                };
+            }
             "--extents" => extents = Some(PathBuf::from(value()?)),
             // The caller's `component-tensors.json`: the four components' stored element types, which
             // no shardless host can read for itself.
@@ -223,17 +234,28 @@ fn run() -> Result<(), String> {
     };
 
     let harnesses: Vec<(&str, Harness)> = match component.as_str() {
-        "all" => vec![
-            ("audio-encoder", audio_encoder as Harness),
-            ("audio-decoder", audio_decoder as Harness),
-            ("video-encoder", video_encoder as Harness),
-            ("video-decoder", video_decoder as Harness),
-            ("denoiser", denoiser as Harness),
-            ("conditioned", conditioned as Harness),
-            ("video-postprocessor", video_postprocessor as Harness),
-            ("text-encoder", text_encoder as Harness),
-            ("vision-tower", vision_tower as Harness),
-        ],
+        // `all` is one *deployment*, not both: the plain denoiser runs a `t2va` step and the
+        // conditioned one runs a `fl2va` step, so a row set holding both describes two deployments and
+        // cannot be compared with either walk. `--conditioned` selects which, and it is the walk's own
+        // flag with the walk's own default, because the comparison is only meaningful when the two
+        // enumerations were invoked identically.
+        "all" => {
+            let mut harnesses: Vec<(&str, Harness)> = vec![
+                ("audio-encoder", audio_encoder as Harness),
+                ("audio-decoder", audio_decoder as Harness),
+                ("video-encoder", video_encoder as Harness),
+                ("video-decoder", video_decoder as Harness),
+                ("video-postprocessor", video_postprocessor as Harness),
+                ("text-encoder", text_encoder as Harness),
+                ("vision-tower", vision_tower as Harness),
+            ];
+            if conditioned_deployment {
+                harnesses.push(("conditioned", conditioned as Harness));
+            } else {
+                harnesses.push(("denoiser", denoiser as Harness));
+            }
+            harnesses
+        }
         // The order above is the one a caller reads: the decoders, then the network, then the prompt's
         // path. `all` is every harness this build can drive, and the audio halves answer by name while
         // their extents table is missing rather than silently leaving the run short.
