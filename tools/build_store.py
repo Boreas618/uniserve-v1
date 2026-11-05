@@ -251,8 +251,8 @@ def module_digest(directory):
     return digest.hexdigest(), total
 
 
-def source_digest(package):
-    """The digest of the source a cell's module was built from.
+def source_files(package):
+    """Every source file of a package, by relative path, with the digest of its content.
 
     A package's own directory is its source: the manifest that declares it, the compile script that
     runs, and whatever that script compiles. A store outlives the tree it was built from, and a cell
@@ -260,25 +260,55 @@ def source_digest(package):
     package with the module its older source built, and two runs in a row stopped inside kernels for
     exactly that (`bf16 = 3` in an entry header, a word order in a signature).
 
+    The files are recorded one by one, not only as one digest: a reader that refuses a stale cell has
+    to name what changed, and "this package changed" leaves the reader to diff it.
+
     Build scratch is excluded: the compile script runs inside the package directory, so an import
     leaves `__pycache__` behind and its bytes shift with nothing the module depends on.
     """
-    digest = hashlib.sha256()
+    files = {}
     root = package["root"]
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix == ".pyc" or "__pycache__" in path.parts:
             continue
-        digest.update(path.relative_to(root).as_posix().encode())
+        files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def source_digest(files):
+    """One digest over a package's files, for a line that has room for one number."""
+    digest = hashlib.sha256()
+    for name, content in sorted(files.items()):
+        digest.update(name.encode())
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(content.encode())
         digest.update(b"\0")
     return digest.hexdigest()
 
 
-def write_source_record(directory: Path, digest: str, target: str) -> None:
-    """State, in the cell, which source built it."""
+def changed_files(stated, current):
+    """The files that make a cell stale: what changed, what appeared and what went."""
+    changed = [name for name, digest in sorted(stated.items())
+               if name in current and current[name] != digest]
+    appeared = sorted(set(current) - set(stated))
+    went = sorted(set(stated) - set(current))
+    return changed, appeared, went
+
+
+def write_source_record(directory: Path, package, target: str) -> None:
+    """State, in the cell, which source built it and which files that source was."""
+    files = source_files(package)
     (directory / "source.json").write_text(
-        json.dumps({"digest": digest, "target": target}, indent=1) + "\n"
+        json.dumps(
+            {
+                "package": package["root"].as_posix(),
+                "target": target,
+                "digest": source_digest(files),
+                "files": files,
+            },
+            indent=1,
+        )
+        + "\n"
     )
 
 
@@ -292,6 +322,13 @@ def verify(root: Path, rows, packages, target, revision, fixture, refuse_absent:
     """
     print(f"# verify: {root} (revision {revision}, {target})")
     print(f"# fixture: {fixture} ({len(rows)} rows)")
+    # A store that states no source anywhere is a store nobody stated - a Program Server's, or one
+    # built before this instrument - and it installs as it always did. What is worth refusing is a
+    # store that states sources for some cells and not others: that is a store part of which was
+    # rebuilt, and the part that was not cannot be told from stale.
+    states_sources = next(root.rglob("source.json"), None) is not None
+    if not states_sources:
+        print("# this store states no source digest, so no cell can be told from a stale one")
     stale, absent, fresh = [], [], 0
     for op, key, stated_backend in rows:
         candidates = [
@@ -311,15 +348,23 @@ def verify(root: Path, rows, packages, target, revision, fixture, refuse_absent:
             found = True
             record = directory / "source.json"
             if not record.is_file():
+                if not states_sources:
+                    break
                 verdict = (op, package["backend"], key,
                            "the cell states no source digest, so it cannot be told from a stale one")
                 break
-            stated = json.loads(record.read_text()).get("digest")
-            current = source_digest(package)
-            if stated != current:
+            stated = json.loads(record.read_text())
+            current = source_files(package)
+            changed, appeared, went = changed_files(stated.get("files") or {}, current)
+            if changed or appeared or went:
+                named = ", ".join(
+                    [f"{name} changed" for name in changed]
+                    + [f"{name} appeared" for name in appeared]
+                    + [f"{name} went" for name in went]
+                )
                 verdict = (op, package["backend"], key,
-                           f"built from {str(stated)[:12]}, and this tree's source is "
-                           f"{current[:12]}")
+                           f"built from {str(stated.get('digest'))[:12]} and this tree's source is "
+                           f"{source_digest(current)[:12]}: {named}")
                 break
         if verdict is not None:
             stale.append(verdict)
@@ -479,7 +524,7 @@ def main():
                 failures.append(f"{package['backend']}: {failure}")
                 continue
             (directory / ".committed").write_text("")
-            write_source_record(directory, source_digest(package), args.target)
+            write_source_record(directory, package, args.target)
             built.append((op, package["backend"], key))
             break
         else:
