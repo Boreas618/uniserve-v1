@@ -1,23 +1,26 @@
-//! Image understanding and generation on the simulator.
+//! Image understanding and generation through a native executor process.
 //!
-//! These tests run a scheduler (`SchedulerHandle`) over the simulated
-//! executor, so every image call the engine plans executes in the simulator's
-//! image and text runtimes: vision encoding of an inline image and the context
-//! prefill that places its features; and an image's generation: the
-//! conditioning prefill and cache export, latent preparation, guided denoising
-//! with guidance prefix prefills, decoding to a PNG and the generated image's
-//! feedback encoding. The simulator's denoiser predicts zero velocity, so a
-//! generated image is its seeded initial latent decoded: identical for one
-//! seed, different across seeds.
+//! These tests run a scheduler (`SchedulerHandle`) over one real executor process
+//! (`uniserve executor` with the weightless stub model on CPU), so every
+//! image call the engine plans executes in the executor's image and text
+//! runtimes: vision encoding of an inline image and the context prefill that
+//! places its features; and an image's generation: the conditioning prefill
+//! and cache export, latent preparation, guided denoising with guidance prefix
+//! prefills, decoding to a PNG and the generated image's feedback encoding.
+//! The stub's denoiser predicts zero velocity, so a generated image is its
+//! seeded initial latent decoded: identical for one seed, different across
+//! seeds. The executable comes from `UNISERVE_WORKER_EXECUTABLE` or the
+//! repository environment's `.venv/bin/uniserve`.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, ExecutorGroupConfig, SchedulerHandle};
+use engine::{EngineConfig, SchedulerHandle, ExecutorGroupConfig, ExecutorProcessArgs};
 use engine::{
     Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
@@ -30,6 +33,15 @@ const END_OF_IMAGE: u32 = 1007;
 /// A token that opens an image branch when sampled.
 const START_OF_IMAGE: u32 = 1000;
 
+fn worker_executable() -> PathBuf {
+    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(".venv/bin/uniserve")
+        })
+}
 
 /// One CPU rank holding the language model and its patch encoder.
 fn engine() -> anyhow::Result<SchedulerHandle> {
@@ -69,16 +81,25 @@ fn engine() -> anyhow::Result<SchedulerHandle> {
         2,
         components.clone(),
     )];
-    let mut sim = engine::SimEngine::new();
-    sim.place_components(components);
-    let executor = engine::SimExecutor::new(sim);
-    let rank = engine::Executor::info(&executor)
-        .runtime_info()
-        .expect("the sim states its rank");
-    let engine = SchedulerHandle::with_executor(config, Box::new(executor))
-        .expect("the simulated executor serves");
-    crate::support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
-    Ok(engine)
+    config.worker_process = ExecutorProcessArgs {
+        executable: worker_executable(),
+        daemon: crate::support::daemon(),
+        model: String::new(),
+        stub: true,
+        // The stub rank encodes many small images, so it keeps a larger
+        // encoder cache than a served model's default.
+        encoder_cache_entries: 1024,
+        ranks: config.worker_groups[0].ranks.clone(),
+        components,
+        queue_depth: 2,
+        max_total_tokens: Some(4096),
+        block_size: Some(16),
+        max_batch_calls: 16,
+        max_batch_tokens: 256,
+        attention_backend: "torch".into(),
+        ..config.worker_process.clone()
+    };
+    Ok(SchedulerHandle::start_all(config)?.remove(0))
 }
 
 /// A base64 PNG of `side` x `side` pixels of one color.
