@@ -113,11 +113,15 @@ impl Deployment {
             .iter()
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
-        let dies = dies.clone();
+        // A rung is a clip the **sampler** produces, so it is checked against the timeline rule and
+        // not the encoder's: the encoder accepts any frame count (a condition is cut and padded),
+        // which is why a list of stage lengths read as a clip ladder passed this check for days.
         for rung in &rungs {
-            if let Err(error) = dies.clip.latent_frames(*rung) {
+            if let Err(error) = crate::packing::video_latent_frames(*rung) {
                 return Err(Error::config(format!(
-                    "a {rung}-frame clip is not one the encoder accepts: {error}"
+                    "a {rung}-frame clip is not one this model generates: {error}. A count the \
+                     encoder accepts but a generation cannot is a condition's length, which belongs \
+                     with the rasters rather than with the clips a delivery drives"
                 )));
             }
         }
@@ -141,7 +145,10 @@ impl Deployment {
         let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
         while frames <= MAX_FRAMES {
             rungs.push(frames);
-            frames += crate::CLIP_LATENTS;
+            // The step is the **clip**, not the window: `17n + 5` moves a whole 17-frame clip per
+            // rung, and stepping by `CLIP_LATENTS` printed 22, 27, 32 - a rule no request obeys,
+            // whose size (198) is not the 59 the rule has.
+            frames += crate::CLIP_FRAMES;
         }
         rungs
     }
