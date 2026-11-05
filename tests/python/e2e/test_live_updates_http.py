@@ -577,8 +577,22 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
     try:
         # The engine writes `WARNING` and `ERROR`; a process that dies writes
         # neither, so a panic and the daemon's own account of the loss are
-        # matched by their text as well.
-        marks = (" WARN", " ERROR", "panicked", "the engine was lost")
+        # matched by their text as well. The handover's own steps are `INFO`
+        # and are the only record of how far it got, so the ones that decide
+        # whether the successor ever became a front are named here: a run that
+        # fails at the handover without them says nothing about which step.
+        marks = (
+            " WARN",
+            " ERROR",
+            "panicked",
+            "the engine was lost",
+            "a daemon attached",
+            "attaching a daemon failed",
+            "a request was taken over",
+            "the successor took the responses in flight over",
+            "the service goes on from the previous daemon",
+            "the responses in flight are paused",
+        )
         trouble = []
         for line in _log_lines(log):
             if any(mark in line for mark in marks):

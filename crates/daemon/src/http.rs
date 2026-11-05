@@ -222,6 +222,7 @@ pub(crate) async fn serve_leader(
         accepting.clone(),
     )?);
     let handed_over = Arc::clone(&restarter.handed_over);
+    let mut decided = restarter.decide();
     serve_on(
         &engine,
         &admin,
@@ -233,6 +234,22 @@ pub(crate) async fn serve_leader(
         Some(restarter),
     )
     .await?;
+    // A restart in flight speaks for the deployment. Exiting here would close the handoff
+    // channel under the successor while it is still adopting the engines, and the successor
+    // would report that close as its own failure (`bdf651928`).
+    if decided.borrow().is_none() {
+        let waited = tokio::time::timeout(
+            crate::restart::RESTART_GRACE,
+            decided.wait_for(Option::is_some),
+        )
+        .await;
+        if waited.is_err() {
+            tracing::warn!(
+                "a restart was still in flight when this daemon stopped serving; its successor \
+                 may have been left holding a handoff nobody answers"
+            );
+        }
+    }
     Ok(handed_over.load(Ordering::Acquire))
 }
 
