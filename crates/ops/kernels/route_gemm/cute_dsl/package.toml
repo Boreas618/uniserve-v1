@@ -37,4 +37,7 @@ dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536",
 # rows are runtime sizes, and the kernel's grids derive from the tile count.
 permuted_rows = 32768
 expanded_rows = 32768
-max_active_clusters = 1
+# The persistent grid's bound, one cluster per multiprocessor. It is the largest multiprocessor
+# count of the parts this architecture serves, GB200's 152: a smaller bound leaves multiprocessors
+# idle, and on a part with fewer the CTAs past its count start as the first ones exit.
+max_active_clusters = 152

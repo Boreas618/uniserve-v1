@@ -163,8 +163,8 @@ pub struct CacheDescription {
 
 impl CacheDescription {
     /// The pool one group of `layers` dense layers describes: one column holding
-    /// `layers` rows of `kv_heads x head_dim` of `dtype`, no scales, no state
-    /// fields and no checkpoints.
+    /// `layers` rows of `kv_heads x head_dim` of `dtype`, a scale per cell when
+    /// `dtype` is a quantized one, no state fields and no checkpoints.
     ///
     /// A caller that has no model geometry yet - the mount's capacity path - gets
     /// the smallest honest pool from it instead of inventing fields.
@@ -190,11 +190,15 @@ impl CacheDescription {
         // flag bytes are per column too (`2 * columns`), because each field's
         // flag plane has one byte per cell.
         let columns = layers.max(1);
-        let per_column = 2 * plane_bytes + 2;
+        // A quantized page reads through one f32 scale per cell and field, and a
+        // cell is one unit of one column, so the scale bytes grow as the flags do.
+        let quantized = matches!(dtype, PrefixCacheDtype::Float8E4m3Fn);
+        let scale_bytes = if quantized { 2 * 4 } else { 0 };
+        let per_column = 2 * plane_bytes + 2 + scale_bytes;
         Self {
             columns,
             plane_bytes,
-            quantized: false,
+            quantized,
             // The initialized flags live here and nowhere else: `fit_cache`'s
             // `unit_overhead` is the unit index columns, a different cost.
             unit_bytes: u64::from(columns) * per_column,
