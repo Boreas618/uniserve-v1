@@ -2999,6 +2999,32 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let inside = |address: u64| inside_bytes(address, width);
         let mut out = String::from(" probes:");
 
+        // The span the launch reads, as the columns hold it *now*: `cum_seq_lens_q` names where each
+        // row's queries start and end, and `seq_lens` how many keys that row may read. A bound baked
+        // at capture and a span uploaded per batch disagree exactly when these numbers and the
+        // launch's own `max_q`/`sum_q` disagree, and every row after the batch's own comes from that.
+        let spelled = |raw: &[u8]| {
+            let values: Vec<String> = raw
+                .chunks_exact(4)
+                .map(|word| i32::from_ne_bytes(word.try_into().unwrap_or([0; 4])).to_string())
+                .collect();
+            if values.len() > 8 {
+                format!("{},+{}", values[..8].join(","), values.len() - 8)
+            } else {
+                values.join(",")
+            }
+        };
+        for (name, address, count) in [
+            ("cum_q", self.columns.query_offsets.device.ptr.address(), live + 1),
+            ("seq_lens", self.columns.seq_lens.device.ptr.address(), live),
+        ] {
+            let bytes = count.saturating_mul(4).min(4096);
+            match self.read_device(address, bytes) {
+                Some(raw) => out.push_str(&format!(" {name}[{}]", spelled(&raw))),
+                None => out.push_str(&format!(" {name}=unreadable")),
+            }
+        }
+
         // Attention outputs, by layer: the one tensor this runner can name without a layout guess,
         // because the node's own argument is the struct that holds the pointer.
         let mut layer = 0_usize;
