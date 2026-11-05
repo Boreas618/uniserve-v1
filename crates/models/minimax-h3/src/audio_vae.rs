@@ -1179,10 +1179,17 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
+        // A stage's residual is one addition over the stage's whole value, and the addition's key is
+        // the **last axis**: the flattening flattens the channels, so the column count is the stage's
+        // length and not `channels · length`. Each stage multiplies the length by its rate, so the seven
+        // rows are the seven lengths of a bucket.
         for bucket in buckets {
+            let mut length = u64::from(*bucket);
             for stage in &stages {
-                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+                length = length
+                    .checked_mul(u64::from(stage.rate))
+                    .ok_or_else(|| Error::config("the audio track's length overflows".to_owned()))?;
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, length)?);
             }
         }
         Ok(programs.finish())

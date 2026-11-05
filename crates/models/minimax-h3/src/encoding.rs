@@ -1845,12 +1845,14 @@ impl AudioEncoder {
             dtype,
         ));
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);
+        // The projection's attention is **causal** over the frames, as the load builds it and as its
+        // forward says in its own comment: stating it dense here named a mask the layer never runs.
         let attention = Attention::dense(
             head_dim,
             config.num_attention_heads,
             config.num_attention_heads,
             LONGEST_TRACK,
-            false,
+            true,
             None,
             1.0 / (head_dim as f32).sqrt(),
         )?;
@@ -1883,10 +1885,31 @@ impl AudioEncoder {
         )?);
 
         // Each residual unit's output is one addition over the whole unit, so its width is the inner
-        // channel count times the track's samples.
+        // channel count times the track's samples **as the network takes them**: a track that is not a
+        // whole number of latent frames is right-padded to one (`padded_samples`, the reference's
+        // `unpack_samples`), so the walk states the padded width the launch uses rather than the
+        // deployment's unpadded length, which no launch ever sees.
+        let hop: u64 = config
+            .encoder_rates
+            .iter()
+            .map(|rate| u64::from(*rate))
+            .product();
+        // The residual additions, one per extent the network adds over. The key is the **last axis**:
+        // a unit's residual is over `[channels, extent]`, so the column count is the extent at that
+        // stage - the padded track divided by the rates up to it - and not the track's length; the
+        // projection's own residual is over `[frames, channels]` and is `channels` wide. A row keyed by
+        // the track length alone names a width the first stage has, and it is the only one it names.
         for samples in samples {
-            for inner in &widths {
-                let columns = u64::from(*inner) * u64::from(*samples);
+            let padded = padded_samples(u64::from(*samples), hop)?;
+            let mut extent = padded;
+            for rate in &config.encoder_rates {
+                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, extent) {
+                    programs.launch::<ScaledAddOp>(&descriptor);
+                }
+                extent = (extent / u64::from(*rate)).max(1);
+            }
+            // The projection's residual over the latent rows.
+            for columns in [u64::from(channels), extent] {
                 if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
                     programs.launch::<ScaledAddOp>(&descriptor);
                 }
@@ -2837,7 +2860,7 @@ mod tests {
             .collect();
         assert_eq!(
             attention,
-            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"],
+            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_causal_window_false_cu_seq_lens_false"],
             "{programs:?}"
         );
 
