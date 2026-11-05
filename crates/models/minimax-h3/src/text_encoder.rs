@@ -1730,6 +1730,7 @@ fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Res
             nn::DType::F32,
             Shape::new(&[frequencies.len() as u64]),
             &bytes,
+            "minimax-h3",
         )
         .map_err(Error::from)
 }

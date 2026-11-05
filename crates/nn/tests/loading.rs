@@ -239,6 +239,71 @@ fn fused_parts_are_joined_in_the_order_the_operator_reads() {
     assert!(store.published[0].0.to_string().contains("up+gate"));
 }
 
+/// A computed weight is named by what computed it, not by the label its model chose.
+///
+/// Two deployments that both call their fused output heads
+/// `denoiser.video.student_heads.weight` and compute different numbers are two weights. The label
+/// and the extent are identical, so a key holding only those makes the second deployment map the
+/// first one's bytes - which is the silent cross-deployment corruption this test exists against.
+#[test]
+fn a_computed_weight_is_named_by_its_provenance_and_not_by_its_label_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[("weight", vec![1], bf16(&[1.0]))],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let shape = Shape::new(&[2]);
+    let name = "denoiser.video.student_heads.weight";
+    let base: Vec<u8> = [0.5_f32, 0.25]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let reference: Vec<u8> = [1.0_f32, 2.0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+
+    let first = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .constant(name, DType::F32, shape, &base, "transformer")
+            .unwrap()
+    };
+    let second = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .constant(name, DType::F32, shape, &reference, "transformer_ref")
+            .unwrap()
+    };
+    assert_ne!(
+        store.published[0].0, store.published[1].0,
+        "two producers computing different tables under one label are two keys"
+    );
+    assert_ne!(store.published[0].1, store.published[1].1);
+    assert_ne!(first.view().ptr, second.view().ptr);
+    assert!(store.published[0].0.to_string().contains("computed:"));
+
+    // The same numbers by the same class are one weight: a restart after a key change maps what
+    // the first load published instead of computing it again.
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    loader
+        .constant(name, DType::F32, shape, &base, "transformer")
+        .unwrap();
+    assert_eq!(store.published.len(), 2);
+
+    // The same numbers by another class are another weight: the producer is part of the
+    // provenance even when the bytes agree, because nothing else states which interpretation the
+    // table belongs to.
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    loader
+        .constant(name, DType::F32, shape, &base, "transformer_ref")
+        .unwrap();
+    assert_eq!(store.published.len(), 3);
+}
+
 #[test]
 fn a_layout_a_single_region_cannot_produce_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -274,13 +339,25 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
     let first = {
         let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
         loader
-            .constant("rotary.inv_freq", DType::F32, Shape::new(&[2]), &table)
+            .constant(
+                "rotary.inv_freq",
+                DType::F32,
+                Shape::new(&[2]),
+                &table,
+                "test",
+            )
             .unwrap()
     };
     let second = {
         let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
         loader
-            .constant("rotary.inv_freq", DType::F32, Shape::new(&[2]), &table)
+            .constant(
+                "rotary.inv_freq",
+                DType::F32,
+                Shape::new(&[2]),
+                &table,
+                "test",
+            )
             .unwrap()
     };
     assert_eq!(store.published.len(), 1);
@@ -290,7 +367,13 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
     // The same bytes under another name are another constant.
     let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
     loader
-        .constant("other.inv_freq", DType::F32, Shape::new(&[2]), &table)
+        .constant(
+            "other.inv_freq",
+            DType::F32,
+            Shape::new(&[2]),
+            &table,
+            "test",
+        )
         .unwrap();
     assert_eq!(store.published.len(), 2);
 
@@ -298,7 +381,13 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
     let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
     assert!(
         loader
-            .constant("short.inv_freq", DType::F32, Shape::new(&[2]), &table[..4])
+            .constant(
+                "short.inv_freq",
+                DType::F32,
+                Shape::new(&[2]),
+                &table[..4],
+                "test"
+            )
             .is_err()
     );
     assert_eq!(store.published.len(), 2);
@@ -1206,6 +1295,7 @@ fn a_host_store_retains_weights_and_answers_the_first_region() {
             shape: Shape::new(&[4, 32]),
             stride: None,
         },
+        provenance: None,
     };
     let bytes: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
     let first = store
