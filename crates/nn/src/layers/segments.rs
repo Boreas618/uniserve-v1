@@ -135,12 +135,16 @@ impl VsaTiles {
         self.width
     }
 
-    /// The descriptor one launch of each of this layer's five programs takes.
+    /// The descriptor this layer's `vsa_prepare_tiles` launch takes.
     ///
-    /// Five, not one: the chain's five launches are five different operators (`vsa_prepare_tiles`,
-    /// `vsa_zero_padding`, `vsa_add_gated_tiles`, `vsa_compose_gated_rows`, `vsa_select_tiles`), so a
-    /// walk that asks which programs a model launches needs each by its own name and with the
-    /// geometry that launch reads.
+    /// Each program needs its own accessor rather than one shared descriptor, because they are
+    /// different operators with different geometry: `vsa_prepare_tiles`, `vsa_zero_padding`,
+    /// `vsa_scores`, `vsa_select_tiles`, `vsa_compress_pooled` and `vsa_add_gated_tiles` are the six
+    /// this chain launches, and `vsa_compose_gated_rows` is declared and reached by no launch here.
+    ///
+    /// The prepare launch is the one whose descriptor reads **strides**, so a walk without a device
+    /// can state it only for the layout the model's buffers have: `query_row_stride` and
+    /// `query_head_stride` are the caller's views, not the layer's geometry.
     pub fn prepare_tiles_descriptor(
         &self,
         query: TensorView,
