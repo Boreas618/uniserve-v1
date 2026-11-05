@@ -856,9 +856,9 @@ impl VideoDecoder {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 k,
                 dtype,
+                dtype,
                 WeightOrder::NxK,
                 bias,
-                dtype,
                 dtype,
             ));
         }
