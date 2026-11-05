@@ -2076,7 +2076,7 @@ impl MainProcess {
                 continue;
             };
             return Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend: backend.clone(),
                     revision: *revision,
@@ -2093,7 +2093,7 @@ impl MainProcess {
         // holds, which reads as a store defect and is not one.
         match declared_program(&self.listing()?.packages, operator) {
             Some((op, backend, revision)) => Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend,
                     revision,
@@ -2189,6 +2189,17 @@ impl MainProcess {
                 keys = declared;
             }
             keys.append(&mut known);
+            // A slot of a divided operator holds its own package's descriptors alone: a generation
+            // that launched the operator states all of them.
+            if slot.part.is_some() {
+                if listing.is_none() {
+                    listing = Some(self.listing().map_err(invalid)?);
+                }
+                if let Some(store) = listing.as_ref() {
+                    let built = built_keys(store, &slot.op, program, &self.targets);
+                    keys.retain(|key| built.contains(key));
+                }
+            }
             keys.sort_unstable();
             keys.dedup();
             let group = groups
@@ -3623,6 +3634,7 @@ impl MainProcess {
             self.serving = true;
             return Ok(());
         };
+        let bound = self.watchdog.stall_bound();
         for (scheduler, cache) in self.schedulers.iter().zip(parked) {
             // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
             // from a predecessor: it is the same world, and the requests it ended at the drain are
@@ -3630,6 +3642,13 @@ impl MainProcess {
             scheduler
                 .promote(cache, true, false)
                 .context("resuming a scheduler")?;
+            // The promotion states the cache; it is the resume that ends the park. A scheduler left
+            // parked takes requests into its queue and admits none of them.
+            match scheduler.resume(true).recv_timeout(bound) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => bail!("resuming a scheduler: {reason}"),
+                Err(error) => bail!("resuming a scheduler: no answer within {bound:?}: {error}"),
+            }
         }
         self.serving = true;
         Ok(())
@@ -6638,12 +6657,30 @@ fn operator_slots(
     let slot = |phase: Option<PhaseKind>| ProgramSlot {
         op: op.to_owned(),
         phase,
+        part: None,
     };
     let (claims, refusal) = split_claims(holders);
     if refusal.is_none() && claims.len() > 1 {
         return claims
             .into_iter()
             .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
+            .collect();
+    }
+    // Packages whose built keys share none divide the operator by descriptor - a bf16 module and an
+    // f32 one, whose keys state no phase - so each holds a slot of its own: one program would serve
+    // its own keys and refuse the other's at the first capture that launches them.
+    if divides_descriptors(holders) {
+        return holders
+            .iter()
+            .map(|(program, _)| {
+                (
+                    ProgramSlot {
+                        part: Some(program.backend.clone()),
+                        ..slot(None)
+                    },
+                    program.clone(),
+                )
+            })
             .collect();
     }
     // The fallback is right - a wrong split would have a package asked for a key it cannot build -
@@ -6667,6 +6704,19 @@ fn operator_slots(
         Some(program) => vec![(slot(None), program.clone())],
         None => Vec::new(),
     }
+}
+
+/// Whether every package built keys of its own, none of them shared: then each one's descriptors are
+/// its alone, and the generation needs them all.
+fn divides_descriptors(holders: &[(Program, Vec<String>)]) -> bool {
+    if holders.len() < 2 || holders.iter().any(|(_, keys)| keys.is_empty()) {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    holders
+        .iter()
+        .flat_map(|(_, keys)| keys)
+        .all(|key| seen.insert(key))
 }
 
 /// The phases an operator's packages claim, and - when they cannot be split across them - why.
@@ -6816,6 +6866,7 @@ fn resolve_slots(
                     ProgramSlot {
                         op: op.clone(),
                         phase: *phase,
+                        part: None,
                     },
                     program.clone(),
                 );
@@ -7192,6 +7243,7 @@ mod tests {
             program_server::program::ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7214,6 +7266,7 @@ mod tests {
         let slot = |op: &str| program_server::program::ProgramSlot {
             op: op.to_owned(),
             phase: None,
+            part: None,
         };
         let program = |backend: &str, revision: u32| Program {
             backend: backend.to_owned(),
@@ -7468,6 +7521,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -7506,6 +7560,7 @@ mod tests {
                 .get(&ProgramSlot {
                     op: "paged_attention".to_owned(),
                     phase: Some(PhaseKind::Prefill),
+                    part: None,
                 })
                 .map(|program| program.backend.as_str()),
             Some("fa4"),
@@ -7514,6 +7569,7 @@ mod tests {
         let decode_slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: Some(PhaseKind::Decode),
+            part: None,
         };
         let Some(decode_program) = programs.get(&decode_slot).cloned() else {
             panic!("the decode phase bound no program");
@@ -7541,6 +7597,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7574,6 +7631,7 @@ mod tests {
         let slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: None,
+            part: None,
         };
         assert_eq!(
             programs.get(&slot).map(|program| program.backend.as_str()),
@@ -7677,6 +7735,7 @@ mod tests {
         let slot = |phase: Option<PhaseKind>| ProgramSlot {
             op: "paged_attention".to_owned(),
             phase,
+            part: None,
         };
         // What serves: one package filling both phases.
         let mut serving = Programs::new();
@@ -7711,6 +7770,7 @@ mod tests {
         let slot = |op: &str, phase: Option<PhaseKind>| ProgramSlot {
             op: op.to_owned(),
             phase,
+            part: None,
         };
 
         let mut group: (Vec<ProgramRequest>, Vec<Descriptors>) = (Vec::new(), Vec::new());
@@ -8020,6 +8080,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -8083,6 +8144,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
