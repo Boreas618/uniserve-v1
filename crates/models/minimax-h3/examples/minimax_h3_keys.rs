@@ -101,11 +101,7 @@ use nn::layers::tiles::{
 use ops::DType;
 use ops::modulation::ModulatedRmsNormDescriptor;
 use ops::noise::NoiseDescriptor;
-use ops::residual::{ScaledResidualDescriptor, WeightedRmsNormDescriptor};
-
-/// Samples one `audio_resample` program produces: the package's `block` dimension, which the
-/// reference's resampler takes as its hop (`crates/ops/kernels/audio_resample/*/package.toml`).
-const RESAMPLE_BLOCK: u32 = 256;
+use ops::residual::ScaledResidualDescriptor;
 
 /// The audio VAE decoder's initial width (`decoder_dim`).
 const DECODER_DIM: u32 = 1024;
@@ -524,24 +520,11 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         lines.push((operator.to_owned(), descriptor));
     };
 
-    // ---- Audio: the BigVGAN decoder's activations, at every width the seven stages produce.
+    // ---- Audio: the BigVGAN decoder's activations.
     //
-    // `snake_beta` is the decoder's: `MiniMaxH3AudioAMPBlock` and `activation_post` wrap
-    // `MiniMaxH3AudioSnakeBeta` (`autoencoder_kl_minimax_h3_audio.py:412`, `:470`), whose two
-    // parameters are log-space.
-    for stage in 0..DECODER_RATES.len() as u32 {
-        let channels = DECODER_DIM >> (stage + 1);
-        push(
-            "snake_beta",
-            ops::snake_beta::Descriptor {
-                dtype: DType::F32,
-                channels,
-                block: ELEMENTWISE_BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-    }
+    // `snake_beta` is **not** stated: this model's decoder runs the fused `audio_activation` for the
+    // same seven widths (its `act_and_mul` row), and nothing in the crate constructs a
+    // `snake_beta` descriptor - a row for it compiles a program no launch asks for.
 
     // `snake` is the encoder's: one linear parameter, used by the DAC residual units and encoder
     // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). **A stage runs its
@@ -574,31 +557,11 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         .to_string(),
     );
 
-    // The decoder's upsamplers are the reference's `Activation1d`: a replicate pad, a transposed
-    // convolution of stride 2, a `SnakeBeta`, then a low-pass of the same ratio — which is our
-    // `audio_resample` in both directions at the same width, ratio 2 and a 12-tap filter.
-    for stage in 0..DECODER_RATES.len() as u32 {
-        let channels = DECODER_DIM >> (stage + 1);
-        for mode in [
-            ops::audio_resample::Mode::Upsample,
-            ops::audio_resample::Mode::Downsample,
-        ] {
-            push(
-                "audio_resample",
-                ops::audio_resample::Descriptor {
-                    mode,
-                    dtype: DType::F32,
-                    channels,
-                    kernel: ACTIVATION_KERNEL,
-                    ratio: ACTIVATION_RATIO,
-                    block: RESAMPLE_BLOCK,
-                    pdl: PDL,
-                }
-                .to_string(),
-            );
-        }
-    }
-
+    // The decoder's upsamplers are the reference's `Activation1d` - a replicate pad, a transposed
+    // convolution of stride 2, a low-pass of the same ratio - and **this model states them as those
+    // three launches** (`conv_transpose1d`, `frame_pad`, `conv1d`), not as `audio_resample`: the
+    // operator exists in `ops` and nothing in the crate constructs its descriptor, so a row for it
+    // compiles a program no launch asks for.
     // ---- Media: the two programs whose variants do not depend on a resolution.
     //
     // Padding is not one of them: the video VAE's replicate and reflect pads are `frame_pad`'s
@@ -606,17 +569,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `audio_resample` and its convolutions. A general ATen `F.pad(mode="replicate")` over trailing
     // axes has no caller in the reference, so it is not declared.
     //
-    // The video path's antialiased downscale of a packed uint8 frame, three colour channels.
-    push(
-        "antialiased_resize_uint8",
-        ops::resize::Descriptor {
-            mode: ops::resize::Mode::Bicubic,
-            channels: 3,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The video path's antialiased downscale is **not** stated: no caller constructs
+    // `ops::resize`'s descriptor, and the postprocessor's resize is `position_interpolate` plus the
+    // packed `rgb_bytes` packing. A row here would compile a program no launch asks for.
 
     // ---- The DiT's projections: one key per distinct contraction length.
     //
@@ -887,16 +842,8 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    push(
-        "weighted_rms_norm",
-        WeightedRmsNormDescriptor {
-            dtype: deployment,
-            columns: HIDDEN,
-            tile: row_tile(HIDDEN),
-            absmax: false,
-        }
-        .to_string(),
-    );
+    // `weighted_rms_norm` is **not** stated: `nn` exports the layer and no model code constructs it -
+    // the DiT's norms are `modulated_rms_norm`, `rms_norm` and the plain final `RmsNorm` below.
     // The DiT's output norm, `norm_out.norm`, is a **plain** `RmsNorm` over the hidden state
     // (`transformer.rs`'s `load`, `RmsNorm::new(gain(...), eps)`) - the stack's own final
     // normalization, not the weighted one every block wears and not the modulated one it consumes.
@@ -1007,19 +954,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The register prefix and the zero tail around the caller's rows.
-    push(
-        "sequence_append",
-        ops::sequence_append::Descriptor {
-            dtype: deployment,
-            width: HIDDEN,
-            registers: 4,
-            tail: 12,
-            block: ops::sequence_append::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The register prefix and the zero tail are **not** `sequence_append`: the packed sequence is
+    // built by `rows` and `copy_block`, and nothing in the crate constructs `sequence_append`'s
+    // descriptor. A row for it compiles a program no launch asks for.
     // The seam between two decoded tiles - **every width the model can hand the operator**, on both
     // axes, because both are compiled loop bounds rather than launch values.
     //
