@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut track: Vec<u32> = Vec::new();
     // A sparse deployment's attention: the segment tile, the sparsity rate, and the tile bound the
     // selection's compression reduces over — a deployment fact, stated by whoever sizes the store.
-    let mut sparse: Option<(u32, f64, u32)> = None;
+    let mut sparse: Option<(u32, f64, u32, Option<f64>)> = None;
     // Whether the deployment serves conditioned tasks (`fl2va`/`ref2va`) or only `t2va`: it decides the
     // modulation cache's group count, which is a program's width.
     let mut conditioned: Option<bool> = None;
@@ -108,16 +108,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--sparse" => {
-                // `tile,sparsity,tiles`: the segment tile rows, the fraction of key tiles dropped,
-                // and the bound on the key tiles one compression reduces over.
+                // `tile,sparsity,tiles[,reference_keep]`: the segment tile rows, the fraction of key
+                // tiles dropped, the bound on the key tiles one compression reduces over, and — for a
+                // student with reference videos — the fraction of its own key tiles a reference query
+                // keeps. The three are the checkpoint's own contract (`fastvideo_inference.json`), and
+                // `Config` reads them there; this flag states them for a base release whose contract
+                // lives outside the tree the walk is given.
                 let parts: Vec<&str> = value.split(',').collect();
-                if parts.len() != 3 {
-                    return Err("--sparse is `tile,sparsity,tiles`".into());
+                if parts.len() != 3 && parts.len() != 4 {
+                    return Err("--sparse is `tile,sparsity,tiles[,reference_keep]`".into());
                 }
+                let reference_keep = match parts.get(3) {
+                    Some(keep) => Some(keep.trim().parse()?),
+                    None => None,
+                };
                 sparse = Some((
                     parts[0].trim().parse()?,
                     parts[1].trim().parse()?,
                     parts[2].trim().parse()?,
+                    reference_keep,
                 ));
             }
             "--track" => {
@@ -240,8 +249,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // program at the entries' width. The denoiser states its two stacks and the orchestration
         // around them, so the walk asks it rather than a stack.
         let (attention, tiles) = match sparse {
-            Some((tile, sparsity, tiles)) => (
-                AttentionKind::sparse(tile, sparsity, None)?,
+            Some((tile, sparsity, tiles, reference_keep)) => (
+                AttentionKind::sparse(tile, sparsity, reference_keep)?,
                 tiles,
             ),
             None => (AttentionKind::Dense, 0),
@@ -284,8 +293,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         packed.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
         elements.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
         track.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        sparse.map_or("-".to_owned(), |(tile, sparsity, tiles)| format!(
-            "{tile},{sparsity},{tiles}"
+        sparse.map_or("-".to_owned(), |(tile, sparsity, tiles, reference_keep)| format!(
+            "{tile},{sparsity},{tiles}{}",
+            reference_keep.map_or(String::new(), |keep| format!(",{keep}"))
         )),
     );
     for (operator, key) in &rows {
