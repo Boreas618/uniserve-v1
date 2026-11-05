@@ -31,7 +31,8 @@ fn usage() -> String {
     "schedule_dump [--root <checkpoint>] [--out <dir>] [--commit <revision>]\n\n\
      Writes `schedule-transformer.json` and `schedule-transformer_ref.json` under `--out`, each one\n\
      the sampled schedule of one DiT: its grid kind, its sigma ladder per modality and its step\n\
-     count. Compare two trees' dumps with `tools/compare_schedule.py --dump <dir>`.\n"
+     count. The next step is `tools/compare_schedule.py` on the directory this wrote; the flags are\n\
+     that tool's, not this one's.\n"
         .to_owned()
 }
 
