@@ -102,17 +102,16 @@ impl HfSpecialTokens {
 ///
 /// This is the raw view of the file `ResolvedModelFiles::config_path` selects,
 /// distinct from the resolved `crate::model::ModelConfig`. Composite
-/// checkpoints nest their language model under `llm_config` (the SenseNova
-/// and Bagel layouts) or `text_config` (DiffusionGemma); the root
-/// `model_type` still identifies the family.
+/// checkpoints may nest their language model under `llm_config` or
+/// `text_config`; the root `model_type` still identifies the family.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
     model_type: Option<String>,
     max_position_embeddings: Option<u32>,
-    /// Nested language-model section of a SenseNova or Bagel checkpoint.
+    /// Nested language-model section a composite checkpoint may carry.
     llm_config: Option<Box<ModelConfig>>,
-    /// Nested language-model section of a DiffusionGemma checkpoint.
+    /// Nested language-model section a composite checkpoint may carry.
     text_config: Option<Box<ModelConfig>>,
 }
 
@@ -134,10 +133,6 @@ pub struct GenerationConfig {
     pub repetition_penalty: Option<f32>,
     /// Default maximum number of generated tokens.
     pub max_new_tokens: Option<u32>,
-    /// The block-diffusion sampler defaults, which only a block-diffusion
-    /// checkpoint states.
-    #[serde(flatten)]
-    pub denoising: models::diffusion_gemma::GenerationDefaults,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,9 +233,8 @@ where
 mod tests {
     use super::ModelConfig;
 
-    /// A flat Qwen3 layout and the nested SenseNova, Bagel, and DiffusionGemma
-    /// layouts: the family comes from the root `model_type` and the context
-    /// limit from the language-model section.
+    /// A flat layout and a nested one: the family comes from the root
+    /// `model_type` and the context limit from the language-model section.
     #[test]
     fn configured_model_layouts_expose_context_limits() {
         for (source, model_type, max_tokens) in [
@@ -250,18 +244,11 @@ mod tests {
                 40960,
             ),
             (
-                r#"{"model_type":"neo_chat","llm_config":{"model_type":"qwen3","num_attention_heads":32,"max_position_embeddings":262144}}"#,
-                "neo_chat",
-                262144,
-            ),
-            (
-                r#"{"model_type":"bagel","llm_config":{"model_type":"qwen2","num_attention_heads":28,"max_position_embeddings":32768}}"#,
-                "bagel",
-                32768,
-            ),
-            (
-                r#"{"model_type":"diffusion_gemma","canvas_length":256,"text_config":{"model_type":"diffusion_gemma_text","max_position_embeddings":262144}}"#,
-                "diffusion_gemma",
+                // A checkpoint may nest its language model; the root model
+                // type names the checkpoint and the nested section states the
+                // context limit.
+                r#"{"model_type":"nested_example","llm_config":{"model_type":"qwen3","num_attention_heads":32,"max_position_embeddings":262144}}"#,
+                "nested_example",
                 262144,
             ),
         ] {
