@@ -1403,8 +1403,8 @@ def _restart_while_streaming(
             f"stream errors: {[repr(one) for one in errors]})"
         ) from error
     restarted = _admin(base_url, "restart")
-    # A refusal here is the successor's own answer, and the reason it gives names
-    # the step that stopped; the daemons' log says what happened to the processes
+    # A refusal here is the successor's own answer, and its reason names the
+    # step that stopped; the daemons' log says what happened to the processes
     # the handover was carrying, which the answer cannot.
     assert restarted.status_code == 200, f"{restarted.text}{_log_trouble(log)}"
     successor = restarted.json()["result"]["pid"]
@@ -1424,8 +1424,17 @@ def _restart_while_streaming(
 
     # New requests are served while the old daemon finishes its streams.
     for _ in range(3):
-        reply = _chat(base_url, name, "Say hello.")
-        assert reply["choices"][0]["message"]["content"]
+        try:
+            reply = _chat(base_url, name, "Say hello.")
+        except Exception as error:  # noqa: BLE001 - the successor's answer, whole, with the log
+            raise AssertionError(
+                f"a new request after the restart failed: {error!r}"
+                f"{_log_trouble(log)}"
+            ) from error
+        assert reply["choices"][0]["message"]["content"], (
+            f"a new request after the restart answered an empty completion: "
+            f"{reply}{_log_trouble(log)}"
+        )
     for thread in streaming:
         thread.join(timeout=1800)
     assert all(done.is_set() for done in dones), "a stream did not end"
@@ -1639,8 +1648,8 @@ def _restart_with_a_json_body(
         "the one-body request was never served",
     )
     restarted = _admin(base_url, "restart")
-    # A refusal here is the successor's own answer, and the reason it gives names
-    # the step that stopped; the daemons' log says what happened to the processes
+    # A refusal here is the successor's own answer, and its reason names the
+    # step that stopped; the daemons' log says what happened to the processes
     # the handover was carrying, which the answer cannot.
     assert restarted.status_code == 200, f"{restarted.text}{_log_trouble(log)}"
     successor = restarted.json()["result"]["pid"]
