@@ -32,12 +32,16 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import json
 import pathlib
 import re
 import sys
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+#: The compile driver every package imports; a key is parsed by the package's own copy.
+_COMPILE = "_compile"
 KERNELS = ROOT / "crates/ops/kernels"
 OPS = ROOT / "crates/ops/src"
 
@@ -286,6 +290,121 @@ def read_shape(spec, fields, declared, target, op, backend, gaps):
         return None
 
 
+def sweep(
+    fixture: pathlib.Path, store: pathlib.Path, target: str
+) -> tuple[list[str], list[str]]:
+    """Compare every built cell's recorded signature with the package that wrote it, in order.
+
+    This is `ops::Kernel::check`'s comparison made **before a launch exists**: the cell's
+    `metadata.json` is what `check` holds the packed words to, and the package's own `spec()` is what
+    the compile script handed Triton. Both are keyed by one descriptor, so the comparison is made for
+    **the phase the key names** rather than for the union of an operator's arms - which is the one
+    thing a source-level reader gets wrong (`paged_attention` packs two phases' lists from one table).
+    Each position is compared by name, so a disagreement says which word is where.
+    """
+    problems: list[str] = []
+    gaps: list[str] = []
+    cells = 0
+    for line in fixture.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        row = line.split("\t")
+        op, descriptor = row[0], row[1]
+        backend = row[2] if len(row) > 2 else "triton"
+        package = KERNELS / op / backend
+        build = package / "src/build.py"
+        cell = store / op / backend
+        recorded = sorted(cell.glob(f"*/{target}/{descriptor}/metadata.json"))
+        if not recorded:
+            # A native package records no Triton metadata: its parameters are its entry's C
+            # declaration and `launch.json` names that entry. That is a different statement rather
+            # than a missing one, and it is reported as such.
+            if sorted(cell.glob(f"*/{target}/{descriptor}/launch.json")):
+                gaps.append(
+                    f"{op}/{backend} {descriptor}: a native cell, whose parameters are its "
+                    f"entry's C declaration rather than a recorded signature"
+                )
+            else:
+                gaps.append(f"{op} {descriptor}: no built cell under {store}")
+            continue
+        cells += 1
+        if not build.exists():
+            gaps.append(
+                f"{op}/{backend}: a built cell with no package under crates/ops/kernels"
+            )
+            continue
+        try:
+            spec = load_spec(build)
+            manifest = tomllib.loads((package / "package.toml").read_text())
+            compile_mod = spec.__globals__[_COMPILE]
+        except Exception as error:  # noqa: BLE001
+            gaps.append(
+                f"{op}/{backend}: the package could not be read ({error})"
+            )
+            continue
+        declared = manifest["kernel"]["descriptors"]
+        declared = declared if isinstance(declared, list) else [declared]
+        fields = None
+        for shape in declared:
+            try:
+                fields = compile_mod.parse_key(
+                    descriptor, shape.get("dimensions", {})
+                )
+                break
+            except BaseException:  # noqa: BLE001 - a shape that does not parse this key
+                continue
+        if fields is None:
+            gaps.append(
+                f"{op}/{backend} {descriptor}: no declared shape parses this key"
+            )
+            continue
+        parameters_of, first_target = parameters(package)
+        try:
+            stated = spec(fields, parameters_of, target)
+        except BaseException as error:  # noqa: BLE001
+            gaps.append(
+                f"{op}/{backend} {descriptor}: `spec` refused it ({error})"
+            )
+            continue
+        constexprs = set(stated.get("constexprs") or {})
+        expected = [
+            (name, kind)
+            for name, kind in (stated.get("signature") or {}).items()
+            if kind != "constexpr" and name not in constexprs
+        ]
+        module = json.loads(recorded[0].read_text()).get("signature") or {}
+        actual = list(module.items())
+        if len(actual) != len(expected):
+            problems.append(
+                f"{op}/{backend} {descriptor}: the module records {len(actual)} parameter(s) "
+                f"{[name for name, _ in actual]} and the package states {len(expected)} "
+                f"{[name for name, _ in expected]}"
+            )
+            continue
+        for position, (
+            (packed_name, packed_ty),
+            (kernel_name, kernel_ty),
+        ) in enumerate(zip(actual, expected)):
+            if packed_name != kernel_name:
+                problems.append(
+                    f"{op}/{backend} {descriptor}: position {position}: the kernel reads "
+                    f"`{kernel_name}`, the package states `{packed_name}`"
+                )
+                break
+            if packed_ty != kernel_ty:
+                problems.append(
+                    f"{op}/{backend} {descriptor}: position {position}: `{kernel_name}` is "
+                    f"`{kernel_ty}` in the kernel and `{packed_ty}` in the module"
+                )
+                break
+    if cells:
+        print(
+            f"{cells} cell(s) compared in order against the packages that wrote them",
+            file=sys.stderr,
+        )
+    return problems, gaps
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -297,7 +416,37 @@ def main() -> int:
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="print the three lists"
     )
+    parser.add_argument(
+        "--fixture",
+        help="a key fixture: each row is `op<TAB>descriptor[<TAB>backend]`",
+    )
+    parser.add_argument(
+        "--store", help="the built store whose cells --fixture is compared to"
+    )
+    parser.add_argument(
+        "--target",
+        default="sm_100a",
+        help="the architecture the store was built for",
+    )
     arguments = parser.parse_args()
+
+    if arguments.fixture:
+        if not arguments.store:
+            print(
+                "--fixture needs --store: the cells are what the comparison reads"
+            )
+            return 2
+        problems, gaps = sweep(
+            pathlib.Path(arguments.fixture),
+            pathlib.Path(arguments.store),
+            arguments.target,
+        )
+        print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
+        for problem in problems:
+            print(f"  problem: {problem}")
+        for gap in gaps:
+            print(f"  gap:     {gap}")
+        return 1 if (arguments.check and problems) else 0
 
     operators = arguments.operator or sorted(
         p.name for p in KERNELS.iterdir() if p.is_dir()
