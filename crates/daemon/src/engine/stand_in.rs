@@ -39,6 +39,10 @@ pub(crate) enum Answer {
 pub(crate) struct PrecopyPayload {
     /// The operators the command carried.
     pub(crate) kernels: usize,
+    /// The revision each operator's program stated, by operator: a joining
+    /// process must receive the numbers the epoch installed, never the zero a
+    /// filled program carries before a Program Server selects one.
+    pub(crate) revisions: Vec<(String, u32)>,
     /// The scheduling program's backend.
     pub(crate) policy: String,
 }
@@ -84,6 +88,16 @@ pub(crate) fn main_processes_recording(
                         engine,
                         PrecopyPayload {
                             kernels: precopy.kernels.len(),
+                            revisions: precopy
+                                .kernels
+                                .iter()
+                                .map(|kernel| {
+                                    (
+                                        kernel.op.clone(),
+                                        kernel.program.as_ref().map_or(0, |p| p.revision),
+                                    )
+                                })
+                                .collect(),
                             policy: precopy
                                 .policy
                                 .as_ref()
