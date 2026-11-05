@@ -133,18 +133,7 @@ impl Op for FramePad {
                 ),
             ));
         }
-        let channels_last = args.out.strides
-            == Strides::new(&[
-                args.out.shape.dim(1)
-                    * args.out.shape.dim(2)
-                    * args.out.shape.dim(3)
-                    * args.out.shape.dim(4),
-                args.out.shape.dim(4),
-                args.out.shape.dim(1) * args.out.shape.dim(3) * args.out.shape.dim(4),
-                args.out.shape.dim(1) * args.out.shape.dim(4),
-                1,
-            ]);
-        if args.out.strides != Strides::row_major(args.out.shape) && !channels_last {
+        if args.out.strides != Strides::row_major(args.out.shape) && !is_channels_last(&args.out) {
             return Err(Error::argument(
                 Self::NAME,
                 "the output is neither contiguous nor channels-last".to_owned(),
@@ -278,6 +267,31 @@ pub const FRAME_REDUCTION_CLASS: u32 = 1 << 16;
 pub fn frame_reduction_class(channels_per_group: u64, pixels: u64) -> u32 {
     let reduction = channels_per_group.saturating_mul(pixels).max(1);
     reduction.next_power_of_two().min(u64::from(u32::MAX)) as u32
+}
+
+/// The strides of a `[batch, channels, frames, height, width]` frame stored channels-last.
+///
+/// The logical axes keep their meaning and the order lives in the strides: a pixel's channels are
+/// contiguous, so the channel axis' stride is 1 and a pixel is a channel count away from the next.
+pub fn channels_last_strides(shape: Shape) -> Strides {
+    let (channels, frames, height, width) =
+        (shape.dim(1), shape.dim(2), shape.dim(3), shape.dim(4));
+    Strides::new(&[
+        channels * frames * height * width,
+        1,
+        height * width * channels,
+        width * channels,
+        channels,
+    ])
+}
+
+/// Whether `out` is stored channels-last: exactly the channels-last order and not the contiguous
+/// one.
+///
+/// A frame whose channels are one wide has both orders as its strides, and it is contiguous: the
+/// compiled variant a launch selects must not depend on an axis that carries no order.
+pub fn is_channels_last(out: &TensorView) -> bool {
+    out.strides == channels_last_strides(out.shape) && out.strides != Strides::row_major(out.shape)
 }
 
 /// The element step between neighbouring pixels of one frame, in either layout a video tensor is
@@ -685,15 +699,12 @@ impl Op for FrameNormPad {
                 "the output's batch and channels differ from the source's".to_owned(),
             ));
         }
-        let channels_last = descriptor.channels_last;
+        // The compiled variant and the view must name the same storage order: the program's store
+        // path is chosen at compilation, so a view in the other order would be written through the
+        // wrong branch. A frame in neither packed order is refused, not walked.
+        let channels_last = is_channels_last(&args.out);
         let expected = if channels_last {
-            Strides::new(&[
-                channels * args.out.shape.dim(2) * args.out.shape.dim(3) * args.out.shape.dim(4),
-                args.out.shape.dim(4),
-                channels * args.out.shape.dim(3) * args.out.shape.dim(4),
-                channels * args.out.shape.dim(4),
-                1,
-            ])
+            channels_last_strides(args.out.shape)
         } else {
             Strides::row_major(args.out.shape)
         };
@@ -701,13 +712,27 @@ impl Op for FrameNormPad {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the descriptor compiles for {} output storage, the view is {:?}",
-                    if channels_last {
+                    "the output is neither contiguous nor channels-last: strides {:?} for {:?}",
+                    args.out.strides.as_slice(),
+                    args.out.shape.dims()
+                ),
+            ));
+        }
+        if descriptor.channels_last != channels_last {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the descriptor compiles for {} output storage, the view is {}",
+                    if descriptor.channels_last {
                         "channels-last"
                     } else {
                         "contiguous"
                     },
-                    args.out.strides.as_slice()
+                    if channels_last {
+                        "channels-last"
+                    } else {
+                        "contiguous"
+                    }
                 ),
             ));
         }
@@ -896,6 +921,21 @@ mod tests {
         let scrambled = view(&[1, 4, 3, 2, 5], &[120, 30, 10, 10, 2]);
         let error = pixel_stride(&scrambled).expect_err("neither layout must refuse");
         assert!(error.to_string().contains("neither layout"), "{error}");
+    }
+
+    #[test]
+    fn the_order_of_a_frame_is_read_off_its_strides() {
+        assert!(!is_channels_last(&channel_first()));
+        assert!(is_channels_last(&channels_last()));
+        // A frame one channel wide has both orders as its strides, so it must read as contiguous:
+        // a variant chosen by an axis that carries no order would key on nothing.
+        let single = view(&[1, 1, 3, 2, 5], &[30, 1, 10, 5, 1]);
+        assert_eq!(single.strides, Strides::row_major(single.shape));
+        assert!(!is_channels_last(&single));
+        assert_eq!(
+            channels_last_strides(single.shape),
+            Strides::row_major(single.shape)
+        );
     }
 
     #[test]
