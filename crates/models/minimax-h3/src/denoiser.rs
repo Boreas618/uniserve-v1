@@ -2081,18 +2081,18 @@ impl Denoiser {
         // conditioned deployment's conditioner hands it FP32. So a conditioned deployment states the
         // refiner at both, and a dense one at the stack's type alone - the recorder drove the forward
         // and read exactly that, in both deployments.
-        let refiner_types: &[nn::DType] = match groups {
-            Groups::Generated => &[dtype],
-            Groups::Conditioned => &[dtype, nn::DType::F32],
-        };
-        for refiner_type in refiner_types {
-            programs.extend(crate::conditioning::TokenRefiner::programs(
-                config,
-                dtype,
-                *refiner_type,
-                dtype,
-            )?);
-        }
+        // **One refiner, and it is not the deployment's type.** Its features are the prompt's (the
+        // deployment's), its blocks compute in FP32 (`Rows::reserve` allocates them at
+        // `block.dtype`), and its output is the deployment's. A per-group ladder of refiner types
+        // stated variants no forward instantiates: the recording shows one refiner, a block of
+        // `f32` over `bf16` features at 5376 columns.
+        let _ = groups;
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config,
+            dtype,
+            nn::DType::F32,
+            dtype,
+        )?);
 
         let video = config.video_channels;
 
