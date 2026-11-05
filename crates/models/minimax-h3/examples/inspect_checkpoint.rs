@@ -33,13 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match contract {
             None => "none - the checkpoint is a pipeline export".to_owned(),
             Some(contract) => format!(
-                "task {:?}, DiT {}, schedules {:?}, sparse tile {} sparsity {} keep {:?}",
+                "task {:?}, DiT {}, schedules {:?}, backend {:?}, sparse {:?}",
                 contract.task,
                 contract.dit.directory(),
                 contract.schedule,
-                contract.attention.tile,
-                contract.attention.sparsity,
-                contract.attention.reference_keep
+                contract.backend,
+                contract.attention
             ),
         }
     );
