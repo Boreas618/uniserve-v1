@@ -7,16 +7,15 @@ on its builder thread and calls :func:`attach` once it is up.
 numerical library by its import path. Everything else is the library's:
 descriptor parsing, registration, model loading, serving and shutdown.
 
-The same library exports the video request rules of the ``models`` crate,
-which the numerical library plans MiniMax-H3 requests with
-(:func:`library`).
+The video request rules of the ``models`` crate are not this library's: they
+are answered by the ``uniserve rules`` command (``uniserve.video_rules``),
+which plans a MiniMax-H3 request without loading this module's library.
 """
 
 from __future__ import annotations
 
 import faulthandler
 import functools
-import importlib.util
 import logging
 import pkgutil
 import signal
@@ -63,26 +62,6 @@ def import_path(path: str) -> Callable[..., Any]:
         return result
 
     return translate(call)
-
-
-@functools.cache
-def library() -> tvm_ffi.Module:
-    """The worker library ``uniserve._worker``, loaded once.
-
-    Besides the worker entry it exports the video canvas and frame-count
-    rules (``video_canvas`` and the functions beside it), which any process
-    may call: loading the library starts nothing. In a worker process this
-    is the library the ``uniserve worker`` command already loaded.
-
-    Raises:
-        ImportError: The library is not installed.
-    """
-    spec = importlib.util.find_spec("uniserve._worker")
-    if spec is None or spec.origin is None:
-        raise ImportError(
-            "the worker library uniserve._worker is not installed"
-        )
-    return tvm_ffi.load_module(spec.origin)
 
 
 def attach() -> None:
