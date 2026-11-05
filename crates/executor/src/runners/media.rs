@@ -265,8 +265,10 @@ impl Output {
             )));
         }
         let pcm: Vec<i16> = pcm
-            .chunks_exact(2)
-            .map(|pair| i16::from_ne_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_ne_bytes(*pair))
             .collect();
         let track = self
             .media

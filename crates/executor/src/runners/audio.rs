@@ -277,15 +277,16 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
         // One PCM column, and a track nobody has read yet: a decode of another request would
         // overwrite it before its artifact exists. The first track's life ends at
         // `Products::forget`, which the transport calls once it has the bytes.
-        if let (Some(store), Some(published)) = (self.products.as_deref(), self.published_for) {
-            if published != request && store.holds(published, Product::Track) {
-                return Err(Error::Invalid(format!(
-                    "request {} asks for an audio decode and this runner's PCM column still holds \
-                     request {}'s track: a decode writes the one column, so the second track would \
-                     replace the first before its artifact was read",
-                    request.request_id.0, published.request_id.0
-                )));
-            }
+        if let (Some(store), Some(published)) = (self.products.as_deref(), self.published_for)
+            && published != request
+            && store.holds(published, Product::Track)
+        {
+            return Err(Error::Invalid(format!(
+                "request {} asks for an audio decode and this runner's PCM column still holds \
+                 request {}'s track: a decode writes the one column, so the second track would \
+                 replace the first before its artifact was read",
+                request.request_id.0, published.request_id.0
+            )));
         }
         let audio = self.audio(bucket)?;
         let latents = self.latents(audio);
