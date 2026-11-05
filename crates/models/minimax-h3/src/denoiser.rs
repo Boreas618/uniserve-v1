@@ -2089,6 +2089,7 @@ impl Denoiser {
             programs.extend(crate::conditioning::TokenRefiner::programs(
                 config,
                 *refiner_type,
+                dtype,
             )?);
         }
 
