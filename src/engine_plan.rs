@@ -1195,6 +1195,15 @@ impl EpochPlan {
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
         let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
             (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            // A media rank keeps no cache, and its resident pool holds the tables its model
+            // declares per layout. The reservation is addresses and not storage: a table books the
+            // allowance as it maps, so the range is what the device has left to give.
+            _ if matches!(served, Served::Media(_)) => {
+                platform::Device::new(device)
+                    .with_context(|| format!("opening device {}", device.0))?
+                    .memory_info()?
+                    .free
+            }
             _ => 0,
         };
         let snapshot = planned.state_snapshot_bytes();
