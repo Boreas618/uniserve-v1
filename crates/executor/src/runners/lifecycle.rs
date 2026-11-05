@@ -299,19 +299,29 @@ impl Lifecycle {
         // kind changed. A recapture that says only "the structure changed" leaves the reader to
         // guess whether a program was built differently or the same program is ordered differently.
         let mismatch = served.structure_mismatch(&walked.nodes)?;
-        if unannotated || mismatch.is_some() {
+        // A serving graph whose own table left a launch unexplained cannot be rebound for any
+        // program: the parameters of that launch have no node to land on, and the bucket would be
+        // reported as prepared while it kept running the kernel the update replaced. The structure
+        // comparison cannot see it - both tables are empty at the same positions - so it is its own
+        // condition, and it is a recapture.
+        let reboundable = served.nodes_complete();
+        if unannotated || !reboundable || mismatch.is_some() {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments. The generation being
             // replaced keeps its own graph and executable, which a revert serves from.
             let held = hold_kernels(kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
-            if unannotated {
+            if unannotated || !reboundable {
+                // The recorder's defect, not the capture's: the launches ran and the graph holds
+                // their nodes, and the table that should name them is empty at some position.
                 tracing::error!(
                     bucket = %bucket,
                     generation,
-                    "the walk reported no node table; recaptured the bucket rather than silently \
-                     rebinding nothing"
+                    walk_annotated = !unannotated,
+                    serving_annotated = reboundable,
+                    "a node table left launches unexplained; recaptured the bucket rather than \
+                     rebinding fewer nodes than the graph launches"
                 );
             } else {
                 tracing::info!(
@@ -547,13 +557,32 @@ pub(crate) fn hold_kernels(
     Ok(held)
 }
 
+/// How many launches' node lists a capture reports at `debug` before it stops reporting them.
+///
+/// The first few say whether attribution is empty from the first launch or only once the capture
+/// has advanced, which is the difference between a recorder that cannot see nodes and one that saw
+/// them all at once.
+const REPORTED_LAUNCHES: usize = 4;
+
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
         // The walk's edges, not only its nodes: a programmatic edge orders less than a
         // completion edge, and 4.5's rebind condition compares the structure those kinds make.
         let recorded = self.capture.borrow_mut().record_walk();
         match recorded {
-            Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
+            Ok(nodes) => {
+                let launch = self.nodes.len();
+                if launch < REPORTED_LAUNCHES {
+                    tracing::debug!(
+                        launch,
+                        operator,
+                        key,
+                        nodes = nodes.len(),
+                        "a capture's launch reported the nodes it added"
+                    );
+                }
+                self.nodes.push((operator, key.to_owned(), nodes));
+            }
             Err(error) => {
                 if self.failure.is_none() {
                     self.failure = Some(error);
