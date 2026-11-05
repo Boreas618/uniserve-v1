@@ -764,10 +764,45 @@ impl Epochs {
             kernels: record.kernels.clone(),
             policy: record.policy.clone(),
         };
+        self.hand_programs(host, engine, config, &programs, commands)
+    }
+
+    /// Gives an epoch switch's target `programs`, as [`Self::hand_to`] gives a joining process the
+    /// serving epoch's: the target parks before any `Precopy` names a generation, and a promotion
+    /// refuses a process that holds none.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon has no channel to its main processes, and when the process refuses
+    /// the programs or does not answer.
+    pub fn hand_target(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+        programs: &FilledPrograms,
+    ) -> Result<(), Failure> {
+        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
+            kind: "no_command_channel".to_owned(),
+            reason: "the daemon has no channel to its main processes".to_owned(),
+            device: None,
+        })?;
+        self.hand_programs(host, engine, config, programs, commands)
+    }
+
+    fn hand_programs(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+        programs: &FilledPrograms,
+        commands: crate::supervision::ProcessCommands,
+    ) -> Result<(), Failure> {
+        let record = programs.clone();
         let deployment = Deployment {
             config: config.clone(),
             build_config: crate::epoch::BuildConfig::of(config),
-            programs,
+            programs: programs.clone(),
         };
         let process = crate::engine::control::EpochProcess {
             host: host.to_owned(),
