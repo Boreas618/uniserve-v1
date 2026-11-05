@@ -371,6 +371,10 @@ driver_table! {
             *mut u64, *mut u64, *mut usize, usize, *mut MemcpyAttributes, *mut usize, usize, Handle,
         );
         memcpy_3d_batch_async = "cuMemcpy3DBatchAsync_v2": fn(usize, *mut Memcpy3DBatchOp, u64, Handle);
+        // The name of a captured node's kernel. It is a diagnostic, so a driver that does not
+        // export it degrades the dump rather than failing the device: the entry is lazy, and a
+        // `name()` that finds it absent answers an empty string.
+        func_get_name = "cuFuncGetName": fn(*mut *const c_char, Handle);
     }
 }
 

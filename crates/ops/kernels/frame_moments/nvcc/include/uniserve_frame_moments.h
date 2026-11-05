@@ -22,6 +22,9 @@ typedef struct uniserve_frame_moments_call {
   int64_t values_channel;
   /// Elements between frames.
   int64_t values_frame;
+  /// Elements between neighbouring pixels of one frame: 1 channel-first, the channel count
+  /// channels-last.
+  int64_t values_pixel;
   /// Frames per batch.
   int64_t frames;
   /// Pixels per frame and channel, `height · width`.
@@ -41,10 +44,11 @@ typedef struct uniserve_frame_moments_call {
 } uniserve_frame_moments_call;
 
 static_assert(offsetof(uniserve_frame_moments_call, values) == 0, "call layout");
-static_assert(offsetof(uniserve_frame_moments_call, epsilon) == 64, "call layout");
-static_assert(offsetof(uniserve_frame_moments_call, mean) == 72, "call layout");
-static_assert(offsetof(uniserve_frame_moments_call, error) == 88, "call layout");
-static_assert(sizeof(uniserve_frame_moments_call) == 88 + UNISERVE_FRAME_MOMENTS_MESSAGE,
+static_assert(offsetof(uniserve_frame_moments_call, values_pixel) == 32, "call layout");
+static_assert(offsetof(uniserve_frame_moments_call, epsilon) == 72, "call layout");
+static_assert(offsetof(uniserve_frame_moments_call, mean) == 80, "call layout");
+static_assert(offsetof(uniserve_frame_moments_call, error) == 96, "call layout");
+static_assert(sizeof(uniserve_frame_moments_call) == 96 + UNISERVE_FRAME_MOMENTS_MESSAGE,
               "call layout");
 
 #endif  // UNISERVE_FRAME_MOMENTS_H

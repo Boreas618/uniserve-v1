@@ -129,14 +129,10 @@ fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::O
             retention: config.video_job_config.retention,
             max_bytes: config.video_job_config.max_bytes,
         },
-        readout_config: frontend::options::ReadoutOptions {
-            layout: readout_layout(config.readout_config.layout),
-            canvas: canvas_mode(config.readout_config.canvas),
-            candidates: candidate_tokens(config.readout_config.candidates),
-        },
         migration_config: frontend::options::MigrationOptions {
             max_migrations: config.migration_config.max_migrations,
         },
+        ..Default::default()
     })
 }
 
@@ -160,39 +156,6 @@ fn reasoning_parser(parser: daemon::options::ReasoningParser) -> frontend::optio
     match parser {
         File::Auto => Owned::Auto,
         File::None => Owned::None,
-    }
-}
-
-/// How a readout lays its questions out.
-fn readout_layout(layout: daemon::options::ReadoutLayout) -> frontend::options::ReadoutLayout {
-    use daemon::options::ReadoutLayout as File;
-    use frontend::options::ReadoutLayout as Owned;
-    match layout {
-        File::Joint => Owned::Joint,
-        File::Independent => Owned::Independent,
-    }
-}
-
-/// The canvas length of a readout.
-fn canvas_mode(mode: daemon::options::CanvasMode) -> frontend::options::CanvasMode {
-    use daemon::options::CanvasMode as File;
-    use frontend::options::CanvasMode as Owned;
-    match mode {
-        File::Full => Owned::Full,
-        File::Compact => Owned::Compact,
-        File::Fixed(tokens) => Owned::Fixed(tokens),
-    }
-}
-
-/// Which answer spellings a readout sums.
-fn candidate_tokens(
-    candidates: daemon::options::CandidateTokens,
-) -> frontend::options::CandidateTokens {
-    use daemon::options::CandidateTokens as File;
-    use frontend::options::CandidateTokens as Owned;
-    match candidates {
-        File::Variants => Owned::Variants,
-        File::Primary => Owned::Primary,
     }
 }
 

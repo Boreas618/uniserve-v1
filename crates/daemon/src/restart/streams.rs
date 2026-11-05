@@ -40,9 +40,7 @@
 //! with a state a successor continues from. A covered response whose state
 //! cannot be frozen ends at the boundary instead of being kept here — the
 //! process that hands the deployment over does not wait for a response to end.
-//! The SenseNova and omni readout output filters declare no state; item 2
-//! removes their routes from the covered set, and until then a response they
-//! write ends at the boundary.
+//! Every route the daemon serves declares that state, so no route is exempt.
 //!
 //! A video artifact's body is covered too: its state names the job and the
 //! byte the predecessor reached, and the successor streams the job's retained
@@ -613,7 +611,6 @@ mod tests {
             configured_tokenizer(),
             "refused-handoff".into(),
             vec![client],
-            None,
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
             VideoJobOptions::default(),
@@ -655,7 +652,6 @@ mod tests {
             configured_tokenizer(),
             "refused-handoff-2".into(),
             vec![client],
-            None,
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
             VideoJobOptions::default(),

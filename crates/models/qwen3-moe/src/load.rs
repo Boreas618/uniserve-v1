@@ -40,6 +40,16 @@ use crate::model::{
 use crate::representation::{self, Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
+/// The block-scale layout the expert products read the **weights** in: the 128x4 swizzled form.
+///
+/// Both families carry their weight operand this way — `mSfLayoutA` is `SfLayout(3)` in every one of
+/// the artifact's E2M1 kernels, and `BatchedGemmOptions.h` states the rule it follows: "mSfLayoutA
+/// has to be R128cX when not batch M or not routed". The plane the two families disagree about is
+/// the **tokens** operand, which is `nn::Moe`'s statement, not the loader's.
+///
+/// The shard stores the plain form, so the loader builds this table once at load.
+pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
 ///
 /// `root` holds `config.json` and the safetensors shards (an index or a directory of shards); the
@@ -795,9 +805,9 @@ fn expert_block(
             )));
         }
         let vocabulary = as_u32(config.num_experts, "num_experts")?;
-        // The shard's block scales are the export's own — linear, one per sixteen elements — and the
-        // products read the swizzled 128x4 table, which the loader builds once at load. A checkpoint
-        // that already holds a converted table is refused here rather than swizzled a second time.
+        // The shard's block scales are the export's own — linear, one per sixteen elements — and a
+        // product that reads a swizzled table has it built once here. A checkpoint that already
+        // holds a converted table is refused rather than swizzled a second time.
         if layout != ScaleLayout::Linear {
             return Err(Error::Unsupported(format!(
                 "{parameter} declares {layout} block scales, and this loader builds the published \
@@ -814,7 +824,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                ScaleLayout::Swizzled128X4,
+                WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -828,7 +838,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                ScaleLayout::Swizzled128X4,
+                WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -1271,5 +1281,51 @@ mod tests {
 
     fn config_without_yarn() -> Config {
         config()
+    }
+
+    /// The block-scale layouts each product's kernels were built for, held against the packages.
+    ///
+    /// A product's planes are read by kernels that were **compiled** with a layout for each operand,
+    /// and nothing checks the two against each other at runtime: the layouts are not options the
+    /// runner's lookup compares (`GemmOptions` carries no `SfLayout`), so a package built for one
+    /// form handed a plane in another reads every block factor at the wrong offset and answers
+    /// plausible numbers. This is the one place the two statements meet.
+    ///
+    /// `mSfLayoutA` is the **weights** and `mSfLayoutB` the **tokens** — `BatchedGemmOptions.h`
+    /// states both ("mSfLayoutA has to be R128cX", "Tokens need use SF linear layout when being
+    /// routed") — and the two families disagree about the second only.
+    #[test]
+    fn a_products_package_states_the_scale_layouts_nn_publishes() {
+        let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/kernels");
+        let cases = [
+            (
+                "gather_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::GATED_TOKEN_SCALE_LAYOUT,
+            ),
+            (
+                "route_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::ACTIVATION_SCALE_LAYOUT,
+            ),
+        ];
+        let name = |layout: ScaleLayout| match layout {
+            ScaleLayout::Linear => "\"linear\"",
+            ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
+        };
+        for (operator, weights, tokens) in cases {
+            let package = kernels.join(operator).join("trtllm/package.toml");
+            let stated = std::fs::read_to_string(&package)
+                .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
+            for (option, expected) in [("mSfLayoutA", name(weights)), ("mSfLayoutB", name(tokens))]
+            {
+                let line = format!("{option} = {expected}");
+                assert!(
+                    stated.contains(&line),
+                    "{operator}'s package does not state `{line}`: the kernels it publishes would \
+                     read a plane nn publishes in another form, and nothing at launch would say so"
+                );
+            }
+        }
     }
 }

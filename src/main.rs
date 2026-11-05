@@ -23,7 +23,6 @@ mod logging;
 mod program_server;
 mod serve;
 mod storage;
-mod worker;
 
 use std::env;
 use std::ffi::OsString;
@@ -114,16 +113,22 @@ pub(crate) fn shutdown_signal() -> CancellationToken {
 
 /// Starts the UniServe command-line process.
 fn main() -> Result<std::process::ExitCode> {
+    // A supervised process's standard error is its supervisor's pipe, and the supervisor that
+    // started it may be gone: after a hot restart the successor adopts the process without its
+    // predecessor's pipe, so a panic written only to standard error is invisible in the run's
+    // log. Standard output is the log every process of the deployment shares, so a panic is
+    // stated there as well - one line, before the process ends either way.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        println!("a process panicked: {panic}");
+        default(panic);
+    }));
     let lifeline = take_lifeline();
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => serve::run(*args, &cli.log),
         Command::Frontend(args) => frontend::run(*args, &cli.log),
         Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
-        Command::Worker { arguments } => {
-            follow_lifeline(lifeline);
-            worker::run(arguments)
-        }
         Command::Storage(args) => Ok(storage::run(*args)),
         Command::External(arguments) => run_external(&arguments),
     }

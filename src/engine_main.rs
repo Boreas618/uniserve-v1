@@ -39,8 +39,8 @@
 //!   and the per-device counters `FromEngine::Device` that [`Self::send_metrics`]
 //!   fills (§2.3).
 //! - **builder03** (`crates/executor`): `capacity::plan(&CapacityRequest) ->
-//!   Result<Plan>`, whose producer is still `crates/worker/src/worker/planning.rs`
-//!   and still entangled with the launch machinery §4 deletes, and the Storage
+//!   Result<Plan>`, whose producer the retired worker held and which is still
+//!   entangled with the launch machinery §4 deletes, and the Storage
 //!   Server client's publish/map surface that a weight store stands on.
 //! - **nobody yet**: the `nn::RetainedWeights` production implementation. Its two
 //!   methods (`retained`, `publish`) are all a checkpoint load needs, and the
@@ -538,7 +538,10 @@ pub(crate) fn run(
     match &ending {
         Ok(None) => tracing::warn!("the main process ends: a shutdown was commanded"),
         Ok(Some(failure)) => {
-            tracing::warn!(reason = failure.reason(), "the main process ends: the epoch failed")
+            tracing::warn!(
+                reason = failure.reason(),
+                "the main process ends: the epoch failed"
+            )
         }
         Err(error) => tracing::warn!(%error, "the main process ends: the control thread failed"),
     }
@@ -1085,6 +1088,13 @@ impl MainProcess {
             device_command(&self.watchdog, device, "the wake", submission)?;
         }
         self.slept = false;
+        // The description this process answers a cache query from is refreshed here, and this is the
+        // one place it can go stale: a wake maps the segments again, and a segment that came back at
+        // a new offset is a different answer for a successor. Every scheduler answers it here - the
+        // streams are not paused - where asking from the handover's own control pass would wait.
+        if let Ok(info) = self.engine_info() {
+            self.announced = Some(info);
+        }
         let kept = self.memory.as_ref().map(Memory::mapped_resident);
         if let (Some(before), Some(after)) = (kept_before, kept) {
             tracing::info!(
@@ -1507,10 +1517,7 @@ impl MainProcess {
                 // refused it" are different lines in a run.
                 tracing::info!(
                     front,
-                    command = command
-                        .kind
-                        .as_ref()
-                        .map_or("none", engine_command_name),
+                    command = command.kind.as_ref().map_or("none", engine_command_name),
                     "the engine read an engine command"
                 );
                 self.engine_command(front, command)
@@ -3690,7 +3697,9 @@ impl MainProcess {
                 };
                 // Everything the consumer has read can no longer be replayed, which is what bounds
                 // the journal.
-                served.kept.retain(|(position, _)| *position > consumed.events);
+                served
+                    .kept
+                    .retain(|(position, _)| *position > consumed.events);
                 return Ok(());
             }
             Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
@@ -3721,10 +3730,7 @@ impl MainProcess {
                         front,
                         "replaying an event a taken-over request produced during the pause"
                     );
-                    self.send_event(
-                        front,
-                        proto::request::wire::from_engine::Kind::Event(event),
-                    );
+                    self.send_event(front, proto::request::wire::from_engine::Kind::Event(event));
                 }
                 tracing::info!(
                     request = command.request,
@@ -3894,14 +3900,29 @@ impl MainProcess {
                     error: LEDGERS.to_owned(),
                 }),
             ),
-            // What the prefix cache holds is the schedulers' answer, and they are asked through
-            // the process connection.
+            // What the prefix cache holds is answered here, from what this process announced.
+            //
+            // A standby that starts on these devices maps the serving epoch's segments read-only
+            // (`specs/worker.md` 7.4 step 1), so reading them moves nothing and is not a lifecycle
+            // command. The answer is the description this process gave the daemon when it became
+            // ready: the segments are the pool's, and they are the same for as long as the epoch
+            // serves. Asking every scheduler afresh is what cannot be done from here - a scheduler
+            // holding paused streams does not answer until its stall bound, and a control thread
+            // waiting on one cannot serve the handover's own commands (`501fa5e6f`).
             Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => {
+                let (error, segments) = match &self.announced {
+                    Some(info) => (String::new(), info.segments.clone()),
+                    None => (
+                        "this process has announced no cache segments: it has not become ready"
+                            .to_owned(),
+                        Vec::new(),
+                    ),
+                };
                 Some(proto::request::wire::from_engine::Kind::CacheDescribed(
                     proto::request::wire::CacheDescribed {
                         id: describe.id,
-                        error: EPOCH_LIFECYCLE.to_owned(),
-                        segments: Vec::new(),
+                        error,
+                        segments,
                     },
                 ))
             }
@@ -4031,10 +4052,14 @@ impl MainProcess {
             // The front this request belongs to detached. Its new owner names itself with a
             // `Takeover`, and until then nobody is reading: the request's events are kept for the
             // takeover to replay.
-            tracing::debug!(front, "a request's front is gone; its events are kept for a takeover");
+            tracing::debug!(
+                front,
+                "a request's front is gone; its events are kept for a takeover"
+            );
             return;
         };
-        if let Err(error) = connection.send(&proto::request::wire::FromEngine { kind: Some(kind) }) {
+        if let Err(error) = connection.send(&proto::request::wire::FromEngine { kind: Some(kind) })
+        {
             tracing::warn!(%error, front, "sending an event of an admitted request failed");
         }
     }
@@ -6725,7 +6750,11 @@ mod tests {
         let kept: std::collections::VecDeque<_> = (1..=4).map(|at| (at, event(9, "e"))).collect();
 
         assert_eq!(replay_after(&kept, 0).len(), 4, "a takeover from the start");
-        assert_eq!(replay_after(&kept, 2).len(), 2, "only the events past the position");
+        assert_eq!(
+            replay_after(&kept, 2).len(),
+            2,
+            "only the events past the position"
+        );
         assert!(
             replay_after(&kept, 4).is_empty(),
             "a consumer at the last event has nothing left to replay"

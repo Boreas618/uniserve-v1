@@ -19,7 +19,6 @@ from .minimax_h3 import MiniMaxH3Dataset
 from .mjhq import MJHQDataset
 from .pie_bench import PieBenchDataset
 from .sharegpt import ShareGPTDataset
-from .systemone import SystemOneDataset
 from .ueval import UEvalDataset
 
 # Maps the `dataset` configuration name to its adapter class.
@@ -31,7 +30,6 @@ DATASETS: dict[str, type[Dataset]] = {
     "pie-bench": PieBenchDataset,
     "jsonl": JsonlDataset,
     "minimax-h3": MiniMaxH3Dataset,
-    "systemone": SystemOneDataset,
     "gsm8k": GSM8KDataset,
 }
 
@@ -102,7 +100,6 @@ __all__ = [
     "MiniMaxH3Dataset",
     "PieBenchDataset",
     "ShareGPTDataset",
-    "SystemOneDataset",
     "UEvalDataset",
     "get_dataset",
     "load_examples",

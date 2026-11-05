@@ -19,10 +19,8 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
-    png_size_from_b64,
     require_uniserve_binary,
     server_process,
-    tiny_input_png_b64,
     worker_executable,
     written_deployment,
 )
@@ -40,12 +38,8 @@ def _command(
     directory: Path,
     worker_config: dict[str, Any],
 ) -> list[str]:
-    # A step writes an input image's vision block whole, and a request whose
-    # block exceeds the step budget is refused. BAGEL's block holds 1371
-    # tokens.
-    step_tokens = {"qwen3": "1024", "bagel": "2048", "sensenova": "4096"}[
-        description
-    ]
+    # Qwen3 states the step budget its attention keys are built for.
+    step_tokens = "1024"
     return [
         str(require_uniserve_binary()),
         "serve",
@@ -63,10 +57,9 @@ def _command(
         "--set",
         "dtype=bfloat16",
         "--set",
-        "kv_cache_config.max_tokens="
-        + ("65536" if description == "sensenova" else "8192"),
+        "kv_cache_config.max_tokens=8192",
         "--max-model-len",
-        "32768" if description == "sensenova" else "4096",
+        "4096",
         "--set",
         f"max_num_batched_tokens={step_tokens}",
         "--set",
@@ -81,23 +74,6 @@ def _chats(description: str) -> dict[str, list[dict[str, Any]]]:
     chats: dict[str, list[dict[str, Any]]] = {
         "text": [{"role": "user", "content": "Name a primary color."}]
     }
-    if description in {"bagel", "sensenova"}:
-        chats["image"] = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe the dominant color."},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": (
-                                f"data:image/png;base64,{tiny_input_png_b64()}"
-                            )
-                        },
-                    },
-                ],
-            }
-        ]
     return chats
 
 
@@ -190,14 +166,6 @@ def one_device(
         pytest.param(
             "qwen3", "UNISERVE_QWEN3_MODEL", marks=pytest.mark.model("qwen3")
         ),
-        pytest.param(
-            "bagel", "UNISERVE_BAGEL_MODEL", marks=pytest.mark.model("bagel")
-        ),
-        pytest.param(
-            "sensenova",
-            "UNISERVE_SENSENOVA_MODEL",
-            marks=pytest.mark.model("sensenova"),
-        ),
     ],
 )
 @pytest.mark.parametrize("parallel_axis", ["tensor", "pipeline", "sequence"])
@@ -224,7 +192,6 @@ def test_ordered_bindings_generate_outputs(
         "components": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
-    image_size = (512, 512) if description == "bagel" else (2048, 1152)
     with server_process(
         _command(description, checkpoint, port, tmp_path, worker_config),
         base_url,
@@ -252,23 +219,6 @@ def test_ordered_bindings_generate_outputs(
             assert choice["finish_reason"] in ("stop", "length"), name
             message = choice["message"]
             assert message.get("content") or message.get("reasoning_content")
-
-        if description in {"bagel", "sensenova"}:
-            generated = httpx.post(
-                f"{base_url}/v1/images/generations",
-                json={
-                    "model": description,
-                    "prompt": "A blue square.",
-                    "size": f"{image_size[0]}x{image_size[1]}",
-                    "steps": 1,
-                    "seed": 7,
-                },
-                timeout=180,
-            )
-            generated.raise_for_status()
-            images = generated.json()["data"]
-            assert len(images) == 1
-            assert png_size_from_b64(images[0]["b64_json"]) == image_size
 
         ranked = _ranked(base_url, description)
 

@@ -41,7 +41,6 @@ use nn::layers::{
 };
 use ops::Op;
 use ops::attention::Phase;
-use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
 use ops::moe::exchange::Mode;
 use ops::moe::grouped::{GatherGemmNvfp4, RouteGemmNvfp4};
@@ -236,7 +235,7 @@ pub fn keys(
                             *rows,
                             n,
                             k,
-                            ScaleLayout::Swizzled128X4,
+                            Moe::ACTIVATION_SCALE_LAYOUT,
                             false,
                             dtype,
                         )
@@ -250,7 +249,7 @@ pub fn keys(
             for k in [hidden, query, hidden] {
                 push(
                     <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                    Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4).to_string(),
+                    Moe::quantize_descriptor_of(dtype, k, Moe::ACTIVATION_SCALE_LAYOUT).to_string(),
                 );
             }
         }
@@ -279,14 +278,19 @@ pub fn keys(
             let local = width(partition.expert_range(config).len(), "local expert count")?;
             push("moe_sort", moe.sort_descriptor(local).to_string());
             if experts_encoded {
-                for k in [
-                    hidden,
-                    width(config.moe_intermediate_size, "expert intermediate width")?,
+                // The two encodings the forward states: the gated product's operand in the linear
+                // form, the plain product's in the 128x4 swizzled form. The walk states one key per
+                // descriptor the forward launches, so it states these two exactly as they are.
+                for (k, layout) in [
+                    (hidden, Moe::GATED_TOKEN_SCALE_LAYOUT),
+                    (
+                        width(config.moe_intermediate_size, "expert intermediate width")?,
+                        Moe::ACTIVATION_SCALE_LAYOUT,
+                    ),
                 ] {
                     push(
                         <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                        Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4)
-                            .to_string(),
+                        Moe::quantize_descriptor_of(dtype, k, layout).to_string(),
                     );
                 }
                 push(
@@ -295,13 +299,13 @@ pub fn keys(
                         dtype,
                         activation(config.hidden_act)?,
                         DType::F8E4M3,
-                        ScaleLayout::Swizzled128X4,
+                        Moe::GATED_TOKEN_SCALE_LAYOUT,
                     )
                     .to_string(),
                 );
                 push(
                     <RouteGemmNvfp4 as Op>::NAME,
-                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, ScaleLayout::Swizzled128X4)
+                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, Moe::ACTIVATION_SCALE_LAYOUT)
                         .to_string(),
                 );
             } else {
@@ -337,7 +341,7 @@ pub fn keys(
                                 *rows,
                                 n,
                                 k,
-                                ScaleLayout::Swizzled128X4,
+                                Moe::ACTIVATION_SCALE_LAYOUT,
                                 false,
                                 dtype,
                             )

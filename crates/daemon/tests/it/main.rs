@@ -6,11 +6,8 @@
 #![cfg(test)]
 
 mod chat_template;
-mod diffusion_gemma_tokenizer;
-mod gemma4_output;
 mod model_preprocessing;
 mod nodes;
 mod qwen3_output;
 mod supervision;
 mod support;
-mod systemone_checkpoint;

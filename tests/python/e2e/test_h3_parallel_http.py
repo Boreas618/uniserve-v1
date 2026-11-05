@@ -392,7 +392,7 @@ def test_component_bindings_release_cancelled_requests(
         "--set",
         "dtype=bfloat16",
         "--set",
-        "quantization_config.mode=balanced",
+        "quantization.mode=balanced",
     ]
     if two_hosts:
         # Products cross the hosts by the mechanisms each edge derives, as in

@@ -14,8 +14,7 @@
 //!
 //! Some options configure one model family: the token batch budgets,
 //! `chat_config` and `image_fetch_config` token models, `video_config`,
-//! `media_config` and `video_job_config` MiniMax-H3, `readout_config` and
-//! `diffusion_generation_config` DiffusionGemma. Startup refuses such an
+//! `media_config` and `video_job_config` MiniMax-H3. Startup refuses such an
 //! option stated for a checkpoint of another family rather than ignoring it
 //! ([`Stated::refuse_foreign_options`]).
 
@@ -40,12 +39,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use models::ModelDescription;
-use models::diffusion_gemma::DenoisingOverrides;
 
 pub use args::{FLAG_PATHS, ServeArgs, Stated, overridden, printed, resolve_text};
-pub use values::{
-    CandidateTokens, CanvasMode, ChatTemplateContentFormatOption, ImageSize, ReadoutLayout,
-};
+pub use values::{ChatTemplateContentFormatOption, ImageSize};
 
 /// Environment variable read for the API key when `server_config.api_key`
 /// is unset.
@@ -64,9 +60,9 @@ const PLACEMENT_SHORTHAND: [&str; 5] = [
 /// options by configuration path.
 ///
 /// Token models schedule token batches and render chat prompts, which a
-/// video pipeline does neither of; the video and DiffusionGemma tables
-/// configure behavior only their family has.
-const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
+/// video pipeline does neither of; the video tables configure behavior only
+/// their family has.
+const FAMILY_OPTIONS: [(Family, &[&str]); 2] = [
     (
         Family::TokenModels,
         &[
@@ -81,10 +77,6 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
         Family::MiniMaxH3,
         &["video_config", "media_config", "video_job_config"],
     ),
-    (
-        Family::DiffusionGemma,
-        &["readout_config", "diffusion_generation_config"],
-    ),
 ];
 
 /// A group of model families some options belong to.
@@ -92,7 +84,6 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 3] = [
 enum Family {
     TokenModels,
     MiniMaxH3,
-    DiffusionGemma,
 }
 
 impl Family {
@@ -101,7 +92,6 @@ impl Family {
         match self {
             Self::TokenModels => !description.is_pipeline(),
             Self::MiniMaxH3 => description == ModelDescription::MiniMaxH3,
-            Self::DiffusionGemma => description == ModelDescription::DiffusionGemma,
         }
     }
 
@@ -110,7 +100,6 @@ impl Family {
         match self {
             Self::TokenModels => "token models",
             Self::MiniMaxH3 => "MiniMax-H3 video generation",
-            Self::DiffusionGemma => "DiffusionGemma",
         }
     }
 }
@@ -122,8 +111,8 @@ impl Stated {
     /// # Errors
     ///
     /// Fails, naming the first such option and the served model, when a
-    /// video pipeline states a token-model option, or another model states
-    /// a MiniMax-H3 or DiffusionGemma table.
+    /// video pipeline states a token-model option, or a token model states a
+    /// MiniMax-H3 table.
     pub fn refuse_foreign_options(&self, description: ModelDescription) -> anyhow::Result<()> {
         for (family, paths) in FAMILY_OPTIONS {
             if family.serves(description) {
@@ -165,7 +154,11 @@ pub struct ServeConfig {
     pub dtype: ModelDtype,
     /// Precision policy, such as `mode = "balanced"` or per-component
     /// selections under `components`; empty selects the model's default.
-    pub quantization_config: serde_json::Map<String, Value>,
+    pub quantization: serde_json::Map<String, Value>,
+    /// The retired name of `quantization`. A configuration that states it is
+    /// refused with the name to state instead, and it is never written back.
+    #[serde(rename = "quantization_config", skip_serializing)]
+    pub retired_quantization_config: Option<Value>,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
@@ -245,8 +238,6 @@ pub struct ServeConfig {
     pub video_config: VideoOptions,
     pub media_config: MediaOptions,
     pub video_job_config: VideoJobOptions,
-    pub readout_config: ReadoutOptions,
-    pub diffusion_generation_config: DenoisingOverrides,
 }
 
 impl Default for ServeConfig {
@@ -256,7 +247,8 @@ impl Default for ServeConfig {
             served_model_name: None,
             max_model_len: None,
             dtype: ModelDtype::BFloat16,
-            quantization_config: serde_json::Map::new(),
+            quantization: serde_json::Map::new(),
+            retired_quantization_config: None,
             mm_processor_kwargs: serde_json::Map::new(),
             attention_backend: "auto".to_owned(),
             prefill_attention_backend: None,
@@ -293,8 +285,6 @@ impl Default for ServeConfig {
             video_config: VideoOptions::default(),
             media_config: MediaOptions::default(),
             video_job_config: VideoJobOptions::default(),
-            readout_config: ReadoutOptions::default(),
-            diffusion_generation_config: DenoisingOverrides::default(),
         }
     }
 }
@@ -693,8 +683,6 @@ pub struct WorkerOptions {
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
     pub mesh: Option<String>,
-    /// Torch process-group backend for the ranks' collectives.
-    pub distributed_backend: Option<String>,
     /// Keep a standby beside every worker group: it maps the group's
     /// retained weights and cache, captures its graphs and parks, and
     /// replaces the group when it fails instead of a relaunch. A group whose
@@ -726,7 +714,6 @@ impl Default for WorkerOptions {
             executable: default_executable(),
             watchdog_timeout: Duration::from_secs(300),
             mesh: None,
-            distributed_backend: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
         }
@@ -793,7 +780,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: Qwen3, SenseNova, BAGEL and DiffusionGemma (`chat_config`).
+/// Chat models: `Qwen3` (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatOptions {
@@ -928,10 +915,8 @@ pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> Serve
         image_fetch_config: target.image_fetch_config.clone(),
         media_config: target.media_config.clone(),
         video_job_config: target.video_job_config.clone(),
-        readout_config: target.readout_config,
         migration_config: target.migration_config.clone(),
         mm_processor_kwargs: target.mm_processor_kwargs.clone(),
-        diffusion_generation_config: target.diffusion_generation_config,
         ..current.clone()
     }
 }
@@ -947,10 +932,8 @@ pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> boo
         || current.image_fetch_config != target.image_fetch_config
         || current.media_config != target.media_config
         || current.video_job_config != target.video_job_config
-        || current.readout_config != target.readout_config
         || current.migration_config != target.migration_config
         || current.mm_processor_kwargs != target.mm_processor_kwargs
-        || current.diffusion_generation_config != target.diffusion_generation_config
         // Where this host's Program Server listens: the daemon reads it
         // alone, and an epoch's programs are prepared against it (§5.1).
         || current.program_server != target.program_server
@@ -1121,20 +1104,6 @@ impl Default for VideoJobOptions {
             max_bytes: 1 << 30,
         }
     }
-}
-
-/// DiffusionGemma System One readouts (`readout_config`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReadoutOptions {
-    /// `joint` packs questions into shared canvases; `independent` gives
-    /// each its own prompt and canvas.
-    pub layout: ReadoutLayout,
-    /// Canvas length: `full`, `compact`, or a positive multiple of 16.
-    pub canvas: CanvasMode,
-    /// `variants` sums supported answer spellings; `primary` reads the
-    /// space-prefixed one.
-    pub candidates: CandidateTokens,
 }
 
 impl ServeConfig {
@@ -1475,11 +1444,10 @@ impl ServeConfig {
                 watchdog_timeout_ms: u64::try_from(worker.watchdog_timeout.as_millis())
                     .unwrap_or(u64::MAX),
                 mesh: worker.mesh.clone().unwrap_or_default(),
-                distributed_backend: worker.distributed_backend.clone().unwrap_or_default(),
                 standby: worker.standby,
                 attention_backend: self.attention_backend.clone(),
                 dtype: word(&self.dtype),
-                quantization_config: Value::Object(self.quantization_config.clone()).to_string(),
+                quantization: Value::Object(self.quantization.clone()).to_string(),
                 load_format: word(&self.load_config.format),
                 download_dir: text(&self.load_config.download_dir),
                 load_threads: self.load_config.threads.map(NonZeroU32::get),

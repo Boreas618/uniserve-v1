@@ -88,7 +88,38 @@ const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
 /// checkpoint's vocabulary, which is the only direction that needs no tokenizer here.
 const DEFAULT_TOKENS: u64 = 1;
 
+/// The stage the run is in, so a panic that aborts names where it happened.
+///
+/// A release build panics through `abort`, and a panic raised without a caller location prints the
+/// panic machinery's own source and nothing of this program's: the NVFP4 run's log held `internal
+/// error: entered unreachable code` and no way to say which stage had reached it. Every stage the
+/// run enters is recorded here, and the hook prints it before the default hook prints the rest, so
+/// one run names the stage even when a backtrace is lost to a log's width.
+static STAGE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start-up");
+
+/// Name the stage the run is entering.
+fn stage(name: &'static str) {
+    if let Ok(mut held) = STAGE.lock() {
+        *held = name;
+    }
+}
+
+/// Print the stage a panic happened in, then let the default hook print the panic itself.
+fn name_panicking_stage() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A run's output is block-buffered when the log is a file, and an abort discards whatever
+        // was never flushed - so the last line a log holds is not the last thing the run did. A
+        // panic that aborts is exactly when that matters, so the buffer goes out first.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let held = STAGE.lock().map(|held| *held).unwrap_or("start-up");
+        eprintln!("stage: {held}");
+        previous(info);
+    }));
+}
+
 fn main() -> ExitCode {
+    name_panicking_stage();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Message(message)) => {
@@ -184,6 +215,9 @@ struct Args {
     /// A cut inside `--layer`, named by the reference tensor that answers it: `normalized`,
     /// `attended` or `mlp_out`.
     substage: Option<Substage>,
+    /// Walk every cut of `--layer` in one run and read each as a finite count: the instrument for
+    /// "which operator first writes a value that is not a number".
+    cuts: bool,
     /// The reference stage a `--stage block` run starts from: its `hidden_NN` is the run's input
     /// instead of the embedding, which measures one layer's arithmetic and no prefix's.
     from: Option<usize>,
@@ -307,6 +341,7 @@ impl Args {
         let mut dump = None;
         let mut reference = None;
         let mut substage = None;
+        let mut cuts = false;
         let mut from = None;
         let mut routing = false;
         let mut scores = false;
@@ -409,6 +444,9 @@ impl Args {
                         }
                     };
                 }
+                "--cuts" => {
+                    cuts = true;
+                }
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -503,6 +541,7 @@ impl Args {
             dump,
             reference,
             substage,
+            cuts,
             from,
             routing,
             scores,
@@ -642,6 +681,7 @@ impl RetainedWeights for HostWeights {
 }
 
 fn stage_weights(args: &Args) -> Result<()> {
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let mut store = HostWeights::default();
@@ -703,17 +743,20 @@ fn stage_weights(args: &Args) -> Result<()> {
 // Stage 1: the vocabulary table's rows, launched on the device.
 
 fn stage_embedding(args: &Args) -> Result<()> {
+    stage("the store's programs");
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `embedding` needs a program store: pass --store <path> or set UNISERVE_STORE",
         )
     })?;
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
 
     // 1. The device and the stream every launch is issued on, before any weight is allocated: a
     //    driver that cannot give a device should fail here and not inside a load.
     let device =
         platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    stage("the device");
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
@@ -728,6 +771,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
         args.kv_pages,
         Encoded::default(),
     )?;
+    stage("the program generation");
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary, as the checkpoint declares
@@ -749,6 +793,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
         usize::try_from(bytes).unwrap_or(usize::MAX),
     )?;
     let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    stage("the forward's modules");
     let forward = Forward::new(&stream, &generation, &arena);
 
     // 5. One launch: the ids of the tokens whose rows the checkpoint itself can vouch for.
@@ -891,6 +936,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // A run measures a pair - the checkpoint's representation and the deployment's cache precision -
     // and a number that does not say which pair it measured cannot enter a table. The pair is the
     // run's first line, read from the checkpoint and stated by the deployment, never overridden.
+    stage("the checkpoint's declaration");
     let declared = Representation::read(&args.checkpoint)?;
     // A calibrated checkpoint keeps some tensors in the source dtype and packs the rest, so naming
     // the representation is not the same as measuring it: the counts below come from the checkpoint's
@@ -916,6 +962,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         args.checkpoint.display(),
         args.kv_pages,
     );
+    stage("the store's programs");
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
@@ -938,10 +985,12 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         check_reference_prompt(dir, &tokens)?;
     }
 
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let device =
         platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    stage("the device");
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
@@ -956,9 +1005,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             generated: args.generate.map(|_| 1),
         },
     )?;
+    stage("the program generation");
     let generation = load_generation(&device, &store_root, &needed)?;
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
+    stage("the checkpoint's weights");
     let (model, loaded) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
     // What the model holds, by representation, beside what the index declares: a loader that fell
     // back to a full-precision path for a packed tensor still prints the declaration and still reads
@@ -970,6 +1021,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         weights.packed_bytes,
         weights.dense,
     )?;
+    stage("the representation it compares");
     if loaded != declared {
         return Err(Failure::message(format!(
             "the checkpoint declared {} before the load and {} during it: a declaration that \
@@ -980,6 +1032,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
 
     // The arena, from the plan and the config's own cache geometry.
+    stage("the plan");
     let plan = model.plan(count)?;
     let page_size = 64_u64;
     let pages = count.div_ceil(page_size).max(1);
@@ -995,8 +1048,10 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, reserve)?;
+    stage("the arena");
     let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
     let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    stage("the forward's modules");
     let forward = Forward::new(&stream, &generation, &arena);
 
     // The batch of one sequence: every prompt token is one query row, the last asks for logits.
@@ -1087,6 +1142,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The forward: start from the embedding, then either stop at one layer or walk the stack and
     // project the last row. `--from` replaces the embedding with a reference stage, so what the
     // layer below computes is measured against the reference's own state and not a prefix's.
+    stage("the first stage's input");
     let hidden = match args.from {
         Some(from) => {
             let dir = args.reference.as_deref().ok_or_else(|| {
@@ -1210,11 +1266,56 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // fails at `plan.bytes` past the first. The mark is taken once and released after each
         // measurement has been read back to the host.
         let mark = arena.mark();
+        // Every cut of the chosen layer in one run, each read as a finite count. This is the
+        // instrument for "which operator first writes a value that is not a number": one launch per
+        // cut, no reference, and the arena released between them exactly as the layer walk does.
+        if args.cuts {
+            let rows = tokens_usize(&batch);
+            let width = usize::try_from(plan.hidden).unwrap_or(0);
+            for cut in [
+                Substage::Normalized,
+                Substage::Attended,
+                Substage::GateIn,
+                Substage::MlpOut,
+            ] {
+                let name = cut.name();
+                let out = measure(Some(cut))?;
+                stream.synchronize()?;
+                let values = download_bf16(&stream, out, rows, width)?;
+                arena.release(mark);
+                let mut nonfinite = 0_usize;
+                let mut low = f64::INFINITY;
+                let mut high = f64::NEG_INFINITY;
+                for value in &values {
+                    if value.is_finite() {
+                        let value = f64::from(*value);
+                        low = low.min(value);
+                        high = high.max(value);
+                    } else {
+                        nonfinite += 1;
+                    }
+                }
+                println!(
+                    "  layer {layer} {name}: {} of {} not finite ({low:.4} .. {high:.4})",
+                    nonfinite,
+                    values.len()
+                );
+                if nonfinite > 0 {
+                    return Err(Failure::message(format!(
+                        "layer {layer}'s {name} is the first cut whose values are not all finite: \
+                         {nonfinite} of {} are NaN or infinite",
+                        values.len()
+                    )));
+                }
+            }
+            return Ok(());
+        }
         // The digest is the block measurement's own evidence that two identical runs agree, and
         // it costs two extra passes of the layer. A cut, the router's selection or the gate's
         // scores ask a different question of the same layer, so their runs pay for one forward.
         if args.substage.is_none() && !args.routing && !args.scores {
             let mut digests = Vec::new();
+            stage("the block digests");
             for run in 0..2 {
                 let rows = measure(None)?;
                 stream.synchronize()?;
@@ -1463,14 +1564,28 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    // The row's own reading, before any argmax: an id chosen from a row that is not all finite says
+    // nothing about the operator that wrote it, so the count and the finite range are printed first.
+    let mut nonfinite = 0_usize;
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for value in &values {
+        if value.is_finite() {
+            low = low.min(*value);
+            high = high.max(*value);
+        } else {
+            nonfinite += 1;
+        }
+    }
+    println!(
+        "the logits row: {} of {} not finite, finite range {low:.4} .. {high:.4}",
+        nonfinite,
+        values.len()
+    );
     print_kv_digests(
         &stream,
         &planes,
         &block_table,
-        page_size,
-        kv_heads,
-        head_dim,
-        page_dtype,
         usize::try_from(count).unwrap_or(0),
     )?;
     arena.release(prefill);
@@ -1486,6 +1601,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     for (token, logprob) in &best {
         println!("  {token}\t{logprob:.6}");
     }
+    stage("the generation");
     if args.generate.is_some() {
         generate(
             args,
@@ -1613,7 +1729,11 @@ fn generate(
     let mut differed = false;
     for step in 0..steps {
         // The prompt's row answers the token at position `start`; a decode step's row answers the
-        // one after it, so the position of this step's token is `start + step`.
+        // one after it, so the position of this step's token is `start + step`. `label` is this
+        // step as a reader counts it - one for the first token - and every line about the run
+        // prints it, so one launch cannot appear under two step numbers. A *reference index* stays
+        // the loop's own, because it addresses the reference file.
+        let label = step + 1;
         let position = start.saturating_add(u64::try_from(step).unwrap_or(0));
         let slot = slot_for(position, page_size, block_table)?;
         check_continuation(
@@ -1639,9 +1759,8 @@ fn generate(
                     // finding about the sampler and not about the model.
                     if theirs != chosen {
                         println!(
-                            "generate: step {}: `Sampler::greedy` chose {theirs} and the raw row's \
-                             argmax is {chosen}",
-                            step + 1
+                            "generate: step {label}: `Sampler::greedy` chose {theirs} and the raw \
+                             row's argmax is {chosen}"
                         );
                     }
                     chosen = theirs;
@@ -1651,16 +1770,15 @@ fn generate(
                     // would produce an id list that cannot say which path chose it, and a decode
                     // run is the only evidence the decode path has.
                     return Err(Failure::message(format!(
-                        "generate: step {}: the sampler path did not run ({error}); pass \
-                         `--greedy host` to ask for the host argmax deliberately",
-                        step + 1
+                        "generate: step {label}: the sampler path did not run ({error}); pass \
+                         `--greedy host` to ask for the host argmax deliberately"
                     )));
                 }
             }
         }
         let best = top_logprobs(&row, 5);
         println!(
-            "generate: step {step} of {steps}: position {position}, slot {slot}, seq_len {}, token \
+            "generate: step {label} of {steps}: position {position}, slot {slot}, seq_len {}, token \
              {chosen} ({source})",
             position.saturating_add(1)
         );
@@ -1670,16 +1788,16 @@ fn generate(
         chosen_ids.push(chosen);
         if let Some(dir) = args.dump.as_deref() {
             // The file carries the reference's own index, so a first difference names its file.
-            let file = dir.join(format!("logits_step_{step:02}.npy"));
+            let file = dir.join(format!("logits_step_{label:02}.npy"));
             write_npy(&file, &row, 1, vocabulary)?;
             println!(
-                "dump: {} is step {step}'s row, 1 x {vocabulary} f32",
+                "dump: {} is step {label}'s row, 1 x {vocabulary} f32",
                 file.display()
             );
         }
         // The comparison is the measurement: a list that differs says nothing about where, and the
-        // first differing step names the launch the defect is in - step 0 is the prefill's own
-        // answer, step 1 is the decode's first launch, and a later step is the slot or the page.
+        // first differing reference index names the launch the defect is in - index 0 is the
+        // prefill's own answer, index 1 is the decode's first launch, a later one the slot or page.
         if let Some(expected) = expected.as_deref() {
             match expected.get(step) {
                 Some(want) if *want == chosen => agreed += 1,
@@ -1699,7 +1817,7 @@ fn generate(
                                  chose {want} with margin {shown}; {step} of {steps} ids agree \
                                  before it"
                             );
-                            println!("generate: step {step}'s top-5, on our row:");
+                            println!("generate: step {label}'s top-5, on our row:");
                             for (token, logprob) in &best {
                                 println!("  {token}\t{logprob:.6}");
                             }
@@ -1766,6 +1884,7 @@ fn generate(
         next.check()?;
         let hidden = arena.tensor(DType::BF16, Shape::new(&[1, hidden_width]))?;
         model.embed_input_ids(forward, ids, hidden)?;
+        stage("a generated step's forward");
         model.forward(forward, &next, cache, hidden)?;
         model.logits(forward, hidden, logits)?;
         stream.synchronize()?;
@@ -1895,9 +2014,10 @@ fn check_continuation(
     let wanted = start.saturating_add(u64::try_from(step).unwrap_or(0));
     if position != wanted {
         return Err(Failure::message(format!(
-            "decode step {step} of a {start} row prompt is at position {position}, and the token it \
+            "decode step {} of a {start} row prompt is at position {position}, and the token it \
              appends is the one at {wanted}: a continuation that skips or repeats a position writes \
-             its keys beside another token's"
+             its keys beside another token's",
+            step + 1
         )));
     }
     if slot != position {
@@ -2643,6 +2763,33 @@ fn report_stage(
         width,
     } = stage;
     dump_stage(args, stage, values)?;
+    // The first question a wrong number asks is whether it is a number at all. A stage whose values
+    // are not all finite names the operator that produced them, and every later reading is a
+    // consequence of that one, so the walk stops here and says which stage it was.
+    let mut nonfinite = 0_usize;
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for value in values {
+        if value.is_finite() {
+            let value = f64::from(*value);
+            low = low.min(value);
+            high = high.max(value);
+        } else {
+            nonfinite += 1;
+        }
+    }
+    println!(
+        "  {label}: {} of {} not finite ({low:.4} .. {high:.4})",
+        nonfinite,
+        values.len()
+    );
+    if nonfinite > 0 {
+        return Err(Failure::message(format!(
+            "{label} is the first stage whose values are not all finite: {nonfinite} of {} are \
+             NaN or infinite, and the operator that wrote this stage is the one to read",
+            values.len()
+        )));
+    }
     let Some(dir) = args.reference.as_deref() else {
         return Ok(None);
     };
@@ -3015,6 +3162,7 @@ fn prompt_ids(text: &str) -> Result<Vec<i32>> {
 /// because it filters the list and cannot see past it. That is `examples/keys_check.rs`'s question,
 /// which walks the model's own enumeration (`qwen3_moe::keys::keys`) against the same file.
 fn preflight(args: &Args) -> Result<()> {
+    stage("the checkpoint's declaration");
     let declared = Representation::read(&args.checkpoint)?;
     let count = u64::try_from(prompt_ids(&args.tokens)?.len()).unwrap_or(0);
     let encoded = Encoded {
@@ -3610,26 +3758,35 @@ fn print_kv_digests(
     stream: &platform::Stream,
     planes: &[KvPlanes],
     block_table: &[i32],
-    page_size: u64,
-    kv_heads: u64,
-    head_dim: u64,
-    page_dtype: ops::DType,
     tokens: usize,
 ) -> Result<()> {
+    // The plane's own shape is the geometry. A caller that states it again can state another one,
+    // and the digest would then cover a byte range its plane does not have.
+    let Some(first) = planes.first() else {
+        return Ok(());
+    };
+    let page_dtype = first.key.dtype;
+    let page_size = first.key.shape.dim(1);
+    let kv_heads = first.key.shape.dim(2);
+    let head_dim = first.key.shape.dim(3);
     let element = page_dtype.bytes().unwrap_or(1).max(1);
     let token_elements = kv_heads.saturating_mul(head_dim);
     let page_elements = page_size.saturating_mul(token_elements);
     let held = (tokens as u64).min(page_size);
-    let bytes = usize::try_from(held.saturating_mul(token_elements).saturating_mul(element))
-        .unwrap_or(0);
+    let bytes =
+        usize::try_from(held.saturating_mul(token_elements).saturating_mul(element)).unwrap_or(0);
     if bytes == 0 {
         return Ok(());
     }
     let page = u64::try_from(block_table.first().copied().unwrap_or(0).max(0)).unwrap_or(0);
+    // The quantity, stated once: the served side prints the same three numbers, so a reader can
+    // tell two digests apart from two different byte ranges rather than from two different answers.
+    println!("kv digests: page {page}, {held} token(s), {bytes} bytes each");
     for (layer, plane) in planes.iter().enumerate() {
         let mut digests = String::new();
         for (name, view) in [("k", plane.key), ("v", plane.value)] {
-            let base = view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
+            let base =
+                view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
             let mut raw = vec![0_u8; bytes];
             // SAFETY: `raw` is this function's own buffer of `bytes`, and the source is the plane's
             // first page, which holds at least `held` tokens of the prompt the prefill wrote.
@@ -3638,7 +3795,14 @@ fn print_kv_digests(
             }
             digests.push_str(&format!(" {name}={:016x}", platform::fnv1a(&raw)));
         }
-        println!("kv layer{layer}:{digests}");
+        // The address each plane starts at: two layers whose planes share one address are one plane,
+        // and a digest that agrees across layers then says nothing about the arithmetic. Printing it
+        // is what tells "the same number" from "the same bytes".
+        println!(
+            "kv layer{layer}:{digests} at k=0x{:x} v=0x{:x}",
+            plane.key.ptr.address(),
+            plane.value.ptr.address()
+        );
     }
     stream.synchronize()?;
     Ok(())

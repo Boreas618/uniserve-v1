@@ -96,11 +96,10 @@ impl Default for WorkerProcessArgs {
             load_threads: None,
             parallel_degrees: Vec::new(),
             dtype: Self::DEFAULT_DTYPE,
-            quantization_config: serde_json::json!({}),
+            quantization: serde_json::json!({}),
             kv_cache_dtype: None,
             mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             worker_mesh: None,
-            distributed_backend: None,
             graph_policy: GraphPolicy::default(),
             decode_graph_batch_sizes: None,
             prefill_outputs: true,
@@ -293,7 +292,6 @@ impl WorkerProcessArgs {
             expert_order: self.expert_order.clone(),
             role: serde_name(&self.role)?,
             expert_microbatches: self.expert_microbatches,
-            distributed_backend: self.distributed_backend.clone(),
             mesh: self.worker_mesh.clone(),
             no_model: self.stub,
             load_format: serde_name(&self.load_format)?,
@@ -301,7 +299,7 @@ impl WorkerProcessArgs {
             load_threads: self.load_threads,
             parallel_degrees: self.parallel_degrees.clone(),
             model_dtype: self.dtype.as_str().to_owned(),
-            quantization_config: self.quantization_config.clone(),
+            quantization: self.quantization.clone(),
             prefix_cache_dtype: self
                 .kv_cache_dtype
                 .as_ref()

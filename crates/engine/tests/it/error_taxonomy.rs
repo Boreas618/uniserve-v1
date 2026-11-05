@@ -234,11 +234,6 @@ fn stepped_past(world: &World, from: u64) {
 /// revert.
 struct World {
     handle: CommandSender,
-    /// The scheduler's own thread. It ends when the world's command channel
-    /// closes, which is when `handle` is dropped with this struct: nothing here
-    /// joins it, so the field is kept for that lifetime rather than read.
-    #[allow(dead_code)]
-    thread: thread::JoinHandle<()>,
 }
 
 impl World {
@@ -254,12 +249,13 @@ impl World {
         )
         .expect("the simulated scheduler starts");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let thread = thread::spawn(move || {
+        // The thread detaches when its handle is dropped, which is what this
+        // fixture wants: the scheduler ends when `handle` closes the channel.
+        thread::spawn(move || {
             let _ = scheduler.run(rx);
         });
         let world = Self {
             handle: CommandSender::new(tx),
-            thread,
         };
         world
             .install("fcfs", 1, good)

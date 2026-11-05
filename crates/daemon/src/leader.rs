@@ -42,7 +42,6 @@ use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
 use crate::input::media::MediaConnector;
 use crate::input::processor::LoadModel as _;
-use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use crate::input::{
     GenerateRequest, InputProcessor, LoadedModel, LoadedRenderer, Prompt, RequestRenderer,
@@ -96,8 +95,6 @@ pub struct Leader {
     /// Independent replica worlds behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
-    /// The System One readout encoder of a model that serves the readout.
-    readout: Option<Arc<ReadoutEncoder>>,
     /// The epoch layer: the epoch records, the switch in flight and the
     /// adapter that commands the deployment's main processes (§7.4). It
     /// shares the records with the admin's `GET /admin/config`.
@@ -134,12 +131,8 @@ pub enum Task {
     /// Chat completions (`/v1/chat/completions`): every model that renders
     /// a chat prompt.
     Generate,
-    /// Image generation (`/v1/images/generations`).
-    ImageGeneration,
     /// Video generation (`/v1/videos`, `/v1/capabilities`).
     VideoGeneration,
-    /// The System One decision readout (`/v1/systemone`).
-    Readout,
 }
 
 /// Records each scheduler's statistics under `model_name`, and with
@@ -795,7 +788,7 @@ impl Leader {
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Prepared> {
         let LoadedModel {
-            config: mut model_config,
+            config: model_config,
             tokenizer,
             renderer,
         } = ModelConfig::load(config)
@@ -804,16 +797,6 @@ impl Leader {
         // Options of another model family than the served one are refused
         // rather than ignored.
         stated.refuse_foreign_options(model_config.description())?;
-        // The server's block-diffusion sampling replaces the checkpoint's
-        // defaults once, before any request is lowered.
-        if let ModelParameters::DiffusionGemma(profile) = &mut model_config.parameters {
-            profile.sampling = config
-                .diffusion_generation_config
-                .apply(profile.sampling)
-                .map_err(|message| {
-                    anyhow::anyhow!("invalid diffusion_generation_config: {message}")
-                })?;
-        }
         let max_model_len = model_config.max_model_len;
 
         // The options state the scheduler and the placement; the loaded model
@@ -826,48 +809,12 @@ impl Leader {
             eos: control_tokens.eos,
             end_of_image: control_tokens.end_of_image,
             max_model_len,
-            // Every generated canvas uses the served sampling, which the
-            // worker sizes its canvas state for and prepares its canvas
-            // steps with.
-            canvas_sampling: match &model_config.parameters {
-                ModelParameters::DiffusionGemma(profile) => Some(wire::CanvasSampling {
-                    canvas_length: profile.sampling.canvas_length,
-                    max_steps: profile.sampling.max_steps,
-                    entropy_bound: profile.sampling.entropy_bound,
-                    t_min: profile.sampling.t_min,
-                    t_max: profile.sampling.t_max,
-                    confidence_threshold: profile.sampling.confidence_threshold,
-                    stability_threshold: profile.sampling.stability_threshold,
-                }),
-                _ => None,
-            },
-            // A DiffusionGemma prompt, image block or committed block only
-            // conditions canvases: its prefill writes the prefix cache alone.
-            prefill_outputs: !matches!(model_config.parameters, ModelParameters::DiffusionGemma(_)),
+            // No model this daemon serves generates canvases: canvas sampling
+            // reaches a worker with the request that needs it, and every
+            // prefill returns the outputs its caller asked for.
+            canvas_sampling: None,
+            prefill_outputs: true,
         });
-        // Under CUDA graphs an image model's workers generate only the image
-        // sizes they capture; unless the options name them, those are the
-        // size a request gets without naming one, in both orientations.
-        let default_size = match &model_config.parameters {
-            ModelParameters::Bagel(profile) => Some(&profile.resolution_policy.default),
-            ModelParameters::SenseNova(profile) => Some(&profile.resolution_policy.default),
-            _ => None,
-        };
-        if let (Some(size), Some(graphs)) = (default_size, spec.cuda_graphs.as_mut())
-            && graphs.flow_shapes.is_none()
-        {
-            let mut shapes = vec![wire::Shape {
-                height: size.height,
-                width: size.width,
-            }];
-            if size.height != size.width {
-                shapes.push(wire::Shape {
-                    height: size.width,
-                    width: size.height,
-                });
-            }
-            graphs.flow_shapes = Some(wire::Shapes { shapes });
-        }
         // Video workers prepare exactly the canvases their denoiser names for
         // the configured resolutions and aspect ratios, refusing a pair it
         // does not generate, and report them back as the only canvases
@@ -909,7 +856,7 @@ impl Leader {
             tokenizer,
             renderer,
             spec: _,
-            max_model_len,
+            max_model_len: _,
         } = prepared;
         let model_name = config.model().to_owned();
         let info = client.info().clone();
@@ -917,16 +864,14 @@ impl Leader {
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
         // processor.
-        let mut model_files = None;
         let renderer = match renderer {
-            LoadedRenderer::Chat { renderer, files } => {
+            LoadedRenderer::Chat { renderer, .. } => {
                 // No other served model's processor takes options.
                 anyhow::ensure!(
                     config.mm_processor_kwargs.is_empty(),
                     "invalid mm_processor_kwargs: the processor of `{}` takes no options",
                     config.model()
                 );
-                model_files = Some(files);
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video(vision) => {
@@ -965,28 +910,6 @@ impl Leader {
             }
         };
 
-        // A DiffusionGemma checkpoint serves the System One readout, whose
-        // encoder renders prompts with the checkpoint's own chat template.
-        let readout = match (&model_config.parameters, &model_files) {
-            (ModelParameters::DiffusionGemma(profile), Some(files)) => {
-                let encoder = ReadoutEncoder::load(
-                    files,
-                    Arc::clone(&tokenizer),
-                    profile,
-                    config.readout_config,
-                    max_model_len,
-                )
-                .context("failed to prepare the System One readout")?;
-                info!(
-                    layout = ?config.readout_config.layout,
-                    canvas = ?config.readout_config.canvas,
-                    "serving the System One readout"
-                );
-                Some(encoder)
-            }
-            _ => None,
-        };
-
         let processor = InputProcessor::new(
             model_config,
             tokenizer,
@@ -1003,7 +926,6 @@ impl Leader {
             vec![Arc::new(client)],
             processor,
             images,
-            readout,
             config,
             observer,
             updates,
@@ -1016,19 +938,15 @@ impl Leader {
 
     /// Serves `processor`'s model under `served_model_name` over the
     /// independent replicas in `clients`, labelling metrics with `model_name`.
-    /// The clients must be nonempty and serve the same numerical capabilities.
-    ///
-    /// `images` resolves the image references of every request, and
-    /// `readout` serves `POST /v1/systemone` for a model that has one;
-    /// `options` states the request and statistics logging
-    /// (`logging_config`) and request migration (`migration_config`).
+    /// `images` resolves the image references of every request, and `options`
+    /// states the request and statistics logging (`logging_config`) and
+    /// request migration (`migration_config`).
     pub fn new(
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
         processor: InputProcessor,
         images: MediaConnector,
-        readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
@@ -1038,7 +956,6 @@ impl Leader {
             clients,
             processor,
             images,
-            readout,
             options,
             Arc::default(),
             updates,
@@ -1057,7 +974,6 @@ impl Leader {
         clients: Vec<Arc<EngineClient>>,
         processor: InputProcessor,
         images: MediaConnector,
-        readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
         observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
@@ -1109,7 +1025,6 @@ impl Leader {
             info,
             replicas,
             images,
-            readout: readout.map(Arc::new),
             updates,
             log_requests: logging.log_requests,
             _stats_logger: stats_logger,
@@ -1140,20 +1055,14 @@ impl Leader {
     /// The tasks this engine serves.
     ///
     /// A video model serves video generation alone; every other model serves
-    /// chat completions, an omni model image generation as well, and a model
-    /// with a readout encoder the System One readout.
+    /// chat completions, and a model that generates images serves image
+    /// generation as well.
     pub fn supported_tasks(&self) -> Vec<Task> {
         let mut tasks = Vec::new();
         if self.processor.video_service().is_some() {
             tasks.push(Task::VideoGeneration);
         } else {
             tasks.push(Task::Generate);
-        }
-        if self.processor.supports_image_output() {
-            tasks.push(Task::ImageGeneration);
-        }
-        if self.readout.is_some() {
-            tasks.push(Task::Readout);
         }
         tasks
     }
@@ -1171,11 +1080,6 @@ impl Leader {
     /// The connector every request's image references go through.
     pub(crate) fn images(&self) -> &MediaConnector {
         &self.images
-    }
-
-    /// The System One readout encoder, when this model serves the readout.
-    pub(crate) fn readout_encoder(&self) -> Option<&Arc<ReadoutEncoder>> {
-        self.readout.as_ref()
     }
 
     /// Fetches the input images of a generation request, renders and
@@ -2537,9 +2441,8 @@ impl Replica {
     /// Has the serving engine give back its KV cache and CUDA graph storage
     /// and keep its weights, as vLLM's `sleep` does: new requests wait, the
     /// token requests in flight, image-generating ones included, are
-    /// recomputed once it wakes, the video requests in flight continue from
-    /// their stored step, and readouts finish first. Returns what each
-    /// worker reported.
+    /// recomputed once it wakes, and the video requests in flight continue
+    /// from their stored step. Returns what each worker reported.
     ///
     /// # Errors
     ///
@@ -2766,7 +2669,10 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         // successor: this daemon's watch sees that client go away by design, and a
         // relaunch here would start a second engine for a deployment another daemon
         // serves.
-        if replica.handed_over.load(std::sync::atomic::Ordering::Acquire) {
+        if replica
+            .handed_over
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             tracing::info!(
                 %reason,
                 "this daemon handed its engine over; the successor owns it, so it is not relaunched here"
@@ -2888,31 +2794,24 @@ struct SpecialTokenIds {
 
 /// Resolves the control tokens the engine uses for the loaded model.
 ///
-/// `bos` and `end_of_image` come from the profile's `GenerationControls` and
-/// are `0` for profiles without them (`Qwen3` and `MiniMaxH3`). The EOS list
+/// `bos` and `end_of_image` are each `0`: every profile the daemon serves
+/// states neither, and the engine reads `0` as "no such token". The EOS list
 /// is the model's complete EOS set with the primary EOS placed first (and
 /// added when the set lacks it). The order matters to the engine scheduler,
 /// which substitutes `eos[0]` for the token of a completion that commits
-/// none. The primary EOS is the nonzero `GenerationControls::eos` when
-/// present, otherwise `ModelConfig::primary_eos_token_id`; when neither
-/// exists the list keeps the set's ascending order.
+/// none. The primary EOS is `ModelConfig::primary_eos_token_id`; without it
+/// the list keeps the set's ascending order.
 fn special_token_ids(model: &ModelConfig) -> SpecialTokenIds {
-    let controls = model.generation_controls();
-    let bos = controls.map_or(0, |value| value.bos);
-    let end_of_image = controls.map_or(0, |value| value.end_of_image);
-    let primary_eos = controls
-        .map(|value| value.eos)
-        .filter(|value| *value != 0)
-        .or(model.primary_eos_token_id);
+    let primary_eos = model.primary_eos_token_id;
     let mut eos = model.eos_token_ids.iter().copied().collect::<Vec<_>>();
     if let Some(primary_eos) = primary_eos {
         eos.retain(|value| *value != primary_eos);
         eos.insert(0, primary_eos);
     }
     SpecialTokenIds {
-        bos,
+        bos: 0,
         eos,
-        end_of_image,
+        end_of_image: 0,
     }
 }
 
@@ -3032,7 +2931,6 @@ mod tests {
             configured_tokenizer(),
             "lost-engine-model".into(),
             vec![Arc::clone(&client)],
-            None,
         );
         assert!(engine.is_healthy());
 
@@ -3072,7 +2970,6 @@ mod tests {
             configured_tokenizer(),
             "sim-model".into(),
             clients.clone(),
-            None,
         );
 
         // Both requests are submitted before either stream is read, so the

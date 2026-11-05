@@ -6,7 +6,7 @@ post-attention norm and gated MLP, while one attention call covers the packed
 tokens of all routes, so every route reads and writes the same prefix cache
 layer. ``IndexedRoutes`` assign the packed tokens to routes: every token
 takes a dense route and a sparse route takes over a static list of rows
-(BAGEL's image markers, which take the ``text`` route among ``flow``
+(image markers, which take the ``text`` route among ``flow``
 latents); calls without routes run every token through the first route.
 
 ``MoTLayer`` owns that composition and the residual flow. A subclass states

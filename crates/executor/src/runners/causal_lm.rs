@@ -836,6 +836,245 @@ fn runner_dump() -> bool {
 }
 
 /// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
+/// Whether a replay walks its batch eagerly instead of launching the bucket's graph.
+///
+/// A diagnosis of one question: is a wrong answer the batch the runner staged, or the graph it
+/// launched? Both are answered by the same run, because the walk uses the same columns, the same arena
+/// and the same programs. It is never a serving path: an eager walk is what capture does, and a
+/// deployment that ran it would launch every operator again on every batch.
+/// Every layer's attention output, digested at the launch that wrote it.
+///
+/// The buffer a layer is attended into is the forward's and the next layer overwrites it, so a digest
+/// read after the graph has run answers for the last layer whichever name it carries. This reads one
+/// layer's bytes while they exist, which is the only reading that can say whether a layer's own
+/// attention program wrote anything.
+#[derive(Default)]
+struct AttentionOutputs {
+    written: std::cell::RefCell<Vec<(usize, String, usize)>>,
+}
+
+impl AttentionOutputs {
+    /// One digest of a view, read on the launching stream: `None` when the copy cannot be made.
+    fn digest(view: nn::TensorView, stream: &platform::Stream) -> Option<(String, usize)> {
+        let bytes = usize::try_from(view.shape.numel())
+            .ok()
+            .zip(view.dtype.bytes())
+            .map(|(elements, width)| elements.saturating_mul(width as usize))?;
+        if bytes == 0 {
+            return None;
+        }
+        let mut raw = vec![0_u8; bytes];
+        // SAFETY: the buffer is this call's own and of `bytes`, and the source is an address a launch
+        // was just given. The copy is issued on the launching stream, so it is ordered after the write.
+        let copied = unsafe {
+            platform::memcpy_async(raw.as_mut_ptr() as u64, view.ptr.address(), bytes, stream)
+        };
+        if copied.is_err() || stream.synchronize().is_err() {
+            return None;
+        }
+        let nonzero = raw.iter().filter(|byte| **byte != 0).count();
+        Some((format!("{:016x}", platform::fnv1a(&raw)), nonzero))
+    }
+}
+
+impl nn::AttentionProbe for AttentionOutputs {
+    fn attention(
+        &self,
+        layer: usize,
+        query: nn::TensorView,
+        out: nn::TensorView,
+        stream: &platform::Stream,
+    ) {
+        let (Some((query_digest, query_nz)), Some((out_digest, out_nz))) =
+            (Self::digest(query, stream), Self::digest(out, stream))
+        else {
+            return;
+        };
+        self.written.borrow_mut().push((
+            layer,
+            format!("{query_digest} qnz={query_nz} o={out_digest} onz={out_nz}"),
+            0,
+        ));
+    }
+}
+
+impl AttentionOutputs {
+    /// `l<n>=<digest> nz=<bytes>` per layer, in the order the layers ran.
+    fn spelled(&self) -> String {
+        let written = self.written.borrow();
+        if written.is_empty() {
+            return "none".to_owned();
+        }
+        written
+            .iter()
+            .map(|(layer, digest, _)| format!("l{layer}:{digest}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn eager_replay() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER.get_or_init(|| {
+        std::env::var_os("UNISERVE_EAGER_REPLAY").is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// Whether a replay compares the graph it is about to launch with a fresh capture of the same walk.
+///
+/// A captured node keeps what the host computed when the capture ran - the kernel's arguments, the
+/// tensor maps built from the pose, every device pointer the walk derived from it - and the walk that
+/// serves a batch issues the same launches with the batch's own values. Comparing the two, node for
+/// node in capture order, names the first place the graph and the walk disagree, which is the
+/// difference between a replay that answers right and one that does not.
+fn graph_diff() -> bool {
+    static DIFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIFF.get_or_init(|| {
+        std::env::var_os("UNISERVE_GRAPH_DIFF").is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// Every kernel node of one walk's table, in capture order, with the operator it belongs to.
+fn kernel_nodes<'a>(
+    nodes: &'a crate::captured::Nodes,
+) -> Vec<(&'static str, &'a platform::GraphNode)> {
+    nodes
+        .iter()
+        .flat_map(|(operator, _, launch)| launch.iter().map(move |node| (*operator, &node.node)))
+        .collect()
+}
+
+/// The first difference between one node's captured launch and the same launch issued live.
+fn launch_difference(
+    captured: &platform::OwnedKernelNodeParams,
+    walked: &platform::OwnedKernelNodeParams,
+) -> Option<String> {
+    if captured.grid != walked.grid {
+        return Some(format!(
+            "grid replay={:?} walk={:?}",
+            captured.grid, walked.grid
+        ));
+    }
+    if captured.block != walked.block {
+        return Some(format!(
+            "block replay={:?} walk={:?}",
+            captured.block, walked.block
+        ));
+    }
+    if captured.shared_memory != walked.shared_memory {
+        return Some(format!(
+            "shared replay={} walk={}",
+            captured.shared_memory, walked.shared_memory
+        ));
+    }
+    if captured.parameters.len() != walked.parameters.len() {
+        return Some(format!(
+            "arguments replay={} walk={}",
+            captured.parameters.len(),
+            walked.parameters.len()
+        ));
+    }
+    // A pointer is printed as the word it is: the two blobs differ in a value only where something
+    // the host computed at capture time was replaced by something it computed for this batch.
+    let word = |blob: &[u8], at: usize| -> u64 {
+        blob.get(at & !7..(at & !7) + 8)
+            .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap_or([0; 8])))
+            .unwrap_or(0)
+    };
+    for (index, (replay, live)) in captured.parameters.iter().zip(&walked.parameters).enumerate() {
+        if replay.len() != live.len() {
+            return Some(format!(
+                "argument {index}: replay={} bytes walk={} bytes",
+                replay.len(),
+                live.len()
+            ));
+        }
+        if let Some(at) = replay.iter().zip(live).position(|(left, right)| left != right) {
+            return Some(format!(
+                "argument {index} byte {at}: replay={:#x} walk={:#x}",
+                word(replay, at),
+                word(live, at)
+            ));
+        }
+    }
+    None
+}
+
+/// What a serving graph's attention launches baked, beside what the batch it serves states.
+///
+/// A captured node keeps the host's values from capture time, and **the batch size is the one of them a
+/// batch can contradict**: the graph states `mBatchSize` from the pose it recorded, and a replay of that
+/// graph for a batch with another row count leaves the kernel working on rows the batch does not hold.
+/// The other four numbers are stated by geometry rather than by a pose - the longest query, the longest
+/// key, the CTA split and the pages per sequence - so they are printed beside the batch's figures rather
+/// than compared with them, and a reader sees whether the graph's own geometry is the one the deployment
+/// wants.
+///
+/// It reads and compares; it captures, launches and allocates nothing, because a diagnosis that disturbs
+/// the path it measures answers about itself.
+fn baked_difference(
+    captured: &crate::captured::Captured,
+    bucket: Bucket,
+    staging: &Staging,
+) -> String {
+    let graph = captured.template();
+    let nodes = kernel_nodes(captured.nodes());
+    let rows = i64::from(bucket.rows);
+    let live = staging.live_tokens();
+    let longest = staging
+        .batch_rows()
+        .seq_lens
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    let mut seen = 0usize;
+    let mut baked = None;
+    for (operator, node) in &nodes {
+        if *operator != "paged_attention" {
+            continue;
+        }
+        let Ok(params) = graph.kernel_node_params(node) else {
+            continue;
+        };
+        let Some(blob) = params.parameters.first() else {
+            continue;
+        };
+        // `fmha::KernelParams`' offsets, as `notes/exec/attention-bound.md` records them.
+        let integer = |at: usize| -> i64 {
+            blob.get(at..at + 4)
+                .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap_or([0; 4]))))
+                .unwrap_or(0)
+        };
+        let numbers = (
+            integer(1132),
+            integer(1172),
+            integer(1176),
+            integer(1184),
+            integer(1188),
+        );
+        if baked.is_none() {
+            baked = Some(numbers);
+        }
+        seen += 1;
+    }
+    let Some((batch, max_q, max_kv, ctas_kv, pages)) = baked else {
+        return "no attention node in the graph".to_owned();
+    };
+    if batch != rows {
+        return format!(
+            " first=paged_attention batch baked={batch} this batch rows={rows} \
+             (live_tokens={live} longest_row_kv={longest})"
+        );
+    }
+    format!(
+        " attention={seen} batch={batch}={rows} baked[max_q={max_q} max_kv={max_kv} \
+         ctas_kv={ctas_kv} pages_per_seq={pages}] batch[live_tokens={live} \
+         longest_row_kv={longest}] all=same"
+    )
+}
+
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
     for (index, value) in values.iter().enumerate() {
@@ -952,58 +1191,6 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
          cached prefix would read pages that were never copied"
             .into(),
     ))
-}
-
-/// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
-///
-/// The package hands `TllmGenFmhaRunnerParams` to the kernel **by value**, so the node's argument
-/// blob is that struct: every pointer it holds was resolved at capture and every scalar in it is
-/// what the replay uses, with no host-side figure of the batch anywhere in between. Offsets are
-/// `sizeof`/`offsetof` of the shipped header
-/// (`flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h`, 496 bytes), read with a
-/// three-line C++ probe compiled against that header rather than counted by hand.
-fn decode_fmha_params(bytes: &[u8]) -> String {
-    const SIZE: usize = 496;
-    if bytes.len() < SIZE {
-        return format!("blob={}B (not the {SIZE} of TllmGenFmhaRunnerParams)", bytes.len());
-    }
-    let pointer = |at: usize| -> u64 {
-        u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
-    };
-    let integer = |at: usize| -> i32 {
-        i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
-    };
-    format!(
-        "fmha blob={} mask={} kernel={} sched={} multi_cta={} q={:#x} k={:#x} v={:#x} \
-         page_idx={:#x} seq_lens_kv={:#x} cum_q={:#x} out={:#x} batch={} max_q={} max_kv={} \
-         sum_q={} sum_kv={} pages_per_seq={} tokens_per_page={} pages_in_pool={} heads_q={} \
-         q_stride_tokens={} k_stride_kv={} pdl={} stream={:#x}",
-        bytes.len(),
-        integer(4),
-        integer(8),
-        integer(12),
-        bytes[16] != 0,
-        pointer(24),
-        pointer(32),
-        pointer(40),
-        pointer(152),
-        pointer(128),
-        pointer(136),
-        pointer(296),
-        integer(380),
-        integer(388),
-        integer(392),
-        integer(404),
-        integer(408),
-        integer(412),
-        integer(416),
-        integer(420),
-        integer(368),
-        integer(312),
-        integer(320),
-        bytes[488] != 0,
-        pointer(480)
-    )
 }
 
 /// Whether a block table view holds `bytes` readable bytes of page indices.
@@ -1244,6 +1431,14 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// launch carries and the pointers the kernel dereferences. A kernel handed a table of zeros or
     /// a bound of one reads nothing, and no host-side figure says which.
     pending_attention: Option<String>,
+    /// Whether this runner has served a batch. A bucket captured before that may be warmed by an
+    /// eager walk; one captured afterwards may not, because the walk would run a forward over an
+    /// arena a serving bucket owns.
+    served: bool,
+    /// Whether a capture is in flight: a probe that copies and synchronises is legal between
+    /// launches and **not** inside a recording, where a synchronise is refused by the driver and a
+    /// failed one can leave the recording in a state it never recovers from.
+    capturing: bool,
     pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
@@ -1338,6 +1533,41 @@ impl<M: CausalLm> CausalLmRunner<M> {
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
         let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
+        // One contract, checked once, before any bucket is captured: the attention program states
+        // how many pages a row of the block table holds (`ceil(max_kv_len / page_size)`), and the
+        // cache allocates rows of its own width. A program that states more pages than a row holds
+        // addresses entries the row does not own - the next slot's pages, or past the table - and
+        // the page index it reads there is a unit no descriptor covers. That reads as an illegal
+        // address in the FMHA kernel, one batch in, and nothing on the host can see it.
+        if let Some(cache) = kv.cache() {
+            let width = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tables()
+                .width();
+            let pages = usize::try_from(
+                geometry
+                    .max_kv_len
+                    .div_ceil(kv.page_size().max(1)),
+            )
+            .unwrap_or(usize::MAX);
+            if width < pages {
+                return Err(Error::Invariant(format!(
+                    "the cache's block-table rows are {width} pages wide and the attention \
+                     program's geometry needs {pages} (max_kv_len {} over {} tokens per page): a row \
+                     this program addresses reads pages it does not own",
+                    geometry.max_kv_len,
+                    kv.page_size()
+                )));
+            }
+            tracing::info!(
+                width,
+                pages,
+                max_kv_len = geometry.max_kv_len,
+                page_size = kv.page_size(),
+                "the block table is wide enough for the pages the attention program addresses"
+            );
+        }
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
         } else {
@@ -1363,6 +1593,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             cache_page: None,
             pending_attention: None,
+            served: false,
+            capturing: false,
             pending_install: None,
             pending_dump: None,
             last_prefill: None,
@@ -1722,6 +1954,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                let launched = Instant::now();
+                // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
+                // same model, launched operator by operator instead of as one graph. It splits every
+                // remaining question in two - a wrong answer here is what the runner *staged*, and a
+                // right answer here is capture or replay - without a second deployment to compare
+                // against.
+                let eager = eager_replay();
+                if eager {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        generation = *generation,
+                        live_tokens = self.staging.live_tokens(),
+                        "this replay walks the batch eagerly instead of launching its graph"
+                    );
+                    // Cloned before the walk: the epoch is borrowed for the walk itself.
+                    let kernels = self.lifecycle.generation_named(*generation)?.clone();
+                    self.walk(*bucket, &kernels)?;
+                }
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
@@ -1742,12 +1992,28 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
-                let launched = Instant::now();
+                // What the graph baked against what this batch states, node by node: a captured
+                // node keeps the host's values from capture time, and the numbers a pose decides -
+                // the batch size, the sum of the query lengths, the maximum key length, the CTA
+                // split - are the ones a graph and a batch can disagree about silently. This reads
+                // the graph's own parameters and the staged columns; it captures nothing, launches
+                // nothing and allocates nothing, because a diagnosis that disturbs the path it
+                // measures answers about itself.
+                if graph_diff() {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        difference = %baked_difference(captured, *bucket, &self.staging),
+                        "the serving graph's baked numbers against the batch it is serving"
+                    );
+                }
                 let enqueue = Instant::now();
-                captured.launch(&stream)?;
+                let nodes = captured.kernel_nodes();
+                if !eager {
+                    captured.launch(&stream)?;
+                }
                 self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
-                    counters.launches(captured.kernel_nodes());
+                    counters.launches(nodes);
                 }
                 // The captured launch's token bound is the pose the bucket was captured with, which
                 // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
@@ -1757,15 +2023,27 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // computes for itself.
                 let live = self.staging.live_tokens();
                 if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
+                    // The bound alone says the launch runs work this batch does not hold; what the
+                    // work *does* is decided by the columns those rows read, and the rows past the
+                    // live span are the ones no operator wrote. A slot there is either absent
+                    // (`-1`, which the cache write skips) or left from another batch, and a row
+                    // naming a slot this batch never allocated is a write outside its pages - which
+                    // the device reports as an illegal address two commands later.
                     tracing::warn!(
                         captured_tokens = bucket.tokens,
                         live_tokens = live,
+                        beyond = %self.beyond_span(live, u64::from(bucket.tokens)),
                         "a prefill bucket's captured launch states more tokens than this batch \
                          holds: the bound was taken from the pose the bucket was captured with"
                     );
                 }
+                self.served = true;
                 if runner_dump() {
-                    let call = self.dump_attention_call(captured, first_page.or(self.cache_page));
+                    let call = format!(
+                        "{}{}",
+                        self.dump_attention_call(captured, first_page.or(self.cache_page)),
+                        self.dump_layer_probes(captured)
+                    );
                     self.pending_attention = Some(call);
                 }
                 if runner_dump() {
@@ -1892,9 +2170,82 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// executable are the same for every runner, so those live in [`Lifecycle`].
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
+        self.warm(bucket, &kernels)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        // The recording's own window: nothing that synchronises may run inside it.
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        let walked = walked?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
+    }
+
+    /// Walks a bucket's pose once *before* it is captured, so every operator's first-use host work
+    /// is done outside the recording.
+    ///
+    /// A capture records launches, not the host work behind them. An operator that builds a runner,
+    /// loads a cubin or compiles a module on its first call does that work inside the recording, and
+    /// the graph then replays a launch whose preparation never happened again - which is how a
+    /// captured attention writes nothing while the same call outside a graph works. One eager walk
+    /// of the same pose makes every operator ready, so the capture records launches of things that
+    /// exist. The operator's entry can refuse a capture that meets an unprepared runner; this is what
+    /// keeps that refusal from firing on a healthy warmup.
+    ///
+    /// It runs only where a bucket is first captured - a warmup, before the bucket serves - and not
+    /// where a bucket is rebound: a hot update's new operators are warmed by the shadow pass, and an
+    /// eager walk of a new generation over a serving bucket's own arena is work the switchover
+    /// design does not allow.
+    fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
+        // A warm walk runs over the arena of the bucket it walks, so it must not do so while another
+        // bucket's batch is staged: that batch owns the staging and may be half-served. A walk of the
+        // bucket whose own batch is staged is the opposite of a hazard, and it is the case a capture
+        // after serving depends on - the launches build the plans for exactly the pose the capture
+        // records, and an operator whose plan was never built cannot be captured at all (a cuBLASLt
+        // plan allocates its workspace, which a capture cannot carry).
+        // No gate on having served: a capture is its own job on this thread, dispatched between
+        // batches rather than inside one (`Job::Capture`), so no batch is ever mid-serve here and the
+        // warm walk of one bucket can never replace another's. Skipping the walk for a bucket
+        // captured after serving left the plan of every later bucket to be built *inside* its own
+        // recording - which no capture can carry, because a cuBLASLt plan allocates its workspace.
+
+        let began = std::time::Instant::now();
+        // The pose, stated before the walk that can fault on it: a warm launch that dies names the
+        // numbers it was given, and the table it read, rather than leaving them to be inferred from
+        // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged - which is how a
+        // capture during serving walks the serving batch rather than replacing it with a warm pose.
+        if self.staging.staged() != Some(bucket) {
+            self.stage_warm(bucket)?;
+        }
+        let (lengths, offsets) = warm_span(bucket);
+        tracing::info!(
+            bucket = %bucket,
+            rows = bucket.rows,
+            tokens = bucket.tokens,
+            calls = warm_calls(bucket).len(),
+            seq_lens = ?lengths,
+            query_offsets = ?offsets,
+            // The third statement of the same partition: the count the kernels bound by. It must
+            // equal the last of `query_offsets` and the tokens the calls own, and a capture where
+            // those three disagree is an operand no descriptor can match.
+            live_tokens = self.staging.live_tokens(),
+            page_size = self.geometry.page_size,
+            max_kv_len = self.geometry.max_kv_len,
+            "a bucket's warm pose"
+        );
+        if runner_dump() {
+            tracing::info!(bucket = %bucket, pose = %self.dump_kernel_arguments(bucket),
+                "a bucket's warm pose, as the columns and the page table hold it");
+        }
+        self.walk(bucket, kernels)?;
+        // The warm launches are real device work on the pool's stream; a capture begun over them is
+        // legal and does not contain them, but nothing may plan a mapping while they are in flight.
+        self.stream.synchronize()?;
+        tracing::debug!(
+            bucket = %bucket,
+            warm_ms = began.elapsed().as_secs_f64() * 1e3,
+            "a bucket's operators were warmed before its capture"
+        );
+        Ok(())
     }
 
     /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
@@ -2266,6 +2617,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
         {
             self.greedy_first_tokens(logits, rows, sampling)?;
         }
+        // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
+        // a kernel that answers the width instead of the last index is a defect and not a token,
+        // and a token one past the vocabulary reaches the tokenizer as an out-of-range id. The
+        // check is here, once, on the readback of every batch: it costs one comparison and it
+        // turns a batch of nonsense tokens into a refusal at the first step that produced one.
+        if let Some(row) = ids.iter().position(|id| {
+            let id = *id;
+            id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
+        }) {
+            return Err(Error::Invariant(format!(
+                "row {row} sampled token {} outside the vocabulary of {}",
+                ids[row], self.geometry.vocabulary
+            )));
+        }
         let states = states_of(
             self.staging.slots(rows),
             self.staging.batch_rows(),
@@ -2611,15 +2976,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return format!("{shape} no-parameters");
         };
         if bytes.len() != 8 {
-            // The two plane pointers the launch carries, beside the addresses this runner's own
-            // layer 0 has: a graph reading another plane is invisible from every host-side figure,
-            // and the digest below would then describe bytes the kernel never touched.
-            let key = u64::from_ne_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
-            let value = u64::from_ne_bytes(bytes[40..48].try_into().unwrap_or([0; 8]));
+            // A native package does not hand the kernel a pointer to the operator's call: the
+            // trtllm-gen entry builds the kernel's own `KernelParams` and launches it by value, so
+            // the node's argument **is** that struct - 1344 bytes, its first 512 five TMA
+            // descriptors rather than addresses. Every scalar in it is what the replay uses, and
+            // its three grid extents name the launch this node holds.
             return format!(
-                "{shape} {}{}{}",
-                decode_fmha_params(bytes),
-                self.plane_verdict(key, value),
+                "{shape} {}{}",
+                self.decode_kernel_params(bytes),
                 self.dump_cache_digests(first_page)
             );
         }
@@ -2801,6 +3165,141 @@ impl<M: CausalLm> CausalLmRunner<M> {
         out
     }
 
+    /// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
+    ///
+    /// The entry hands the kernel `flashinfer::trtllm::fmha::KernelParams` **by value**, so the
+    /// node's argument blob is that struct: 1344 bytes whose first 896 are seven `CUtensorMap`
+    /// descriptors (Q, K, the sparse pool, V, O, and the two FP4 scale descriptors), followed by
+    /// the grid, the output pointer, the sequence and page vectors, and the launch's integers.
+    ///
+    /// **The offsets are the struct's own, and the run confirmed two of them independently:**
+    /// `cum_seq_lens_q` landed at 936 and `seq_lens` at 1096 in the blob the caller printed, which
+    /// is where `ptrCumSeqLensQ` and `ptrSeqLensKv` sit. The remaining fields follow that same
+    /// field order, so the numbers below are read at their declared positions rather than guessed.
+    ///
+    /// **Q, K and V are not plain pointers here.** They travel inside `tmaQ_`/`tmaK_`/`tmaV_`, and a
+    /// descriptor stores its base address encoded with swizzle and alignment bits - which is why a
+    /// scan of the blob finds the sequence vectors verbatim and no plane address at all. That
+    /// verdict compares the descriptor's first word with the plane under an alignment mask and says
+    /// `masked` when they agree only after it, `OTHER` when they do not.
+    fn decode_kernel_params(&self, bytes: &[u8]) -> String {
+        const SIZE: usize = 1344;
+        if bytes.len() < SIZE {
+            return format!("kparams blob={}B (not the {SIZE} of fmha::KernelParams)", bytes.len());
+        }
+        let pointer = |at: usize| -> u64 {
+            u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+        };
+        let integer = |at: usize| -> i32 {
+            i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+        };
+        let verdict = |name: &str, at: u64, own: u64| -> String {
+            if at == 0 {
+                format!(" {name}=null")
+            } else if at == own {
+                format!(" {name}=own")
+            } else {
+                format!(" {name}=OTHER({at:#x})")
+            }
+        };
+        let mut out = format!(
+            "kparams blob={} grid=[{},{},{}] batch={} window={} chunked_log2={} \
+             out={:#x} cum_q={:#x} cum_kv={:#x} page_idx={:#x} seq_lens_kv={:#x} \
+             counter={:#x} partial_o={:#x} stats={:#x} tmaQ={:#x} tmaK={:#x} \
+             tmaKsw={:#x} tmaV={:#x} tmaO={:#x} {}",
+            bytes.len(),
+            integer(896),
+            integer(900),
+            integer(904),
+            integer(1132),
+            integer(1128),
+            integer(1136),
+            pointer(912),
+            pointer(936),
+            pointer(944),
+            pointer(1016),
+            pointer(1096),
+            pointer(1000),
+            pointer(1024),
+            pointer(1112),
+            pointer(0),
+            pointer(128),
+            pointer(256),
+            pointer(384),
+            pointer(512),
+            // The kernel may store O through its own tensor map rather than through `ptrO`, and the
+            // two are different statements of where attention's output is. If they differ, the
+            // tensor the projection reads was never written - which is what an all-zero attention
+            // output looks like from the projection's end.
+            if pointer(512) == pointer(912) {
+                "out_view=tmaO==ptrO".to_string()
+            } else {
+                format!(
+                    "out_view=DIFFERS tmaO={:#x} ptrO={:#x}",
+                    pointer(512),
+                    pointer(912)
+                )
+            }
+        );
+        // The launch's own lengths, at the offsets `KernelParams` declares them: `mMaxSeqLenQ` 1172,
+        // `mMaxSeqLenKv` 1176, the CTA bounds 1180 and 1184, `mMaxNumPagesPerSeqKv` 1188, and the
+        // head counts 1192 and 1196. The head counts are the cross-check - `mNumHeadsKv` must equal
+        // the KV plane's heads - so the block needs no device fact to be trusted.
+        out.push_str(&format!(
+            " max_q={} max_kv={} ctas_q={} ctas_kv={} pages_per_seq={} heads_kv={} heads_q={}",
+            integer(1172),
+            integer(1176),
+            integer(1180),
+            integer(1184),
+            integer(1188),
+            integer(1192),
+            integer(1196)
+        ));
+        // Past `mNumHeadsQPerKv` the struct holds a `cuda::fast_mod_div<int32_t>` whose width this
+        // host cannot read, so the tail is stated as a window rather than at offsets chosen by
+        // arithmetic: the pair `(mSumOfSeqLensQ, mSumOfSeqLensKv)` identifies itself, because the
+        // query lengths sum to the tokens the call was built for and the KV lengths do not.
+        let mut tail = String::new();
+        for at in (1256..1288).step_by(4) {
+            tail.push_str(&format!("{} ", integer(at)));
+        }
+        out.push_str(&format!(" tail@1256=[{tail}]"));
+        if let Ok(planes) = self.kv.planes(0) {
+            if let Some(first) = planes.first() {
+                out.push_str(&format!(
+                    " plane_heads={} plane_pages={}",
+                    first.key.shape.dim(2),
+                    first.key.shape.dim(0)
+                ));
+            }
+        }
+        out.push_str(&verdict("cum_q", pointer(936), self.columns.query_offsets.device.ptr.address()));
+        out.push_str(&verdict("seq_lens_kv", pointer(1096), self.columns.seq_lens.device.ptr.address()));
+        match self.kv.planes(0) {
+            Ok(planes) => match planes.first() {
+                Some(first) => {
+                    let masked = |at: u64, own: u64| -> &'static str {
+                        if at & !0x3ff == own & !0x3ff {
+                            "masked"
+                        } else {
+                            "OTHER"
+                        }
+                    };
+                    out.push_str(&format!(
+                        " planes=layer0:{}/{}(K,V descriptor vs plane) layer0K={:#x} layer0V={:#x}",
+                        masked(pointer(128), first.key.ptr.address()),
+                        masked(pointer(384), first.value.ptr.address()),
+                        first.key.ptr.address(),
+                        first.value.ptr.address()
+                    ));
+                }
+                None => out.push_str(" planes=empty"),
+            },
+            Err(error) => out.push_str(&format!(" planes=refused({error})")),
+        }
+        out
+    }
+
     /// Whether the plane pointers a launch carries are this runner's own layer 0 planes.
     fn plane_verdict(&self, key: u64, value: u64) -> String {
         let Ok(planes) = self.kv.planes(0) else {
@@ -2846,6 +3345,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let live = self.staging.live_tokens().max(1);
         let held = page_size.min(live);
         let mut out = String::from(" cache:");
+        let first_elements = planes
+            .first()
+            .map(|plane| plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3)))
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "(page {page}, {held} token(s), {} bytes each)",
+            held.saturating_mul(first_elements).saturating_mul(element)
+        ));
         for (layer, plane) in planes.iter().enumerate() {
             let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
             let page_elements = page_size.saturating_mul(token_elements);
@@ -2873,6 +3380,400 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     None => out.push_str(&format!("{name}=unreadable ")),
                 }
             }
+        }
+        out
+    }
+
+    /// What the slot column holds for the rows a captured bound names beyond this batch's span.
+    ///
+    /// The cache write reads one slot per row of the launch's grid. Rows past the live span are rows
+    /// this batch never staged, so their slots are whatever the column last held: `-1` (which the
+    /// write skips), a slot of an earlier batch (a write into another request's pages), or a value
+    /// nothing ever wrote (a write into pages that do not exist, which is an illegal address on the
+    /// device). The three are indistinguishable from the bound alone, and only the third faults.
+    fn beyond_span(&self, live: u64, tokens: u64) -> String {
+        let first = usize::try_from(live).unwrap_or(0);
+        let count = usize::try_from(tokens.saturating_sub(live)).unwrap_or(0).min(4096);
+        if count == 0 {
+            return "none".to_owned();
+        }
+        let address = self.columns.slot_mapping.device.ptr.address().saturating_add((first as u64) * 4);
+        let Some(raw) = self.read_device(address, count * 4) else {
+            return "unreadable".to_owned();
+        };
+        let mut negative = 0_usize;
+        let mut largest = i64::MIN;
+        let mut first_few = String::new();
+        for (index, word) in raw.chunks_exact(4).enumerate() {
+            let slot = i32::from_ne_bytes(word.try_into().unwrap_or([0; 4]));
+            if slot < 0 {
+                negative += 1;
+            } else {
+                largest = largest.max(i64::from(slot));
+            }
+            if index < 4 {
+                first_few.push_str(&format!("{slot},"));
+            }
+        }
+        format!("rows={count} negative={negative} max={largest} first=[{first_few}]")
+    }
+
+    /// The tensors a captured graph writes, read back from the pointers its own launches name.
+    ///
+    /// Layer 0's keys and values are byte-identical to the slice's and layer 1's are not, so the
+    /// disagreement lies between layer 0's KV write and layer 1's projection: attention's output,
+    /// `o_proj`, the residual, the post-attention norm, the router, the experts, or the second
+    /// residual. Nothing on the host says what a kernel in the middle of a captured graph wrote -
+    /// its own arguments say where it wrote it. So this reads two sets of buffers:
+    ///
+    /// * every attention launch's output, at `KernelParams::ptrO` (offset 912 of the struct the node
+    ///   carries), stated with the launch's own grid so a decode launch and a prefill launch are
+    ///   told apart;
+    /// * for the first [`LAYER_PROBE_NODES`] launches, every 8-byte word of their arguments that
+    ///   lands inside the graph's arena, once per distinct address, labelled by the launch that
+    ///   names it first.
+    ///
+    /// Each digest covers the batch's own span - `live` rows of `hidden` elements at the forward's
+    /// element width - so a row here and a slice dump of the same tensor are comparable as bytes
+    /// rather than by name, and a tensor the two sides agree on shows up as one address whose digest
+    /// matches. It reads memory, so it runs only under the dump and only on the device thread, and
+    /// every failure becomes text.
+    fn dump_layer_probes(&self, captured: &crate::captured::Captured) -> String {
+        /// How far into the graph the pointer table reads: layer 0's segment, which is the stretch
+        /// between the KV write and layer 1's projection.
+        const LAYER_PROBE_NODES: usize = 64;
+
+        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+        let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
+        let element = usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let width = live.saturating_mul(hidden).saturating_mul(element);
+        if live == 0 || width == 0 {
+            return " probes=none".to_owned();
+        }
+        let (start, reserved) = match self.pool() {
+            Ok(mut pool) => match pool.base(self.stream_id()) {
+                Ok(base) => (base.address(), pool.reserved() as u64),
+                Err(error) => return format!(" probes=no-arena({error})"),
+            },
+            Err(error) => return format!(" probes=no-pool({error})"),
+        };
+        let inside_bytes = |address: u64, bytes: usize| {
+            address >= start && (address - start).saturating_add(bytes as u64) <= reserved
+        };
+        let inside = |address: u64| inside_bytes(address, width);
+        let mut out = String::from(" probes:");
+        // Every extent an attention launch named as its output. If the layers share one, a digest read
+        // after the whole graph says nothing about what any single layer wrote: the last writer of
+        // that extent is the one being read, and the reading is the graph's rather than a layer's.
+        let mut attn_extents: Vec<u64> = Vec::new();
+
+        // The span the launch reads, as the columns hold it *now*: `cum_seq_lens_q` names where each
+        // row's queries start and end, and `seq_lens` how many keys that row may read. A bound baked
+        // at capture and a span uploaded per batch disagree exactly when these numbers and the
+        // launch's own `max_q`/`sum_q` disagree, and every row after the batch's own comes from that.
+        let spelled = |raw: &[u8]| {
+            let values: Vec<String> = raw
+                .chunks_exact(4)
+                .map(|word| i32::from_ne_bytes(word.try_into().unwrap_or([0; 4])).to_string())
+                .collect();
+            if values.len() > 8 {
+                format!("{},+{}", values[..8].join(","), values.len() - 8)
+            } else {
+                values.join(",")
+            }
+        };
+        for (name, address, count) in [
+            ("cum_q", self.columns.query_offsets.device.ptr.address(), live + 1),
+            ("seq_lens", self.columns.seq_lens.device.ptr.address(), live),
+        ] {
+            let bytes = count.saturating_mul(4).min(4096);
+            match self.read_device(address, bytes) {
+                Some(raw) => out.push_str(&format!(" {name}[{}]", spelled(&raw))),
+                None => out.push_str(&format!(" {name}=unreadable")),
+            }
+        }
+
+        // Attention outputs, by layer: the one tensor this runner can name without a layout guess,
+        // because the node's own argument is the struct that holds the pointer.
+        let mut layer = 0_usize;
+        let mut layer0_out = 0_u64;
+        let mut dirty = Vec::new();
+        for (operator, _, launches) in captured.nodes() {
+            if *operator != "paged_attention" {
+                continue;
+            }
+            for launch in launches {
+                let params = captured.template().kernel_node_params(&launch.node).ok();
+                let address = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(912..920))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let grid = params
+                    .as_ref()
+                    .map(|params| format!("{:?}", params.grid))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                // A digest names a value; a byte count names its content. An output nobody wrote
+                // reads as all zeros, which is the same digest for every batch - and that is a
+                // different defect from an output written wrongly, so it is stated beside the digest.
+                let (named, written) = if address == 0 {
+                    ("null".to_owned(), String::new())
+                } else if !inside(address) {
+                    ("outside".to_owned(), String::new())
+                } else {
+                    match self.read_device(address, width) {
+                        Some(raw) => (
+                            format!("{:016x}", platform::fnv1a(&raw)),
+                            format!(" nz={}", raw.iter().filter(|byte| **byte != 0).count()),
+                        ),
+                        None => ("unreadable".to_owned(), String::new()),
+                    }
+                };
+                // The partial matrix and stats the multi-CTA split fills: the FMHA kernel writes
+                // these and a separate reduction turns them into the output, so nonzero partials
+                // beside a zero output is that reduction not having run.
+                let partial = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(1024..1032))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let split = if partial != 0 && self.in_arena(partial, 4096) {
+                    self.read_device(partial, 4096)
+                        .map(|raw| {
+                            format!(" pnz={}", raw.iter().filter(|byte| **byte != 0).count())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                // The multi-CTA counter, read after the launch: a reduction that leaves it dirty
+                // hands the next launch a counter that never reaches its CTA bound, which is the
+                // shape of an illegal address on the *second* batch rather than the first.
+                let counter = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(1000..1008))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let counter_value = if counter != 0 && self.in_arena(counter, 4) {
+                    self.read_device(counter, 4)
+                        .map(|raw| i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4])))
+                } else {
+                    None
+                };
+                let counted = match counter_value {
+                    Some(value) => format!(" cnt={value}"),
+                    None => String::new(),
+                };
+                if !attn_extents.contains(&address) {
+                    attn_extents.push(address);
+                }
+                if layer == 0 && address != 0 {
+                    layer0_out = address;
+                }
+                if let Some(value) = counter_value {
+                    if value != 0 {
+                        dirty.push((layer, value));
+                    }
+                }
+                // Where the launch's own tensor map says the output is. A kernel may store O through
+                // `tmaO_` rather than through `ptrO`, and the two are different statements of one
+                // address: a zero `ptrO` beside a nonzero map is attention writing a tensor the
+                // projection never reads, which is what an all-zero attention output looks like from
+                // the projection's end.
+                let tma_o = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(512..520))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let mapped = if tma_o != 0 && tma_o != address && inside(tma_o) {
+                    match self.read_device(tma_o, width) {
+                        Some(raw) => format!(
+                            " map={:016x} mapnz={}",
+                            platform::fnv1a(&raw),
+                            raw.iter().filter(|byte| **byte != 0).count()
+                        ),
+                        None => " map=unreadable".to_owned(),
+                    }
+                } else if tma_o != 0 && tma_o != address {
+                    format!(" map={tma_o:#x}-outside")
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}"
+                ));
+                if layer0_out != 0 && address == layer0_out && layer > 0 {
+                    out.push_str("(shared)");
+                }
+                layer += 1;
+            }
+        }
+
+        // Which layers left the multi-CTA counter dirty, and what the graph's kernels actually are.
+        // The counter is a semaphore the kernels reset, so a nonzero value after a launch is a
+        // protocol that did not complete - and the layers that share the value are the answer to
+        // "which batches", because every layer of one batch is launched by the same graph.
+        out.push_str(&format!(" cnt_dirty={}/{}", dirty.len(), layer));
+        if !dirty.is_empty() {
+            let named: Vec<String> = dirty
+                .iter()
+                .take(6)
+                .map(|(layer, value)| format!("L{layer}={value}"))
+                .collect();
+            out.push_str(&format!("[{}]", named.join(",")));
+        }
+        // An operator's name says what asked for a launch; the kernel's name says what ran. A
+        // protocol that is two launches shows as two names under one operator, and a launch filed
+        // under the wrong operator cannot hide.
+        let mut functions: Vec<(String, usize)> = Vec::new();
+        for (_, _, launches) in captured.nodes() {
+            for launch in launches {
+                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
+                    continue;
+                };
+                let name = params
+                    .function
+                    .name()
+                    .unwrap_or_else(|error| format!("unnamed({error})"));
+                match functions.iter_mut().find(|(known, _)| *known == name) {
+                    Some((_, count)) => *count += 1,
+                    None => functions.push((name, 1)),
+                }
+            }
+        }
+        out.push_str(&format!(" attn_extents={}", attn_extents.len()));
+        functions.sort_by(|left, right| right.1.cmp(&left.1));
+        // Every function of the graph, not the twelve most frequent: the question the histogram
+        // answers is which kernels are *absent* (a reduction node, a reduction's second launch), and
+        // a truncated list cannot answer it - a count of 1 at the end of the list is exactly what an
+        // absent kernel looks like from the top.
+        let spelled: Vec<String> = functions
+            .iter()
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect();
+        out.push_str(&format!(" functions=[{}]", spelled.join(",")));
+
+        // The projection out of the attention block: the slice's `attended` cut is the attention
+        // block's output *projected out and before the residual add*, so the tensor to compare
+        // against is not the one the FMHA kernel wrote but the one the gemm after it wrote. The gemm
+        // is named by its own call layout's `input` holding attention's output address, not by its
+        // position, so a graph that reorders its layers still pairs correctly.
+        if layer0_out != 0 {
+            use ops::gemm::GEMM_CALL_LAYOUT;
+            let word = |blob: &[u8], at: usize| -> u64 {
+                blob.get(at..at + 8)
+                    .map(|w| u64::from_ne_bytes(w.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0)
+            };
+            let projection = captured.nodes().iter().find_map(|(operator, _, launches)| {
+                if *operator != "gemm" {
+                    return None;
+                }
+                launches.iter().find_map(|launch| {
+                    let params = captured.template().kernel_node_params(&launch.node).ok()?;
+                    let blob = params.parameters.first()?;
+                    if word(blob, GEMM_CALL_LAYOUT.input) != layer0_out {
+                        return None;
+                    }
+                    Some(word(blob, GEMM_CALL_LAYOUT.out))
+                })
+            });
+            match projection {
+                Some(address) if inside(address) => match self.read_device(address, width) {
+                    Some(raw) => out.push_str(&format!(
+                        " proj0={:016x} from={:#x}",
+                        platform::fnv1a(&raw),
+                        layer0_out
+                    )),
+                    None => out.push_str(" proj0=unreadable"),
+                },
+                Some(_) => out.push_str(" proj0=outside"),
+                None => {
+                    // Say who does name it, so a deployment whose projection is not called `gemm`
+                    // states that instead of leaving the absence unexplained.
+                    let mut named = Vec::new();
+                    for (operator, _, launches) in captured.nodes() {
+                        if *operator == "paged_attention" || named.contains(operator) {
+                            continue;
+                        }
+                        let carries = launches.iter().any(|launch| {
+                            captured
+                                .template()
+                                .kernel_node_params(&launch.node)
+                                .ok()
+                                .map(|params| {
+                                    params.parameters.iter().any(|blob| {
+                                        blob.chunks_exact(8).any(|word| {
+                                            u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]))
+                                                == layer0_out
+                                        })
+                                    })
+                                })
+                                .unwrap_or(false)
+                        });
+                        if carries {
+                            named.push(*operator);
+                        }
+                    }
+                    out.push_str(&format!(" proj0=no-gemm; names={}", named.join(",")));
+                }
+            }
+        }
+
+        // Then every arena pointer the first launches name, once per address, with the launches that
+        // name it. A tensor's producer and its consumer both carry its address, so naming them
+        // answers the question no host figure can: does the operator after attention read the buffer
+        // attention wrote, or one the forward staged at capture?
+        let mut seen: Vec<(u64, Vec<(usize, String)>)> = Vec::new();
+        let mut index = 0_usize;
+        'nodes: for (operator, _, launches) in captured.nodes() {
+            for launch in launches {
+                if index >= LAYER_PROBE_NODES {
+                    break 'nodes;
+                }
+                index += 1;
+                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
+                    continue;
+                };
+                for blob in &params.parameters {
+                    for word in blob.chunks_exact(8) {
+                        let address = u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]));
+                        // Sixty-four bytes is the smallest span worth a digest: a sequence vector, a
+                        // counter and a page table all fit in it, and a digest of a shorter span
+                        // would name nothing.
+                        if !inside_bytes(address, 64) {
+                            continue;
+                        }
+                        let naming = (index, (*operator).to_owned());
+                        match seen.iter_mut().find(|(named, _)| *named == address) {
+                            Some((_, names)) if names.len() < 3 && !names.contains(&naming) => {
+                                names.push(naming);
+                            }
+                            Some(_) => {}
+                            None => seen.push((address, vec![naming])),
+                        }
+                    }
+                }
+            }
+        }
+        for (slot, (address, names)) in seen.iter().take(32).enumerate() {
+            let bytes = if inside(*address) { width } else { 64 };
+            let digest = match self.read_device(*address, bytes) {
+                Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
+                None => "unreadable".to_owned(),
+            };
+            let mut spelled = String::new();
+            for (node, operator) in names {
+                spelled.push_str(&format!(" n{node}{operator}"));
+            }
+            out.push_str(&format!(" p{slot}={digest}@{bytes}B{spelled}"));
+        }
+        if seen.len() > 32 {
+            out.push_str(&format!(" (+{} more)", seen.len() - 32));
         }
         out
     }
@@ -2952,9 +3853,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let slots = self.staging.slots(rows).to_vec();
         let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
         let live = seq_lens.iter().filter(|&&length| length > 0).count();
+        // The three statements of one partition, beside the rows they describe: a query count, the
+        // partition it makes, and the count the kernels bound by. A batch where they disagree is an
+        // operand mismatch, and it is the reading a one-row and a three-row pose of one bucket differ
+        // in - which is where a fault that appears above one row has to be.
+        let query_offsets = self.staging.batch_rows().query_offsets.to_vec();
+        let calls = self.staging.batch_rows().calls.len();
         let mut out = format!(
-            "rows={rows} live_rows={live} seq_lens={seq_lens:?} slots={slots:?} page_size={} \
-             max_kv_len={}",
+            "rows={rows} live_rows={live} seq_lens={seq_lens:?} query_offsets={query_offsets:?} \
+             live_tokens={} calls={calls} slots={slots:?} page_size={} max_kv_len={}",
+            self.staging.live_tokens(),
             self.kv.page_size(),
             self.geometry.max_kv_len,
         );
@@ -3198,6 +4106,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// the nodes it records are the ones the live graph has and the addresses are the same each
     /// time. It launches nothing: the stream is capturing.
     fn walk(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
+        self.walk_body(bucket, generation)
+    }
+
+    /// The walk's own work, without the wrapper a throwaway capture needs.
+    fn walk_body(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
         let stream = self.stream.clone();
         match self.staging.staged() {
             Some(staged) if staged == bucket => {}
@@ -3213,8 +4126,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.pool()?.reserved(),
         );
         let batch = self.token_batch(bucket)?;
-        let forward = Forward::new(&stream, generation, &arena)
+        // Under the dump, every layer's attended output is read at its own launch: the buffer is
+        // reused by the next layer, so any later reading is the last layer's whichever name it has.
+        let probe = AttentionOutputs::default();
+        let mut forward = Forward::new(&stream, generation, &arena)
             .with_live_tokens(self.columns.live_tokens.device);
+        // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
+        // inside a capture is refused by the driver - which is a measurement that breaks what it
+        // measures, and one that no line of its own would ever explain.
+        if runner_dump() && !self.capturing {
+            forward = forward.with_attention_probe(&probe);
+        }
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -3233,6 +4155,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
             Ok(())
         })?;
+        if runner_dump() {
+            tracing::info!(
+                bucket = %bucket,
+                outputs = %probe.spelled(),
+                "attention outputs, each read at its own layer's launch"
+            );
+        }
         if first {
             self.pool()?.record(self.stream_id(), bucket, arena.used())?;
         }
@@ -3391,35 +4320,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn stage_warm(&mut self, bucket: Bucket) -> Result<Shape> {
         let tokens = bucket.tokens as usize;
         let rows = bucket.rows as usize;
+        let span = warm_span(bucket);
         let columns = BatchColumns {
             rows: nn::BatchRows {
                 positions: vec![0; tokens],
                 slot_mapping: vec![-1; tokens],
-                // One row carries the bucket's whole token run and the rest carry none: a prefill
-                // graph's attention reads `query_offsets` as a partition of `num_tokens`, so a warm
-                // pose that gave every row one token would describe a batch of `rows` tokens wearing
-                // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
-                seq_lens: {
-                    let mut lengths = vec![1_i32; rows];
-                    lengths[0] = bucket.tokens as i32;
-                    lengths
-                },
-                query_offsets: {
-                    let mut offsets = vec![bucket.tokens as i32; rows + 1];
-                    offsets[0] = 0;
-                    offsets
-                },
+                // The partition the launch reads, and the calls below are the same shape a serving
+                // batch states: `warm_span` and `warm_calls` state each rule once, with the reason
+                // beside it, because both were once the prefill form applied to a decode bucket.
+                seq_lens: span.0,
+                query_offsets: span.1,
                 logits_rows: vec![-1; rows],
-                calls: vec![nn::BatchRow {
-                    request: 0,
-                    kind: if bucket.variant.is_decode() {
-                        nn::RowKind::Decode
-                    } else {
-                        nn::RowKind::Prefill
-                    },
-                    cache_group: 0,
-                    rows: 0..bucket.tokens,
-                }],
+                calls: warm_calls(bucket),
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
@@ -3434,12 +4346,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
-            commit: inert_commit(1),
-            page_size: 1,
-            max_kv_len: 1,
+            commit: inert_commit(if bucket.variant.is_decode() { rows } else { 1 }),
+            // The geometry the upload hands the model, and the same two values the serving pose
+            // states (`token_batch_with`): a captured node's page size and key bound are its own,
+            // so a warm pose that stated its own would freeze a page of one token and a reduction
+            // of one key into the graph every served batch then replays. `page_size` is the
+            // cache's and `max_kv_len` the model's; neither is a property of a bucket, so no pose
+            // states one of its own.
+            page_size: self.geometry.page_size,
+            max_kv_len: self.geometry.max_kv_len,
         };
         self.staging
-            .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
+            .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
     }
 
 }
@@ -3585,6 +4503,77 @@ pub fn calls_output(
 /// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
 /// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
 /// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+/// The span a warm pose states: `seq_lens` per row, and `query_offsets` per row boundary.
+///
+/// A prefill row carries a multi-token run, so the first row holds the bucket's whole extent and the
+/// rest hold none - a partition of `num_tokens` into one run. **A decode row is one query token of
+/// its own sequence**, so its partition is the identity: row `i` holds `cum_seq_lens_q[i]..[i + 1]`,
+/// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
+/// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
+/// partition no tensor has computes a tiling and a mask that no buffer matches.
+/// The calls a warm pose states: one per row for a decode bucket, one over the run for a prefill.
+///
+/// A decode row is one request's one token, and `Staging::stage` extends a batch to one call per
+/// padded row in exactly this form, so a decode pose that stated one call holding the whole token run
+/// would describe a batch no serving batch has - and a capture states its pose to the model for the
+/// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
+/// bucket's tokens.
+/// The call ids of a bucket's warm pose: one per call `warm_calls` states.
+///
+/// `Staging::stage` refuses a pose whose call ids do not name every call of its rows, and a decode
+/// bucket's warm pose states one call per row - so a single `CallId(0)` is a pose of one call
+/// wearing eight. The ids are positional: a call's id names its slot in the batch's tables, and a
+/// warm pose has no request to carry one.
+fn warm_call_ids(bucket: Bucket) -> Vec<CallId> {
+    warm_calls(bucket)
+        .into_iter()
+        .enumerate()
+        .map(|(index, _)| CallId(index as u64))
+        .collect()
+}
+
+fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
+    let rows = bucket.rows;
+    if bucket.variant.is_decode() {
+        (0..rows)
+            .map(|row| nn::BatchRow {
+                request: 0,
+                kind: nn::RowKind::Decode,
+                cache_group: 0,
+                rows: row..row + 1,
+            })
+            .collect()
+    } else {
+        vec![nn::BatchRow {
+            request: 0,
+            kind: nn::RowKind::Prefill,
+            cache_group: 0,
+            rows: 0..bucket.tokens,
+        }]
+    }
+}
+
+fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
+    let rows = usize::try_from(bucket.rows).unwrap_or(0);
+    let tokens = bucket.tokens as i32;
+    // Every warm row's slot is `-1`, and `resident.rs:258-273` states the rule that goes with it: an
+    // absent row is filled with page zero - the pool's reserved padding unit - **and its `seq_lens`
+    // entry states the same zero**, because a row that names page zero and claims a key makes the
+    // kernel read the padding unit as if a request had written it. That is a launch with no request
+    // behind it, and at more than one row it is an address the pool does not own.
+    let lengths = vec![0_i32; rows];
+    let offsets = if bucket.variant.is_decode() {
+        (0..=rows as i32).collect()
+    } else {
+        let mut offsets = vec![tokens; rows + 1];
+        if let Some(first) = offsets.first_mut() {
+            *first = 0;
+        }
+        offsets
+    };
+    (lengths, offsets)
+}
+
 fn warm_parameters(rows: usize) -> Vec<f32> {
     let columns = ops::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
@@ -3668,6 +4657,59 @@ fn gather_indices(
 
 #[cfg(test)]
 mod tests {
+    use super::{Bucket, Variant, warm_span};
+
+    #[test]
+    fn a_decode_bucket_partitions_its_queries_one_per_row() {
+        // The defect this guards: the pose gave row 0 the whole run, which is the prefill partition,
+        // and the attention kernel then computed four queries in row 0 of a tensor holding one row
+        // per token - the launch that faulted at four rows and never at one.
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(
+            query_offsets,
+            vec![0, 1, 2, 3, 4],
+            "a decode row is one query token, so the partition is the identity"
+        );
+        assert_eq!(
+            seq_lens,
+            vec![0, 0, 0, 0],
+            "a warm row's slot is absent, and an absent row claims no key"
+        );
+    }
+
+    #[test]
+    fn a_decode_bucket_states_one_call_per_row() {
+        // The second pose defect: one call holding the bucket's whole token run is a shape no
+        // serving decode batch has, and a capture states its pose to the model for the bucket's
+        // life. A decode row is one request's one token.
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let calls = super::warm_calls(bucket);
+        assert_eq!(calls.len(), 4, "one call per decode row");
+        for (row, call) in calls.iter().enumerate() {
+            assert_eq!(call.kind, nn::RowKind::Decode);
+            assert_eq!(
+                call.rows,
+                row as u32..row as u32 + 1,
+                "a decode call holds one token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefill_bucket_gives_its_first_row_the_whole_run() {
+        // A prefill row carries a multi-token run: the partition puts every token in row 0 and the
+        // reach of every other row at zero, which is what the kernel reads to split the run.
+        let bucket = Bucket::prefill(2, 512, Variant::PrefillOutput);
+        let (seq_lens, query_offsets) = warm_span(bucket);
+        assert_eq!(query_offsets, vec![0, 512, 512]);
+        assert_eq!(
+            seq_lens,
+            vec![0, 0],
+            "a warm row's slot is absent, and an absent row claims no key"
+        );
+    }
+
     /// A page readback is bounded by the plane it reads before any copy is issued: the driver's
     /// error sticks to the runner's stream, so a read outside the allocation would not merely lose
     /// a diagnostic, it would fail the batch after it.

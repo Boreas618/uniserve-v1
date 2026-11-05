@@ -68,18 +68,6 @@ pub(crate) enum Command {
     /// request interface.
     #[command(hide = true)]
     Engine(EngineArgs),
-    /// Run one worker: the process a node's daemon starts for each worker
-    /// of a worker group placed on the node.
-    #[command(
-        hide = true,
-        disable_help_flag = true,
-        override_usage = "uniserve worker --engine ADDRESS --worker-id ID --rank R --generation G"
-    )]
-    Worker {
-        /// The worker's arguments, which the worker library parses.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        arguments: Vec<OsString>,
-    },
     /// The Storage Server of this host and the operator's commands against
     /// it.
     Storage(Box<StorageArgs>),
@@ -131,7 +119,7 @@ mod tests {
                     Some("program-server") => "program-server",
                     _ => "other",
                 },
-                Command::Engine(_) | Command::Worker { .. } => "other",
+                Command::Engine(_) => "other",
             };
             assert_eq!(name, expected);
         }

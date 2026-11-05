@@ -143,8 +143,7 @@ pub struct BuildConfig {
     pub mem_fraction_static: f64,
     /// Element type of parameters and activations.
     pub dtype: ModelDtype,
-    /// The checkpoint's quantization (§1). The configuration field is
-    /// `quantization_config` until §7.7 replaces it with `quantization`.
+    /// The checkpoint's quantization (§1).
     pub quantization: Map<String, Value>,
     /// Tensor-parallel workers of each scheduler.
     pub tensor_parallel_size: NonZeroUsize,
@@ -193,7 +192,7 @@ impl BuildConfig {
             max_running_requests: config.max_running_requests,
             mem_fraction_static: config.mem_fraction_static,
             dtype: config.dtype,
-            quantization: config.quantization_config.clone(),
+            quantization: config.quantization.clone(),
             tensor_parallel_size: config.tensor_parallel_size,
             data_parallel_size: config.data_parallel_size,
             worker_groups: config.worker_groups.clone(),
@@ -1478,10 +1477,6 @@ pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
 /// the model's processor options) and the ones the daemon reads alone
 /// (logging, the update's own policy and the admin API's address). A change
 /// of them is a hot restart of the process that reads them (§7.5).
-///
-/// `readout_config` and `diffusion_generation_config` are the daemon's own
-/// today and belong to neither list; §7.7 retires them, and until then a
-/// change of them is the host layer's rather than silently ignored.
 pub fn host_layer_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
     crate::options::daemon_options_differ(current, target)
         || current.update_config != target.update_config
@@ -2202,9 +2197,6 @@ mod tests {
             ("decode_attention_backend", |config: &mut ServeConfig| {
                 config.decode_attention_backend = Some("trtllm".to_owned())
             }),
-            ("moe_config.exchange", |config: &mut ServeConfig| {
-                config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
-            }),
             ("moe_runner_backend", |config: &mut ServeConfig| {
                 config.moe_runner_backend = Some("cutlass".to_owned())
             }),
@@ -2241,6 +2233,30 @@ mod tests {
                 "{what} moves the programs"
             );
         }
+
+        // The exchange is a program only where experts are spread over ranks:
+        // a single-rank deployment's MoE block takes its local arm and launches
+        // no exchange at all (`nn::Moe::forward` routes through
+        // `forward_expert_parallel` only when an expert lives on another rank),
+        // so the setting moves nothing there — and filling the slot anyway
+        // would pin a program no call reaches.
+        let exchange_only = set(|config: &mut ServeConfig| {
+            config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
+        });
+        assert_eq!(
+            layer(&base, &Deployment::of(exchange_only.clone())),
+            Layer::None,
+            "at one rank the exchange setting moves nothing"
+        );
+        let mut spread = ServeConfig::default();
+        spread.moe_config.expert_parallel = true;
+        let mut spread_exchanged = spread.clone();
+        spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
+        assert_eq!(
+            layer(&Deployment::of(spread), &Deployment::of(spread_exchanged)),
+            Layer::Program,
+            "in an expert-parallel deployment the exchange moves the programs"
+        );
 
         // Only the epoch layer's values build the main process: the host
         // layer's and the program layer's leave the build config equal

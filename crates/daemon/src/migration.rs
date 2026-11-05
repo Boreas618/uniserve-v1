@@ -1031,9 +1031,8 @@ mod tests {
     /// The interleaved request of the image tests: a four-token prompt whose
     /// greedy text opens an image on `trigger`, at most three images of six
     /// denoising steps, fed back by a vision encoder whose feature write
-    /// samples the next token (`sampled`, as SenseNova feeds images back), or
-    /// by a latent encoder after which decoding continues with a configured
-    /// token (as BAGEL does).
+    /// samples the next token (`sampled`), or by a latent encoder after which
+    /// decoding continues with a configured token.
     fn interleaved(trigger: u32, sampled: bool) -> GenerationRequest {
         let encoder = ImageEncoderInput {
             encoder: if sampled {
