@@ -387,7 +387,15 @@ pub struct Partition {
 }
 
 impl Partition {
-    /// An unsharded deployment: one rank holds every block, sized for the released checkpoint.
+    /// An unsharded deployment: one rank holds every block, sized at the released checkpoint's own
+    /// conditioning table.
+    ///
+    /// **This capacity is not a deployment's.** `RELEASED_CONDITION_ROWS` describes the reference's
+    /// rasters; an H3 keyframe is a whole generated frame, so a partition built here keys its packed
+    /// row bound - and with it the dense attention's `max_kv_len`, which is part of a program's key -
+    /// at a bound no store holds. Anything that states a program takes [`Self::serving`], which
+    /// derives the capacity from the task; this exists for a caller that needs ranks and blocks and
+    /// no capacity at all.
     pub fn single() -> Self {
         Self {
             ulysses_degree: 1,
@@ -511,6 +519,9 @@ impl Partition {
     /// `tensor_rank` and `sequence_rank` are two different groups' positions, and both are stated: a
     /// deployment that sharded the denoiser's sequence and named only the text encoder's rank would
     /// have every rank draw the same noise.
+    ///
+    /// The capacity is the released table's, as in [`Self::single`]: a caller that states programs
+    /// wants [`Self::serving`], which derives it from the task.
     pub fn new(
         config: &Config,
         ulysses_degree: usize,
