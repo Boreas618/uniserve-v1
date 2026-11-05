@@ -1,7 +1,8 @@
 //! The cache unit pool's device storage and its unit-level resets.
 //!
-//! Each field (key, value) owns separate allocations in the layout the
-//! numerical cache library reads (`uniserve.prefix_cache.units`):
+//! Each field (key, value) owns separate allocations in the layout the cache
+//! computations read - the executor's operators, and the unit resets below,
+//! which address these fields directly:
 //!
 //! | Field | Element | Shape |
 //! | --- | --- | --- |
@@ -937,7 +938,8 @@ impl CachePlanes {
         let mut restored = 0;
         let mut failure = None;
         for field in 0..self.values.len() {
-            if let Err(error) = owner.restore_segments(&spec_of(field), &self.values[field], &indices)
+            if let Err(error) =
+                owner.restore_segments(&spec_of(field), &self.values[field], &indices)
             {
                 failure = Some(error);
                 break;
