@@ -457,13 +457,25 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // latent frames, which is the caller's own rule (`padded_samples`) and not a rounding here.
     let length = minimax_h3::encoding::padded_samples(u64::from(request.track), encoder.hop())
         .map_err(|error| error.to_string())?;
+    // The encoder reads the stereo pair: two batch rows, one channel each, which is the shape
+    // `unpack_samples` hands it after a mono track has been expanded to two identical channels.
+    // One row encodes half a track of latent frames and every count downstream accepts it, so the
+    // shape is stated here rather than left to the caller's convenience.
     let samples = arena
-        .tensor(DType::F32, Shape::new(&[1, 1, length]))
+        .tensor(DType::F32, Shape::new(&[u64::from(minimax_h3::config::AUDIO_CHANNELS), 1, length]))
         .map_err(|error| error.to_string())?;
     let frames = encoder.frames(length).map_err(|error| error.to_string())?;
     let channels = u64::from(config.latent_channels);
+    // The latents are channel-major: both channels' frames as `2 * frames` rows, the stereo pair
+    // named in the row count rather than a batch dimension.
     let out = arena
-        .tensor(DType::F32, Shape::new(&[frames, channels]))
+        .tensor(
+            DType::F32,
+            Shape::new(&[
+                u64::from(minimax_h3::config::AUDIO_CHANNELS) * frames,
+                channels,
+            ]),
+        )
         .map_err(|error| error.to_string())?;
 
     let mut recorded = Recorded::default();
