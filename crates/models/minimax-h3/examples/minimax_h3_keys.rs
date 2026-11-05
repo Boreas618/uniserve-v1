@@ -491,7 +491,7 @@ fn main() {
             clip_frames.clone(),
         )
         .unwrap_or_else(|error| panic!("the deployment's VAE rows are not statable: {error}"));
-        match deployment.vae_rows() {
+        match deployment.own_vae_rows() {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the audio VAE's rows are not statable: {error}"),
         }
