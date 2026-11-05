@@ -216,38 +216,24 @@ fn run() -> Result<(), String> {
             // The caller's `component-tensors.json`: the four components' stored element types, which
             // no shardless host can read for itself.
             "--types" => types = Some(PathBuf::from(value()?)),
-            // `tile,sparsity[,reference_keep]`: the bound the compression reduces over is the
-            // deployment's own, computed from its layouts at load, so it is not a flag here.
+            // `tile,sparsity[,reference_keep]`: read by the model's own rule, so a string either
+            // H3 tool is handed is accepted or refused by one sentence. The tile bound the
+            // compression reduces over is the deployment's own, computed from its layouts at load,
+            // and no flag states it.
             "--sparse" => {
                 let stated = value()?;
-                let parts: Vec<&str> = stated.split(',').collect();
-                if parts.len() != 2 && parts.len() != 3 {
-                    return Err(
-                        "--sparse is `tile,sparsity[,reference_keep]` here: the recorder derives the \
-                         tile bound (`Layouts::tiles_bound`) as the deployment's own, so unlike the \
-                         walk's `tile,sparsity,tiles[,reference_keep]` there is no tile count to \
-                         state - and a third value is the keep rate, which must lie in (0, 1]"
-                            .to_owned(),
-                    );
+                match minimax_h3::config::AttentionKind::sparse_of(&stated)
+                    .map_err(|error| error.to_string())?
+                {
+                    minimax_h3::config::AttentionKind::Sparse {
+                        tile,
+                        sparsity,
+                        reference_keep,
+                    } => sparse = Some((tile, sparsity, reference_keep)),
+                    minimax_h3::config::AttentionKind::Dense => {
+                        return Err("--sparse states a sparse deployment".to_string());
+                    }
                 }
-                sparse = Some((
-                    parts[0]
-                        .trim()
-                        .parse()
-                        .map_err(|_| "--sparse's tile is a row count")?,
-                    parts[1]
-                        .trim()
-                        .parse()
-                        .map_err(|_| "--sparse's sparsity is a fraction")?,
-                    match parts.get(2) {
-                        Some(keep) => Some(
-                            keep.trim()
-                                .parse()
-                                .map_err(|_| "--sparse's keep rate is a fraction")?,
-                        ),
-                        None => None,
-                    },
-                ));
             }
             "--list" => list = true,
             "--names" => names = true,
