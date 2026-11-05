@@ -290,6 +290,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let audio = root.join("audio_vae/config.json");
     if audio.exists() {
+        // The two audio VAEs state F32 rows by the design's own table, and neither component takes a
+        // type - so a checkpoint that stored the audio VAE in another type would be walked at F32 and
+        // read as served. It is refused here rather than stated, because making the components take a
+        // type is their owner's change and a silent F32 is the defect this flag exists to end.
+        if audio_type != ops::DType::F32 {
+            return Err(format!(
+                "this checkpoint stores the audio VAE in {audio_type:?}: the audio components state \
+                 F32 rows by design and take no type, so a walk here would state rows no launch asks"
+            )
+            .into());
+        }
         let config = AudioVaeConfig::parse(&read(&audio)?)?;
         // `--samples` is the deployment's clip lengths in **frames**; a decode starts from the
         // track's **latent frames** and `AudioDecoder::programs` takes that quantity. Passing the
