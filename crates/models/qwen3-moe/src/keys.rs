@@ -40,6 +40,7 @@ use nn::layers::{
     TILE_ROWS,
 };
 use ops::Op;
+use ops::fp4::ScaleLayout;
 use ops::attention::Phase;
 use ops::gemm::WeightOrder;
 use ops::moe::exchange::Mode;
@@ -278,14 +279,19 @@ pub fn keys(
             let local = width(partition.expert_range(config).len(), "local expert count")?;
             push("moe_sort", moe.sort_descriptor(local).to_string());
             if experts_encoded {
-                for k in [
-                    hidden,
-                    width(config.moe_intermediate_size, "expert intermediate width")?,
+                // The two encodings the forward states: the gated product's operand in the linear
+                // form, the plain product's in the 128x4 swizzled form. The walk states one key per
+                // descriptor the forward launches, so it states these two exactly as they are.
+                for (k, layout) in [
+                    (hidden, ScaleLayout::Linear),
+                    (
+                        width(config.moe_intermediate_size, "expert intermediate width")?,
+                        Moe::ACTIVATION_SCALE_LAYOUT,
+                    ),
                 ] {
                     push(
                         <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                        Moe::quantize_descriptor_of(dtype, k, Moe::ACTIVATION_SCALE_LAYOUT)
-                            .to_string(),
+                        Moe::quantize_descriptor_of(dtype, k, layout).to_string(),
                     );
                 }
                 push(
