@@ -641,10 +641,13 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 );
             }
         }
-        normalized(&mut sources, at("widen.weight"), format!("{base}.5"));
-        region(&mut sources, at("widen.bias"), format!("{base}.5.bias"));
-        // The stage's own Snake sits between the last unit and the widening convolution.
-        region(&mut sources, at("snake.alpha"), format!("{base}.4.alpha"));
+        // The stage's pieces are numbered as the checkpoint numbers them: `block.3` is the stage's own
+        // Snake, between the last residual unit and the widening convolution, and `block.4` is the
+        // widen itself. One index higher asks for names no shard holds (`block.5`), which no shape
+        // check can see and only the read of the missing tensor reports.
+        region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
+        normalized(&mut sources, at("widen.weight"), format!("{base}.4"));
+        region(&mut sources, at("widen.bias"), format!("{base}.4.bias"));
     }
     // The network ends with a Snake and the output convolution.
     region(
@@ -2001,7 +2004,8 @@ impl AudioEncoder {
         let projection = Projection::load(config, &mut binder, frames)?;
         let channels = u64::from(config.latent_channels);
         let mean = Conv1d::new(
-            binder.region("mean_projection.weight", &[channels, channels])?,
+            // A 1x1 convolution is stored 3-d like every other filter: `[out, in, 1]`.
+            binder.region("mean_projection.weight", &[channels, channels, 1])?,
             Some(binder.region("mean_projection.bias", &[channels])?),
             crate::audio_vae::geometry(1, 1, 0)?,
             false,
