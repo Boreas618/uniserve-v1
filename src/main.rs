@@ -44,7 +44,7 @@ const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
 const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Caps the default number of Tokio executor threads when `TOKIO_WORKER_THREADS` is unset.
+/// Caps the default number of Tokio worker threads when `TOKIO_WORKER_THREADS` is unset.
 ///
 /// The cap bounds scheduling overhead on machines with many logical CPUs.
 /// Returns `None`, leaving the choice to Tokio's builder, when the variable
@@ -63,7 +63,7 @@ fn tokio_worker_threads() -> Option<usize> {
                 info!(
                     available_parallelism = available,
                     capped_worker_threads = worker_threads,
-                    "capping tokio executor threads, set {TOKIO_WORKER_THREADS_ENV} to override"
+                    "capping tokio worker threads, set {TOKIO_WORKER_THREADS_ENV} to override"
                 );
             }
             worker_threads
