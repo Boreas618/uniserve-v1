@@ -604,21 +604,24 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
-            // `SegmentAttention`'s key bound is in **rows** and must be whole tiles; `tiles` is a count
-            // of tiles. Passing the count made the fine attention's bound eight tiles where the
-            // selection may choose `tiles` of them, which a 512-tile walk argument hid because 512 is
-            // a multiple of 64: the refusal is by rows, so the shortfall was silent.
+            // The fine attention's key extent is the packed rows the program serves, which is what the
+            // model's own forward passes (`attention_sparse.rs:127`) and is whole tiles by
+            // construction: the stream holds the video, text, conditioning and audio tiles, so a bound
+            // counted in video tiles alone is short by the rest.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles) * u64::from(tile),
+                u64::from(rows),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
             // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            // The factor table's row is one channel per rotated **pair**, `rotated / 2` - the shape the
+            // descriptor states for the cosine and sine tables. A row of `rotated` is twice the table
+            // the kernel reads, and the stride is compiled in.
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated / 2)),
             );
             programs.launch::<ops::segments::VsaZeroPadding>(&tiles_layer.zero_padding_descriptor(dtype));
             programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
@@ -627,7 +630,7 @@ impl Transformer {
                 &tiles_layer.add_gated_tiles_descriptor(dtype),
             );
             programs.launch::<ops::segments::VsaSelectTiles>(
-                &tiles_layer.select_descriptor(u64::from(tiles))?,
+                &tiles_layer.select_descriptor()?,
             );
             programs.launch::<SparseAttention>(&fine.descriptor_of(dtype));
         }
