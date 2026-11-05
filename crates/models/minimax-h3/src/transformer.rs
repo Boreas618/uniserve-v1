@@ -662,15 +662,27 @@ impl Transformer {
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
+        // **The cache is FP32 whatever the stack's type is**: the timestep embedding, its activation
+        // (the `silu f32` row) and every projection matrix feeding it are the checkpoint's twelve FP32
+        // tensors, so a gather keyed by the deployment's type names a module the launch never asks for
+        // - which is how two of them read as unlaunched to the recorder while this walk stated them.
         for columns in [
             18 * u64::from(hidden),
             2 * u64::from(hidden),
             u64::from(hidden),
         ] {
             programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                dtype, columns,
+                nn::DType::F32,
+                columns,
             )?);
         }
+        // One table at the hidden width is the stack's own rather than the cache's - the recorded
+        // launch reads it at the deployment's type - so both are stated: the same gather at two
+        // element types is two programs, and a store holding one dies on the other.
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
+            dtype,
+            u64::from(hidden),
+        )?);
         // The step's own entry per group is an index row, not a table row.
         programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
             nn::DType::I32,
@@ -753,13 +765,21 @@ impl Transformer {
         // launch passes that stride (`GatedActivation::forward` takes it from the views). A key stating
         // the half's width names a program the launch never makes.
         let half = u64::from(config.intermediate_size);
-        programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
-            dtype,
-            half,
-            nn::layers::Activation::Silu,
-            u64::from(rows) * half,
-            true,
-        )?);
+        // **`wide` is the element count, and a deployment whose bound crosses `u32::MAX` needs both
+        // programs.** The key's `wide` field is `elements >= u32::MAX` (`nn::layers::activation`), so a
+        // launch keys it from the *request's* rows while this walk states the deployment's bound: at
+        // the bound the stack keys `wide_true`, and every request smaller than 299 593 rows keys
+        // `wide_false`. A store holding only one of them serves one of the two and dies on the other,
+        // which is exactly how the recorder caught this - one row differing in that field alone.
+        for elements in [u64::from(rows) * half, half] {
+            programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
+                dtype,
+                half,
+                nn::layers::Activation::Silu,
+                elements,
+                true,
+            )?);
+        }
 
         Ok(programs.finish())
     }
@@ -1281,7 +1301,9 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
-            32_000,
+            // A bound above `u32::MAX / intermediate_size` (299 593 rows), so the gated activation's
+            // two `wide` classes are distinct: below it the same program is keyed twice and deduped.
+            400_000,
             Groups::of(true),
             &Partition::single(),
             0,
@@ -1296,7 +1318,10 @@ mod tests {
 
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("rms_norm"), 1);
-        assert_eq!(count("logits_gather"), 4);
+        // Four tables of the FP32 modulation cache (18·hidden, 2·hidden, hidden and the step's group
+        // index) plus the stack's own table at the hidden width in the deployment's type: the same
+        // gather at two element types is two programs.
+        assert_eq!(count("logits_gather"), 5);
         // Three forms: the video stack's two (no gate, at the attention's and the feed-forward's
         // modulation widths) and the audio's one (gated, retaining the normalized row).
         assert_eq!(count("modulated_rms_norm"), 3);
@@ -1304,7 +1329,9 @@ mod tests {
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("dense_attention"), 1);
         assert_eq!(count("rotary_factors"), 1);
-        assert_eq!(count("act_and_mul"), 1);
+        // One gated activation in two `wide` classes: the key's `wide` is the element count, so a
+        // deployment whose bound crosses `u32::MAX` keys both from the same launch site.
+        assert_eq!(count("act_and_mul"), 2);
         // The gated activation reads the two halves of **one packed projection**: the halves keep the
         // packed row stride, so the key states twice the width, and `GatedActivation::forward` takes
         // exactly that from the views. A key stating the half's width names a program no launch makes.
@@ -1313,13 +1340,24 @@ mod tests {
             .filter(|(name, _)| name == "act_and_mul")
             .map(|(_, key)| key.as_str())
             .collect();
+        // Two classes, and the first proves the packed-view rule: the halves keep the packed row
+        // stride, so each half's stride between rows is twice its width. The second is the same
+        // program at the element count of one row, which is the class every request below
+        // `u32::MAX / width` rows keys (299 593 here).
         assert_eq!(
             activated,
-            vec![concat!(
-                "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
-                "_value_stride_28672_wide_false_pdl_false_stepwise_true"
-            )],
-            "the block's activation is the packed-view program at the stepwise recipe"
+            vec![
+                concat!(
+                    "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
+                    "_value_stride_28672_wide_false_pdl_false_stepwise_true"
+                ),
+                concat!(
+                    "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
+                    "_value_stride_28672_wide_true_pdl_false_stepwise_true"
+                ),
+            ],
+            "the block's activation is the packed-view program at the stepwise recipe, in both \
+             `wide` classes because the deployment's bound crosses u32::MAX / width"
         );
 
         // The AdaLN activation is FP32 `(`modulation.rs` refuses a timestep pair in any other type),
