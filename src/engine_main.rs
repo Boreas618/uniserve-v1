@@ -1945,13 +1945,25 @@ impl MainProcess {
                     slot.op
                 )));
             };
-            let serving = descriptor_keys(&self.generations[0], operator);
+            // A generation may hold two packages of one operator, one per phase: a key belongs to
+            // the phase its own text states, so a phase's slot takes only the keys of its phase and
+            // no package is ever asked for a key it cannot build. A key that states no phase fits
+            // every slot - it is the only key a phase-less operator has.
+            let mut keys: Vec<String> = descriptor_keys(&self.generations[0], operator)
+                .into_iter()
+                .filter(|key| key_fits_phase(key, slot.phase))
+                .collect();
             // A generation that launched this operator states the keys it runs; a key the walk has
             // taught since is added to them, never substituted for them. The first generation has
             // nothing serving, so its keys come from the package - once, not one capture at a time -
             // and a taught key joins them for the packages the store does not describe.
-            let mut keys = serving;
-            let mut known: Vec<String> = learned.get(operator).cloned().unwrap_or_default();
+            let mut known: Vec<String> = learned
+                .get(operator)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|key| key_fits_phase(key, slot.phase))
+                .collect();
             if keys.is_empty() {
                 if listing.is_none() {
                     let read = self.listing().map_err(invalid)?;
@@ -5602,6 +5614,19 @@ fn key_phase(key: &str) -> Option<PhaseKind> {
         .find(|phase| phase.as_str() == name)
 }
 
+/// Whether a descriptor key belongs to a slot's phase.
+///
+/// A generation may hold two packages of one operator, one per phase, and the Program Server hands
+/// a request's program every key the request names for its operator: a slot that took the other
+/// phase's key would have its package asked for a key it cannot build. A key whose text states no
+/// phase fits every slot - it is the only kind a phase-less operator has.
+fn key_fits_phase(key: &str, phase: Option<PhaseKind>) -> bool {
+    match phase {
+        None => true,
+        Some(phase) => key_phase(key).map_or(true, |held| held == phase),
+    }
+}
+
 /// The slots one operator's generation holds, from what each candidate package built for this host.
 ///
 /// An operator may be built by more than one package - `paged_attention` is fa4's prefill module and
@@ -6062,6 +6087,29 @@ mod tests {
         );
         assert_eq!(slots.len(), 1, "an overlapping split was stated");
         assert_eq!(slots[0].1.backend, "fa4");
+    }
+
+    /// A slot's keys are the ones its phase owns: a generation that holds two packages of one
+    /// operator must never name the other phase's key to either of them, because the Program Server
+    /// hands a request's program every key the request names for its operator and a package cannot
+    /// build a phase it does not declare.
+    #[test]
+    fn a_slot_takes_the_keys_of_its_own_phase() {
+        let prefill = "phase_prefill_dtype_bf16_head_dim_128";
+        let decode = "phase_decode_dtype_bf16_kv_bf16_head_dim_128";
+        let gemm = "dtype_f16_m_128_n_128_k_7168";
+
+        assert!(key_fits_phase(prefill, Some(PhaseKind::Prefill)));
+        assert!(!key_fits_phase(decode, Some(PhaseKind::Prefill)));
+        assert!(key_fits_phase(decode, Some(PhaseKind::Decode)));
+        assert!(
+            !key_fits_phase(prefill, Some(PhaseKind::Decode)),
+            "a decode slot would have been asked for the prefill key"
+        );
+        // A phase-less slot is the whole operator, and a phase-less key fits any slot.
+        assert!(key_fits_phase(prefill, None));
+        assert!(key_fits_phase(gemm, None));
+        assert!(key_fits_phase(gemm, Some(PhaseKind::Decode)));
     }
 
     /// An operator is one operator however many packages fill it: a store that splits attention
