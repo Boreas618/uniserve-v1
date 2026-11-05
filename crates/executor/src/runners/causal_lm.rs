@@ -2472,6 +2472,37 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Ok(params) => params,
             Err(error) => return format!("params-refused({error})"),
         };
+        // What the entry actually enqueued: a native package unpacks the call into the kernel's own
+        // arguments at capture time, so these blobs are the launch's whole input and every pointer
+        // among them was resolved then. Scanning them for this runner's own column addresses says
+        // whether the graph reads the vectors each batch uploads, or a copy taken from the warm
+        // pose at capture - the question no host-side figure answers, and one that needs no device
+        // read at all.
+        let known = [
+            ("seq_lens", self.columns.seq_lens.device.ptr.address()),
+            (
+                "cum_seq_lens_q",
+                self.columns.query_offsets.device.ptr.address(),
+            ),
+        ];
+        let mut shape = format!(
+            "attention {operator} {key} grid={:?} block={:?} shared={} params={}",
+            params.grid,
+            params.block,
+            params.shared_memory,
+            params.parameters.len()
+        );
+        for (index, blob) in params.parameters.iter().enumerate() {
+            shape.push_str(&format!(" p{index}({}B)", blob.len()));
+            for (name, address) in known {
+                let pattern = address.to_ne_bytes();
+                for at in 0..blob.len().saturating_sub(7) {
+                    if blob[at..at + 8] == pattern {
+                        shape.push_str(&format!(" {name}@{index}+{at}"));
+                    }
+                }
+            }
+        }
         // The kernel's one argument is the pointer to its call struct.
         let Some(bytes) = params.parameters.first() else {
             return "no-parameters".to_owned();
@@ -2486,11 +2517,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // and the driver's error sticks to this stream, so the read happens only inside the arena
         // the bucket owns - and "outside" is itself the answer.
         if !self.in_arena(address, LAYOUT.size) {
-            return format!(
-                "attention {operator} {key} grid={:?} block={:?} shared={} call={address:#x} \
-                 outside-arena",
-                params.grid, params.block, params.shared_memory
-            );
+            return format!("{shape} call={address:#x} outside-arena");
         }
         let Some(call) = self.read_device(address, LAYOUT.size) else {
             return format!("call-unreadable({address:#x})");
