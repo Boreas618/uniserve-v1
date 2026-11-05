@@ -272,7 +272,7 @@ fn run() -> Result<(), String> {
         Some(path) => read_extents(path)?,
         None => BTreeMap::new(),
     };
-    let bound = deployment_bound(&root, tokens, sparse)?;
+    let bound = deployment_bound(&root, sparse)?;
     if let Some(stated) = rows
         && stated != bound
     {
@@ -1541,30 +1541,43 @@ fn deployment_types(path: &Path) -> String {
     }
 }
 
-/// The deployment's own bounded packed-row count, from the model's own rule.
+/// The **store's** bounded packed-row count: the widest over the tasks one store serves, from the
+/// model's own rule.
 ///
-/// Serving sizes its attention from `Layouts::rows_bound` and the walk takes it as its only source, so
-/// the recorder asks the same function rather than a flag: a harness that sized the attention from an
-/// argument would record a deployment the model cannot be asked to be.
-fn deployment_bound(
-    root: &Path,
-    tokens: u32,
-    sparse: Option<(u32, f64, Option<f64>)>,
-) -> Result<u32, String> {
+/// Serving sizes its attention from `Layouts::rows_bound` of the arrangement `Partition::serving`
+/// builds, so the recorder asks that same function rather than a flag - and it asks it for every task,
+/// because `max_kv_len` is exact and part of a dense attention program's key while one store serves
+/// all three. A layout built from a request's own text length, or from a single condition unit, keys
+/// attention at a bound no store holds: the cell is missing, the refusal names a key rather than the
+/// request, and the recording's own row count does not change - which is how a bound that follows a
+/// flag survives inspection.
+///
+/// `--tokens` is deliberately **not** an argument here. It states the prompt a recording drives,
+/// which is a request's fact and belongs with the request; the prompt length is not in the key.
+fn deployment_bound(root: &Path, sparse: Option<(u32, f64, Option<f64>)>) -> Result<u32, String> {
     let config = minimax_h3::Config::read(root, None).map_err(|error| error.to_string())?;
-    let mut network = config
-        .denoisers
-        .get(&Dit::Base)
-        .ok_or("this checkpoint holds no base network")?
-        .clone();
-    if let Some((tile, sparsity, reference_keep)) = sparse {
-        network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
+    let mut bound = 0u32;
+    for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
+        let mut network = config
+            .denoisers
+            .get(&dit)
+            .ok_or_else(|| format!("this checkpoint holds no {} network", dit.directory()))?
+            .clone();
+        if let Some((tile, sparsity, reference_keep)) = sparse {
+            network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
+                .map_err(|error| error.to_string())?;
+        }
+        // The partition is the store's statement of the two capacities; the arrangement is the only
+        // place they become rows, so both come from here rather than from an argument.
+        let partition =
+            Partition::serving(&config, task, 1, 1, 0, 0).map_err(|error| error.to_string())?;
+        let arrangement = partition
+            .arrangement(&network)
             .map_err(|error| error.to_string())?;
+        let rules = Layouts::new(network, arrangement).map_err(|error| error.to_string())?;
+        bound = bound.max(rules.rows_bound().map_err(|error| error.to_string())?);
     }
-    let arrangement =
-        Arrangement::new(&network, tokens, 64, 1).map_err(|error| error.to_string())?;
-    let rules = Layouts::new(network, arrangement).map_err(|error| error.to_string())?;
-    rules.rows_bound().map_err(|error| error.to_string())
+    Ok(bound)
 }
 
 /// One component's stored element type, from the caller's table where it is at hand and the
