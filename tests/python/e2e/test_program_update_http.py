@@ -796,16 +796,19 @@ def test_a_wrong_kernel_is_refused_by_shadow_execution(
     # The comparison's own sentence, not a refusal for any reason at all: the
     # element past tolerance and the bound it left, and never the sentence that
     # says nothing was compared.
+    # The refusal is printed whole: its first clause names the step that failed
+    # and the rest carries the engine's own sentence, so a slice at 800
+    # characters can hide the very string these assertions are about.
     assert COMPARED in refusal, (
         "a wrong kernel was refused without the comparison's sentence: "
-        f"{refusal[:800]}"
+        f"{refusal}"
     )
     assert "tolerance atol" in refusal, (
-        f"the refusal names no tolerance: {refusal[:800]}"
+        f"the refusal names no tolerance: {refusal}"
     )
     assert IDLE not in refusal, (
         "the wrong kernel was not compared at all: the update was refused "
-        f"because no resident request ran a step: {refusal[:800]}"
+        f"because no resident request ran a step: {refusal}"
     )
 
     after = epoch_record(server)
