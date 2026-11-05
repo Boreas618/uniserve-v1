@@ -60,6 +60,13 @@ conditioned=true
 # `wide` form with it — follows from this line. `ref2va` is the widest of the three: 304,976 dense and
 # 351,232 sparse, and one store means the widest.
 task=ref2va
+# The tasks **one store serves**, which is every task the model answers: a row is the pair
+# (operator, key) and the key depends on the task, so a walk of one task states one task's rows. The
+# `logits_gather` that reads the modulation table is the one that differs — `columns_2` when nothing
+# is conditioned over (`t2va`) and `columns_4` when a conditioner is (`fl2va`, `ref2va`) — so a
+# fixture walked at `task` above lacks a cell a `t2va` request launches. The rows only the other
+# tasks state are appended below, and their source is named in the fixture.
+serves='t2va fl2va ref2va'
 elements=123456
 # One track per clip, `audio_samples` of it: the walk refuses a track no stated clip implies, so this
 # line cannot drift from the one above without a refusal naming both.
@@ -108,6 +115,53 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     --types "$types" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
+
+# 1b. The rows the other served tasks state and this one does not. Appended to the walk's own print so
+# that the generator counts them, and so that `keys_delta` compares the fixture with the rows it was
+# built from. A task that states nothing new appends nothing; a task that states something prints it,
+# because a difference nobody looked at reads exactly like a difference that lost twelve rows.
+echo 'rows the other served tasks state:'
+other_dense="$staging/walk-other-dense.txt"
+other_sparse="$staging/walk-other-sparse.txt"
+: >"$other_dense"
+: >"$other_sparse"
+for other in $serves; do
+    [ "$other" = "$task" ] && continue
+    case "$other" in
+        t2va) other_conditioned=false ;;
+        *) other_conditioned=true ;;
+    esac
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example programs -- "$root" \
+        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
+        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
+        --track "$track" --types "$types" >>"$other_dense"
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example programs -- "$root" \
+        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
+        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
+        --track "$track" --types "$types" --sparse "$sparse" >>"$other_sparse"
+done
+# Only whole rows (`operator<TAB>key`), only those the fixture's own task does not state, sorted and
+# deduplicated across the other tasks.
+for pair in "dense:$walk_dense:$other_dense" "sparse:$walk_sparse:$other_sparse"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    walk=${rest%%:*}
+    others=${rest#*:}
+    only="$staging/only-$name.txt"
+    comm -23 \
+        <(grep -P '^[a-z0-9_]+\t' "$others" | sort -u) \
+        <(grep -P '^[a-z0-9_]+\t' "$walk" | sort -u) >"$only"
+    printf '  %-10s %s row(s)' "$name" "$(wc -l <"$only")"
+    if [ -s "$only" ]; then
+        printf ', appended:\n'
+        sed 's/^/    /' "$only"
+        cat "$only" >>"$walk"
+    else
+        printf '\n'
+    fi
+done
 
 # 2. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
