@@ -2139,13 +2139,11 @@ impl Denoiser {
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
-        nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32, 4 * u64::from(video))?;
-        for columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
-            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
-                nn::DType::F32,
-                nn::DType::F32,
-                columns,
-            )?);
+        // One descriptor: the anchors' widths are the operands', and neither reaches the key.
+        for _columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
+            programs.launch::<ScaledAddOp>(
+                &nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32),
+            );
         }
 
         // The solver's step: one gated residual over the whole trajectory of each modality. The
