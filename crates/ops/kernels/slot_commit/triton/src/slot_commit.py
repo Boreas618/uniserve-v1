@@ -127,8 +127,16 @@ def _slot_commit_kernel(
     )
 
     tl.store(verified + slot, cache.to(VERIFIED), mask=dedicated)
-    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled & dedicated)
-    tl.store(predicates + slot, carries, mask=sampled & dedicated)
+    # A token is a row of the vocabulary, and the three things below are the only places this step
+    # uses one *as an index*: the next input column, the predicate relay and the penalty counts. A
+    # sampler can answer one past its vocabulary (an `argmax` over a row with no numeric value does
+    # exactly that), and such a value is not a token: installing it would hand the next step an id
+    # the embedding cannot address, and the penalty add would land in the *next* slot's row of the
+    # count plane. So the impossible value installs nothing - its request is refused where the
+    # batch's tokens are read back, and no slot is poisoned in the meantime.
+    token_valid = token < VOCAB
+    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled & dedicated & token_valid)
+    tl.store(predicates + slot, carries, mask=sampled & dedicated & token_valid)
     tl.store(logical + slot, position, mask=sampled & dedicated)
     tl.store(sampling + slot, sampling_position, mask=sampled & dedicated)
     # The penalty counts are the one field two rows could share: the add is
@@ -137,5 +145,5 @@ def _slot_commit_kernel(
     tl.atomic_add(
         penalties + slot.to(tl.int64) * VOCAB + token,
         weight,
-        mask=sampled & dedicated & (counts_penalty != 0),
+        mask=sampled & dedicated & token_valid & (counts_penalty != 0),
     )
