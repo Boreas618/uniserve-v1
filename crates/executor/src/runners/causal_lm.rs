@@ -1000,50 +1000,79 @@ fn launch_difference(
     None
 }
 
-/// The first place a serving graph and a fresh capture of the same walk disagree, node by node.
-fn graph_difference(
-    graph: &platform::Graph,
-    nodes: &crate::captured::Nodes,
-    walked: &crate::runners::lifecycle::Walked,
+/// What a serving graph's attention launches baked, beside what the batch it serves states.
+///
+/// A captured node keeps the host's values from capture time, and **the batch size is the one of them a
+/// batch can contradict**: the graph states `mBatchSize` from the pose it recorded, and a replay of that
+/// graph for a batch with another row count leaves the kernel working on rows the batch does not hold.
+/// The other four numbers are stated by geometry rather than by a pose - the longest query, the longest
+/// key, the CTA split and the pages per sequence - so they are printed beside the batch's figures rather
+/// than compared with them, and a reader sees whether the graph's own geometry is the one the deployment
+/// wants.
+///
+/// It reads and compares; it captures, launches and allocates nothing, because a diagnosis that disturbs
+/// the path it measures answers about itself.
+fn baked_difference(
+    captured: &crate::captured::Captured,
+    bucket: Bucket,
+    staging: &Staging,
 ) -> String {
-    let replay = kernel_nodes(nodes);
-    let live = kernel_nodes(&walked.nodes);
-    let mut report = format!("nodes replay={} walk={}", replay.len(), live.len());
-    for (ordinal, ((replay_operator, replay_node), (live_operator, live_node))) in
-        replay.iter().zip(&live).enumerate()
-    {
-        let Ok(captured) = graph.kernel_node_params(replay_node) else {
-            report.push_str(&format!(" node {ordinal}: the replay's own parameters are unreadable"));
-            return report;
-        };
-        let Ok(issued) = walked.template.kernel_node_params(live_node) else {
-            report.push_str(&format!(" node {ordinal}: the walk's parameters are unreadable"));
-            return report;
-        };
-        if replay_operator != live_operator {
-            report.push_str(&format!(
-                " first={ordinal} operator replay={replay_operator} walk={live_operator}"
-            ));
-            return report;
+    let graph = captured.template();
+    let nodes = kernel_nodes(captured.nodes());
+    let rows = i64::from(bucket.rows);
+    let live = staging.live_tokens();
+    let longest = staging
+        .batch_rows()
+        .seq_lens
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    let mut seen = 0usize;
+    let mut baked = None;
+    for (operator, node) in &nodes {
+        if *operator != "paged_attention" {
+            continue;
         }
-        if let Some(difference) = launch_difference(&captured, &issued) {
-            let name = captured
-                .function
-                .name()
-                .unwrap_or_else(|error| format!("unnamed({error})"));
-            report.push_str(&format!(
-                " first={ordinal} {replay_operator} {name} {difference}"
-            ));
-            return report;
+        let Ok(params) = graph.kernel_node_params(node) else {
+            continue;
+        };
+        let Some(blob) = params.parameters.first() else {
+            continue;
+        };
+        // `fmha::KernelParams`' offsets, as `notes/exec/attention-bound.md` records them.
+        let integer = |at: usize| -> i64 {
+            blob.get(at..at + 4)
+                .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap_or([0; 4]))))
+                .unwrap_or(0)
+        };
+        let numbers = (
+            integer(1132),
+            integer(1172),
+            integer(1176),
+            integer(1184),
+            integer(1188),
+        );
+        if baked.is_none() {
+            baked = Some(numbers);
         }
+        seen += 1;
     }
-    report.push_str(" all=");
-    report.push_str(if replay.len() == live.len() {
-        "same"
-    } else {
-        "the walks agree as far as both go"
-    });
-    report
+    let Some((batch, max_q, max_kv, ctas_kv, pages)) = baked else {
+        return "no attention node in the graph".to_owned();
+    };
+    if batch != rows {
+        return format!(
+            " first=paged_attention batch baked={batch} this batch rows={rows} \
+             (live_tokens={live} longest_row_kv={longest})"
+        );
+    }
+    format!(
+        " attention={seen} batch={batch}={rows} baked[max_q={max_q} max_kv={max_kv} \
+         ctas_kv={ctas_kv} pages_per_seq={pages}] batch[live_tokens={live} \
+         longest_row_kv={longest}] all=same"
+    )
 }
 
 fn runner_up(values: &[f32], best: usize) -> f32 {
@@ -1938,17 +1967,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     let kernels = self.lifecycle.generation_named(*generation)?.clone();
                     self.walk(*bucket, &kernels)?;
                 }
-                // A comparison of what the graph baked against what this batch's own walk issues:
-                // a captured node keeps the host's values from capture time, so the first node that
-                // differs between the two names the difference between a replay that answers right
-                // and one that does not. It is a diagnosis, never a serving path.
-                let fresh = if graph_diff() {
-                    let stream = self.stream.clone();
-                    let kernels = self.lifecycle.generation_named(*generation)?.clone();
-                    Some(walk_capture(&stream, || self.walk_body(*bucket, &kernels))?)
-                } else {
-                    None
-                };
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
@@ -1969,11 +1987,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
-                if let Some(walked) = &fresh {
+                // What the graph baked against what this batch states, node by node: a captured
+                // node keeps the host's values from capture time, and the numbers a pose decides -
+                // the batch size, the sum of the query lengths, the maximum key length, the CTA
+                // split - are the ones a graph and a batch can disagree about silently. This reads
+                // the graph's own parameters and the staged columns; it captures nothing, launches
+                // nothing and allocates nothing, because a diagnosis that disturbs the path it
+                // measures answers about itself.
+                if graph_diff() {
                     tracing::warn!(
                         bucket = %bucket,
-                        difference = %graph_difference(captured.template(), captured.nodes(), walked),
-                        "the serving graph against a fresh capture of this batch's own walk"
+                        difference = %baked_difference(captured, *bucket, &self.staging),
+                        "the serving graph's baked numbers against the batch it is serving"
                     );
                 }
                 let enqueue = Instant::now();
