@@ -300,6 +300,27 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     }
     return true;
   };
+  // A tensor's refusal carries the tensor's own numbers. A caller that reads only the operand's name
+  // cannot tell a zero extent from a layout cuDNN will not take from a dimension past its limit, and
+  // those have different cures - so the dims, the strides and the element type travel with the fault.
+  auto finalize_tensor = [&library, error, status](void* descriptor, const char* which,
+                                                   const int64_t* dims, const int64_t* strides,
+                                                   int32_t dtype) {
+    if (library.backend_finalize(descriptor) == kSuccess) {
+      return true;
+    }
+    std::snprintf(error, 512,
+                  "cudnnBackendFinalize failed on %s: dims [%lld %lld %lld %lld %lld] strides "
+                  "[%lld %lld %lld %lld %lld] dtype %d",
+                  which, static_cast<long long>(dims[0]), static_cast<long long>(dims[1]),
+                  static_cast<long long>(dims[2]), static_cast<long long>(dims[3]),
+                  static_cast<long long>(dims[4]), static_cast<long long>(strides[0]),
+                  static_cast<long long>(strides[1]), static_cast<long long>(strides[2]),
+                  static_cast<long long>(strides[3]), static_cast<long long>(strides[4]),
+                  static_cast<int>(dtype));
+    *status = 1;
+    return false;
+  };
   auto tensor = [&](const int64_t* dims, const int64_t* strides, int32_t dtype, int64_t uid,
                     const char* which, void** descriptor) {
     return make(kDescriptorTensor, descriptor) &&
@@ -307,7 +328,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
            set(*descriptor, kAttrTensorDimensions, kTypeInt64, kSpatial + 2, dims) &&
            set(*descriptor, kAttrTensorStrides, kTypeInt64, kSpatial + 2, strides) &&
            set(*descriptor, kAttrTensorUniqueId, kTypeInt64, 1, &uid) &&
-           finalize(*descriptor, which);
+           finalize_tensor(*descriptor, which, dims, strides, dtype);
   };
   /// Row-major strides of a contiguous tensor, the last axis running fastest.
   auto row_major = [](const int64_t* dims, int64_t* strides) {
