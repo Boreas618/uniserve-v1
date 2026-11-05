@@ -373,24 +373,35 @@ impl Bucket {
     ///
     /// A stated extent is matched exactly; `Extent::None` on the caller's side is a caller that does
     /// not know the shape, and the bucket's own extent is then the answer; and a host bucket holds
-    /// every canvas, because it captures no graph and so no canvas narrows it.
+    /// every computation of its call, whatever its rows, tokens or canvas, because it captures no
+    /// graph and so no size narrows it.
     pub fn holds_computation(&self, computation: &Computation) -> bool {
         let Some(variant) = computation.variant() else {
             return false;
         };
-        self.variant == variant
-            && self.rows >= computation.rows
+        if self.variant != variant {
+            return false;
+        }
+        // A host call's bucket states which device serves the call and no bound at all: the stage
+        // serves a batch of however many requests of that call arrived, one after the other, and
+        // `Bucket::host`'s one row is the shape of one request rather than a capacity. Comparing a
+        // batch's rows against it would drop every batch of two, silently and only when a
+        // deployment served two requests at once - the one case a first run never reaches.
+        if self.variant.host() {
+            return true;
+        }
+        self.rows >= computation.rows
             && self.tokens >= computation.tokens
-            && (self.variant.host()
-                || computation.extent == Extent::None
-                || self.extent == computation.extent)
+            && (computation.extent == Extent::None || self.extent == computation.extent)
     }
 
     /// A host call's bucket: a computation no graph is captured for.
     ///
     /// The artifact's three host calls are served in this process (§2.4), so the device states
     /// them without capturing anything: what the bucket answers is which device serves the call,
-    /// and one row is what one request of a media call is. It carries no extent because there is
+    /// and one row is the shape of one request rather than a bound, which is why
+    /// [`Bucket::holds_computation`] measures no computation against it. It carries no extent
+    /// because there is
     /// no canvas to state - an audio track's samples come from the decoder's window and a mux
     /// reads what the encodes already wrote.
     pub const fn host(variant: Variant) -> Self {
@@ -725,6 +736,56 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host call's bucket serves its call whatever the batch holds, because it states no bound.
+    ///
+    /// The artifact's three calls are served in this process, one request after another, so a batch
+    /// of two of them is the same call twice and the same bucket serves both. Measured against one
+    /// row - the shape of one request - a batch of two matched nothing, and the mechanism's only
+    /// trace of that is a debug line, which is the kind of stop a deployment reads as a hang.
+    #[test]
+    fn a_host_bucket_serves_every_request_of_its_call() {
+        let plan = Buckets::new([
+            Bucket::host(Variant::VideoEncode),
+            Bucket::host(Variant::AudioEncode),
+            Bucket::host(Variant::Mux),
+            Bucket::clip(48, 768, 1344),
+        ]);
+
+        for (call, variant) in [
+            (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
+            (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
+            (ipc::MediaCall::Muxing, Variant::Mux),
+        ] {
+            for rows in [1, 2, 4] {
+                let batch = Computation {
+                    call,
+                    rows,
+                    tokens: 0,
+                    extent: Extent::None,
+                };
+                assert_eq!(batch.variant(), Some(variant));
+                assert_eq!(
+                    plan.select_media(&batch),
+                    Some(Bucket::host(variant)),
+                    "a {call:?} batch of {rows} request(s)"
+                );
+            }
+        }
+
+        // A device computation is still measured against its bucket: two clips are not one capture.
+        let two_clips = Computation {
+            call: ipc::MediaCall::VideoDecoding,
+            rows: 2,
+            tokens: 0,
+            extent: Extent::Clip {
+                frames: 48,
+                height: 768,
+                width: 1344,
+            },
+        };
+        assert_eq!(plan.select_media(&two_clips), None);
+    }
 
     /// The executor states which media computations its plan serves, and the mechanism forms a
     /// batch only where the answer is a bucket: a denoising step is served only by a graph captured
