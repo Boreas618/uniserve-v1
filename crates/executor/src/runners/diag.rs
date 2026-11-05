@@ -262,9 +262,16 @@ mod tests {
         assert_eq!(bytes, half.to_le_bytes().to_vec());
     }
 
+    /// The refusal names the element type as `DType`'s own `Display` spells it - `i32`, not `I32`:
+    /// the message and the test were written against two different spellings of one value, and the
+    /// message is the one a reader sees.
     #[test]
     fn a_type_that_is_not_a_float_cannot_be_a_dump() {
         let error = widen(DType::I32, &[0u8; 4]).unwrap_err();
-        assert!(format!("{error}").contains("a dump is `f4` or `f2` and this tensor is I32"));
+        let refusal = format!("{error}");
+        assert!(
+            refusal.contains("a dump is `f4` or `f2` and this tensor is i32"),
+            "the refusal names the type as the type spells itself: {refusal}"
+        );
     }
 }
