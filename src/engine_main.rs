@@ -4281,10 +4281,14 @@ impl Drop for NativeModule {
 /// declared, which is the property `dlopen` is for; a module whose files define it in more than one
 /// place, or in none, is refused by name with its files listed.
 ///
-/// A module with siblings is never loaded from a copy: its entry receives no path - `ops::Entry`
-/// takes the call structure and the stream - so the object finds its own `cubins/` through the
-/// location it was built or placed at, and a copy carries neither. The warning says which of the two
-/// the object states for itself.
+/// A module with siblings is never loaded from a copy, and never from a descriptor number. Its entry
+/// receives no path - `ops::Entry` takes the call structure and the stream - so the object finds its
+/// own `cubins/` from the file it was loaded from: `paged_attention`'s module does it with `dladdr`
+/// of its own entry and takes the directory of `dli_fname`
+/// (`crates/ops/kernels/paged_attention/trtllm/src/entry.cpp`, `module_directory`). `dli_fname` is the
+/// path handed to `dlopen`, so that path must be the module's own file: `/proc/self/fd/<n>` gives the
+/// directory `/proc/self/fd`, and a copy gives the copy's directory. Both are refusals here instead
+/// of a load that dies at the first cubin.
 fn native_library(
     files: Vec<program_server::ModuleFile>,
     entry: &str,
@@ -4334,10 +4338,18 @@ fn native_library(
         .nth(chosen)
         .ok_or_else(|| invalid("the chosen library file is missing".to_owned()))?;
     if siblings {
-        // The question a reader of a failed load has: how does this object find the files beside it?
+        // The question a reader of a failed load has: where does this object look for the files
+        // beside it? A module that resolves them itself uses the path it was loaded from - `dladdr`
+        // of its own entry - so that directory is the answer, and `origin` says whether it also
+        // states `$ORIGIN` in a run path, which is the other way a sibling can be found.
+        let module = match std::fs::read_link(format!("/proc/self/fd/{}", as_raw_fd(&file))) {
+            Ok(target) => target,
+            Err(_) => std::path::PathBuf::new(),
+        };
         tracing::info!(
             library = %file.name,
-            files = chosen + 1,
+            loaded_from = %module.display(),
+            directory = %module.parent().map(|path| path.display().to_string()).unwrap_or_default(),
             origin = ?origin_in_runpath(&file),
             "this native module's library sits beside other files of the module"
         );
@@ -4368,6 +4380,13 @@ fn origin_in_runpath(file: &program_server::ModuleFile) -> Option<bool> {
     let bytes = bytes_of(file)?;
     let path = dynamic_string(&bytes, &[29, 15])?;
     Some(path.contains("$ORIGIN"))
+}
+
+/// The descriptor behind a module's file, for the line that says where the object will look for its
+/// siblings.
+fn as_raw_fd(file: &program_server::ModuleFile) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd as _;
+    file.file.as_raw_fd()
 }
 
 /// The path a native module is loaded from: the store's own file when it still has one, and a copy
@@ -5537,9 +5556,12 @@ mod tests {
     /// stand in for those files with the library named so it sorts **second**, and the entry declared
     /// is one only it defines.
     ///
-    /// The directory is the module: its entry receives no path, so the location the library is loaded
-    /// from is the only thing a module has to find the files beside it - which is why a module with
-    /// siblings is never loaded from a copy this process made.
+    /// The directory is the module, and the mechanism is the package's own: `paged_attention`'s entry
+    /// takes no path and finds `cubins/` from `dladdr` of its own symbol, whose `dli_fname` is the
+    /// path this process handed `dlopen`. So the path must be the module's own file - which is what
+    /// the assertions below hold: the library is that file, it is not a copy, and the sibling sits in
+    /// the directory the object will look in. A `/proc/self/fd/<n>` path would give it
+    /// `/proc/self/fd`, and a copy would give it the copy's directory.
     #[test]
     fn a_native_library_is_the_file_that_defines_the_entry_not_the_first_one() {
         let Some(libc) = loaded_library("libc.so.6") else {
