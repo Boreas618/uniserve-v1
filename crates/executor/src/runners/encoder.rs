@@ -19,8 +19,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use nn::capability::{Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, TokenBatch};
 use ipc::TimingCounters;
+use nn::capability::{
+    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, TokenBatch,
+};
 use ops::{DType, PhaseKind};
 use platform::DeviceId;
 
@@ -28,8 +30,9 @@ use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchOutput, Job, Jobs};
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::{encode_i32, Column};
-use crate::runners::lifecycle::{walk_capture, Lifecycle};
+use crate::runners::columns::{Column, encode_i32};
+use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -55,18 +58,29 @@ struct EncoderColumns {
     /// `[rows]` i32 the hidden rows whose logits are wanted: never written, and zeroed so a model
     /// that reads the column anyway reads a defined row rather than uninitialised memory.
     logits_rows: Column,
+    /// `[tokens × hidden]` the encoded states, in the model's own element type.
+    ///
+    /// A column rather than arena scratch: the states are a product another call of the same
+    /// request reads, so the region they live in must be the runner's for as long as it serves
+    /// rather than a reservation the captured graph happens to address. One region holds every
+    /// request of the largest bucket this runner stages, one request's rows after another.
+    hidden: Column,
 }
 
 impl EncoderColumns {
-    fn new(device: DeviceId, tokens: u32, rows: u32) -> Result<Self> {
+    fn new(device: DeviceId, tokens: u32, rows: u32, shape: EncoderShape) -> Result<Self> {
         let tokens64 = u64::from(tokens.max(1));
         let rows64 = u64::from(rows.max(1));
+        let hidden = tokens64
+            .checked_mul(u64::from(shape.hidden.max(1)))
+            .ok_or_else(|| Error::Invalid("an encoder's hidden column overflows".into()))?;
         Ok(Self {
             ids: Column::new(device, DType::I32, tokens64)?,
             positions: Column::new(device, DType::I32, tokens64)?,
             seq_lens: Column::new(device, DType::I32, rows64)?,
             query_offsets: Column::new(device, DType::I32, rows64 + 1)?,
             logits_rows: Column::new(device, DType::I32, rows64)?,
+            hidden: Column::new(device, shape.dtype, hidden)?,
         })
     }
 }
@@ -91,6 +105,16 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     /// The bucket the columns are staged for, so a capture smaller than the largest bucket knows how
     /// far the columns it uploads run.
     staged: Option<Bucket>,
+    /// The epoch's product store, attached by the executor that starts this runner: what an encode
+    /// produces and a denoise step of the same request reads.
+    products: Option<std::sync::Arc<dyn Products>>,
+    /// The requests of the batch staged last, and how many token rows of the hidden column each of
+    /// them occupies, in request order.
+    ///
+    /// A replay publishes what its own launch wrote, and the batch numbers its calls by position,
+    /// so the request's name is kept here beside the rows it covers (`Batch::media`'s staged record
+    /// is the only place a request is named).
+    pending: Vec<(ipc::RequestKey, u32)>,
 }
 
 impl<M: Encoder + Send + Sync> EncoderRunner<M> {
@@ -117,9 +141,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
                         .into(),
                 )
             })?;
-        let columns = EncoderColumns::new(binding.device, largest.tokens, largest.rows)?;
-        let lifecycle =
-            Lifecycle::new(binding.id, generation, binding.stream.clone());
+        let columns = EncoderColumns::new(binding.device, largest.tokens, largest.rows, shape)?;
+        let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
             phases: binding.phases,
@@ -135,6 +158,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             columns,
             ids: Vec::new(),
             staged: None,
+            products: None,
+            pending: Vec::new(),
         })
     }
 
@@ -189,9 +214,13 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
 
     fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
         let pools = self.pools.as_ref().ok_or_else(|| {
-            Error::Resource("the encoder runner has no graph pools; the device attaches them at start")
+            Error::Resource(
+                "the encoder runner has no graph pools; the device attaches them at start",
+            )
         })?;
-        Ok(pools.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        Ok(pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// The layout of `bucket`'s encode, as the model states it.
@@ -233,7 +262,11 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             self.lifecycle.generation.number(),
             &key,
             &tables,
-            |host| model.prepare_state(&prompt, &layout, host).map_err(Error::from),
+            |host| {
+                model
+                    .prepare_state(&prompt, &layout, host)
+                    .map_err(Error::from)
+            },
         )
     }
 
@@ -275,7 +308,10 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.ids = columns.input_ids.iter().map(|id| *id as u32).collect();
         let mut buffer = Vec::new();
 
-        encode_i32(&mut buffer, &self.ids.iter().map(|id| *id as i32).collect::<Vec<_>>());
+        encode_i32(
+            &mut buffer,
+            &self.ids.iter().map(|id| *id as i32).collect::<Vec<_>>(),
+        );
         self.columns.ids.write(&buffer)?;
         encode_i32(&mut buffer, &threads.positions);
         self.columns.positions.write(&buffer)?;
@@ -286,6 +322,18 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         encode_i32(&mut buffer, &threads.logits_rows);
         self.columns.logits_rows.write(&buffer)?;
         self.staged = Some(bucket);
+        // Which request is at which rows: a replay publishes what its own launch wrote, and a batch
+        // numbers its calls by position, so the name the store is keyed by is kept here with the
+        // token rows that request covers (`Batch::media`'s record is where a request is named).
+        self.pending.clear();
+        if let Some(media) = &batch.media {
+            for (index, window) in threads.query_offsets.windows(2).enumerate() {
+                let rows = u32::try_from(window[1] - window[0]).map_err(|_| {
+                    Error::Invalid("a request's token rows do not fit a count".into())
+                })?;
+                self.pending.push((media.request(index)?.request, rows));
+            }
+        }
         // The columns are sized for the largest bucket the runner was bound with; a batch planned
         // into a smaller one writes exactly its own prefix and the graph reads only that far.
         Ok(())
@@ -310,6 +358,9 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.query_offsets.write(&buffer)?;
         self.columns.logits_rows.write(&buffer)?;
         self.staged = Some(bucket);
+        // A warm capture serves no request, so its launch publishes nothing: a row left here would
+        // name a request whose states this capture overwrote.
+        self.pending.clear();
         Ok(())
     }
 
@@ -321,6 +372,48 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.seq_lens.upload(&self.stream)?;
         self.columns.query_offsets.upload(&self.stream)?;
         self.columns.logits_rows.upload(&self.stream)?;
+        Ok(())
+    }
+
+    /// Publishes the encoded states this replay's launch wrote: one `Text` product per request of
+    /// the batch staged last.
+    ///
+    /// The region is the runner's own hidden column, which the captured graph addresses, so the
+    /// view names memory that stays this runner's until it launches this bucket again - the store
+    /// names it and the copy that moves it is the reader's, ordered on the reader's stream.
+    ///
+    /// Only `Text` is published. The conditioning rows a `ref2va` request lays out are a different
+    /// packing of a vision tower's features rather than a slice of this sequence, and this encoder
+    /// writes one region (`EncoderOutputs::hidden`); publishing a second product from it would be
+    /// the executor inventing the model's layout arithmetic.
+    fn publish(&self) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            // A runner whose store was not attached publishes nothing. The consumer that reads a
+            // product refuses by name, so the gap is named where it is felt rather than here.
+            return Ok(());
+        };
+        let width = u64::from(self.shape.hidden.max(1));
+        let mut first = 0u64;
+        for (request, rows) in &self.pending {
+            let rows = u64::from(*rows);
+            if rows == 0 {
+                continue;
+            }
+            let view = self
+                .columns
+                .hidden
+                .device
+                .at(self.columns.hidden.device.offset_elements(first * width))
+                .reshape(ops::Shape::new(&[rows, width]));
+            products.publish(
+                *request,
+                Product::Text,
+                self.device,
+                self.stream_id(),
+                &view,
+            )?;
+            first += rows;
+        }
         Ok(())
     }
 
@@ -344,16 +437,19 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         if !tables.is_empty() {
             self.fill(bucket)?;
         }
-        let state = self.tables.views(
-            self.lifecycle.generation.number(),
-            &key,
-            &tables,
-        )?;
-        let hidden_view = arena.tensor(
-            self.shape.dtype,
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.shape.hidden)]),
-        )?;
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
         let tokens = u64::from(bucket.tokens);
+        let width = u64::from(self.shape.hidden.max(1));
+        // The states are the column's first `tokens × width` elements: a warm capture writes them
+        // and so does every replay, at the offset a request's rows begin, which is why the region
+        // is the runner's rather than the walk's.
+        let hidden_view = self
+            .columns
+            .hidden
+            .extent(0..tokens * width)
+            .reshape(ops::Shape::new(&[tokens, width]));
         let inputs = EncoderInputs {
             ids: self.columns.ids.extent(0..tokens),
             batch,
@@ -363,10 +459,17 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             diagnostics: &[],
         };
         self.model
-            .encode(&forward, inputs, EncoderOutputs { hidden: hidden_view })
+            .encode(
+                &forward,
+                inputs,
+                EncoderOutputs {
+                    hidden: hidden_view,
+                },
+            )
             .map_err(Error::from)?;
         if first {
-            self.pool()?.record(self.stream_id(), bucket, arena.used())?;
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
     }
@@ -401,15 +504,12 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 computation.call
             )));
         }
-        let bucket = self
-            .buckets
-            .select_media(&computation)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "no bucket was captured for {:?} of {} row(s) and {} token(s)",
-                    computation.call, computation.rows, computation.tokens
-                ))
-            })?;
+        let bucket = self.buckets.select_media(&computation).ok_or_else(|| {
+            Error::Invalid(format!(
+                "no bucket was captured for {:?} of {} row(s) and {} token(s)",
+                computation.call, computation.rows, computation.tokens
+            ))
+        })?;
         self.stage(&batch, bucket)?;
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
@@ -470,6 +570,10 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
         self.lifecycle.discard(generation)
     }
 
+    fn attach_products(&mut self, products: Arc<dyn Products>) {
+        self.products = Some(products);
+    }
+
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(pools);
@@ -491,11 +595,11 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                     .graphs
                     .captured_for(*bucket, *generation)
                     .ok_or_else(|| {
-                        Error::Invariant(format!(
-                            "no graph of bucket {bucket} in generation {generation} or in a \
+                    Error::Invariant(format!(
+                        "no graph of bucket {bucket} in generation {generation} or in a \
                              generation it replaces"
-                        ))
-                    })?;
+                    ))
+                })?;
                 if served != *generation {
                     tracing::debug!(
                         bucket = %bucket,
@@ -509,9 +613,10 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
-                // The encode's outputs are read by the denoiser or the decoder through resident
-                // products, not through this completion: the stream's order is what makes them
-                // readable, and the wait is the executor's on the runner's stream.
+                // The encoded states are a product a denoise step of the same request reads, so
+                // they are named for it after this launch wrote them: the stream's order is what
+                // makes them readable, and the wait is the executor's on the runner's stream.
+                self.publish()?;
                 Ok(BatchOutput {
                     calls: Vec::new(),
                     timing: TimingCounters {
@@ -543,9 +648,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || {
-            self.walk(bucket, &kernels)
-        })?;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 
@@ -553,9 +656,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || {
-            self.walk(bucket, &kernels)
-        })?;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.rebind(bucket, generation, walked, &kernels)
     }
 }
