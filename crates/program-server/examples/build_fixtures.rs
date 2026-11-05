@@ -328,6 +328,19 @@ impl Options {
                         path.display()
                     ));
                 };
+                // A third field is the backend `tools/build_store.py` reads, which pins the package
+                // that builds a cell. This builder does not read it, and taking it for part of the
+                // key would key a cell by a name no launch asks for - the store would build and hold
+                // a program nothing reaches. Refuse rather than mis-key, and name where the field is
+                // honoured.
+                if key.contains('\t') {
+                    return Err(format!(
+                        "{}: {op:?} states a third field, which is the backend `tools/build_store.py` \
+                         reads and this builder does not - build the store with that tool, or state \
+                         the key alone and let every package that declares it be built",
+                        path.display()
+                    ));
+                }
                 fixtures.push(Fixture {
                     op: op.trim().to_owned(),
                     key: key.trim().to_owned(),

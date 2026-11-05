@@ -739,6 +739,14 @@ fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTen
     // then answers `Ok((n, metadata))` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts at
     // `N_LEN + n`. Adding `n` alone shifts every tensor eight bytes early — the right shape over
     // the wrong bytes, which is why the read-back test asserts content rather than length.
+    //
+    // **The subtraction below cannot underflow, and this is the dependency rather than an
+    // assumption.** The same crate refuses a header whose `8 + n` runs past the buffer
+    // (`buffer.get(N_LEN..stop)` returning `None` is `InvalidHeaderLength`) and requires
+    // `payload_end + 8 + n == buffer_len` exactly (`MetadataIncompleteBuffer`) — both in
+    // `safetensors-0.8.0/src/tensor.rs`. A version that relaxed either would let this line read past
+    // the file, which is why the version is named here: a bump that changes those two checks is the
+    // one that must visit this function.
     const HEADER_PREFIX: u64 = 8;
     let header = HEADER_PREFIX + header as u64;
     let payload = bytes.len() as u64 - header;
@@ -928,6 +936,38 @@ mod tests {
         let path = directory.join("model.safetensors");
         std::fs::write(&path, &file).expect("a shard");
         path
+    }
+
+    /// A tensor's name is matched exactly as the checkpoint stores it.
+    ///
+    /// A layout states the names a checkpoint holds, so a name that differs by a `model.` prefix is a
+    /// different name: the map is keyed by the stored spelling and a load asks for that spelling. The
+    /// audit over a deployment may normalize the prefix, because it compares the checkpoint's names
+    /// against the model's key rules; this is the load's side of that distinction, and it is what makes
+    /// the audit's normalized count a statement a reader can check.
+    #[test]
+    fn a_tensor_name_is_matched_exactly_as_the_checkpoint_stores_it() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        // Four BF16 elements, eight bytes.
+        let halfs = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        shard(
+            root.path(),
+            &[("layers.0.attention.q_proj.weight", "BF16", &[2, 2], &halfs)],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        assert!(
+            checkpoint
+                .tensor("layers.0.attention.q_proj.weight")
+                .is_some(),
+            "the stored spelling resolves"
+        );
+        assert!(
+            checkpoint
+                .tensor("model.layers.0.attention.q_proj.weight")
+                .is_none(),
+            "a name that differs by the prefix is a different name, not a fallback"
+        );
     }
 
     /// A shard's tensors read back **byte for byte at the payload-relative offsets the header

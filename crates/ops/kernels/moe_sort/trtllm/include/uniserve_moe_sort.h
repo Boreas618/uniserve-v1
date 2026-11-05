@@ -46,6 +46,7 @@ struct uniserve_moe_sort_call {
   int64_t tile_tokens;
   int64_t scales_dtype;
   char error[512];
+  int32_t const* live_tokens;
 };
 
 // The operator crate's `DType::as_i64()` numbering.
@@ -60,17 +61,45 @@ enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_F4E2M1 = 7,
 };
 
+// Every field is asserted, not one per group: two fields of the same size can be swapped in a
+// header alone, and a group-level assert is the check that cannot see it. The Rust side reads
+// these literals (crates/ops/src/moe/sort.rs, `the_package_header_declares_this_call_layout`),
+// so a layout that moves on one side fails on the other rather than at run time.
+static_assert(offsetof(uniserve_moe_sort_call, ids) == 0,
+              "the call's route ids must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, scales) == 8,
+              "the call's route weights must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, tile_to_expert) == 16,
               "the call's tile metadata must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, tile_to_limit) == 24,
+              "the call's tile metadata must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, expanded_to_permuted) == 32,
+              "the call's the permutation map must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, permuted_to_expanded) == 40,
+              "the call's the permutation map must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, total_padded_tokens) == 48,
-              "the call's scalars must sit where the operator's layout puts them");
+              "the call's the two scalars must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, num_non_exiting_tiles) == 56,
+              "the call's the two scalars must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, live_tokens) == 632,
+              "the call's live count must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, tokens) == 64,
-              "the call's extents must sit where the operator's layout puts them");
+              "the call's the extents must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, top) == 72,
+              "the call's the extents must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, experts) == 80,
+              "the call's the extents must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, local_experts) == 88,
+              "the call's the extents must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, local_offset) == 96,
+              "the call's the extents must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_moe_sort_call, tile_tokens) == 104,
+              "the call's the extents must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, scales_dtype) == 112,
-              "the call's scale type must sit where the operator's layout puts it");
+              "the call's the scale type must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, error) == 120,
-              "the call's error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_moe_sort_call) == 632,
+              "the call's the error message must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_moe_sort_call) == 640,
               "the call must be the size of the operator's layout");
 
 // Group the routes by local expert: fills the tile metadata and both

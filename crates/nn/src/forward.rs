@@ -212,6 +212,13 @@ pub struct Forward<'a> {
     pub exchange: Option<&'a ExchangeViews>,
     /// The operator this forward shadows, when it is a 7.3 comparison pass.
     pub shadow: Option<Shadow<'a>>,
+    /// `[1]` i32: the token rows of this batch that are live, when the caller states them.
+    ///
+    /// A captured bucket is wider than the batch that fills it. A layer that partitions work by
+    /// token row needs to know which rows are real, and it cannot derive that from any shape: the
+    /// arena is the bucket's. The value is device-resident because it changes per replay of one
+    /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
+    pub live_tokens: Option<TensorView>,
 }
 
 impl<'a> Forward<'a> {
@@ -224,6 +231,7 @@ impl<'a> Forward<'a> {
             group: None,
             exchange: None,
             shadow: None,
+            live_tokens: None,
         }
     }
 
@@ -241,6 +249,7 @@ impl<'a> Forward<'a> {
             group: None,
             exchange: None,
             shadow: None,
+            live_tokens: None,
         }
     }
 
@@ -276,6 +285,21 @@ impl<'a> Forward<'a> {
     }
 
     /// The same forward as a shadow comparison of one operator's call.
+    /// State which token rows of this batch are live, for the layers that partition by row.
+    ///
+    /// The buffer is `[1]` i32 on the device and must outlive the bucket: a captured graph reads it
+    /// on every replay, so a buffer reallocated per request is a dangling pointer in a graph that
+    /// outlives the request.
+    pub fn with_live_tokens(mut self, tokens: TensorView) -> Self {
+        self.live_tokens = Some(tokens);
+        self
+    }
+
+    /// The token rows of this batch that are live, when the caller stated them.
+    pub fn live_of(&self) -> Option<TensorView> {
+        self.live_tokens
+    }
+
     pub fn with_shadow(mut self, shadow: Shadow<'a>) -> Self {
         self.shadow = Some(shadow);
         self

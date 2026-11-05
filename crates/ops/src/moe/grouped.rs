@@ -1740,4 +1740,36 @@ mod nvfp4_call_layout_tests {
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 176);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 184);
     }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_gather_header_declares_this_call_layout() {
+        let layout = GATHER_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "gather_gemm",
+            "uniserve_gather_call",
+            &[
+                ("hidden", layout.hidden),
+                ("weights", layout.weights),
+                ("out", layout.out),
+                ("tile_to_expert", layout.tile_to_expert),
+                ("tile_to_limit", layout.tile_to_limit),
+                ("permuted_to_expanded", layout.permuted_to_expanded),
+                ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
+                ("tokens", layout.tokens),
+                ("permuted_rows", layout.permuted_rows),
+                ("width", layout.width),
+                ("hidden_size", layout.hidden_size),
+                ("experts", layout.experts),
+                ("top", layout.top),
+                ("dtype", layout.dtype),
+                ("error", layout.error),
+            ],
+            layout.size,
+        );
+    }
 }
