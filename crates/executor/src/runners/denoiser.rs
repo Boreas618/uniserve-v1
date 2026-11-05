@@ -730,10 +730,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 // and only the store holds both ends: it waits on the producer's write before this
                 // stream copies. A runner issuing its own `memcpy_async` from another device's
                 // region would be reading bytes no ordering protects.
-                let Some(available) = products.product_bytes(request, kind)? else {
+                let Some(published) = products.product(request, kind)? else {
                     return Err(products::absent(request, kind));
                 };
-                let (copied, zeroed) = fills(request, kind, available, bytes)?;
+                let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
                 let destination = TensorView::new(
                     ops::DevicePtr::new(column.host.address() + u64::from(index) * bytes),
                     self.shape.dtype,
@@ -1525,8 +1525,12 @@ mod product_tests {
             self.held.contains(&kind)
         }
 
-        fn product_bytes(&self, _request: ipc::RequestKey, _kind: Product) -> Result<Option<u64>> {
-            unreachable!("the presence rule reads existence, not a length")
+        fn product(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+        ) -> Result<Option<products::Published>> {
+            unreachable!("the presence rule reads existence, not a placement")
         }
 
         fn copy_into(
