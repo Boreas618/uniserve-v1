@@ -63,9 +63,13 @@ static_assert(offsetof(uniserve_route_gemm_nvfp4_call, dtype) == 176);
 static_assert(offsetof(uniserve_route_gemm_nvfp4_call, error) == 184);
 static_assert(sizeof(uniserve_route_gemm_nvfp4_call) == 696);
 
-// The operator crate's `DType::as_i64()` numbering, for the types this entry names.
-constexpr int64_t uniserve_dtype_bf16 = 3;
-constexpr int64_t uniserve_dtype_e2m1 = 10;
+// The operator crate's `DType::as_i64()` numbering, for the types this entry names. The order is
+// `crates/ops/src/tensor.rs`'s declaration: U8 0, I32 1, I64 2, F16 3, BF16 4, F32 5, F8E4M3 6,
+// F4E2M1 7, I16 8. A hand copy of an enum drifts, which is why the entry's first act is to refuse a
+// `dtype` that is not the one it was compiled for - a drift then costs a run and names itself here
+// rather than producing a silently wrong product.
+constexpr int64_t uniserve_dtype_bf16 = 4;
+constexpr int64_t uniserve_dtype_e2m1 = 7;
 
 // One launch. `stream` is the CUstream of the device the executor drives; the entry
 // asks the device its own answers (its id, the tactic's scratch requirement) rather
