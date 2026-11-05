@@ -400,6 +400,7 @@ impl<'a> Forward<'a> {
         O::launch(previous, descriptor, args, stream)
             .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
         Self::record::<O>(descriptor);
+        shadow.twins.borrow_mut().freeze(stream);
         Ok(())
     }
 
