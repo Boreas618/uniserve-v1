@@ -360,6 +360,7 @@ impl EncodedStep {
         tokens: u64,
         geometry: MoeGeometry,
         layout: ScaleLayout,
+        gated_layout: ScaleLayout,
         dtype: DType,
     ) -> Result<Self> {
         let MoeGeometry {
@@ -394,7 +395,7 @@ impl EncodedStep {
                 Launch::SecondEncode,
             ),
             gated_scales: buffer(
-                layout.shape(routes, intermediate),
+                gated_layout.shape(routes, intermediate),
                 DType::U8,
                 Launch::SecondEncode,
             ),
@@ -460,9 +461,10 @@ pub fn encoded_bytes(
     tokens: u64,
     geometry: MoeGeometry,
     layout: ScaleLayout,
+    gated_layout: ScaleLayout,
     dtype: DType,
 ) -> Result<u64> {
-    EncodedStep::new(tokens, geometry, layout, dtype)?.bytes()
+    EncodedStep::new(tokens, geometry, layout, gated_layout, dtype)?.bytes()
 }
 
 /// The bytes the routing prefix reserves for `tokens` rows: the scores, the kept ids and weights,
@@ -552,12 +554,13 @@ pub fn step_bytes(
     tokens: u64,
     geometry: MoeGeometry,
     layout: ScaleLayout,
+    gated_layout: ScaleLayout,
     dtype: DType,
     encoded: bool,
 ) -> Result<u64> {
     let routing = routing_bytes(tokens, geometry, dtype)?;
     let expert = if encoded {
-        encoded_bytes(tokens, geometry, layout, dtype)?
+        encoded_bytes(tokens, geometry, layout, gated_layout, dtype)?
     } else {
         dense_bytes(tokens, geometry, dtype)?
     };
@@ -1444,6 +1447,7 @@ impl Moe {
         &self,
         tokens: u64,
         layout: ScaleLayout,
+        gated_layout: ScaleLayout,
         dtype: DType,
     ) -> Result<EncodedStep> {
         EncodedStep::new(
@@ -1456,6 +1460,7 @@ impl Moe {
                 tile: u64::from(self.tile),
             },
             layout,
+            gated_layout,
             dtype,
         )
     }
@@ -1465,7 +1470,13 @@ impl Moe {
     ///
     /// [`step_bytes`] states the extents; this answers them for this block's geometry, which is what
     /// a deployment asks when it sizes the arena from its plan.
-    pub fn step_bytes(&self, tokens: u64, layout: ScaleLayout, dtype: DType) -> Result<u64> {
+    pub fn step_bytes(
+        &self,
+        tokens: u64,
+        layout: ScaleLayout,
+        gated_layout: ScaleLayout,
+        dtype: DType,
+    ) -> Result<u64> {
         step_bytes(
             tokens,
             MoeGeometry {
@@ -1476,6 +1487,7 @@ impl Moe {
                 tile: u64::from(self.tile),
             },
             layout,
+            gated_layout,
             dtype,
             matches!(self.stacks, ExpertStacks::Encoded { .. }),
         )
@@ -1592,13 +1604,16 @@ impl Moe {
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
         //    the product multiplies by, and its global scale is the stack's neutral.
         //
-        // The layout here is the **activation plane's**; the weights' plane reaches the products
-        // through the same descriptors' `layout` field only because that field *is* this one — the
-        // weights' form is a property of their encoded stack, which each product's kernels state.
-        let activation_layout = Self::ACTIVATION_SCALE_LAYOUT;
+        // Two activation encodings, because the artifact's two families are two: the gated product
+        // (the artifact's `swiGlu` kernels) reads its operand's block scales in the linear form and
+        // the plain product's kernels read them swizzled (`flashinferMetaInfo.h`: the gated family's
+        // tokens operand is `SfLayout(0)`, the plain family's `SfLayout(3)`). One encoding for both is
+        // the defect that made the first end-to-end NVFP4 run produce a row no argmax could read.
+        let input_layout = ScaleLayout::Linear;
+        let gated_layout = Self::ACTIVATION_SCALE_LAYOUT;
         // The step's whole working set from one table: the plan sums the same extents to size the
         // arena, so every buffer a launch writes is a buffer the plan reserved.
-        let step = self.encoded_step(tokens, activation_layout, hidden.dtype)?;
+        let step = self.encoded_step(tokens, input_layout, gated_layout, hidden.dtype)?;
         let values = arena.tensor(step.values.dtype, step.values.shape)?;
         let scales = arena.tensor(step.scales.dtype, step.scales.shape)?;
         let token_scale = arena.tensor(step.token_scale.dtype, step.token_scale.shape)?;
@@ -1606,7 +1621,7 @@ impl Moe {
             hidden.dtype,
             u32::try_from(hidden_width)
                 .map_err(|_| Error::shape("Moe", format!("{hidden_width} hidden elements")))?,
-            activation_layout,
+            input_layout,
         );
         let args = QuantizeArgs {
             input: hidden,
@@ -1656,7 +1671,7 @@ impl Moe {
             u32::try_from(intermediate).map_err(|_| {
                 Error::shape("Moe", format!("{intermediate} intermediate elements"))
             })?,
-            activation_layout,
+            gated_layout,
         );
         let args = QuantizeArgs {
             input: gated,
@@ -2127,7 +2142,7 @@ pub(super) mod tests {
         let moe = quantized_block(2048, 768).expect("the encoded block");
         let tokens = 15;
         let step = moe
-            .encoded_step(tokens, ScaleLayout::Linear, DType::BF16)
+            .encoded_step(tokens, ScaleLayout::Linear, ScaleLayout::Swizzled128X4, DType::BF16)
             .expect("the step's buffers");
         // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
         // tile per route, so the step's rows are 15 360 and not 120.
@@ -2186,11 +2201,22 @@ pub(super) mod tests {
             experts: 128,
             tile: 128,
         };
-        let planned = encoded_bytes(tokens, geometry, ScaleLayout::Linear, DType::BF16)
+        let planned = encoded_bytes(
+            tokens,
+            geometry,
+            ScaleLayout::Linear,
+            ScaleLayout::Swizzled128X4,
+            DType::BF16,
+        )
             .expect("the encoded term");
         assert_eq!(planned, step.bytes().expect("the step's bytes"));
         assert_eq!(
-            moe.step_bytes(tokens, ScaleLayout::Linear, DType::BF16)
+            moe.step_bytes(
+                tokens,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+            )
                 .expect("the step"),
             routing_bytes(tokens, geometry, DType::BF16).expect("the prefix") + planned
         );
@@ -2250,16 +2276,32 @@ pub(super) mod tests {
             86_507_520
         );
         assert_eq!(
-            step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, false).expect("dense step"),
+            step_bytes(
+                15,
+                geometry,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+                false,
+            ).expect("dense step"),
             86_576_384
         );
         assert_eq!(
-            encoded_bytes(15, geometry, ScaleLayout::Linear, DType::BF16)
+            encoded_bytes(
+            15, geometry, ScaleLayout::Linear, ScaleLayout::Swizzled128X4, DType::BF16,
+        )
                 .expect("the encoded step"),
             94_217_728
         );
         assert_eq!(
-            step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, true).expect("encoded step"),
+            step_bytes(
+                15,
+                geometry,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+                true,
+            ).expect("encoded step"),
             94_286_592
         );
         assert_eq!(
@@ -2295,7 +2337,14 @@ pub(super) mod tests {
         let small = exchanged_bytes(15, geometry, decode, DType::BF16).expect("the decode's step");
         assert!(
             small
-                < step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, true)
+                < step_bytes(
+                15,
+                geometry,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+                true,
+            )
                     .expect("the encoded single-rank step"),
             "{small} is not below the single-rank reservation"
         );
@@ -2306,7 +2355,14 @@ pub(super) mod tests {
         };
         let rows = exchanged_rows(1_024, geometry, prefill).expect("the prefill's rows");
         assert_eq!(rows, 67_456);
-        let single = step_bytes(1_024, geometry, ScaleLayout::Linear, DType::BF16, false)
+        let single = step_bytes(
+            1_024,
+            geometry,
+            ScaleLayout::Linear,
+            ScaleLayout::Swizzled128X4,
+            DType::BF16,
+            false,
+        )
             .expect("the single-rank step");
         let exchanged =
             exchanged_bytes(1_024, geometry, prefill, DType::BF16).expect("the exchanged step");
