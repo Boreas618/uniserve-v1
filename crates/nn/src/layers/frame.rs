@@ -154,7 +154,6 @@ pub struct FrameNormPad {
     weight: Option<Weight>,
     bias: Option<Weight>,
     reflect: bool,
-    channels_last: bool,
 }
 
 impl FrameNormPad {
@@ -177,19 +176,15 @@ impl FrameNormPad {
             weight,
             bias,
             reflect,
-            channels_last: false,
         })
     }
 
-    /// Write the padded frame channels-last (`[batch, frames, height, width, channels]`).
-    pub fn with_channels_last(mut self) -> Self {
-        self.channels_last = true;
-        self
-    }
-
     /// The descriptor one normalize-pad launch takes from numbers: the frame's channels and pixels,
-    /// the groups its statistics are taken over, the layout it writes, whether the affine parameters
-    /// are present, and the padded frame's pixel count (one pixel is a class of its own).
+    /// the groups its statistics are taken over, the storage order it writes, whether the affine
+    /// parameters are present, and the padded frame's pixel count (one pixel is a class of its own).
+    ///
+    /// A walk has the extents and not the views, so it states the order; a launch reads it off
+    /// `out`'s strides, which is where the order of a frame actually lives.
     pub fn descriptor_of(
         dtype: ops::DType,
         channels: u64,
@@ -213,7 +208,8 @@ impl FrameNormPad {
     ///
     /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
     /// contiguous; `mean` and `rstd` are the `frame_moments` of the same frames; `out` is the padded
-    /// frame in the activation's element type, channel-first or channels-last.
+    /// frame in the activation's element type, in either storage order — its strides state which,
+    /// and they select the compiled variant.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -232,28 +228,22 @@ impl FrameNormPad {
                 format!("a padded frame is rank 5, not {:?}", out.shape.dims()),
             ));
         }
-        // Channel-first: [batch, channels, frames, height, width]; channels-last:
-        // [batch, frames, height, width, channels]. The layer states which, so a frame whose width
-        // happens to equal its channel count is not guessed at.
+        // The axes are logical in either storage order — `[batch, channels, frames, height, width]`
+        // — and the order lives in the strides, so one view of a channels-last buffer serves this
+        // layer exactly as a channels-first one does.
         let channels = values.shape.dim(1);
-        let (frames_axis, height_axis, width_axis) = if self.channels_last {
-            (1, 2, 3)
-        } else {
-            (2, 3, 4)
-        };
-        let channel_axis = if self.channels_last { 4 } else { 1 };
-        if out.shape.dim(channel_axis) != channels {
+        if out.shape.dim(1) != channels {
             return Err(Error::shape(
                 "FrameNormPad",
                 format!(
                     "an output of {} channels for a source of {channels}",
-                    out.shape.dim(channel_axis)
+                    out.shape.dim(1)
                 ),
             ));
         }
-        if out.shape.dim(frames_axis) < values.shape.dim(2)
-            || out.shape.dim(height_axis) < values.shape.dim(3)
-            || out.shape.dim(width_axis) < values.shape.dim(4)
+        if out.shape.dim(2) < values.shape.dim(2)
+            || out.shape.dim(3) < values.shape.dim(3)
+            || out.shape.dim(4) < values.shape.dim(4)
         {
             return Err(Error::shape(
                 "FrameNormPad",
@@ -261,13 +251,15 @@ impl FrameNormPad {
                     .to_owned(),
             ));
         }
-        let padded_pixels = out.shape.dim(height_axis) * out.shape.dim(width_axis);
+        let padded_pixels = out.shape.dim(3) * out.shape.dim(4);
         let descriptor = Self::descriptor_of(
             values.dtype,
             values.shape.dim(1),
             values.shape.dim(3) * values.shape.dim(4),
             self.groups,
-            self.channels_last,
+            // The variant follows the output's storage, which the view states; the operator checks
+            // the two agree before it launches.
+            frame::is_channels_last(&out),
             self.weight.is_some(),
             padded_pixels,
         );
