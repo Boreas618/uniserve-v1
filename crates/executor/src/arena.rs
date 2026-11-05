@@ -519,8 +519,21 @@ impl Pools {
     /// remember: the addresses repeat. A zero extent is a bucket without activations.
     pub fn record(&mut self, stream: StreamId, bucket: Bucket, bytes: u64) -> Result<()> {
         self.ledger.note(stream, bucket, bytes)?;
+        let reservation = self.ledger.reservation;
         let pool = self.pool(stream)?;
         pool.plans.insert(bucket, Plan { bytes });
+        // What a capture cost, as one line per bucket: the extent its walk reached inside the range.
+        // The figures are the three a reader needs and cannot get afterwards - the extent, the range
+        // it sits in, and how many buckets share the range - because the pool's own mapping is the
+        // range and not the extents inside it.
+        tracing::info!(
+            stream = stream.0,
+            bucket = %bucket,
+            extent = bytes,
+            reservation,
+            planned = pool.plans.len(),
+            "the graph pool booked a bucket's extent"
+        );
         Ok(())
     }
 
@@ -645,6 +658,14 @@ impl Pools {
             let bytes = usize::try_from(self.ledger.reservation)
                 .map_err(|_| Error::Resource("a stream's graph range is larger than memory"))?;
             let buffer = self.allocator.allocate(PoolKind::Graph, bytes)?;
+            // The range is mapped whole on the first capture, whatever the plan holds: buckets are
+            // extents inside it, so this figure - and not the largest of them - is what the device's
+            // budget carries for graphs.
+            tracing::info!(
+                stream = stream.0,
+                reservation = self.ledger.reservation,
+                "the graph pool mapped its whole reservation at the first capture"
+            );
             self.pools.insert(
                 stream,
                 Pool {
