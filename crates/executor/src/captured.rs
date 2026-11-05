@@ -106,14 +106,29 @@ impl Captured {
                 "a captured graph with kernels has no node table".into(),
             ));
         }
-        let mut kernel_nodes = 0u64;
+        // Two counts, and they are about different subjects: what the walk *declared* and what the
+        // template *holds*. The walk's per-launch table is the rebind's subject - a node the table
+        // does not name cannot be given new parameters - and the template's kernel nodes are what a
+        // replay actually launches.
+        let mut recorded_kernels = 0u64;
+        let mut recorded_anything = 0u64;
         for (_, _, launch) in &nodes {
+            recorded_anything += launch.len() as u64;
             for walked in launch {
                 if walked.node.kind()? == platform::GraphNodeKind::Kernel {
-                    kernel_nodes += 1;
+                    recorded_kernels += 1;
                 }
             }
         }
+        let mut template_kernels = 0u64;
+        for node in template.nodes()? {
+            if node.kind()? == platform::GraphNodeKind::Kernel {
+                template_kernels += 1;
+            }
+        }
+        // What one replay launches is the template's count, not the table's: a table that names one
+        // node of a 781-node graph would otherwise report one kernel per replay.
+        let kernel_nodes = template_kernels;
         // A capture is the one place in this system where a silent partial result looks exactly like
         // success: it returns in milliseconds, with no error, and its graph replays a fraction of the
         // forward. So the template is read back from the driver and compared with what the walk
@@ -124,13 +139,43 @@ impl Captured {
         // column and an empty node per ordering edge, so the template holds at least what the walk
         // launched and equality is not the invariant. Holding fewer is: it means nodes the walk
         // reported are not in the graph a replay launches.
-        let launched = nodes.iter().map(|(_, _, launch)| launch.len() as u64).sum::<u64>();
+        let launched = nodes.len() as u64;
         let template_nodes = template.nodes()?.len() as u64;
         if template_nodes < launched {
             return Err(Error::Invariant(format!(
                 "the capture recorded {launched} launch(es) and its graph holds {template_nodes} \
                  node(s): the work a replay launches is not the work the walk declared"
             )));
+        }
+        // The other side, and it decides whether a rebind can be trusted: the walk's table must
+        // account for the graph's kernel nodes. A table that names fewer kernels than the graph
+        // launches is a rebind that would set parameters on some of them and silently leave the
+        // rest running the replaced program - a new generation that differs from the old one in
+        // exactly the nodes it did not name.
+        //
+        // It refuses only when the table is **complete** - every launch named at least one node.
+        // An incomplete table is the recorder's defect rather than the capture's, and a capture is
+        // also how a bucket first comes to serve: refusing it there would take the deployment down
+        // for a fault of the update path. So it is reported at `warn` with all three counts, and
+        // the rebind path refuses by name exactly where the missing nodes would be written.
+        let complete = nodes.iter().all(|(_, _, launch)| !launch.is_empty());
+        if complete && recorded_kernels < template_kernels {
+            return Err(Error::Invariant(format!(
+                "the walk named {recorded_kernels} kernel node(s) and the graph holds \
+                 {template_kernels}: the walk cannot account for {} of them, and a rebind would \
+                 leave those running the replaced program",
+                template_kernels - recorded_kernels
+            )));
+        }
+        if !complete {
+            tracing::warn!(
+                launches = launched,
+                recorded_nodes = recorded_anything,
+                recorded_kernels,
+                template_kernels,
+                "the walk's node table names fewer kernels than the graph holds: a rebind of this \
+                 bucket cannot set every launch's parameters"
+            );
         }
         Ok(Self {
             exec,
@@ -174,6 +219,16 @@ impl Captured {
     /// How many kernel nodes the graph has: the launches one replay issues.
     pub fn kernel_nodes(&self) -> u64 {
         self.kernel_nodes
+    }
+
+    /// Whether the walk's table named a node for every launch it reported.
+    ///
+    /// A rebind sets parameters node by node, so a launch the table left empty is a launch whose
+    /// new program can never reach the executable: the bucket would be reported as rebound while
+    /// that launch kept running the replaced kernel. The precopy path recaptures such a bucket
+    /// instead, and this is the fact it decides on.
+    pub fn nodes_complete(&self) -> bool {
+        !self.nodes.is_empty() && self.nodes.iter().all(|(_, _, launch)| !launch.is_empty())
     }
 
     /// Whether the graph launches `operator` at all.
