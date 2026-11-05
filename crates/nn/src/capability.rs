@@ -722,6 +722,26 @@ pub trait Denoiser {
     /// The latent layout this request needs.
     fn layout(&self, request: &VideoRequest<'_>) -> Layout;
 
+    /// The denoising steps one request of `task` runs, in order.
+    ///
+    /// The runner executes one step per call and cannot derive the schedule: the steer belongs to
+    /// the model's checkpoint, and `Step::index` and `Step::count` are what a solver checks itself
+    /// against, so a runner holding its own sigma table would be a second source of truth for a
+    /// value the model states.
+    ///
+    /// The task is the key rather than a positional index because a request names its task: a
+    /// vector of schedules whose first element is the one a request starts with says which
+    /// schedule to take by position, and a second modality inserted at the front changes every
+    /// caller silently.
+    ///
+    /// A model that states no schedule for `task` refuses by name. Empty would be the same value
+    /// as a schedule that exists and has no steps, which is the opposite fact.
+    fn schedule(&self, task: VideoTask) -> Result<Vec<Step>> {
+        Err(Error::Unsupported(format!(
+            "a denoiser that states no schedule for {task:?}"
+        )))
+    }
+
     /// Draw the initial noise of `out` from `seed`, addressed within `layout`.
     ///
     /// The layout is a parameter because the draw's element offsets are functions of the request's
