@@ -28,6 +28,7 @@ use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
 use minimax_h3::partition::Partition;
+use minimax_h3::programs::{Deployment, Types};
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::VideoDecoder;
 use minimax_h3::vision::VisionTower;
@@ -191,9 +192,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokens.sort_unstable();
     tokens.dedup();
-    if packed.is_empty() {
-        return Err("--rows is the deployment's and has no default".into());
-    }
+    // `--rows` has no default and no authority: the deployment derives this number
+    // (`Layouts::rows_bound`), so a stated value is checked against it below rather than believed.
     packed.sort_unstable();
     packed.dedup();
     if track.is_empty() {
@@ -296,6 +296,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_type =
         minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "audio_vae")?;
 
+    // **The deployment states its own facts.** `--rows` was an input and the deployment derives that
+    // number (`Layouts::rows_bound`), so a walk cut at a stated bound could describe a deployment no
+    // request reaches - and every count it printed was about that request. The value is asked here
+    // and a stated `--rows` is checked against it.
+    let deployment = Deployment::read(
+        &root,
+        Types {
+            text_encoder: text_type,
+            transformer: stack_type,
+            video: vae_type,
+            audio: audio_type,
+        },
+        samples.clone(),
+    )?;
+    let attention = match (sparse, stated_attention) {
+        (_, Some(contract)) => {
+            AttentionKind::sparse(contract.tile, contract.sparsity, contract.reference_keep)?
+        }
+        (Some((tile, sparsity, _, reference_keep)), None) => {
+            AttentionKind::sparse(tile, sparsity, reference_keep)?
+        }
+        (None, None) => AttentionKind::Dense,
+    };
+    let bound = deployment.bound(&partition, Some(attention))?;
+    let rows_bound = match packed.iter().copied().max() {
+        Some(stated) if stated != bound => {
+            return Err(format!(
+                "--rows states {stated} packed rows and the deployment's own bound is {bound}: a \
+                 walk that stamped another number describes a deployment it cannot be asked to be"
+            )
+            .into());
+        }
+        _ => bound,
+    };
+    eprintln!(
+        "the deployment's packed row bound is {rows_bound}: {}",
+        if packed.is_empty() {
+            "stated by the deployment, no --rows given"
+        } else {
+            "--rows agrees with it"
+        }
+    );
+
     let audio = root.join("audio_vae/config.json");
     if audio.exists() {
         // The two audio VAEs state F32 rows by the design's own table, and neither component takes a
@@ -377,33 +420,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_object()
             .ok_or_else(|| format!("{component}/config.json is not an object"))?;
         let config = TransformerConfig::parse(values, &format!("{component}/config.json"))?;
-        let max = packed.iter().copied().max().unwrap_or(0);
+        let max = rows_bound;
         // The group count is the task set's: a conditioned deployment's modulation cache is another
         // program at the entries' width. The denoiser states its two stacks and the orchestration
         // around them, so the walk asks it rather than a stack.
-        let (attention, tiles) = match (sparse, stated_attention) {
-            (_, Some(sparse_contract)) => (
-                AttentionKind::sparse(
-                    sparse_contract.tile,
-                    sparse_contract.sparsity,
-                    sparse_contract.reference_keep,
-                )?,
-                // The bound on the key tiles one compression reduces over: the deployments' packed
-                // rows over the tile's rows, rounded up to the next power of two because the bound is
-                // a compiled class rather than a request count.
-                (packed
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(0)
-                    .div_ceil(sparse_contract.tile))
+        // The bound on the key tiles one compression reduces over: the deployment's packed rows over
+        // the tile's rows, rounded up to the next power of two because the bound is a compiled class
+        // rather than a request count. A caller's stated tile count is not an input either - the
+        // deployment's own bound decides the class.
+        let tiles = match (attention, sparse) {
+            (AttentionKind::Dense, _) => 0,
+            (sparse_kind, Some((tile, _, stated_tiles, _))) if stated_tiles == 0 => {
+                let _ = (sparse_kind, tile);
+                rows_bound.div_ceil(tile).next_power_of_two()
+            }
+            (_, Some((tile, _, stated_tiles, _))) => {
+                let derived = rows_bound.div_ceil(tile).next_power_of_two();
+                if stated_tiles != derived {
+                    return Err(format!(
+                        "--sparse states {stated_tiles} tiles and the deployment's bound \
+                         {rows_bound} over a {tile}-row tile is {derived}"
+                    )
+                    .into());
+                }
+                derived
+            }
+            (_, None) => rows_bound
+                .div_ceil(stated_attention.expect("a stated contract").tile)
                 .next_power_of_two(),
-            ),
-            (Some((tile, sparsity, tiles, reference_keep)), None) => (
-                AttentionKind::sparse(tile, sparsity, reference_keep)?,
-                tiles,
-            ),
-            (None, None) => (AttentionKind::Dense, 0),
         };
         rows.extend(Denoiser::programs(
             &config,
@@ -433,11 +477,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("# {} data rows, {operators} operators", rows.len());
     println!(
-        "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}",
+        "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: [{rows_bound}] (the deployment's own bound), trajectory elements: {elements:?}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}",
         partition.ulysses_degree
     );
     println!(
-        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --types <table> --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
+        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --types <table> --samples {} --rasters {} --tokens {} --elements {} --track {} --sparse {} --tp {degree}`",
         samples
             .iter()
             .map(u32::to_string)
@@ -449,11 +493,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Vec<_>>()
             .join(","),
         tokens
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-        packed
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
