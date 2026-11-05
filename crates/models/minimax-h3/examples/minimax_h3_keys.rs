@@ -35,7 +35,8 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys -- \
+//!     --commit "$(git rev-parse --short HEAD)" > notes/programs/minimax-h3-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
 //!     --against notes/programs/minimax-h3-keys.txt
 //! ```
@@ -309,6 +310,7 @@ fn main() {
     // The flag decides *which* row set is enumerated; the tuple decides the deployment the bound is
     // derived from. A walk that had only the flag could not state the bound its tile derives, and it
     // stated the dense one - which the recorder refuses.
+    let mut commit: Option<String> = None;
     let mut sparse = false;
     let mut sparse_deployment: Option<(u32, f64, Option<f64>)> = None;
     while let Some(flag) = arguments.next() {
@@ -331,6 +333,10 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            // The revision the rows are enumerated from. The generator cannot read it - it reads a
+            // checkpoint, not a tree - so the caller states it, and a fixture that omits it is a
+            // row set with no way back to the code that produced it.
+            "--commit" => commit = Some(value(&mut arguments, "--commit")),
             "--sparse" => {
                 // The value the walk takes (`tile_rows,sparsity[,reference_keep]`) **is** the sparse
                 // deployment: its tile is what the network's attention is when the layout is built,
@@ -669,6 +675,7 @@ fn main() {
         bound,
         serving.tensor_parallel,
         serving.ulysses_degree,
+        commit.as_deref(),
     );
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
@@ -689,6 +696,7 @@ fn header(
     bound: u32,
     tensor_parallel: usize,
     ulysses_degree: usize,
+    commit: Option<&str>,
 ) {
     let operators = lines
         .iter()
@@ -792,7 +800,21 @@ fn header(
         "# checkpoint: MiniMax-H3. Its two DiTs (`transformer`, `transformer_ref`) are the same \
          config, so one set of rows serves the base network and the reference DiT."
     );
-    println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    println!(
+        "# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys -- --commit <revision>"
+    );
+    // **The provenance line.** A row set is the code that enumerated it at one commit; without the
+    // revision a reader cannot tell a fixture from a re-cut of itself, and a comparison between two
+    // files cannot say whether they differ by a row or by a week. The generator cannot read the
+    // revision (it reads a checkpoint), so it states the one it was given and says so when it was
+    // given none, rather than leaving the absence to look like a clean file.
+    match commit {
+        Some(revision) => println!("# commit: {revision}"),
+        None => println!(
+            "# commit: unstated - pass `--commit $(git rev-parse --short HEAD)` so this row set \
+             names the code that enumerated it"
+        ),
+    }
     // The four fields that decide the derived rows, printed from the checkpoint that decided them. A
     // reader asking "which canvas is this file for" gets the answer beside the count, and the answer
     // cannot drift from the rows: both come from one read of `--root`.

@@ -176,10 +176,11 @@ rm -f "$probe"
 #    drives - which is what they are for.
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p minimax-h3 --example minimax_h3_keys -- --root "$root" >"$walk_dense"
+    cargo run -q -p minimax-h3 --example minimax_h3_keys -- --root "$root" --commit "$commit" \
+    >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example minimax_h3_keys -- --root "$root" --sparse "$sparse" \
-    >"$walk_sparse"
+    --commit "$commit" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
