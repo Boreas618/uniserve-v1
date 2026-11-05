@@ -336,6 +336,7 @@ driver_table! {
             *const LaunchConfig, Handle, *mut *mut c_void, *mut *mut c_void,
         );
         func_set_attribute = "cuFuncSetAttribute": fn(Handle, i32, i32);
+        func_get_name = "cuFuncGetName_v2": fn(*mut *const c_char, Handle);
 
         stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, i32);
         stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
