@@ -31,6 +31,11 @@ pub enum Error {
     /// A model layer's computation failed.
     #[error(transparent)]
     Nn(#[from] nn::Error),
+    /// The media encoders or the muxer refused: a raster or a track the codecs cannot take, or an
+    /// assembly that is not complete. The class is the media crate's own, kept whole so a caller
+    /// can tell a plan refusal from a codec failure.
+    #[error(transparent)]
+    Media(#[from] media::Error),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -264,7 +269,7 @@ fn kind_code(error: &Error) -> ErrorCode {
         Error::Transport { .. } | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
         // An operator or model failure is a computation failure, unless its own
         // kind says otherwise; the message carries the library's text.
-        Error::Ops(_) | Error::Nn(_) => ErrorCode::ComputeError,
+        Error::Ops(_) | Error::Nn(_) | Error::Media(_) => ErrorCode::ComputeError,
     }
 }
 
@@ -350,7 +355,9 @@ mod tests {
         assert_eq!(faulted.code, ErrorCode::FatalWorkerFailure);
         assert!(faulted.fatal);
         assert!(
-            faulted.message().contains("decode_sampled/8 rows/512 tokens"),
+            faulted
+                .message()
+                .contains("decode_sampled/8 rows/512 tokens"),
             "the fault does not name the work in flight: {}",
             faulted.message()
         );
@@ -361,7 +368,10 @@ mod tests {
         );
 
         let refused = Failure::classify(
-            Error::in_flight("serving batch 18", Error::Invalid("a batch of 3 rows".into())),
+            Error::in_flight(
+                "serving batch 18",
+                Error::Invalid("a batch of 3 rows".into()),
+            ),
             None,
         );
         assert_eq!(refused.code, ErrorCode::InvalidDescriptor);

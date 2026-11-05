@@ -429,6 +429,10 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
                 bucket: *bucket,
                 generation: *generation,
             },
+            Job::Host { call, .. } => Job::Host {
+                runner,
+                call: *call,
+            },
         })
         .collect()
 }
