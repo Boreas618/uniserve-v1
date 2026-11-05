@@ -68,7 +68,33 @@ use nn::weights::WeightLoader;
 use nn::weights::WeightRequest;
 use nn::{DType, Forward, Shape};
 
+/// What the recorder takes, printed for `--help`.
+///
+/// The recorder is the deployment check's engine (`tools/check_h3_deployment.sh` runs it at every
+/// point the file states), so the caller meets its arguments in a failure before reading this file:
+/// printing them where a caller looks first is the difference between a flag list and a guess.
+fn usage() -> String {
+    "record --root <checkpoint> [--names | --list | --extents <file>] [--component <name>] [--types <file>]\n\
+     \x20      [--clip <frames>] [--raster <height>x<width>] [--track <samples>] [--rows <n>]\n\
+     \x20      [--tokens <n>] [--elements <n>] [--conditioned true|false]\n\
+     \x20      [--sparse <tile,sparsity[,reference_keep]>] [--against <path>]\n\
+     \x20      [--check-extents]\n\n\
+     --names lists the components the checkpoint holds; --list the program keys one component\n\
+     launches; --check-extents states every row's extents without recording. Everything else\n\
+     records the deployment at the point the flags describe.\n"
+        .to_owned()
+}
+
 fn main() -> ExitCode {
+    // Asked before parsing, so `--help` answers whatever else is on the line: a caller who has just
+    // watched a run refuse wants the flag list, not a message about `--help` not being one of them.
+    if std::env::args()
+        .skip(1)
+        .any(|flag| flag == "--help" || flag == "-h")
+    {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(problem) => {

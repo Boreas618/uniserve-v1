@@ -65,9 +65,9 @@ use crate::arena::StreamId;
 /// | [`Product::Text`] | the encoder runner | the denoiser, through `copy_into` |
 /// | [`Product::VideoLatents`] | the denoiser runner | the decoder, through `copy_into` |
 /// | [`Product::AudioLatents`] | the denoiser runner | nothing yet - `ref2va` only |
-/// | [`Product::Video`] | the decoder runner | the transport, when it writes the artifact |
-/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - the encoder writes one region | - |
-/// | [`Product::Track`] | **nobody** - the audio decode is not built | - |
+/// | [`Product::Video`] | the decoder runner | the media encode, when it writes the artifact |
+/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - a reference condition, `ref2va` only | - |
+/// | [`Product::Track`] | the audio decode runner | the audio encode, when it writes the artifact |
 ///
 /// A kind nobody published is not a hole a reader falls into: the store answers `None` and a refusal
 /// names the product and the request, which is what `ref2va` reports today.
@@ -85,21 +85,24 @@ pub enum Product {
     VideoLatents,
     /// The audio latent trajectory, in the same sense.
     AudioLatents,
-    /// `[channels, frames, rows, columns]` the decoded clip: a decode writes it and the transport
-    /// that turns it into an artifact reads it.
+    /// The request's video frames: a decode writes them and the encoder that turns them into an
+    /// artifact's units reads them.
     ///
-    /// It is a product for the same reason the latents are: the region is a runner's own column, and
-    /// a value another call must read has nowhere to be unless it is named. The name is
-    /// `(request, kind)` like every other, so the transport reads one clip by the identity the
-    /// request was admitted under rather than by a position in a batch.
+    /// **The extent is the postprocessor's**, not the clip's: `[frames, rows, columns, 3]` bytes,
+    /// where a frame is one frame the timeline keeps. A deployment that serves no postprocessor
+    /// publishes the decoded clip instead, `[channels, frames, rows, columns]` in the model's own
+    /// element type. It is a product for the same reason the latents are: the region is a runner's
+    /// own column, and a value another call must read has nowhere to be unless it is named. The name
+    /// is `(request, kind)` like every other, so the encoder reads one request's frames by the
+    /// identity the request was admitted under rather than by a position in a batch.
     Video,
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
     ///
-    /// **No runner publishes it yet**: the audio decode is the piece of this seam that is not built,
-    /// and `ref2va` is the only task that asks for it. It is named here because a product's name is
-    /// the design's vocabulary rather than a record of what compiles - and the store refuses a kind
-    /// nothing published by name (`absent`), so a reader of it today is told which product is
-    /// missing rather than reading a region nobody wrote.
+    /// The audio decode runner publishes it and an audio encode reads it. It is a different product
+    /// from [`Product::Audio`] on purpose: that one is a request's reference audio condition (an
+    /// input the media reader produced), and this one is what this request's own denoising produced:
+    /// a conditioner reads the first, the muxer's audio encode reads the second, and a store that
+    /// gave them one name would let a `ref2va` request read its input as its output.
     Track,
 }
 
@@ -216,6 +219,39 @@ pub trait Products: Send + Sync {
         destination: &TensorView,
         stream: &platform::Stream,
     ) -> Result<bool>;
+
+    /// Copies `request`'s `kind` product into host memory and waits for the copy to land.
+    ///
+    /// This is the read the media work makes. `crates/media`'s encoders and muxer take host bytes,
+    /// and both products they consume - the clip and the track - are device regions. `out` is pinned
+    /// host memory of exactly the product's size, which [`Products::product`] states; `stream` is
+    /// the reader's own stream, and the copy is ordered on it after the producer's write exactly as
+    /// [`Products::copy_into`] orders a device copy. The call **waits** before it returns, because
+    /// the reader runs on this thread and has no stream to wait on.
+    ///
+    /// `false` is a product no call of `request` produced - never a buffer of zeros, which would be
+    /// a frame of black nobody made.
+    ///
+    /// The bytes carry the producer's own element type: this store copies, and a `f16` clip stays
+    /// `f16`. A reader that wants `u8` pixels converts them, because the conversion is the model's
+    /// arithmetic and its range is the model's statement.
+    ///
+    /// A store that holds no device cannot answer, and its default refusal says so rather than
+    /// handing back a buffer nobody wrote.
+    fn stage(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        out: &platform::PinnedBuffer,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        let _ = (request, kind, out, stream);
+        Err(crate::Error::Invalid(
+            "this product store cannot copy a product to host memory: it holds no device, and the \
+             media work reads its bytes on the host"
+                .into(),
+        ))
+    }
 
     /// Drops every product of `request`, answering how many there were.
     ///
@@ -514,6 +550,59 @@ impl Products for Held {
                 stream,
             )?;
         }
+        Ok(true)
+    }
+
+    fn stage(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        out: &platform::PinnedBuffer,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(false);
+        };
+        let product = placed.view.byte_len()?;
+        if product != out.len() as u64 {
+            return Err(crate::Error::Invalid(format!(
+                "request {} stages {product} byte(s) of {} into {} byte(s) of host memory: a \
+                 partial copy is a reader whose buffer disagrees with the product's shape",
+                request.request_id.0,
+                kind.name(),
+                out.len()
+            )));
+        }
+        let read = (stream.device(), StreamId(stream.raw()));
+        if route((placed.device, placed.stream), read) == Route::AfterTheWriter {
+            let Some(written) = placed.written.as_ref() else {
+                return Err(crate::Error::Invalid(format!(
+                    "request {} stages {} written on device {} stream {} with no record of its \
+                     write: a producer that expects a host reader states the event (`written_on`) \
+                     when it publishes",
+                    request.request_id.0,
+                    kind.name(),
+                    placed.device.0,
+                    placed.stream.0
+                )));
+            };
+            stream.wait_event(written)?;
+        }
+        // SAFETY: both ranges outlive the copy - the product's region belongs to the request, which
+        // is in flight while it is read, and `out` belongs to the caller - and the copy is ordered
+        // on `stream` after the writer's event where they differ. `synchronize` is what makes the
+        // host bytes readable on this thread, and it is why the caller needs no stream of its own.
+        unsafe {
+            platform::memcpy_async(
+                out.address(),
+                placed.view.ptr.address(),
+                usize::try_from(product)
+                    .map_err(|_| crate::Error::Invalid("a product is larger than memory".into()))?,
+                stream,
+            )?;
+        }
+        stream.synchronize()?;
         Ok(true)
     }
 
