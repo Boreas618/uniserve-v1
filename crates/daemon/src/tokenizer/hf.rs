@@ -43,9 +43,9 @@ fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
 /// The result matches `fastokens` decoding with the same byte-level decoder.
 /// IDs missing from the vocabulary contribute no text, as in Hugging Face
 /// `tokenizers` and vLLM: a model's vocabulary dimension can exceed its
-/// tokenizer vocabulary (a checkpoint may pad it above the tokenizer's), so
-/// sampling or a logprob candidate can produce an ID in that gap, and one
-/// such ID must not fail the whole response.
+/// tokenizer vocabulary (`Qwen3` checkpoints pad it), so sampling or
+/// a logprob candidate can produce an ID in that gap, and one such ID must
+/// not fail the whole response.
 fn decode_fastokens_byte_level(
     tokenizer: &FastokensTokenizer,
     token_ids: &[u32],

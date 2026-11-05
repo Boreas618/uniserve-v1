@@ -2,8 +2,10 @@
 //!
 //! `ModelConfig::load` builds one [`HfChatRenderer`] from the checkpoint files
 //! and the server's template options for every model except a diffusers
-//! pipeline. For each chat prompt, the model's preprocessing calls
-//! [`HfChatRenderer::render`] and tokenizes the rendered prompt.
+//! pipeline. For each chat prompt, the model's preprocessing (`Qwen3`, or a
+//! video pipeline's own) calls
+//! [`HfChatRenderer::render`] and tokenizes the rendered prompt (the
+//! multimodal path first resolves its image placeholders in it).
 //!
 //! Rendering converts each `ChatMessage` into a `TemplateMessage`, the
 //! OpenAI-compatible JSON shape that Hugging Face templates inspect: assistant
@@ -47,10 +49,10 @@ pub use jinja::{load_chat_template, resolve_chat_template};
 /// Image rendering settings for a renderer that accepts `image_url` parts.
 ///
 /// Without this value, rendering fails with
-/// `Error::UnsupportedMultimodalContent` on any `image_url` part. No served
-/// profile writes an image token, so production loading passes `None` for
-/// every model, and a chat request's image parts are refused while it is
-/// preprocessed: they never reach the renderer.
+/// `Error::UnsupportedMultimodalContent` on any `image_url` part. Production
+/// loading passes `None` for every model the daemon serves: a video pipeline
+/// replaces each chat image with a text placeholder (`replace_chat_images`)
+/// before rendering, so image parts never reach the renderer there.
 pub struct MultimodalRenderInfo {
     /// Text substituted for each image part when content is flattened to a
     /// string. With list-shaped content, image parts become `{"type": "image"}`
