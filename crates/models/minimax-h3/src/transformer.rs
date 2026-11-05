@@ -731,13 +731,16 @@ impl Transformer {
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+        // The gated activation reads the two halves of **one** packed projection: `projection_halves`
+        // keeps the packed row stride, so each half's stride between rows is twice its width, and the
+        // launch passes that stride (`GatedActivation::forward` takes it from the views). A key stating
+        // the half's width names a program the launch never makes.
+        let half = u64::from(config.intermediate_size);
+        programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
             dtype,
-            u64::from(config.intermediate_size),
+            half,
             nn::layers::Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
-            u64::from(rows) * u64::from(config.intermediate_size),
+            u64::from(rows) * half,
             true,
         )?);
 
@@ -1283,11 +1286,21 @@ mod tests {
         assert_eq!(count("dense_attention"), 1);
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("act_and_mul"), 1);
-        assert!(
-            programs
-                .iter()
-                .any(|(name, key)| name == "act_and_mul" && key.contains("stepwise_true")),
-            "the block's activation is the stepwise recipe: {programs:?}"
+        // The gated activation reads the two halves of **one packed projection**: the halves keep the
+        // packed row stride, so the key states twice the width, and `GatedActivation::forward` takes
+        // exactly that from the views. A key stating the half's width names a program no launch makes.
+        let activated: Vec<&str> = programs
+            .iter()
+            .filter(|(name, _)| name == "act_and_mul")
+            .map(|(_, key)| key.as_str())
+            .collect();
+        assert_eq!(
+            activated,
+            vec![concat!(
+                "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
+                "_value_stride_28672_wide_false_pdl_false_stepwise_true"
+            )],
+            "the block's activation is the packed-view program at the stepwise recipe"
         );
 
         // The AdaLN activation is FP32 `(`modulation.rs` refuses a timestep pair in any other type),
