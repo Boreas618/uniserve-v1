@@ -44,6 +44,27 @@ fail() {
     exit 1
 }
 
+# One generator question, with the generator's own failure kept apart from the file's.
+#
+# A generator answers about a file only when the generator exists: on a tree mid-edit `cargo` produces
+# no rows at all, and reporting that as "the file is not the generator's rows" sends a reader to the
+# fixture while the cause is a compile error a few lines above. The compiler's own line is what
+# separates the two, and it is printed before either verdict.
+generator_question() {
+    local label=$1
+    shift
+    local out=$scratch/generator.out
+    local status=0
+    python3 "$gaps" "$@" >"$out" 2>&1 || status=$?
+    cat "$out"
+    [ "$status" -eq 0 ] && return 0
+    if grep -q '^error\[E\|^error: could not compile' "$out"; then
+        grep -m1 '^error' "$out" | sed 's/^/   /'
+        fail "the generator did not build, so no row was compared with $label: the tree is mid-edit"
+    fi
+    fail "the file is not the generator's rows"
+}
+
 # The clip's soundtrack is the clip's own, in latent frames: 800 samples per
 # latent at 40 latents per second of 24 generated frames per second.
 track=$(python3 - "$clip" <<'PY'
@@ -54,7 +75,7 @@ PY
 
 # 1. Is the file the rows of this tree?
 echo "== the list against the model's own enumeration"
-python3 "$gaps" --generator "$root" --fixture "$fixture" || fail "the file is not the generator's rows"
+generator_question "$(basename "$fixture")" --generator "$root" --fixture "$fixture"
 
 # 2. Does the file state what it holds?
 echo
@@ -79,7 +100,8 @@ sparse_producer=64,0.9
 sparse_programs=64,0.9,8192
 if [ -f "$sparse_fixture" ]; then
     echo "   spellings: generator and recorder $sparse_producer, programs $sparse_programs"
-    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=$sparse_producer \
+    generator_question "$(basename "$sparse_fixture")" --generator "$root" \
+        --generator-flag=--sparse --generator-flag=$sparse_producer \
         --fixture "$sparse_fixture" || sparse_not_generated=1
 else
     echo "   skipped: $sparse_fixture is absent"
