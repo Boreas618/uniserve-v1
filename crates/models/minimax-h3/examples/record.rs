@@ -1139,7 +1139,38 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         height: probe_layout.video.height,
         width: probe_layout.video.width,
     };
-    let rows = minimax_h3::packing::Visual { frames: 1, raster }.rows();
+    // **The reference is a clip, not a still.** An image reference carries no soundtrack in H3's
+    // packing (a one-frame reference is an image, and the packing refuses an image with audio), so
+    // the request that reaches the audio condition is a `ref2va` one whose reference is decoded to a
+    // latent frame or more - one encoder clip, which is the shortest reference the model serves.
+    let piece_frames = 17u32;
+    let piece_latent = network.clip.latent_frames(piece_frames).map_err(|error| error.to_string())?;
+    // The capacity this request needs is the packing's own count for its condition - the reference's
+    // visual rows **and its soundtrack's** - so it is asked of the packing rather than restated: a
+    // capacity that held only the visual rows refused the load by 80 rows on the first canvas.
+    let target_canvas = minimax_h3::config::offered_canvases()
+        .iter()
+        .find(|canvas| canvas.height == height && canvas.width == width)
+        .copied()
+        .ok_or("the request's raster is not one of the deployment's canvases")?;
+    let piece_condition = minimax_h3::packing::Condition {
+        role: minimax_h3::packing::Role::Reference,
+        frame: Some(minimax_h3::packing::Frame {
+            canvas: target_canvas,
+            num_frames: piece_frames,
+        }),
+        audio_samples: request.track,
+    };
+    let piece_segments = minimax_h3::packing::condition_segments(
+        std::slice::from_ref(&piece_condition),
+        &target_canvas,
+        network.clip,
+    )
+    .map_err(|error| error.to_string())?;
+    let rows: u32 = piece_segments
+        .iter()
+        .map(|segment| segment.video_rows() + segment.audio_rows())
+        .sum();
     // The condition capacity is the deployment's and holds this request's rows, in whole capacity
     // units: a capacity the packing cannot serve is refused at load rather than at the first write.
     let capacity = rows.div_ceil(unit) * unit;
@@ -1167,9 +1198,12 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let conditions = [ConditionShape {
         role: ConditionRole::Reference,
-        frames: 1,
-        height: raster.height,
-        width: raster.width,
+        frames: piece_frames,
+        // The condition's own raster in **pixels**: the model reduces it to latents itself
+        // (`canvas_of_raster` then `latent_raster`), so a harness that states the latent raster here
+        // is divided twice and the packing sees a raster the request never had.
+        height,
+        width,
         // A reference condition that carries audio: the audio projection and its narrow crossing
         // (`target_bf16_source_f32 columns 2688`, the audio modulation at 56) exist only for a
         // request with an audio condition, and a harness that states `0` never reaches them.
@@ -1251,7 +1285,13 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     let pixels = arena
         .tensor(
             ops::DType::F32,
-            Shape::new(&[1, 3, 1, u64::from(height), u64::from(width)]),
+            Shape::new(&[
+                1,
+                3,
+                u64::from(piece_frames),
+                u64::from(height),
+                u64::from(width),
+            ]),
         )
         .map_err(|error| error.to_string())?;
     let noise = arena
@@ -1259,18 +1299,52 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
             ops::DType::F32,
             Shape::new(&[
                 u64::from(config.video_vae.latent_channels),
-                1,
+                u64::from(piece_latent),
                 u64::from(raster.height),
                 u64::from(raster.width),
             ]),
         )
         .map_err(|error| error.to_string())?;
+    // The reference's soundtrack is a condition of the request the layout has already packed, so its
+    // rows are the model's own count - the denoiser's segment for it - and not a second statement of
+    // the arithmetic.
+    let piece_segment = denoiser
+        .segments(&asked)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|segment| segment.audio_rows() > 0 || segment.video_rows() > 0)
+        .ok_or("the request's reference packs into no segment")?;
+    let piece_audio_rows = piece_segment.audio_rows();
+    let piece_rows = piece_segment.video_rows();
+    // The piece's soundtrack, at the samples the request's condition states: a reference that
+    // carries audio is the deployment's own case (`fl2va` fits every `ref2va` request that has one),
+    // and a harness that hands the conditioner `None` records a conditioner that never encodes one.
+    let piece_track = arena
+        .tensor(
+            ops::DType::F32,
+            // The encoder reads one mono track per batch row, so a stereo soundtrack is its two
+            // channels - the same form the generated track takes, and the one the packing's
+            // channel-major rows are counted for.
+            Shape::new(&[
+                u64::from(minimax_h3::config::AUDIO_CHANNELS),
+                1,
+                // The encoder convolves whole 800-sample latent frames, so the request's track is
+                // handed to it **padded** - the padding is a request buffer's tail, which the
+                // reference's `unpack_samples` fills and which is the caller's here.
+                minimax_h3::encoding::padded_samples(
+                    u64::from(request.track),
+                    u64::from(config.audio_vae.hop()),
+                )
+                .map_err(|error| error.to_string())?,
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
     let pieces = [nn::capability::MediaInput {
         role: nn::capability::MediaRole::Reference,
-        rows,
-        audio_rows: 0,
+        rows: piece_rows,
+        audio_rows: piece_audio_rows,
         pixels: Some(pixels),
-        audio: None,
+        audio: Some(piece_track),
         noise: Some(noise),
     }];
     let video = arena
