@@ -1434,6 +1434,12 @@ fn half_bits(value: f32) -> u16 {
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
+///
+/// The container is **channel-major**, which is the reference's own latent layout (`[B, C, T, H, W]`,
+/// permuted to channels-last only inside its decoder), so one voxel's channels are `frames · height ·
+/// width` elements apart in the file and adjacent in the rows. Reading them adjacently in the file
+/// instead would hand the decode a transposed latent and still produce a plausible raster: the class
+/// this branch keeps finding, and here it would have been silent on the harness that has never run.
 fn pack_latents(
     bytes: &[u8],
     tiles: &[minimax_h3::video_vae::Tile],
@@ -1453,20 +1459,56 @@ fn pack_latents(
     }
     let mut packed = Vec::with_capacity(bytes.len());
     for tile in tiles {
-        let (row_start, row_end) = tile.latent_rows;
-        let (column_start, column_end) = tile.latent_columns;
-        for frame in 0..frames {
-            for row in u64::from(row_start)..u64::from(row_end) {
-                for column in u64::from(column_start)..u64::from(column_end) {
-                    let at = ((frame * height + row) * width + column) * channels * 2;
-                    let start = usize::try_from(at).unwrap_or(0);
-                    let end = start + usize::try_from(channels * 2).unwrap_or(0);
-                    packed.extend_from_slice(&bytes[start..end]);
+        gather_tile(
+            bytes,
+            (frames, height, width, channels),
+            (tile.latent_rows.0, tile.latent_rows.1),
+            (tile.latent_columns.0, tile.latent_columns.1),
+            &mut packed,
+        )?;
+    }
+    Ok(packed)
+}
+
+/// One tile's voxels, gathered out of a channel-major raster into rows of `channels` elements each.
+///
+/// Rows run frame by frame, then row, then column, and each row's channels are adjacent - the order
+/// this decoder's `[voxels, channels]` operand reads. The four geometries and the tile's spans are
+/// arguments rather than fields so that a small raster states the arrangement in a test.
+fn gather_tile(
+    bytes: &[u8],
+    geometry: (u64, u64, u64, u64),
+    rows: (u32, u32),
+    columns: (u32, u32),
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let (frames, height, width, channels) = geometry;
+    let plane = frames
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(width))
+        .ok_or_else(|| Failure::message("the latent raster's extent overflows".to_owned()))?;
+    let element = 2_u64;
+    for frame in 0..frames {
+        for row in u64::from(rows.0)..u64::from(rows.1) {
+            for column in u64::from(columns.0)..u64::from(columns.1) {
+                let voxel = (frame * height + row) * width + column;
+                for channel in 0..channels {
+                    let at = (channel * plane + voxel) * element;
+                    let start = usize::try_from(at).unwrap_or(usize::MAX);
+                    let end = start.saturating_add(usize::try_from(element).unwrap_or(0));
+                    let held = bytes.get(start..end).ok_or_else(|| {
+                        Failure::message(format!(
+                            "the latent raster ends before element {at}: it holds {} bytes and a \
+                             {frames}x{height}x{width} raster of {channels} channels does not fit",
+                            bytes.len()
+                        ))
+                    })?;
+                    out.extend_from_slice(held);
                 }
             }
         }
     }
-    Ok(packed)
+    Ok(())
 }
 
 /// `[channels, frames, rows x columns]` to `[frames, rows x columns, channels]`, both float16.
@@ -1486,7 +1528,7 @@ fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTAINER_F32, Failure, convert_latents};
+    use super::{CONTAINER_F32, Failure, convert_latents, gather_tile};
     use nn::DType;
 
     /// The one narrowing the pipeline makes: a denoiser's FP32 latent, read by a decode whose element
@@ -1523,6 +1565,43 @@ mod tests {
             Err(Failure::Message(message)) => panic!("the copy: {message}"),
         };
         assert_eq!(same, source);
+    }
+
+    /// The container is channel-major and the decoder's operand is voxel-major: a tile's rows are each
+    /// voxel's channels, gathered across the file's channel planes. Two planes of three voxels make the
+    /// arrangement visible, and the wrong one (channels adjacent in the file) is a different sequence.
+    #[test]
+    fn a_tiles_rows_are_gathered_across_the_channels_planes() {
+        // Three channels, one frame, one row of three columns: `[3, 1, 1, 3]`, values named by their
+        // position so a permutation cannot read as a pass.
+        let half = |value: u16| value.to_le_bytes();
+        let mut raster = Vec::new();
+        for channel in 0..3_u16 {
+            for column in 0..3_u16 {
+                raster.extend_from_slice(&half(10 * channel + column));
+            }
+        }
+        let mut out = Vec::new();
+        match gather_tile(&raster, (1, 1, 3, 3), (0, 1), (0, 3), &mut out) {
+            Ok(()) => {}
+            Err(Failure::Message(message)) => panic!("the gather: {message}"),
+        }
+        let got: Vec<u16> = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|element| u16::from_le_bytes(*element))
+            .collect();
+        // Voxel 0 takes one element from each plane, then voxel 1, then voxel 2.
+        assert_eq!(got, vec![0, 10, 20, 1, 11, 21, 2, 12, 22]);
+    }
+
+    /// A raster shorter than the tile's spans is refused with the element it ran out at, not read past
+    /// the end into another tile's bytes.
+    #[test]
+    fn a_raster_that_ends_early_is_refused() {
+        let mut out = Vec::new();
+        assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), &mut out).is_err());
     }
 
     /// An element type this stage has no conversion to is refused by name rather than reinterpreted as
