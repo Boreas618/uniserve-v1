@@ -460,7 +460,7 @@ use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
+use nn::{AttentionBackend, DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
 /// One transformer layer of the decoder: the attention half and the gated feed-forward half, each
@@ -749,6 +749,34 @@ pub fn folded_input(
     ))
 }
 
+/// The attention of the decoder's block, for the element type the clip is decoded at.
+///
+/// FlashAttention-4's program is a half-precision kernel and serves the packed form of one
+/// sequence, the form that carries row offsets and refuses a null table; the FP32 program is a GEMM
+/// and a softmax, serves one sequence without offsets, and its package declares exactly that cell.
+/// The block is one sequence either way, so the element type alone decides which program is asked
+/// for - and a clip decoded at f32 must not ask for a half-precision kernel.
+fn block_attention(head: u32, heads: u32, rows: u32, dtype: DType) -> Result<Attention> {
+    let scale = (head as f32).sqrt().recip();
+    match dtype {
+        DType::F32 => Ok(Attention::fp32(head, heads, heads, rows, false, scale)?),
+        _ => Ok(Attention::dense(
+            head, heads, heads, rows, false, None, scale,
+        )?),
+    }
+}
+
+/// Whether this attention serves the packed form: the one the offsets table selects.
+///
+/// The descriptor prints `cu_seq_lens` only for the form *without* offsets, so a launch and the walk
+/// that states it must agree on this one predicate or the store builds a cell no launcher binds.
+fn packed(attention: &Attention) -> bool {
+    matches!(
+        attention.backend(),
+        AttentionBackend::Dense | AttentionBackend::Sparse
+    )
+}
+
 impl VideoDecoder {
     /// Every checkpoint tensor the video decoder reads, by name.
     ///
@@ -867,20 +895,16 @@ impl VideoDecoder {
 
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
-        let attention = Attention::dense(
-            head,
-            heads,
-            heads,
+        let attention = block_attention(head, heads, width, dtype)?;
+        // The form the backend serves: the flash kernel's packed one with offsets, or the FP32
+        // program's single sequence without them.
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype,
+            dtype,
+            dtype,
             width,
-            false,
-            None,
-            (head as f32).sqrt().recip(),
-        )?;
-        // The packed form of one sequence: the flash backend refuses a null offsets table, so the
-        // launch states the offsets and the key is the one fa4 declares.
-        programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(dtype, dtype, dtype, width, true),
-        );
+            packed(&attention),
+        ));
 
         Ok(programs.finish())
     }
@@ -1077,15 +1101,12 @@ impl VideoDecoder {
                     "minimax-h3",
                 )?
             },
-            attention: Attention::dense(
+            attention: block_attention(
                 head,
-                heads,
                 heads,
                 u32::try_from(canvas.rows())
                     .map_err(|_| Error::config("too many tokens".to_owned()))?,
-                false,
-                None,
-                1.0 / (head as f32).sqrt(),
+                dtype,
             )?,
             config: config.clone(),
             ffn_mult: config.decoder_ffn_mult,
@@ -1393,15 +1414,26 @@ impl VideoDecoder {
                 per_head(rotated_query),
                 per_head(rotated_key),
             )?;
-            // One sequence: the clip's rows, its registers and its tail attended together, stated as
-            // the packed form of one sequence because the flash backend serves only that form.
+            // One sequence: the clip's rows, its registers and its tail attended together.
+            //
+            // The row offsets are the flash backend's packed form and nothing else: it serves
+            // sequences packed by offsets and no other shape, while the FP32 program - a GEMM and a
+            // softmax - serves one sequence without them, and its key says which it is
+            // (`cu_seq_lens` is printed only for the form without offsets). One sequence makes the
+            // two arithmetically identical, so the launch states the form its own backend has
+            // rather than asking for a cell the other backend's package declares.
+            let offsets = if packed(&self.attention) {
+                Some(self.offsets.view())
+            } else {
+                None
+            };
             self.attention.attend_dense(
                 f,
                 per_head(rotated_query),
                 per_head(rotated_key),
                 per_head(value),
-                Some(self.offsets.view()),
-                Some(self.offsets.view()),
+                offsets,
+                offsets,
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
                 attended,
@@ -2198,5 +2230,41 @@ pub(crate) mod tests {
         // One dense attention whatever the clip: the row count is a launch value, so the decoder's
         // programs do not depend on the raster a request asks for.
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
+    }
+
+    /// One dense attention, and its key is the form the element type it decodes at has.
+    ///
+    /// The FP32 program is a GEMM and a softmax over one sequence: it reads no offsets, and its
+    /// key says so (`_cu_seq_lens_false` is printed exactly for the form without them), which is
+    /// the only cell `dense_attention/f32` declares. The half-precision kernel serves the packed
+    /// form, which carries offsets and prints no such field. A clip decoded at f32 that asked the
+    /// half-precision kernel for its attention would name a program the f32 package cannot build.
+    #[test]
+    fn the_decoders_attention_names_the_form_its_element_type_has() {
+        let config = video_config();
+        let key = |dtype: DType| {
+            VideoDecoder::programs(&config, dtype)
+                .expect("the decoder's programs")
+                .into_iter()
+                .find(|(name, _)| name == "dense_attention")
+                .map(|(_, key)| key)
+                .expect("one dense attention")
+        };
+
+        let fp32 = key(DType::F32);
+        assert!(
+            fp32.ends_with("mask_dense_window_false_cu_seq_lens_false"),
+            "{fp32}"
+        );
+        assert!(fp32.contains("dtype_f32_kv_f32_out_f32"), "{fp32}");
+
+        for half in [DType::F16, DType::BF16] {
+            let packed = key(half);
+            assert!(packed.ends_with("mask_dense_window_false"), "{packed}");
+            assert!(
+                !packed.contains("cu_seq_lens"),
+                "the packed form names no offsets: {packed}"
+            );
+        }
     }
 }
