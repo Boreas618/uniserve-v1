@@ -1192,6 +1192,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// launch carries and the pointers the kernel dereferences. A kernel handed a table of zeros or
     /// a bound of one reads nothing, and no host-side figure says which.
     pending_attention: Option<String>,
+    /// Whether this runner has served a batch. A bucket captured before that may be warmed by an
+    /// eager walk; one captured afterwards may not, because the walk would run a forward over an
+    /// arena a serving bucket owns.
+    served: bool,
     pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
@@ -1311,6 +1315,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             cache_page: None,
             pending_attention: None,
+            served: false,
             pending_install: None,
             pending_dump: None,
             last_prefill: None,
@@ -1719,6 +1724,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                          holds: the bound was taken from the pose the bucket was captured with"
                     );
                 }
+                self.served = true;
                 if runner_dump() {
                     let call = format!(
                         "{}{}",
@@ -1873,6 +1879,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// eager walk of a new generation over a serving bucket's own arena is work the switchover
     /// design does not allow.
     fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
+        if self.served {
+            // A bucket recaptured after serving is recaptured because a program changed, and the
+            // operator that changed was warmed by its shadow pass; an eager forward here would run
+            // over the arena a serving bucket owns.
+            return Ok(());
+        }
         let began = std::time::Instant::now();
         self.walk(bucket, kernels)?;
         // The warm launches are real device work on the pool's stream; a capture begun over them is
