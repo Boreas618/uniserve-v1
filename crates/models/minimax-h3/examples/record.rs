@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use minimax_h3::encoding::AudioEncoder;
+use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use nn::forward::Arena;
 use nn::tensor::DevicePtr;
 use nn::weights::WeightLoader;
@@ -141,8 +141,12 @@ fn run() -> Result<(), String> {
     };
 
     let harnesses: Vec<(&str, Harness)> = match component.as_str() {
-        "all" => vec![("audio-encoder", audio_encoder as Harness)],
+        "all" => vec![
+            ("audio-encoder", audio_encoder as Harness),
+            ("video-encoder", video_encoder as Harness),
+        ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
+        "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -272,6 +276,62 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
+}
+
+/// The video VAE's encoder: one still, through the tile walk the encoder's own `encode` reserves.
+///
+/// Its weights are stored plainly — no weight-normalized pair — so this harness needs no extents table,
+/// which is why it can run on a host with no shard while the audio VAE cannot.
+fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = video_config(&request.root)?;
+    // The video VAE's encoder computes in FP32 at every deployment, so its loader states FP32: the
+    // element type a module carries is the one its arithmetic runs in, not the sample's.
+    let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
+    let encoder = VideoEncoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+
+    // `--raster <height>x<width>` is the walk's own convention (`programs.rs --rasters`), so the pixel
+    // tensor's two spatial axes are the pair in that order.
+    let (height, width) = request.raster;
+    let frames = 1u32;
+    let latency = encoder.latent_frames(frames).map_err(|error| error.to_string())?;
+    // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a bias and an
+    // output that disagree, which is what a mixed operand reads as).
+    let pixels = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[1, 3, u64::from(frames), u64::from(height), u64::from(width)]),
+        )
+        .map_err(|error| error.to_string())?;
+    let compression = u64::from(config.spatial_compression());
+    let moments = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[
+                2 * u64::from(config.latent_channels),
+                u64::from(latency),
+                u64::from(height) / compression,
+                u64::from(width) / compression,
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = encoder.encode(&forward, pixels, moments);
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
+}
+
+fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
+    let path = root.join("vae/config.json");
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let values: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    minimax_h3::VideoVaeConfig::parse(&values).map_err(|error| error.to_string())
 }
 
 fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
