@@ -357,7 +357,17 @@ impl Lifecycle {
             *ordinal += 1;
         }
         let held = hold_kernels(kernels, &walked.nodes)?;
-        let prepared = Captured::from_template(template, walked.nodes, held)?;
+        // The prepared executable is the serving template's, so its node table is too: the walk's
+        // nodes belong to the graph the walk captured, and no executable of this template can be
+        // set through them. The two tables have one shape, which the comparison above established,
+        // and each launch keeps the descriptor key the walk stated for it.
+        let nodes = served
+            .nodes()
+            .iter()
+            .zip(&walked.nodes)
+            .map(|((operator, _, launch), (_, key, _))| (*operator, key.clone(), launch.clone()))
+            .collect();
+        let prepared = Captured::from_template(template, nodes, held)?;
         let mut applied = 0usize;
         for (operator, ordinal, params) in launches {
             applied += prepared.rebind_launch(operator, ordinal, &params)?;
