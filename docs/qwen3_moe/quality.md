@@ -80,28 +80,38 @@ export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. The reference side is a **second checkout of the baseline tree** — `git worktree add /tmp/gsm8k-reference f1de185a2`, with its own `uv sync` — so the two implementations never share an environment; the block below is that side's, then the candidate's. The candidate needs the root package's release binary and an environment installed from this checkout, because the worker imports the `uniserve` package of the environment it runs in. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight and the reference plan and run, then build and run the candidate's three cells by name, then compare each cell with itself:
 
 ```bash
-cd /tmp/gsm8k-reference   # the baseline tree, installed on its own
+# The reference side, in its own worktree and its own environment.
+cd /tmp/gsm8k-reference
 .venv/bin/python -m pytest -q tests/python/unit/eval_driver/test_gsm8k_benchmark.py tests/python/unit/eval_driver/test_accuracy_compare.py
 .venv/bin/python -c "from uniserve_eval.config import load_config; from uniserve_eval.datasets import load_examples; c = load_config('uniserve_eval/qwen3_moe.toml'); rows, _ = load_examples(c.selected_points('qwen3-moe-gsm8k-bf16')[0]); print(len(rows), rows[0].id, rows[-1].id)"
 .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k
-.venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root artifacts/qwen3_moe/gsm8k-baseline
-# Candidate: build the root package's binary, install this checkout's environment, then run the cells by name.
+REF=/abs/path/artifacts/qwen3_moe/gsm8k-reference
+.venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root "$REF"
+
+# The candidate side, in this checkout.
+cd <candidate worktree>
 cargo build --release
+cp -p .venv/bin/uniserve .venv/bin/uniserve.previous
+install -m 755 target/release/uniserve .venv/bin/uniserve
+cmp target/release/uniserve .venv/bin/uniserve   # silent: the installed copy is the build
 export VIRTUAL_ENV=$PWD/.venv
 .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable "$PWD/target/release/uniserve"
-# The FP8 KV cell's provider name differs by implementation: the baseline's
-# `torch` provider does not exist in the rewrite, whose FP8 planes its own
-# attention layer reads. The profile reads this variable for that cell only.
+# The FP8 KV cell's provider name differs by implementation: the reference
+# side's `torch` provider does not exist in the rewrite, whose FP8 planes its
+# own attention layer reads. The profile reads this variable for that cell only.
 export UNISERVE_QWEN3_FP8_ATTENTION_BACKEND=auto
+CAND=/abs/path/artifacts/qwen3_moe/gsm8k-candidate
 for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
-  .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run "$cell" --executable "$PWD/target/release/uniserve" --output-root artifacts/qwen3_moe/gsm8k-candidate || break
+  .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run "$cell" --executable "$PWD/target/release/uniserve" --output-root "$CAND" || break
 done
+
+# One verdict per cell: the same cell on both sides.
 for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
-  .venv/bin/python -m uniserve_eval compare "artifacts/qwen3_moe/gsm8k-baseline/$cell" "artifacts/qwen3_moe/gsm8k-candidate/$cell"
+  .venv/bin/python -m uniserve_eval compare "$REF/$cell" "$CAND/$cell"
 done
 ```
 
-The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate builds the root package's `target/release/uniserve`, installs the environment from the same checkout, names that binary with `--executable`, and runs the same three cells by name, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable`, `--output-root`, and — for the FP8 KV cell alone — the name the loading path is given for its attention: `torch` on the baseline, `auto` on the candidate. A provider is a name in one implementation's registry, so the two runs cannot name the same one: `torch` is the baseline's only reader of per-block FP8 pages, and the rewrite reads those planes in its own attention layer and takes `attention_backend` as a loading-path name.
+The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. Both roots are absolute and outside the trees: `artifacts/` is git-ignored, so a bundle exists only in the checkout that produced it, and a relative path would make the verdict a coin flip. Each side runs its three cells serially, one server at a time. The candidate builds the root package's `target/release/uniserve`, installs it, and names it with `--executable`; because `--executable` replaces only the first word of a server command and the daemon resolves its other processes through `$VIRTUAL_ENV/bin/uniserve`, the install is what keeps one deployment from running two generations — `cmp` proves it, `--help` does not. `run` refuses a non-empty result directory, so the two roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable`, `--output-root`, and — for the FP8 KV cell alone — the name the loading path is given for its attention: `torch` on the baseline, `auto` on the candidate. A provider is a name in one implementation's registry, so the two runs cannot name the same one: `torch` is the baseline's only reader of per-block FP8 pages, and the rewrite reads those planes in its own attention layer and takes `attention_backend` as a loading-path name.
 
 ## Results
 
