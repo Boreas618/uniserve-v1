@@ -57,10 +57,14 @@ CONSTANT = re.compile(
 FIXTURE = pathlib.Path("notes/programs/minimax-h3-deployment-keys.txt")
 AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
 
-GENERATOR = pathlib.Path("crates/models/minimax-h3/examples/minimax_h3_keys.rs")
-DEFAULT_LADDER = re.compile(
-    r"const DEPLOYMENT_FRAMES: \[u32; \d+\] = \[(?P<list>[^\]]*)\];"
-)
+# The deployment's own ladder is `Deployment::generated`, in the crate: the
+# walk checks a stated clip against it, so the step it walks by is the single
+# rule both obey. The step is read from the source, never typed here -
+# stepping by `CLIP_LATENTS` instead of `CLIP_FRAMES` printed 198 rungs where
+# the rule has 59.
+PROGRAMS = pathlib.Path("crates/models/minimax-h3/src/programs.rs")
+GENERATED = re.compile(r"pub fn generated\(\)")
+STEP = re.compile(r"frames \+= (?P<step>[A-Za-z_:]+);")
 
 
 def constants() -> dict[str, int]:
@@ -117,34 +121,13 @@ def servable() -> list[int]:
     return rungs
 
 
-def defaults() -> list[int]:
-    """The ladder the generator states when no `--frames` is given."""
-    found = DEFAULT_LADDER.search((ROOT / GENERATOR).read_text())
+def generated_step(source: str) -> str | None:
+    """The identifier `Deployment::generated` walks its rungs by, or None."""
+    found = GENERATED.search(source)
     if not found:
-        raise SystemExit(
-            f"{GENERATOR} states no `DEPLOYMENT_FRAMES`: the default ladder is "
-            "read from there rather than restated here, so a constant that is "
-            "gone is refused"
-        )
-    values = constants()
-    rungs = []
-    for item in found["list"].split(","):
-        item = item.strip()
-        if not item:
-            continue
-        # A rung may be written as a constant's name; the value is the rule's.
-        name = item.rsplit("::", 1)[-1]
-        if name in values:
-            rungs.append(values[name])
-        elif item.isdigit():
-            rungs.append(int(item))
-        else:
-            raise SystemExit(
-                f"the default ladder names `{item}`, which is neither a "
-                "number nor one of the rule's constants: a rung this check "
-                "cannot read is a rung it cannot judge"
-            )
-    return rungs
+        return None
+    stepped = STEP.search(source[found.end() : found.end() + 2000])
+    return None if stepped is None else stepped["step"]
 
 
 def requestable(
@@ -180,9 +163,9 @@ def ladder(header: str) -> list[int]:
     found = LADDER.search(header)
     if not found:
         raise SystemExit(
-            "the header states no clip lengths: the check reads the ladder "
-            "from there rather than restating the rule, so the generator owes "
-            "the line `# ... clip lengths: [...]` before the check can run"
+            "the header states no clip lengths and this check was asked to "
+            "read one: the row comparison is the authority, so this path is "
+            "only taken when a caller passes a header to parse"
         )
     return [int(value) for value in found["list"].split(",") if value.strip()]
 
@@ -212,31 +195,30 @@ def report(default: set[str], stated: set[str]) -> int:
     return 1
 
 
-def report_refused(
-    stated: list[int],
-    refused: list[int],
-    allowed: list[int],
-    admissible: list[int],
-) -> int:
-    """Name the rungs no request can ask for, and what the rule does admit."""
-    values = constants()
-    print(
-        f"the default ladder states {len(stated)} rung(s), {len(refused)} of "
-        "them are not clips a request can name:"
-    )
-    for rung in refused:
+def report_step(step: str | None, values: dict[str, int]) -> int:
+    """Judge the step the deployment walks its own ladder by."""
+    if step is None:
         print(
-            f"  {rung:>5}  not of the form {values['CLIP_FRAMES']}n + "
-            f"{values['CLIP_LATENTS']}"
+            f"{PROGRAMS} states no `frames += ...` inside `generated`: the "
+            "step is read from there rather than restated here, so a ladder "
+            "this check cannot find is one it cannot judge"
         )
+        return 1
+    wanted = values["CLIP_FRAMES"]
+    wrong = (values["MAX_FRAMES"] - wanted) // values["CLIP_LATENTS"]
+    if step.rsplit("::", 1)[-1] != "CLIP_FRAMES":
+        print(
+            f"`Deployment::generated` steps by `{step}` where the rule steps "
+            f"by `CLIP_FRAMES` ({wanted}): stepping by `CLIP_LATENTS` yields "
+            f"{wrong} rungs, of which one is a clip `17n + 5` admits"
+        )
+        return 1
     print(
-        f"the rule admits {len(admissible)} clip length(s), {admissible[0]} to "
-        f"{admissible[-1]}; the default's {len(allowed)} requestable rung(s) "
-        f"are {allowed}. A row set for a refused rung is a set for a clip the "
-        "model never sees, and the row comparison cannot run until the default "
-        "is one the rule admits"
+        f"`Deployment::generated` steps by `{step}`, which is the rule's own "
+        "step: the ladder the walk checks against and the ladder a request can "
+        "name are one statement"
     )
-    return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -282,10 +264,9 @@ def main(argv: list[str] | None = None) -> int:
             "the model can produce"
         )
 
-    stated_rungs = defaults()
-    refused, allowed = requestable(stated_rungs, clause)
-    if refused:
-        return report_refused(stated_rungs, refused, allowed, clause)
+    values = constants()
+    if report_step(generated_step((ROOT / PROGRAMS).read_text()), values):
+        return 1
 
     header, default = generate()
     if not default:
@@ -300,24 +281,36 @@ def main(argv: list[str] | None = None) -> int:
             "statement of one truth"
         )
 
-    # Two sets, two answers, and only one of them is a defect: a delivery rung
-    # outside the rule is a clip the model cannot serve, while a rule rung the
-    # delivery does not drive is a scheduling choice - inventory nobody asks
-    # for, which a store should not hold. The second is reported, never failed.
-    undriven = [rung for rung in clause if rung not in set(stated_rungs)]
+    # A rule rung the delivery does not drive is a scheduling choice and not a
+    # shortfall: inventory nobody asks for is what a store should not hold.
+    undriven = [rung for rung in clause if rung not in set(file_rungs)]
     print(
-        f"{len(stated_rungs)} delivery rung(s), every one inside the rule; the "
-        f"rule admits {len(clause)} and the delivery does not drive "
-        f"{len(undriven)} of them, which is a choice about what to serve"
+        f"the file drives {len(file_rungs)} rung(s); the rule admits "
+        f"{len(clause)} and the delivery does not drive {len(undriven)} of "
+        "them, which is a choice about what to serve"
     )
 
-    stated_header, stated = generate("--frames", ",".join(map(str, clause)))
-    if ladder(stated_header) != clause:
+    # The rows are the authority: two runs, one ladder each, compared as row
+    # sets. A header line stating the ladder is checked when the generator
+    # writes one, and its absence is not a defect - the comparison below does
+    # not need it.
+    # The two runs compared are the deployment's own ladder stated twice: by
+    # the generator's default, and by `--frames`. Two different ladders differ
+    # by design; one ladder stated two ways must not.
+    if not file_rungs:
+        print(
+            f"{FIXTURE} states no clip ladder, so there is no second statement "
+            "of the deployment's own rungs to compare: the flag trial is run "
+            "against the rule's ladder instead, which a delivery need not drive"
+        )
+        file_rungs = clause
+    stated_header, stated = generate("--frames", ",".join(map(str, file_rungs)))
+    if LADDER.search(stated_header) and ladder(stated_header) != file_rungs:
         raise SystemExit(
-            f"--frames {clause} was asked for and the header states "
+            f"--frames {file_rungs} was asked for and the header states "
             f"{ladder(stated_header)}: the flag does not reach the rows"
         )
-    print(f"{len(clause)} rungs: {clause}")
+    print(f"{len(file_rungs)} rung(s): {file_rungs}")
     return report(set(default), set(stated))
 
 
@@ -342,11 +335,16 @@ def self_test() -> int:
     refused, allowed = requestable([5, 22, 39], rungs)
     assert refused == [5] and allowed == [22, 39], (refused, allowed)
     assert requestable(rungs, rungs) == ([], rungs)
-    # The generator's own ladder is read, not restated: whatever it states, the
-    # split accounts for every rung exactly once.
-    default_rungs = defaults()
-    refused, allowed = requestable(default_rungs, rungs)
-    assert len(refused) + len(allowed) == len(default_rungs)
+    # The deployment's step is read from the source and judged against the rule.
+    right = "pub fn generated() -> Vec<u32> { frames += crate::CLIP_FRAMES; }"
+    wrong = "pub fn generated() -> Vec<u32> { frames += crate::CLIP_LATENTS; }"
+    absent = "pub fn admissable() -> bool { true }"
+    assert generated_step(right) == "crate::CLIP_FRAMES", generated_step(right)
+    assert generated_step(wrong) == "crate::CLIP_LATENTS"
+    assert generated_step(absent) is None
+    assert report_step(None, constants()) == 1
+    assert report_step("crate::CLIP_LATENTS", constants()) == 1
+    assert report_step("crate::CLIP_FRAMES", constants()) == 0
     # The second direction is not a defect: a rule rung the delivery does not
     # drive is inventory no run asks for. Thirty-eight of fifty-nine is the
     # delivery's own number and it must read as a choice, not a shortfall.
