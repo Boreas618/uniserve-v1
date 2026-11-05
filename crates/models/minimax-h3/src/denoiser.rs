@@ -1458,6 +1458,35 @@ impl ConditionEncoders {
     }
 }
 
+/// The rank-two view the initial-noise operator addresses: `[c, f, h, w]` merged into `[c · f · h, w]`.
+///
+/// `philox_noise` draws a **flat stream** — a value is a function of `(seed, element)` — and reads a
+/// two-axis buffer, so the raster keeps its own shape and the draw is handed one reinterpretation of
+/// the same bytes. Which axis stays the row does not change a value: the element order is the
+/// raster's row-major order either way, and the operator's grid under a scalar key counts the whole
+/// buffer rather than its rows.
+///
+/// Both modalities take the same merge rather than one taking a split of its own, because their
+/// shapes differ and the addressing does not: the video latent is `[channels, frames, height,
+/// width]` and the audio's is `[AUDIO_CHANNELS · audio_channels, frames, 1, 1]`. A rule per
+/// modality would be two statements of one operator's contract, and the audio's was absent - the
+/// draw was handed the four-axis raster and refused `expected 2 axes, found 4` after the first
+/// stage had already been drawn.
+fn noise_view(shape: Shape) -> Result<Shape> {
+    let dims = shape.dims();
+    if dims.len() != 4 {
+        return Err(Error::config(format!(
+            "a latent is drawn as a native four-axis raster and this one is {:?}",
+            dims
+        )));
+    }
+    let rows = dims[0]
+        .checked_mul(dims[1])
+        .and_then(|rows| rows.checked_mul(dims[2]))
+        .ok_or_else(|| Error::config(format!("a latent of {:?} has no row count", dims)))?;
+    Ok(Shape::new(&[rows, dims[3]]))
+}
+
 /// A model error as the capability's.
 fn flattened(error: Error) -> nn::Error {
     nn::Error::Weight {
@@ -1563,13 +1592,14 @@ impl nn::capability::Denoiser for Denoiser {
             ))));
         }
         // The draw is a flat stream - `(seed, element)` - so the operator reads a two-axis view and
-        // the raster keeps its own shape: merging the last two axes is one reinterpretation of the
-        // same bytes, and the element order is the raster's flat order either way. Handing the
-        // four-axis view over is what the operator refused (`expected 2 axes, found 4`), and it
-        // refused it after the load, one launch after the first stage's.
+        // the raster keeps its own shape: `noise_view` merges the leading three axes into rows and
+        // leaves the last as the width, one reinterpretation of the same bytes, and the element
+        // order is the raster's flat order either way. Handing the four-axis view over is what the
+        // operator refused (`expected 2 axes, found 4`), and it refused it after the load, one
+        // launch after the first stage's.
         let flat = out
             .video
-            .reshape(Shape::new(&[native[0] * native[1] * native[2], native[3]]));
+            .reshape(noise_view(out.video.shape).map_err(flattened)?);
         // Both draws carry the **same** `stage` and `draw`, and only the offset differs: the
         // operator's address is `counter = [pair_low, pair_high, stage, draw]`, so either of those
         // words selects a different stream rather than a later position in this one. The reference
@@ -1582,7 +1612,10 @@ impl nn::capability::Denoiser for Denoiser {
         // which no shape or type refuses.
         noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, video_offset)?;
         if let Some(audio) = out.audio {
-            noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 0, audio_offset)?;
+            // The same merge, for the same reason: the audio latent arrives as the four-axis raster
+            // the sample is (`[channels, frames, 1, 1]`), and the operator's addressing is flat.
+            let flat = audio.reshape(noise_view(audio.shape).map_err(flattened)?);
+            noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, audio_offset)?;
         }
         Ok(())
     }
@@ -4372,6 +4405,34 @@ mod tests {
         assert_eq!(one.condition, expected);
         assert_eq!(one.video, one.condition);
         assert_eq!(one.audio, one.video + bare.audio);
+    }
+
+    /// The draw's addressing is flat, so both latents are handed the same merge and neither keeps
+    /// the raster's four axes. The audio latent is the one that used to: the draw was handed it
+    /// as the sample arrives and the operator refused `expected 2 axes, found 4` after the video's
+    /// stage had already been drawn, which is a stop one stage into a request.
+    #[test]
+    fn both_latents_are_drawn_as_one_flat_stream() {
+        let video = Shape::new(&[24, 37, 48, 84]);
+        let flat = noise_view(video).unwrap();
+        assert_eq!(flat.dims(), &[24 * 37 * 48, 84]);
+        assert_eq!(flat.numel(), video.numel(), "the merge loses no element");
+
+        // The audio latent of a 121-frame request: two channels of 64 features over 37 latent
+        // frames, the raster's last two axes unit as the sample carries them.
+        let audio = Shape::new(&[2 * 64, 37, 1, 1]);
+        let flat = noise_view(audio).unwrap();
+        assert_eq!(flat.dims(), &[2 * 64 * 37, 1]);
+        assert_eq!(flat.numel(), audio.numel());
+    }
+
+    /// A latent that is not the native four-axis raster is refused here, by its shape, rather than
+    /// one stage into the request by the operator's rank check.
+    #[test]
+    fn a_latent_that_is_not_a_native_raster_is_refused() {
+        let error = noise_view(Shape::new(&[4, 96768])).unwrap_err();
+        let text = format!("{error}");
+        assert!(text.contains("[4, 96768]"), "{text}");
     }
 
     #[test]
