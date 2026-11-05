@@ -1713,7 +1713,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 if runner_dump() {
-                    let call = self.dump_attention_call(captured, first_page.or(self.cache_page));
+                    let call = format!(
+                        "{}{}",
+                        self.dump_attention_call(captured, first_page.or(self.cache_page)),
+                        self.dump_layer_probes(captured)
+                    );
                     self.pending_attention = Some(call);
                 }
                 if runner_dump() {
@@ -2807,6 +2811,38 @@ impl<M: CausalLm> CausalLmRunner<M> {
             pointer(128),
             pointer(384)
         );
+        // The launch's own lengths, at the offsets `KernelParams` declares them: `mMaxSeqLenQ` 1172,
+        // `mMaxSeqLenKv` 1176, the CTA bounds 1180 and 1184, `mMaxNumPagesPerSeqKv` 1188, and the
+        // head counts 1192 and 1196. The head counts are the cross-check - `mNumHeadsKv` must equal
+        // the KV plane's heads - so the block needs no device fact to be trusted.
+        out.push_str(&format!(
+            " max_q={} max_kv={} ctas_q={} ctas_kv={} pages_per_seq={} heads_kv={} heads_q={}",
+            integer(1172),
+            integer(1176),
+            integer(1180),
+            integer(1184),
+            integer(1188),
+            integer(1192),
+            integer(1196)
+        ));
+        // Past `mNumHeadsQPerKv` the struct holds a `cuda::fast_mod_div<int32_t>` whose width this
+        // host cannot read, so the tail is stated as a window rather than at offsets chosen by
+        // arithmetic: the pair `(mSumOfSeqLensQ, mSumOfSeqLensKv)` identifies itself, because the
+        // query lengths sum to the tokens the call was built for and the KV lengths do not.
+        let mut tail = String::new();
+        for at in (1256..1288).step_by(4) {
+            tail.push_str(&format!("{} ", integer(at)));
+        }
+        out.push_str(&format!(" tail@1256=[{tail}]"));
+        if let Ok(planes) = self.kv.planes(0) {
+            if let Some(first) = planes.first() {
+                out.push_str(&format!(
+                    " plane_heads={} plane_pages={}",
+                    first.key.shape.dim(2),
+                    first.key.shape.dim(0)
+                ));
+            }
+        }
         out.push_str(&verdict("cum_q", pointer(936), self.columns.query_offsets.device.ptr.address()));
         out.push_str(&verdict("seq_lens_kv", pointer(1096), self.columns.seq_lens.device.ptr.address()));
         match self.kv.planes(0) {
@@ -2914,6 +2950,160 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     None => out.push_str(&format!("{name}=unreadable ")),
                 }
             }
+        }
+        out
+    }
+
+    /// The tensors a captured graph writes, read back from the pointers its own launches name.
+    ///
+    /// Layer 0's keys and values are byte-identical to the slice's and layer 1's are not, so the
+    /// disagreement lies between layer 0's KV write and layer 1's projection: attention's output,
+    /// `o_proj`, the residual, the post-attention norm, the router, the experts, or the second
+    /// residual. Nothing on the host says what a kernel in the middle of a captured graph wrote -
+    /// its own arguments say where it wrote it. So this reads two sets of buffers:
+    ///
+    /// * every attention launch's output, at `KernelParams::ptrO` (offset 912 of the struct the node
+    ///   carries), stated with the launch's own grid so a decode launch and a prefill launch are
+    ///   told apart;
+    /// * for the first [`LAYER_PROBE_NODES`] launches, every 8-byte word of their arguments that
+    ///   lands inside the graph's arena, once per distinct address, labelled by the launch that
+    ///   names it first.
+    ///
+    /// Each digest covers the batch's own span - `live` rows of `hidden` elements at the forward's
+    /// element width - so a row here and a slice dump of the same tensor are comparable as bytes
+    /// rather than by name, and a tensor the two sides agree on shows up as one address whose digest
+    /// matches. It reads memory, so it runs only under the dump and only on the device thread, and
+    /// every failure becomes text.
+    fn dump_layer_probes(&self, captured: &crate::captured::Captured) -> String {
+        /// How far into the graph the pointer table reads: layer 0's segment, which is the stretch
+        /// between the KV write and layer 1's projection.
+        const LAYER_PROBE_NODES: usize = 64;
+
+        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+        let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
+        let element = usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let width = live.saturating_mul(hidden).saturating_mul(element);
+        if live == 0 || width == 0 {
+            return " probes=none".to_owned();
+        }
+        let (start, reserved) = match self.pool() {
+            Ok(mut pool) => match pool.base(self.stream_id()) {
+                Ok(base) => (base.address(), pool.reserved() as u64),
+                Err(error) => return format!(" probes=no-arena({error})"),
+            },
+            Err(error) => return format!(" probes=no-pool({error})"),
+        };
+        let inside_bytes = |address: u64, bytes: usize| {
+            address >= start && (address - start).saturating_add(bytes as u64) <= reserved
+        };
+        let inside = |address: u64| inside_bytes(address, width);
+        let mut out = String::from(" probes:");
+
+        // Attention outputs, by layer: the one tensor this runner can name without a layout guess,
+        // because the node's own argument is the struct that holds the pointer.
+        let mut layer = 0_usize;
+        for (operator, _, launches) in captured.nodes() {
+            if *operator != "paged_attention" {
+                continue;
+            }
+            for launch in launches {
+                let params = captured.template().kernel_node_params(&launch.node).ok();
+                let address = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(912..920))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let grid = params
+                    .as_ref()
+                    .map(|params| format!("{:?}", params.grid))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let named = if address == 0 {
+                    "null".to_owned()
+                } else if !inside(address) {
+                    "outside".to_owned()
+                } else {
+                    match self.read_device(address, width) {
+                        Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
+                        None => "unreadable".to_owned(),
+                    }
+                };
+                // The multi-CTA counter, read after the launch: a reduction that leaves it dirty
+                // hands the next launch a counter that never reaches its CTA bound, which is the
+                // shape of an illegal address on the *second* batch rather than the first.
+                let counter = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(1000..1008))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let counted = if counter != 0 && self.in_arena(counter, 4) {
+                    self.read_device(counter, 4)
+                        .map(|raw| {
+                            format!(
+                                " cnt={}",
+                                i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4]))
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(" attn{layer}={named}@{grid}{counted}"));
+                layer += 1;
+            }
+        }
+
+        // Then every arena pointer the first launches name, once per address, with the launches that
+        // name it. A tensor's producer and its consumer both carry its address, so naming them
+        // answers the question no host figure can: does the operator after attention read the buffer
+        // attention wrote, or one the forward staged at capture?
+        let mut seen: Vec<(u64, Vec<(usize, String)>)> = Vec::new();
+        let mut index = 0_usize;
+        'nodes: for (operator, _, launches) in captured.nodes() {
+            for launch in launches {
+                if index >= LAYER_PROBE_NODES {
+                    break 'nodes;
+                }
+                index += 1;
+                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
+                    continue;
+                };
+                for blob in &params.parameters {
+                    for word in blob.chunks_exact(8) {
+                        let address = u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]));
+                        // Sixty-four bytes is the smallest span worth a digest: a sequence vector, a
+                        // counter and a page table all fit in it, and a digest of a shorter span
+                        // would name nothing.
+                        if !inside_bytes(address, 64) {
+                            continue;
+                        }
+                        let naming = (index, (*operator).to_owned());
+                        match seen.iter_mut().find(|(named, _)| *named == address) {
+                            Some((_, names)) if names.len() < 3 && !names.contains(&naming) => {
+                                names.push(naming);
+                            }
+                            Some(_) => {}
+                            None => seen.push((address, vec![naming])),
+                        }
+                    }
+                }
+            }
+        }
+        for (slot, (address, names)) in seen.iter().take(32).enumerate() {
+            let bytes = if inside(*address) { width } else { 64 };
+            let digest = match self.read_device(*address, bytes) {
+                Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
+                None => "unreadable".to_owned(),
+            };
+            let mut spelled = String::new();
+            for (node, operator) in names {
+                spelled.push_str(&format!(" n{node}{operator}"));
+            }
+            out.push_str(&format!(" p{slot}={digest}@{bytes}B{spelled}"));
+        }
+        if seen.len() > 32 {
+            out.push_str(&format!(" (+{} more)", seen.len() - 32));
         }
         out
     }
