@@ -731,19 +731,19 @@ fn prefill_end(state: &RequestState) -> u32 {
     // goes, while `RequestState::prompt_tokens` is only what the request's
     // usage charges and leaves those tokens out.
     let prompt = u32::try_from(state.req.prompt_token_ids.len()).unwrap_or(u32::MAX);
-    // Every vision block of an input image writes its cache tokens into the
-    // context at its prompt position, so the prefill that reaches it is sized
-    // past the text around it.
+    // Every input-image block writes its cache tokens into the context at its
+    // prompt position when the prefill reaches it — a latent block as the
+    // extension call of its own, a vision block joining the context prefill —
+    // so the context the next prefill must reach is the prompt plus the tokens
+    // of the blocks still to write. Counting only `Vision` stopped at the
+    // latent encoder and left the whole image uncounted; counting every block,
+    // written or not, would size a chunk past blocks already in the cache.
     let mut blocks = 0u32;
-    let mut cursor = generation::BlockCursor::default();
+    let mut cursor = state.block_cursor();
     while let Some((_, input)) = state.input_block(cursor) {
-        if input.encoder != crate::ImageEncoder::Vision {
-            break;
+        if let Some(tokens) = input.num_cache_tokens {
+            blocks = blocks.saturating_add(tokens);
         }
-        let Some(tokens) = input.num_cache_tokens else {
-            break;
-        };
-        blocks = blocks.saturating_add(tokens);
         let Some(next) = state.next_block(cursor) else {
             break;
         };
