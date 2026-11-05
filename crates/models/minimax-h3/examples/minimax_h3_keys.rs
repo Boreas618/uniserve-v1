@@ -654,7 +654,15 @@ fn main() {
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines, &config.video_vae, &rasters, &clip_frames, bound);
+    header(
+        &lines,
+        &config.video_vae,
+        &rasters,
+        &clip_frames,
+        bound,
+        serving.tensor_parallel,
+        serving.ulysses_degree,
+    );
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -672,6 +680,8 @@ fn header(
     rasters: &[(u32, u32)],
     clip_frames: &[u32],
     bound: u32,
+    tensor_parallel: usize,
+    ulysses_degree: usize,
 ) {
     let operators = lines
         .iter()
@@ -680,6 +690,45 @@ fn header(
         .len();
     // The deployments the two loops above build: the stack's stated type, the checkpoint's own, and
     // the video VAE's container type, which the checkpoint states rather than the deployment.
+    // **The deployment line**, in the form every tool in this lane reads: `examples/h3_fixture.rs`
+    // copies the header line that starts `MiniMax-H3 programs for` verbatim into the fixture, so a
+    // walk that omits it cannot be cut into one. It states the axes the row set is a statement over -
+    // the clips, the canvases, the bound it was cut at - so a reader of the fixture learns which
+    // deployment it serves without consulting the generator that made it.
+    println!(
+        "# MiniMax-H3 programs for these clip lengths: {:?}, raster sizes: {:?}, packed rows: {}, \
+         element types: [{} stack, {} VAE], sparse attention: {}, tensor-parallel degree {}, \
+         ulysses degree {} - enumerated by the model's own `programs` from `--root`'s checkpoint",
+        clip_frames,
+        rasters
+            .iter()
+            .map(|(height, width)| format!("({height}, {width})"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        bound,
+        DEPLOYMENTS
+            .iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        VAES.iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        // The deployment's own rows decide it: the `vsa_*` group and the fine attention are the
+        // only operators a sparse deployment launches that a dense one does not, so the line
+        // states what the rows say rather than a flag the printer would have to be handed.
+        if lines
+            .iter()
+            .any(|(operator, _)| operator == "sparse_attention")
+        {
+            "Some(64, 0.9)"
+        } else {
+            "None"
+        },
+        tensor_parallel,
+        ulysses_degree,
+    );
     println!(
         "# The program rows a MiniMax-H3 deployment launches, one `operator<TAB>key` line each."
     );
