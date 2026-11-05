@@ -2085,8 +2085,11 @@ impl Denoiser {
             2,
         )?
         .descriptor());
+        // The draw writes the request's latents, which are FP32 whatever the stack's own type is: the
+        // solver accumulates into them. A row keyed by the deployment's dtype is a module no launch asks
+        // for, which is how it read as unlaunched until the harness drove the draw.
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
-            dtype,
+            nn::DType::F32,
             NoiseKind::Normal,
             ops::noise::KeySource::Scalar,
         ));

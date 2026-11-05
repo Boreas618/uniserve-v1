@@ -46,6 +46,8 @@ use std::process::ExitCode;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
+// The capability trait, for the request's noise draw: it is a method of the trait, not of the struct.
+use nn::capability::Denoiser as _;
 use nn::capability::{
     Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape, TokenBatch, VideoRequest,
     VideoTask,
@@ -768,6 +770,12 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
+    // The request's own noise draw runs first: one Philox stream per request, the conditions' draws
+    // then the video's then the audio's. A harness that hands the network pre-made latents never
+    // launches it, which is why the row was stated and unlaunched until now.
+    denoiser
+        .draw_noise(&forward, nn::capability::Seed(0), layout, latents)
+        .map_err(|error| error.to_string())?;
     // The prompt's refinement runs before the first step, over the layout's own text rows: the
     // encoder's features at their width into the network's rows.
     let text_width = u64::from(config.text_encoder.hidden_size);
