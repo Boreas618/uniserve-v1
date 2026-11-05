@@ -41,7 +41,7 @@ use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
-use minimax_h3::partition::{Component, Components, Partition};
+use minimax_h3::partition::{Component, Components, Partition, Ulysses};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
 use nn::{
     Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
@@ -377,7 +377,7 @@ fn stage_partition(
     place: Place,
     condition_rows: u32,
 ) -> Result<Partition, String> {
-    let serving = Partition::serving(config, task, 1, 1, 0, 0)
+    let serving = Partition::serving(config, task, Ulysses::single(), 1, 0, 0)
         .map_err(show)?
         .sized(minimax_h3::partition::RELEASED_TEXT_ROWS, condition_rows);
     let placed = serving.blocks.without(Component::TextEncoder);
@@ -917,8 +917,14 @@ fn encode(args: &Args) -> Result<(), String> {
         // The example's own raster: it exercises the conditioned path against the checkpoint's
         // tile canvas, which is what it can state without a deployment's options.
         let tile = minimax_h3::video_vae::TILE_PIXELS;
-        minimax_h3::load(&checkpoint, partition, deployment, (tile, tile), &mut loader)
-            .map_err(show)?
+        minimax_h3::load(
+            &checkpoint,
+            partition,
+            deployment,
+            (tile, tile),
+            &mut loader,
+        )
+        .map_err(show)?
     };
     let denoiser = std::sync::Arc::clone(
         model

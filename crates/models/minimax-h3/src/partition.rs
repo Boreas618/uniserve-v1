@@ -341,6 +341,59 @@ impl FromIterator<Component> for Components {
     }
 }
 
+/// How a Ulysses member's merged head projections reach it.
+///
+/// A deployment states this (`crates/ipc`'s `HeadProjection`); it is normalized here, at the loading
+/// boundary, because it decides two things this stack cannot change at run time: **the weights a rank
+/// holds** and **the communication its attention runs**.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Projection {
+    /// Every member gathers every member's rows and projects **its own head shard** with
+    /// head-partitioned weights, so a rank of `d` holds `1/d` of the attention projections.
+    ///
+    /// **This stack does not implement it.** `attention` and `attention_sparse` load whole
+    /// projections on every rank (`Attention::load` requests `to_q`/`to_k`/`to_v`/`to_out` at
+    /// `num_attention_heads * head_dim`) and then send each member that member's head shard, which is
+    /// [`Projection::Exchange`]. A deployment that states this mode is refused rather than loaded
+    /// with weights its field says it does not have.
+    Gather,
+    /// Every member projects its own rows for all heads with **whole weights** and sends each member
+    /// that member's head shard: three scatters and one gather around the attention, which is what
+    /// both attention layers do.
+    Exchange,
+}
+
+/// A deployment's Ulysses group: its sequence degree and the projection its members use.
+///
+/// The two travel together because they are one statement - the degree decides the head shard and the
+/// projection decides whether that shard is what a rank *holds* or what it *receives*. Two adjacent
+/// `usize`s would let a caller pair a degree with the wrong mode and compile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ulysses {
+    /// Ranks the sequence is exchanged over; the heads each rank attends is `heads / degree`.
+    pub degree: usize,
+    /// How the merged head projections reach a member.
+    pub projection: Projection,
+}
+
+impl Ulysses {
+    /// One rank: no exchange, so no communication and no head shard.
+    ///
+    /// A single rank states [`Projection::Exchange`] because that is what the layer does; at degree
+    /// one the two modes are the identity and the projection is not consulted.
+    pub const fn single() -> Self {
+        Self {
+            degree: 1,
+            projection: Projection::Exchange,
+        }
+    }
+
+    /// A group of `degree` ranks using `projection`.
+    pub const fn of(degree: usize, projection: Projection) -> Self {
+        Self { degree, projection }
+    }
+}
+
 /// How one deployment splits the model, and which of its blocks this rank places.
 ///
 /// The partition is a deployment fact the epoch hands the model: the degrees and the rank's place
@@ -453,7 +506,7 @@ impl Partition {
     pub fn serving(
         config: &Config,
         task: VideoTask,
-        ulysses_degree: usize,
+        ulysses: Ulysses,
         tensor_parallel: usize,
         tensor_rank: usize,
         sequence_rank: usize,
@@ -474,6 +527,31 @@ impl Partition {
                     .join(", ")
             )));
         }
+        // **The projection decides what a rank holds, so it is refused here rather than at the first
+        // attention.** A group of one has no exchange and no shard: both modes are the identity and
+        // the field is not consulted, so a one-rank deployment is accepted whichever mode it states.
+        if ulysses.degree > 1 {
+            if ulysses.projection == Projection::Gather {
+                return Err(Error::config(format!(
+                    "this stack exchanges head projections and gathers nothing: {} ranks were asked \
+                     for the gather mode, which needs head-partitioned weights and loads whole ones",
+                    ulysses.degree
+                )));
+            }
+            // The sparse attention composes a layer's compression across the exchange's members, and
+            // that composition is not written (`attention_sparse`). Refused here so a deployment
+            // learns it at its partition rather than at the first sparse layer's construction.
+            if matches!(
+                config.denoisers[&dit].attention,
+                crate::config::AttentionKind::Sparse { .. }
+            ) {
+                return Err(Error::config(format!(
+                    "the sparse attention composes its compression across {} ulysses ranks, whose \
+                     exchange is not written: a sparse deployment serves one rank",
+                    ulysses.degree
+                )));
+            }
+        }
         let mut blocks = Components::of([
             Component::TextEncoder,
             Component::VideoDecoder,
@@ -491,7 +569,7 @@ impl Partition {
         }
         let partition = Self::new(
             config,
-            ulysses_degree,
+            ulysses.degree,
             tensor_parallel,
             tensor_rank,
             sequence_rank,
@@ -699,7 +777,8 @@ mod tests {
             .get(&crate::checkpoint::Dit::Base)
             .expect("a base DiT");
         let bound = |task| -> u32 {
-            let partition = Partition::serving(&config, task, 1, 1, 0, 0).expect("a partition");
+            let partition =
+                Partition::serving(&config, task, Ulysses::single(), 1, 0, 0).expect("a partition");
             let arrangement = partition.arrangement(denoiser).expect("an arrangement");
             crate::denoiser::Layouts::new(denoiser.clone(), arrangement)
                 .expect("a layout rule")
@@ -745,8 +824,15 @@ mod tests {
             condition_rows(&config, VideoTask::TextToVideoAudio).expect("a capacity"),
             64
         );
-        let serving = Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0, 0)
-            .expect("a serving partition");
+        let serving = Partition::serving(
+            &config,
+            VideoTask::FirstLastToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("a serving partition");
         assert_eq!(serving.condition_rows, 2048);
     }
 
@@ -892,8 +978,15 @@ mod tests {
         // One tensor shard over two sequence shards: every rank's `tensor_rank` is 0, and the
         // partition still tells the two ranks apart - which is what the denoiser's draw offsets and
         // row shards are counted from.
-        let first = Partition::serving(&config, VideoTask::TextToVideoAudio, 2, 1, 0, 0)
-            .expect("two ranks");
+        let first = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::of(2, Projection::Exchange),
+            1,
+            0,
+            0,
+        )
+        .expect("two ranks");
         let second = first.at_sequence_rank(1);
         assert_eq!(first.tensor_rank, second.tensor_rank);
         assert_eq!(first.ulysses_degree, second.ulysses_degree);
@@ -908,12 +1001,118 @@ mod tests {
     }
 
     #[test]
+    fn a_gathering_deployment_is_refused_by_name() {
+        // This stack exchanges head projections: every rank loads whole attention projections and
+        // sends each member that member's head shard. A deployment that states the gather mode asks
+        // for head-partitioned weights the model never loads, so the two would disagree about what a
+        // rank holds - refused at the partition, where the deployment's own mode arrives, rather than
+        // at the first attention to be built.
+        let config = config();
+        let refused = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::of(2, Projection::Gather),
+            1,
+            0,
+            0,
+        )
+        .expect_err("a gathering deployment");
+        let said = refused.to_string();
+        assert!(said.contains("gathers nothing"), "{said}");
+        assert!(said.contains("2 ranks"), "{said}");
+
+        // One rank has no exchange and no head shard, so both modes are the identity and the mode is
+        // not consulted: a one-rank deployment is accepted whichever it states, which is what a
+        // config stating no sequence parallelism gets from the protocol's default.
+        let one = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::of(1, Projection::Gather),
+            1,
+            0,
+            0,
+        )
+        .expect("one rank, either mode");
+        assert_eq!(one.ulysses_degree, 1);
+    }
+
+    #[test]
+    fn a_sparse_deployment_serves_one_rank() {
+        // The sparse attention composes a layer's compression across the exchange's members, and that
+        // composition is not written. A sharded sparse deployment would attend its own rows alone and
+        // silently produce a different model, so the partition refuses it before a layer is built.
+        let mut config = config();
+        config
+            .denoisers
+            .get_mut(&crate::checkpoint::Dit::Base)
+            .expect("a base DiT")
+            .attention =
+            crate::config::AttentionKind::sparse(128, 0.8, None).expect("a sparse kind");
+        let refused = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::of(2, Projection::Exchange),
+            1,
+            0,
+            0,
+        )
+        .expect_err("a sharded sparse deployment");
+        let said = refused.to_string();
+        assert!(said.contains("compression"), "{said}");
+        assert!(said.contains("2 ulysses ranks"), "{said}");
+
+        // One rank serves the sparse network, which is the deployment the tile bound is stated for.
+        let one = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("one rank serves a sparse network");
+        assert_eq!(one.ulysses_degree, 1);
+    }
+
+    #[test]
+    fn an_exchanging_group_divides_the_heads_it_states() {
+        // The degree is what a rank's head shard is counted from, so an accepted group must leave the
+        // DiT's heads divisible by it - the state a later attention layer reads rather than rechecks.
+        let config = config();
+        let four = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::of(4, Projection::Exchange),
+            1,
+            0,
+            0,
+        )
+        .expect("four exchanging ranks");
+        assert_eq!(four.ulysses_degree, 4);
+        let denoiser = config
+            .denoisers
+            .get(&crate::checkpoint::Dit::Base)
+            .expect("a base DiT");
+        assert_eq!(
+            four.denoiser_heads(denoiser.transformer.num_attention_heads) * 4,
+            denoiser.transformer.num_attention_heads
+        );
+    }
+
+    #[test]
     fn a_deployment_places_one_denoiser_and_the_encoders_its_task_needs() {
         let config = config();
 
         // `t2va` carries no conditions, so it needs no condition encoder.
-        let t2va =
-            Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0, 0).expect("t2va");
+        let t2va = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("t2va");
         assert_eq!(
             t2va.blocks,
             Components::of([
@@ -925,15 +1124,29 @@ mod tests {
         );
 
         // A keyframe is a condition unit, so `fl2va` runs the encoders; it shares `t2va`'s DiT.
-        let fl2va = Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0, 0)
-            .expect("fl2va");
+        let fl2va = Partition::serving(
+            &config,
+            VideoTask::FirstLastToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("fl2va");
         assert!(fl2va.blocks.contains(Component::LatentEncoder));
         assert!(fl2va.blocks.contains(Component::Transformer));
         assert!(!fl2va.blocks.contains(Component::TransformerRef));
 
         // `ref2va` is the reference partition, and its references and keyframes need the encoders.
-        let ref2va = Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
-            .expect("ref2va");
+        let ref2va = Partition::serving(
+            &config,
+            VideoTask::ReferenceToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("ref2va");
         assert!(ref2va.blocks.contains(Component::TransformerRef));
         assert!(!ref2va.blocks.contains(Component::Transformer));
         assert!(ref2va.blocks.contains(Component::LatentEncoder));
@@ -947,10 +1160,24 @@ mod tests {
             .denoisers
             .remove(&crate::checkpoint::Dit::Base)
             .expect("the base partition");
-        let error = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0, 0)
-            .expect_err("no transformer");
+        let error = Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect_err("no transformer");
         assert!(error.to_string().contains("transformer"), "{error}");
-        Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
-            .expect("the reference partition is held");
+        Partition::serving(
+            &config,
+            VideoTask::ReferenceToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("the reference partition is held");
     }
 }

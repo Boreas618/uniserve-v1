@@ -475,8 +475,17 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             println!("DiT plan {name}: this checkpoint has no such DiT");
             continue;
         };
-        let partition =
-            minimax_h3::partition::Partition::serving(&config, task, ulysses, tensor, 0, 0)?;
+        let partition = minimax_h3::partition::Partition::serving(
+            &config,
+            task,
+            minimax_h3::partition::Ulysses::of(
+                ulysses,
+                minimax_h3::partition::Projection::Exchange,
+            ),
+            tensor,
+            0,
+            0,
+        )?;
         let arrangement = partition.arrangement(rules)?;
         for frames in [124_u32, 362] {
             let conditioned = !matches!(task, nn::capability::VideoTask::TextToVideoAudio);

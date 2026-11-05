@@ -52,6 +52,7 @@ use minimax_h3::video_vae::Tiles;
 use minimax_h3::AttentionKind;
 use minimax_h3::Partition;
 use minimax_h3::output::{Splice, VideoPostprocessor};
+use minimax_h3::partition::Ulysses;
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use nn::capability::Denoiser as _;
@@ -1623,8 +1624,8 @@ fn deployment_bound(root: &Path, sparse: Option<(u32, f64, Option<f64>)>) -> Res
         }
         // The partition is the store's statement of the two capacities; the arrangement is the only
         // place they become rows, so both come from here rather than from an argument.
-        let partition =
-            Partition::serving(&config, task, 1, 1, 0, 0).map_err(|error| error.to_string())?;
+        let partition = Partition::serving(&config, task, Ulysses::single(), 1, 0, 0)
+            .map_err(|error| error.to_string())?;
         let arrangement = partition
             .arrangement(&network)
             .map_err(|error| error.to_string())?;
