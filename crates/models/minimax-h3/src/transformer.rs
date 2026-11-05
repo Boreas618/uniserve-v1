@@ -591,7 +591,7 @@ impl Transformer {
         let hidden = config.hidden_size;
         let head = config.head_dim;
         let heads = partition.denoiser_heads(config.num_attention_heads);
-        let rotated: u32 = ROTATED_AXES.iter().sum();
+        let rotated: u32 = rotated_axes(config).iter().sum();
         let interaction = 6 * u64::from(hidden);
         let mut programs = Programs::default();
 
@@ -684,7 +684,7 @@ impl Transformer {
         )?);
 
         // The rotation and the attention, both over this rank's heads.
-        let sections = nn::layers::Sections::new(&ROTATED_AXES)
+        let sections = nn::layers::Sections::new(&rotated_axes(config))
             .map_err(Error::from)?
             .interleaved();
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(

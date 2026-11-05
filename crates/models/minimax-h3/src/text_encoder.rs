@@ -745,6 +745,8 @@ impl TextEncoder {
             }
         }
         keys
+    }
+
     /// The programs the retained layers and the prompt splice of this encoder launch.
     ///
     /// Stated from the configuration and the tensor-parallel position alone, because a deployment

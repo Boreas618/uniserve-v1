@@ -748,6 +748,8 @@ impl VisionTower {
             }
         }
         keys
+    }
+
     /// The programs one tower call launches, from the configuration and the deployment's element type.
     ///
     /// `sequence` is the largest patch grid the deployment serves: it is the dense attention's key

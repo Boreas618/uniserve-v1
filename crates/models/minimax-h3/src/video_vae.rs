@@ -758,6 +758,8 @@ impl VideoDecoder {
     /// block and name before a byte is read.
     pub fn keys(config: &VideoVaeConfig) -> crate::Result<Vec<String>> {
         Ok(crate::audio_vae::tensor_keys(&sources(config)?))
+    }
+
     /// The programs one clip's decode of `config` launches.
     ///
     /// Stated from the configuration alone, because a deployment compiles its store before it opens
