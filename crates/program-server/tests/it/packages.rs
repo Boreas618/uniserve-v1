@@ -359,20 +359,26 @@ fn parse_key(
 fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     // The H3 row set that belongs to a deployment: its own generator's file, which `key_coverage`
-    // and `build_store` certify. `minimax-h3-keys.txt` is a walk print of the older enumeration and
-    // states rows whose fields no package has had since the key changed — reading it here asserted
-    // about a file the store is not built from.
+    // and `build_store` certify. The deployment's list has one name now: it used to be written twice,
+    // and the second file asserted about rows the store was not built from.
     // Both subject files are the committed ones: `.local/qwen3-moe-keys.txt` is a generator's
     // output that exists only on a host that ran it, so naming it here made the Qwen3 half of this
     // test skip silently on every other checkout — a check that is not reached is not a check.
+    // A named fixture that is absent is therefore a failure of its own: the same silence took this
+    // test's H3 half when the deployment's list was renamed and left `checked > 0` green on the
+    // rows of the other file.
     let fixtures = [
         root.join("../../notes/programs/qwen3-moe-keys.txt"),
-        root.join("../../notes/programs/minimax-h3-deployment-keys.txt"),
+        root.join("../../notes/programs/minimax-h3-keys.txt"),
     ];
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for fixture in &fixtures {
         let Some(keys) = fixture_keys(fixture) else {
+            failures.push(format!(
+                "{}: this test names the fixture and it is absent, so no row of it was parsed",
+                fixture.display()
+            ));
             continue;
         };
         // This fixture's declared-blocked rows: no package fills them yet, so a missing field is the

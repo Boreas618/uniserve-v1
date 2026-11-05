@@ -26,13 +26,14 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-#: The row sets to audit. H3's dense rows come from `minimax-h3-deployment-keys.txt`, the file the
-#: deployment's own generator writes and `key_coverage`/`build_store` certify (140 rows, 140 built);
-#: `minimax-h3-keys.txt` is a walk print of the older enumeration and would audit fields no current
-#: row carries. The sparse rows have no certified file yet, so they are audited where they stand.
+#: The row sets to audit. H3's dense rows come from `minimax-h3-keys.txt`, which the deployment's own
+#: generator writes and `key_coverage`/`build_store` certify; the file it replaced held the same rows
+#: under a second name, and one deployment with two names is the second statement of one truth this
+#: lane keeps removing. The sparse rows have no certified file yet, so they are audited where they
+#: stand.
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
-    HERE.parent / 'notes/programs/minimax-h3-deployment-keys.txt',
+    HERE.parent / 'notes/programs/minimax-h3-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-sparse-keys.txt',
 )
 
