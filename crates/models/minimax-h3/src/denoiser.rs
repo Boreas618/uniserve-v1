@@ -2982,6 +2982,7 @@ impl Denoiser {
             DType::F32,
             Shape::new(&[entries, frequency]),
             &projections.frequencies(&times)?,
+            "minimax-h3",
         )?;
         let mut entry_bytes = Vec::with_capacity(table.len() * 4);
         for value in &table {
@@ -3005,6 +3006,7 @@ impl Denoiser {
             DType::I32,
             Shape::new(&[entry_rows, u64::from(groups.count())]),
             &entry_bytes,
+            "minimax-h3",
         )?;
 
         // The tables are the modulation projections' own type, because the reference allocates them
@@ -3021,6 +3023,7 @@ impl Denoiser {
                 table_type,
                 Shape::new(&[entries, columns]),
                 &zeros,
+                "minimax-h3",
             )?);
         }
         let adaln_output = loader.constant(
@@ -3028,6 +3031,7 @@ impl Denoiser {
             table_type,
             Shape::new(&[entries, 2 * hidden]),
             &vec![0_u8; (entries * 2 * hidden * unit) as usize],
+            "minimax-h3",
         )?;
         let cache = AdaLnCache::new(
             adaln_layers.clone(),
