@@ -358,7 +358,12 @@ pub struct RankFacts<'a> {
     pub max_model_len: usize,
     /// Fraction of the device's storage the epoch may hold.
     pub mem_fraction_static: f64,
-    pub cache: CacheGeometry,
+    /// The paged key/value geometry this rank keeps, or `None` for a rank that keeps no paged
+    /// cache at all - a media rank, whose resident state is the request's own whole footprint
+    /// rather than pages a scheduler addresses. `plan_rank` plans the first and `plan_media` the
+    /// second, and each refuses the other's value by name: a plan fitted for one is not a plan the
+    /// other can honour, and the two would differ silently if a zero stood for absence.
+    pub cache: Option<CacheGeometry>,
     pub kv_dtype: ipc::PrefixCacheDtype,
 }
 
@@ -615,6 +620,44 @@ pub fn token_plan(
 /// must be able to read it, and the answer states the width a batch's block
 /// table needs at that page size.
 pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+    let cache = facts.cache.ok_or_else(|| {
+        Error::Invalid(
+            "this rank states no paged key/value geometry, so no cache can be planned for it: \
+             `plan_media` is the planner for a rank that keeps none"
+                .into(),
+        )
+    })?;
+    plan(facts, report, group, Some(cache))
+}
+
+/// What a rank that keeps **no paged key/value cache** plans: the same regions, no cache fitted.
+///
+/// A media rank's resident state is each request's own whole footprint - a layout's conditioning
+/// rows, its latent trajectory and its clip - not pages a scheduler addresses, so there is nothing
+/// to fit and nothing to divide into units. What it does book is what every rank books: the graph
+/// storage the captures reserve, the scratch region the shadow and the state group's snapshot share,
+/// and the fixed storage the rank's owners allocate. The plan's `cache` and the worker info's
+/// `prefix_cache` are then absent, which is what a scheduler reads to know this rank takes no
+/// paged request.
+pub fn plan_media(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+    if facts.cache.is_some() {
+        return Err(Error::Invalid(
+            "this rank states a paged key/value geometry and the media class keeps no paged \
+             cache: `plan_rank` is the planner for a rank that keeps one, and a geometry here \
+             would fit a cache nothing addresses"
+                .into(),
+        ));
+    }
+    plan(facts, report, group, None)
+}
+
+/// The one planner both entry points share: what differs between them is only the cache fitted.
+fn plan(
+    facts: &RankFacts<'_>,
+    report: Report,
+    group: &HostGroup,
+    cache: Option<CacheGeometry>,
+) -> Result<TokenPlan> {
     // What the rank may plan into is what is LEFT: the weights are already on the device, so the
     // pools fit into the free bytes and not into the device's total.
     let total_bytes = match facts.device {
@@ -678,16 +721,19 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
         reserved_bytes,
         None,
         group,
-        |size| {
-            Ok(Some(Arc::new(crate::memory::CachePlan::new(
+        |size| match &cache {
+            Some(geometry) => Ok(Some(Arc::new(crate::memory::CachePlan::new(
                 crate::memory::CacheDescription::dense(
                     size as u32,
-                    facts.cache.layers,
-                    facts.cache.kv_heads,
-                    facts.cache.head_dim,
+                    geometry.layers,
+                    geometry.kv_heads,
+                    geometry.head_dim,
                     facts.kv_dtype,
                 ),
-            )?)))
+            )?))),
+            // No cache: the closure answers that the rank fits none, which is what makes the plan
+            // state an absent cache rather than a cache of zero units.
+            None => Ok(None),
         },
     )?;
     let mut answer = TokenPlan {
