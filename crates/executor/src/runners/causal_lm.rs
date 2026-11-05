@@ -2900,9 +2900,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let gather = spelled(&gather, rows);
         let line = format!(
             "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
-             positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
+             ids={} positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
              slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
             bucket.variant,
+            spelled(self.staging.input_ids(tokens.min(8)), 8),
             spelled(&self.staging.batch_rows().positions, 8),
             spelled(&self.staging.batch_rows().seq_lens, rows),
             spelled(&self.staging.batch_rows().query_offsets, rows + 1),
