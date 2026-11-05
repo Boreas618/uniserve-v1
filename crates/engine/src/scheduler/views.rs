@@ -1124,7 +1124,7 @@ pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
 
 /// The distinct requests resident on one worker, by the request affinity the
 /// mechanism records when it places a call.
-fn resident_requests(placement: &Placement, worker: &crate::WorkerGroupId) -> u32 {
+fn resident_requests(placement: &Placement, worker: &crate::ExecutorGroupId) -> u32 {
     let mut requests = HashSet::new();
     for ((key, _), owner) in &placement.affinity {
         if owner == worker {
@@ -1143,7 +1143,7 @@ fn resident_requests(placement: &Placement, worker: &crate::WorkerGroupId) -> u3
 fn holds_component(
     placement: &Placement,
     request: RequestKey,
-    worker: &crate::WorkerGroupId,
+    worker: &crate::ExecutorGroupId,
 ) -> bool {
     placement
         .affinity
@@ -1159,7 +1159,7 @@ fn holds_request(
     request: RequestKey,
     bound: &str,
     decode_stage: bool,
-    worker: &crate::WorkerGroupId,
+    worker: &crate::ExecutorGroupId,
 ) -> bool {
     let pinned = if decode_stage {
         &placement.decode_affinity
@@ -1214,7 +1214,7 @@ pub(crate) fn replica_targets(
     scheduler: &Scheduler,
     request: RequestKey,
     kind: CallKind,
-) -> Vec<(crate::WorkerGroupId, String)> {
+) -> Vec<(crate::ExecutorGroupId, String)> {
     replica_facts(scheduler, request, kind)
         .into_iter()
         .map(|(_, worker, bound)| (worker, bound))
@@ -1228,7 +1228,7 @@ fn replica_facts(
     scheduler: &Scheduler,
     request: RequestKey,
     kind: CallKind,
-) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
+) -> Vec<(ReplicaView, crate::ExecutorGroupId, String)> {
     candidate_facts(
         scheduler,
         request,
@@ -1249,8 +1249,8 @@ fn candidate_facts<'a>(
     scheduler: &'a Scheduler,
     request: RequestKey,
     kind: CallKind,
-    candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)>,
-) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
+    candidates: impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)>,
+) -> Vec<(ReplicaView, crate::ExecutorGroupId, String)> {
     let world = &scheduler.executor;
     let table = world_blocks(world);
     let decode_stage = matches!(

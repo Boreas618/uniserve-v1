@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::WorkerGroupId;
+use crate::ExecutorGroupId;
 use crate::executor::ExecutionBatch;
 use crate::executor::{Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
@@ -40,7 +40,7 @@ pub(super) trait World {
     fn info(&self) -> &ExecutorInfo;
 
     /// Whether `worker` has an unclaimed submission slot.
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool;
 }
 
 /// What the mechanism executes through.
@@ -193,7 +193,7 @@ impl Submissions {
     }
 
     /// Whether every worker of `worker` is ready to accept execution.
-    pub(super) fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    pub(super) fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
             Path::Workers(executor) => executor.is_ready(worker),
             // The arm serves the pools its inventory states and no others.
@@ -202,7 +202,7 @@ impl Submissions {
     }
 
     /// Whether `worker` executes nothing further.
-    pub(super) fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    pub(super) fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
             Path::Workers(executor) => executor.is_closed(worker),
             // A device of this process is closed when the process ends.
@@ -211,7 +211,7 @@ impl Submissions {
     }
 
     /// Whether `worker` has an unclaimed destination submission slot.
-    pub(super) fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    pub(super) fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
             Path::Workers(executor) => executor.has_capacity(worker),
             // `Batches::submit` queues on the device's own stream and never
@@ -335,7 +335,7 @@ impl Submissions {
     pub(super) fn map_host_cache(
         &mut self,
         tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             Path::Workers(executor) => executor.map_host_cache(tokens),
             // No rank of this process maps a host page pool, so the mechanism
@@ -414,7 +414,7 @@ impl Submissions {
         &mut self,
         name: &str,
         payload: &str,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             Path::Workers(executor) => executor.hook_groups(name, payload),
             Path::InProcess(_) => Ok(Vec::new()),
@@ -440,7 +440,7 @@ impl World for Submissions {
         Submissions::info(self)
     }
 
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         Submissions::has_capacity(self, worker)
     }
 }
@@ -836,7 +836,7 @@ mod tests {
         (
             call,
             crate::executor::RequestPlacement {
-                worker: WorkerGroupId("gpu".to_owned()),
+                worker: ExecutorGroupId("gpu".to_owned()),
                 request_pool_idx: None,
                 block_tables: Vec::new(),
                 new_cache_units: Vec::new(),

@@ -22,7 +22,7 @@
 //!   identity against the in-flight window before any completion is applied,
 //!   stages completions, and applies them in request-local dependency order.
 //! - Failure reconciliation: `on_executor_error` retires only the work a
-//!   `WorkerFailure` invalidates. Any other executor error, and a worker
+//!   `ExecutorFailure` invalidates. Any other executor error, and a worker
 //!   failure classified as a control-plane invariant violation, is
 //!   engine-fatal.
 //!
@@ -65,7 +65,7 @@ impl Scheduler {
     /// handed to `on_executor_error` and stops dispatching.
     fn dispatch_submissions(
         &mut self,
-        blocked_workers: &mut HashSet<crate::WorkerGroupId>,
+        blocked_workers: &mut HashSet<crate::ExecutorGroupId>,
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be

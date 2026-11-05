@@ -77,7 +77,7 @@ fn rank(host: &str) -> WorkerInfo {
         max_batch_calls: 16,
         max_batch_tokens: 512,
         // A text pool serves token generation, so it advertises the paged KV
-        // pool every such worker has (`WorkerInfo::default`): a worker with no
+        // pool every such executor has (`WorkerInfo::default`): an executor with no
         // prefix cache is refused a token request at submission, which is the
         // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,

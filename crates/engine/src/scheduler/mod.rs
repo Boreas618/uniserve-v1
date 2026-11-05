@@ -142,7 +142,7 @@ use ipc::{
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
 
-use crate::executor::{RankBuffer, WorkerFailure};
+use crate::executor::{RankBuffer, ExecutorFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,

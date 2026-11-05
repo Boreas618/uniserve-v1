@@ -6,14 +6,14 @@
 //! batches in flight by a queue depth, and tracks admitted requests and live
 //! products for `command_has_capacity`.
 //!
-//! [`SimEngine`] keeps the per-request progress a worker tracks:
+//! [`SimEngine`] keeps the per-request progress an executor tracks:
 //! positions, cache extent, denoising step, and predicate values. It enforces
 //! request identity, lifecycle, call coordinates, and predicate dependencies,
 //! and reports deterministic tokens, cache extents, denoising progress, and
 //! synthetic media published through POSIX shared memory. The module is built
 //! only with the `testing` feature; engine and server tests and the engine's
 //! `control_plane` example drive the scheduler through it in place of GPU
-//! workers.
+//! executors.
 
 use ipc::{ForwardMode, MediaCall, TransferMode};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,7 +24,7 @@ use std::time::Duration;
 use crate::CommandWaker;
 use crate::executor::{
     BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    PoolPlacement, WorkerFailure, WorkerGroupId, logical_result,
+    PoolPlacement, ExecutorFailure, ExecutorGroupId, logical_result,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -62,26 +62,26 @@ enum Job {
 }
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
-/// Reports a simulated deployment's worker group lost, the way a dead launch
+/// Reports a simulated deployment's executor group lost, the way a dead launch
 /// does: the group closes, and the executor answers its next poll with the
 /// loss instead of a result.
 ///
 /// A real launch that cannot be replaced closes its group, and the scheduler
 /// stops when every model group is closed. Without this a simulated executor's
-/// workers never die, so no in-process case could state what happens when they
+/// executors never die, so no in-process case could state what happens when they
 /// all do.
 #[derive(Clone, Default)]
 pub struct SimLoss {
     /// The group reported lost: it stays lost for the executor's lifetime, so
     /// it reports not ready after the report has been answered.
-    group: Arc<Mutex<Option<WorkerGroupId>>>,
+    group: Arc<Mutex<Option<ExecutorGroupId>>>,
     /// Whether the lost group is closed as well as lost: a launch that cannot
     /// be replaced closes its group, while one whose replacement is starting
     /// is not ready but not closed.
     closed: Arc<Mutex<bool>>,
     /// The report the executor's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
-    pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
+    pending: Arc<Mutex<Option<(ExecutorGroupId, String, Vec<ipc::RequestKey>)>>>,
     /// Wakes a scheduler parked on this executor, so the loss is answered
     /// without waiting out its park.
     wake: Arc<Mutex<Option<CommandWaker>>>,
@@ -94,7 +94,7 @@ impl SimLoss {
     /// # Panics
     ///
     /// Panics if a previous report is still pending: a loss is delivered once.
-    pub fn lose(&self, group: WorkerGroupId, message: impl Into<String>) {
+    pub fn lose(&self, group: ExecutorGroupId, message: impl Into<String>) {
         {
             let mut lost = self
                 .group
@@ -131,7 +131,7 @@ impl SimLoss {
     ///
     /// Panics if a previous report is still pending: a report is delivered
     /// once.
-    pub fn stall(&self, group: WorkerGroupId, stall: &ipc::Stall) {
+    pub fn stall(&self, group: ExecutorGroupId, stall: &ipc::Stall) {
         {
             let mut lost = self
                 .group
@@ -177,7 +177,7 @@ impl SimLoss {
     /// # Panics
     ///
     /// Panics if a previous report is still pending: a loss is delivered once.
-    pub fn lose_to_replace(&self, group: WorkerGroupId, message: impl Into<String>) {
+    pub fn lose_to_replace(&self, group: ExecutorGroupId, message: impl Into<String>) {
         self.lose(group, message);
         *self
             .closed
@@ -186,7 +186,7 @@ impl SimLoss {
     }
 
     /// Installs a replacement group: it is ready again and takes work.
-    pub fn restore(&self, group: &WorkerGroupId) {
+    pub fn restore(&self, group: &ExecutorGroupId) {
         let mut lost = self
             .group
             .lock()
@@ -197,7 +197,7 @@ impl SimLoss {
     }
 
     /// Whether `group` was reported lost beyond replacement.
-    fn is_closed(&self, group: &WorkerGroupId) -> bool {
+    fn is_closed(&self, group: &ExecutorGroupId) -> bool {
         let lost = self
             .group
             .lock()
@@ -219,7 +219,7 @@ impl SimLoss {
     }
 
     /// Whether `group` has been reported lost.
-    fn is_lost(&self, group: &WorkerGroupId) -> bool {
+    fn is_lost(&self, group: &ExecutorGroupId) -> bool {
         self.group
             .lock()
             .map(|lost| lost.as_ref().is_some_and(|name| name == group))
@@ -227,7 +227,7 @@ impl SimLoss {
     }
 
     /// Takes the report the next poll answers with, if it has not been.
-    fn take(&self) -> Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)> {
+    fn take(&self) -> Option<(ExecutorGroupId, String, Vec<ipc::RequestKey>)> {
         self.pending.lock().ok().and_then(|mut slot| slot.take())
     }
 }
@@ -325,7 +325,7 @@ impl SimExecutor {
                             let result = engine.execute(batch).map(|report| {
                                 (
                                     logical_result(
-                                        crate::executor::WorkerResult::receive(report),
+                                        crate::executor::ExecutorResult::receive(report),
                                         true,
                                         &commands,
                                     ),
@@ -492,7 +492,7 @@ impl SimExecutor {
     /// reports it: their requests, the buffers those calls would have
     /// produced, and the reason of each request the simulated model refused.
     /// `None` when every call of the result succeeded.
-    fn call_failure(&self, result: &BatchResult) -> Option<WorkerFailure> {
+    fn call_failure(&self, result: &BatchResult) -> Option<ExecutorFailure> {
         let failed = || {
             result
                 .results
@@ -521,14 +521,14 @@ impl SimExecutor {
             .map(TensorRef::buffer_id)
             .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
             .collect::<HashSet<_>>();
-        Some(WorkerFailure {
-            worker_id: WorkerGroupId("sim".to_owned()),
+        Some(ExecutorFailure {
+            worker_id: ExecutorGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
             refusals,
             retired: Vec::new(),
             buffers: buffers.into_iter().collect(),
-            execution: crate::executor::WorkerExecError::non_finite(
+            execution: crate::executor::ExecuteError::non_finite(
                 result.batch_id,
                 result.results.iter().map(|completion| &completion.output),
             ),
@@ -536,7 +536,7 @@ impl SimExecutor {
         })
     }
 
-    /// Closes the simulated physical worker.
+    /// Closes the simulated physical executor.
     fn shutdown(&mut self) -> anyhow::Result<()> {
         // A batch waiting for its permit would otherwise never return, and
         // the join below would wait for it forever.
@@ -550,7 +550,7 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         self.is_ready(worker) && self.in_flight < self.depth
     }
 
@@ -574,11 +574,11 @@ impl Executor for SimExecutor {
 
     /// A lost group is closed only once its replacement has failed: while one
     /// is starting it is not ready, and the scheduler waits for it.
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         self.handle.is_none() || self.loss.is_closed(worker)
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.handle.is_some()
             && !self.loss.is_lost(worker)
             && self
@@ -608,7 +608,7 @@ impl Executor for SimExecutor {
         }))
     }
 
-    /// Returns the worker metadata.
+    /// Returns the executor metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
@@ -617,7 +617,7 @@ impl Executor for SimExecutor {
     ///
     /// Returns `WouldBlock` with the batch while `depth` batches are in
     /// flight. Returns `Failed` when the executor is closed, a placement names
-    /// a worker other than the simulator, the batch fails validation, or the
+    /// an executor other than the simulator, the batch fails validation, or the
     /// simulator thread is gone. The batch's admissions and products are
     /// recorded before it is queued and are not rolled back if queuing fails.
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
@@ -663,7 +663,7 @@ impl Executor for SimExecutor {
         // closed group's loss is engine-fatal when no other model group
         // serves.
         if let Some((worker_id, message, requests)) = self.loss.take() {
-            return Err(anyhow::Error::new(WorkerFailure {
+            return Err(anyhow::Error::new(ExecutorFailure {
                 worker_id,
                 endpoints: Vec::new(),
                 requests,
@@ -738,11 +738,11 @@ impl Executor for SimExecutor {
         self.shutdown()
     }
 
-    /// Answers the engine's own worker hooks as a worker without a device
+    /// Answers the engine's own executor hooks as an executor without a device
     /// does: its cache is not split into segments, it gives back no storage,
     /// it has no fence probes, and a profiling session it takes part in runs
     /// no collector and writes no file. It loads and unloads LoRA adapters
-    /// as a worker with a LoRA plugin does, answering the slot; other plugin
+    /// as an executor with a LoRA plugin does, answering the slot; other plugin
     /// hooks fail, as no plugin is loaded.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         let result = match name {
@@ -768,7 +768,7 @@ impl Executor for SimExecutor {
                     .map(|collector| {
                         (
                             collector.as_str().to_owned(),
-                            serde_json::json!("unavailable: the simulated worker has no device"),
+                            serde_json::json!("unavailable: the simulated executor has no device"),
                         )
                     })
                     .collect();
@@ -797,7 +797,7 @@ impl Executor for SimExecutor {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
                 serde_json::json!({ "adapter": payload["adapter"] })
             }
-            other => anyhow::bail!("no plugin implements the worker hook {other}"),
+            other => anyhow::bail!("no plugin implements the executor hook {other}"),
         };
         Ok(vec![result.to_string()])
     }
@@ -831,7 +831,7 @@ struct SimRequestState {
     /// continue after them.
     history: usize,
     /// The step index of the request's trajectory: the solver steps it has
-    /// completed. Image decoding resets it to zero, as it does on a worker
+    /// completed. Image decoding resets it to zero, as it does on an executor
     /// rank.
     step_index: u16,
     /// Boolean values of the request's resolved products that later calls
@@ -1097,27 +1097,27 @@ fn select_token(
     })
 }
 
-/// Deterministic local model engine that implements the worker lifecycle protocol.
-/// How the simulated worker speculates: what its drafter proposes and the
-/// worker time each step reports.
+/// Deterministic local model engine that implements the executor lifecycle protocol.
+/// How the simulated executor speculates: what its drafter proposes and the
+/// executor time each step reports.
 #[derive(Clone, Copy, Debug)]
 pub struct SimSpeculation {
     /// The leading drafts of each proposal that are the request's next
     /// tokens; the drafts after them are wrong.
     pub accepted: usize,
-    /// Worker time of a decoding step none of whose verifications carries
+    /// Executor time of a decoding step none of whose verifications carries
     /// drafts, in microseconds.
     pub decode_us: u64,
-    /// Worker time of a decoding step one of whose verifications carries
+    /// Executor time of a decoding step one of whose verifications carries
     /// drafts, in microseconds.
     pub verify_us: u64,
-    /// Worker time of a prompt step per token it evaluates, in
+    /// Executor time of a prompt step per token it evaluates, in
     /// microseconds.
     pub prompt_token_us: u64,
 }
 
 impl SimSpeculation {
-    /// The worker time of a step of `calls`: its prompt tokens' and, with
+    /// The executor time of a step of `calls`: its prompt tokens' and, with
     /// decodes or verifications among them, one decoding step's.
     fn step_us<'a>(&self, calls: impl Iterator<Item = &'a Call>) -> u64 {
         let mut prompt_tokens = 0;
@@ -1170,20 +1170,20 @@ pub struct SimEngine {
     vocab: usize,
     results_on_wait: bool,
     /// Readout candidate whose log-probability is reported as NaN, as a
-    /// worker with a numerical defect reports it.
+    /// executor with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
-    /// Block-diffusion sampling the simulated worker is launched with, as a
+    /// Block-diffusion sampling the simulated executor is launched with, as a
     /// rank's launch configuration states it.
     canvas_sampling: Option<ipc::CanvasSampling>,
-    /// How the simulated worker speculates, when it runs a drafter.
+    /// How the simulated executor speculates, when it runs a drafter.
     speculation: Option<SimSpeculation>,
-    /// The worker groups the simulated deployment runs: one named `sim` unless
+    /// The executor groups the simulated deployment runs: one named `sim` unless
     /// a test names more.
     ///
     /// A deployment's groups are separate launches that serve different
     /// components and fail independently, so a statement about one group
     /// failing while another serves needs more than one here.
-    groups: Vec<WorkerGroupId>,
+    groups: Vec<ExecutorGroupId>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -1228,7 +1228,7 @@ impl Pace {
 }
 
 /// One write a simulated request's call made to its context: the KV cache a
-/// worker holds for it, in write order. Two requests whose logs are equal
+/// executor holds for it, in write order. Two requests whose logs are equal
 /// hold the same context, whichever calls wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextWrite {
@@ -1304,7 +1304,7 @@ impl SimEngine {
     /// Model limits of a deployment without a model-imposed bound.
     ///
     /// The scheduler takes the served features from the call kinds the
-    /// simulated worker reports and clamps these limits to its capacities.
+    /// simulated executor reports and clamps these limits to its capacities.
     pub fn generation_limits() -> crate::GenerationLimits {
         crate::GenerationLimits {
             max_latent_units: u64::MAX,
@@ -1312,7 +1312,7 @@ impl SimEngine {
             max_vae_grid_tokens: u32::MAX,
             max_vit_grid_tokens: u32::MAX,
             // One latent unit of the simulated image: 256 MiB over the
-            // simulated worker's 65,536 latent units.
+            // simulated executor's 65,536 latent units.
             latent_bytes_per_unit: 4096,
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
@@ -1350,7 +1350,7 @@ impl SimEngine {
                 ranks: 1,
                 components: BTreeMap::new(),
             },
-            groups: vec![WorkerGroupId("sim".to_owned())],
+            groups: vec![ExecutorGroupId("sim".to_owned())],
             max_model_len: SIM_MAX_MODEL_LEN,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
@@ -1787,7 +1787,7 @@ impl SimEngine {
                             .map(|canvas| canvas.max_steps)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "canvas call for a worker launched without canvas sampling"
+                                    "canvas call for an executor launched without canvas sampling"
                                 )
                             })?;
                     let request_id = call.request_key.request_id;
@@ -1884,7 +1884,7 @@ impl SimEngine {
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
-                // A worker's image decoding releases the request's
+                // An executor's image decoding releases the request's
                 // latent and resets its denoising step to zero.
                 request.step_index = 0;
                 if let Some(image) = request.image().cloned() {
@@ -1895,7 +1895,7 @@ impl SimEngine {
                     };
                     // A decoding that writes the request's feedback image
                     // product publishes its values after the PNG, as a
-                    // worker does.
+                    // executor does.
                     let mut media = synthetic_png_b64(width, height)?.into_bytes();
                     if call.image_output.is_some() {
                         let values = synthetic_feedback_values(
@@ -1959,7 +1959,7 @@ impl SimEngine {
         self.placement.queue_depth = (depth as usize).max(1);
     }
 
-    /// Names the worker groups this deployment runs, replacing the single
+    /// Names the executor groups this deployment runs, replacing the single
     /// `sim` group.
     ///
     /// Each group reports the same placement, ranks and pools: what differs
@@ -1967,11 +1967,11 @@ impl SimEngine {
     pub fn name_groups(&mut self, names: &[&str]) {
         self.groups = names
             .iter()
-            .map(|name| WorkerGroupId((*name).to_owned()))
+            .map(|name| ExecutorGroupId((*name).to_owned()))
             .collect();
     }
 
-    /// Places the pool's components, as a launch places a worker group's,
+    /// Places the pool's components, as a launch places an executor group's,
     /// and launches the pool with the ranks they span.
     pub fn place_components(&mut self, components: BTreeMap<String, ComponentConfig>) {
         self.placement.ranks = components
@@ -2002,7 +2002,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2011,7 +2011,7 @@ impl SimEngine {
         self.info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache")
+            .expect("sim AR executor has a prefix cache")
             .groups = groups;
     }
 
@@ -2019,7 +2019,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2028,7 +2028,7 @@ impl SimEngine {
         self.info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache")
+            .expect("sim AR executor has a prefix cache")
             .num_units = count;
     }
 
@@ -2038,7 +2038,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2048,7 +2048,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache");
+            .expect("sim AR executor has a prefix cache");
         cache.segments = (0..segments)
             .map(|ordinal| ipc::CacheSegment {
                 world: if (1..=inherited).contains(&ordinal) {
@@ -2071,7 +2071,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2081,7 +2081,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache");
+            .expect("sim AR executor has a prefix cache");
         let first = cache.groups[0].clone();
         let layer = cache
             .groups
@@ -2105,7 +2105,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2115,7 +2115,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache")
+            .expect("sim AR executor has a prefix cache")
             .groups
         {
             group.block_size = tokens;
@@ -2124,7 +2124,7 @@ impl SimEngine {
 
     /// Speculates as `speculation` states: the simulated drafter proposes
     /// for the calls that ask for drafts, verifications accept the drafts
-    /// that are the model's tokens, and every step reports its worker time.
+    /// that are the model's tokens, and every step reports its executor time.
     pub fn set_speculation(&mut self, speculation: SimSpeculation) {
         self.speculation = Some(speculation);
     }
@@ -2134,7 +2134,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated worker does not expose a prefix cache.
+    /// Panics when the simulated executor does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2144,7 +2144,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR worker has a prefix cache");
+            .expect("sim AR executor has a prefix cache");
         let first = cache.groups[0].clone();
         let layer = cache
             .groups
@@ -2161,7 +2161,7 @@ impl SimEngine {
         });
     }
 
-    /// Launches the simulated worker with block-diffusion sampling: a canvas
+    /// Launches the simulated executor with block-diffusion sampling: a canvas
     /// step stops its block no later than the sampling's step limit.
     pub fn set_canvas_sampling(&mut self, sampling: ipc::CanvasSampling) {
         self.canvas_sampling = Some(sampling);
@@ -2174,7 +2174,7 @@ impl SimEngine {
     }
 
     /// Holds every batch that skips a predicated call until the returned
-    /// sender releases it, as a worker whose skipped step is still running
+    /// sender releases it, as an executor whose skipped step is still running
     /// holds its batch's result: each message releases one held batch, and
     /// dropping the sender releases the rest.
     pub fn hold_predicated_batches(&mut self) -> Sender<()> {
@@ -2264,7 +2264,7 @@ fn digest(values: &[u8]) -> u64 {
 }
 
 /// What `call`, which completed with `record`, wrote into `request`'s
-/// context, as a worker's KV cache holds it, and the provenance of the image
+/// context, as an executor's KV cache holds it, and the provenance of the image
 /// products it made.
 fn context_writes(
     call: &Call,
@@ -2449,7 +2449,7 @@ impl Default for SimEngine {
 }
 
 impl SimEngine {
-    /// Returns the worker metadata.
+    /// Returns the executor metadata.
     fn info(&self) -> &WorkerInfo {
         &self.info
     }
@@ -2565,7 +2565,7 @@ impl SimEngine {
                 })
                 .transpose()?;
 
-            // As on a worker, a chained call releases the products of
+            // As on an executor, a chained call releases the products of
             // the call it follows, and a predicate is released once its
             // consumer has read it. The predicate value is read above, before
             // these releases, because it may be a product of the predecessor.
@@ -2781,7 +2781,7 @@ mod tests {
             vec![(
                 call,
                 crate::executor::RequestPlacement {
-                    worker: WorkerGroupId("sim".into()),
+                    worker: ExecutorGroupId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),
                     new_cache_units: Vec::new(),

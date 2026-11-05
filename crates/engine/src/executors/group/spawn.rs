@@ -66,12 +66,12 @@ impl ExecutorProcessArgs {
         mut expert_store: Option<Reservation>,
     ) -> anyhow::Result<LaunchedWorkers> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        crate::WorkerGroupConfig::validate_members(&self.ranks, &self.components)?;
+        crate::ExecutorGroupConfig::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
             self.components.is_empty() != self.role.serves_requests(),
             "executor role disagrees with request component placement"
         );
-        if self.role == crate::WorkerGroupRole::Experts {
+        if self.role == crate::ExecutorGroupRole::Experts {
             anyhow::ensure!(
                 self.expert_parallel.as_ref().is_some_and(|placement| {
                     placement.attention_ranks > 0 && placement.rank >= placement.attention_ranks
@@ -430,7 +430,7 @@ impl ExecutorGroup {
         // Each process serves the rank the group launched it as.
         let incarnations = IncarnationRegistry::default();
         incarnations.assign(
-            &crate::WorkerGroupId(process_args.worker_id.clone()),
+            &crate::ExecutorGroupId(process_args.worker_id.clone()),
             workers.iter().map(|worker| &worker.info().endpoint),
         );
         Ok(Self {

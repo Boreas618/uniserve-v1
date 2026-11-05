@@ -5,7 +5,7 @@
 //! host. Requests are routed only to admissible pairings, and a decoding executor
 //! without one is refused at startup.
 
-use crate::executor::WorkerGroupId;
+use crate::executor::ExecutorGroupId;
 
 /// Returns, for each executor that decodes video, the encoder replicas that
 /// keep every media unit it decodes on the host that decoded it.
@@ -25,12 +25,12 @@ use crate::executor::WorkerGroupId;
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     placements: &[(
-        WorkerGroupId,
+        ExecutorGroupId,
         Vec<String>,
         std::collections::BTreeMap<String, crate::ComponentConfig>,
     )],
 ) -> anyhow::Result<
-    std::collections::BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>,
+    std::collections::BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>,
 > {
     let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
@@ -105,13 +105,13 @@ pub(crate) fn video_unit_codecs(
 #[cfg(test)]
 mod tests {
     use super::video_unit_codecs;
-    use crate::WorkerRank;
-    use crate::executor::{ComponentConfig, WorkerGroupId};
+    use crate::ExecutorRank;
+    use crate::executor::{ComponentConfig, ExecutorGroupId};
     use ipc::MediaCall;
     use std::collections::BTreeMap;
 
-    fn rank(host: &str, device: &str) -> WorkerRank {
-        WorkerRank {
+    fn rank(host: &str, device: &str) -> ExecutorRank {
+        ExecutorRank {
             host: host.to_owned(),
             device: device.to_owned(),
         }
@@ -235,7 +235,7 @@ mod tests {
         for worker in ["text", "flow-0", "flow-1"] {
             transfer.worker_ranks.insert(worker.to_owned(), 1);
         }
-        let slots = |routed: &BTreeMap<String, WorkerGroupId>| {
+        let slots = |routed: &BTreeMap<String, ExecutorGroupId>| {
             media_consumer_slots(
                 &[MediaCall::LatentPreparation],
                 &routing,
@@ -250,7 +250,7 @@ mod tests {
             )
         };
 
-        let routed = BTreeMap::from([("denoiser".to_owned(), WorkerGroupId("flow-1".to_owned()))]);
+        let routed = BTreeMap::from([("denoiser".to_owned(), ExecutorGroupId("flow-1".to_owned()))]);
         assert_eq!(slots(&routed), [transfer.acknowledgment_slot("flow-1", 0)]);
 
         assert_eq!(
@@ -284,7 +284,7 @@ mod tests {
         }
         let routed = BTreeMap::from([(
             "video_codec".to_owned(),
-            WorkerGroupId("encoder-0".to_owned()),
+            ExecutorGroupId("encoder-0".to_owned()),
         )]);
 
         let slots = media_consumer_slots(
@@ -307,11 +307,11 @@ mod tests {
     /// function itself reads only the ranks' hosts.
     fn pairing(
         placements: &[(
-            &WorkerGroupId,
-            &[WorkerRank],
+            &ExecutorGroupId,
+            &[ExecutorRank],
             &BTreeMap<String, ComponentConfig>,
         )],
-    ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
+    ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>> {
         let placed = placements
             .iter()
             .map(|(id, ranks, components)| {
@@ -327,8 +327,8 @@ mod tests {
 
     #[test]
     fn units_encoded_on_their_own_host_are_admitted() {
-        let model = WorkerGroupId("model".to_owned());
-        let host = WorkerGroupId("host".to_owned());
+        let model = ExecutorGroupId("model".to_owned());
+        let host = ExecutorGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -358,8 +358,8 @@ mod tests {
         // Two units per decoding rank: positions 0 to 3 come from host a's
         // decoders and go to host a's encoders, positions 4 to 7 likewise on
         // host b.
-        let model = WorkerGroupId("model".to_owned());
-        let host = WorkerGroupId("host".to_owned());
+        let model = ExecutorGroupId("model".to_owned());
+        let host = ExecutorGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -441,21 +441,21 @@ mod tests {
         // the replica's own host.
         let flows = [
             (
-                WorkerGroupId("flow-a".to_owned()),
+                ExecutorGroupId("flow-a".to_owned()),
                 vec![rank("a", "cuda:0")],
             ),
             (
-                WorkerGroupId("flow-b".to_owned()),
+                ExecutorGroupId("flow-b".to_owned()),
                 vec![rank("b", "cuda:0")],
             ),
         ];
         let encoders = [
             (
-                WorkerGroupId("encoder-a".to_owned()),
+                ExecutorGroupId("encoder-a".to_owned()),
                 vec![rank("a", "cpu")],
             ),
             (
-                WorkerGroupId("encoder-b".to_owned()),
+                ExecutorGroupId("encoder-b".to_owned()),
                 vec![rank("b", "cpu")],
             ),
         ];

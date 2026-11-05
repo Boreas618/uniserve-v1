@@ -393,9 +393,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
+    /// The worker groups that prefill only (`ExecutorGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
-    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::ExecutorGroupId>) {
         self.placement.prefill_groups = groups.into_iter().collect();
     }
 
@@ -609,7 +609,7 @@ impl Scheduler {
     ) {
         let info = self.executor.info();
         let groups: Vec<(
-            crate::WorkerGroupId,
+            crate::ExecutorGroupId,
             Vec<(u32, crate::encoder_outputs::RankEncoders<'_>)>,
         )> = info
             .rank_encoders

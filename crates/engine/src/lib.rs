@@ -1,22 +1,22 @@
-//! Scheduling, KV cache management, worker execution and request control.
+//! Scheduling, KV cache management, executor execution and request control.
 //!
 //! The crate is the engine process (`uniserve engine`): it serves the request
-//! interface to the leader's daemon (`service`) and drives the worker
+//! interface to the leader's daemon (`service`) and drives the executor
 //! processes.
 //! A deployment runs one scheduler per DP rank: `SchedulerHandle` (`core`)
-//! launches the worker processes, or takes a supplied executor, and runs the
+//! launches the executor processes, or takes a supplied executor, and runs the
 //! `Scheduler` (`scheduler`) on a thread of its own. Frontends submit and
 //! control requests through the handle and receive each request's events on
 //! its `EventRx` (`handle`). On its thread, the `Scheduler` admits requests,
-//! assigns cache pages (`kv_cache`) and other worker storage (`allocation`),
+//! assigns cache pages (`kv_cache`) and other executor storage (`allocation`),
 //! and submits calls through the `Executor` trait (`executor`);
-//! `Dispatcher` (`worker`) splits each batch into per-worker submissions
-//! to the worker processes.
+//! `Dispatcher` (`executor`) splits each batch into per-executor submissions
+//! to the executor processes.
 //!
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
 //! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
 
-/// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
+/// Scheduler-owned allocation of executor storage; only its `OutOfStorage`
 /// error is public.
 pub mod allocation;
 mod clock;
@@ -39,7 +39,7 @@ mod warmup;
 mod executors;
 
 pub use crate::core::{
-    EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
+    EngineConfig, RankFacts, SchedulerHandle, ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank,
 };
 pub use crate::deployment::Deployment;
 pub use crate::executor::{
@@ -47,7 +47,7 @@ pub use crate::executor::{
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
     ParallelConfig, PoolPlacement, RankBuffer, RankEncoderPools, RequestPlacement,
     SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
-    WorkerExecError, WorkerFailure, WorkerGroupId, WorkerResult,
+    ExecuteError, ExecutorFailure, ExecutorGroupId, ExecutorResult,
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
@@ -88,7 +88,7 @@ pub use crate::executors::{
     ExecutorProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
-/// Serializable scheduler, cache, and worker performance snapshots.
+/// Serializable scheduler, cache, and executor performance snapshots.
 pub use proto::report;
 pub use proto::request::{
     ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,

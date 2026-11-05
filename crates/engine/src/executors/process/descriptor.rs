@@ -68,15 +68,15 @@ impl Default for ExecutorProcessArgs {
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
             weights: None,
-            ranks: vec![crate::WorkerRank {
+            ranks: vec![crate::ExecutorRank {
                 host: "localhost".into(),
                 device: "cuda:0".into(),
             }],
             host: "localhost".into(),
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
-            components: crate::WorkerGroupConfig::single_component(DEFAULT_COMPONENT, 1),
-            role: crate::WorkerGroupRole::Model,
+            components: crate::ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
+            role: crate::ExecutorGroupRole::Model,
             peers: Default::default(),
             stub: false,
             queue_depth: Self::DEFAULT_QUEUE_DEPTH,
@@ -147,7 +147,7 @@ impl ExecutorProcessArgs {
     pub(super) fn host_slot(&self, rank: u32) -> anyhow::Result<(u32, u32)> {
         let rank = rank as usize;
         let host = &self.ranks[rank].host;
-        let resident = |placed: &&crate::WorkerRank| &placed.host == host;
+        let resident = |placed: &&crate::ExecutorRank| &placed.host == host;
 
         // The rank's host index counts the ranks placed before it on its host.
         let index = self.ranks[..rank].iter().filter(resident).count();

@@ -16,14 +16,14 @@
 //!
 //! The executor also holds the engine's copy of every cross-executor product
 //! export until the scheduler frees the buffer or its request finishes
-//! without retaining it, and on a `WorkerFailure` computes the calls,
+//! without retaining it, and on a `ExecutorFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
 
 pub(crate) mod codecs;
 mod failure;
 mod results;
 
-use crate::executor::WorkerResult;
+use crate::executor::ExecutorResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use super::{BatchSubmitError, IncarnationRegistry, ExecutorGroup};
 use crate::CommandWaker;
 use crate::executor::{
     BatchResult, CommandOutcome, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, WorkerFailure, WorkerGroupId,
+    RankBuffer, RequestPlacement, TransferConfig, UnroutableInputs, ExecutorFailure, ExecutorGroupId,
 };
 use anyhow::Context;
 use ipc::{
@@ -148,7 +148,7 @@ enum Dispatch {
     /// The group refused inputs that no configured edge carries to the rank
     /// reading them; nothing was recorded. The failure names the requests
     /// whose calls read those inputs.
-    Refused(Box<WorkerFailure>),
+    Refused(Box<ExecutorFailure>),
 }
 
 /// The executor and component whose call produces a buffer.
@@ -169,8 +169,8 @@ struct BufferRoute {
 /// Executor indices used throughout are positions in `executors`.
 pub struct Dispatcher {
     /// Executor identity to its index in `executors`.
-    routing: HashMap<WorkerGroupId, usize>,
-    workers: Vec<(WorkerGroupId, ExecutorGroup)>,
+    routing: HashMap<ExecutorGroupId, usize>,
+    workers: Vec<(ExecutorGroupId, ExecutorGroup)>,
     /// The executor and rank of every live rank incarnation, which the groups
     /// keep current as they replace ranks.
     incarnations: IncarnationRegistry,
@@ -217,7 +217,7 @@ pub struct Dispatcher {
     command_wake_pending: bool,
     /// A failure reconciled inside `submit`. `submit` refuses further batches
     /// with `WouldBlock` until `poll` returns it.
-    pending_failure: Option<WorkerFailure>,
+    pending_failure: Option<ExecutorFailure>,
     closed: bool,
 }
 
@@ -262,7 +262,7 @@ impl Dispatcher {
     /// endpoints, or no runtime capacity view can be derived from the executors.
     /// As a side effect every group learns the deployment-wide media routing.
     pub fn try_new(
-        mut workers: Vec<(WorkerGroupId, ExecutorGroup)>,
+        mut workers: Vec<(ExecutorGroupId, ExecutorGroup)>,
         transfer: TransferConfig,
     ) -> anyhow::Result<Self> {
         let command_wake = crate::handle::WakeSignal::new()?;
@@ -719,7 +719,7 @@ impl Dispatcher {
     /// `Submitted` records the submission, its collective sequence, and the
     /// admissions it carried. Errors come from resolving admissions, from
     /// building or validating the wire batch, or from the group; a group that
-    /// replaced its ranks reports a `WorkerFailure`.
+    /// replaced its ranks reports a `ExecutorFailure`.
     fn submit_worker(
         &mut self,
         worker_index: usize,
@@ -914,7 +914,7 @@ impl Dispatcher {
         worker_index: usize,
         batch: &ExecutionBatch,
         refusal: UnroutableInputs,
-    ) -> anyhow::Result<WorkerFailure> {
+    ) -> anyhow::Result<ExecutorFailure> {
         let requests = batch
             .requests
             .iter()
@@ -928,7 +928,7 @@ impl Dispatcher {
             !requests.is_empty(),
             "refused input products are read by no call: {refusal}"
         );
-        Ok(WorkerFailure {
+        Ok(ExecutorFailure {
             worker_id: self.workers[worker_index].0.clone(),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
@@ -1020,7 +1020,7 @@ impl Dispatcher {
 
     /// Runs `action` on every group, the groups together, and returns each
     /// group's identity with its ranks' results.
-    fn groups_together<F>(&mut self, action: F) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>>
+    fn groups_together<F>(&mut self, action: F) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>>
     where
         F: Fn(&mut ExecutorGroup) -> anyhow::Result<Vec<String>> + Sync,
     {
@@ -1047,7 +1047,7 @@ impl Dispatcher {
 }
 
 impl Executor for Dispatcher {
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         // Submissions already queued for the executor claim its free group slots.
         self.routing.get(worker).is_some_and(|&index| {
             self.workers[index].1.available_slots() > self.worker_submissions[index].len()
@@ -1060,13 +1060,13 @@ impl Executor for Dispatcher {
             .all(|index| self.has_capacity(&self.workers[index].0))
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.routing
             .get(worker)
             .is_some_and(|&index| self.workers[index].1.is_ready())
     }
 
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         self.routing
             .get(worker)
             .is_none_or(|&index| self.workers[index].1.is_closed())
@@ -1081,7 +1081,7 @@ impl Executor for Dispatcher {
     ///
     /// Returns `WouldBlock` while a reconciled failure awaits `poll`, while
     /// `depth` logical batches are pending, or when a target executor has no
-    /// free slot. A `WorkerFailure` raised while dispatching is reconciled and
+    /// free slot. A `ExecutorFailure` raised while dispatching is reconciled and
     /// held for the next `poll`, and the batch counts as submitted: its fate
     /// arrives through that failure and the batch's results. A reconciliation
     /// error is returned as `Failed`. Any other error while partitioning or
@@ -1417,7 +1417,7 @@ impl Executor for Dispatcher {
                 .get(&batch_id)
                 .is_some_and(|pending| pending.workers.is_empty())
             {
-                self.publish_result(WorkerResult {
+                self.publish_result(ExecutorResult {
                     batch_id,
                     done: true,
                     results: Vec::new(),
@@ -1444,7 +1444,7 @@ impl Executor for Dispatcher {
         })();
         match submit_result {
             Ok(()) => Ok(()),
-            Err(error) if error.is::<WorkerFailure>() => {
+            Err(error) if error.is::<ExecutorFailure>() => {
                 self.pending_failure = Some(
                     self.reconcile_worker_failure(error)
                         .map_err(ExecutorSubmitError::Failed)?,
@@ -1463,7 +1463,7 @@ impl Executor for Dispatcher {
     /// A failure held by `submit` is returned first. A drained command wake
     /// makes the call return `Ok(None)` at once, before or after waiting, so
     /// the scheduler can read its commands. An executor failure found while
-    /// pumping is reconciled and returned as a `WorkerFailure`; any other
+    /// pumping is reconciled and returned as a `ExecutorFailure`; any other
     /// error is returned unchanged.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if let Some(loss) = self.pending_failure.take() {
@@ -1637,14 +1637,14 @@ impl Executor for Dispatcher {
         &mut self,
         name: &str,
         payload: &str,
-    ) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
+    ) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>> {
         self.groups_together(|group| group.hook(name, payload))
     }
 
     /// Maps the host KV cache on every group, the groups together
     /// (`ExecutorGroup::map_host_cache`), and returns each group's identity
     /// with its ranks' pools.
-    fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<(WorkerGroupId, Vec<String>)>> {
+    fn map_host_cache(&mut self, tokens: u64) -> anyhow::Result<Vec<(ExecutorGroupId, Vec<String>)>> {
         self.groups_together(|group| group.map_host_cache(tokens))
     }
 
