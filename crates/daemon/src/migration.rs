@@ -1028,9 +1028,9 @@ mod tests {
         assert!(matches!(next(&mut events).await, Some(Event::Error { .. })));
     }
 
-    /// The interleaved request of the migration tests: a four-token prompt
-    /// whose greedy text opens an image on `trigger`, at most three images of
-    /// six denoising steps, fed back by a vision encoder whose feature write
+    /// The interleaved request of the image tests: a four-token prompt whose
+    /// greedy text opens an image on `trigger`, at most three images of six
+    /// denoising steps, fed back by a vision encoder whose feature write
     /// samples the next token (`sampled`), or by a latent encoder after which
     /// decoding continues with a configured token.
     fn interleaved(trigger: u32, sampled: bool) -> GenerationRequest {

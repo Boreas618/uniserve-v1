@@ -2,8 +2,8 @@
 
 ``send_request`` is the single entry point the benchmark runner
 (``uniserve_eval.pipeline.run``) uses per request. It routes by endpoint to a
-transport for native video APIs, image generations, decision readouts,
-streamed chat, or non-streaming chat, and folds everything observable into one
+transport for native video APIs, image generations, streamed chat, or
+non-streaming chat, and folds everything observable into one
 ``RequestRecord``: HTTP status, success and a stable failure classifier, client
 timing, token usage with its provenance, generated text, and media. Video
 bodies remain encoded until the runner inspects them after measurement.
@@ -23,14 +23,11 @@ from typing import Any
 import aiohttp
 
 from ..types import (
-    DJEV_EVALUATE,
     IMAGES_GENERATIONS,
-    SYSTEMONE,
     VIDEOS_SYNC,
     RequestRecord,
     TaskRequest,
 )
-from .decision import send_decision
 from .http import post_json, response_lines
 from .images import ImageOutputError, decode_openai_image_parts
 from .native_video import receive_video
@@ -53,8 +50,8 @@ async def send_request(
     """Dispatch one task request through its endpoint-specific transport.
 
     The endpoint selects the transport before ``request.stream`` is
-    consulted, so video, image-generation, and decision-readout requests
-    never take the SSE path. ``output_len_fallback`` becomes the record's
+    consulted, so video and image-generation requests never take the SSE
+    path. ``output_len_fallback`` becomes the record's
     ``requested_output_len`` for every endpoint. On chat endpoints,
     ``prompt_len`` and ``output_len_fallback`` stand in for token counts the
     server does not report.
@@ -92,8 +89,6 @@ async def send_request(
                 await receive_video(session, base_url, request, record)
         elif request.endpoint == IMAGES_GENERATIONS:
             await _send_images(session, url, payload, record)
-        elif request.endpoint in (SYSTEMONE, DJEV_EVALUATE):
-            await send_decision(session, url, request.endpoint, payload, record)
         elif request.stream:
             await _send_chat_stream(
                 session, url, payload, record, prompt_len, output_len_fallback

@@ -12,16 +12,11 @@ from pathlib import Path
 from typing import Any, Literal, TypeGuard
 
 # Endpoint paths. `send_request` in `uniserve_eval.transport.client` selects
-# the video, image-generations, and decision-readout transports by path; any
-# other endpoint uses a chat transport.
+# the video and image-generation transports by path; any other endpoint uses a
+# chat transport.
 CHAT_COMPLETIONS = "/v1/chat/completions"
 IMAGES_GENERATIONS = "/v1/images/generations"
 VIDEOS_SYNC = "/v1/videos/sync"
-# TypeSafe System One decision readout (OpenAPI 0.2.0): one state per request.
-SYSTEMONE = "/v1/systemone"
-# DJev's multi-state readout, the reference implementation of the same
-# decision semantics under its NanoJev-compatible schema.
-DJEV_EVALUATE = "/api/evaluate"
 
 DEFAULT_I2T_QUESTION = "Describe this image in detail."
 
@@ -38,7 +33,6 @@ class TaskName(StrEnum):
     I2T = "i2t"
     INTERLEAVE = "interleave"
     VIDEO = "video"
-    SYSTEMONE = "systemone"
 
 
 @dataclass(frozen=True)
@@ -625,11 +619,6 @@ class RequestRecord:
     status_code: int | None = None
     finish_reason: str | None = None
     stop_reason: str | None = None
-    # A decision readout answers every question of each state it carries;
-    # `answers` keeps the server's answer objects keyed by question id.
-    decision_states: int = 0
-    decision_questions: int = 0
-    answers: dict[str, Any] | None = None
 
     def begin(
         self,
@@ -908,11 +897,6 @@ class RequestRecord:
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,
-            # Decision readouts: answered states and questions, and the
-            # answers as the server returned them.
-            "decision_states": self.decision_states,
-            "decision_questions": self.decision_questions,
-            "answers": self.answers,
         }
 
 
