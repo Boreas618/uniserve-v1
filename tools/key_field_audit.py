@@ -26,9 +26,13 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
+#: The row sets to audit. H3's dense rows come from `minimax-h3-deployment-keys.txt`, the file the
+#: deployment's own generator writes and `key_coverage`/`build_store` certify (140 rows, 140 built);
+#: `minimax-h3-keys.txt` is a walk print of the older enumeration and would audit fields no current
+#: row carries. The sparse rows have no certified file yet, so they are audited where they stand.
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
-    HERE.parent / 'notes/programs/minimax-h3-keys.txt',
+    HERE.parent / 'notes/programs/minimax-h3-deployment-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-sparse-keys.txt',
 )
 
@@ -149,6 +153,7 @@ def main() -> int:
     unearned = 0
     audited = 0
     unbuilt = 0
+    skipped = 0
     first_failure = None
     for fixture in FIXTURES:
         for operator, key in rows_of(fixture):
@@ -156,9 +161,15 @@ def main() -> int:
                 continue
             if operator in seen:
                 continue
+            # The row names one backend, and only that backend's artefact can answer for it: the
+            # packages of one operator are different sources (`paged_attention` is `trtllm` for bf16
+            # and Triton for `kv_f8e4m3`), so building a row against another one reports "does not
+            # build" about a package that never claimed the row. `covers` is the store's own reader.
             candidates = [one for one in packages.get(operator, [])
-                          if one["manifest"]["source"]["kind"] == "triton"]
+                          if one["manifest"]["source"]["kind"] == "triton"
+                          and store.covers(one, key)]
             if not candidates:
+                skipped += 1
                 continue
             seen.add(operator)
             package = candidates[0]
@@ -173,11 +184,11 @@ def main() -> int:
                     if first_failure is None:
                         first_failure = f"{operator}: {verdict}"
             if arguments.limit and audited >= arguments.limit:
-                return report(audited, unbuilt, unearned, first_failure)
-    return report(audited, unbuilt, unearned, first_failure)
+                return report(audited, unbuilt, unearned, skipped, first_failure)
+    return report(audited, unbuilt, unearned, skipped, first_failure)
 
 
-def report(audited, unbuilt, unearned, first_failure):
+def report(audited, unbuilt, unearned, skipped, first_failure):
     """State what was measured, and refuse to pass over operators that could not be built.
 
     An operator whose base key does not build contributes no evidence: a moved key could not be
@@ -187,6 +198,9 @@ def report(audited, unbuilt, unearned, first_failure):
     measured = audited - unbuilt
     print(f"{audited} operator(s) read, {measured} whose base built, "
           f"{unearned} field value(s) not earned")
+    if skipped:
+        print(f"{skipped} row(s) skipped: no Triton package covers them, so a field's cost is not "
+              f"this tool's question for them (a native backend's build is the store's)")
     if unbuilt:
         print(f"{unbuilt} operator(s) could not be measured: the interpreter running this script is "
               f"the one that must carry the toolchain (Triton, CuTe DSL, nvcc). First: {first_failure}")
