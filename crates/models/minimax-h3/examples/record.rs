@@ -59,6 +59,10 @@ use minimax_h3::output::{Splice, VideoPostprocessor};
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use minimax_h3::Partition;
+
+/// The prompt capacity the denoiser's rows are stated at: the deployment's own text limit, and the
+/// one number in the deployment line that is not a function of the clip or the raster.
+const PROMPT_TOKENS: u32 = 4096;
 use nn::layers::{Linear, WeightOrder};
 use nn::weights::WeightRequest;
 use nn::forward::Arena;
@@ -212,26 +216,16 @@ fn run() -> Result<(), String> {
         other => return Err(format!("unknown component {other}")),
     };
 
-    println!(
-        "# recorded from the model's own forward, at {}: dtype {}, clip {}, raster {}x{}, packed rows {}, sparse {:?}",
-        request.root.display(),
-        request.dtype,
-        request.clip,
-        request.raster.0,
-        request.raster.1,
-        request.rows,
-        request.sparse
-    );
+    // The row count is printed once every row is read, so no two readings of this print can disagree
+    // about it: the rows go out deduplicated, in the order a fixture holds them, and the summary below
+    // is the count of exactly what was printed.
     let mut all: Vec<(String, String)> = Vec::new();
     let mut refusals: Vec<(&str, String)> = Vec::new();
     for (name, harness) in &harnesses {
         match harness(&request) {
             Ok(rows) => {
                 eprintln!("# {name}: {} rows", rows.len());
-                for row in rows {
-                    println!("{}\t{}", row.0, row.1);
-                    all.push(row);
-                }
+                all.extend(rows);
             }
             Err(reason) => {
                 // A refusal is a row of the output, not an exit.
@@ -243,6 +237,24 @@ fn run() -> Result<(), String> {
     }
     all.sort();
     all.dedup();
+    // The deployment line is the one `h3_fixture` copies into a fixture, and it is the walk's own line
+    // with this recorder's numbers in it: a print from here is a fixture's source on a machine with no
+    // device and no shard, which is what makes the walk the second enumeration rather than the first.
+    println!(
+        "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [({}, {})], prompt lengths: [{}], \
+         packed rows: [{}], sparse attention: {sparse:?}, tensor-parallel degree 1, ulysses degree 1 \
+         - recorded from the model's own forward at {}",
+        request.clip,
+        request.raster.0,
+        request.raster.1,
+        PROMPT_TOKENS,
+        request.rows,
+        request.root.display(),
+        sparse = request.sparse
+    );
+    for row in &all {
+        println!("{}\t{}", row.0, row.1);
+    }
     let mut operators: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
     operators.sort_unstable();
     operators.dedup();
@@ -751,7 +763,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
         first_frames: 0,
         last_frames: 0,
         references: 0,
-        text_tokens: 4096,
+        text_tokens: PROMPT_TOKENS,
         conditions: &[],
         vision_spans: &[],
     };
