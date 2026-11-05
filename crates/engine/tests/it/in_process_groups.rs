@@ -156,3 +156,161 @@ fn a_relaunching_group_leaves_its_executor_serving_the_others() {
         "the replacement takes work"
     );
 }
+
+/// A text request of `max_und_tokens` tokens whose prompt is `prompt`.
+fn greedy_request(id: u64, prompt: Vec<u32>, max_und_tokens: usize) -> GenerationRequest {
+    let mut request = request(id, 1, 0);
+    request.prompt_token_ids = prompt;
+    request.sampling = SamplingParams {
+        ignore_eos: true,
+        ..Default::default()
+    };
+    request.max_und_tokens = max_und_tokens;
+    request
+}
+
+/// Serves `requests` on `groups` and returns the tokens each generated.
+fn generate(
+    groups: &[(&str, engine::ExecutorGroupRole)],
+    requests: Vec<GenerationRequest>,
+) -> Vec<Vec<u32>> {
+    use engine::{EngineConfig, Executor, ExecutorGroupId, SchedulerHandle};
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(16);
+    if !groups.is_empty() {
+        let names: Vec<&str> = groups.iter().map(|(name, _)| *name).collect();
+        sim.name_groups(&names);
+    }
+    let executor = SimExecutor::new(sim);
+    let rank = executor
+        .info()
+        .runtime_info()
+        .expect("the sim states its rank");
+    let mut config = EngineConfig::sim("groups");
+    config.max_running_requests = 4;
+    if !groups.is_empty() {
+        let base = config.worker_groups.remove(0);
+        config.worker_groups = groups
+            .iter()
+            .map(|(name, role)| engine::ExecutorGroupConfig {
+                id: ExecutorGroupId((*name).to_owned()),
+                role: *role,
+                ..base.clone()
+            })
+            .collect();
+    }
+    let engine = SchedulerHandle::with_executor(config, Box::new(executor))
+        .expect("the simulated executor serves");
+    support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
+
+    let mut streams: Vec<_> = requests
+        .into_iter()
+        .map(|request| engine.submit(request).expect("the engine takes the submission"))
+        .collect();
+    let mut generated = Vec::new();
+    for events in &mut streams {
+        let deadline = Instant::now() + ANSWER;
+        let mut tokens = Vec::new();
+        let mut finished = false;
+        while Instant::now() < deadline && !finished {
+            match events.try_recv() {
+                Ok(Event::TextToken { id, .. }) => tokens.push(id),
+                Ok(event) if event.is_terminal() => finished = true,
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(finished, "a request did not finish: it generated {tokens:?}");
+        generated.push(tokens);
+    }
+    engine.shutdown();
+    generated
+}
+
+/// An engine whose every group is lost, with no replacement coming, stops
+/// admitting work.
+///
+/// The launched path reaches the same scheduler state when its rank processes
+/// are killed and their recovery fails; here the executor states the loss.
+#[test]
+fn losing_every_worker_stops_request_admission() {
+    use engine::{EngineConfig, Executor, ExecutorGroupId, SchedulerHandle, SubmitError};
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(4);
+    let executor = SimExecutor::new(sim);
+    let loss = executor.loss();
+    let rank = executor
+        .info()
+        .runtime_info()
+        .expect("the sim states its rank");
+    let engine = SchedulerHandle::with_executor(EngineConfig::sim("sim-model"), Box::new(executor))
+        .expect("the simulated executor serves");
+    support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
+
+    // The engine serves while its group is live.
+    let mut first = engine
+        .submit(request(1, 4, 100))
+        .expect("the engine takes the submission");
+    let deadline = Instant::now() + ANSWER;
+    let mut served = false;
+    while Instant::now() < deadline && !served {
+        match first.try_recv() {
+            Ok(event) => served = event.is_terminal(),
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(served, "the engine serves while its group is live");
+
+    // Every rank is gone, and no replacement will stand.
+    loss.lose(
+        ExecutorGroupId("sim".to_owned()),
+        "every rank of the group was lost",
+    );
+    let deadline = Instant::now() + ANSWER;
+    while !engine.is_dead() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        engine.is_dead(),
+        "an engine without execution workers kept accepting work"
+    );
+    match engine.submit(request(2, 4, 200)) {
+        Err(SubmitError::Dead) => {}
+        Err(other) => panic!("a dead engine refused the request as {other:?}"),
+        Ok(_) => panic!("a dead engine admitted a request"),
+    }
+    engine.shutdown();
+}
+
+/// A deployment that splits prefill from decode generates what one group
+/// generates: the prefill group hands its requests to the decode group and the
+/// tokens are the model's either way.
+#[test]
+fn a_prefill_group_hands_its_requests_to_a_decode_group() {
+    use engine::ExecutorGroupRole;
+
+    let prompts = vec![vec![7, 8, 9], (0..600u32).map(|index| index % 47 + 5).collect()];
+    let requests = || {
+        prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| greedy_request(index as u64 + 101, prompt.clone(), 6))
+            .collect::<Vec<_>>()
+    };
+
+    let alone = generate(&[], requests());
+    let handed = generate(
+        &[
+            ("prefill", ExecutorGroupRole::Prefill),
+            ("decode", ExecutorGroupRole::Decode),
+        ],
+        requests(),
+    );
+    assert!(
+        alone.iter().all(|tokens| tokens.len() == 6),
+        "one group generated {alone:?}"
+    );
+    assert_eq!(handed, alone, "the prefill and decode groups parted ways");
+}
