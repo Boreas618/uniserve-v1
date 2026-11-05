@@ -133,6 +133,17 @@ impl Deployment {
         })
     }
 
+    /// A deployment of the checkpoint at `root`.
+    ///
+    /// The configuration is read through [`Config::read`], which normalizes the checkpoint's sidecars
+    /// at this boundary - the one place that knows how a checkpoint's directories become a deployment.
+    /// A walk that parsed the component directories itself lacks the clip rule, the attention kind and
+    /// the canvas set, which are exactly the facts `rows_bound` needs; building a denoiser config from
+    /// what it has would be a second normalization of the same checkpoint.
+    pub fn read(root: &std::path::Path, types: Types, rungs: Vec<u32>) -> Result<Self> {
+        Self::new(Config::read(root, None)?, types, rungs)
+    }
+
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
     /// than listed: `17n + 5` up to [`MAX_FRAMES`].
     ///
@@ -238,6 +249,34 @@ impl Deployment {
             )?);
         }
         Ok(programs.finish())
+    }
+
+    /// The packed row bound the deployment's DiTs are laid out at, at the attention kind it serves.
+    ///
+    /// One function answers this number for serving (`Layouts::rows_bound`), for the rows this file
+    /// states and for a walk's `--rows`, which is why it is published: a flag that restates a bound
+    /// the deployment derives is a second answer, and the only way it can be caught is by asking the
+    /// deployment. The largest bound over the checkpoint's DiTs is the deployment's, because one store
+    /// serves both.
+    pub fn bound(
+        &self,
+        partition: &Partition,
+        attention: Option<crate::config::AttentionKind>,
+    ) -> Result<u32> {
+        let mut bound = 0;
+        for config in self.config.denoisers.values() {
+            let network = match attention {
+                Some(attention) => {
+                    let mut network = config.clone();
+                    network.attention = attention;
+                    network
+                }
+                None => config.clone(),
+            };
+            let arrangement = partition.arrangement(&network)?;
+            bound = bound.max(crate::denoiser::Layouts::new(network, arrangement)?.rows_bound()?);
+        }
+        Ok(bound)
     }
 
     /// The rows the two audio VAEs and the video VAE state, at the request extents a walk states.
