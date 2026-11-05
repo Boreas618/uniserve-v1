@@ -125,7 +125,10 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut component = String::from("all");
-    let mut clip = 256u32;
+    // The smallest clip H3 generates: a frame count has the form `17n + 5`, and the deployment's
+    // serving request states its own. A stated clip that no H3 request can be is refused below,
+    // because every width the temporal classes key derives from it.
+    let mut clip = 22u32;
     // The first canvas the deployment offers: every harness that reads one raster (the denoiser's,
     // the decoder's) reads this one, and the others are added by `--raster`.
     let mut raster = {
@@ -145,7 +148,9 @@ fn run() -> Result<(), String> {
     // `--track`. They key the packed stream's offsets and the audio encoder's widths, so a
     // comparison of two deploments must pass the same pair to both enumerations.
     let mut tokens = 4096u32;
-    let mut track = 44_100u32;
+    // No default: a soundtrack is `audio_samples` of the clip, which is one function of the clip
+    // rather than a second number that can disagree with it.
+    let mut track: Option<u32> = None;
     let mut elements = 0u64;
     let mut against: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
@@ -187,9 +192,11 @@ fn run() -> Result<(), String> {
             "--rows" => rows = Some(value()?.parse().map_err(|_| "--rows is a count")?),
             "--tokens" => tokens = value()?.parse().map_err(|_| "--tokens is a count")?,
             "--track" => {
-                track = value()?
-                    .parse()
-                    .map_err(|_| "--track is a count of samples")?
+                track = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--track is a count of samples")?,
+                )
             }
             "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
@@ -263,6 +270,26 @@ fn run() -> Result<(), String> {
              describes a deployment the model cannot be asked to be"
         ));
     }
+    // **A clip and its soundtrack are one fact, not two.** A generated frame count has the form
+    // `17n + 5`, and a clip's soundtrack is `packing::audio_samples` of it; a stated track that is
+    // not that number describes a request the model cannot be asked for, and the audio widths the
+    // encoder keys would be a class no launch reaches.
+    if clip < 22 || clip % 17 != 5 {
+        return Err(format!(
+            "--clip states {clip} frames and an H3 clip is `17n + 5` frames, at least 22"
+        ));
+    }
+    let derived_track = minimax_h3::packing::audio_samples(clip);
+    if let Some(stated) = track
+        && stated != derived_track
+    {
+        return Err(format!(
+            "--track states {stated} samples and a {clip}-frame clip's soundtrack is \
+             {derived_track} samples (`audio_samples`): the track is a function of the clip, not a \
+             second number that can disagree with it"
+        ));
+    }
+    let track = derived_track;
     let request = Request {
         root,
         bound,
