@@ -543,9 +543,10 @@ def run_encode_rows(options) -> int:
     convention to reproduce beyond the pixels themselves.
 
     The rows that come back are the conditioner's input, `[rows, channels * 4]` FP32. The crate's
-    stage writes the *projected* prefix instead, whose projection is the DiT's; when the crate
-    writes the same rows beside the pixels this compares them, and until then it writes the
-    reference side and says so.
+    conditioned stage writes them beside its pixels - `rows.h3t`, which the case names in
+    `encoder_rows_file` - through the trace views of the served `prepare_conditioning` arm, so this
+    compares the encoder on both sides and leaves the projection out of it. A case without them
+    gets the reference side alone, and the page says so.
     """
     component = "video_encoder"
     stack = options.stack
