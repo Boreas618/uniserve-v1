@@ -2,7 +2,7 @@
 //!
 //! The loader never converts a checkpoint's weights in place and never holds a whole shard in host
 //! memory: each shard is mapped read-only with `memmap2`, the `safetensors` crate parses its header
-//! through [`read_header`], and one tensor's bytes are copied when a weight is converted. A shard is
+//! through `read_header`, and one tensor's bytes are copied when a weight is converted. A shard is
 //! mapped for the life of the [`Checkpoint`], which is the model's life; the mapping costs virtual
 //! address space, not resident memory.
 //!
