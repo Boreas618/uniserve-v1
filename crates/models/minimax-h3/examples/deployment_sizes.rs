@@ -415,12 +415,16 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
     // named one degree while measuring the other would size a deployment it never planned.
     for (name, dit, task, ulysses, tensor) in [
         (
-            "t2va / fl2va, 1 rank",
+            "t2va, 1 rank",
             Dit::Base,
             nn::capability::VideoTask::TextToVideoAudio,
             1_usize,
             1_usize,
         ),
+        // A conditioned deployment reserves its own condition capacity, so its plan is a **different
+        // plan** from the unconditioned one and cannot share a line: `t2va` reserves one unit and
+        // `fl2va` two keyframes at the largest canvas. `fl2va`'s row is below, where its name states
+        // that it is the conditioned deployment.
         (
             "t2va, Ulysses 2 (the text encoder unsharded)",
             Dit::Base,
