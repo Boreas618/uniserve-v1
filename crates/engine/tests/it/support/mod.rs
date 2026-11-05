@@ -6,8 +6,11 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod serving;
 pub(crate) mod storage;
 pub(crate) mod video;
+
+pub(crate) use serving::{pool, rank, Serving, SAMPLED};
 
 /// The digest of test image `id` (`ImageInput::digest`): its little-endian
 /// bytes, then zeros, so that images of distinct ids differ.
