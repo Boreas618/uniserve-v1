@@ -819,11 +819,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width.
+    // The timestep embedding's activation, over the transformer's hidden width. Its element type is
+    // FP32 at every deployment: the AdaLN pair this activation feeds is FP32 whatever the stack's
+    // weights are (`crates/ops/src/modulation.rs` refuses any other type), so a row at the
+    // deployment's dtype would build a cell no launch can reach.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: deployment,
+            dtype: DType::F32,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,
