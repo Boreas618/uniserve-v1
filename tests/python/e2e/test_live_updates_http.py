@@ -675,9 +675,10 @@ def _stream_count(
     reasons: list[str] | None = None,
     prompt: str = PROMPT,
     errors: list[BaseException] | None = None,
+    arrivals: list[float] | None = None,
 ) -> None:
-    """Streams the count, appending each content delta to `read` and each
-    finish reason to `reasons`.
+    """Streams the count, appending each content delta to `read`, the moment
+    it arrived to `arrivals`, and each finish reason to `reasons`.
 
     Runs on a thread, where an exception would otherwise be printed to a log
     the test's failure does not carry and read exactly like a stream that
@@ -685,7 +686,7 @@ def _stream_count(
     count of zero. `errors` keeps what went wrong so the failure states it.
     """  # noqa: D205
     try:
-        _stream_count_body(base_url, model, read, reasons, prompt)
+        _stream_count_body(base_url, model, read, reasons, prompt, arrivals)
     except BaseException as error:  # noqa: BLE001 - reported, never swallowed
         if errors is not None:
             errors.append(error)
@@ -701,6 +702,7 @@ def _stream_count_body(
     read: list[str],
     reasons: list[str] | None,
     prompt: str,
+    arrivals: list[float] | None = None,
 ) -> None:
     with httpx.stream(
         "POST",
@@ -725,6 +727,8 @@ def _stream_count_body(
                     content = (choice.get("delta") or {}).get("content")
                     if content:
                         read.append(content)
+                        if arrivals is not None:
+                            arrivals.append(time.monotonic())
                     if reasons is not None and choice.get("finish_reason"):
                         reasons.append(choice["finish_reason"])
 
@@ -2486,6 +2490,7 @@ def _lose_the_serving_engine(
     read: list[str] = []
     done = threading.Event()
     errors: list[BaseException] = []
+    arrivals: list[float] = []
     reasons: list[str] = []
     streaming = threading.Thread(
         target=_stream_count,
@@ -2494,6 +2499,7 @@ def _lose_the_serving_engine(
             "reasons": reasons,
             "prompt": RECOVERY_PROMPT,
             "errors": errors,
+            "arrivals": arrivals,
         },
     )
     streaming.start()
@@ -2519,9 +2525,19 @@ def _lose_the_serving_engine(
         f"the response in flight did not continue within "
         f"{RECOVERY_BOUND_S:.0f} s of the engine {killed} ending",
     )
-    recovery_s = resumed[0] - started
 
     streaming.join(timeout=1800)
+    # What the client lived through: the longest silence of the stream from the
+    # last token before the loss on. The arrival of each token is its own
+    # reading, so this is exact to the token; a poll of the count would round up
+    # to its interval, and tokens already on their way would read as a recovery.
+    last_before = [moment for moment in arrivals if moment < started][-1:]
+    after = [moment for moment in arrivals if moment >= started]
+    spans = last_before + after
+    recovery_s = max(
+        (later - earlier for earlier, later in zip(spans, spans[1:])),
+        default=resumed[0] - started,
+    )
     # The measurement is taken before the tokens are judged: a run whose served
     # path is broken still states how long the recovery took, which is the one
     # number this case exists to record.
