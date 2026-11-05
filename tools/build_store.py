@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,18 @@ def covers_one(descriptors, key):
         return False
     return all(value in dimensions.get(name, []) for name, value in pairs)
 
+
+def prune_empty_directories(root: Path) -> None:
+    """Remove the empty ancestors a failed attempt leaves behind.
+
+    Only directories that hold nothing at all are removed, deepest first, so a store a failed build
+    touched is left as the build found it. Anything a cell wrote keeps its directory.
+    """
+    if not root.is_dir():
+        return
+    for directory in sorted((one for one in root.rglob("*") if one.is_dir()), reverse=True):
+        if not any(directory.iterdir()):
+            directory.rmdir()
 
 def covers(package, key):
     """Whether the package covers this key: it covers one of the shapes it declares."""
@@ -254,8 +267,14 @@ def main():
         failures = []
         for package in candidates:
             directory = root / op / package["backend"] / str(args.revision) / args.target / key
+            # A cell exists only once it has committed. A failed attempt can leave a directory with
+            # a manifest and a source and no `.committed` mark, and a later reader cannot tell that
+            # from a cell built by an older revision — so an attempt that created one removes it.
+            existed = directory.exists()
             failure = build(package, key, args.target, directory, args.python)
             if failure:
+                if not existed:
+                    shutil.rmtree(directory, ignore_errors=True)
                 failures.append(f"{package['backend']}: {failure}")
                 continue
             (directory / ".committed").write_text("")
@@ -268,6 +287,7 @@ def main():
     # stops at it can carry on with an empty directory. The first failure is the evidence, and a
     # missing capability in the interpreter is the common cause.
     if not built:
+        prune_empty_directories(root)
         first = skipped[0][2] if skipped else "no candidate package"
         sys.exit(
             f"the store is empty: none of {len(rows)} keys built for {args.target} with "
@@ -308,6 +328,9 @@ def main():
         print(f"built\t{op}\t{backend}\t{key}")
     for op, key, reason in skipped:
         print(f"SKIPPED\t{op}\t{reason}\t{key}")
+    # A skipped key may have left an empty chain behind; the store holds cells, not the shape of an
+    # attempt.
+    prune_empty_directories(root)
     return 0 if not skipped else 1
 
 
