@@ -792,13 +792,15 @@ impl VisionTower {
         programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, merged, true));
 
         // The learned table resampled onto the request's grid, and the residual that adds it.
-        programs.launch::<PositionOp>(&PositionInterpolate::new(
+        programs.launch::<PositionOp>(
+            &PositionInterpolate::new(dtype, u64::from(hidden), BlockRows::position_grid(config)?)?
+                .descriptor(),
+        );
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
             dtype,
             u64::from(hidden),
-            BlockRows::position_grid(config)?,
-        )?
-        .descriptor());
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(hidden), false)?);
+            false,
+        )?);
 
         // The patch rotation, then one bidirectional attention per grid.
         programs.launch::<RopeApply>(
@@ -815,9 +817,9 @@ impl VisionTower {
             (head_dim as f32).sqrt().recip(),
         )
         .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, sequence, true,
-        ));
+        programs.launch::<DenseAttention>(
+            &attention.dense_descriptor(dtype, dtype, dtype, sequence, true),
+        );
 
         // The blocks' approximated GELU over the feed-forward's rows, and the merger's exact one over a
         // merged row.
@@ -1244,15 +1246,12 @@ mod tests {
     /// approximation and the merger's exact form are two programs.
     #[test]
     fn the_tower_states_its_programs_from_its_config() {
-        let config = crate::config::tests_support::released_config().text_encoder.vision;
-        let programs = VisionTower::programs(&config, nn::DType::BF16, 4096)
-            .expect("the tower's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let config = crate::config::tests_support::released_config()
+            .text_encoder
+            .vision;
+        let programs =
+            VisionTower::programs(&config, nn::DType::BF16, 4096).expect("the tower's programs");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("layer_norm"), 2);
         assert_eq!(count("position_interpolate"), 1);
