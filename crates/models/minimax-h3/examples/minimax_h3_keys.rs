@@ -131,6 +131,11 @@ const VAE_WIDTH: u32 = 32 * 64;
 /// The video VAE's spatial compression: 256 output pixels per 16 latent columns.
 const VAE_SPATIAL_COMPRESSION: u32 = 16;
 
+/// The video decoder's rotated width: three quarters of its 64-wide attention head (`vae/config.json`:
+/// `decoder_attention_head_dim 64`, `decoder_rope_dim_ratio 0.75`), which is 48 elements - a 24-column
+/// table, split evenly over the three coordinate axes (`video_vae::rotary`).
+const VAE_DECODER_ROTATED: u32 = 48;
+
 /// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
 /// `[rows, 8192]`).
 const VAE_MLP: u32 = 8192;
@@ -234,6 +239,16 @@ fn header(lines: &[(String, String)]) {
         "# The program rows a MiniMax-H3 deployment launches, one `operator<TAB>key` line each."
     );
     println!("# {} data rows, {operators} operators", lines.len());
+    // The rule the row set is grown and shrunk by, stated where a reader meets the count. A row was
+    // dropped once for having no launcher and a device run stopped on it in its first four launches
+    // (`rotary_factors ... sections_16-16-16`, the video decoder's), so the asymmetry is written down:
+    // **a row costs a compile and a missing row costs a run**, and a removal has to be argued from the
+    // construction rather than from an absence of launches.
+    println!(
+        "# rows are here because a launcher reaches them or because the construction requires them; \
+         a row is removed only when the construction contradicts it, never because no walk has \
+         produced it yet (`tools/walk_gaps.py --by-shape` reports a walk's shape the file lacks)."
+    );
     println!(
         "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
          {}; a run states which deployment it serves and a store built from this file serves all of \
@@ -458,15 +473,31 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // - **The text encoder's** is Qwen3-VL's M-RoPE: three unequal sections (48, 40, 40 of the
     //   head's 128 rotated elements) whose frequencies cycle over (time, height, width), a
     //   64-column table.
-    for (rotated, per_axis, interleaved) in [
-        (ROTATED, [ROTATED / ROPE_AXES; 3], false),
-        (128, [48, 40, 40], true),
+    //
+    // - **The video decoder's** is a third cut again, and it is not a head of the stack: its head is
+    //   64 wide and three quarters of it rotate (`vae/config.json`: `decoder_attention_head_dim 64`,
+    //   `decoder_rope_dim_ratio 0.75`), so 48 elements split evenly over three axes - a 24-column
+    //   table - and its **coordinates are F32 whatever the decode's element type is**, which is the
+    //   same fact that makes the decoder plan's `cosine`/`sine` entries F32
+    //   (`video_vae::rotary`). The stage-2 walk asked for exactly this row -
+    //   `rotary_factors dtype_f32_positions_f32_columns_24_..._sections_16-16-16` - in the first four
+    //   launches the decoder ever made, and the file did not hold it because no launcher had reached
+    //   it when the row was dropped. A row costs a compile; a missing row costs a run.
+    for (rotated, per_axis, interleaved, positions) in [
+        (ROTATED, [ROTATED / ROPE_AXES; 3], false, DType::I32),
+        (128, [48, 40, 40], true, DType::I32),
+        (
+            VAE_DECODER_ROTATED,
+            [VAE_DECODER_ROTATED / ROPE_AXES; 3],
+            false,
+            DType::F32,
+        ),
     ] {
         push(
             "rotary_factors",
             ops::rope::FactorsDescriptor {
                 dtype: DType::F32,
-                positions: DType::I32,
+                positions,
                 columns: rotated / 2,
                 block: ROTARY_BLOCK,
                 // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
@@ -889,14 +920,15 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width. Its element type is
-    // FP32 at every deployment: the AdaLN pair this activation feeds is FP32 whatever the stack's
-    // weights are (`crates/ops/src/modulation.rs` refuses any other type), so a row at the
-    // deployment's dtype would build a cell no launch can reach.
+    // The timestep embedding's activation, over the transformer's hidden width, at **the stack's own
+    // element type**: `transformer.rs` launches `Silu::descriptor_of(dtype, config.time_hidden_dim)`
+    // from the stack's `dtype`, and the stage-5 walk launched it at `f16` for an f16 deployment. A row
+    // at FP32 alone was this file's defect: the AdaLN *pair* downstream is FP32, but the activation
+    // that feeds it is not, and a BF16 deployment would have stopped on this key.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: DType::F32,
+            dtype: deployment,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,
