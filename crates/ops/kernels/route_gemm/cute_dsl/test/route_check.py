@@ -8,7 +8,7 @@ compiled for one descriptor of the fixture —
 `hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16_tile_128x128_cluster_1x1` — so every case
 runs those shapes and varies only the token count.
 
-The call is the operator's `RouteCall` (`crates/ops/src/moe/grouped.rs`, `error` at 104), and the
+The call is the operator's `RouteCall` (`crates/ops/src/moe/grouped.rs`, `error` at 96), and the
 metadata is a **valid sort built here**, as in `gather_gemm`'s check: routes grouped by expert, each
 expert's rows cut into tiles of 128, `permuted_to_expanded` the inverse map. That is what makes an
 **expert with no routes** and a **partly filled last tile** possible — the two cases a gather that
@@ -54,19 +54,29 @@ class Call(ctypes.Structure):
         ("width", ctypes.c_int64),
         ("intermediate", ctypes.c_int64),
         ("experts", ctypes.c_int64),
-        ("expanded_rows", ctypes.c_int64),
         ("dtype", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
     ]
 
 
-#: `crates/ops/src/moe/grouped.rs` — `ROUTE_CALL_LAYOUT`'s size, which `entry.h` also pins. Measured,
-#: not remembered: a field added to the operator's struct shifts every field after it.
-ROUTE_CALL_SIZE = 616
-assert ctypes.sizeof(Call) == ROUTE_CALL_SIZE, (
-    f"the check's RouteCall mirror is {ctypes.sizeof(Call)} bytes, the operator's layout says "
-    f"{ROUTE_CALL_SIZE}"
-)
+
+def declared_size(header, struct):
+    """The `sizeof` the package header's `static_assert` pins, read rather than restated."""
+    text = header.read_text()
+    marker = f"sizeof({struct}) =="
+    if marker not in text:
+        raise SystemExit(f"{header}: no `{marker}` static_assert")
+    digits = text.split(marker, 1)[1].lstrip(" =").split()[0].rstrip(",")
+    return int(digits)
+
+#: `entry.h`'s own `static_assert`, which `crates/ops/src/moe/grouped.rs`'s `ROUTE_CALL_LAYOUT` pins
+#: too: read here rather than restated, because a private copy of the size drifts in silence.
+ROUTE_CALL_SIZE = declared_size(pathlib.Path(__file__).resolve().parents[1] / "src" / "entry.h", "uniserve_route_call")
+if ctypes.sizeof(Call) != ROUTE_CALL_SIZE:
+    raise SystemExit(
+        f"the check's RouteCall mirror is {ctypes.sizeof(Call)} bytes, the operator's header says "
+        f"{ROUTE_CALL_SIZE}"
+    )
 
 
 def gamma(reduction, unit):
@@ -172,7 +182,6 @@ def main() -> int:
         width=hidden_size,
         intermediate=intermediate,
         experts=experts,
-        expanded_rows=expanded,
         dtype=BF16,
         error=b"",
     )
