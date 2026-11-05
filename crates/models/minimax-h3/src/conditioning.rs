@@ -306,9 +306,9 @@ impl TokenRefiner {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
             stream,
+            stream,
             WeightOrder::NxK,
             false,
-            stream,
             stream,
         ));
 
