@@ -695,7 +695,11 @@ def main() -> int:
     if arguments.expect_key is not None and arguments.expect_key != key:
         parser.error(f"the flags name {key}, not {arguments.expect_key}")
 
-    failures = check_hand(arguments.op)
+    # The hand case is keyed by the form the operator computes, not by its name: `HAND` holds
+    # `modulated` and `gated`, and this is the same test the descriptor's key uses to say which
+    # form a cell is — one derivation, two readers.
+    form = "modulated" if arguments.op == "modulated_rms_norm" else "gated"
+    failures = check_hand(form)
     for case in cases(arguments.op, arguments):
         # Triton's interpreter truncates a bf16 store and rounds an f16 one; hardware rounds.
         case["truncate"] = arguments.interpreter and case["dtype"] == "bf16"
