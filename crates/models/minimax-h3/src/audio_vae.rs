@@ -813,8 +813,13 @@ struct DecoderStep {
 /// The alias-free activation's geometry, from the checkpoint's own constants.
 const ACTIVATION_KERNEL: u32 = 12;
 const ACTIVATION_RATIO: u32 = 2;
-/// The program's width, as the operator states it.
-const ACTIVATION_BLOCK: u32 = 256;
+/// The program's width, as the operator states it - **a key field**, not a request's length.
+///
+/// The launcher passes this to `AudioActivation::new`, so it is what the walk records and what the
+/// deployment list must hold. It is public because the fixture generator states the rows a store is
+/// built from, and a second copy of this number in that generator is how the file came to say 1024
+/// for seven rows the device launches at 256.
+pub const ACTIVATION_BLOCK: u32 = 256;
 /// The two channels the reference decodes and interleaves.
 const PCM_CHANNELS: u32 = 2;
 
@@ -905,8 +910,19 @@ impl AudioDecoder {
             false,
         )?;
         let mut binder = Binder::new(loader, table);
+        // The input projection is one weight and a bias, and the weight is a **3-d filter**: the
+        // export holds `[latent_dim, latent_channels, 1]` - a kernel of one is the same arithmetic
+        // and not the same rank, and `Conv1d::new` refuses anything that is not 3-d. Asking for two
+        // dimensions would trade a mapping refusal for a rank refusal one line later.
         let input = Conv1d::new(
-            binder.normalized("input.weight")?,
+            binder.region(
+                "input.weight",
+                &[
+                    u64::from(config.latent_dim),
+                    u64::from(config.latent_channels),
+                    1,
+                ],
+            )?,
             Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
             geometry(1, 1, 0)?,
             false,
