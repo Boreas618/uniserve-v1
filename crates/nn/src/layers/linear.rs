@@ -677,6 +677,37 @@ mod tests {
         assert_eq!(projection.weight().shape.dims(), &[8, 32]);
     }
 
+    /// The walk's descriptor and a loaded projection's are one key.
+    ///
+    /// `descriptor_of` states the operand types from the geometry alone, which is what the key walk
+    /// and the fixture use; `descriptor` states the scales' type from the checkpoint's own plane. A
+    /// checkpoint whose scales plane is declared as anything but E4M3 makes the two keys differ, and
+    /// the launch then asks the store for a program the walk never named - with every number in the
+    /// key looking plausible. This pins the pair this deployment's checkpoint states.
+    #[test]
+    fn the_walk_and_a_loaded_projection_state_one_key() {
+        let (n, k, rows) = (8_u64, 64_u64, 16_u32);
+        let layout = ScaleLayout::Swizzled128X4;
+        let mut scales = packed(n, k, layout);
+        scales.scales = weight(DType::F8E4M3, layout.shape(n, k).dims());
+        let projection = Nvfp4Linear::new(&scales, None, layout, DType::BF16, 128).unwrap();
+
+        let loaded = projection.descriptor(rows, DType::BF16).expect("a key");
+        let walked =
+            Nvfp4Linear::descriptor_of(rows, n as u32, k as u32, layout, false, DType::BF16)
+                .expect("the walk's key");
+
+        assert_eq!(loaded.packed, walked.packed, "the packed bytes");
+        assert_eq!(
+            loaded.scale, walked.scale,
+            "the block scale: the checkpoint's plane and the walk's literal must be one type"
+        );
+        assert_eq!(loaded.m, walked.m, "the row class");
+        assert_eq!(loaded.n, walked.n);
+        assert_eq!(loaded.k, walked.k);
+        assert_eq!(loaded.layout, walked.layout);
+    }
+
     #[test]
     fn a_weight_only_export_cannot_be_encoded() {
         // The distinction the loader keeps: a checkpoint that states no activation scale at all is
