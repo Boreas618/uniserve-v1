@@ -915,6 +915,9 @@ impl Scheduler {
     /// the calls' own kinds, which is what a refusal is about (a mixed phase or
     /// a mixed sampling class).
     fn log_step(&self, plan: &Plan, batches: &[ExecutionBatch]) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         let calls: usize = batches.iter().map(|batch| batch.requests.len()).sum();
         if calls == 0 {
             tracing::debug!(
@@ -929,6 +932,8 @@ impl Scheduler {
             );
             return;
         }
+        // Only when the line is enabled: a step is the hot path, and the sums and the kinds vector
+        // exist for the log line and nowhere else.
         let tokens: usize = batches
             .iter()
             .flat_map(|batch| batch.requests.iter())
