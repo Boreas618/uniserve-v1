@@ -16,7 +16,6 @@ mod in_process;
 mod in_process_completion;
 mod in_process_groups;
 mod in_process_media;
-mod in_process_migration;
 mod in_process_stalls;
 mod in_process_worlds;
 mod media_occupancy;
