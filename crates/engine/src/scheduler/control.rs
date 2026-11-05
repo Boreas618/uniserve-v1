@@ -827,6 +827,9 @@ impl Scheduler {
         }
         policy.request(stage);
         let applied = policy.boundary(state).map_err(|error| error.to_string());
+        if applied.is_ok() && matches!(stage, Stage::Switchover | Stage::Revert) {
+            self.seed_from_policy();
+        }
         if serves {
             // A policy instance serves from this boundary on (§7.3 step 3).
             self.note_policy_serves();

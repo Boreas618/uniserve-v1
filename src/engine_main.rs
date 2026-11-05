@@ -836,6 +836,9 @@ impl MainProcess {
         // the reports of §7.3, and every command of the program layer - travels on this one.
         let mut process =
             ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
+        // Every command of the program layer arrives on this socket, and a stage waits for the
+        // command before it: the control thread sleeps on it as it does on the request socket.
+        control.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -940,7 +943,15 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
+        let schedulers = schedulers(
+            &plan,
+            launch,
+            &memory,
+            &model,
+            &executors,
+            &inventory,
+            control.wake(),
+        )?;
 
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
@@ -1177,6 +1188,13 @@ impl MainProcess {
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
+            // A transition moves one stage a pass, and what ends a stage is a device, a Program
+            // Server or a scheduler rather than a socket. Passes run back to back while one is in
+            // flight, so each stage costs what its work costs: a recovery is made of these stages,
+            // and a client's stream stands still for all of them.
+            if self.precopy.is_some() || !self.warming.is_empty() || self.draining.is_some() {
+                due = due.min(Instant::now() + TRANSITION_POLL);
+            }
             let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
@@ -1202,7 +1220,8 @@ impl MainProcess {
                             return Ok(Some(failure));
                         }
                     }
-                    Ready::Woken | Ready::Idle => {}
+                    // What these announce is read by the pass below, whatever woke it.
+                    Ready::Process | Ready::Woken | Ready::Idle => {}
                 }
             }
 
@@ -1223,6 +1242,7 @@ impl MainProcess {
             // successor holds the deployment: this process is still serving it, and ending here
             // would leave the successor with a front into nothing (§7.5.1).
             if self.process.closed() {
+                self.control.watch_process(None);
                 let serving = self.control.live_attached();
                 if serving == 0 {
                     self.stopping = true;
@@ -4988,6 +5008,9 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// seconds, so the poll costs a wake per tenth of a second for the length of the window.
 const PROBATION_POLL: Duration = Duration::from_millis(100);
 
+/// How long a serve pass sleeps while a precopy, a warmup or a drain is in flight.
+const TRANSITION_POLL: Duration = Duration::from_millis(1);
+
 /// How often a device that is busy delays the question asked of the policy slots: a probe that finds
 /// a device running proves nothing about whether a policy serves, so it is asked again after this.
 const POLICY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
@@ -6931,6 +6954,7 @@ fn schedulers(
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
+    control: ipc::Wake,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -6967,7 +6991,10 @@ fn schedulers(
         executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
             .stating(vec![inventory]),
     );
-    let handle = engine::SchedulerHandle::over_batches(config, batches)?;
+    // The control thread forwards what a scheduler produced, so it sleeps until a step says there
+    // is something: a request's tokens reach the daemon when they exist, not at the next pass.
+    let progress = engine::CommandWaker::new(move || control.wake());
+    let handle = engine::SchedulerHandle::over_batches_telling(config, batches, progress)?;
     Ok(vec![handle])
 }
 

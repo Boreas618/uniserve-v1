@@ -318,6 +318,8 @@ pub(crate) struct Switch {
     /// Where the switchover began and how long its pause took: from its first
     /// promote to the last drained epoch.
     switchover_started: Option<Instant>,
+    /// The operator committed before the trial began (`Switch::commit`).
+    commit_asked: bool,
     pause: Option<Duration>,
     /// Whether a serving main process of the previous epoch exited during the
     /// switch, which hands the failure domain to the standby promotion
@@ -379,6 +381,7 @@ impl Switch {
             target_dead: BTreeSet::new(),
             failure: None,
             switchover_started: None,
+            commit_asked: false,
             pause: None,
             promotion_due: false,
         }
@@ -575,9 +578,19 @@ impl Switch {
 
     /// The operator commits: the target serves from now on and the previous
     /// epoch is dropped and retired.
+    ///
+    /// The operator may ask before the trial has begun: the answer to an apply
+    /// comes once the target serves, while the drain that starts the trial is
+    /// still in flight. The commit is kept and applied when the trial starts, so
+    /// an answered commit is never one that did nothing.
     pub(crate) fn commit(&mut self, roster: &mut impl Roster) {
-        if self.phase != Phase::Probation {
-            return;
+        match self.phase {
+            Phase::Preparing | Phase::Promoting | Phase::Serving => {
+                self.commit_asked = true;
+                return;
+            }
+            Phase::Probation => {}
+            Phase::Committing | Phase::Reverting | Phase::Purged | Phase::Abandoned => return,
         }
         self.phase = Phase::Committing;
         let generation = self.target_generation();
@@ -1067,6 +1080,9 @@ impl Switch {
                 self.record.status = Status::Probation;
                 self.epochs.record(self.target, self.record.clone());
                 self.phase = Phase::Probation;
+                if std::mem::take(&mut self.commit_asked) {
+                    self.commit(roster);
+                }
             }
             Phase::Committing if hosts.is_subset(&self.committed) => {
                 self.record.status = Status::Serving;
@@ -2341,6 +2357,30 @@ mod tests {
         assert_eq!(switch.phase(), Phase::Probation);
         assert!(roster.stops.is_empty());
         assert!(switch.failure().is_none());
+    }
+
+    /// The answer to an apply comes once the target serves, so an operator's
+    /// commit can arrive while the drain that starts the trial is in flight. It
+    /// is kept for the trial: a commit that was answered and did nothing would
+    /// leave the previous epoch's process running for good.
+    #[test]
+    fn a_commit_before_the_trial_applies_when_the_trial_starts() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.promoted(&mut roster, "n0", 6);
+        switch.promoted(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Serving);
+        roster.commands.clear();
+
+        switch.commit(&mut roster);
+        assert_eq!(switch.phase(), Phase::Serving, "the drain has not finished");
+        assert!(roster.commands.is_empty(), "nothing is commanded yet");
+
+        switch.drained(&mut roster, "n0", 11);
+        switch.drained(&mut roster, "n1", 11);
+        assert_eq!(switch.phase(), Phase::Committing);
+        assert_eq!(roster.commands.len(), 2, "a commit per node");
     }
 
     /// A commit records the target as serving once it acknowledges, stops the

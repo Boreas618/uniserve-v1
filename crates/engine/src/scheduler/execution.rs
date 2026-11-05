@@ -342,6 +342,9 @@ impl Scheduler {
             .in_flight
             .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
         self.publish_cache_stats();
+        if progressed {
+            self.progress.wake();
+        }
         progressed
     }
 
@@ -897,6 +900,7 @@ impl Scheduler {
                 );
                 self.policy_report = Some(report);
                 self.policy = Some(policy);
+                self.seed_from_policy();
             }
             Err(fatal) => {
                 // Both failures are named: the one that ended the policy, which
@@ -1110,6 +1114,15 @@ impl Scheduler {
                 && self.inflight.pending_submissions.is_empty(),
             "a policy is adopted at a batch boundary"
         );
+        self.policy = Some(policy);
+        self.seed_from_policy();
+    }
+
+    /// States the page table and the recorder from the instance that serves
+    /// now, which every change of instance does: a mechanism that kept the
+    /// table of the instance before it would judge the new one's answers by a
+    /// state it was never told.
+    pub(super) fn seed_from_policy(&mut self) {
         // The epoch's page table is walked once, here, so every later step costs
         // what changed: the policy was handed the same table in its snapshot.
         self.pages = views::page_index(self);
@@ -1118,9 +1131,10 @@ impl Scheduler {
         // observed. Seeding the recorder from that same snapshot is what keeps
         // the next step's events proportional to what changed after it, rather
         // than one `Updated` per live request to a policy that already knows.
-        let snapshot = policy.instantiated_on().clone();
-        self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
-        self.policy = Some(policy);
+        if let Some(policy) = self.policy.as_ref() {
+            let snapshot = policy.instantiated_on().clone();
+            self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
+        }
     }
 
     /// Tells the policy that the encoder entry `key` is live, with the last use
