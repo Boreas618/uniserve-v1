@@ -588,14 +588,20 @@ impl Leader {
             previous_generation,
             spawn_generation,
         };
+        let programs = next.programs.clone();
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(spec)) = (&applied, joining) {
+            self.updates.await_programs(&target.host_identity);
             replicas[0].follow_switch(
                 Arc::clone(control),
-                spec,
-                spawn_generation,
-                target_epoch,
-                epochs.served(),
+                Arc::clone(&self.updates),
+                crate::leader::SwitchTarget {
+                    spec,
+                    config: target.clone(),
+                    programs,
+                    engine: spawn_generation,
+                    epoch: target_epoch,
+                },
             );
         }
         applied

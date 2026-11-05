@@ -135,6 +135,20 @@ pub enum Task {
     VideoGeneration,
 }
 
+/// What a replica needs to follow an epoch switch onto its target (§7.4).
+pub(crate) struct SwitchTarget {
+    /// The spec the target is welcomed with.
+    pub(crate) spec: wire::EngineSpec,
+    /// The configuration the target serves.
+    pub(crate) config: ServeConfig,
+    /// The programs the target takes before it is promoted.
+    pub(crate) programs: crate::epoch::FilledPrograms,
+    /// The target's launch generation, the number its links state.
+    pub(crate) engine: u64,
+    /// The epoch the target serves.
+    pub(crate) epoch: u64,
+}
+
 /// Records each scheduler's statistics under `model_name`, and with
 /// `observer`, which reads each world's rates.
 pub(crate) fn stats_sink(
@@ -1985,12 +1999,18 @@ impl Replica {
     pub(crate) fn follow_switch(
         self: &Arc<Self>,
         control: Arc<EngineControl>,
-        mut spec: wire::EngineSpec,
-        engine: u64,
-        epoch: u64,
-        mut served: tokio::sync::watch::Receiver<u64>,
+        updates: Arc<crate::updates::driver::Driver>,
+        target: SwitchTarget,
     ) {
         let replica = Arc::clone(self);
+        let SwitchTarget {
+            mut spec,
+            config,
+            programs,
+            engine,
+            epoch,
+        } = target;
+        let mut served = updates.epochs().served();
         tokio::spawn(async move {
             let sink = stats_sink(
             replica.model_name.clone(),
@@ -2013,6 +2033,27 @@ impl Replica {
                     return;
                 }
             };
+            // The target parks with no programs: it takes them here, and the switch promotes it
+            // once it holds them.
+            let host = config.host_identity.clone();
+            let handing = Arc::clone(updates.epochs());
+            let handed = tokio::task::spawn_blocking(move || {
+                handing.hand_target(&config.host_identity, engine, &config, &programs)
+            })
+            .await;
+            match handed {
+                Ok(Ok(())) => updates.handed(&host),
+                Ok(Err(failure)) => {
+                    warn!(engine, "the switch's target took no programs: {}", failure.reason);
+                    updates.rollback(&failure.reason);
+                    return;
+                }
+                Err(error) => {
+                    warn!(engine, "handing the switch's target its programs ended: {error}");
+                    updates.rollback(&error.to_string());
+                    return;
+                }
+            }
             while *served.borrow_and_update() < epoch {
                 if served.changed().await.is_err() {
                     return;
