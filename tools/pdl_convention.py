@@ -46,7 +46,18 @@ def declares_pdl(operator, key):
         if not (source / 'build.py').exists():
             continue
         manifest = tomllib.loads(manifest_path.read_text())
-        dimensions = manifest.get('kernel', {}).get('descriptors', {}).get('dimensions', {})
+        # A package may declare one descriptor table or several (`[[kernel]]`), one per shape it
+        # serves; both forms describe the same fields, so the checker reads either.
+        kernel = manifest.get('kernel', {})
+        kernels = kernel if isinstance(kernel, list) else [kernel]
+        # Each descriptor table is a shape the package serves, and a key belongs to exactly one of
+        # them — merging the tables would let the second's `columns` values hide the first's, which is
+        # how a key that parses under `columns = 64` reads as unparsable.
+        tables = []
+        for one in kernels:
+            described = one.get('descriptors', {})
+            for table in described if isinstance(described, list) else [described]:
+                tables.append(table.get('dimensions', {}))
         sys.path.insert(0, str(source))
         try:
             sys.modules.pop('_compile', None)
@@ -54,9 +65,17 @@ def declares_pdl(operator, key):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             import _compile
-            fields = _compile.parse_key(key, dimensions)
-            described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')
-            return any(name.lower() == 'pdl' and ty != 'constexpr' for name, ty in described['signature'].items())
+            for dimensions in tables:
+                try:
+                    fields = _compile.parse_key(key, dimensions)
+                except Exception:
+                    continue
+                described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')
+                return any(
+                    name.lower() == 'pdl' and ty != 'constexpr'
+                    for name, ty in described['signature'].items()
+                )
+            return None
         except Exception:
             return None
         finally:
@@ -65,9 +84,21 @@ def declares_pdl(operator, key):
 
 
 rows = []
+declared_blocked = set()
 for fixture in ('notes/programs/qwen3-moe-keys.txt', 'notes/programs/minimax-h3-keys.txt'):
-    for line in pathlib.Path(fixture).read_text().strip().split('\n'):
+    for line in pathlib.Path(fixture).read_text().split('\n'):
+        # A fixture is rows plus a header. `#` carries the deployment, the walk's revision and the
+        # rows no package declares yet — those are `# blocked:`, a tab, then operator, key and the
+        # coverage tool's reason, and a row declared there has no package table to check against.
+        if line.startswith('# blocked:\t'):
+            _, operator, key, _ = line.split('\t', 3)
+            declared_blocked.add((operator, key))
+            continue
+        if not line or line.startswith('#'):
+            continue
         operator, key = line.split('\t')
+        if (operator, key) in declared_blocked:
+            continue
         rows.append((operator, key))
 
 seen = set()
