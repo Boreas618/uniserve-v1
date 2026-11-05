@@ -2,15 +2,16 @@
 # Qwen3MoeForCausalLM checkpoint. Three cells confirm the BF16 checkpoint,
 # its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
 #
-# A confirmation compares two runs that differ only in the thing under test:
-# the BF16 cell of a run set is the reference, and the NVFP4 or FP8 KV cell of
-# the same set is what it is compared with, on the same 1319-row test split
-# and the same sampling settings. The three cells differ only in the
-# checkpoint path and the KV cache dtype; every other setting is identical, so
-# a comparison isolates precision. A BF16 accuracy measured in another run set
-# is history, not a denominator, because the two runs then differ by whatever
-# else changed between their commits and the interval would answer a question
-# nobody asked.
+# A confirmation compares the same cell measured twice: once on the tree the
+# baseline was accepted on and once at the candidate commit, on the same
+# 1319-row test split and the same sampling settings, so the two runs differ
+# in the implementation and nothing else. Each cell is compared with itself;
+# two cells are not comparable, because they differ in the checkpoint or the
+# KV cache dtype and the evaluator requires both runs to share their
+# provenance (`uniserve_eval/pipeline/compare.py:213`). A BF16 accuracy
+# measured at another commit is history, not a denominator, because the two
+# runs then differ by whatever else changed between the commits and the
+# interval would answer a question nobody asked.
 #
 # A server command names no `--worker-executable`: today's default worker
 # binary is the daemon's own executable, so `run --executable <new binary>`
