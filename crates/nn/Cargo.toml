@@ -18,6 +18,7 @@ serde_json.workspace = true
 memmap2 = "0.9"
 # A computed weight has no file to name it, so its key carries a digest of the bytes it produced.
 sha2.workspace = true
+safetensors = "0.8.0"
 
 [dev-dependencies]
 tempfile.workspace = true

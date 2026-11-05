@@ -1,0 +1,41 @@
+# The kv_write_scaled operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program writes one page of an E4M3 cache: it derives the page's scale from
+# the values the launch brings, re-encodes the page when the scale grows, stores
+# the rows, and commits the scale and the flag in that order. The page's scale is
+# a maximum over every column of every row, so the row is walked inside the
+# program; the second grid axis names the width of those passes and the programs
+# past the first return.
+#
+# The block is the page: one f32 scale per page over `page` tokens, which is the
+# layout `paged_attention` reads with `key_scale`/`value_scale`.
+
+op = "kv_write_scaled"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/kv_write_scaled.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_scale_f32_page_64_heads_4_head_dim_128_block_128_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = ["64", "16", "32", "128"], heads = ["4", "8", "1", "2"], head_dim = ["128", "64", "256"], block = ["128", "256", "512", "1024"], pdl = ["true", "false"] }
+
+[parameters]

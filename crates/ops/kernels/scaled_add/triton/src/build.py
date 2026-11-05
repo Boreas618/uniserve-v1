@@ -32,7 +32,7 @@ def spec(fields, parameters, target):
             "source_ptr": "*" + DTYPES[fields["source"]],
             "alpha": "fp32",
             "beta": "fp32",
-            "elements": "i32",
+            "elements": "i64",
             "BLOCK": "constexpr",
         },
         "constexprs": {"BLOCK": block},

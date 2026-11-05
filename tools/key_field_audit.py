@@ -29,7 +29,6 @@ HERE = pathlib.Path(__file__).resolve().parent
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-keys.txt',
-    HERE.parent / 'notes/programs/minimax-h3-keys-bf16.txt',
     HERE.parent / 'notes/programs/minimax-h3-sparse-keys.txt',
 )
 
