@@ -1,4 +1,4 @@
-"""Computes request, token, image, video, and decision benchmark metrics.
+"""Computes request, token, image, and video benchmark metrics.
 
 ``build_summary`` calls ``summarize`` on the measured ``RequestRecord`` list
 and the measured duration from ``run_load``. Record latencies (end-to-end,
@@ -222,18 +222,6 @@ def summarize(
             scale=1000,
         )
         summary.update(_server_timings(successful))
-
-    # Decision readouts answer states and questions rather than generating
-    # tokens; their rates share the measured-window denominator.
-    decision_states = sum(record.decision_states for record in successful)
-    if decision_states:
-        decision_questions = sum(
-            record.decision_questions for record in successful
-        )
-        summary["completed_states"] = decision_states
-        summary["states_per_second"] = decision_states / duration
-        summary["completed_questions"] = decision_questions
-        summary["questions_per_second"] = decision_questions / duration
     return summary
 
 

@@ -778,7 +778,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: Qwen3 (`chat_config`).
+/// Chat models: `Qwen3` (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatOptions {

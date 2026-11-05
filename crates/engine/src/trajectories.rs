@@ -1,6 +1,6 @@
 //! The host tier of latent trajectories, as the scheduler drives it: a
 //! video request's, and the trajectory of each image a token request
-//! generates (BAGEL, SenseNova).
+//! generates.
 //!
 //! A request is preempted and resumed at denoising-step boundaries: its
 //! trajectory's state at a step boundary is the samples of the bank
