@@ -910,13 +910,10 @@ impl EpochPlan {
     /// The media class's parallel shape is the deployment's, and the page states it beside the
     /// component it splits; the same reader the launcher used answers it here, so a rank and the
     /// engine that started it cannot disagree about the group's degrees.
-    fn deployment_groups(&self) -> Result<Vec<engine::WorkerGroupConfig>> {
-        let path = self.build.worker_groups.as_ref().with_context(|| {
-            "the media class's parallel shape is the deployment's, and this epoch states no \
-             deployment file: a tensor-parallel width alone cannot say which sequence degree this \
-             rank's group splits"
-                .to_owned()
-        })?;
+    fn deployment_groups(&self) -> Result<Option<Vec<engine::WorkerGroupConfig>>> {
+        let Some(path) = self.build.worker_groups.as_ref() else {
+            return Ok(None);
+        };
         let text = path
             .to_str()
             .with_context(|| format!("the deployment file {} is not UTF-8", path.display()))?;
@@ -929,6 +926,7 @@ impl EpochPlan {
             .unwrap_or_else(|| "localhost".to_owned());
         deployment
             .worker_groups(&host)
+            .map(Some)
             .with_context(|| format!("placing the deployment file {} on {host}", path.display()))
     }
 
@@ -977,11 +975,12 @@ impl EpochPlan {
                 // through the same reader the launcher used.
                 let groups = self.deployment_groups()?;
                 let (ulysses, tensor_parallel, tensor_rank, sequence_rank) = media_parallel(
-                    &groups,
+                    groups.as_deref(),
                     &self.group,
                     self.rank,
                     placement.tensor_parallel,
                     placement.tensor_rank,
+                    self.world_size,
                 )?;
                 // **The partition serves the task the checkpoint states, and a checkpoint that
                 // states several is refused here.** One partition carries one task's block set
@@ -1902,16 +1901,28 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
 fn media_parallel(
-    groups: &[engine::WorkerGroupConfig],
+    groups: Option<&[engine::WorkerGroupConfig]>,
     group: &str,
     rank: u32,
     tensor_parallel: u32,
     tensor_rank: u32,
+    world_size: usize,
 ) -> Result<(minimax_h3::partition::Ulysses, usize, usize, usize)> {
     let tensor_parallel =
         usize::try_from(tensor_parallel).context("a tensor-parallel width the process addresses")?;
     let tensor_rank = usize::try_from(tensor_rank).context("a tensor rank the process addresses")?;
     let rank = usize::try_from(rank).context("a rank number the process addresses")?;
+    // A deployment that states no file places one rank per device, and with one rank there is no
+    // other rank for a shape to disagree with: the width the build config states is the whole of it.
+    let Some(groups) = groups else {
+        if world_size == 1 {
+            return Ok((minimax_h3::partition::Ulysses::single(), 1, 0, 0));
+        }
+        bail!(
+            "this deployment states no worker-group file and serves {world_size} ranks, so no \
+             sequence degree is stated for them: a file is what places a rank's group and its split"
+        );
+    };
     let placed = groups
         .iter()
         .find(|candidate| candidate.id.0 == group)
@@ -2184,7 +2195,8 @@ mod tests {
              [worker_groups.components.text_encoder]\ntensor_parallel_size = 4\n",
         );
         let (ulysses, tensor_parallel, tensor_rank, sequence_rank) =
-            media_parallel(&placed, "model", 2, 4, 2).expect("a four-way exchange partition");
+            media_parallel(Some(&placed), "model", 2, 4, 2, 4)
+                .expect("a four-way exchange partition");
         assert_eq!(ulysses.degree, 4, "the page states the degree");
         assert_eq!(
             ulysses.projection,
@@ -2195,12 +2207,31 @@ mod tests {
         assert_eq!(sequence_rank, 2, "a component of every rank places the rank at its ordinal");
     }
 
+    /// A deployment with no worker-group file serves one rank, and refuses to guess above one.
+    ///
+    /// The shorthand deployment (no `--worker-groups`) states a tensor-parallel width and no
+    /// sequence degree. With one rank no other rank can disagree with the shape, so one rank's
+    /// sequence is the whole of it; with several, a shape read from the width alone would be an
+    /// assumption, and the refusal names the file that would state it.
+    #[test]
+    fn a_deployment_without_a_file_serves_one_rank_or_refuses() {
+        let (ulysses, tensor_parallel, tensor_rank, sequence_rank) =
+            media_parallel(None, "model", 0, 1, 0, 1).expect("one rank's sequence");
+        assert_eq!(ulysses.degree, 1);
+        assert_eq!((tensor_parallel, tensor_rank, sequence_rank), (1, 0, 0));
+        let error = media_parallel(None, "model", 2, 4, 2, 4).expect_err("four ranks need a file");
+        assert!(
+            format!("{error:#}").contains("worker-group file"),
+            "the refusal names what would state the shape: {error:#}"
+        );
+    }
+
     /// A page that states no split serves one rank's sequence, which is not a refusal.
     #[test]
     fn a_group_with_no_sequence_split_serves_one_rank() {
         let placed = groups("[worker_groups.components.transformer]\n");
         let (ulysses, _, _, sequence_rank) =
-            media_parallel(&placed, "model", 1, 1, 0).expect("one rank's sequence");
+            media_parallel(Some(&placed), "model", 1, 1, 0, 1).expect("one rank's sequence");
         assert_eq!(ulysses.degree, 1);
         assert_eq!(sequence_rank, 1);
     }
@@ -2216,7 +2247,8 @@ mod tests {
             "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2, projection = \"gather\" }\n",
         );
-        let error = media_parallel(&gather, "model", 0, 2, 0).expect_err("gather is unimplemented");
+        let error =
+            media_parallel(Some(&gather), "model", 0, 2, 0, 2).expect_err("gather is unimplemented");
         assert!(
             format!("{error:#}").contains("exchange"),
             "the refusal names the mode this stack implements: {error:#}"
@@ -2227,7 +2259,8 @@ mod tests {
              [worker_groups.components.text_encoder]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2 }\n",
         );
-        let error = media_parallel(&two, "model", 0, 2, 0).expect_err("one partition, one split");
+        let error =
+            media_parallel(Some(&two), "model", 0, 2, 0, 2).expect_err("one partition, one split");
         assert!(
             format!("{error:#}").contains("transformer") && format!("{error:#}").contains("text_encoder"),
             "the refusal names both components: {error:#}"
