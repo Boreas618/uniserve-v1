@@ -898,6 +898,14 @@ fn stage_denoise(args: &Args) -> Result<()> {
         packing.audio_rows,
         packing.padded_tokens,
     );
+    // The arrangement is JSON a comparator parses, so it is parsed here first for the same reason the
+    // case is: a format-string typo would otherwise surface on the run host as a comparator refusing
+    // a file nobody can see, and the refusal names the statement instead.
+    serde_json::from_str::<serde_json::Value>(&arrangement).map_err(|error| {
+        Failure::message(format!(
+            "the layout statement this stage writes is not JSON ({error}): {arrangement}"
+        ))
+    })?;
     std::fs::write(directory.join("layout.json"), arrangement)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     // The wording is the reference producer's own, so the two logs can be read side by side
