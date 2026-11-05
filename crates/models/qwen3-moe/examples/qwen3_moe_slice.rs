@@ -1883,7 +1883,10 @@ fn check_continuation(
 mod tests {
     use std::path::Path;
 
-    use super::{Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
+    use super::{
+        ENCODED_OPERATORS, Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys,
+        slot_for,
+    };
 
     /// An encoded deployment's install list holds its packed product, at the class its own rows
     /// round to.
@@ -1983,6 +1986,35 @@ mod tests {
     fn a_short_sequence_length_is_refused() {
         let refused = check_continuation(15, 0, 15, 15, 15, 64).expect_err("seq_len 15 for 16");
         assert!(refused.to_string().contains("seq_len"), "{refused}");
+    }
+
+    /// Every operator the harness declares as encoded reaches an encoded deployment's list.
+    ///
+    /// The defect this generalises was one omission: `nvfp4_gemm` was in no list, so every encoded
+    /// stage dropped it, the generation loaded, and the first packed product found no kernel
+    /// although the store held the key. A test naming one operator would not catch the next
+    /// omission, so this one walks the set the harness declares.
+    #[test]
+    fn an_encoded_deployment_installs_every_encoded_operator() {
+        let encoded = Encoded {
+            declared: true,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let keys = needed_keys(
+            Path::new("a store root the pre-flight never reads"),
+            Stage::Decode,
+            true,
+            KvPages::Bf16,
+            encoded,
+        )
+        .expect("the deployment's list");
+        for operator in ENCODED_OPERATORS {
+            assert!(
+                keys.iter().any(|(named, _)| named == operator),
+                "`{operator}` is not in an encoded deployment's list"
+            );
+        }
     }
 
     /// The page type selects the cache's own rows and no others.
