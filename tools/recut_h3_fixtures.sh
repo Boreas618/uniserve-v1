@@ -365,13 +365,16 @@ if [ "$status" -ne 0 ]; then
 fi
 for name in $attempted; do
     case "$name" in
-        dense)
-            cp "$fixture_dense" notes/programs/minimax-h3-keys.txt
-            echo 'written: notes/programs/minimax-h3-keys.txt'
-            ;;
         sparse)
-            cp "$fixture_sparse" notes/programs/minimax-h3-sparse-keys.txt
-            echo 'written: notes/programs/minimax-h3-sparse-keys.txt'
+            # One file holds the union: the sparse deployment launches every row the dense one does,
+            # and a store built from a dense-only file lacked the rows a sparse run launches.
+            cp "$fixture_sparse" notes/programs/minimax-h3-keys.txt
+            echo 'written: notes/programs/minimax-h3-keys.txt (the union, stated as the sparse deployment)'
+            ;;
+        dense)
+            # A dense certification states nothing the file lacks: its rows are the sparse set's
+            # subset, so rewriting the file from it would drop the rows the sparse deployment launches.
+            echo 'dense: certified; notes/programs/minimax-h3-keys.txt holds the union and is unchanged'
             ;;
     esac
 done
