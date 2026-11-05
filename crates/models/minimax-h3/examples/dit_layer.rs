@@ -505,6 +505,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let _guard = device.enter()?;
     let stream = device.stream()?;
     let generation = load_generation(&device, &store_root)?;
+    check_sparse_store(&generation, denoiser_config.attention)?;
 
     // 2. The case's request, its layout and its packing: the deployment's own rule, so the row count,
     //    the padding and the coordinates are the ones a served request would have.
@@ -600,13 +601,17 @@ fn stage_denoise(args: &Args) -> Result<()> {
             reference_keep,
         } => {
             let total = packing.padded_tokens / tile;
+            // The extent is the model's own rule, and its alignment is a whole number of tiles:
+            // `1` here was the harness's, and it refused every sparse case at its own summary
+            // print ("the 1-row alignment is not a whole number of 64-row tiles") before any
+            // launch. The alignment moves no tile count, so the printed number is unchanged.
             let video = packing::segment_extent(
                 frames,
                 &canvas,
                 packing.text_rows,
                 packing.condition_rows,
                 tile,
-                1,
+                tile,
             )
             .map(|extent| extent.video_tiles)
             .map_err(|error| Failure::message(format!("a sparse layout of this case: {error}")))?;
@@ -1174,6 +1179,7 @@ fn stage_block(args: &Args) -> Result<()> {
     //    is allocated, so a store that lacks a package is reported as coverage rather than as the
     //    first operator to launch.
     let generation = load_generation(&device, &store_root)?;
+    check_sparse_store(&generation, denoiser.attention)?;
 
     // 3. The request and its packed rows. The layout is the deployment's own rule, so the row count,
     //    the padding and the coordinates are the ones a served request would have.
@@ -2076,6 +2082,49 @@ impl RetainedWeights for DeviceWeights {
 /// The store's layout is `op/backend/revision/target/descriptor`, and which backend, revision and
 /// target it holds is the deployment's business: this harness wants every committed descriptor,
 /// because `ops` binds by key at the launch and a missing one is named there.
+/// The six operators a sparse deployment launches that a dense one does not.
+///
+/// A dense store holds none of them, so a sparse stage with the wrong store launches its
+/// projections and the first norm and then stops at the first `vsa_*` cell - which from outside is
+/// "it stopped at `vsa_prepare_tiles` after fifteen launches" and says nothing about the store.
+/// Counting them before any weight loads names the store as the subject.
+const SPARSE_OPERATORS: [&str; 6] = [
+    "vsa_prepare_tiles",
+    "vsa_scores",
+    "vsa_select_tiles",
+    "vsa_compress_pooled",
+    "vsa_add_gated_tiles",
+    "vsa_zero_padding",
+];
+
+/// Print the sparse chain's cell counts, and refuse when the store holds none of one.
+///
+/// The store is the deployment's: a sparse deployment's is built from
+/// `notes/programs/minimax-h3-sparse-keys.txt`, and one built from the dense list cannot serve it.
+fn check_sparse_store(generation: &ops::Generation, attention: AttentionKind) -> Result<()> {
+    if !matches!(attention, AttentionKind::Sparse { .. }) {
+        return Ok(());
+    }
+    let mut empty: Vec<&'static str> = Vec::new();
+    let mut counts: Vec<String> = Vec::new();
+    for operator in SPARSE_OPERATORS {
+        let keys = generation.keys(operator).count();
+        if keys == 0 {
+            empty.push(operator);
+        }
+        counts.push(format!("{operator} {keys}"));
+    }
+    println!("sparse store: {}", counts.join(", "));
+    if !empty.is_empty() {
+        return Err(Failure::message(format!(
+            "this store holds no kernel for {}, so a sparse stage cannot launch: the store is the \
+             deployment's own, and this one was built for a dense deployment",
+            empty.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Generation> {
     if !root.is_dir() {
         return Err(Failure::message(format!(
