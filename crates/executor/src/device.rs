@@ -945,12 +945,12 @@ impl Device {
                         );
                     }
                     Err(error) => {
-                        tracing::info!(
-                            bucket = %bucket,
-                            elapsed_ms,
-                            %error,
-                            "the bucket's capture failed"
-                        );
+                        // The reason first, on a line of its own: a reader's log tail trims a line
+                        // at a fixed width, and a reason printed after a bucket name and an elapsed
+                        // time is a reason no run shows. The bucket follows, so the two readings a
+                        // failure needs - what stopped and which bucket - are one line apart.
+                        tracing::warn!(%error, "a bucket's capture failed");
+                        tracing::info!(bucket = %bucket, elapsed_ms, "the bucket whose capture failed");
                     }
                 }
             }
