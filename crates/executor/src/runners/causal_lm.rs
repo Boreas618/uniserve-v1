@@ -1131,6 +1131,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
     /// read beside the write that should have fed it.
     last_prefill: Option<String>,
+    /// How long the last `cuGraphLaunch` took to return, which is the host's enqueue cost and not
+    /// the device's work: a replay that is slow in its enqueue is a graph the driver cannot hand
+    /// over quickly, and one that is slow after it is the kernels.
+    enqueue_ms: f64,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1238,6 +1242,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             pending_dump: None,
             last_prefill: None,
+            enqueue_ms: 0.0,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1600,7 +1605,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 let launched = Instant::now();
+                let enqueue = Instant::now();
                 captured.launch(&stream)?;
+                self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
@@ -1940,7 +1947,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
+                enqueue_ms = self.enqueue_ms,
                 replay_ms = launched.elapsed().as_secs_f64() * 1e3,
+                wait_ms = (launched.elapsed().as_secs_f64() * 1e3 - self.enqueue_ms).max(0.0),
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
