@@ -234,7 +234,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if matches!(component, Component::LatentEncoder) {
                 ConditionEncoders::load(&config, &checkpoint, &mut loader).map(|_| ())
             } else {
-                load(&checkpoint, partition, stated, &mut loader).map(|_| ())
+                let tile = minimax_h3::video_vae::TILE_PIXELS;
+                load(&checkpoint, partition, stated, (tile, tile), &mut loader).map(|_| ())
             }
         };
         if let Err(error) = outcome {
