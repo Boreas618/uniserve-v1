@@ -310,12 +310,11 @@ impl TokenRefiner {
             hidden,
             true,
         ));
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+        // The halves of one packed projection: the stride they carry is twice their width.
+        programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
             dtype,
             u64::from(config.intermediate_size),
             Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
             u64::from(inner),
             true,
         )?);
