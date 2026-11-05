@@ -103,6 +103,34 @@ fn run() -> Result<(), String> {
 
     let tile_plan =
         video_encoder_run_arena(&config, &extents).map_err(|error| error.to_string())?;
+
+    // The stitcher's own buffers, which the run plan does **not** state and the run cannot do without:
+    // `tiled_encode::Scene::encode` takes a ring of two blocks per tile column plus one hand-off block
+    // *after* the encoder's reservation, each `[1, 2 * latent_channels, tile_rows, tile_columns]` F32.
+    // Its signature is `(config, extents)` and its only caller is the frozen harness, so the grid it
+    // would need to know is not reachable here - this prices what is missing rather than fixing it.
+    let columns = {
+        let mut starts: Vec<u32> = plan.tiles.iter().map(|tile| tile.columns.0).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts.len()
+    };
+    let tile_rows = plan
+        .tiles
+        .first()
+        .map(|tile| u64::from(tile.rows.1))
+        .unwrap_or(0);
+    let tile_columns = plan
+        .tiles
+        .first()
+        .map(|tile| u64::from(tile.columns.1))
+        .unwrap_or(0);
+    let stitch_block = 2 * u64::from(config.latent_channels) * tile_rows * tile_columns;
+    let stitch = (2 * u64::try_from(columns).unwrap_or(0) + 1) * stitch_block * 4;
+    println!(
+        "the stitcher takes {stitch} B in {} block(s) of {stitch_block} elements ({columns} tile column(s)), which the run plan does not state",
+        2 * columns + 1
+    );
     // The conditioning runs once per request over the *latent* grid.
     let latent_frames = minimax_h3::encoding::Stack::of(&config)
         .map_err(|error| error.to_string())?
@@ -253,6 +281,15 @@ fn run() -> Result<(), String> {
         if tile_bytes != 0 {
             return Err(format!(
                 "one tile allocates {tile_bytes} B beyond the set it was reserved: a layer is taking buffers from the arena inside a forward"
+            ));
+        }
+        if check {
+            return Err(format!(
+                "the run plan is {stitch} B short of the forward: the stitcher's ring and hand-off are \
+                 {} block(s) of {stitch_block} elements. A run sized from this plan stops at the first \
+                 of them unless `--arena-gib` covers it, and the fix is the harness passing its grid to \
+                 `video_encoder_run_arena`",
+                2 * columns + 1
             ));
         }
         if check && set_plan - set_bytes > nn::forward::ALIGNMENT - 1 {
