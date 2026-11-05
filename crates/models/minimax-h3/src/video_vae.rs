@@ -460,7 +460,7 @@ use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
+use nn::{AttentionBackend, DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
 /// One transformer layer of the decoder: the attention half and the gated feed-forward half, each
@@ -749,6 +749,34 @@ pub fn folded_input(
     ))
 }
 
+/// The attention of the decoder's block, for the element type the clip is decoded at.
+///
+/// FlashAttention-4's program is a half-precision kernel and serves the packed form of one
+/// sequence, the form that carries row offsets and refuses a null table; the FP32 program is a GEMM
+/// and a softmax, serves one sequence without offsets, and its package declares exactly that cell.
+/// The block is one sequence either way, so the element type alone decides which program is asked
+/// for - and a clip decoded at f32 must not ask for a half-precision kernel.
+fn block_attention(head: u32, heads: u32, rows: u32, dtype: DType) -> Result<Attention> {
+    let scale = (head as f32).sqrt().recip();
+    match dtype {
+        DType::F32 => Ok(Attention::fp32(head, heads, heads, rows, false, scale)?),
+        _ => Ok(Attention::dense(
+            head, heads, heads, rows, false, None, scale,
+        )?),
+    }
+}
+
+/// Whether this attention serves the packed form: the one the offsets table selects.
+///
+/// The descriptor prints `cu_seq_lens` only for the form *without* offsets, so a launch and the walk
+/// that states it must agree on this one predicate or the store builds a cell no launcher binds.
+fn packed(attention: &Attention) -> bool {
+    matches!(
+        attention.backend(),
+        AttentionBackend::Dense | AttentionBackend::Sparse
+    )
+}
+
 impl VideoDecoder {
     /// Every checkpoint tensor the video decoder reads, by name.
     ///
@@ -772,6 +800,7 @@ impl VideoDecoder {
     /// residual its projection's, as the checkpoint's mapping states.
     pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
+        use nn::layers::UnpatchifyVideo;
         use ops::activation::ValueFirstSwiglu as SwigluOp;
         use ops::attention::dense::DenseAttention;
         use ops::cross_fade::CrossFade as CrossFadeOp;
@@ -779,9 +808,8 @@ impl VideoDecoder {
         use ops::norm::LayerNorm as LayerNormOp;
         use ops::norm::RmsNorm as RmsNormOp;
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
+        use ops::rope::{QkNormRope, RotaryFactors, Rotation};
         use ops::rows::{self, Rows as RowsOp};
-        use nn::layers::UnpatchifyVideo;
         use ops::unpatchify::Unpatchify;
 
         let (head, heads) = (
@@ -798,25 +826,13 @@ impl VideoDecoder {
 
         let mut programs = Programs::default();
 
-        // The clip's latents in, the clip's pixels out. The projection in, the attention's four, the
-        // final one out carry a bias; the feed-forward's packed pair does not, and its row is the
-        // second shape of the same program rather than a sixth one.
+        // The clip's latents in, the clip's pixels out.
         for k in [config.latent_channels, width, ffn, width, patch] {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 k,
                 dtype,
                 WeightOrder::NxK,
                 bias,
-                dtype,
-                dtype,
-            ));
-        }
-        for k in [width, ffn] {
-            programs.launch::<Gemm>(&Linear::descriptor_of(
-                k,
-                dtype,
-                WeightOrder::NxK,
-                false,
                 dtype,
                 dtype,
             ));
@@ -848,7 +864,11 @@ impl VideoDecoder {
         // The layer's two halves: their normalization, the residual each projection folds into, and
         // the gated feed-forward's packed activation.
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(width, dtype));
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(width), bias)?);
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
+            dtype,
+            u64::from(width),
+            bias,
+        )?);
         programs.launch::<SwigluOp>(&PackedSwiGlu::descriptor_of(
             dtype,
             u64::from(ffn),
@@ -860,32 +880,30 @@ impl VideoDecoder {
         // The output path: the final normalization, the projection to pixels, and the stitch's
         // unpatchify and its blends.
         programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, width, bias));
-        programs.launch::<Unpatchify>(&UnpatchifyVideo::new(
-            dtype,
-            u64::from(config.out_channels),
-            config.temporal_compression(),
-            spatial,
-        )?
-        .descriptor());
+        programs.launch::<Unpatchify>(
+            &UnpatchifyVideo::new(
+                dtype,
+                u64::from(config.out_channels),
+                config.temporal_compression(),
+                spatial,
+            )?
+            .descriptor(),
+        );
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
 
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
-        let attention = Attention::dense(
-            head,
-            heads,
-            heads,
-            width,
-            false,
-            None,
-            (head as f32).sqrt().recip(),
-        )?;
-        // The packed form of one sequence: the flash backend refuses a null offsets table, so the
-        // launch states the offsets and the key is the one fa4 declares.
+        let attention = block_attention(head, heads, width, dtype)?;
+        // The form the backend serves: the flash kernel's packed one with offsets, or the FP32
+        // program's single sequence without them.
         programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, width, true,
+            dtype,
+            dtype,
+            dtype,
+            width,
+            packed(&attention),
         ));
 
         Ok(programs.finish())
@@ -1068,8 +1086,9 @@ impl VideoDecoder {
             offsets: {
                 // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
                 // created once with the weights and read by every clip's attention launch.
-                let rows = i32::try_from(canvas.rows())
-                    .map_err(|_| Error::config("a clip's rows exceed a sequence offset".to_owned()))?;
+                let rows = i32::try_from(canvas.rows()).map_err(|_| {
+                    Error::config("a clip's rows exceed a sequence offset".to_owned())
+                })?;
                 let mut bytes = Vec::with_capacity(8);
                 for offset in [0i32, rows] {
                     bytes.extend_from_slice(&offset.to_le_bytes());
@@ -1082,15 +1101,12 @@ impl VideoDecoder {
                     "minimax-h3",
                 )?
             },
-            attention: Attention::dense(
+            attention: block_attention(
                 head,
-                heads,
                 heads,
                 u32::try_from(canvas.rows())
                     .map_err(|_| Error::config("too many tokens".to_owned()))?,
-                false,
-                None,
-                1.0 / (head as f32).sqrt(),
+                dtype,
             )?,
             config: config.clone(),
             ffn_mult: config.decoder_ffn_mult,
@@ -1294,30 +1310,26 @@ impl VideoDecoder {
     /// reservation would grow the clip's footprint by the tile count. The plan states these once
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
     pub fn scratch(&self, f: &Forward) -> Result<TileScratch> {
-        // The decoder's per-tile buffers come from the one statement of their names, shapes and
-        // element types: `crate::decoding::tile_scratch` is also what the executor sizes the arena
-        // from, so this reservation and the plan it is sized by cannot disagree. They did twice
-        // before it existed - once by the grid's tile count and once by an element type.
-        let buffers = crate::decoding::tile_scratch(&self.config, self.dtype)?;
-        let view = |index: usize| -> Result<TensorView> {
-            let (_, dtype, dims) = buffers[index];
-            Ok(f.arena().tensor(dtype, Shape::new(&dims))?)
-        };
+        let rows = self.canvas.rows();
+        let voxels = self.canvas.voxels();
+        let width = u64::from(self.width);
+        let ffn = width * u64::from(self.ffn_mult);
+        let half = u64::from(rotary(&self.config)?.0 / 2);
         Ok(TileScratch {
-            stream: view(0)?,
-            projected: view(1)?,
-            cosine: view(2)?,
-            sine: view(3)?,
-            normalized: view(4)?,
-            query: view(5)?,
-            key: view(6)?,
-            value: view(7)?,
-            rotated_query: view(8)?,
-            rotated_key: view(9)?,
-            attended: view(10)?,
-            update: view(11)?,
-            gate_up: view(12)?,
-            gated: view(13)?,
+            stream: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            projected: f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?,
+            cosine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
+            sine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
+            normalized: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            value: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            rotated_query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            rotated_key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            attended: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            update: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
+            gate_up: f.arena().tensor(self.dtype, Shape::new(&[rows, 2 * ffn]))?,
+            gated: f.arena().tensor(self.dtype, Shape::new(&[rows, ffn]))?,
         })
     }
 
@@ -1402,15 +1414,26 @@ impl VideoDecoder {
                 per_head(rotated_query),
                 per_head(rotated_key),
             )?;
-            // One sequence: the clip's rows, its registers and its tail attended together, stated as
-            // the packed form of one sequence because the flash backend serves only that form.
+            // One sequence: the clip's rows, its registers and its tail attended together.
+            //
+            // The row offsets are the flash backend's packed form and nothing else: it serves
+            // sequences packed by offsets and no other shape, while the FP32 program - a GEMM and a
+            // softmax - serves one sequence without them, and its key says which it is
+            // (`cu_seq_lens` is printed only for the form without offsets). One sequence makes the
+            // two arithmetically identical, so the launch states the form its own backend has
+            // rather than asking for a cell the other backend's package declares.
+            let offsets = if packed(&self.attention) {
+                Some(self.offsets.view())
+            } else {
+                None
+            };
             self.attention.attend_dense(
                 f,
                 per_head(rotated_query),
                 per_head(rotated_key),
                 per_head(value),
-                Some(self.offsets.view()),
-                Some(self.offsets.view()),
+                offsets,
+                offsets,
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
                 attended,
@@ -1718,7 +1741,8 @@ pub(crate) mod tests {
         // decoder built for one packing cannot be read through the other's.
         let dense = voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width)
             .expect("the dense table");
-        let tiled = voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
+        let tiled =
+            voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
         assert_ne!(dense, tiled, "{dense:?}");
     }
 
@@ -2126,9 +2150,8 @@ pub(crate) mod tests {
             .iter()
             .map(|source| match &source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => tensor.clone(),
-                crate::audio_vae::Tensor::Normalized { .. }
-                | crate::audio_vae::Tensor::Parts(_) => {
-                    panic!("the video decoder folds no weight norm and fuses no tensor")
+                crate::audio_vae::Tensor::Normalized { .. } => {
+                    panic!("the video decoder folds no weight norm")
                 }
             })
             .collect();
@@ -2180,19 +2203,13 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_states_its_programs_from_its_own_config() {
         let config = video_config();
-        let programs = VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let programs =
+            VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
-        // Every projection this decoder has, by the two forms it launches: the key carries the
-        // element types, the order and the epilogue, and the contraction length is a descriptor field
-        // of one program. The projection in, the attention's four and the one out carry a bias; the
-        // feed-forward's packed pair does not, and those are the second row.
-        assert_eq!(count("gemm"), 2);
+        // Every projection this decoder has, whatever its contraction: the key carries the element
+        // types and the order, and the contraction length is a descriptor field of one program.
+        assert_eq!(count("gemm"), 1);
         assert_eq!(count("rows"), 1, "three placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
@@ -2215,4 +2232,39 @@ pub(crate) mod tests {
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
     }
 
+    /// One dense attention, and its key is the form the element type it decodes at has.
+    ///
+    /// The FP32 program is a GEMM and a softmax over one sequence: it reads no offsets, and its
+    /// key says so (`_cu_seq_lens_false` is printed exactly for the form without them), which is
+    /// the only cell `dense_attention/f32` declares. The half-precision kernel serves the packed
+    /// form, which carries offsets and prints no such field. A clip decoded at f32 that asked the
+    /// half-precision kernel for its attention would name a program the f32 package cannot build.
+    #[test]
+    fn the_decoders_attention_names_the_form_its_element_type_has() {
+        let config = video_config();
+        let key = |dtype: DType| {
+            VideoDecoder::programs(&config, dtype)
+                .expect("the decoder's programs")
+                .into_iter()
+                .find(|(name, _)| name == "dense_attention")
+                .map(|(_, key)| key)
+                .expect("one dense attention")
+        };
+
+        let fp32 = key(DType::F32);
+        assert!(
+            fp32.ends_with("mask_dense_window_false_cu_seq_lens_false"),
+            "{fp32}"
+        );
+        assert!(fp32.contains("dtype_f32_kv_f32_out_f32"), "{fp32}");
+
+        for half in [DType::F16, DType::BF16] {
+            let packed = key(half);
+            assert!(packed.ends_with("mask_dense_window_false"), "{packed}");
+            assert!(
+                !packed.contains("cu_seq_lens"),
+                "the packed form names no offsets: {packed}"
+            );
+        }
+    }
 }

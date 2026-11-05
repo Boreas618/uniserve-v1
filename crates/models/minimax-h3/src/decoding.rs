@@ -171,6 +171,17 @@ impl Buffer {
         }
     }
 
+    /// The bytes the buffer occupies in an arena: its size rounded up to the arena's alignment.
+    ///
+    /// `plan::Arena::reserve` aligns every give-out to [`nn::forward::ALIGNMENT`], so a reservation
+    /// summed from raw sizes is short by up to `ALIGNMENT - 1` bytes **per buffer** - multiplied by
+    /// the number of buffers, which for the video decoder's sixteen is up to 4 KiB. The first run to
+    /// meet it was short by 64 bytes, exactly the padding of the two rotary tables (`1797 x 24 x 4`
+    /// is not a multiple of 256).
+    pub fn reservation(&self) -> u64 {
+        self.bytes().next_multiple_of(nn::forward::ALIGNMENT)
+    }
+
     /// The bytes the buffer occupies.
     pub fn bytes(&self) -> u64 {
         // A plan with an unknown element name is caught by [`Self::width`]; this answers for the four
@@ -229,64 +240,15 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
-/// The transformer's per-tile scratch: one tile's buffers, reserved once per clip and reused by
-/// every tile of the grid.
+/// The bytes a runner must reserve for `plan`: every buffer at the arena's alignment.
 ///
-/// **This is the one statement of their names, shapes and element types.** [`video_arena`] publishes
-/// them to the executor, which sizes the arena from them, and
-/// [`crate::video_vae::VideoDecoder::scratch`] reserves them — so a plan and the reservation it sizes
-/// cannot disagree. They disagreed twice before this existed: the plan multiplied one tile's scratch
-/// by the grid's tile count, and it declared f16 over a reservation at the checkpoint's F32.
-///
-/// The order is the reservation order, and the shapes are the decoder's canvas — the tile the
-/// decoder is built for, not any one tile of a particular grid.
-pub fn tile_scratch(
-    config: &crate::VideoVaeConfig,
-    dtype: nn::DType,
-) -> Result<Vec<(&'static str, nn::DType, [u64; 2])>> {
-    let spatial = config.spatial_compression();
-    let tile = crate::video_vae::Canvas::clip(
-        config,
-        crate::video_vae::TILE_PIXELS / spatial,
-        crate::video_vae::TILE_PIXELS / spatial,
-    );
-    let rows = u64::from(tile.rows());
-    let voxels = u64::from(tile.voxels());
-    let width = u64::from(config.decoder_num_attention_heads)
-        * u64::from(config.decoder_attention_head_dim);
-    let ffn = width * u64::from(config.decoder_ffn_mult);
-    let half = u64::from(crate::video_vae::rotary(config)?.0 / 2);
-    let wide = [rows, 2 * ffn];
-    Ok(vec![
-        ("stream", dtype, [rows, width]),
-        ("projected", dtype, [voxels, width]),
-        ("cosine", nn::DType::F32, [rows, half]),
-        ("sine", nn::DType::F32, [rows, half]),
-        ("normalized", dtype, [rows, width]),
-        ("query", dtype, [rows, width]),
-        ("key", dtype, [rows, width]),
-        ("value", dtype, [rows, width]),
-        ("rotated_query", dtype, [rows, width]),
-        ("rotated_key", dtype, [rows, width]),
-        ("attended", dtype, [rows, width]),
-        ("update", dtype, [rows, width]),
-        ("gate_up", dtype, wide),
-        ("gated", dtype, [rows, ffn]),
-    ])
-}
-
-/// The plan's name for a float element type a decode holds.
-///
-/// The names are [`Buffer::width`]'s own, so a plan cannot declare a type the arena cannot size.
-fn element_name(dtype: nn::DType) -> Result<&'static str> {
-    match dtype {
-        nn::DType::F16 => Ok("f16"),
-        nn::DType::BF16 => Ok("bf16"),
-        nn::DType::F32 => Ok("f32"),
-        other => Err(Error::config(format!(
-            "{other:?} is not an element type a decode holds: f16, bf16 or f32"
-        ))),
-    }
+/// **A plan summed raw is short.** The arena aligns each give-out to [`nn::forward::ALIGNMENT`] and a
+/// plan's entries are not all multiples of it, so the reservation a runner makes has to be the
+/// aligned sum rather than the sum of the sizes. The failure this prevents is the smallest that has
+/// ever stopped a stage: `22081536 bytes requested at offset 368378880 of a 390460352-byte region`,
+/// 64 bytes past the end, because `1797 x 24 x 4` twice is 64 bytes of padding the sum left out.
+pub fn arena_reservation(plan: &[Buffer]) -> u64 {
+    plan.iter().map(Buffer::reservation).sum()
 }
 
 pub fn video_arena(
@@ -294,27 +256,39 @@ pub fn video_arena(
     canvas: &crate::video_vae::Canvas,
     dtype: nn::DType,
 ) -> Result<Vec<Buffer>> {
-    // Every buffer a decode holds is the element type its weights are stored in - the checkpoint's,
-    // not a convention. Declaring a wider type than the reservation would leave the arena short by a
-    // factor the executor cannot see, and declaring a narrower one wastes the budget.
-    let element = element_name(dtype)?;
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
+    let ffn = u64::from(config.decoder_ffn_mult);
+    let (rotated, _) = crate::video_vae::rotary(config)?;
+    let columns = u64::from(config.decoder_num_attention_heads)
+        * u64::from(config.decoder_attention_head_dim);
     let (height, width_px) = canvas.pixels(config);
     let frames = canvas.frames_out(config);
+    // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
+    // because a tile at the canvas's edge can be narrower than the tile size.
+    let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
+    let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
+    // **The order is the reservation order**: the clip-level buffers are reserved once, before the
+    // tile loop, and live across the whole clip; the transformer's fourteen are reserved there too, once
+    // (`VideoDecoder::scratch`), and reused by every tile - the arena never rewinds, so a per-tile
+    // reservation would grow the clip's footprint by the tile count. The token buffers *are* per tile,
+    // because each tile's decode owns its own, and their sum is the `tokens` entry. The executor sizes
+    // the arena by the sum. There is no entry for the clip's blended raster: the blend's destination is
+    // the caller's `DecodedMedia.video`, which is the runner's buffer and not the arena's.
     let patch = u64::from(config.out_channels)
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
         * u64::from(config.spatial_compression());
-    // The token buffer is the one entry that holds every tile at once, because each tile's decode
-    // owns its own and their reservations sum to it. The transformer's fourteen are one tile's and
-    // come from [`tile_scratch`], which is also what reserves them - so this plan and the
-    // reservation it sizes cannot disagree about a name, a shape or an element type.
-    let tokens_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    let mut buffers = vec![
+    // **The plan's element types are the block's, not a `dtype = "auto"` assumption.** Every buffer the
+    // transformer allocates is at `VideoDecoder::dtype` (`video_vae.rs`'s `scratch`), and the rotary
+    // tables are the one exception: they are F32 whatever the decode is. A plan that spelled `f16` for
+    // both sides reserved half of what an FP32 decode needs, and the shortfall surfaced not as a plan
+    // complaint but as an arena that "cannot give out" a buffer partway through the clip.
+    let element = crate::text_encoder::element_of(dtype);
+    Ok(vec![
         Buffer {
             name: "decoded".to_owned(),
             element,
@@ -323,17 +297,79 @@ pub fn video_arena(
         Buffer {
             name: "tokens".to_owned(),
             element,
-            elements: tokens_rows * patch,
+            elements: rows * patch,
         },
-    ];
-    for (name, held, dims) in tile_scratch(config, dtype)? {
-        buffers.push(Buffer {
-            name: name.to_owned(),
-            element: element_name(held)?,
-            elements: dims[0] * dims[1],
-        });
-    }
-    Ok(buffers)
+        Buffer {
+            name: "stream".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "projected".to_owned(),
+            element,
+            elements: voxels * columns,
+        },
+        Buffer {
+            name: "cosine".to_owned(),
+            element: "f32",
+            elements: rows * u64::from(rotated / 2),
+        },
+        Buffer {
+            name: "sine".to_owned(),
+            element: "f32",
+            elements: rows * u64::from(rotated / 2),
+        },
+        Buffer {
+            name: "normalized".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "query".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "key".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "value".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "rotated_query".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "rotated_key".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "attended".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "update".to_owned(),
+            element,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "gate_up".to_owned(),
+            element,
+            elements: rows * 2 * columns * ffn,
+        },
+        Buffer {
+            name: "gated".to_owned(),
+            element,
+            elements: rows * columns * ffn,
+        },
+    ])
 }
 
 /// The video decoder's tiled output path: one tile's tokens become its pixels in the clip's raster.
@@ -881,11 +917,112 @@ mod tests {
         // Clips overlap by two latent frames: the second clip starts five frames after the first.
         assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
     }
+    /// The plan is the block's own allocation list, so its element types are the decode's - all of
+    /// them but the rotary tables, which the block allocates at F32 whatever it decodes at. A plan
+    /// that spelled one type for both reserved half of what an FP32 decode asks the arena for, and the
+    /// shortfall surfaced inside the clip as "cannot give out" rather than as a plan that was short.
+    /// A reservation summed raw is short by every buffer's padding - and the buffers that pad are
+    /// the ones whose element count is not a multiple of the alignment, which for this decoder is the
+    /// two rotary tables. The first device run to meet it was 64 bytes short of a 372 MiB arena.
     #[test]
-    fn the_video_arena_holds_one_tiles_scratch_and_every_tiles_tokens() {
+    fn a_plan_is_reserved_at_the_arenas_alignment_not_at_its_raw_sum() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 16, 16);
+        let plan = video_arena(&config, &canvas, nn::DType::F32).expect("the plan");
+        let raw: u64 = plan.iter().map(Buffer::bytes).sum();
+        let reserved = arena_reservation(&plan);
+        assert_eq!(
+            reserved,
+            plan.iter()
+                .map(|buffer| buffer.bytes().next_multiple_of(nn::forward::ALIGNMENT))
+                .sum::<u64>(),
+            "the reservation is each buffer at the arena's alignment"
+        );
+        assert!(reserved >= raw, "an aligned sum is never smaller");
+        // **The difference is padding, buffer by buffer, and not a multiple of anything.** An earlier
+        // version of this test asserted `(reserved - raw) % 256 == 0`, which is false whenever the
+        // buffers' raw sum is not itself a multiple of the alignment - the paddings sum to whatever
+        // they sum to. What is true is that each buffer pads by less than one alignment, and that the
+        // total difference is those paddings.
+        let padding: u64 = plan
+            .iter()
+            .map(|buffer| buffer.reservation() - buffer.bytes())
+            .sum();
+        assert_eq!(
+            reserved - raw,
+            padding,
+            "the difference is the buffers' padding"
+        );
+        for buffer in &plan {
+            assert!(
+                buffer.reservation() - buffer.bytes() < nn::forward::ALIGNMENT,
+                "{}: {} pads by no more than one alignment",
+                buffer.name,
+                buffer.bytes()
+            );
+        }
+        // And the function's own rule, on a size no canvas has to supply: a buffer whose element
+        // count is not a multiple of the alignment is rounded up, not down, and one that is a
+        // multiple is left alone. The device run that found this was 64 bytes short because two
+        // 172,512-byte tables were placed at their raw size.
+        let uneven = Buffer {
+            name: "a table".to_owned(),
+            element: "f32",
+            elements: 172_512 / 4,
+        };
+        assert_eq!(uneven.bytes(), 172_512);
+        assert_eq!(uneven.reservation(), 172_544, "rounded up to the next 256");
+        let even = Buffer {
+            name: "an aligned tensor".to_owned(),
+            element: "f32",
+            elements: 65_536 / 4,
+        };
+        assert_eq!(even.reservation(), even.bytes(), "a multiple is not moved");
+    }
+
+    #[test]
+    fn the_video_arena_is_stated_in_the_decodes_own_element_type() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 16, 16);
+        let tables = |plan: &[Buffer]| -> u64 {
+            plan.iter()
+                .filter(|buffer| buffer.name == "cosine" || buffer.name == "sine")
+                .map(Buffer::bytes)
+                .sum()
+        };
+        let half = video_arena(&config, &canvas, nn::DType::F16).expect("the f16 plan");
+        let whole = video_arena(&config, &canvas, nn::DType::F32).expect("the f32 plan");
+        let total = |plan: &[Buffer]| -> u64 { plan.iter().map(Buffer::bytes).sum() };
+        // Every typed entry doubles, and the two tables do not: the F32 plan is the F16 plan plus the
+        // typed half, with the tables counted once on both sides.
+        assert_eq!(
+            total(&whole),
+            2 * total(&half) - tables(&half),
+            "the f32 plan is the f16 plan with every typed buffer doubled and the tables counted once"
+        );
+        assert_eq!(
+            tables(&whole),
+            tables(&half),
+            "a rotary table is F32 at both"
+        );
+        for (one, other) in half.iter().zip(&whole) {
+            assert_eq!(one.name, other.name, "the two plans name the same buffers");
+            assert_eq!(one.elements, other.elements, "and hold the same elements");
+            let expected = if one.name == "cosine" || one.name == "sine" {
+                "f32"
+            } else {
+                "f16"
+            };
+            assert_eq!(one.element, expected, "{} at f16", one.name);
+            assert_eq!(other.element, "f32", "{} at f32", one.name);
+        }
+    }
+
+    #[test]
+    fn the_video_arena_holds_all_tiles_of_one_clip() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
-        let arena = video_arena(&config, &canvas, nn::DType::F32).expect("the arena");
+        let arena = video_arena(&config, &canvas, nn::DType::F16).expect("the arena");
         // The served 768x1344 canvas at 256/64 is 4 rows of 7 tiles, each 16x16 latent voxels of
         // 7 frames.
         assert_eq!(canvas.frames, 7);
@@ -896,30 +1033,12 @@ mod tests {
             .tiles(&config, &canvas)
             .len();
         assert_eq!(tiles, 28);
-        // The transformer's buffers are reserved once per clip and reused by every tile, so their
-        // entry is **one tile's** rows: sizing them by the grid would multiply the clip's footprint
-        // by the tile count, and the arena would not fit beside the weights.
-        let stream = arena
+        let tokens = arena
             .iter()
             .find(|buffer| buffer.name == "stream")
             .expect("the residual stream");
-        assert_eq!(stream.elements, 1797 * 2048);
-        // The token buffer is the one entry that holds every tile at once, because each tile's
-        // decode owns its own.
-        let patch = u64::from(config.out_channels)
-            * u64::from(config.temporal_compression())
-            * u64::from(config.spatial_compression())
-            * u64::from(config.spatial_compression());
-        let tokens = arena
-            .iter()
-            .find(|buffer| buffer.name == "tokens")
-            .expect("the token buffer");
-        assert_eq!(tokens.elements, 28 * 1797 * patch);
-        // Every buffer a decode holds is declared at the element type its weights are stored in, so
-        // the bytes follow from the plan's own width and not from a convention: declaring f16 over an
-        // f32 reservation leaves the arena short by half, which is what the executor sizes from.
-        assert_eq!(tokens.width().expect("a declared type"), 4);
-        assert_eq!(tokens.bytes(), tokens.elements * 4);
+        assert_eq!(tokens.elements, 28 * 1797 * 2048);
+        assert_eq!(tokens.bytes(), tokens.elements * 2);
         // The two rotary factor tables the code reserves, in the position it reserves them: half the
         // rotated width each, so their sum is the rotated width - not the head.
         let cosine = arena
@@ -933,7 +1052,7 @@ mod tests {
         assert_eq!(sine, cosine + 1);
         assert_eq!(
             arena[cosine].elements + arena[sine].elements,
-            1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
+            28 * 1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
         );
         assert_eq!(arena[cosine].elements, arena[sine].elements);
         // The clip-level buffers come first and the per-tile ones after, which is the order the model

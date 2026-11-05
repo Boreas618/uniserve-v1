@@ -511,18 +511,44 @@ fn stage_decode(args: &Args) -> Result<()> {
         latent_channels
     );
 
+    // The tile grid, before the arena: the plan and the harness's own latent buffer both count the
+    // tiles' voxels, so the grid is read once and both readings use it.
+    let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
+    let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
     // 5. The arena: `video_arena` is the plan the runner reserves by, and this harness uses it rather
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
-    let plan = video_arena(&config.video_vae, &canvas, nn::DType::F32)?;
-    let mut planned = 0_u64;
-    for buffer in &plan {
-        planned += buffer.elements * buffer.width()?;
-    }
-    // The plan's own number. A stated `--arena-gib` may raise it - a real over-reserve is honest if it
-    // says so - and the line below prints both, so a short plan is visible as a number rather than as
-    // a reservation failure inside the decode.
-    let arena_bytes = planned.max(args.arena_gib << 30);
+    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
+    // **Each buffer at the arena's alignment, not at its raw size.** The arena aligns every give-out
+    // to `nn::forward::ALIGNMENT`, so the raw sum is short by up to 255 bytes per buffer - and the
+    // first run to meet it was 64 bytes short of a 372 MiB region, which is the two rotary tables'
+    // padding and nothing else. `arena_reservation` is that sum, so a runner that reserves by the
+    // plan cannot be short by an alignment it did not know about.
+    let planned = minimax_h3::decoding::arena_reservation(&plan);
+    let raw: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+    // **The harness is also the runner.** The latents it uploads and the raster it decodes into are,
+    // in service, the request's latent and `DecodedMedia.video` - the caller's buffers, which the
+    // runner allocates and the plan deliberately does not count (`video_arena`'s note). Here they come
+    // out of this region because the harness has one device pointer to give, so they are counted
+    // separately and named: a harness that reserved the plan alone would be short by its own two
+    // buffers, and the failure would read as the plan again.
+    let element_bytes = dtype.bytes().ok_or_else(|| {
+        Failure::message(format!(
+            "the decode is {dtype}, which has no whole-byte element size"
+        ))
+    })?;
+    let (pixel_height, pixel_width) = canvas.pixels(&config.video_vae);
+    let held = element_bytes
+        * (voxels * latent_channels
+            + u64::from(minimax_h3::output::Rgb::CHANNELS)
+                * u64::from(canvas.frames_out(&config.video_vae))
+                * u64::from(pixel_height)
+                * u64::from(pixel_width));
+    // The plan's own number plus what this harness holds. A stated `--arena-gib` may raise it - a real
+    // over-reserve is honest if it says so - and the line below prints all three, so a short
+    // reservation is visible as a number rather than as a failure inside the decode.
+    let reserved = planned + held;
+    let arena_bytes = reserved.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
         platform::PoolKind::Graph,
@@ -535,16 +561,37 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {} ({} KiB of alignment), {} KiB held by this \
+         harness, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
+        minimax_h3::text_encoder::element_of(dtype),
+        (planned - raw) >> 10,
+        held >> 10,
         arena_bytes >> 20,
-        if arena_bytes > planned {
-            " (the flag raised it; the plan alone is what the decode needs)"
+        if arena_bytes > reserved {
+            " (the flag raised it; the plan and this harness's two buffers are what the decode needs)"
         } else {
             ""
         }
     );
+
+    // **Where each buffer will land.** A stop inside the arena names a size and an offset, and an
+    // offset is only readable against the placement that produced it - the harness's two buffers
+    // first, then the plan's entries at the arena's alignment. Printing it costs sixteen lines and
+    // turns "an arena that cannot give out" into a name and a number the moment it happens.
+    {
+        let mut at = held;
+        for buffer in &plan {
+            at = at.next_multiple_of(nn::forward::ALIGNMENT);
+            println!(
+                "  arena {:<22} {:>12} B at {at}",
+                buffer.name,
+                buffer.bytes()
+            );
+            at += buffer.bytes();
+        }
+    }
 
     // 6. The latents: the file the reference's own decoder is called with, packed into the rows this
     //    decoder reads. A missing file is generated from a fixed pattern instead, so the stage can run
@@ -623,9 +670,10 @@ fn stage_decode(args: &Args) -> Result<()> {
                 u64::from(args.latent_height),
                 u64::from(args.latent_width),
             ];
-            if held == container && extents == wanted {
+            let form = latent_form(held, &extents, &wanted, &trajectory, container);
+            if form == LatentForm::Own {
                 (payload, false)
-            } else if extents == trajectory {
+            } else if form == LatentForm::Trajectory {
                 println!(
                     "latents: {} - trajectory form {extents:?} of element code {held}, converted to \
                      {dtype}",
@@ -680,9 +728,14 @@ fn stage_decode(args: &Args) -> Result<()> {
         }
         None => String::new(),
     };
-    let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
-    let packed = pack_latents(&latent_bytes, &tiles, &canvas)?;
-    let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
+
+    let packed = pack_latents(&latent_bytes, &tiles, &canvas, dtype)?;
+    println!(
+        "latents: {} bytes = {} elements at {dtype}; the rows this stage reads hold {}",
+        latent_bytes.len(),
+        u64::try_from(latent_bytes.len()).unwrap_or(0) / dtype.bytes().unwrap_or(1),
+        packed.len()
+    );
     let latents = upload(
         &stream,
         &arena,
@@ -733,11 +786,11 @@ fn stage_decode(args: &Args) -> Result<()> {
     // line is the one that says which of the two happened.
     let peak = arena.used();
     println!(
-        "arena used: {} MiB of {} MiB planned{}",
+        "arena used: {} MiB of {} MiB reserved{}",
         peak >> 20,
-        planned >> 20,
-        if peak > planned {
-            " - THE PLAN IS SHORT BY THE DIFFERENCE"
+        reserved >> 20,
+        if peak > reserved {
+            " - THE RESERVATION IS SHORT BY THE DIFFERENCE"
         } else {
             ""
         }
@@ -788,10 +841,48 @@ fn stage_decode(args: &Args) -> Result<()> {
         element_of(dtype)?,
         &transposed,
     )?;
+    // **The raster in numpy's own container, beside the crate's.** `tools/diagnosis/compare.py`
+    // pairs the two implementations' trees by relative path and reads `.npy`; a raster written only
+    // as `.h3t` would appear there as a file the reference has and this crate does not - a false
+    // absence in a delivery artifact, which is worse than a missing row because it reads as a defect
+    // in the decoder. The two files hold the same numbers: the payload is the tensor's bytes, and the
+    // widening to `f32` is this container's one requirement (`diagnosis::write_npy`).
+    let raster_shape = [frames, u64::from(height), u64::from(width_px), channels];
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("raster.npy"),
+        &raster_shape,
+        &widen_to_f32(&transposed, dtype)?,
+    )
+    .map_err(Failure::message)?;
+    // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
+    // whole-raster residual: a seam that is faded with the wrong weight moves a band of a few dozen
+    // pixels, and the maximum over a 25-frame raster is somewhere else. The grid knows where every
+    // overlap is - each tile names the band it shares with the tile above and to its left, in output
+    // pixels - so the case states the bands and the comparator reports a row per band. The reference
+    // probe copies this `case.json` verbatim, so both sides are compared on the same bands rather
+    // than on two readings of the grid.
+    let ratio = config.video_vae.spatial_compression();
+    let mut seams = Vec::new();
+    for tile in &tiles {
+        for (axis, extent, start) in [
+            ("rows", tile.above, tile.latent_rows.0),
+            ("columns", tile.left, tile.latent_columns.0),
+        ] {
+            if extent == 0 {
+                continue;
+            }
+            let offset = start * ratio;
+            seams.push(format!(
+                "{{\"axis\": \"{axis}\", \"start\": {offset}, \"end\": {}}}",
+                offset + extent
+            ));
+        }
+    }
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
          \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
-         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}}}\n",
+         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}, \
+         \"seams\": [{}], \"checkpoint\": \"{}\"}}\n",
         height,
         width_px,
         canvas.frames,
@@ -801,6 +892,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         if generated { "generated" } else { "supplied" },
         tiles.len(),
         rows,
+        seams.join(", "),
+        args.root.display(),
     );
     std::fs::write(directory.join("case.json"), case).map_err(|error| {
         Failure::message(format!(
@@ -818,7 +911,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         walk_path.display()
     );
     println!(
-        "wrote {}/raster.h3t: [{frames}, {height}, {width_px}, {channels}] from {} tiles, latents {}",
+        "wrote {}/raster.h3t and raster.npy: [{frames}, {height}, {width_px}, {channels}] from {} \
+         tiles, latents {}",
         directory.display(),
         tiles.len(),
         if generated {
@@ -1274,6 +1368,31 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// The `f32` bytes of a payload at `dtype`: the widening `diagnosis::write_npy` requires.
+///
+/// A decode at the checkpoint's own half precision writes its `.h3t` at that width, and the reference
+/// covers its `.npy` twin by widening on the reader's side. This crate writes both files from one
+/// payload, so the widening happens here: FP32 is copied, FP16 is widened exactly (every half is a
+/// value a `f32` holds), and any other width is refused by name rather than guessed at.
+fn widen_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::F32 => Ok(bytes.to_vec()),
+        DType::F16 => {
+            let mut widened = Vec::with_capacity(bytes.len() * 2);
+            for half in bytes.as_chunks::<2>().0 {
+                widened.extend_from_slice(
+                    &nn::weights::half_to_f32(u16::from_le_bytes(*half)).to_le_bytes(),
+                );
+            }
+            Ok(widened)
+        }
+        other => Err(Failure::message(format!(
+            "a raster at {other} has no `f32` twin this stage writes: it widens FP16 and copies \
+             FP32, and another width would have to be guessed at"
+        ))),
+    }
+}
+
 /// The frames one clip keeps: its body, the frames the final clip drops and the tail that overlaps the
 /// next clip - the span the decoder trims to, which is fewer than the frames it decodes.
 fn kept_frames(config: &minimax_h3::VideoVaeConfig) -> u64 {
@@ -1310,6 +1429,39 @@ fn read_container(path: &Path) -> Result<(u8, Vec<u64>, Vec<u8>)> {
         extents.push(u64::from_le_bytes(word.try_into().unwrap_or_default()));
     }
     Ok((held, extents, bytes[6 + rank * 8..].to_vec()))
+}
+
+/// Which of the two containers this stage reads a supplied latent in.
+///
+/// The two forms differ in **rank and in element type**, and both differences are load-bearing: the
+/// stage's own container is `[1, C, frames, H, W]` at the decode's type, and a denoiser's trajectory
+/// is `[C, frames, H, W]` because the sample is FP32. A file that matches neither is neither - and it
+/// is refused with both forms named, never reinterpreted, because the byte count of the two is the same
+/// and a wrong rank read as a length would put a permuted latent through the decoder silently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LatentForm {
+    /// `[1, C, frames, H, W]` at the decode's element type: the stage's own, read as it stands.
+    Own,
+    /// `[C, frames, H, W]`: a trajectory, narrowed to the decode's type by [`convert_latents`].
+    Trajectory,
+    /// Neither, and the caller must be told both.
+    Neither,
+}
+
+fn latent_form(
+    held: u8,
+    extents: &[u64],
+    wanted: &[u64; 5],
+    trajectory: &[u64; 4],
+    container: u8,
+) -> LatentForm {
+    if held == container && extents == wanted {
+        LatentForm::Own
+    } else if extents == trajectory {
+        LatentForm::Trajectory
+    } else {
+        LatentForm::Neither
+    }
 }
 
 /// The container's element code for FP32, which is what a denoiser's trajectory holds.
@@ -1351,7 +1503,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     for element in bytes.chunks(from) {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
-            DType::F16 => out.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1389,7 +1541,7 @@ fn pattern_latents(
         // rounding and not in the pattern - which is what makes two pages comparable.
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
-            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1414,30 +1566,6 @@ fn bf16_bits(value: f32) -> u16 {
     }
 }
 
-/// The nearest float16 bit pattern of `value`, by the round-to-nearest-even rule `DType::F16` keeps.
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00;
-    }
-    let shifted = exponent - 127 + 15;
-    if shifted >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if shifted <= 0 {
-        return sign;
-    }
-    let mut half = ((shifted as u32) << 10) | (mantissa >> 13);
-    let remainder = mantissa & 0x1fff;
-    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
-        half += 1;
-    }
-    sign | half as u16
-}
-
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
 ///
 /// The container is **channel-major**, which is the reference's own latent layout (`[B, C, T, H, W]`,
@@ -1449,17 +1577,31 @@ fn pack_latents(
     bytes: &[u8],
     tiles: &[minimax_h3::video_vae::Tile],
     canvas: &Canvas,
+    dtype: DType,
 ) -> Result<Vec<u8>> {
     let channels = 24_u64;
     let frames = u64::from(canvas.frames);
     let height = u64::from(canvas.height);
     let width = u64::from(canvas.width);
-    let expected = channels * frames * height * width * 2;
+    // The width is **the decode's**, read from its element type and never written down: a `* 2` here
+    // meant "f16" and refused every whole-stored export by a factor of two, which read as a size
+    // disagreement rather than as the assumption it was.
+    let element = dtype.bytes().unwrap_or(0);
+    if element == 0 {
+        return Err(Failure::message(format!(
+            "the decode is {dtype}, which has no whole-byte element size"
+        )));
+    }
+    let elements = channels * frames * height * width;
+    let expected = elements * element;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
         return Err(Failure::message(format!(
-            "the latents hold {} bytes and a {frames}x{height}x{width} clip of {channels} channels \
-             needs {expected}",
-            bytes.len()
+            "the latents hold {} bytes = {} elements at {element} B, and a {frames}x{height}x{width} \
+             clip of {channels} channels at {dtype} needs {expected} bytes = {elements} elements - \
+             the element type is the decode's, so a disagreement here is a file of another type, \
+             not a conversion this stage performs silently",
+            bytes.len(),
+            u64::try_from(bytes.len()).unwrap_or(0) / element,
         )));
     }
     let mut packed = Vec::with_capacity(bytes.len());
@@ -1469,6 +1611,7 @@ fn pack_latents(
             (frames, height, width, channels),
             (tile.latent_rows.0, tile.latent_rows.1),
             (tile.latent_columns.0, tile.latent_columns.1),
+            element,
             &mut packed,
         )?;
     }
@@ -1485,6 +1628,7 @@ fn gather_tile(
     geometry: (u64, u64, u64, u64),
     rows: (u32, u32),
     columns: (u32, u32),
+    element: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (frames, height, width, channels) = geometry;
@@ -1492,7 +1636,11 @@ fn gather_tile(
         .checked_mul(height)
         .and_then(|value| value.checked_mul(width))
         .ok_or_else(|| Failure::message("the latent raster's extent overflows".to_owned()))?;
-    let element = 2_u64;
+    if element == 0 {
+        return Err(Failure::message(
+            "an element of zero bytes cannot be gathered".to_owned(),
+        ));
+    }
     for frame in 0..frames {
         for row in u64::from(rows.0)..u64::from(rows.1) {
             for column in u64::from(columns.0)..u64::from(columns.1) {
@@ -1533,7 +1681,7 @@ fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTAINER_F32, Failure, convert_latents, gather_tile};
+    use super::{CONTAINER_F32, Failure, LatentForm, convert_latents, gather_tile, latent_form};
     use nn::DType;
 
     /// The one narrowing the pipeline makes: a denoiser's FP32 latent, read by a decode whose element
@@ -1587,7 +1735,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        match gather_tile(&raster, (1, 1, 3, 3), (0, 1), (0, 3), &mut out) {
+        match gather_tile(&raster, (1, 1, 3, 3), (0, 1), (0, 3), 2, &mut out) {
             Ok(()) => {}
             Err(Failure::Message(message)) => panic!("the gather: {message}"),
         }
@@ -1601,12 +1749,59 @@ mod tests {
         assert_eq!(got, vec![0, 10, 20, 1, 11, 21, 2, 12, 22]);
     }
 
+    /// The gather's element width is the raster's, not a constant: the same geometry at four bytes
+    /// per element reads four-byte elements, which is what a whole-stored export writes. A `* 2` that
+    /// meant "f16" here refused every f32 latent by a factor of two and read as a size disagreement.
+    #[test]
+    fn a_gather_reads_its_elements_at_the_rasters_own_width() {
+        let word = |value: f32| value.to_le_bytes();
+        let mut raster = Vec::new();
+        for channel in 0..2_u32 {
+            for column in 0..2_u32 {
+                raster.extend_from_slice(&word((10 * channel + column) as f32));
+            }
+        }
+        let mut out = Vec::new();
+        match gather_tile(&raster, (1, 1, 2, 2), (0, 1), (0, 2), 4, &mut out) {
+            Ok(()) => {}
+            Err(Failure::Message(message)) => panic!("the gather: {message}"),
+        }
+        let got: Vec<f32> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|element| f32::from_le_bytes(*element))
+            .collect();
+        // Voxel 0 takes one element from each plane, then voxel 1 - at four bytes each.
+        assert_eq!(got, vec![0.0, 10.0, 1.0, 11.0]);
+    }
+
     /// A raster shorter than the tile's spans is refused with the element it ran out at, not read past
     /// the end into another tile's bytes.
     #[test]
     fn a_raster_that_ends_early_is_refused() {
         let mut out = Vec::new();
-        assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), &mut out).is_err());
+        assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), 2, &mut out).is_err());
+    }
+
+    /// The two containers are told apart by rank and by element type, and neither is guessed from a
+    /// length: the same byte count reads as a permuted latent if the rank is ignored.
+    #[test]
+    fn the_two_container_forms_are_told_apart_and_a_third_is_neither() {
+        let wanted = [1, 24, 7, 16, 16];
+        let trajectory = [24, 7, 16, 16];
+        let own = latent_form(5, &wanted, &wanted, &trajectory, 5);
+        assert_eq!(own, LatentForm::Own);
+        // A trajectory at FP32: the rank is one shorter and the code is the sample's.
+        let sampled = latent_form(1, &trajectory, &wanted, &trajectory, 5);
+        assert_eq!(sampled, LatentForm::Trajectory);
+        // The stage's own shape at the wrong element type is neither: a decode reading bytes labelled
+        // one width from a buffer of another is a page of nonsense, not a conversion.
+        let mismatched = latent_form(1, &wanted, &wanted, &trajectory, 5);
+        assert_eq!(mismatched, LatentForm::Neither);
+        // And a trajectory of the right rank but the wrong clip length is neither too.
+        let short = latent_form(1, &[24, 7, 16, 8], &wanted, &trajectory, 5);
+        assert_eq!(short, LatentForm::Neither);
     }
 
     /// An element type this stage has no conversion to is refused by name rather than reinterpreted as

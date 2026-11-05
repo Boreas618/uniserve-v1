@@ -20,15 +20,15 @@
 use std::path::PathBuf;
 
 use minimax_h3::audio_vae::AudioDecoder;
-use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::config::{
     AttentionKind, AudioVaeConfig, TextEncoderConfig, TransformerConfig, VideoVaeConfig,
 };
-use minimax_h3::partition::Partition;
-use minimax_h3::output::VideoPostprocessor;
-use minimax_h3::text_encoder::TextEncoder;
-use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
+use minimax_h3::denoiser::Denoiser;
+use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
+use minimax_h3::output::VideoPostprocessor;
+use minimax_h3::partition::Partition;
+use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::VideoDecoder;
 use minimax_h3::vision::VisionTower;
 
@@ -46,14 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The video decoder's precision is the checkpoint's, not the config's: the design converts
     // nothing at load, so the deployment states the element type its weights are in.
-    // No `--dtype`: the deployment states four element types and there is no single value that
-    // matches them, so each component's rows key from its own (`load::deployment_dtype`).
-    // The caller's `component-tensors.json`, which states the four components' stored element types.
-    let mut types: Option<PathBuf> = None;
+    let mut dtype: Option<ops::DType> = None;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
     let mut tokens: Vec<u32> = Vec::new();
-    let mut tensor_parallel: Option<usize> = None;    let mut ulysses: Option<usize> = None;
+    let mut tensor_parallel: Option<usize> = None;
+    let mut ulysses: Option<usize> = None;
     // The packed row count the DiT partitions are compiled for: a deployment's layout statement, not
     // a request's count.
     let mut packed: Vec<u32> = Vec::new();
@@ -141,69 +139,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
-            // The four components' stored element types, from the caller's tensor table: a row is keyed
-            // by an element type, and no shardless host can read them from the checkpoint, so a
-            // deployment states them or the fixture cannot be attributed.
-            "--types" => types = Some(PathBuf::from(value.as_str())),
+            "--dtype" => {
+                dtype = Some(match value.as_str() {
+                    "f16" => ops::DType::F16,
+                    "bf16" => ops::DType::BF16,
+                    "f32" => ops::DType::F32,
+                    other => return Err(format!("{other} is not a float type").into()),
+                });
+            }
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
-    if samples.is_empty() {
-        return Err("--samples is the deployment's and has no default".into());
+    if samples.is_empty() || rasters.is_empty() {
+        return Err("both --samples and --rasters are the deployment's and have no default".into());
     }
-    // **The canvases are the deployment's, not the caller's.** A row keyed for a raster the engine
-    // can never be asked for is a cell no launch reads, and a stated raster outside the served set
-    // was exactly that: `480x832` is the encoder's own test raster, and its `scaled_add columns
-    // 399360` is the seam blend over a canvas this deployment does not serve.
-    let offered: Vec<(u32, u32)> = minimax_h3::config::offered_canvases()
-        .iter()
-        .map(|canvas| (canvas.height, canvas.width))
-        .collect();
-    if rasters.is_empty() {
-        rasters = offered.clone();
-    } else {
-        for (height, width) in &rasters {
-            if !offered.contains(&(*height, *width)) {
-                return Err(format!(
-                    "--rasters {height}x{width} is not one of the deployment's offered canvases \
-                     {offered:?}: a row keyed for a canvas no request can name is a cell no launch \
-                     reads"
-                )
-                .into());
-            }
-        }
-    }
-    // Each component's element type, from one source with a fallback: the caller's `--types` table
-    // where it is at hand, the checkpoint's own shard headers where they are, and a refusal naming
-    // both when neither is. A walk has no `--dtype` because a deployment does not have one type.
-    let checkpoint = nn::Checkpoint::open(&root).ok();
-    let stated_types = match types.as_deref() {
-        Some(table) => Some(minimax_h3::load::ElementTypes::read(table)?),
-        None => None,
-    };
-    if let (Some(stated), Some(checkpoint)) = (&stated_types, &checkpoint) {
-        stated.verify(checkpoint)?;
-    }
-    let dtype_of = |component: &str| {
-        minimax_h3::load::deployment_dtype(stated_types.as_ref(), checkpoint.as_ref(), component)
-    };
-    // The four types are stated when the caller's table is at hand, and said to be unstated when it is
-    // not: the table is an artifact of an export (`artifacts/` is not in the tree), so requiring it
-    // would make the walk refuse on a host that simply has not exported one. A row set without its
-    // element types is still unattributable - that is a statement about the header, and the gate is
-    // the fixture's generator rather than this diagnostic.
-    let element_types = match (&stated_types, types.as_deref()) {
-        (Some(stated), Some(table)) => format!("[{}] from {}", stated.field(), table.display()),
-        _ => format!("[{}]", minimax_h3::load::UNSTATED),
-    };
+    let dtype = dtype.ok_or("--dtype is the checkpoint's and has no default")?;
     if tokens.is_empty() {
         return Err("--tokens is the deployment's and has no default".into());
     }
     tokens.sort_unstable();
     tokens.dedup();
-    // `--rows` is optional: the deployment states its own packed bound (`Layouts::rows_bound`) and
-    // serving sizes its attention from it, so a walk needs no flag. A stated value is a claim this
-    // walk checks, and a wrong one is refused by name rather than stamped into the header.
+    if packed.is_empty() {
+        return Err("--rows is the deployment's and has no default".into());
+    }
     packed.sort_unstable();
     packed.dedup();
     if track.is_empty() {
@@ -222,9 +180,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stated = minimax_h3::Contract::read(&root)?.and_then(|contract| contract.attention);
     let stated_attention = stated;
     if stated.is_some() && sparse.is_some() {
-        return Err("this checkpoint states its own contract: --sparse states a deployment it already \
+        return Err(
+            "this checkpoint states its own contract: --sparse states a deployment it already \
                     states"
-            .into());
+                .into(),
+        );
     }
     let conditioned = conditioned.ok_or("--conditioned is the deployment's and has no default")?;
     let degree = tensor_parallel.ok_or("--tp is the deployment's and has no default")?;
@@ -271,21 +231,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        // The container's own stored type, from the same source as every other component: the
-        // decoder's tensor space is the checkpoint's, not a deployment's choice, and a flag here was
-        // the last one that decided a row's element type.
-        rows.extend(VideoDecoder::programs(&config, dtype_of("vae")?)?);
-        rows.extend(VideoPostprocessor::programs(dtype_of("vae")?, &rasters));
+        rows.extend(VideoDecoder::programs(&config, dtype)?);
+        rows.extend(VideoPostprocessor::programs(dtype, &rasters));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
-        // A conditioned deployment's pixels reach the encoder through the tiled path, whose seam
-        // blends and tile extents no whole-frame enumeration states.
-        if conditioned {
-            rows.extend(minimax_h3::tiled_encode::ClipEncoder::programs(
-                &config, &rasters, 1,
-            )?);
-        }
     } else {
         eprintln!("not walked: {} has no video VAE config", root.display());
     }
@@ -298,23 +248,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // One row per prompt length: the attention's key bound is the deployment's, and the gated
         // activation's `wide` form follows from it.
         for tokens in &tokens {
-            rows.extend(TextEncoder::programs(
-                &config,
-                &partition,
-                dtype_of("text_encoder")?,
-                *tokens,
-            )?);
+            rows.extend(TextEncoder::programs(&config, &partition, dtype, *tokens)?);
         }
         // The tower attends grids of the deployment's largest image; its programs do not depend on
-        // them beyond the bound the module is accepted for. **It keys from `text_encoder`'s type
-        // because that component is where the checkpoint stores it** - the vision tower is a tensor
-        // set inside the text encoder's component, not a fifth component with storage of its own.
+        // them beyond the bound the module is accepted for.
         let sequence = tokens.iter().copied().max().unwrap_or(0);
-        rows.extend(VisionTower::programs(
-            &config.vision,
-            dtype_of("text_encoder")?,
-            sequence,
-        )?);
+        rows.extend(VisionTower::programs(&config.vision, dtype, sequence)?);
     } else {
         eprintln!("not walked: text_encoder");
     }
@@ -335,75 +274,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let values = values
             .as_object()
             .ok_or_else(|| format!("{component}/config.json is not an object"))?;
-        let config =
-            TransformerConfig::parse(values, &format!("{component}/config.json"))?;
+        let config = TransformerConfig::parse(values, &format!("{component}/config.json"))?;
+        let max = packed.iter().copied().max().unwrap_or(0);
         // The group count is the task set's: a conditioned deployment's modulation cache is another
         // program at the entries' width. The denoiser states its two stacks and the orchestration
         // around them, so the walk asks it rather than a stack.
-        let (attention, stated_tiles) = match (sparse, stated_attention) {
+        let (attention, tiles) = match (sparse, stated_attention) {
             (_, Some(sparse_contract)) => (
                 AttentionKind::sparse(
                     sparse_contract.tile,
                     sparse_contract.sparsity,
                     sparse_contract.reference_keep,
                 )?,
-                None,
+                // The bound on the key tiles one compression reduces over: the deployments' packed
+                // rows over the tile's rows, rounded up to the next power of two because the bound is
+                // a compiled class rather than a request count.
+                (packed
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .div_ceil(sparse_contract.tile))
+                .next_power_of_two(),
             ),
-            (Some((tile, sparsity, stated_tiles, reference_keep)), None) => (
+            (Some((tile, sparsity, tiles, reference_keep)), None) => (
                 AttentionKind::sparse(tile, sparsity, reference_keep)?,
-                Some(stated_tiles),
+                tiles,
             ),
-            (None, None) => (AttentionKind::Dense, None),
+            (None, None) => (AttentionKind::Dense, 0),
         };
-        // **The deployment's own bounds, not a caller's numbers.** `rows_bound` and `tiles_bound` cap
-        // every canvas and frame count the deployment offers, and serving sizes its attention from
-        // them (`load.rs`); a walk that took either from a flag would state a program for a deployment
-        // nobody can ask it to be. A stated value is a claim to check, never a source: a mismatch is
-        // refused by name with both numbers, as `--sparse` already refuses another tile class.
-        let tokens_max = tokens.iter().copied().max().unwrap_or(0);
-        let mut network = minimax_h3::Config::read(&root, None)?.denoisers;
-        let mut base = network
-            .remove(&minimax_h3::Dit::Base)
-            .ok_or("this checkpoint holds no base network")?;
-        base.attention = attention;
-        let arrangement = Arrangement::new(&base, tokens_max, 64, 1)?;
-        let rules = Layouts::new(base, arrangement)?;
-        let rows_bound = rules.rows_bound()?;
-        let tiles = match attention {
-            AttentionKind::Dense => 0,
-            AttentionKind::Sparse { .. } => rules.tiles_bound()?,
-        };
-        if let Some(stated) = packed.iter().copied().max()
-            && stated != rows_bound
-        {
-            return Err(format!(
-                "--rows states {stated} packed rows and the deployment's own bound is \
-                 {rows_bound}: the attention is compiled for the bound it serves, and a walk \
-                 that stamped a smaller one describes a deployment it cannot be asked to be"
-            )
-            .into());
-        }
-        if let Some(stated) = stated_tiles
-            && stated.next_power_of_two() != tiles.next_power_of_two()
-        {
-            return Err(format!(
-                "--sparse states {stated} tiles and the deployment's own bound is {tiles}: the \
-                 launch keys the bound's next power of two ({}, not {}), and a row naming another \
-                 class is a module no launch asks for",
-                tiles.next_power_of_two(),
-                stated.next_power_of_two()
-            )
-            .into());
-        }
-        // The header states the bound the deployment serves, whatever the caller stated.
-        packed = vec![rows_bound];
         rows.extend(Denoiser::programs(
             &config,
             attention,
-            dtype_of("transformer")?,
-            rows_bound,
+            dtype,
+            max,
             Groups::of(conditioned),
             &partition,
+            &elements,
             tiles,
         )?);
     }
@@ -423,24 +330,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         names.len()
     };
     println!("# {} data rows, {operators} operators", rows.len());
-    // Read from the same function the decoder's rows were keyed from, so the header cannot state one
-    // element type while the rows below it say another.
-    println!("# the VAE container runs {}", dtype_of("vae")?);
     println!(
-        "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, element types: {element_types}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}", partition.ulysses_degree
+        "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}",
+        partition.ulysses_degree
     );
     println!(
-        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
-        samples.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        rasters.iter().map(|(height, width)| format!("{height}x{width}")).collect::<Vec<_>>().join(","),
-        tokens.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        packed.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        elements.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
-        track.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-        sparse.map_or("-".to_owned(), |(tile, sparsity, tiles, reference_keep)| format!(
-            "{tile},{sparsity},{tiles}{}",
-            reference_keep.map_or(String::new(), |keep| format!(",{keep}"))
-        )),
+        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --dtype {dtype} --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
+        samples
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        rasters
+            .iter()
+            .map(|(height, width)| format!("{height}x{width}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        tokens
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        packed
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        elements
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        track
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        sparse.map_or(
+            "-".to_owned(),
+            |(tile, sparsity, tiles, reference_keep)| format!(
+                "{tile},{sparsity},{tiles}{}",
+                reference_keep.map_or(String::new(), |keep| format!(",{keep}"))
+            )
+        ),
     );
     for (operator, key) in &rows {
         println!("{operator}\t{key}");

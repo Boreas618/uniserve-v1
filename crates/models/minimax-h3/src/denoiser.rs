@@ -46,8 +46,8 @@ use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 use crate::attention::{Factors, Visible};
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
-use crate::partition::Partition;
 use crate::packing::{self, DensePacking};
+use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
 use crate::transformer::Transformer;
@@ -97,6 +97,17 @@ impl Arrangement {
 }
 
 /// The deployment's layout rule: how a request snaps, and what its tables are.
+/// The element type of the sample the trajectory accumulates, and of its noise.
+///
+/// The reference keeps its trajectory in FP32 and refuses any other type at its own entry
+/// (`denoiser.py:1206-1216`, and `precision.py` pins the video and audio latents' input and output
+/// there), so the draw, the patch and the unpatchify all read and write this one type - **not the
+/// stack's**, which is the checkpoint's. Both sites read this constant: the forward refuses a latent
+/// of another type by name ([`Denoiser::denoise_traced`]), and [`Denoiser::programs`] states the rows
+/// the launch will ask for. Keying those rows from the stack's type instead was a real store gap -
+/// a BF16 `unpatchify_video` row for a launch that asks for `dtype_f32`.
+pub const SAMPLE_DTYPE: DType = DType::F32;
+
 pub struct Layouts {
     config: DenoiserConfig,
     arrangement: Arrangement,
@@ -1492,6 +1503,23 @@ impl nn::capability::Denoiser for Denoiser {
             }
             _ => {}
         }
+        // The draw writes the trajectory, so it reads the sample's type: a latent of another type
+        // would launch a noise row the plan does not state, and `denoise` would refuse it one call
+        // later with the launch already made.
+        if out.video.dtype != SAMPLE_DTYPE {
+            return Err(flattened(Error::config(format!(
+                "the video latents are {} and the draw writes {SAMPLE_DTYPE}",
+                out.video.dtype
+            ))));
+        }
+        if let Some(audio) = out.audio
+            && audio.dtype != SAMPLE_DTYPE
+        {
+            return Err(flattened(Error::config(format!(
+                "the audio latents are {} and the draw writes {SAMPLE_DTYPE}",
+                audio.dtype
+            ))));
+        }
         let noise = nn::Noise::new();
         // The video's stream is drawn at the latent's **native** shape, `[channels, frames, height,
         // width]`, which is the buffer `denoise` reads and the solver folds a velocity into - its
@@ -2044,9 +2072,9 @@ impl Denoiser {
     /// The two stacks are their own functions ([`Transformer::programs`],
     /// [`crate::conditioning::TokenRefiner::programs`]); this adds the orchestration around them — the
     /// pack and its inverse, the draw, the strided copies, the coefficient gather, and the blends the
-    /// solver and the conditioner issue. The trajectory's element count states no key: the solver's
-    /// residual carries one column gathered per evaluation, so a row keyed by the sample's elements is
-    /// a row no launch asks for.
+    /// solver and the conditioner issue. `elements` is the element count of the largest trajectory a
+    /// modality steps: the solver's residual is one operator over the whole sample, so its width is a
+    /// deployment statement and not a constant.
     #[allow(clippy::too_many_arguments)]
     pub fn programs(
         config: &crate::config::TransformerConfig,
@@ -2055,11 +2083,11 @@ impl Denoiser {
         rows: u32,
         groups: Groups,
         partition: &Partition,
+        elements: &[u64],
         tiles: u32,
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
-        use ops::gemm::Gemm as GemmOp;
         use ops::noise::NoiseKind;
         use ops::noise::PhiloxNoise as NoiseOp;
         use ops::patch::Patch as PatchOp;
@@ -2070,49 +2098,20 @@ impl Denoiser {
         programs.extend(Transformer::programs(
             config, attention, dtype, rows, groups, partition, tiles,
         )?);
-        // The refiner's own rows key from the type its features arrive in, and a conditioned
-        // deployment's conditioner hands them FP32 (`conditioning.rs`: the conditioned path works in
-        // FP32 from the draw to the projection, and the refiner's working buffer takes the features'
-        // type). A walk that stated them at the stack's bulk type left five launches - the refiner's
-        // attention, per-head norm, gated activation and two logits gathers - without a cell, which is
-        // what the recorder found.
-        // **The refiner is handed features of two types and takes each as it comes** (its working
-        // buffer is `features.dtype`): the prompt's own rows arrive at the stack's type and a
-        // conditioned deployment's conditioner hands it FP32. So a conditioned deployment states the
-        // refiner at both, and a dense one at the stack's type alone - the recorder drove the forward
-        // and read exactly that, in both deployments.
-        // **One refiner, and it is not the deployment's type.** Its features are the prompt's (the
-        // deployment's), its blocks compute in FP32 (`Rows::reserve` allocates them at
-        // `block.dtype`), and its output is the deployment's. A per-group ladder of refiner types
-        // stated variants no forward instantiates: the recording shows one refiner, a block of
-        // `f32` over `bf16` features at 5376 columns.
-        let _ = groups;
-        programs.extend(crate::conditioning::TokenRefiner::programs(
-            config,
-            dtype,
-            nn::DType::F32,
-            dtype,
-        )?);
+        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
 
         let video = config.video_channels;
 
         // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
-        // The patch reads the latents, and a trajectory is FP32 whatever the stack's type is.
-        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(nn::DType::F32));
-        // The inverse of the pack reads the sample, and the sample is the trajectory's FP32 whatever the
-        // stack's type is — the forward builds it at `video.dtype`, not at the deployment's.
-        programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(
-            nn::DType::F32,
-            u64::from(video),
-            1,
-            2,
-        )?
-        .descriptor());
-        // The draw writes the request's latents, which are FP32 whatever the stack's own type is: the
-        // solver accumulates into them. A row keyed by the deployment's dtype is a module no launch asks
-        // for, which is how it read as unlaunched until the harness drove the draw.
+        // The first three read or write the **sample**, not the stack: the trajectory is FP32
+        // (`SAMPLE_DTYPE`, and the forward refuses any other), so a row keyed from `dtype` would name
+        // a program the launch never asks for.
+        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(SAMPLE_DTYPE));
+        programs.launch::<Unpatchify>(
+            &nn::layers::UnpatchifyVideo::new(SAMPLE_DTYPE, u64::from(video), 1, 2)?.descriptor(),
+        );
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
-            nn::DType::F32,
+            SAMPLE_DTYPE,
             NoiseKind::Normal,
             ops::noise::KeySource::Scalar,
         ));
@@ -2121,19 +2120,15 @@ impl Denoiser {
         ));
 
         // The three gathers outside the modulation: the prefix rows of the packed stream, the solver's
-        // step coefficient, and the trace's row copy the diagnosis takes.
-        for (gathered, columns) in [(nn::DType::F32, 1u64), (nn::DType::I32, 1u64)] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                gathered, columns,
-            )?);
-        }
-        // The token stream's own placement: one row per token at the stack's width, in the three
-        // gathers the packed stream takes.
-        programs.launch::<ops::rows::Rows>(&nn::layers::Rows::descriptor_of(
+        // step coefficient, and the trace's row copy the diagnosis takes. The wide one gathers the
+        // stack's packed rows; the one-column one gathers the **solver's coefficient**, which is an
+        // FP32 constant (`Solver::load` publishes the two tables as F32), so its row is the sample's
+        // type and not the stack's.
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
             dtype,
-            ops::rows::Mode::Replace,
-            config.hidden_size,
-        ));
+            u64::from(config.hidden_size),
+        )?);
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, 1)?);
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
@@ -2146,86 +2141,22 @@ impl Denoiser {
             )?);
         }
 
-        // The crossings between the sample's element type and FP32. `ScaledAdd`'s key is the **pair**
-        // of element types, so a walk that states only same-type additions leaves each of these
-        // launches without a cell: the input projection widens the patched rows (video at
-        // `channels · 4` columns, audio at its feature count), each projection's FP32 output is
-        // narrowed into the packed rows at the hidden width, and the timestep pair's FP32 activation
-        // is narrowed into the modulation's width at the start of every evaluation. Each is one
-        // launch of the served path (`denoiser.rs`'s two projections and `modulation.rs`'s narrow).
-        // **The crossings are derived from the two element types, not listed.** `ScaledAdd`'s key is
-        // the pair, so a triple whose two sides are the same type - or whose direction the operands
-        // cannot have - is a row nothing launches: the recorder ran every path of both deployments and
-        // never made the reverse narrows, the same-type adds or the audio feature width this list used
-        // to state. So the pairs are those the boundary actually has, and each is stated once:
-        //   the input projection widens the patched rows from the stack's type into FP32;
-        //   its FP32 output is narrowed back at the hidden width;
-        //   the timestep pair's FP32 activation is narrowed into the modulation's width.
-        // A dense stack (`dtype == F32`) has no crossing at all: every pair below is the same type and
-        // the loop emits nothing, which is what the model does.
-        // **One width, both directions.** The boundary is the packed rows: they are widened into FP32
-        // for the projections and narrowed back into the stack, and everything else the walk used to
-        // state here is a same-type add the forward already makes - the canvas at `channels · 4` is
-        // FP32 on both sides (`denoise`: `patch.forward` writes an FP32 buffer, and the anchor mix adds
-        // two of them), and the timestep pair is narrowed once, into the modulation's hidden width.
-        let crossings = vec![
-            (nn::DType::F32, dtype, u64::from(config.hidden_size)),
-            (dtype, nn::DType::F32, u64::from(config.hidden_size)),
-        ];
-        let _ = groups;
-        // The conditioner's own projection: its weight is one of the checkpoint's twelve FP32 tensors
-        // (`modulation.rs` pins each projection matrix to `Some(DType::F32)`), so the launch is FP32
-        // rows against an FP32 weight and **one rounding into the prefix's type** - a biased product
-        // whose output type is the deployment's. The stack's shared `gemm` row is keyed by the
-        // deployment's type on both sides and states nothing here; the recorder found the launch, not
-        // the walk.
-        if groups == crate::modulation::Groups::Conditioned {
-            // The rows the projection reads are the condition features, which are the stack's own
-            // type - the FP32 in this crossing is the weight, not the operand. Two projections read
-            // them (video's and audio's), one carrying its bias and one not, so both epilogues are
-            // stated: a store holding one serves one condition and dies on the other.
-            // Three products read the projection's FP32 weight: the video condition's rows are
-            // already FP32 (`input_f32`, its bias carried) while the audio condition's are the stack's
-            // own type, once with its bias and once without. Each is one launch of the served path, and
-            // a store holding two of the three serves one condition and dies on the other.
-            for (input, bias) in [
-                (nn::DType::F32, true),
-                (dtype, true),
-                (dtype, false),
-            ] {
-                programs.launch::<GemmOp>(&nn::layers::Linear::descriptor_of(
-                    config.hidden_size,
-                    nn::DType::F32,
-                    nn::layers::WeightOrder::NxK,
-                    bias,
-                    input,
-                    dtype,
-                ));
-            }
-        }
-        // One launch per pair the boundary has. A triple whose sides are equal is not a crossing and is
-        // not stated: the stack's own same-type adds are stated by the plan's ordinary columns, not here.
-        for (target, source, columns) in crossings {
-            if target == source {
-                continue;
-            }
-            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
-                target, source, columns,
-            )?);
-        }
-
-        // The solver's step: one gated residual over the whole trajectory of each modality. Its
-        // coefficient is one column gathered per evaluation rather than per buffer, so the key names
-        // the scale's width and not the trajectory's: a row keyed by the element count is a row no
-        // launch ever asks for, which is how five of them were carried here.
+        // The solver's step: one gated residual over the whole trajectory of each modality. The
+        // trajectory is the sample (`Solver::step` reads the sample and the velocity in one type,
+        // and the forward refuses a sample that is not `SAMPLE_DTYPE`), so these rows are the
+        // sample's type - keyed from the stack they would name a row no step ever launches.
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-            nn::DType::F32,
-            1,
+            SAMPLE_DTYPE,
+            u64::from(video) * 4,
             false,
         )?);
-        programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-            dtype, 1, false,
-        )?);
+        for count in elements {
+            programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
+                SAMPLE_DTYPE,
+                *count,
+                false,
+            )?);
+        }
         Ok(programs.finish())
     }
 
@@ -2888,11 +2819,11 @@ impl Denoiser {
         // (`denoiser.py:1206-1216`: a latent input of any other type is a `ValueError`). A sample in
         // the stack's type would round the trajectory once per evaluation - a drift no shape refuses
         // and no page localises - so this refuses instead of running the cheaper arithmetic.
-        if video.dtype != DType::F32 {
+        if video.dtype != SAMPLE_DTYPE {
             return Err(Error::config(format!(
-                "the video latents are {} and a trajectory is FP32: the sample is what the solver \
-                 accumulates into, and the stack's own element type is {}",
-                video.dtype, dtype
+                "the video latents are {} and a trajectory is {SAMPLE_DTYPE}: the sample is what \
+                 the solver accumulates into, and the stack's own element type is {dtype}",
+                video.dtype
             )));
         }
         // The trajectory is FP32 and the stack is the deployment's, and the two are crossed twice
@@ -2924,7 +2855,7 @@ impl Denoiser {
         // solver - whose step reads one type for the sample and the velocity (`solver.rs`).
         // Allocating these in `cond.text.dtype` instead would round the trajectory itself at every
         // evaluation, which no shape refuses and no page shows.
-        let sample_dtype = video.dtype;
+        let sample_dtype = SAMPLE_DTYPE;
         let patch = nn::layers::Patch::new(channels, height, width)?;
         // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
         // It reads the token grid from `out`, so a clip of another length replays the same launch.
@@ -3262,17 +3193,12 @@ impl Denoiser {
         let solver = Solver::load(&schedule, loader)?;
         // The refiner reads the text encoder's features and writes the DiT's conditioning; its rows
         // are bounded by the same packed-row bound the stack's attention is sized for.
-        // The refiner reads the encoder's rows, whose count is the **prefix** - not the packed row
-        // bound: its scratch is sized per row it can see, and a packed bound would size it for every
-        // video row of the widest layout. The prefix is the prompt's rows, the condition's rows
-        // beneath them and the zero row the layout reserves after both, because a conditioned
-        // request's conditioner writes into one buffer at those offsets and the refiner reads it
-        // whole: a bound of the prompt's rows alone refuses the first conditioned launch by name
-        // (`a 4096-key bound for a launch of 4545 keys`).
-        let prefix_rows = arrangement.text_rows + arrangement.condition_rows + 1;
+        // The refiner reads the encoder's rows, whose count is the text capacity - not the packed
+        // row bound: its scratch is sized per row it can see, and a packed bound would size it for
+        // every video row of the widest layout.
         let refiner = crate::conditioning::TokenRefiner::load(
             &config.transformer,
-            prefix_rows,
+            arrangement.text_rows,
             partition,
             loader,
         )?;
@@ -3395,6 +3321,7 @@ mod tests {
             32_000,
             Groups::of(true),
             &crate::partition::Partition::single(),
+            &[1_000_000],
             0,
         )
         .expect("the denoiser's programs");
@@ -3411,71 +3338,16 @@ mod tests {
         ] {
             assert!(has(operator), "{operator} is missing: {programs:?}");
         }
-        // The solver's residual reads one coefficient per evaluation, so every residual the denoiser
-        // states is one column wide: a key carrying the sample's element count is a row no launch
-        // asks for, and two of them were carried here until the recorder named them.
+        // The solver's residual over the whole trajectory is a second program from the patch-column
+        // one, because the width is in the key.
         let residuals = programs
             .iter()
             .filter(|(name, _)| name == "scaled_residual")
             .map(|(_, key)| key.clone())
             .collect::<Vec<_>>();
         assert!(
-            !residuals.is_empty(),
-            "the denoiser states no residual: {programs:?}"
-        );
-        for key in &residuals {
-            assert!(
-                key.contains("columns_1_"),
-                "a residual is keyed by the scale's width: {residuals:?}"
-            );
-        }
-    }
-
-    /// The four crossings between the sample's element type and FP32 are programs of their own:
-    /// `ScaledAdd`'s key is the **pair** of element types, so a walk that states only same-type
-    /// additions leaves the served path's widens and narrows without a cell — the failure shows up as
-    /// a launch with no program, not as a shape. Each key here is one launch: the two input
-    /// projections' widenings (`channels · 4` for video, the audio feature count) and the two narrows
-    /// of a projection's FP32 output and of the timestep pair's activation into the modulation.
-    #[test]
-    fn the_denoiser_states_the_crossings_between_the_sample_and_fp32() {
-        let config = crate::config::tests_support::released_config();
-        let (_, denoiser) = config
-            .denoisers
-            .iter()
-            .next()
-            .expect("a released DiT partition");
-        let programs = Denoiser::programs(
-            &denoiser.transformer,
-            denoiser.attention,
-            nn::DType::BF16,
-            32_000,
-            Groups::of(true),
-            &crate::partition::Partition::single(),
-            0,
-        )
-        .expect("the denoiser's programs");
-        let crossed: Vec<&str> = programs
-            .iter()
-            .filter(|(name, _)| name == "scaled_add")
-            .map(|(_, key)| key.as_str())
-            .filter(|key| {
-                key.starts_with("target_f32_source_bf16") || key.starts_with("target_bf16_source_f32")
-            })
-            .collect();
-        // The walk sorts its rows, so the expected set is compared in the same order it prints.
-        let mut crossed = crossed;
-        crossed.sort_unstable();
-        assert_eq!(
-            crossed,
-            vec![
-                "target_bf16_source_f32_columns_5376_block_1024",
-                "target_f32_source_bf16_columns_5376_block_1024",
-            ],
-            "the boundary is the packed rows and nothing else: one program each way at the hidden \
-             width. The canvas at `channels · 4` is FP32 on both sides and the timestep pair is \
-             narrowed into the modulation's hidden width, so neither is a crossing - a pair of one \
-             type is not a pair"
+            residuals.iter().any(|key| key.contains("columns_1000000")),
+            "{residuals:?}"
         );
     }
     use super::*;
@@ -4522,48 +4394,5 @@ mod tests {
             .map(|table| table.name)
             .collect();
         assert_eq!(names, SEGMENT_TABLES);
-    }
-
-    /// A sparse deployment's tile bound is its own layout rule's, not a caller's number.
-    ///
-    /// The walk states the bound as an argument (`--sparse tile,sparsity,tiles`), which is a second
-    /// statement of one fact: the model computes it once, at load, over every canvas and frame count
-    /// the deployment offers. This measures the model's own number, so a drift between the two shows
-    /// as a red test rather than as a fixture row nothing compares.
-    #[test]
-    fn the_sparse_tile_bound_is_the_layout_rules_and_the_fixture_s() {
-        let config = crate::config::tests_support::released_config();
-        let network = config
-            .denoisers
-            .get(&crate::Dit::Base)
-            .expect("a released base network")
-            .clone();
-        let mut sparse = network.clone();
-        sparse.attention =
-            crate::config::AttentionKind::sparse(64, 0.9, None).expect("a served tile");
-        let arrangement = Arrangement::new(&sparse, 4096, 64, 1).expect("an arrangement");
-        let layouts = Layouts::new(sparse, arrangement).expect("the layout rule");
-        let bound = layouts.tiles_bound().expect("a sparse deployment's bound");
-        // The descriptor keys the bound by its next power of two, and the launch refuses a request
-        // outside the live bound rather than clamping: so the class, not the request's count, is what
-        // a sparse deployment's store must hold. Measured: 5 400 tiles over this deployment's own
-        // canvases, the 8 192 class, and both the compress and the select rows name it.
-        assert_eq!(
-            bound.next_power_of_two(),
-            8192,
-            "the deployment's own bound is {bound}"
-        );
-        // The fine attention's key bound is rows, so the tile count is multiplied by the tile: a
-        // bound of `bound` rows is not whole tiles and a bound of `bound * 64` rows is.
-        let tile = 64u64;
-        assert!(
-            (u64::from(bound) * tile).is_multiple_of(tile),
-            "the fine attention's bound is whole tiles"
-        );
-        assert!(
-            nn::layers::SegmentAttention::new(tile, 56, 128, u64::from(bound) * tile, nn::DType::F16)
-                .is_ok(),
-            "the deployment's own bound loads as the fine attention's key extent"
-        );
     }
 }

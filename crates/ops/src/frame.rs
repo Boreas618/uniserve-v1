@@ -73,11 +73,7 @@ impl FramePadDescriptor {
     /// descriptor carries the result, so the caller and the compiled program agree on the variant.
     pub fn tiles(values: &TensorView, out: &TensorView) -> (u32, u32) {
         let contiguous_out = out.strides == Strides::row_major(out.shape);
-        Self::tiles_of(
-            values.strides.last() == 1,
-            contiguous_out,
-            out.shape.dim(4),
-        )
+        Self::tiles_of(values.strides.last() == 1, contiguous_out, out.shape.dim(4))
     }
 
     /// The same split, from the two facts it turns on: whether the source's columns are unit-strided
