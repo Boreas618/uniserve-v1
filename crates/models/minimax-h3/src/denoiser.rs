@@ -1611,22 +1611,7 @@ impl nn::capability::Denoiser for Denoiser {
         f: &Forward,
         cond: nn::capability::Conditioning<'_>,
     ) -> nn::Result<()> {
-        // The refiner's rows are the denoiser's conditioning (`denoiser.py:510-532`): every task's
-        // text passes through it once, in place over the runner's `text` buffer, and the encoder's
-        // own features arrive in `source`. A request with no source has no conditioning to refine -
-        // and no text either, since the encoder always writes what the refiner reads.
-        //
-        // A conditioned request's condition rows, below the prompt's: the encoders write them from
-        // `media`, at the offsets the layout's own counts place them, and the two writes are
-        // disjoint. A request with no media has no condition rows at all, which is every `t2va`.
-        let Some(source) = cond.source else {
-            return Ok(());
-        };
-        if !cond.media.is_empty() {
-            self.encode_media(f, cond.media, cond.text)
-                .map_err(flattened)?;
-        }
-        self.refine_conditioning(f, source, cond.text, cond.state, None)
+        self.prepare_conditioning_traced(f, cond, None)
             .map_err(flattened)
     }
 
@@ -2275,6 +2260,7 @@ impl Denoiser {
         f: &Forward,
         media: &[nn::capability::MediaInput],
         text: TensorView,
+        trace: Option<&ConditionTrace<'_>>,
     ) -> Result<()> {
         let encoders = self.encoders.as_ref().ok_or_else(|| {
             Error::config(
@@ -2295,6 +2281,9 @@ impl Denoiser {
             &pieces,
         )?;
         let audio_channels = u64::from(self.config.transformer.audio_channels);
+        // The trace's `clean` views are one per **visual** condition, in packed order, so the
+        // counter advances on the visual pieces alone - an audio-only condition contributes none.
+        let mut visual_index = 0_usize;
         for (piece, (start, _)) in media.iter().zip(placements) {
             if piece.audio_rows > 0 {
                 let samples = piece.audio.ok_or_else(|| {
@@ -2320,7 +2309,9 @@ impl Denoiser {
                 let visual = u32::try_from(start).map_err(|_| {
                     Error::config("a condition row start above u32::MAX".to_owned())
                 })? + piece.audio_rows;
-                self.encode_visual(f, piece, encoders, text, visual)?;
+                let clean = trace.and_then(|trace| trace.clean.get(visual_index).copied());
+                self.encode_visual(f, piece, encoders, text, visual, clean)?;
+                visual_index += 1;
             }
         }
         Ok(())
@@ -2348,6 +2339,7 @@ impl Denoiser {
         encoders: &ConditionEncoders,
         text: TensorView,
         start: u32,
+        trace: Option<TensorView>,
     ) -> Result<()> {
         let pixels = piece.pixels.ok_or_else(|| {
             Error::config(format!(
@@ -2520,6 +2512,15 @@ impl Denoiser {
         let columns = video_channels * 4;
         let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
         patch.forward(f, latent, clean, latent_frames)?;
+        // The diagnosis's view of the condition, before the anchor mixes the draw in: the rows the
+        // video encoder emits, which is what a reference's own encode probe returns. `ScaledAdd`
+        // with β = 0 is the packed copy, and the served path offers no view and launches nothing.
+        if let Some(view) = trace {
+            check_trace_view(view, rows, columns, "clean")?;
+            nn::layers::ScaledAdd
+                .forward(f, view, clean, 1.0, 0.0)
+                .map_err(Error::from)?;
+        }
         let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
         patch.forward(f, draw, anchored, latent_frames)?;
         // `target ← β · target + α · source` with the target the latent's rows and the source the
@@ -2614,6 +2615,37 @@ impl Denoiser {
     ///
     /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
     /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
+    /// [`Denoiser::prepare_conditioning`] with the conditioned path's diagnostic views.
+    ///
+    /// **The served arm is this one with no trace**, so a page a harness writes through it is the
+    /// arithmetic a request runs, launch for launch. A trace is the design's numeric diagnosis
+    /// (`specs/worker.md` 10) and never a gate: `clean` receives each visual condition's rows as the
+    /// video encoder emits them (`[rows, channels * 4]` FP32), before the anchor mixes the draw in,
+    /// which is the value a reference's encoder probe returns; `refined` receives the refiner's rows
+    /// where the pack gathers them. Nothing is written unless a view is offered.
+    pub fn prepare_conditioning_traced(
+        &self,
+        f: &Forward,
+        cond: nn::capability::Conditioning<'_>,
+        trace: Option<&ConditionTrace<'_>>,
+    ) -> Result<()> {
+        // The refiner's rows are the denoiser's conditioning (`denoiser.py:510-532`): every task's
+        // text passes through it once, in place over the runner's `text` buffer, and the encoder's
+        // own features arrive in `source`. A request with no source has no conditioning to refine -
+        // and no text either, since the encoder always writes what the refiner reads.
+        //
+        // A conditioned request's condition rows, below the prompt's: the encoders write them from
+        // `media`, at the offsets the layout's own counts place them, and the two writes are
+        // disjoint. A request with no media has no condition rows at all, which is every `t2va`.
+        let Some(source) = cond.source else {
+            return Ok(());
+        };
+        if !cond.media.is_empty() {
+            self.encode_media(f, cond.media, cond.text, trace)?;
+        }
+        self.refine_conditioning(f, source, cond.text, cond.state, trace.and_then(|t| t.refined))
+    }
+
     pub fn encode_conditions(
         &self,
         f: &Forward,
