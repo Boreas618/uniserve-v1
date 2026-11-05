@@ -1286,11 +1286,19 @@ def _restart_while_streaming(
     ]
     for thread in streaming:
         thread.start()
-    _wait_until(
-        lambda: all(len(read) >= 32 for read in reads),
-        300,
-        "the counts did not stream",
-    )
+    try:
+        _wait_until(
+            lambda: all(len(read) >= 32 for read in reads),
+            300,
+            "the counts did not stream",
+        )
+    except TimeoutError as error:
+        # Three streams open at once is the first place the deployment serves
+        # more than one request at a time; a stop here is the engine's own
+        # account of what it did with them, not a number of seconds.
+        raise AssertionError(
+            f"{error} (counts so far: {[len(read) for read in reads]}){log_tail(log)}"
+        ) from error
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
     successor = restarted.json()["result"]["pid"]
