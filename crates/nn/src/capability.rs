@@ -926,6 +926,29 @@ pub trait Decoder {
         ))
     }
 
+    /// The bytes one decode of `layout` needs, as the model's own plan computes them.
+    ///
+    /// The same contract as [`Denoiser::arena_bytes`], for the subject a decoder already has: it is
+    /// the total of the model's plan for the layout, a pure function of it - two clips of one layout
+    /// answer the same bytes, because the executor keys a capture and its arena by layout - and it
+    /// allocates nothing and touches no device.
+    ///
+    /// It takes a layout rather than a request because a decoder is handed a layout:
+    /// [`layout_of`](Self::layout_of) is how its runner got one, and
+    /// [`layout_tables`](Self::layout_tables) and [`prepare_layout`](Self::prepare_layout) take the
+    /// same subject in the same form.
+    ///
+    /// A layout this block cannot serve - a raster it does not decode to - is refused by name, never
+    /// answered with a number the decode would run past. A decoder that states no plan refuses, as it
+    /// does for a layout it cannot map: a zero would be the same value as an arena of no bytes.
+    fn arena_bytes(&self, layout: &Layout) -> Result<u64> {
+        let _ = layout;
+        Err(Error::shape(
+            "Decoder",
+            "this decoder states no arena plan for a layout".to_owned(),
+        ))
+    }
+
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(
         &self,

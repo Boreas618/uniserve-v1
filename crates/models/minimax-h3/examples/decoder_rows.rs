@@ -41,9 +41,10 @@
 //!
 //! The decoder is built from weight extents alone (`WeightLoader::stated` reads no byte) and
 //! `Forward::recording` reports each launch to a capture sink, so a canvas's tile decodes with no
-//! device and no checkpoint shard. For the row accounting the canvas is the tile the decoder is
-//! loaded with, exactly as `load` hands it: one tile, because the rows a tile launches are the rows
-//! the decoder's own enumeration is about. The clip's whole decode is driven only for its arena.
+//! device and no checkpoint shard. A decoder is loaded with the **clip's** canvas, because that is
+//! the one thing `load` keeps: `layout_of` and `arena_bytes` answer from it, and a decode reads its
+//! extent from the raster it writes. The rows a tile launches are the tile grid's, which this tool
+//! builds beside the decoder and drives the stitch with.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -51,6 +52,7 @@ use std::path::PathBuf;
 use minimax_h3::AttentionKind;
 use minimax_h3::decoding::{ClipDecoder, arena_reservation, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder};
+use nn::capability::Decoder;
 use nn::forward::Arena;
 use nn::layers::{Linear, WeightOrder};
 use nn::tensor::DevicePtr;
@@ -334,7 +336,6 @@ fn fit_arenas(
                 .map_err(|error| error.to_string())?
                 .tiles(config, &clip_canvas)
                 .to_vec();
-            let grid = tiles.first().copied().ok_or("a clip with no tiles")?.canvas;
             let mut loader = WeightLoader::stated(dtype, Some(extents));
             let projection = loader
                 .load(&WeightRequest::region(
@@ -354,7 +355,7 @@ fn fit_arenas(
                 .map_err(|error| error.to_string())?;
             let decoder = VideoDecoder::load(
                 config,
-                grid,
+                clip_canvas,
                 AttentionKind::Dense,
                 dtype,
                 input,
@@ -364,6 +365,21 @@ fn fit_arenas(
             let plan =
                 video_arena(config, &clip_canvas, dtype).map_err(|error| error.to_string())?;
             let need = arena_reservation(&plan);
+
+            // The number a runner allocates from, asked of the capability rather than recomputed
+            // here: it is compared below against the arena a real decode uses, so the tool fails if
+            // the two ever become two statements of different things.
+            let stated = decoder
+                .arena_bytes(
+                    &decoder
+                        .layout_of(nn::capability::Clip {
+                            frames: clip_canvas.frames_out(config),
+                            height,
+                            width,
+                        })
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
 
             // The runner's own buffers - the clip's latent rows, the position table and the raster the
             // stitch writes - are not part of a clip's plan, so they live in their own arena.
@@ -410,8 +426,13 @@ fn fit_arenas(
                     plan.len(),
                     need - used
                 )),
+                Ok(()) if stated != used => failures.push(format!(
+                    "{dtype:?} {width}x{height}: the decoder states {stated} B of arena and the \
+                     clip takes {used} B"
+                )),
                 Ok(()) => println!(
-                    "{dtype:?} {height}x{width}: a {}-tile clip takes all {need} bytes of its {} buffer plan",
+                    "{dtype:?} {height}x{width}: a {}-tile clip takes all {need} bytes of its {} buffer plan, \
+                     and the decoder states that number",
                     tiles.len(),
                     plan.len()
                 ),
