@@ -156,7 +156,8 @@ fn run() -> Result<(), String> {
                 nn::forward::ALIGNMENT - 1
             ));
         }
-        slack += i128::try_from(reserved - used).unwrap_or(i128::MAX);
+        // `u64 -> i128` is infallible: the slack of a plan is not a place to hide a `MAX`.
+        slack += i128::from(reserved - used);
         println!(
             "{length:>5} latent frames ({samples} samples): {} buffer(s), {reserved} B planned, {used} B taken, {}",
             plan.len(),
