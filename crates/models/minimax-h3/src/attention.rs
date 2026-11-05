@@ -550,7 +550,11 @@ fn frequencies(
 /// `[tokens, axes * dim / 2]` (`:355-380` and `attention.py:94-105`): pair `a * pairs + i` is the
 /// `i`-th frequency of axis `a`, so every axis rotates with the same spectrum and the axes occupy
 /// contiguous blocks.
-pub(crate) fn table(pairs: u32, axes: u32, theta: f32) -> Vec<f32> {
+///
+/// Public because it is a host statement a comparison can read: the spectrum and the axes' order
+/// are the two facts a rotation can have wrong while every shape, type and count stays right, and
+/// only a table compares them (`tools/compare_rope_factors.py --dit`).
+pub fn table(pairs: u32, axes: u32, theta: f32) -> Vec<f32> {
     let spectrum: Vec<f32> = (0..pairs)
         .map(|index| {
             let exponent = 2.0 * f64::from(index) / (2.0 * f64::from(pairs));

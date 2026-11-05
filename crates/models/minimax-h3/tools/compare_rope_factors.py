@@ -288,11 +288,74 @@ def compare(name: str, mine, theirs, shape, *, integer: bool = False) -> float:
     return worst[0]
 
 
+def compare_dit(case: Path, checkpoint: Path) -> int:
+    """Compare the DiT's rotary spectrum and axis order with the reference's.
+
+    The DiT's factors are a device operator, so what the host can compare is what feeds it: the
+    `[3 * rope_freq_dim]` table (`attention::table`) and the axis each of its columns takes
+    (`ops::rope::section_axes`). Both are wrong in ways no shape can see - 48 distinct frequencies
+    where the reference repeats 16, or the axes in another order - and the DiT's rotary has had
+    exactly that class of defect.
+    """
+    if install_kernel_stub():
+        print(
+            "note    the reference's compiled kernel module is absent here; only its host inverse"
+            " frequency table is read, which needs no kernel"
+        )
+    stated = json.loads((case / "dit_rope.json").read_text())
+    pairs = int(stated["pairs"])
+    axes = int(stated["axes"])
+    theta = float(stated["theta"])
+    table = [float(value) for value in stated["table"]]
+
+    python = Path(".").resolve()
+    if str(python) not in sys.path:
+        sys.path.insert(0, str(python))
+    rope_module = load_module("reference_rope", python / "uniserve/nn/rope.py")
+    reference = rope_module.RotaryEmbedding(
+        2 * pairs, theta=theta, sections=None, scaling=None, max_position_embeddings=32768
+    )
+    spectrum = [float(value) for value in reference.inv_freq.reshape(-1).tolist()]
+    if len(spectrum) != pairs:
+        raise Differ(
+            f"the reference's RotaryEmbedding({2 * pairs}) gives {len(spectrum)} frequencies and"
+            f" the case states {pairs}"
+        )
+    # The reference's factors are `[axes, tokens, dim / 2]`, flattened axis-major
+    # (`rope.py:355-380`), so column `a * pairs + i` is the `i`-th frequency of axis `a` and the
+    # spectrum repeats once per axis.
+    repeated = spectrum * axes
+    implied = "".join(str(index // pairs) for index in range(axes * pairs))
+    print(f"case    {pairs} frequencies, {axes} axes over {len(table)} columns, theta {theta}")
+    worst = compare("spectrum", table, repeated, (axes * pairs,))
+    if stated["spectrum_axes"] != implied:
+        print(
+            f"axes    ours {stated['spectrum_axes']} and the reference's implied {implied}:"
+            f" the columns take different coordinates"
+        )
+        return 1
+    print(f"axes    {implied}: the axes occupy contiguous blocks of {pairs} columns, as ours do")
+    if worst <= TOLERANCE:
+        print("verdict equal")
+        return 0
+    print("verdict differ")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", type=Path, required=True)
+    parser.add_argument("--case", type=Path, help="a prompt's factors, as encoder_rope wrote them")
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--dit",
+        type=Path,
+        help="compare the DiT's spectrum and axis order instead of a prompt's factors",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.dit is not None:
+        return compare_dit(arguments.dit, arguments.checkpoint)
+    if arguments.case is None:
+        parser.error("one of --case or --dit is required")
 
     role = json.loads((arguments.case / "role.json").read_text())
     shape, coordinates = read_container(arguments.case / "positions.h3t")
