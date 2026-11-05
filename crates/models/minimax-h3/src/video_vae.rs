@@ -1979,7 +1979,12 @@ pub(crate) mod tests {
 
     /// The clip a canvas decodes: the raster's pixels and its native frame count.
     fn clip_of(config: &VideoVaeConfig, canvas: Canvas) -> nn::capability::Clip {
-        let (width, height) = canvas.pixels(config);
+        // `pixels` answers `(height, width)` - the order `layout_of` destructures it in - so this
+        // helper must not read it as `(width, height)`. It did, and on a rectangle that made the
+        // decoder's own canvas arrive transposed: `layout_of` refused it correctly and the two tests
+        // built on this helper were the ones that failed. A square canvas hides a transposition here,
+        // which is why `a_rectangular_canvas_refuses_its_own_transpose` exists.
+        let (height, width) = canvas.pixels(config);
         nn::capability::Clip {
             frames: canvas.frames_out(config),
             height,
