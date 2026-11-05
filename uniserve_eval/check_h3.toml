@@ -23,14 +23,9 @@
 #
 # The launch's default dtype is bfloat16 and an empty quantization_config loads
 # the model's first precision preset, quality (DiT and text encoder BF16, video
-# VAE decoder FP16), so on most servers the omitted selectors name exactly the
-# representation the shipped performance profiles state, and stating them would
-# be redundant. `base-reference` is the measured exception: with the selectors
-# omitted, `check-base-ref2va` failed its warmup with a constant frame and
-# silence and wrote no MP4; with `dtype=bfloat16` and
-# `quantization_config.mode=quality` stated it passes (1/1 requests, an MP4 of
-# 219890 bytes). The two are therefore stated there and nowhere else, because a
-# check cell states only what its own path was measured to need.
+# VAE decoder FP16), so no server states either: every cell measures the
+# representation the shipped performance profiles serve, and a cell states only
+# what its own path was measured to need.
 #
 # No server pins --worker-executable either: the worker processes must run the
 # same build as the daemon, so a deployment launched with --executable runs the
@@ -56,6 +51,12 @@
 #
 #   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3
 #   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3 \
+#     --reuse-deployment
+#
+# and then, on the delivered service, the same six points reversed:
+#
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3-reversed
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3-reversed \
 #     --reuse-deployment
 root = ".."
 artifact_root = "artifacts/minimax_h3/check/results"
@@ -99,10 +100,64 @@ command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--ser
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "dtype=bfloat16", "--set", "quantization_config.mode=quality", "--set", "video_config.max_condition_rows=40960", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "video_config.max_condition_rows=40960", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
 
 # -------------------------------------------------------------------- t2va cells
 # W1's seed-0 row: the official t2va prompt at 16:9, 5 seconds.
+
+# The base-reference cell runs FIRST in `points` **for the baseline**. Today's
+# implementation keys `base-transformer` and `base-reference` under one load
+# identity (one checkpoint, one `--set` set), and a weight the loader computes
+# has no file, so two deployments computing different numbers under one label
+# got one key. The candidate inherits no such ordering: it must pass these six
+# cells in any order on retained weights, and its procedure carries a
+# reversed-order run with the reference cell last.
+#
+# That ordering is one ordering
+# this check set depends on. Its warmup fails with
+# `invalid_video_output: nonzero_video_variance` — a constant frame and silence,
+# no MP4 — when it runs after the other five cells on a host whose Storage
+# Server still holds their retained pages and 61 GiB per GPU; it passes on a
+# fresh host, and fails again on the same host once another cell has run.
+#
+# What it inherits is that retained state, not a selector: `base-transformer`
+# and `base-reference` share the whole load identity on the same checkpoint
+# (same defaults, and of the `--set` keys they have in common the media paths
+# are identical and only the video capacities and durations are sized
+# differently), so the two differ by retention alone. Running it first measures
+# it on the clean host the protocol promises every cell; the other five keep
+# the order they were measured in, and none of them is sensitive to the
+# retention. The inheritance itself is a serving defect, not a property of this
+# check set.
+[benchmarks.check-base-ref2va]
+server = "base-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-ref2va.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/base-ref2va"
+
+[benchmarks.check-base-ref2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-base-ref2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-ref2va.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "ref2va"
 
 [benchmarks.check-fasth3-dmd-t2va]
 server = "fasth3-dmd"
@@ -260,7 +315,17 @@ videos_per_second = "higher"
 checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
 task = "ref2va"
 
-[benchmarks.check-base-ref2va]
+# The six cells in two orders. `check-h3` is the order today's implementation is measured in: the
+# reference cell first, because that implementation shares one Storage Server key between the two base
+# servers on one checkpoint and a weight its loader computes has no file, so whichever of them runs
+# second inherits the first's pages. That ordering is how the baseline is measured, not a property the
+# delivered service is allowed to need.
+#
+# `check-h3-reversed` is the same six points with the reference cell last, and it is the candidate's
+# obligation: the delivered service must pass every cell in any order, on retained weights. A run of
+# `check-h3` alone says the baseline still measures what it measured; a run of `check-h3-reversed` that
+# passes says the ordering requirement is gone.
+[benchmarks.check-base-ref2va-reversed]
 server = "base-reference"
 task = "video"
 model = "MiniMax-H3"
@@ -268,27 +333,196 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
 endpoint = "/v1/videos/sync"
 
-[benchmarks.check-base-ref2va.video]
+[benchmarks.check-base-ref2va-reversed.video]
 task = "ref2va"
 aspect_ratio = "auto"
 condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-media_dir = "artifacts/minimax_h3/check/base-ref2va"
+media_dir = "artifacts/minimax_h3/check-reversed/base-ref2va"
 
-[benchmarks.check-base-ref2va.load]
+[benchmarks.check-base-ref2va-reversed.load]
 num_prompts = 1
 request_rate = inf
 max_concurrency = 1
 request_timeout_s = 3600
 warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
 
-[benchmarks.check-base-ref2va.metrics]
+[benchmarks.check-base-ref2va-reversed.metrics]
 videos_per_second = "higher"
 "video_latency_ms.p50" = "lower"
 "video_latency_ms.p95" = "lower"
 
-[benchmarks.check-base-ref2va.provenance]
+[benchmarks.check-base-ref2va-reversed.provenance]
 checkpoint = "MiniMaxAI/MiniMax-H3"
 task = "ref2va"
 
+[benchmarks.check-fasth3-dmd-t2va-reversed]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-t2va"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "t2va"
+
+[benchmarks.check-base-t2va-reversed]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-t2va-reversed.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check-reversed/base-t2va"
+
+[benchmarks.check-base-t2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-base-t2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-t2va-reversed.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "t2va"
+
+# ------------------------------------------------------------------- fl2va cells
+# W3's seed-0 row: the official first keyframe and prompt on an automatic
+# canvas, 8 seconds.
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-fl2va"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "fl2va"
+
+[benchmarks.check-base-fl2va-reversed]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-fl2va-reversed.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/base-fl2va"
+
+[benchmarks.check-base-fl2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-base-fl2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-fl2va-reversed.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "fl2va"
+
+# ------------------------------------------------------------------- ref2va cells
+# W4's seed-0 row: a reference image and the official reference voice on an
+# automatic canvas, 5 seconds.
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed]
+server = "fasth3-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-omniref-ref2va"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+task = "ref2va"
+
+# The six cells in two orders. `check-h3` is the order today's implementation is measured in: the
+# reference cell first, because that implementation shares one Storage Server key between the two base
+# servers on one checkpoint and a weight its loader computes has no file, so whichever of them runs
+# second inherits the first's pages. That ordering is how the baseline is measured, not a property the
+# delivered service is allowed to need.
+#
+# `check-h3-reversed` is the same six points with the reference cell last, and it is the candidate's
+# obligation: the delivered service must pass every cell in any order, on retained weights. A run of
+# `check-h3` alone says the baseline still measures what it measured; a run of `check-h3-reversed` that
+# passes says the ordering requirement is gone.
 [suites.check-h3]
-points = ["check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va", "check-base-ref2va"]
+points = ["check-base-ref2va", "check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va"]
+
+[suites.check-h3-reversed]
+points = ["check-fasth3-dmd-t2va-reversed", "check-fasth3-dmd-fl2va-reversed", "check-fasth3-omniref-ref2va-reversed", "check-base-t2va-reversed", "check-base-fl2va-reversed", "check-base-ref2va-reversed"]
