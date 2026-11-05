@@ -116,11 +116,12 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
-# 1b. The rows the other served tasks state and this one does not. Appended to the walk's own print so
-# that the generator counts them, and so that `keys_delta` compares the fixture with the rows it was
-# built from. A task that states nothing new appends nothing; a task that states something prints it,
-# because a difference nobody looked at reads exactly like a difference that lost twelve rows.
-echo 'rows the other served tasks state:'
+# 1b. The rows the other served tasks state and this one does not. **The walk states every served
+# task's rows itself** - its gated activation and its logits gather iterate the deployment's task set -
+# so this step appends nothing and refuses instead: a difference here means the walk narrowed to one
+# task, and a fixture that silently patched it would be right by this tool rather than by the model,
+# which is the form that survives longest and confuses the next person to re-check it.
+echo 'rows the other served tasks state (must be zero - the walk states them):'
 other_dense="$staging/walk-other-dense.txt"
 other_sparse="$staging/walk-other-sparse.txt"
 : >"$other_dense"
@@ -155,12 +156,11 @@ for pair in "dense:$walk_dense:$other_dense" "sparse:$walk_sparse:$other_sparse"
         <(grep -P '^[a-z0-9_]+\t' "$walk" | sort -u) >"$only"
     printf '  %-10s %s row(s)' "$name" "$(wc -l <"$only")"
     if [ -s "$only" ]; then
-        printf ', appended:\n'
+        printf ' - FAILED, the walk does not state them:\n'
         sed 's/^/    /' "$only"
-        cat "$only" >>"$walk"
-    else
-        printf '\n'
+        exit 1
     fi
+    printf '\n'
 done
 
 # 2. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
