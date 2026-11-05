@@ -15,9 +15,9 @@ use std::sync::Arc;
 use ipc::PhaseId;
 use ops::Generation;
 
+use crate::Error;
 use crate::Result;
 use crate::batch::{Batch, Jobs};
-use crate::Error;
 
 /// The executor's name for one runner on a device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -309,5 +309,163 @@ impl std::fmt::Debug for NamedRunner {
             .field("id", &self.id)
             .field("phases", &self.phases)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    use crate::plan::{Bucket, Computation, Extent};
+    use nn::capability::{LatentShape, Layout};
+
+    /// A runner that declares a plan and does nothing else: the selection rule reads no behaviour
+    /// beyond the declarations, so nothing else may be exercised by these tests.
+    struct Declaring {
+        plan: Vec<Bucket>,
+    }
+
+    impl Runner for Declaring {
+        fn phases(&self) -> &[ipc::PhaseId] {
+            &[]
+        }
+
+        fn media_plan(&self) -> Vec<Bucket> {
+            self.plan.clone()
+        }
+
+        fn submit(&mut self, _: Batch) -> Result<Jobs> {
+            unreachable!("the selection rule issues nothing")
+        }
+
+        fn warmup(&mut self) -> Result<Jobs> {
+            unreachable!("the selection rule warms nothing")
+        }
+
+        fn precopy(&mut self, _: &Arc<Generation>) -> Result<Jobs> {
+            unreachable!("the selection rule prepares nothing")
+        }
+
+        fn switchover(&mut self, _: u64) -> Result<()> {
+            unreachable!("the selection rule switches nothing")
+        }
+
+        fn revert(&mut self, _: u64) {
+            unreachable!("the selection rule reverts nothing")
+        }
+
+        fn purge(&mut self, _: u64) {
+            unreachable!("the selection rule purges nothing")
+        }
+
+        fn discard(&mut self, _: u64) -> Result<()> {
+            unreachable!("the selection rule discards nothing")
+        }
+
+        fn serve(&mut self, _: &crate::batch::Job) -> Result<crate::batch::BatchOutput> {
+            unreachable!("the selection rule serves nothing")
+        }
+    }
+
+    fn named(id: u32, phase: ipc::PhaseId, plan: Vec<Bucket>) -> NamedRunner {
+        NamedRunner {
+            id: RunnerId(id),
+            phases: vec![phase],
+            runner: Box::new(Declaring { plan }),
+        }
+    }
+
+    fn layout(width: u32) -> Layout {
+        Layout {
+            video: LatentShape {
+                channels: 16,
+                frames: 7,
+                height: 60,
+                width,
+            },
+            audio: None,
+            text_rows: 256,
+            condition_rows: 0,
+            condition_elements: 0,
+        }
+    }
+
+    fn step(at: Layout) -> Computation {
+        Computation {
+            call: ipc::MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Latents(at),
+        }
+    }
+
+    /// The rule a device with one runner per layout needs: two runners of one phase are told apart
+    /// by their plans, so each layout reaches the graph captured for it rather than the first.
+    #[test]
+    fn two_runners_of_one_phase_are_told_apart_by_their_plans() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![
+            named(1, phase, vec![Bucket::denoise(1, layout(32))]),
+            named(2, phase, vec![Bucket::denoise(1, layout(64))]),
+        ];
+
+        let narrow = server_of(&runners, phase, &step(layout(32))).expect("a plan holds it");
+        assert_eq!(narrow.id, RunnerId(1), "the narrow layout reaches its own");
+
+        let wide = server_of(&runners, phase, &step(layout(64))).expect("a plan holds it");
+        assert_eq!(wide.id, RunnerId(2), "the wide layout reaches its own");
+    }
+
+    /// A computation no plan holds is refused by name, naming the phase and the extent: the
+    /// alternative is a runner serving a batch its graph was not captured for.
+    #[test]
+    fn a_computation_no_plan_holds_is_refused_by_name() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![named(1, phase, vec![Bucket::denoise(1, layout(32))])];
+
+        let refusal = server_of(&runners, phase, &step(layout(48)))
+            .expect_err("no plan holds this layout")
+            .to_string();
+        assert!(
+            refusal.contains("no runner of this device serves"),
+            "the refusal says the device does not serve it: {refusal}"
+        );
+        assert!(
+            refusal.contains("Denoise"),
+            "the refusal names the variant: {refusal}"
+        );
+    }
+
+    /// A runner serving another phase is not a candidate, even when its plan holds the extent: the
+    /// phase is what a batch names, and a plan alone cannot move work to another phase's runner.
+    #[test]
+    fn a_runner_of_another_phase_is_not_a_candidate() {
+        let denoising = ipc::PhaseId(3);
+        let encoding = ipc::PhaseId(1);
+        let runners = vec![named(1, encoding, vec![Bucket::denoise(1, layout(32))])];
+
+        assert!(
+            server_of(&runners, denoising, &step(layout(32))).is_err(),
+            "a plan of the phase's extent is not enough without the phase"
+        );
+    }
+
+    /// Two claims on one computation are refused naming both, because a device that serves a shape
+    /// twice cannot choose: one of the two graphs was planned for something else.
+    #[test]
+    fn two_claims_on_one_computation_are_refused_naming_both() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![
+            named(1, phase, vec![Bucket::denoise(1, layout(32))]),
+            named(2, phase, vec![Bucket::denoise(2, layout(32))]),
+        ];
+
+        let refusal = server_of(&runners, phase, &step(layout(32)))
+            .expect_err("two plans claim one computation")
+            .to_string();
+        assert!(
+            refusal.contains("runners 1, 2 all claim"),
+            "the refusal names both runners in id order: {refusal}"
+        );
     }
 }
