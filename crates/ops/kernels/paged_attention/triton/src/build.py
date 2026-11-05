@@ -11,7 +11,7 @@ if it were dense, would be right only by accident.
 """
 
 import _compile
-import paged_attention_decode as kernels
+import paged_attention as kernels
 
 #: The element types a cache plane may have, as Triton spells them.
 PLANES = {"bf16": "bf16", "f16": "fp16", "f8e4m3": "fp8e4nv"}
@@ -25,13 +25,27 @@ def warps_of(page, head_dim):
     return 8 if page * head_dim >= 8192 else 4
 
 
+#: The strides and extents both kernels take, in the order the operator packs them.
+STRIDES = (
+    "q_stride_tokens",
+    "q_stride_heads",
+    "q_stride_dim",
+    "k_stride_pages",
+    "k_stride_tokens",
+    "k_stride_heads",
+    "k_stride_dim",
+    "v_stride_pages",
+    "v_stride_tokens",
+    "v_stride_heads",
+    "v_stride_dim",
+    "o_stride_tokens",
+    "o_stride_heads",
+    "o_stride_dim",
+)
+
+
 def spec(fields, parameters, target):
     """The compilation of one paged_attention descriptor."""
-    if fields["phase"] != "decode":
-        raise SystemExit(
-            "paged_attention/triton serves the decode phase only; the prefill row is a second "
-            "landing and is not compiled here"
-        )
     page = int(fields["page"])
     head_dim = int(fields["head_dim"])
     q_heads = int(fields["q_heads"])
@@ -45,49 +59,40 @@ def spec(fields, parameters, target):
     plane = PLANES[fields["kv"]]
     activation = ACTIVATIONS[fields["dtype"]]
     out = ACTIVATIONS[fields["out"]]
+    prefill = fields["phase"] == "prefill"
+    parameters_of = {
+        "out_ptr": "*" + out,
+        "query_ptr": "*" + activation,
+        "key_ptr": "*" + plane,
+        "value_ptr": "*" + plane,
+        # The scales are read only when the cache is quantized; a dense call passes the null
+        # pointer the operator states, and the program's `QUANTIZED` branch never touches it.
+        "key_scale_ptr": "*fp32",
+        "value_scale_ptr": "*fp32",
+        "page_table_ptr": "*i32",
+        "seq_lens_ptr": "*i32",
+    }
+    parameters_of.update({name: "i32" for name in STRIDES})
+    parameters_of.update({"max_pages": "i32", "page_size": "i32", "softmax_scale": "fp32"})
+    if prefill:
+        # The prefill program reads a row's first query token and whether the batch is packed; the
+        # decode program has one query token per table row and needs neither.
+        parameters_of.update(
+            {"cum_seq_lens_q_ptr": "*i32", "max_q_len": "i32", "packed": "i32"}
+        )
+    constexprs = {
+        "HEAD_DIM": head_dim,
+        "PAGE": page,
+        "GROUP": q_heads // kv_heads,
+        "QUANTIZED": quantized,
+        "OUT_BF16": fields["out"] == "bf16",
+    }
     return {
-        "kernel": kernels._paged_attention_decode_kernel,
-        "signature": {
-            "out_ptr": "*" + out,
-            "query_ptr": "*" + activation,
-            "key_ptr": "*" + plane,
-            "value_ptr": "*" + plane,
-            # The scales are read only when the cache is quantized; a dense call passes the null
-            # pointer the operator states, and the program's `QUANTIZED` branch never touches it.
-            "key_scale_ptr": "*fp32",
-            "value_scale_ptr": "*fp32",
-            "page_table_ptr": "*i32",
-            "seq_lens_ptr": "*i32",
-            "q_stride_tokens": "i32",
-            "q_stride_heads": "i32",
-            "q_stride_dim": "i32",
-            "k_stride_pages": "i32",
-            "k_stride_tokens": "i32",
-            "k_stride_heads": "i32",
-            "k_stride_dim": "i32",
-            "v_stride_pages": "i32",
-            "v_stride_tokens": "i32",
-            "v_stride_heads": "i32",
-            "v_stride_dim": "i32",
-            "o_stride_tokens": "i32",
-            "o_stride_heads": "i32",
-            "o_stride_dim": "i32",
-            "max_pages": "i32",
-            "page_size": "i32",
-            "softmax_scale": "fp32",
-            "HEAD_DIM": "constexpr",
-            "PAGE": "constexpr",
-            "GROUP": "constexpr",
-            "QUANTIZED": "constexpr",
-            "OUT_BF16": "constexpr",
-        },
-        "constexprs": {
-            "HEAD_DIM": head_dim,
-            "PAGE": page,
-            "GROUP": q_heads // kv_heads,
-            "QUANTIZED": quantized,
-            "OUT_BF16": fields["out"] == "bf16",
-        },
+        "kernel": kernels._paged_attention_prefill_kernel
+        if prefill
+        else kernels._paged_attention_decode_kernel,
+        "signature": parameters_of,
+        "constexprs": constexprs,
         # No `launch_pdl` option: this descriptor states no `pdl` field — the operator's key for the
         # quantized cache ends at `len` — so a program that read one would be compiling a word the
         # key never carries.

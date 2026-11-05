@@ -54,7 +54,7 @@ SET = 0.0625  # the softmax scale a device's `1/sqrt(head_dim)` would be, kept e
 def load_kernel(package):
     """The package's kernel, imported from its source directory."""
     del package  # the check's own location is the package's, wherever it is run from
-    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "paged_attention_decode.py"
+    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "paged_attention.py"
     spec = importlib.util.spec_from_file_location("paged_attention_kernel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

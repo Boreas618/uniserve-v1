@@ -707,6 +707,8 @@ impl Op for PagedAttention {
                 q_heads,
                 kv_heads,
                 page_size,
+                tokens,
+                max_q_len,
                 stream,
             );
         }
@@ -804,17 +806,10 @@ impl PagedAttention {
         q_heads: u64,
         kv_heads: u64,
         page_size: u64,
+        tokens: u64,
+        max_q_len: u64,
         stream: &Stream,
     ) -> Result<()> {
-        if descriptor.phase != Phase::Decode {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the Triton program decodes one query row per table row; this call is {:?}",
-                    descriptor.phase
-                ),
-            ));
-        }
         if descriptor.key_value != DType::F8E4M3 {
             return Err(Error::argument(
                 Self::NAME,
@@ -888,14 +883,28 @@ impl PagedAttention {
             .i32(word("the page table's width", args.page_table.shape.dim(1))?)
             .i32(word("the page size", page_size)?)
             .f32(args.scale);
+        if descriptor.phase == Phase::Prefill {
+            // A packed batch states each row's first query token; an unpacked one gives every row
+            // `max_q_len`, which the program derives from the row index.
+            let packed = args.cum_seq_lens_q.numel() > 0;
+            // The view is passed whether or not the batch is packed: `packed` is what the program
+            // branches on, and an unpacked call leaves the pointer unread.
+            arguments
+                .view(args.cum_seq_lens_q)
+                .i32(word("the longest query row", max_q_len)?)
+                .i32(i32::from(packed));
+        }
 
-        // One program per (query row, query head): the row is a table row at decode, and the head
-        // decides the key-value head the program reads.
-        kernel.launch(
-            LaunchGrid::new([batch, q_heads, 1])?,
-            &mut arguments,
-            stream,
-        )
+        // One program per (query row, query head): at decode a table row is one query token, and at
+        // prefill the row's query tokens are its first grid dimension. The head decides the
+        // key-value head the program reads.
+        let grid = match descriptor.phase {
+            Phase::Decode => LaunchGrid::new([batch, q_heads, 1])?,
+            // Over the packed token count rather than a row's length: the longest row is only known
+            // from the offsets on the device, so a shorter row's tiles return before reading a page.
+            Phase::Prefill => LaunchGrid::new([tokens, q_heads, batch])?,
+        };
+        kernel.launch(grid, &mut arguments, stream)
     }
 }
 
