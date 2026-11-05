@@ -19,7 +19,6 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
-use proto::request::ModelDtype;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -136,9 +135,7 @@ pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_s
 /// The build is blocking and its thread cannot be cancelled; the thread is left
 /// to finish rather than joined, which is what a test fixture can do and a
 /// service cannot.
-pub(crate) fn packaged_policy(
-    capacity: engine::BatchCapacity,
-) -> (engine::PolicyProgram, Vec<u8>) {
+pub(crate) fn packaged_policy(capacity: engine::BatchCapacity) -> (engine::PolicyProgram, Vec<u8>) {
     let (answered, answer) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = answered.send(engine::packaged_policy(capacity));
