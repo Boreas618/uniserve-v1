@@ -36,7 +36,7 @@ use nn::{Block, BlockName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::audio_vae::AudioDecoder;
+use crate::audio_vae::BigVgan;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
 use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
@@ -66,7 +66,7 @@ pub struct MinimaxH3 {
     transformer_ref: Option<Arc<Denoiser>>,
     video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>>,
     video_decoder: Option<Arc<crate::video_vae::VideoDecoder>>,
-    audio_decoder: Option<Arc<AudioDecoder>>,
+    audio_decoder: Option<Arc<BigVgan>>,
 }
 
 impl std::fmt::Debug for MinimaxH3 {
@@ -99,7 +99,7 @@ impl std::fmt::Debug for MinimaxH3 {
             )
             .field(
                 "audio_decoder",
-                &self.audio_decoder.as_ref().map(|_| "AudioDecoder"),
+                &self.audio_decoder.as_ref().map(|_| "BigVgan"),
             )
             .finish()
     }
@@ -146,7 +146,7 @@ impl MinimaxH3 {
     }
 
     /// The audio decoder, when this rank places it.
-    pub fn audio_decoder(&self) -> Option<&Arc<AudioDecoder>> {
+    pub fn audio_decoder(&self) -> Option<&Arc<BigVgan>> {
         self.audio_decoder.as_ref()
     }
 }
@@ -671,7 +671,7 @@ pub fn load(
     let mut transformer_ref: Option<Arc<Denoiser>> = None;
     let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
     let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
-    let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
+    let mut audio_decoder: Option<Arc<BigVgan>> = None;
     for component in partition.blocks.iter() {
         let block = match component {
             Component::TextEncoder => {
@@ -819,13 +819,13 @@ pub fn load(
                 let source = checkpoint.component("audio_vae")?;
                 require(
                     source,
-                    &AudioDecoder::keys(&config.audio_vae)?,
+                    &BigVgan::keys(&config.audio_vae)?,
                     component.name(),
                     "decoder",
                     "audio_vae",
                 )?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
+                let decoder = Arc::new(BigVgan::load(&config.audio_vae, &mut shards)?);
                 audio_decoder = Some(Arc::clone(&decoder));
                 Block::Decoder(decoder)
             }
