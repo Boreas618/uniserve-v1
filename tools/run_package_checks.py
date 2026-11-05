@@ -105,11 +105,12 @@ SHARED_CHECKS = ("modulation_check.py",)
 #: store this check is `unrunnable` and says so.
 #:
 #: The store is one this runner is **given**, never one it builds: a second store for one run is two
-#: statements of one thing. Each entry is `(tool, invocations, options it needs)`, and a tool may need
-#: more than one invocation to cover its subject: `kernel_arguments.py` compares a cubin cell against
-#: its recorded signature by default and a native cell's C entry against the Rust structure that
-#: mirrors it only under `--native`, so the deployment's cells are compared in two passes and one
-#: verdict - 131 cells and 21 call structures of the H3 deployment, which is all 152 of them.
+#: statements of one thing. Each entry is `(tool, invocations, options it needs)`, and a tool may
+#: need more than one invocation to cover its subject: `kernel_arguments.py` compares a cubin cell
+#: against its recorded signature under `--check`, and a native package's C entry against the Rust
+#: structure that mirrors it under `--native`. `--native` also early-returns and needs no store, so
+#: one invocation carrying both modes compares no cell at all - the two passes are two invocations
+#: and one verdict: 131 cells and 21 call structures of the H3 deployment, which is all 152 of them.
 TREE_CHECKS = (
     ("kernel_arguments.py", (("--check",), ("--check", "--native")), ("--fixture", "--store")),
 )
@@ -509,7 +510,7 @@ def main():
             outcomes["unrunnable"].append(
                 (
                     f"tools/{name}",
-                    f"the store under --store holds no built cell, so there is nothing to compare",
+                    "the store under --store holds no built cell, so there is nothing to compare",
                     "",
                 )
             )

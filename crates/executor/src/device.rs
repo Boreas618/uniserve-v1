@@ -631,9 +631,27 @@ impl Device {
                 );
                 continue;
             }
-            let result = self.serve(&entry);
+            // The work in flight is this device thread's knowledge alone, and it is gone the moment
+            // the command ends: a fault that names its batch number and nothing else costs a hunt,
+            // so the activity travels inside the failure itself (and in its own log line).
+            let activity = self
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let result = self
+                .serve(&entry)
+                .map_err(|error| match &activity {
+                    Some(activity) => Error::in_flight(activity.clone(), error),
+                    None => error,
+                });
             if let Err(error) = &result {
-                tracing::warn!(%error, device = self.device.0, "a device command failed");
+                tracing::warn!(
+                    %error,
+                    activity = activity.as_deref().unwrap_or("no work in flight"),
+                    device = self.device.0,
+                    "a device command failed"
+                );
             }
             if matches!(result, Ok(Step::Requeued)) {
                 // The entry put the rest of its command at the tail; its submission waits for the
