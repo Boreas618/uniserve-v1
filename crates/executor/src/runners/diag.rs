@@ -262,16 +262,21 @@ mod tests {
         assert_eq!(bytes, half.to_le_bytes().to_vec());
     }
 
-    /// The refusal names the element type as `DType`'s own `Display` spells it - `i32`, not `I32`:
-    /// the message and the test were written against two different spellings of one value, and the
-    /// message is the one a reader sees.
+    /// A type that cannot be written as a `.npy` is refused with the type's own name, and the name
+    /// is `DType`'s rendering - lower case, the same one every other refusal in the tree prints. The
+    /// test pinned the name in capitals, which is what the type printed before `Debug` was made to
+    /// agree with `Display`; the refusal itself never lost its reason.
     #[test]
     fn a_type_that_is_not_a_float_cannot_be_a_dump() {
         let error = widen(DType::I32, &[0u8; 4]).unwrap_err();
-        let refusal = format!("{error}");
+        let text = format!("{error}");
         assert!(
-            refusal.contains("a dump is `f4` or `f2` and this tensor is i32"),
-            "the refusal names the type as the type spells itself: {refusal}"
+            text.contains("a dump is `f4` or `f2`"),
+            "the refusal no longer says what a dump may be: {text}"
+        );
+        assert!(
+            text.contains(&format!("this tensor is {}", DType::I32)),
+            "the refusal does not name the type it was given: {text}"
         );
     }
 }
