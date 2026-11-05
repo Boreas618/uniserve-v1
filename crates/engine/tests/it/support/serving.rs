@@ -24,6 +24,15 @@ pub(crate) struct Serving {
     /// mechanism asked for is half of what a case observes.
     submitted: Mutex<Vec<Batch>>,
     next: Mutex<u64>,
+    /// Whether a call's token follows the cache extent its row states rather
+    /// than its position in the batch.
+    ///
+    /// A positional token makes every batch look alike; a token that follows
+    /// the extent is a function of the request's history as the mechanism
+    /// states it, which is what a case about continuing a request needs: a
+    /// continuation from three generated tokens samples what the uninterrupted
+    /// request sampled fourth.
+    by_extent: bool,
 }
 
 impl Serving {
@@ -32,6 +41,17 @@ impl Serving {
             inventory,
             submitted: Mutex::new(Vec::new()),
             next: Mutex::new(1),
+            by_extent: false,
+        }
+    }
+
+    /// A pool whose sampled token follows each call's cache extent: the same
+    /// request continued from a successor samples what it would have sampled
+    /// uninterrupted.
+    pub(crate) fn by_extent(inventory: Vec<Inventory>) -> Self {
+        Self {
+            by_extent: true,
+            ..Self::new(inventory)
         }
     }
 
@@ -63,7 +83,11 @@ impl Serving {
                     .max(0) as u32;
                 CallOutput::completed(
                     *call,
-                    vec![SAMPLED + index as u32],
+                    vec![if self.by_extent {
+                        SAMPLED + seen
+                    } else {
+                        SAMPLED + index as u32
+                    }],
                     RowState {
                         // Text carries no denoising trajectory: the step index
                         // is a media row's, and this pool serves forwards.
