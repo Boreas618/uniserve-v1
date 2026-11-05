@@ -29,7 +29,7 @@ What the table states, in the order it states it:
     python crates/models/minimax-h3/tools/compare_stack.py \
         --ours artifacts/h3-stage1/denoiser \
         --ref artifacts/h3-stage1-reference/denoiser \
-        --out artifacts/diagnosis/minimax-h3/dit
+        --out artifacts/diagnosis/minimax-h3/dit/stack
     python crates/models/minimax-h3/tools/compare_stack.py --self-test
 
 It needs NumPy only: the harness is proved without a device before any checkpoint is loaded.
@@ -329,7 +329,7 @@ def markdown(table: dict[str, object], commit: str, checkpoint: str) -> str:
         "python crates/models/minimax-h3/tools/compare_stack.py \\",
         "    --ours artifacts/h3-stage1/denoiser \\",
         "    --ref artifacts/h3-stage1-reference/denoiser \\",
-        "    --out artifacts/diagnosis/minimax-h3/dit",
+        "    --out artifacts/diagnosis/minimax-h3/dit/stack",
         "```",
         "",
         "Both producers state the checkpoint as their flag's value; the commit is the tree that ran"
@@ -491,7 +491,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--ref", type=pathlib.Path, default=pathlib.Path("artifacts/h3-stage1-reference/denoiser")
     )
-    parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("artifacts/diagnosis/minimax-h3/dit"))
+    parser.add_argument(
+        "--out",
+        type=pathlib.Path,
+        default=pathlib.Path("artifacts/diagnosis/minimax-h3/dit/stack"),
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
