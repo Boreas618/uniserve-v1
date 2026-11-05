@@ -634,6 +634,7 @@ pub(crate) fn run_leader(
         while let Ok((request, answer)) = requests.try_recv() {
             match route(
                 EPOCH_ENGINE,
+                EPOCH_ENGINE,
                 &request,
                 host,
                 &mut local,
@@ -815,6 +816,7 @@ pub(crate) fn run_leader(
                         kind: Some(upstream::Kind::Request(request)),
                     })) => {
                         if let Some(reply) = route(
+                            engine,
                             peer.owner,
                             &request,
                             host,
@@ -857,6 +859,7 @@ pub(crate) fn run_leader(
                         kind: Some(upstream::Kind::Request(request)),
                     })) => {
                         if let Some(reply) = route(
+                            client,
                             EPOCH_ENGINE,
                             &request,
                             host,
@@ -1084,8 +1087,14 @@ fn answer(
 /// node's daemon otherwise, whose answer comes back later. A stop applies to
 /// every node and is answered once every node stopped the group: it waits in
 /// `stops` for the members' answers.
+///
+/// `engine` is the connection the answer goes back down, and `owner` the
+/// process the request is answered *for* — the engine number a process states,
+/// or the epoch's own owner for a client. They differ for a client, which holds
+/// no engine number but whose launches are answered for the deployment.
 fn route(
     engine: u64,
+    owner: u64,
     request: &Request,
     host: &str,
     local: &mut Local,
@@ -1132,14 +1141,14 @@ fn route(
                 .iter_mut()
                 .filter_map(|member| forward(member).then_some(member.node_rank))
                 .collect();
-            let reply = local.answer(engine, request);
+            let reply = local.answer(owner, request);
             if awaiting.is_empty() {
                 return Some(reply);
             }
             stops.insert((engine, request.id), PendingStop { reply, awaiting });
             None
         }
-        Some(target) if target == host => Some(local.answer(engine, request)),
+        Some(target) if target == host => Some(local.answer(owner, request)),
         Some(target) => match members.iter_mut().find(|member| member.host == target) {
             Some(member) => {
                 if forward(member) {
