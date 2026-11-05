@@ -1302,6 +1302,19 @@ impl<'a> WeightLoader<'a> {
                         .to_owned(),
                 ));
             }
+            // The block scales are the second way a product answers zeros for every activation:
+            // an E4M3 scale of zero multiplies its whole block to zero whatever the codes are. One
+            // zero scale is legitimate (a block whose values are all zero); every scale zero is a
+            // calibration that did not run, and it is invisible in the values themselves.
+            let file_scales = self.shards()?.read(&scales.tensor)?;
+            if file_scales.bytes.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    &scales.tensor,
+                    "every block scale is zero: the product would answer zeros for every \
+                     activation whatever the codes hold, so this tensor's calibration did not run"
+                        .to_owned(),
+                ));
+            }
         }
         // The file's arrangement and the product's are two statements, and the permutation between
         // them happens here once: a kernel must never read a table under a claim it does not meet.
