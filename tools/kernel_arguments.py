@@ -357,17 +357,22 @@ def sweep(
                 for name in stated
                 if not _native_package(KERNELS / op / name)
             ]
-            backend = (
-                triton[0]
-                if len(triton) == 1
-                else (stated[0] if len(stated) == 1 else "triton")
-            )
+            if len(triton) == 1:
+                backend = triton[0]
+            elif len(stated) == 1:
+                backend = stated[0]
+            else:
+                # No backend can be named for this row: either every backend the operator states
+                # is native, or several Triton ones exist and the row does not say which. Guessing
+                # `triton` invented a package name and reported "no built cell" for a native
+                # operator, so an unattributable row says so instead.
+                backend = None
             finding = f"{op} (backends: {', '.join(stated)})"
         else:
             finding = f"{op}/{backend}"
-        package = KERNELS / op / backend
+        package = KERNELS / op / backend if backend else KERNELS / op
         build = package / "src/build.py"
-        cell = store / op / backend
+        cell = store / op / (backend or ".")
         recorded = sorted(cell.glob(f"*/{target}/{descriptor}/metadata.json"))
         if not recorded:
             # A native package records no Triton metadata: its parameters are its entry's C
@@ -377,6 +382,13 @@ def sweep(
                 gaps.append(
                     f"{finding} {descriptor}: a native cell, whose parameters are its "
                     f"entry's C declaration rather than a recorded signature"
+                )
+            elif backend is None:
+                # The row names no backend and the operator states none a cell could be read from,
+                # so the honest report is that the row is unattributable rather than unbuilt.
+                gaps.append(
+                    f"{finding} {descriptor}: the row names no backend, and the store holds no "
+                    f"cell for it under any backend the operator states"
                 )
             elif _native_package(package):
                 # A native package is not a Triton cell, so no build produces a `metadata.json` for
