@@ -79,6 +79,22 @@ impl Column {
             ops::Shape::new(&[elements.end - elements.start]),
         )
     }
+
+    /// The column's head, in `shape`, as a view the batch reads.
+    ///
+    /// A batch's own state is not a flat extent: the sampler's parameters are
+    /// `[rows, PARAMETER_COLUMNS]`, and a bucket narrower than the largest reads its rows from the
+    /// column's head. Both views name the same base pointer, which is what a captured graph
+    /// addresses, so the two differ in shape alone.
+    pub(crate) fn shaped(&self, shape: &[u64]) -> TensorView {
+        debug_assert!(
+            shape.iter().product::<u64>() <= self.device.shape.dim(0),
+            "a shaped view of {} elements does not fit a column of {}",
+            shape.iter().product::<u64>(),
+            self.device.shape.dim(0)
+        );
+        TensorView::new(self.device.ptr, self.device.dtype, ops::Shape::new(shape))
+    }
 }
 
 /// `values` as the bytes of the column's element type, in the host's byte order.
