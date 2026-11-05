@@ -1353,11 +1353,12 @@ def _restart_while_streaming(
         # Three streams open at once is the first place the deployment serves
         # more than one request at a time; a stop here is the engine's own
         # account of what it did with them, not a number of seconds.
-        # The log excerpts come first and the verdict last: the harness keeps
-        # the end of this output, so a long tail in front of the verdict is
-        # what drops the counts and the threads' own errors from the artifact.
+        # Order is what survives: the harness keeps the end of this output, so
+        # the verdict and the warnings/errors come last and the long tail
+        # first. With the excerpts reversed, the last two runs' artifacts held
+        # thirty lines of graph captures and none of the engine's death.
         raise AssertionError(
-            f"{_log_trouble(log)}{log_tail(log, 80)}"
+            f"{log_tail(log, 30)}{_log_trouble(log)}"
             f"\n{error} (counts so far: {[len(read) for read in reads]}; "
             f"stream errors: {[repr(one) for one in errors]})"
         ) from error
