@@ -845,6 +845,14 @@ impl<'a> WeightLoader<'a> {
     /// model's `load` driven by a **recording** forward (`Forward::recording`): the shapes a load
     /// derives are what decide the programs a model launches, and the values never reach a kernel. So
     /// a walk of a model's programs needs no shards and no device.
+    /// The checkpoint this loader reads, when it reads one.
+    ///
+    /// A shapes-only loader has none: it states extents and reads nothing, so a caller that needs a
+    /// fact only a shard holds must say what it does without it.
+    pub fn checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoint
+    }
+
     pub fn shapes(dtype: DType) -> Self {
         Self::stated(dtype, None)
     }
