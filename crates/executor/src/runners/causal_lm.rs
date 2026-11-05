@@ -3907,7 +3907,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             max_kv_len: self.geometry.max_kv_len,
         };
         self.staging
-            .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
+            .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
     }
 
 }
@@ -4068,6 +4068,20 @@ pub fn calls_output(
 /// would describe a batch no serving batch has - and a capture states its pose to the model for the
 /// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
 /// bucket's tokens.
+/// The call ids of a bucket's warm pose: one per call `warm_calls` states.
+///
+/// `Staging::stage` refuses a pose whose call ids do not name every call of its rows, and a decode
+/// bucket's warm pose states one call per row - so a single `CallId(0)` is a pose of one call
+/// wearing eight. The ids are positional: a call's id names its slot in the batch's tables, and a
+/// warm pose has no request to carry one.
+fn warm_call_ids(bucket: Bucket) -> Vec<CallId> {
+    warm_calls(bucket)
+        .into_iter()
+        .enumerate()
+        .map(|(index, _)| CallId(index as u64))
+        .collect()
+}
+
 fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
     let rows = bucket.rows;
     if bucket.variant.is_decode() {
