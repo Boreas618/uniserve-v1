@@ -86,6 +86,11 @@ struct Request {
     root: PathBuf,
     clip: u32,
     raster: (u32, u32),
+    /// **Every canvas the recording claims.** One canvas certifies one canvas: the encoder's pad and
+    /// reduction classes are derived from a frame's extent, and a harness that drives the largest
+    /// raster alone leaves the smallest classes unexercised - and the classes the model launches at
+    /// them invisible. The first entry is `raster`, which the header and the other harnesses read.
+    rasters: Vec<(u32, u32)>,
     /// The deployment's own bounded packed-row count (`Layouts::rows_bound`), which serving reads and
     /// the attention is compiled for. Derived once here so the header and the harness cannot differ.
     bound: u32,
@@ -121,6 +126,10 @@ fn run() -> Result<(), String> {
     let mut component = String::from("all");
     let mut clip = 256u32;
     let mut raster = (480u32, 832u32);
+    // **One canvas by default, and every `--raster` given is claimed.** A recorder over one canvas
+    // certifies one canvas, so the output states which ones it drove; a caller that wants the
+    // deployment's extremes passes both, and the classes each one reaches are then visible.
+    let mut claimed: Vec<(u32, u32)> = Vec::new();
     // No default: the bounded count is the deployment's own (`Layouts::rows_bound`) and serving
     // reads it. A stated value is a claim the denoiser harness checks against it.
     let mut rows: Option<u32> = None;
@@ -147,10 +156,14 @@ fn run() -> Result<(), String> {
             "--raster" => {
                 let stated = value()?;
                 let (w, h) = stated.split_once('x').ok_or("--raster is <width>x<height>")?;
-                raster = (
+                let pair = (
                     w.parse().map_err(|_| "--raster's width is a count")?,
                     h.parse().map_err(|_| "--raster's height is a count")?,
                 );
+                claimed.push(pair);
+                if claimed.len() == 1 {
+                    raster = pair;
+                }
             }
             "--rows" => rows = Some(value()?.parse().map_err(|_| "--rows is a count")?),
             "--tokens" => tokens = value()?.parse().map_err(|_| "--tokens is a count")?,
@@ -226,6 +239,7 @@ fn run() -> Result<(), String> {
         bound,
         clip,
         raster,
+        rasters: if claimed.is_empty() { vec![raster] } else { claimed },
         tokens,
         track,
         elements,
@@ -297,13 +311,19 @@ fn run() -> Result<(), String> {
     // with this recorder's numbers in it: a print from here is a fixture's source on a machine with no
     // device and no shard, which is what makes the walk the second enumeration rather than the first.
     println!(
-        "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [({}, {})], prompt lengths: [{}], \
+        "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [{}], prompt lengths: [{}], \
          packed rows: [{}], trajectory elements: [{}], element types: {}, sparse attention: \
          {:?}, tensor-parallel degree 1, ulysses degree 1 - recorded from the model's own \
          forward at {}",
         request.clip,
-        request.raster.0,
-        request.raster.1,
+        // **The canvases this recording claims**, not the one the other harnesses read: a count is a
+        // statement about the scope beside it, and one canvas certifies one canvas.
+        request
+            .rasters
+            .iter()
+            .map(|(width, height)| format!("{width}x{height}"))
+            .collect::<Vec<_>>()
+            .join(", "),
         request.tokens,
         request.bound,
         request.elements,
@@ -476,13 +496,13 @@ fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     // `--raster <height>x<width>` is the walk's own convention (`programs.rs --rasters`), so the pixel
     // tensor's two spatial axes are the pair in that order.
-    let (height, width) = request.raster;
-    // **Both frame counts the walk states.** The encoder reads one still or one clip, and its
+    // **Both frame counts and every canvas the recording claims.** The encoder reads one still or one clip, and its
     // temporal stack's levels exist only for the clip: a harness that drives a single frame records
     // no launch of them, which is how the walk's `for frames in [1, clip.frames]` came to state
     // levels nothing confirmed. The stack states the clip's length.
     let stack = minimax_h3::encoding::Stack::of(&config).map_err(|error| error.to_string())?;
     let mut recorded = Recorded::default();
+    for (height, width) in request.rasters.clone() {
     for frames in [1, stack.clip.frames] {
         let latency = encoder.latent_frames(frames).map_err(|error| error.to_string())?;
         // The encoder's arithmetic is FP32 whatever the deployment's sample type is (`nn` refuses a
@@ -510,6 +530,7 @@ fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         let run = encoder.encode(&forward, pixels, moments);
         ops::capture::set_sink(None);
         run.map_err(|error| error.to_string())?;
+    }
     }
     Ok(recorded.0)
 }
