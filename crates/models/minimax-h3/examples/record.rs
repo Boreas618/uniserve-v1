@@ -164,7 +164,15 @@ fn run() -> Result<(), String> {
         match argument.as_str() {
             "--root" => root = PathBuf::from(value()?),
             "--component" => component = value()?,
-            "--clip" => clip = value()?.parse().map_err(|_| "clip is a count of frames")?,
+            "--clip" => {
+                let frames: u32 = value()?.parse().map_err(|_| "clip is a count of frames")?;
+                // A clip is `17n + 5` frames and the packing accepts no other, so a recorder driven at
+                // one would record a deployment the sampler cannot be handed. The rule is
+                // `decoding::clips`' and this calls it rather than restating it: the walk refuses by
+                // the same function, which is what keeps the two enumerations at one invocation.
+                minimax_h3::decoding::clips(frames).map_err(|error| error.to_string())?;
+                clip = frames;
+            }
             "--raster" => {
                 let stated = value()?;
                 // **The walk's own order: height first.** `programs.rs --rasters` splits `HxW`, and
