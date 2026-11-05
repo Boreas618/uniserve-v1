@@ -1030,6 +1030,15 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         .get(&Dit::Base)
         .ok_or("this checkpoint holds no base network")?
         .clone();
+    // **The sparse deployment's attention kind, as `denoiser` applies it.** Without this the
+    // conditioned harness drove the dense stack whatever `--sparse` said, so a recording of the
+    // conditioned deployment stated no `vsa_*` row at all while the plain harness launched six of
+    // them: the model wires VSA and the instrument was reading the other backend.
+    let mut network = network;
+    if let Some((tile, sparsity, reference_keep)) = request.sparse {
+        network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
+            .map_err(|error| error.to_string())?;
+    }
     let config_hidden = network.transformer.hidden_size;
     let (height, width) = request.raster;
     let partition = Partition {
