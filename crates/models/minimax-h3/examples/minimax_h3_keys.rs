@@ -109,12 +109,6 @@ const DECODER_DIM: u32 = 1024;
 /// The audio VAE decoder's upsampling rates: seven stages of the 800× total.
 const DECODER_RATES: [u32; 7] = [5, 5, 2, 2, 2, 2, 2];
 
-/// The audio VAE encoder's initial width (`encoder_dim`).
-const ENCODER_DIM: u32 = 64;
-
-/// The audio VAE encoder's strides: five blocks.
-const ENCODER_RATES: [u32; 5] = [2, 4, 4, 5, 5];
-
 /// The alias-free activation wrapper's upsampling ratio (`Activation1d(ratio=2)`).
 const ACTIVATION_RATIO: u32 = 2;
 
@@ -613,36 +607,8 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // same seven widths (its `act_and_mul` row), and nothing in the crate constructs a
     // `snake_beta` descriptor - a row for it compiles a program no launch asks for.
 
-    // `snake` is the encoder's: one linear parameter, used by the DAC residual units and encoder
-    // blocks (`:229`, `:231`, `:252`, `:278`, and `audio_vae.py:321`-`471`). **A stage runs its
-    // Snake at the width it takes in and doubles on the way out** (`EncoderStage.inner` is "half the
-    // stage's output width"), and the network ends with one more Snake at the doubled width - six
-    // widths over five rates, not five. Doubling before the push lost the narrowest one, and with it
-    // the encoder's first stage.
-    let mut encoder_channels = ENCODER_DIM;
-    for _ in ENCODER_RATES {
-        push(
-            "snake",
-            ops::snake::Descriptor {
-                dtype: DType::F32,
-                channels: encoder_channels,
-                block: ELEMENTWISE_BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-        encoder_channels *= 2;
-    }
-    push(
-        "snake",
-        ops::snake::Descriptor {
-            dtype: DType::F32,
-            channels: encoder_channels,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // `snake` is the audio encoder's and `audio_activation` the decoder's; both are stated by
+    // `programs::Deployment::vae_rows`, which reads the widths from the networks' own rate ladders.
 
     // The decoder's upsamplers are the reference's `Activation1d` - a replicate pad, a transposed
     // convolution of stride 2, a low-pass of the same ratio - and **this model states them as those
@@ -1031,16 +997,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     }
     // The sampler's own crossing: the velocity is FP32 like the sample it advances, so the head's
     // output unpatchifies without the decoder's per-channel denormalization.
-    push(
-        "unpatchify_video",
-        ops::unpatchify::Descriptor {
-            dtype: DType::F32,
-            affine: false,
-            block: UNPATCHIFY_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The register prefix and the zero tail are **not** `sequence_append`: the packed sequence is
     // built by `rows` and `copy_block`, and nothing in the crate constructs `sequence_append`'s
     // descriptor. A row for it compiles a program no launch asks for.
@@ -1182,14 +1138,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // conditioner reads, through its FP16 round trip. One row: the chain is fixed and in f32 by the
     // reference, so the only thing the key can name is the operator's own tiling -- and the two
     // launches the conditioned path makes (it does not use programmatic dependent launch) share it.
-    push(
-        "posterior",
-        ops::posterior::Descriptor {
-            block: ops::posterior::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     //
     // One launch per block activation, and each stage's blocks run at the stage's own width - the
@@ -1330,15 +1278,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     );
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
-    push(
-        "pcm_interleave",
-        ops::pcm::Descriptor {
-            dtype: DType::F32,
-            block: ops::pcm::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The initial latent noise, in both element types: the request's draw is FP32 because the
     // reference's sample is (it refuses any other), and the conditioning path draws its own
     // conditions in the trace type.
@@ -1362,18 +1301,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // The pool is the projection's two fused reductions: `heads = num_attention_heads 8`, the head
     // width `latent_dim / heads = 256`, pooled to `latent_channels = 32` (`audio_vae.py:431-440`,
     // `audio_vae/config.json`).
-    push(
-        "adaptive_pool",
-        ops::adaptive_pool::Descriptor {
-            dtype: DType::F32,
-            heads: AUDIO_ATTENTION_HEADS,
-            width: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
-            output: AUDIO_LATENT_CHANNELS,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
     // The audio encoder's projection block: a **causal** attention and a **tanh-GELU** gated unit.
     //
     // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
@@ -1559,6 +1486,16 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // Its learned position table, bilinearly resampled from the 48 × 48 it was trained on to the
     // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
     // output's grid is the args' extent.
+    // Its learned position table, bilinearly resampled from the 48 x 48 it was trained on to the
+    // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
+    // output's grid is the args' extent.
+    //
+    // **This row is stated here, not derived from the tower's `programs`**, because the tower keys it
+    // on a token count while its grid is a second dimension: `VisionTower::programs(dtype, sequence)`
+    // states the table for the sequence it is handed, and the deployment's own table is the trained
+    // 48 x 48 whatever the prompt length is. Passing the prompt length and calling the result the
+    // deployment's table was the composite-number error this crate names - measured when the typed
+    // block was removed and these two rows left the list (282 against 284).
     push(
         "position_interpolate",
         ops::position::Descriptor {
@@ -1832,18 +1769,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         );
     }
     // Its per-frame group statistics over `norm_num_groups 32` with `norm_eps 1e-6`.
-    push(
-        "frame_moments",
-        ops::frame::FrameMomentsDescriptor {
-            dtype: DType::F32,
-            // The encoder's widest frame: four channels per group over a 1344x768 raster. The class
-            // is a declared bound and not a compilation, so it does not reach the key - the launch
-            // refuses a frame outside it.
-            reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
-            epsilon: ops::descriptor::Float::from(1e-6_f32),
-        }
-        .to_string(),
-    );
     // Its normalize-then-pad, with the affine parameters the checkpoint carries (`centered` is the
     // form without them) and `spatial_padding_mode reflect`. `single_pixel` is the descriptor's form
     // for a one-pixel raster, which needs no padding at all: both are listed because which one a
@@ -2245,16 +2170,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `AudioVAEEncoder` holds `[batch, channels, frames]` and its attention attends over frames, so
     // frames move to the leading axis before the qkv projection and back after it. Both extents are
     // launch values, so one row covers every clip length.
-    push(
-        "transpose",
-        ops::transpose::Descriptor {
-            dtype: DType::F32,
-            block: ops::transpose::TILE,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
-
     // Placing the rows a tower contributes into the sequence that reserved them. Four call sites
     // exist and each is in a layer of `crates/models/minimax-h3`, all of them at the layer crate's
     // one element block (its `rows.rs`'s `BLOCK`, 1024) and none on a dependent launch:
