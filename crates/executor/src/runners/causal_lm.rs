@@ -3093,7 +3093,35 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     None => out.push_str(" proj0=unreadable"),
                 },
                 Some(_) => out.push_str(" proj0=outside"),
-                None => out.push_str(" proj0=no-gemm-names-attention-output"),
+                None => {
+                    // Say who does name it, so a deployment whose projection is not called `gemm`
+                    // states that instead of leaving the absence unexplained.
+                    let mut named = Vec::new();
+                    for (operator, _, launches) in captured.nodes() {
+                        if *operator == "paged_attention" || named.contains(operator) {
+                            continue;
+                        }
+                        let carries = launches.iter().any(|launch| {
+                            captured
+                                .template()
+                                .kernel_node_params(&launch.node)
+                                .ok()
+                                .map(|params| {
+                                    params.parameters.iter().any(|blob| {
+                                        blob.chunks_exact(8).any(|word| {
+                                            u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]))
+                                                == layer0_out
+                                        })
+                                    })
+                                })
+                                .unwrap_or(false)
+                        });
+                        if carries {
+                            named.push(*operator);
+                        }
+                    }
+                    out.push_str(&format!(" proj0=no-gemm; names={}", named.join(",")));
+                }
             }
         }
 
