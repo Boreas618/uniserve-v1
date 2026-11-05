@@ -271,13 +271,14 @@ pub struct Prepared {
 /// The products one denoising step reads, in the order a refusal names them.
 ///
 /// The model states each kind's size through its `Layout`, so this list is the model's own list of
-/// what a step consumes and not a choice this runner makes.
+/// what a step consumes and not a choice this runner makes. The request's raw condition media is not
+/// among them: it is an input to the conditioning rather than a row of it, and it is per condition
+/// (`crate::runners::products`).
 const STEP_PRODUCTS: &[Product] = &[
     Product::Text,
     Product::Source,
     Product::Images,
     Product::Audio,
-    Product::Media,
     Product::Latents,
 ];
 
