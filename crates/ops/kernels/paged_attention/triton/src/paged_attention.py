@@ -132,3 +132,126 @@ def _paged_attention_decode_kernel(
         tl.store(out_offsets, result.to(tl.bfloat16))
     else:
         tl.store(out_offsets, result)
+
+
+@triton.jit
+def _paged_attention_prefill_kernel(
+    out_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    value_scale_ptr,
+    page_table_ptr,
+    seq_lens_ptr,
+    cum_seq_lens_q_ptr,
+    q_stride_tokens,
+    q_stride_heads,
+    q_stride_dim,
+    k_stride_pages,
+    k_stride_tokens,
+    k_stride_heads,
+    k_stride_dim,
+    v_stride_pages,
+    v_stride_tokens,
+    v_stride_heads,
+    v_stride_dim,
+    o_stride_tokens,
+    o_stride_heads,
+    o_stride_dim,
+    max_pages,
+    page_size,
+    softmax_scale,
+    max_q_len,
+    packed,
+    HEAD_DIM: tl.constexpr,
+    PAGE: tl.constexpr,
+    GROUP: tl.constexpr,
+    QUANTIZED: tl.constexpr,
+    OUT_BF16: tl.constexpr,
+):
+    """One query row of one batch row, over the pages its table names, causally.
+
+    The query row is a *position in its batch row*: the cache already holds that row's keys from
+    `kv_write`, so key `j` is position `j` and the causal mask is `j <= position`. A packed batch
+    states each row's first query token in `cum_seq_lens_q`; an unpacked one gives every row
+    `max_q_len` tokens, so the row's first token is `row * max_q_len`. Either way the output row is
+    `first + position`, which is what the operator's `[tokens, q_heads, head_dim]` view means.
+    """
+    position = tl.program_id(0)
+    head = tl.program_id(1)
+    row = tl.program_id(2)
+    kv_head = head // GROUP
+    dims = tl.arange(0, HEAD_DIM)
+    lanes = tl.arange(0, PAGE)
+
+    if packed != 0:
+        first = tl.load(cum_seq_lens_q_ptr + row)
+        length = tl.load(cum_seq_lens_q_ptr + row + 1) - first
+    else:
+        first = row * max_q_len
+        length = max_q_len
+    # A tile beyond the row's own length is padding: it returns before it reads a page.
+    if position >= length:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + row)
+    token = first + position
+    query = tl.load(
+        query_ptr + token * q_stride_tokens + head * q_stride_heads + dims * q_stride_dim
+    ).to(tl.float32)
+
+    running_max = tl.full((), float("-inf"), tl.float32)
+    running_sum = tl.zeros((), tl.float32)
+    accumulator = tl.zeros((HEAD_DIM,), tl.float32)
+
+    pages = tl.cdiv(seq_len, PAGE)
+    for index in range(0, pages):
+        page = tl.load(page_table_ptr + row * max_pages + index)
+        key_offsets = (
+            key_ptr
+            + page * k_stride_pages
+            + lanes[:, None] * k_stride_tokens
+            + kv_head * k_stride_heads
+            + dims[None, :] * k_stride_dim
+        )
+        value_offsets = (
+            value_ptr
+            + page * v_stride_pages
+            + lanes[:, None] * v_stride_tokens
+            + kv_head * v_stride_heads
+            + dims[None, :] * v_stride_dim
+        )
+        keys = tl.load(key_offsets)
+        values = tl.load(value_offsets)
+        if QUANTIZED:
+            key_scale = tl.load(key_scale_ptr + page)
+            value_scale = tl.load(value_scale_ptr + page)
+            keys = keys.to(tl.float32) * key_scale
+            values = values.to(tl.float32) * value_scale
+        else:
+            keys = keys.to(tl.float32)
+            values = values.to(tl.float32)
+
+        scores = tl.sum(keys * query[None, :], axis=1) * softmax_scale
+        # Two masks, one where: a key past the row's length is not there, and a key after this query
+        # row's position is in its future. The second is the causal mask and it is the whole
+        # difference from the decode program.
+        key_position = index * PAGE + lanes
+        visible = (key_position <= position) & (key_position < seq_len)
+        scores = tl.where(visible, scores, float("-inf"))
+
+        page_max = tl.max(scores, axis=0)
+        new_max = tl.maximum(running_max, page_max)
+        weights = tl.exp(scores - new_max)
+        correction = tl.exp(running_max - new_max)
+        running_sum = running_sum * correction + tl.sum(weights, axis=0)
+        accumulator = accumulator * correction + tl.sum(weights[:, None] * values, axis=0)
+        running_max = new_max
+
+    result = accumulator / running_sum
+    out_offsets = out_ptr + token * o_stride_tokens + head * o_stride_heads + dims * o_stride_dim
+    if OUT_BF16:
+        tl.store(out_offsets, result.to(tl.bfloat16))
+    else:
+        tl.store(out_offsets, result)
