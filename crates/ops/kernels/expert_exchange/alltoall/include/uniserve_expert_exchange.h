@@ -28,6 +28,11 @@ struct uniserve_exchange_dispatch_call {
   char error[512];
 };
 
+static_assert(offsetof(uniserve_exchange_dispatch_call, error) == 96,
+              "the call's error must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_exchange_dispatch_call) == 608,
+              "the call must be the size of the operator's layout");
+
 // A combine launch: the rows this rank received and processed, summed back into
 // its own rows.
 struct uniserve_exchange_combine_call {
@@ -44,6 +49,11 @@ struct uniserve_exchange_combine_call {
   int64_t dtype;
   char error[512];
 };
+
+static_assert(offsetof(uniserve_exchange_combine_call, error) == 88,
+              "the call's error must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_exchange_combine_call) == 600,
+              "the call must be the size of the operator's layout");
 
 // The executor's transport to the expert-parallel group, as a package sees it.
 // One instance per group: the executor creates it before the first transport
@@ -137,14 +147,6 @@ static_assert(offsetof(UniserveGroup, error) == 64,
               "the group vtable's error message must sit where the executor's mirror puts it");
 static_assert(sizeof(UniserveGroup) == 576,
               "the group vtable must be the size of the executor's mirror");
-static_assert(offsetof(uniserve_exchange_dispatch_call, error) == 96,
-              "the dispatch call's error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_exchange_dispatch_call) == 608,
-              "the dispatch call must be the size of the operator's layout");
-static_assert(offsetof(uniserve_exchange_combine_call, error) == 88,
-              "the combine call's error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_exchange_combine_call) == 600,
-              "the combine call must be the size of the operator's layout");
 
 extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
                                                    void* stream);

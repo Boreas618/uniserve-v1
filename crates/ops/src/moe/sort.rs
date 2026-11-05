@@ -351,115 +351,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Call, error), layout.error);
     }
 
-    /// The package's header declares the layout this crate passes.
-    ///
-    /// `Call` is a `#[repr(C)]` struct and each package mirrors it by hand in
-    /// `include/uniserve_moe_sort.h`, so the layout is stated three times: the struct's fields, the
-    /// [`SORT_CALL_LAYOUT`] bytes, and the header's literals. The const asserts above hold the first
-    /// two together and hold nothing to the third - a header left behind compiles cleanly, loads
-    /// cleanly, and reads every extent from the wrong offset at run time. This test reads the header
-    /// the package's own build asserts on, so a layout that moves on one side fails on the other.
-    ///
-    /// Every field is checked, not one per group of same-sized fields: `tile_to_limit` and
-    /// `expanded_to_permuted` are both pointers, so a transposition between them survives a
-    /// group-level assert on either side.
-    #[test]
-    fn the_package_header_declares_this_call_layout() {
-        let layout = SORT_CALL_LAYOUT;
-        let declared: [(&str, usize); 16] = [
-            ("ids", layout.ids),
-            ("scales", layout.scales),
-            ("tile_to_expert", layout.tile_to_expert),
-            ("tile_to_limit", layout.tile_to_limit),
-            ("expanded_to_permuted", layout.expanded_to_permuted),
-            ("permuted_to_expanded", layout.permuted_to_expanded),
-            ("total_padded_tokens", layout.total_padded_tokens),
-            ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
-            ("tokens", layout.tokens),
-            ("top", layout.top),
-            ("experts", layout.experts),
-            ("local_experts", layout.local_experts),
-            ("local_offset", layout.local_offset),
-            ("tile_tokens", layout.tile_tokens),
-            ("scales_dtype", layout.scales_dtype),
-            ("error", layout.error),
-        ];
-
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/moe_sort");
-        let mut checked = 0;
-        let entries = std::fs::read_dir(&root).unwrap_or_else(|error| {
-            panic!("{}: {error}", root.display());
-        });
-        for entry in entries {
-            let header = entry.unwrap().path().join("include/uniserve_moe_sort.h");
-            let Ok(text) = std::fs::read_to_string(&header) else {
-                // A package with no call header publishes no such contract; the test's subject is
-                // the packages that do.
-                continue;
-            };
-            checked += 1;
-
-            // `<field>, <offset>` from every `offsetof` assert, and the size assert.
-            let mut stated: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            let mut size = None;
-            for line in text.lines() {
-                let line = line.trim();
-                let Some(rest) = line.strip_prefix("static_assert(") else {
-                    continue;
-                };
-                let Some((subject, value)) = rest.split_once("== ") else {
-                    continue;
-                };
-                let Some(value) = value.split(|c: char| !c.is_ascii_digit()).next() else {
-                    continue;
-                };
-                let value: usize = value.parse().unwrap_or_else(|error| {
-                    panic!("{}: {line:?} states no offset: {error}", header.display())
-                });
-                if let Some(field) = subject
-                    .strip_prefix("offsetof(uniserve_moe_sort_call, ")
-                    .and_then(|field| field.strip_suffix(") "))
-                {
-                    stated.insert(field.trim().to_owned(), value);
-                } else if subject.starts_with("sizeof(uniserve_moe_sort_call) ") {
-                    size = Some(value);
-                }
-            }
-
-            for (field, offset) in declared {
-                let header = header.display();
-                assert_eq!(
-                    stated.get(field).copied(),
-                    Some(offset),
-                    "{header} states no offset {offset} for `{field}`, and the operator passes it there"
-                );
-            }
-            assert_eq!(
-                stated.len(),
-                declared.len(),
-                "{}: a field is asserted that the operator's `Call` does not have: {:?}",
-                header.display(),
-                stated
-                    .keys()
-                    .filter(|field| !declared.iter().any(|(name, _)| name == field))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                size,
-                Some(layout.size),
-                "{}: the call must be {} bytes, the operator's layout's size",
-                header.display(),
-                layout.size
-            );
-        }
-        assert!(
-            checked > 0,
-            "{}: no package publishes a call header",
-            root.display()
-        );
-    }
-
     /// The buffer bounds follow the worst routing distribution, not one batch: every expert with a
     /// single route plus one expert with the rest.
     #[test]
@@ -472,6 +363,39 @@ mod tests {
         assert_eq!(
             super::super::max_permuted_rows(1024, 8, 128, 128),
             191 * 128
+        );
+    }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_package_header_declares_this_call_layout() {
+        let layout = SORT_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "moe_sort",
+            "uniserve_moe_sort_call",
+            &[
+                ("ids", layout.ids),
+                ("scales", layout.scales),
+                ("tile_to_expert", layout.tile_to_expert),
+                ("tile_to_limit", layout.tile_to_limit),
+                ("expanded_to_permuted", layout.expanded_to_permuted),
+                ("permuted_to_expanded", layout.permuted_to_expanded),
+                ("total_padded_tokens", layout.total_padded_tokens),
+                ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
+                ("tokens", layout.tokens),
+                ("top", layout.top),
+                ("experts", layout.experts),
+                ("local_experts", layout.local_experts),
+                ("local_offset", layout.local_offset),
+                ("tile_tokens", layout.tile_tokens),
+                ("scales_dtype", layout.scales_dtype),
+                ("error", layout.error),
+            ],
+            layout.size,
         );
     }
 }

@@ -466,4 +466,36 @@ mod tests {
         };
         assert_ne!(wider.to_string(), combine.to_string());
     }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_dispatch_header_declares_this_call_layout() {
+        let layout = DISPATCH_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "expert_exchange",
+            "uniserve_exchange_dispatch_call",
+            &[("error", layout.error)],
+            layout.size,
+        );
+    }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_exchange_combine_header_declares_this_call_layout() {
+        let layout = COMBINE_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "expert_exchange",
+            "uniserve_exchange_combine_call",
+            &[("error", layout.error)],
+            layout.size,
+        );
+    }
 }
