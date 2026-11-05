@@ -490,7 +490,8 @@ struct Layer {
 /// per-head normalization before the rotation has no learned weight — the checkpoint stores none,
 /// which is what `Rotary::apply`'s absent gains express.
 pub struct VideoDecoder {
-    canvas: Canvas,
+    /// Every raster this decoder serves: the deployment's canvases, in the order it named them.
+    canvases: Vec<Canvas>,
     /// The tile stitch: the unpatchify and one compiled blend per seam width, built at load so that no
     /// layer is built on a request's path.
     stitch: crate::decoding::ClipDecoder,
@@ -942,14 +943,62 @@ impl VideoDecoder {
     }
 
     /// Read the 36 layers and the head of the checkpoint's decoder.
+    /// Load one decoder for **every raster the deployment serves**.
+    ///
+    /// `rasters` are the deployment's canvases in pixels, which is where a canvas comes from: the
+    /// checkpoint states its tile and its compression, the deployment states which rasters it
+    /// serves. The constants a decode reads are a **tile's** or a **width's**, so the tables are
+    /// published once and every canvas of the set is a lookup - **serving another raster costs no
+    /// device storage**; the only per-canvas figure is the attention block's row bound, which is
+    /// taken as the largest.
     pub fn load(
         config: &VideoVaeConfig,
-        canvas: Canvas,
+        rasters: &[(u32, u32)],
         attention: AttentionKind,
         dtype: DType,
         input: Linear,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
+        // The deployment's canvases, in its own order. A raster is whole latent cells or it is not a
+        // canvas this decoder can address.
+        let spatial = config.spatial_compression();
+        let mut canvases: Vec<Canvas> = Vec::with_capacity(rasters.len());
+        for &(pixel_width, pixel_height) in rasters {
+            if pixel_width == 0 || pixel_height == 0 {
+                return Err(Error::config(
+                    "a deployment canvas of no pixels decodes nothing".to_owned(),
+                ));
+            }
+            if pixel_width % spatial != 0 || pixel_height % spatial != 0 {
+                return Err(Error::config(format!(
+                    "the deployment's canvas is {pixel_width}x{pixel_height} pixels and this \
+                     checkpoint's decoder compresses {spatial} pixels into one latent cell, so the \
+                     raster is not a whole number of cells"
+                )));
+            }
+            let canvas = Canvas::clip(config, pixel_height / spatial, pixel_width / spatial);
+            if !canvases.contains(&canvas) {
+                canvases.push(canvas);
+            }
+        }
+        let canvas = *canvases.first().ok_or_else(|| {
+            Error::config("a video decoder serves at least one raster".to_owned())
+        })?;
+        // The tables a decode reads are a **tile's**, not a canvas's: one table serves every tile of
+        // every canvas only where every canvas is the same tiles. A deployment whose rasters tile
+        // differently would need a table per raster, and is refused by both named.
+        let tile = largest_tile(config, canvas.height, canvas.width)?;
+        let rows_bound = canvases.iter().map(|canvas| canvas.rows()).max().unwrap_or(0);
+        for other in &canvases[1..] {
+            if largest_tile(config, other.height, other.width)? != tile {
+                return Err(Error::config(format!(
+                    "the deployment serves a {}x{} raster and a {}x{} one whose largest tiles \
+                     differ: the tables a decode reads are one tile's, so every canvas must be a \
+                     whole number of the same tiles",
+                    canvas.height, canvas.width, other.height, other.width
+                )));
+            }
+        }
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
@@ -982,18 +1031,25 @@ impl VideoDecoder {
                 "the decoder canvas has the trailing zero row".to_owned(),
             ));
         }
+        // **A tile's rows, not the clip's.** These two tables say where a decode's register tokens and
+        // its trailing zero row go, and a decode writes them into a **tile's** token buffer
+        // (`decode_clip` hands `decode` one tile at a time). A table whose positions started past the
+        // clip's voxels therefore indexed a tile-sized buffer with a clip-sized offset - a write past
+        // the buffer for every tile but the last, which is the defect `voxel_rows` was corrected for.
+        // The grid's tiles are uniform, so one tile's offsets serve every tile and every canvas.
+        let tile = largest_tile(config, canvas.height, canvas.width)?;
         let register_rows = indices(
             loader,
             &declared_sizes,
             "video_vae.register_rows",
-            canvas.voxels() as u32,
+            tile.voxels() as u32,
             canvas.registers,
         )?;
         let zero_rows = indices(
             loader,
             &declared_sizes,
             "video_vae.zero_rows",
-            (canvas.voxels() + u64::from(canvas.registers)) as u32,
+            (tile.voxels() + u64::from(canvas.registers)) as u32,
             canvas.tail,
         )?;
 
@@ -1100,7 +1156,7 @@ impl VideoDecoder {
         .partial(rotated)?
         .sectioned(Sections::new(&sections)?)?;
         Ok(Self {
-            canvas,
+            canvases,
             dtype,
             stitch,
             width,
@@ -1150,10 +1206,12 @@ impl VideoDecoder {
                     "minimax-h3",
                 )?
             },
+            // One block for the whole set: its bound is the largest served canvas's rows, and a
+            // clip of a smaller canvas reads fewer.
             attention: block_attention(
                 head,
                 heads,
-                u32::try_from(canvas.rows())
+                u32::try_from(rows_bound)
                     .map_err(|_| Error::config("too many tokens".to_owned()))?,
                 dtype,
             )?,
@@ -1366,13 +1424,32 @@ impl VideoDecoder {
     /// tiles share one set: they are used sequentially, and the arena never rewinds, so a per-tile
     /// reservation would grow the clip's footprint by the tile count. The plan states these once
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
-    /// The canvas this decoder was built for: the clip one tiled decode is its grid of.
+    /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
-    /// [`crate::decoding::ClipDecoder::decode_clip`] compares the grid it is handed against this, because
-    /// a decoder built for another canvas scatters a tile's rows with that canvas's permutation - the
-    /// table is a constant of the canvas ([`Self::decode`]), and past its buffer when the two differ.
-    pub fn canvas(&self) -> &Canvas {
-        &self.canvas
+    /// The constants a decode reads are a **tile's** (its voxel permutation, its register and zero-row
+    /// offsets) or a **width's** (the zero row, the rotary frequencies), so they are the same for every
+    /// canvas this deployment names: serving another raster costs a lookup, not a table.
+    pub fn canvases(&self) -> &[Canvas] {
+        &self.canvases
+    }
+
+    /// The served canvas a clip's latent extents name, refused by name when the deployment serves
+    /// another set.
+    pub fn canvas_of(&self, height: u32, width: u32) -> Result<Canvas> {
+        self.canvases
+            .iter()
+            .copied()
+            .find(|canvas| canvas.height == height && canvas.width == width)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "this decoder serves {} and the clip states {height}x{width} latent cells",
+                    self.canvases
+                        .iter()
+                        .map(|canvas| format!("{}x{}", canvas.height, canvas.width))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
     }
 
     /// The largest of this clip's decode tiles: what one tile's buffers are sized by.
@@ -1383,23 +1460,23 @@ impl VideoDecoder {
     /// buffers are reserved once for a whole clip and reused by every tile: sizing them by the clip
     /// reserved the grid's worth for a decode that holds one tile's, and [`Self::decode`] validates a
     /// tile's block against this ceiling rather than against the clip's extents.
-    pub fn largest_tile(&self) -> Result<Canvas> {
-        let grid = Tiles::of(&self.config, &self.canvas)?.tiles(&self.config, &self.canvas);
+    pub fn largest_tile(&self, canvas: &Canvas) -> Result<Canvas> {
+        let grid = Tiles::of(&self.config, canvas)?.tiles(&self.config, canvas);
         grid.into_iter()
             .map(|tile| tile.canvas)
             .max_by_key(|tile| (tile.voxels(), tile.height, tile.width))
             .ok_or_else(|| {
                 Error::config(format!(
                     "a canvas of {} x {} latent cells has no tile to decode",
-                    self.canvas.height, self.canvas.width
+                    canvas.height, canvas.width
                 ))
             })
     }
 
-    pub fn scratch(&self, f: &Forward) -> Result<TileScratch> {
+    pub fn scratch(&self, f: &Forward, canvas: &Canvas) -> Result<TileScratch> {
         // One tile's, not the clip's: the clip is decoded tile by tile and these fourteen buffers are
         // reserved once and reused, so a clip-sized reservation is the grid's worth for one tile's use.
-        let tile = self.largest_tile()?;
+        let tile = self.largest_tile(canvas)?;
         let rows = tile.rows();
         let voxels = tile.voxels();
         let width = u64::from(self.width);
@@ -1434,6 +1511,7 @@ impl VideoDecoder {
     pub fn decode(
         &self,
         f: &Forward,
+        canvas: &Canvas,
         latents: TensorView,
         positions: TensorView,
         out: TensorView,
@@ -1446,18 +1524,18 @@ impl VideoDecoder {
         } else {
             0
         };
-        let registers = u64::from(self.canvas.registers) + u64::from(self.canvas.tail);
+        let registers = u64::from(canvas.registers) + u64::from(canvas.tail);
         let rows = voxels + registers;
-        let ceiling = self.largest_tile()?;
+        let ceiling = self.largest_tile(canvas)?;
         if latents.shape.rank() != 2
             || voxels == 0
-            || voxels % u64::from(self.canvas.frames) != 0
+            || voxels % u64::from(canvas.frames) != 0
             || voxels > ceiling.voxels()
         {
             return Err(Error::config(format!(
                 "the decoder reads one tile's latent rows - a multiple of {} frames' cells, at most \
                  {} - not {:?}",
-                self.canvas.frames,
+                canvas.frames,
                 ceiling.voxels(),
                 latents.shape.dims()
             )));
@@ -1646,28 +1724,41 @@ impl Decoder for VideoDecoder {
         // order: the two were once written the other way round, which a square canvas cannot show.
         // The pair below is compared in one order and the refusal names both rasters in one order,
         // so a transposed clip cannot read as agreement.
-        let (height, width) = self.canvas.pixels(&self.config);
-        let frames = self.canvas.frames_out(&self.config);
-        if (clip.height, clip.width) != (height, width) {
-            return Err(refuse(format!(
-                "this decoder's canvas decodes a {width}x{height} raster and the call states a {}x{} one",
-                clip.width, clip.height,
-            )));
-        }
         // The raster includes the padding frames the splice drops, so the clip is compared against
         // the canvas's own native output rather than against a muxed frame count.
-        if clip.frames != frames {
-            return Err(refuse(format!(
-                "this decoder's canvas decodes {frames} frame(s) and the call states {}",
-                clip.frames
-            )));
-        }
+        let canvas = self
+            .canvases
+            .iter()
+            .copied()
+            .find(|canvas| {
+                canvas.pixels(&self.config) == (clip.height, clip.width)
+                    && canvas.frames_out(&self.config) == clip.frames
+            })
+            .ok_or_else(|| {
+                refuse(format!(
+                    "this decoder serves {} and the call states a {}x{} raster of {} frame(s)",
+                    self.canvases
+                        .iter()
+                        .map(|canvas| {
+                            let (height, width) = canvas.pixels(&self.config);
+                            format!(
+                                "{width}x{height} of {} frame(s)",
+                                canvas.frames_out(&self.config)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    clip.width,
+                    clip.height,
+                    clip.frames
+                ))
+            })?;
         Ok(nn::capability::Layout {
             video: nn::capability::LatentShape {
                 channels: self.config.latent_channels,
-                frames: self.canvas.frames,
-                height: self.canvas.height,
-                width: self.canvas.width,
+                frames: canvas.frames,
+                height: canvas.height,
+                width: canvas.width,
             },
             audio: None,
             text_rows: 0,
@@ -1685,12 +1776,18 @@ impl Decoder for VideoDecoder {
     /// one statement rather than two.
     fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
         let canvas = Canvas::clip(&self.config, layout.video.height, layout.video.width);
-        if canvas != self.canvas {
+        if !self.canvases.contains(&canvas) {
             return Err(nn::Error::Shape {
                 owner: "VideoDecoder",
                 problem: format!(
-                    "this decoder's canvas holds {}x{} latent cells and the layout states {}x{}",
-                    self.canvas.width, self.canvas.height, layout.video.width, layout.video.height,
+                    "this decoder serves {} and the layout states {}x{} latent cells",
+                    self.canvases
+                        .iter()
+                        .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    layout.video.width,
+                    layout.video.height,
                 ),
             });
         }
@@ -1976,7 +2073,7 @@ pub(crate) mod tests {
         let arena = nn::Arena::new(nn::DevicePtr::new(0), need);
         let forward = nn::Forward::recording(&arena);
         decoder
-            .scratch(&forward)
+            .scratch(&forward, &canvas)
             .expect("one clip's transformer scratch fits the plan its decoder states");
     }
 
@@ -2055,9 +2152,11 @@ pub(crate) mod tests {
             ))
             .expect("a stated bias");
         let input = Linear::new(projection, Some(bias), WeightOrder::NxK).expect("a linear");
+        let spatial = config.spatial_compression();
+        let raster = (canvas.width * spatial, canvas.height * spatial);
         VideoDecoder::load(
             config,
-            canvas,
+            &[raster],
             AttentionKind::Dense,
             DType::F32,
             input,

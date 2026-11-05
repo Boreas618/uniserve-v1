@@ -2127,17 +2127,27 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// eager walk of a new generation over a serving bucket's own arena is work the switchover
     /// design does not allow.
     fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
-        if self.served {
-            // A bucket recaptured after serving is recaptured because a program changed, and the
-            // operator that changed was warmed by its shadow pass; an eager forward here would run
-            // over the arena a serving bucket owns.
+        // A warm walk runs over the arena of the bucket it walks, so it must not do so while another
+        // bucket's batch is staged: that batch owns the staging and may be half-served. A walk of the
+        // bucket whose own batch is staged is the opposite of a hazard, and it is the case a capture
+        // after serving depends on - the launches build the plans for exactly the pose the capture
+        // records, and an operator whose plan was never built cannot be captured at all (a cuBLASLt
+        // plan allocates its workspace, which a capture cannot carry).
+        if self
+            .staging
+            .staged()
+            .is_some_and(|staged| staged != bucket)
+        {
             return Ok(());
         }
         let began = std::time::Instant::now();
         // The pose, stated before the walk that can fault on it: a warm launch that dies names the
         // numbers it was given, and the table it read, rather than leaving them to be inferred from
-        // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged.
-        self.stage_warm(bucket)?;
+        // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged - which is how a
+        // capture during serving walks the serving batch rather than replacing it with a warm pose.
+        if self.staging.staged() != Some(bucket) {
+            self.stage_warm(bucket)?;
+        }
         let (lengths, offsets) = warm_span(bucket);
         tracing::info!(
             bucket = %bucket,
