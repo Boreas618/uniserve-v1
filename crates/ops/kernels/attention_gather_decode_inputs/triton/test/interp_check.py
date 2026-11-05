@@ -18,6 +18,7 @@ check compares it instead.
 
 import os
 import pathlib
+import subprocess
 import sys
 
 if os.environ.get("TRITON_INTERPRET") != "1":
@@ -76,8 +77,9 @@ def report(name, scenario):
     return len(failures)
 
 
-def main():
-    scenarios = [
+def scenarios():
+    """The scenarios this check compares, in order; `--scenario N` runs one of them alone."""
+    return [
         (
             "a padded batch whose slots hold short and empty caches",
             Scenario(rows=4, max_rows=4, columns=4, seed=1),
@@ -113,8 +115,50 @@ def main():
             ),
         ),
     ]
-    failures = sum(report(name, scenario) for name, scenario in scenarios)
-    return 1 if failures else 0
+
+
+def run_alone(index):
+    """Run one scenario in this process, for the parent that spawns them one at a time."""
+    name, scenario = scenarios()[index]
+    return 1 if report(name, scenario) else 0
+
+
+def main():
+    """Run every scenario, each in its own interpreter process.
+
+    One process per scenario because the interpreter cannot be trusted with this kernel's scan: on
+    one of the shapes `tl.cumsum` **segfaults** the interpreter process — no traceback, exit 139 —
+    and it does so nondeterministically (measured: 4 of 6 runs on the same input died, 2 passed).
+    A crash is therefore not an input to keep out of the list and not a verdict about the kernel:
+    it is a state this host cannot compare, and the other scenarios' comparisons are still evidence.
+    A parent that ran them in one process would lose all of them the first time the scan died.
+    """
+    if "--scenario" in sys.argv:
+        return run_alone(int(sys.argv[sys.argv.index("--scenario") + 1]))
+
+    compared = crashed = differing = 0
+    for index, (name, _) in enumerate(scenarios()):
+        child = subprocess.run(
+            [sys.executable, __file__, "--scenario", str(index)],
+            env={**os.environ, "TRITON_INTERPRET": "1"},
+        )
+        if child.returncode == 0:
+            compared += 1
+        elif child.returncode < 0 or child.returncode >= 128:
+            crashed += 1
+            print(
+                f"not compared here: {name} — the interpreter process died on this scenario's scan "
+                f"(exit {child.returncode}, no traceback). `tl.cumsum` crashes the interpreter "
+                f"nondeterministically (measured: 4 of 6 runs on one input), so neither a pass nor a "
+                f"crash here is evidence about the program; the device check compares it."
+            )
+        else:
+            differing += 1
+    print(
+        f"{len(scenarios())} scenario(s): {compared} compared, {differing} differing, "
+        f"{crashed} the interpreter cannot run"
+    )
+    return 1 if differing else 0
 
 
 if __name__ == "__main__":
