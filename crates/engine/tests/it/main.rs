@@ -17,7 +17,7 @@ mod error_taxonomy;
 mod expert_rebalance;
 mod in_process;
 mod in_process_completion;
-mod image_ipc;
+mod in_process_images;
 mod in_process_groups;
 mod in_process_media;
 mod in_process_stalls;
