@@ -505,8 +505,11 @@ fn audio_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
 
-    // The clips the deployment serves are the decoder's buckets, as the walk states them.
-    let frames = request.clip;
+    // A clip's video frame count is not the decoder's latent frame count: the audio track is packed at
+    // its own rate, so the latent frames come from the packing's arithmetic and every stage's length
+    // follows from them. Handing the clip's frames in as latent frames launches a ladder no decode
+    // makes - the same quantity stated twice, which is what the walk and this harness must not do.
+    let frames = minimax_h3::packing::audio_latent_frames(request.clip);
     let latent_channels = u64::from(config.latent_channels);
     let latents = arena
         .tensor(
