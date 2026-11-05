@@ -1409,7 +1409,15 @@ impl EventStream {
             _ => {}
         }
         self.consumed += 1;
-        if self.consumed - self.reported >= EVENT_WINDOW / 2
+        // A request that ended or was cancelled is not the engine's to hear
+        // about: its routing has retired the request, and a position that
+        // arrives after that is a command the engine cannot file — the run at
+        // `9f6da2177` lost its second engine to exactly this, `a request
+        // command failed: a consumer's position is the connection's
+        // bookkeeping`. Events already queued when a stream ended still reach
+        // `observe`, so the gate is here and not in the caller.
+        if self.open
+            && self.consumed - self.reported >= EVENT_WINDOW / 2
             && let Some(shared) = &self.shared
         {
             shared.command(
