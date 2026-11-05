@@ -115,10 +115,10 @@ impl Linear {
     pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
         Self::descriptor_of(
             self.k,
+            input,
             self.weight.dtype(),
             self.order,
             self.bias.is_some(),
-            input,
             output,
         )
     }
@@ -131,10 +131,10 @@ impl Linear {
     /// it with a loaded layer's numbers, so an enumeration built on it cannot drift from the launch.
     pub fn descriptor_of(
         k: u32,
+        input: DType,
         weight: DType,
         order: WeightOrder,
         bias: bool,
-        input: DType,
         output: DType,
     ) -> Descriptor {
         Descriptor {

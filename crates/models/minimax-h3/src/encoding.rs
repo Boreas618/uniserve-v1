@@ -1892,9 +1892,9 @@ impl AudioEncoder {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             channels,
             dtype,
+            dtype,
             WeightOrder::NxK,
             true,
-            dtype,
             dtype,
         ));
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);

@@ -1882,7 +1882,24 @@ impl MainProcess {
                 },
             )));
         }
-        Ok(None)
+        // A package the store holds and has never built is invisible to `select_programs`, and an
+        // operator no model forward reaches is exactly that: `slot_commit` is launched by the
+        // runner's own step, so no capture it is missing from comes before the walk names it, and
+        // nothing in the deployment can name its package either. The store holds the package and
+        // declares the keys it can build (`[kernel.descriptors]`), so installing it and asking for
+        // the walked key is what builds it - otherwise a generation refuses an operator the store
+        // holds, which reads as a store defect and is not one.
+        match declared_program(&self.listing()?.packages, operator) {
+            Some((op, backend, revision)) => Ok(Some((
+                program_server::program::ProgramSlot { op, phase: None },
+                Program {
+                    backend,
+                    revision,
+                    arguments: Default::default(),
+                },
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
@@ -5561,6 +5578,30 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 /// - one whose operator this binary does not implement: `admit_installs` refuses a precopy for such
 ///   an operator, and a program this process could never launch is not worth failing a switchover
 ///   over.
+/// The package the store holds for `operator` when none of them is built: the highest revision,
+/// ties broken by the backend's name so the choice is the same on every run.
+///
+/// This is the answer for an operator nothing has captured yet - the package that states its keys
+/// in its manifest but has no module for this host - which is what `select_programs` cannot see,
+/// because its own question is what this host can launch *now*.
+fn declared_program(
+    packages: &[program_server::protocol::ListedPackage],
+    operator: &str,
+) -> Option<(String, String, u32)> {
+    let mut declared: Vec<&program_server::protocol::ListedPackage> = packages
+        .iter()
+        .filter(|package| ops::operator_name(&package.op) == Some(operator))
+        .collect();
+    declared.sort_by(|left, right| {
+        right
+            .revision
+            .cmp(&left.revision)
+            .then_with(|| left.backend.cmp(&right.backend))
+    });
+    let package = declared.first()?;
+    Some((package.op.clone(), package.backend.clone(), package.revision))
+}
+
 fn select_programs(
     packages: &[program_server::protocol::ListedPackage],
     targets: &[Target],
@@ -7013,6 +7054,33 @@ mod tests {
         assert!(
             error.contains("fa4 revision 1"),
             "the refusal does not name what the store holds instead: {error}"
+        );
+    }
+
+
+    /// An operator no model forward reaches - the runner launches `slot_commit` itself - is a
+    /// package the store holds and has never built, so `select_programs` cannot see it. The walk
+    /// names the operator, and the declaration is what lets this host build the key it needs: the
+    /// highest revision of the operator's packages, ties broken by the backend so two runs choose
+    /// alike.
+    #[test]
+    fn a_declared_package_is_chosen_for_an_operator_nothing_built() {
+        let package = |backend: &str, revision: u32| program_server::protocol::ListedPackage {
+            op: "slot_commit".to_owned(),
+            backend: backend.to_owned(),
+            revision,
+            modules: Vec::new(),
+        };
+        let packages = vec![package("triton", 1), package("triton", 3), package("cuda", 3)];
+        assert_eq!(
+            declared_program(&packages, "slot_commit"),
+            Some(("slot_commit".to_owned(), "cuda".to_owned(), 3)),
+            "the highest revision did not win, or the tie was not broken by the backend's name"
+        );
+        assert_eq!(
+            declared_program(&packages, "paged_attention"),
+            None,
+            "an operator the store holds no package of was answered"
         );
     }
 
