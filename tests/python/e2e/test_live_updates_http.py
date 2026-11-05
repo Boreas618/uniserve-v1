@@ -68,6 +68,7 @@ import pytest
 
 from tests.python.e2e.http_helpers import (
     find_free_port,
+    log_tail,
     require_uniserve_binary,
     server_process,
     start_server,
@@ -1245,15 +1246,21 @@ def _restart_while_streaming(
         raise AssertionError(
             "the deployment refused a completion: "
             f"{error.response.status_code} {error.response.text[:2000]}"
+            f"{log_tail(log)}"
         ) from error
     choice = (answered.get("choices") or [{}])[0]
     content = choice.get("message", {}).get("content")
-    assert content, f"the deployment answered no content: {answered}"
+    assert content, (
+        f"the deployment answered no content: {answered}{log_tail(log)}"
+    )
 
     # And one frame of one stream: the three streams below each need 32 counts,
     # so a silent stream and a slow one are the same failure at 300 s. This
     # says which in a minute.
-    _first_stream_frame(base_url, name)
+    try:
+        _first_stream_frame(base_url, name)
+    except AssertionError as error:
+        raise AssertionError(f"{error}{log_tail(log)}") from error
 
     # Three streams in flight at the restart, of different lengths so their
     # boundaries fall at different events of different requests.
