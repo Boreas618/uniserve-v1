@@ -96,7 +96,7 @@ impl Default for WorkerProcessArgs {
             load_threads: None,
             parallel_degrees: Vec::new(),
             dtype: Self::DEFAULT_DTYPE,
-            quantization_config: serde_json::json!({}),
+            quantization: serde_json::json!({}),
             kv_cache_dtype: None,
             mem_fraction_static: Self::DEFAULT_MEM_FRACTION_STATIC,
             worker_mesh: None,
@@ -299,7 +299,7 @@ impl WorkerProcessArgs {
             load_threads: self.load_threads,
             parallel_degrees: self.parallel_degrees.clone(),
             model_dtype: self.dtype.as_str().to_owned(),
-            quantization_config: self.quantization_config.clone(),
+            quantization: self.quantization.clone(),
             prefix_cache_dtype: self
                 .kv_cache_dtype
                 .as_ref()

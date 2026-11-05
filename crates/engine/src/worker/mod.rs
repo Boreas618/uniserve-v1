@@ -171,8 +171,8 @@ pub struct WorkerProcessArgs {
     pub parallel_degrees: Vec<u32>,
     /// Numeric data type used by model parameters and activations.
     pub dtype: crate::ModelDtype,
-    /// WorkerGroup-specific quantization policy.
-    pub quantization_config: serde_json::Value,
+    /// The precision policy, a JSON object.
+    pub quantization: serde_json::Value,
     /// Numeric data type of the KV (prefix) cache, when explicitly selected.
     pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
     /// Each rank's share of its device's total storage, which bounds the
