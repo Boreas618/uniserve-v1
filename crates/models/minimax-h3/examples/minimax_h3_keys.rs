@@ -898,12 +898,18 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     //
-    // One launch per block activation, and each stage's blocks run at the stage's own width: the
-    // seven widths are 1024, 512, 256, 128, 64, 32 and 16 (`audio_vae.py`'s decoder widths), while
-    // the taps, the ratio and the program's block are the same at every stage (`ACTIVATION_*`), so
-    // the key differs only in its width. A single row at the first width would describe one of the
-    // seven launches and leave six without a program.
-    for channels in [1024_u32, 512, 256, 128, 64, 32, 16] {
+    // One launch per block activation, and each stage's blocks run at the stage's own width - the
+    // decoder's schedule halving per stage, `1024 >> (stage + 1)`, so 512 down to 8 over the seven
+    // rates. The taps, the ratio and the program's block are the same at every stage, so the key
+    // differs only in its width, and a single row at the first width would describe one launch and
+    // leave the rest without a program.
+    //
+    // **The widths are the schedule's, computed, not a list.** A written list held 1024 - a width the
+    // schedule never produces, since the first stage halves the decoder's widest - and stopped at 16,
+    // missing the narrowest stage's 8: one row with no launcher and one launch with no row, from the
+    // same transcription, and the deployment's audio decoder would have stopped at its last block.
+    for stage in 0..DECODER_RATES.len() as u32 {
+        let channels = DECODER_DIM >> (stage + 1);
         push(
             "audio_activation",
             ops::audio_activation::Descriptor {
