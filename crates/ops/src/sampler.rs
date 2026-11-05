@@ -618,6 +618,14 @@ pub struct ArgMaxArgs {
 }
 
 /// The largest value's index, per row.
+///
+/// **A row with no numeric value answers the row's width, not an index.** The program's running
+/// index starts at `width` and every tile's index is the smallest column equal to that tile's
+/// largest value, falling back to `width`; a row whose elements are all NaN or all `-inf` therefore
+/// answers `width`, which is one past the last column. When the row is a vocabulary that value is
+/// the vocabulary itself — a number a caller can mistake for a token id. So a reader of `out`
+/// refuses `index >= width` where it reads a token, and the refusal names the row, because only the
+/// reader can say that the row it sampled had no finite logit.
 pub struct ArgMax;
 
 impl Op for ArgMax {
