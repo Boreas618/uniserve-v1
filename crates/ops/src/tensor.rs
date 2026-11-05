@@ -545,19 +545,27 @@ impl TensorView {
 
     /// Check that this view is `dtype` with `last` elements on its last axis and a unit last
     /// stride, as every row-wise operator here reads it.
+    ///
+    /// A refusal names the view it refused: the operator alone does not say *which* of its operands
+    /// disagrees with the descriptor, and an operator with several same-typed operands (a residual, an
+    /// activation's two halves, a projection's input and output) leaves the reader to guess.
     pub fn require_row(&self, operator: &'static str, dtype: DType, last: u64) -> Result<()> {
         if self.dtype != dtype {
             return Err(Error::argument(
                 operator,
-                format!("expected {} elements, found {}", dtype, self.dtype),
+                format!(
+                    "expected {} elements, found {} in the view {:?}",
+                    dtype, self.dtype, self.shape
+                ),
             ));
         }
         if self.last() != last {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "expected {last} elements on the last axis, found {}",
-                    self.last()
+                    "expected {last} elements on the last axis, found {} in the view {:?}",
+                    self.last(),
+                    self.shape
                 ),
             ));
         }
@@ -565,8 +573,9 @@ impl TensorView {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "expected a unit stride on the last axis, found {}",
-                    self.strides.last()
+                    "expected a unit stride on the last axis, found {} in the view {:?}",
+                    self.strides.last(),
+                    self.shape
                 ),
             ));
         }
