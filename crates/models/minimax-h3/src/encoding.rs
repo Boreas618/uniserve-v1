@@ -359,7 +359,6 @@ impl VideoEncoder {
         for source in sources(config)? {
             match source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => keys.push(tensor),
-                crate::audio_vae::Tensor::Parts(parts) => keys.extend(parts),
                 crate::audio_vae::Tensor::Normalized { value, gain } => {
                     keys.push(value);
                     keys.push(gain);
@@ -701,15 +700,22 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
     ] {
         region(&mut sources, parameter.to_owned(), tensor.to_owned());
     }
-    // One fused query-key-value bias from three checkpoint vectors, in query, key, value order.
-    sources.push(Source {
-        parameter: "projection.qkv.bias".to_owned(),
-        tensor: Tensor::Parts(vec![
-            "pre_block.attn.q_bias".to_owned(),
-            "pre_block.attn.zero_k_bias".to_owned(),
-            "pre_block.attn.v_bias".to_owned(),
-        ]),
-    });
+    // The checkpoint fuses query, key and value into one `[3 * wide]` bias parameter and keeps its
+    // three windows as three tensors; the reference fills the windows from them in this order
+    // (`audio_vae.py:521-534`). This encoder's attention reads the three windows as three layers, so
+    // each window is its own source and its own load: a window is a whole tensor here, while the
+    // fused weight below is one tensor read at three offsets.
+    //
+    // `pre_block.attn.zero_k_bias` is the checkpoint's stored key window - a vector it carries like
+    // the other two - so it is requested and loaded, never substituted by a constant on the strength
+    // of its name: a buffer placed in a learned slot is a silent change to the arithmetic.
+    for (parameter, tensor) in [
+        ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+        ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+        ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+    ] {
+        region(&mut sources, parameter.to_owned(), tensor.to_owned());
+    }
     Ok(sources)
 }
 
@@ -2467,14 +2473,14 @@ impl Projection {
          -> Result<Weight> {
             binder.slice(name, index * shape.iter().product::<u64>(), shape)
         };
-        let linear = |binder: &mut Binder<'_, '_>, index: u64| -> Result<Linear> {
+        let linear = |binder: &mut Binder<'_, '_>, index: u64, window: &str| -> Result<Linear> {
             let weight = slice(binder, "projection.qkv.weight", index, &[third, wide])?;
-            let bias = slice(binder, "projection.qkv.bias", index, &[third])?;
+            let bias = binder.region(&format!("projection.qkv.{window}_bias"), &[third])?;
             Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
         };
-        let query = linear(binder, 0)?;
-        let key = linear(binder, 1)?;
-        let value = linear(binder, 2)?;
+        let query = linear(binder, 0, "q")?;
+        let key = linear(binder, 1, "k")?;
+        let value = linear(binder, 2, "v")?;
         let head_dim = u32::try_from(wide / heads)
             .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
         let heads_u32 = u32::try_from(heads)
@@ -3379,9 +3385,9 @@ mod tests {
             .expect("the encoder's parameters");
         // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
         // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
-        // the projection block with the mean convolution: twenty-one tensors and the fused
-        // query-key-value bias.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22);
+        // the projection block with the mean convolution: twenty-one parameters, the fused
+        // query-key-value weight, and the three bias windows the checkpoint keeps as three tensors.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 21 + 1 + 3);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
@@ -3396,7 +3402,8 @@ mod tests {
             "output_snake.alpha",
             "output.weight",
             "projection.qkv.weight",
-            "projection.qkv.bias",
+            "projection.qkv.k_bias",
+            "projection.qkv.v_bias",
             "projection.mlp.gate.weight",
             "mean_projection.bias",
         ] {
@@ -3414,21 +3421,21 @@ mod tests {
             .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
             .count();
         assert_eq!(normalized, 1 + 5 * 7 + 1);
-        // The fused query-key-value bias names its three checkpoint vectors in order.
-        let bias = table
-            .iter()
-            .find(|source| source.parameter == "projection.qkv.bias")
-            .expect("the fused bias");
-        match &bias.tensor {
-            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
-                parts,
-                &vec![
-                    "pre_block.attn.q_bias".to_owned(),
-                    "pre_block.attn.zero_k_bias".to_owned(),
-                    "pre_block.attn.v_bias".to_owned(),
-                ]
-            ),
-            other => panic!("the fused bias is {other:?}"),
+        // The fused query-key-value bias names its three checkpoint windows in order: each window is
+        // its own parameter here, and the key's is the checkpoint's `zero_k_bias` tensor.
+        for (parameter, tensor) in [
+            ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+            ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+            ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+        ] {
+            let source = table
+                .iter()
+                .find(|source| source.parameter == parameter)
+                .unwrap_or_else(|| panic!("{parameter} is missing"));
+            match &source.tensor {
+                crate::audio_vae::Tensor::Region(name) => assert_eq!(name, tensor),
+                other => panic!("{parameter} is {other:?}"),
+            }
         }
     }
 
