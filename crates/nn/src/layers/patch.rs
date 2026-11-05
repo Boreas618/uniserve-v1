@@ -79,6 +79,18 @@ impl Patch {
     /// `frames` is the latent's frame count; it travels as a launch value so a clip of another
     /// length replays a captured step instead of compiling again, and the latent's own extent must
     /// agree with it. The inverse of this mapping is [`super::UnpatchifyVideo::forward`].
+    /// The descriptor one patchify launch takes: the element type alone.
+    ///
+    /// The raster's extents and the frame count travel with the call — the program reads them as
+    /// words — so every canvas of an element type is one compiled module.
+    pub fn descriptor_of(dtype: ops::DType) -> patch::Descriptor {
+        patch::Descriptor {
+            dtype,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -87,11 +99,7 @@ impl Patch {
         frames: u64,
     ) -> Result<()> {
         let frames = self.check_frames(latent, frames)?;
-        let descriptor = patch::Descriptor {
-            dtype: latent.dtype,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(latent.dtype);
         // The layer's raster travels with the call: the program reads it as words, so every canvas
         // of an element type is one compiled module, and the layer's geometry never reaches a key.
         f.operate::<PatchOp>(

@@ -29,6 +29,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["f32", "bf16", "f16"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024"], kernel = ["12"], ratio = ["2"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["f32", "bf16", "f16"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024"], kernel = ["12"], ratio = ["2"], block = ["1024", "256"], pdl = ["false", "true"] }
 
 [parameters]
