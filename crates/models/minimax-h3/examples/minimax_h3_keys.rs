@@ -306,7 +306,11 @@ fn main() {
     // Which attention backend the deployment runs. **One deployment runs one**, so this is what the
     // file is a deployment of, not a filter over a union: without it the sparse selection's rows are
     // absent, and a store built from the file serves the dense deployment and only that.
+    // The flag decides *which* row set is enumerated; the tuple decides the deployment the bound is
+    // derived from. A walk that had only the flag could not state the bound its tile derives, and it
+    // stated the dense one - which the recorder refuses.
     let mut sparse = false;
+    let mut sparse_deployment: Option<(u32, f64, Option<f64>)> = None;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -328,10 +332,27 @@ fn main() {
             }
             "--derived" => derived = true,
             "--sparse" => {
-                // The value the walk takes (`tile_rows,sparsity,max_tiles`) is what the sparse
-                // deployment is; the generator only needs to know it is that deployment.
-                let _ = value(&mut arguments, "--sparse");
+                // The value the walk takes (`tile_rows,sparsity[,reference_keep]`) **is** the sparse
+                // deployment: its tile is what the network's attention is when the layout is built,
+                // and a walk that knew only "sparse" could not state the bound that tile derives.
+                let stated = value(&mut arguments, "--sparse");
+                let mut fields = stated.split(',');
+                let tile = fields
+                    .next()
+                    .and_then(|tile| tile.trim().parse::<u32>().ok())
+                    .unwrap_or_else(|| panic!("--sparse's tile is a row count: {stated}"));
+                let sparsity = fields
+                    .next()
+                    .and_then(|rate| rate.trim().parse::<f64>().ok())
+                    .unwrap_or_else(|| panic!("--sparse's sparsity is a fraction: {stated}"));
+                let keep = match fields.next() {
+                    Some(rate) => Some(rate.trim().parse::<f64>().unwrap_or_else(|_| {
+                        panic!("--sparse's reference keep rate is a fraction: {stated}")
+                    })),
+                    None => None,
+                };
                 sparse = true;
+                sparse_deployment = Some((tile, sparsity, keep));
             }
             other => panic!("unknown flag {other}"),
         }
@@ -468,21 +489,7 @@ fn main() {
             .unwrap_or_else(|error| {
                 panic!("the deployment's serving partition is not statable: {error}")
             });
-    let bound = {
-        let dies = config
-            .denoisers
-            .get(&minimax_h3::checkpoint::Dit::Base)
-            .unwrap_or_else(|| {
-                panic!("the checkpoint holds no base DiT, so its bound is not statable")
-            });
-        serving
-            .arrangement(dies)
-            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement))
-            .and_then(|rules| rules.rows_bound())
-            .unwrap_or_else(|error| {
-                panic!("the deployment's packed bound is not statable: {error}")
-            })
-    };
+    let bound = deployment_bound(&config, sparse_deployment);
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment, bound, sparse));
@@ -827,6 +834,40 @@ fn header(
 /// Every row the DiT, the text encoder and the orchestration around them state at `deployment`'s
 /// element type. `bound` is the deployment's packed row bound: the gated activation's `wide` form is a
 /// property of `bound · width`, so a walk cannot state it without the bound it serves.
+/// The deployment's packed-row bound: **the largest layout any task it serves reaches**, with the
+/// sparse attention applied first when the deployment is the sparse one.
+///
+/// The bound is not a constant of the config. A task's arrangement states its two prefix capacities
+/// (two latent frames' worth between `t2va` and the reference tasks), and a sparse deployment's tile
+/// bound reshapes the layout again, so the count serving reads is the maximum over the tasks. Stating
+/// it for one network - which this walk did - named a bound the recorder refuses, and every sparse
+/// row set was cut at the dense one because `--sparse` never reached here.
+fn deployment_bound(
+    config: &minimax_h3::config::Config,
+    sparse: Option<(u32, f64, Option<f64>)>,
+) -> u32 {
+    let mut bound = 0u32;
+    for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
+        let Some(dies) = config.denoisers.get(&dit) else {
+            panic!("this checkpoint holds no {} network", dit.directory());
+        };
+        let mut network = dies.clone();
+        if let Some((tile, sparsity, keep)) = sparse {
+            network.attention = minimax_h3::config::AttentionKind::sparse(tile, sparsity, keep)
+                .unwrap_or_else(|error| panic!("the sparse deployment is not statable: {error}"));
+        }
+        let reached = minimax_h3::Partition::serving(config, task, 1, 1, 0, 0)
+            .and_then(|partition| partition.arrangement(&network))
+            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(network, arrangement))
+            .and_then(|rules| rules.rows_bound())
+            .unwrap_or_else(|error| {
+                panic!("the {task:?} deployment's packed bound is not statable: {error}")
+            });
+        bound = bound.max(reached);
+    }
+    bound
+}
+
 fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
