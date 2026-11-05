@@ -815,6 +815,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// **No copy**: the captured graph updates the latents in place, so the column *is* the
     /// trajectory and what the store records is a view of it. That is the handoff to a decode, and
     /// it is why the store's `VideoLatents` is a name for memory rather than a second buffer.
+    ///
+    /// **The same lifetime rule as the encoder's text states**: a second batch's step zero gives its
+    /// own request the same row of this column (`prepare_latents` writes it), so a second media batch
+    /// on this runner before the first request's trajectory is forgotten replaces the bytes the first
+    /// request's product still names - silently, because the view is a name and not a copy. One
+    /// in-flight batch per runner, and the rule is execution's to keep (an encode and a denoise are
+    /// the same shape: a captured graph addresses one output region per row).
     fn publish(&self, bucket: Bucket) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Ok(());
