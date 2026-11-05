@@ -26,9 +26,15 @@ Usage:
                  --fixture notes/programs/minimax-h3-keys.txt [--unbound]
 
 Exit status: 1 when a bound key has no fixture line (the run would stop with `no directory`/`no
-kernel`), 0 otherwise. Unbound fixture lines are printed but never failed on by default: a line the
-model does not bind for *this* deployment is normal (the list covers every task and degree), so a
-reader wants the count and not a verdict. `--allow-unbound` silences them entirely.
+kernel`), 0 otherwise. Unbound fixture lines are printed but never failed on by default.
+
+**A file is one deployment's rows, so an unbound line means one of two things, and they are worth
+telling apart before it is dismissed:** the fixture is another deployment's (a `--dtype` or a degree
+that does not match this walk), or the walk is narrower than the file because a component it cannot
+reach - a stage that has never run - contributed its rows to a *bootstrap* list and not to a walk. The
+first is a wrong file; the second is a component this run never exercised, and neither is "normal
+coverage". `--allow-unbound` silences the count entirely, so it is for a reader who has already said
+which of the two it is.
 """
 
 import argparse
