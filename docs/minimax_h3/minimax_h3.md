@@ -241,7 +241,7 @@ Any other field is refused, naming it. The served checkpoint fixes the schedule,
 
 ## Precision
 
-A dense BF16 checkpoint selects its precision with `quantization_config`:
+A dense BF16 checkpoint selects its precision with `quantization`:
 
 | Mode | Denoiser MLP | Text encoder | Video VAE |
 | --- | --- | --- | --- |
@@ -250,7 +250,7 @@ A dense BF16 checkpoint selects its precision with `quantization_config`:
 | `performance` | FP8 | BF16 | NVFP4 |
 | `maximum` | NVFP4 | FP8 | NVFP4 |
 
-Denoiser attention stays BF16. `components` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization_config={ mode = "performance", components = { video_vae = "bf16" } }'`. NVFP4 needs Blackwell; on Hopper, use `quality`, optionally with `{"components":{"mlp":"fp8"}}`. The packed NVFP4 checkpoints carry their own precision and take no `quantization_config`. The presets other than `quality` change the generated media; establish quality for the intended workload before choosing one.
+Denoiser attention stays BF16. `components` overrides parts of a mode by the names `attention`, `mlp`, `text_encoder` and `video_vae`, as in `--set 'quantization={ mode = "performance", components = { video_vae = "bf16" } }'`. NVFP4 needs Blackwell; on Hopper, use `quality`, optionally with `{"components":{"mlp":"fp8"}}`. The packed NVFP4 checkpoints carry their own precision and take no `quantization`. The presets other than `quality` change the generated media; establish quality for the intended workload before choosing one.
 
 ## Further guides
 
@@ -264,7 +264,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 | `uniserve._worker` load or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
 | CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
-| `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization_config` for a packed NVFP4 checkpoint. |
+| `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
 | `NVML reports no device storage for process` | Run the container in the host's process ID namespace (`--pid=host`). |
 | Startup refuses a static storage grant, or GPU out of memory | Raise `--mem-fraction-static`, serve fewer canvases, capacities or seconds, or shard the denoiser further. |
