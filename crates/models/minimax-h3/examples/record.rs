@@ -96,6 +96,8 @@ struct Request {
     /// solver's residual is one column - so it is carried into the deployment line only, where a
     /// reader comparing two deployments sees what each claimed.
     elements: u64,
+    /// The caller's tensor table, when one was given: the four components' stored element types.
+    types: Option<PathBuf>,
     extents: BTreeMap<String, (DType, Shape)>,
     /// The sparse deployment's served tile and keep rate, absent for a dense one.
     sparse: Option<(u32, f64, Option<f64>)>,
@@ -129,6 +131,7 @@ fn run() -> Result<(), String> {
     let mut elements = 0u64;
     let mut against: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
+    let mut types: Option<PathBuf> = None;
     let mut sparse: Option<(u32, f64, Option<f64>)> = None;
     let mut list = false;
     let mut names = false;
@@ -160,6 +163,9 @@ fn run() -> Result<(), String> {
             "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
             "--extents" => extents = Some(PathBuf::from(value()?)),
+            // The caller's `component-tensors.json`: the four components' stored element types, which
+            // no shardless host can read for itself.
+            "--types" => types = Some(PathBuf::from(value()?)),
             // `tile,sparsity[,reference_keep]`: the bound the compression reduces over is the
             // deployment's own, computed from its layouts at load, so it is not a flag here.
             "--sparse" => {
@@ -208,6 +214,7 @@ fn run() -> Result<(), String> {
         tokens,
         track,
         elements,
+        types,
         extents: table,
         sparse,
     };
@@ -263,16 +270,18 @@ fn run() -> Result<(), String> {
     // device and no shard, which is what makes the walk the second enumeration rather than the first.
     println!(
         "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [({}, {})], prompt lengths: [{}], \
-         packed rows: [{}], trajectory elements: [{}], sparse attention: {sparse:?}, \
-         tensor-parallel degree 1, ulysses degree 1 - recorded from the model's own forward at {}",
+         packed rows: [{}], trajectory elements: [{}], element types: [{}], sparse attention: \
+         {:?}, tensor-parallel degree 1, ulysses degree 1 - recorded from the model's own \
+         forward at {}",
         request.clip,
         request.raster.0,
         request.raster.1,
         request.tokens,
         request.rows,
         request.elements,
-        request.root.display(),
-        sparse = request.sparse
+        deployment_types(request.types.as_deref()),
+        request.sparse,
+        request.root.display()
     );
     for row in &all {
         println!("{}\t{}", row.0, row.1);
@@ -918,6 +927,50 @@ fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
     let values: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())
+}
+
+/// The element types the four components store their weights in, as the caller's tensor table states
+/// them.
+///
+/// A recording is one deployment, and a deployment's rows are keyed by element type: a reader who
+/// cannot see which type each component was recorded at cannot tell a differing row from a differing
+/// deployment. **The types cannot be read on a host with no shard** - `nn::Checkpoint::open` reads a
+/// shard's header and `unopened` carries no names - so they arrive as the caller's
+/// `component-tensors.json`, the same artifact the extents table is filled from. The transformer stores
+/// **two** types (one for its stack, one for its declared crossings), and that is stated as it is rather
+/// than collapsed: the crossings are weights a layer pins, not a mixture someone had to choose.
+fn deployment_types(path: Option<&Path>) -> String {
+    let Some(path) = path else {
+        return "unstated (pass --types <component-tensors.json>)".to_owned();
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => return format!("unreadable ({error})"),
+    };
+    let table: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(table) => table,
+        Err(error) => return format!("unreadable ({error})"),
+    };
+    let mut parts = Vec::new();
+    for component in ["text_encoder", "transformer", "vae", "audio_vae"] {
+        let Some(tensors) = table.get(component).and_then(|value| value.as_object()) else {
+            parts.push(format!("{component}: absent"));
+            continue;
+        };
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for meta in tensors.values() {
+            if let Some(dtype) = meta.get("dtype").and_then(|value| value.as_str()) {
+                *counts.entry(dtype.to_owned()).or_default() += 1;
+            }
+        }
+        let stated = counts
+            .iter()
+            .map(|(dtype, count)| format!("{dtype} x{count}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        parts.push(format!("{component}: {stated}"));
+    }
+    parts.join(", ")
 }
 
 /// Every checkpoint tensor the chosen component's load asks for, in the load's order.
