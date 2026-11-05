@@ -142,6 +142,7 @@ impl Migrator {
             losses: 0,
             pending: None,
             resumed: false,
+            scheduled: false,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
@@ -289,8 +290,16 @@ pub struct RequestEvents {
     /// A migration `try_recv` met, which the next `recv` carries out.
     pending: Option<Migration>,
     /// Whether the stream resumed on another engine, whose scheduling event
-    /// repeats one the consumer received.
+    /// repeats one the consumer received. A migration that happened *before*
+    /// the consumer received any scheduling event leaves this false: the
+    /// engine that serves next states the request's scheduling for the first
+    /// time, and skipping it would leave the consumer with a token and no
+    /// output to put it in.
     resumed: bool,
+    /// Whether the consumer received the request's scheduling event. What a
+    /// migration skips is decided from this, because it is a fact about what
+    /// the consumer read, not about which engine sent it.
+    scheduled: bool,
     /// The last step the consumer received of each image that began, by
     /// image identity: an image a migration restarts from noise repeats its
     /// start and the steps the consumer received, which it does not read
@@ -316,6 +325,7 @@ impl RequestEvents {
             losses: 0,
             pending: None,
             resumed: false,
+            scheduled: false,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
@@ -336,6 +346,7 @@ impl RequestEvents {
             losses: 0,
             pending: None,
             resumed: consumed > 0,
+            scheduled: consumed > 0,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
@@ -510,7 +521,7 @@ impl RequestEvents {
     /// steps it received of an image the request restarts from noise.
     fn skips(&mut self, event: &Event) -> bool {
         match event {
-            Event::Scheduled { .. } if self.resumed => {
+            Event::Scheduled { .. } if self.resumed && self.scheduled => {
                 self.resumed = false;
                 true
             }
@@ -546,6 +557,7 @@ impl RequestEvents {
     /// event.
     fn observe(&mut self, event: &Event) {
         match event {
+            Event::Scheduled { .. } => self.scheduled = true,
             Event::TextToken { id, .. } => self.keep(&[*id]),
             Event::TextTokens { ids } => self.keep(ids),
             Event::ImageDone {
@@ -699,6 +711,10 @@ impl RequestEvents {
         }
         // The previous engine's stream ended with its migratable event.
         self.stream = stream;
+        // Whether the next engine's scheduling repeats one the consumer read
+        // is not knowable here — an engine lost before it scheduled anything
+        // leaves the next engine's first scheduling the only one the consumer
+        // will ever see — so `skips` answers it from what the consumer read.
         self.resumed = true;
         self.migrated_at = Some(started);
         Ok(())
@@ -850,11 +866,49 @@ mod tests {
             losses: 0,
             pending: None,
             resumed: false,
+            scheduled: false,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
             on_finish: None,
         }
+    }
+
+    /// A request whose engine was lost before it sent any scheduling reads
+    /// the next engine's scheduling: the repeat a migration removes is one
+    /// the consumer already read, and a consumer that read none has no output
+    /// to put a generated token in.
+    #[test]
+    fn a_resumed_stream_keeps_the_scheduling_its_consumer_never_read() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(tx);
+        let mut events = RequestEvents {
+            stream: EventStream::detached(rx),
+            request: None,
+            hold: None,
+            max_migrations: 0,
+            losses: 1,
+            pending: None,
+            resumed: true,
+            scheduled: false,
+            images: HashMap::new(),
+            migrated_at: None,
+            open: true,
+            on_finish: None,
+        };
+        let scheduling = || Event::Scheduled {
+            queued_at: 1.0,
+            scheduled_at: 2.0,
+        };
+        assert!(
+            !events.skips(&scheduling()),
+            "the next engine's scheduling is the first the consumer reads, not a repeat"
+        );
+        events.observe(&scheduling());
+        assert!(
+            events.skips(&scheduling()),
+            "a second scheduling is the repeat a migration removes"
+        );
     }
 
     /// A request survives `max_migrations` migrations caused by losses and
@@ -1496,6 +1550,7 @@ mod tests {
             losses: 0,
             pending: None,
             resumed: false,
+            scheduled: false,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
@@ -1541,6 +1596,7 @@ mod tests {
             losses: 0,
             pending: None,
             resumed: false,
+            scheduled: false,
             images: HashMap::new(),
             migrated_at: None,
             open: true,
