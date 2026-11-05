@@ -954,9 +954,9 @@ impl EpochPlan {
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
                     proto::request::ModelDtype::Float32 => DType::F32,
                 };
-                let canvas = deployment_canvas(&self.build.video)?;
+                let canvases = deployment_canvases(&self.build.video)?;
                 let model =
-                    minimax_h3::load(&opened, partition, Some(dtype), canvas, &mut loader)?;
+                    minimax_h3::load(&opened, partition, Some(dtype), &canvases, &mut loader)?;
                 let served = Served::Media(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))
@@ -1647,16 +1647,16 @@ fn media_candidates(
     Ok(candidates)
 }
 
-/// The one raster this deployment's video decoder is built for, in pixels.
+/// The rasters this deployment's video decoder serves, in pixels, in the order it names them.
 ///
 /// **A canvas is the deployment's statement, not the checkpoint's**: `video_config.resolutions` and
 /// `video_config.aspect_ratios` name it, and the checkpoint is asked which raster that pair is
-/// (`NAMED_CANVASES`). **A rank serves one raster**, because the decoder's register rows, its
-/// voxel-row table and its sequence offsets are that raster's constants rather than a request's -
-/// they are published at load, so a second canvas needs a second decoder, which this build does not
-/// yet bind. A deployment that names more than one is therefore refused here, by both rasters
-/// named, rather than at the first clip that arrives with the other one.
-fn deployment_canvas(video: &daemon::options::VideoOptions) -> Result<(u32, u32)> {
+/// (`NAMED_CANVASES`). **One decoder serves the whole set**, because the constants a decode reads
+/// are a tile's (its voxel permutation, its register and zero-row offsets) or a width's (the zero
+/// row, the rotary frequencies) - the same for every canvas, so a canvas of the set is a lookup and
+/// costs no device storage. The one per-canvas figure is the attention block's row bound, taken as
+/// the largest.
+fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32, u32)>> {
     use minimax_h3::config::NAMED_CANVASES;
     let mut canvases: Vec<(u32, u32)> = Vec::new();
     for edge in &video.resolutions {
@@ -1693,20 +1693,10 @@ fn deployment_canvas(video: &daemon::options::VideoOptions) -> Result<(u32, u32)
             }
         }
     }
-    match canvases.as_slice() {
-        [one] => Ok(*one),
-        [] => bail!("this deployment prepares no resolution class, so no raster could be decoded"),
-        many => bail!(
-            "this deployment prepares {} rasters ({}), and a video decoder is built for one: its \
-             register rows, voxel rows and sequence offsets are that raster's constants. State one \
-             resolution class and one aspect ratio",
-            many.len(),
-            many.iter()
-                .map(|(width, height)| format!("{width}x{height}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    if canvases.is_empty() {
+        bail!("this deployment prepares no resolution class, so no raster could be decoded");
     }
+    Ok(canvases)
 }
 
 /// The model class a checkpoint declares, as the checkpoint itself states it.

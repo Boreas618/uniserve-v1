@@ -711,21 +711,31 @@ impl ClipDecoder {
                         width.max(tile.latent_columns.1),
                     )
                 });
-        let built = decoder.canvas();
-        if (built.frames, built.height, built.width)
-            != (covered_frames, covered_height, covered_width)
-        {
-            return Err(Error::config(format!(
-                "the tiled decode was handed a decoder built for {}x{} latent cells of {} frame(s) \
-                 and its tiles cover {}x{} of {}: one decoder serves one canvas's grid",
-                built.height,
-                built.width,
-                built.frames,
-                covered_height,
-                covered_width,
-                covered_frames
-            )));
-        }
+        // The grid the tiles cover must be **one the decoder serves**: its tables are a tile's, so
+        // any canvas of the deployment's set is served, and a canvas outside it is refused by name.
+        let canvas = decoder
+            .canvases()
+            .iter()
+            .copied()
+            .find(|canvas| {
+                (canvas.frames, canvas.height, canvas.width)
+                    == (covered_frames, covered_height, covered_width)
+            })
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "the tiled decode's tiles cover {covered_height}x{covered_width} latent cells \
+                     of {covered_frames} frame(s), and this decoder serves {}",
+                    decoder
+                        .canvases()
+                        .iter()
+                        .map(|canvas| format!(
+                            "{}x{} of {} frame(s)",
+                            canvas.height, canvas.width, canvas.frames
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
         // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
         // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
         // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
@@ -749,7 +759,7 @@ impl ClipDecoder {
         // The transformer's fourteen buffers, reserved **once per clip** and reused by every tile: the
         // arena never rewinds, so a per-tile reservation would grow the clip's footprint by the tile
         // count while the plan states them once.
-        let scratch = decoder.scratch(f)?;
+        let scratch = decoder.scratch(f, &canvas)?;
         let patch = self.patch;
         let mut start = 0_u64;
         for tile in tiles {
@@ -765,7 +775,7 @@ impl ClipDecoder {
             let tokens = f
                 .arena()
                 .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
-            decoder.decode(f, latent, positions, tokens, &scratch)?;
+            decoder.decode(f, &canvas, latent, positions, tokens, &scratch)?;
             self.write_tile(f, tile, tokens, decoded, out, seam)?;
             start += tile_voxels;
         }
