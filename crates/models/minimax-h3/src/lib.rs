@@ -41,6 +41,7 @@ pub mod conditioning;
 pub mod config;
 pub mod decoding;
 pub mod denoiser;
+pub mod diagnosis;
 pub mod encoding;
 pub mod load;
 pub mod modulation;
