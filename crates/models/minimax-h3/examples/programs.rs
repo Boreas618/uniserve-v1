@@ -270,6 +270,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
+        // A conditioned deployment's pixels reach the encoder through the tiled path, whose seam
+        // blends and tile extents no whole-frame enumeration states.
+        if conditioned {
+            rows.extend(minimax_h3::tiled_encode::ClipEncoder::programs(
+                &config, &rasters, 1,
+            )?);
+        }
     } else {
         eprintln!("not walked: {} has no video VAE config", root.display());
     }
