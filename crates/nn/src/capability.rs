@@ -953,6 +953,23 @@ pub trait Decoder {
         )))
     }
 
+    /// The interleaved PCM window one decode of `audio` writes: sample frames and channels.
+    ///
+    /// **A track's window is the model's to state, and the runner sizes a column from it.** The
+    /// window is the vocoder's latent steps multiplied by the product of its upsampling rates,
+    /// which is checkpoint arithmetic: a runner that computed it would hold model knowledge, and
+    /// the first deployment with another rate would find it stated twice.
+    ///
+    /// Required rather than defaulted to a shape, for the reason [`element_type`](Self::element_type)
+    /// is: a decoder that does not say has no honest answer, and the alternative - guessing a window
+    /// - is silent, since a short window is a track that ends early and a long one a tail of garbage.
+    fn pcm_window(&self, audio: &LatentShape) -> Result<(u64, u32)> {
+        let _ = audio;
+        Err(Error::Unsupported(
+            "this decoder writes no interleaved PCM".to_owned(),
+        ))
+    }
+
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(
         &self,
