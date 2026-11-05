@@ -109,10 +109,17 @@ impl StderrTail {
         tail
     }
 
+    /// Keeps `line` in the ring, and echoes it where the process's standard
+    /// error went before it was piped: the run's own log.
+    ///
+    /// The echo is not decoration. A worker writes its explanation as it dies,
+    /// and the ring only carries the last line — the ones before it are what a
+    /// reader follows a failure through, so they go out unchanged.
     fn push(kept: &Mutex<VecDeque<String>>, line: String) {
-        let line: String = line.chars().take(Self::LINE).collect();
+        eprintln!("{line}");
+        let kept_line: String = line.chars().take(Self::LINE).collect();
         if let Ok(mut kept) = kept.lock() {
-            kept.push_back(line);
+            kept.push_back(kept_line);
             while kept.len() > Self::LINES {
                 kept.pop_front();
             }
