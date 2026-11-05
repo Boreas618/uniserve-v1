@@ -2681,6 +2681,21 @@ mod tests {
             );
         }
 
+        // The attention's key, stated whole: FP32 operands, head_dim from the final width, plain MHA
+        // (q_heads == kv_heads), and no offsets table because one track is one unpacked sequence.
+        // The `f32` package declares exactly this cell; an f16 form of it is served by no package and
+        // the encoder never asks for one, since its `programs` takes no dtype at all.
+        let attention: Vec<&str> = programs
+            .iter()
+            .filter(|(name, _)| name == "dense_attention")
+            .map(|(_, key)| key.as_str())
+            .collect();
+        assert_eq!(
+            attention,
+            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"],
+            "{programs:?}"
+        );
+
         // A longer track is another residual program, because the unit's whole output is its width.
         let longer = AudioEncoder::programs(&config, &[88_200]).expect("a longer track");
         assert_ne!(longer, programs);
