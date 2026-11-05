@@ -122,6 +122,12 @@ pub struct Candidates {
     pub valid: TensorView,
     /// `[rows, 4 · width + 2 · TOP_K_BINS]` i32: the ordering's scratch, which `top_k` fills.
     pub scratch: TensorView,
+    /// `[rows, vocabulary]` i32: the id space's counts, which `candidate_order` owns for a launch.
+    ///
+    /// It is the size of the vocabulary and not of the candidate row because the ordering counts
+    /// ranks rather than comparing candidates: a deployment with top-k disabled orders a row as wide
+    /// as the vocabulary, and the quadratic form of that comparison was sixteen seconds a token.
+    pub counts: TensorView,
 }
 
 impl Candidates {
@@ -136,6 +142,7 @@ impl Candidates {
             ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
             scratch: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
+            counts: arena.tensor(DType::I32, Shape::new(&[rows, vocabulary]))?,
         })
     }
 }
@@ -302,6 +309,8 @@ impl Sampler {
             ids: candidates.ids,
             ordered_values: candidates.ordered_values,
             ordered_ids: candidates.ordered_ids,
+            counts: candidates.counts,
+            vocabulary: u64::from(self.vocabulary),
         };
 
         f.operate::<CandidateOrder>(&order, args)?;
@@ -578,36 +587,6 @@ impl Sampler {
         }
 
         Ok(rows)
-    }
-
-    /// Put each row's candidates in ascending token id order, ready for the draw.
-    ///
-    /// `values` and `ids` are `[rows, width]` and are left untouched; the two ordered views receive
-    /// the permutation. This is the step between filtering and the draw: `inverse_cdf` inverts a
-    /// cumulative distribution in the order it is given, and the reference orders candidates by token
-    /// id first so that a draw does not depend on the order the top-k program produced
-    /// (`uniserve/sampling/top_k.py:307-314`).
-    pub fn order_candidates(
-        &self,
-        f: &Forward,
-        values: TensorView,
-        ids: TensorView,
-        ordered_values: TensorView,
-        ordered_ids: TensorView,
-    ) -> Result<()> {
-        let descriptor = OrderDescriptor {
-            values: DType::F32,
-            ids: ids.dtype,
-            pdl: launch::PDL,
-        };
-        let args = OrderArgs {
-            values,
-            ids,
-            ordered_values,
-            ordered_ids,
-        };
-
-        f.operate::<CandidateOrder>(&descriptor, args)
     }
 
     /// Take each row's largest shaped logit as its token, and report its log-probability when

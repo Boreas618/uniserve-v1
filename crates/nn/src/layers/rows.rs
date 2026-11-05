@@ -11,6 +11,19 @@
 //! because the sequence and its placeholders belong to the encoder's composition. It owns only the
 //! compiled form — one operator variant per mode, width and element block — so a block that places
 //! rows twice pays for one program.
+//!
+//! # The caller's obligation
+//!
+//! The index view holds **destination** indices, and every value in it must be less than the
+//! destination's row count: the operator writes `destination[indices[j]]`, so a table computed for
+//! another canvas — a clip's row table launched against a tile's rows, which is the mismatch that
+//! scatters a tiled decode past its buffer — writes into whatever the arena put next rather than
+//! refusing. The table is a **bound**, not a permutation: an entry names the packed row of the patch
+//! its voxel lies in, so entries repeat and rows go unnamed, and the only invariant the scatter needs
+//! is that every entry is under the destination's row count. [`Rows::check`] holds the three views' shapes against the descriptor and cannot see a
+//! value, so the table's provenance is the caller's to guarantee: it must be computed for the same
+//! canvas as the destination it is launched against, and a caller that cannot state which canvas a
+//! table came from must not launch it.
 
 use ops::DType;
 use ops::TensorView;

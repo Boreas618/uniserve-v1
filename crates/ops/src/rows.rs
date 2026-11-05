@@ -13,8 +13,20 @@
 //!
 //! `indices` is `[count]` i32 and may repeat: a repeated index is written, or added, more than once,
 //! in the order it appears, so the caller controls the sum order and repeated calls of one launch
-//! agree bit for bit. The rows themselves are `[rows, columns]` and the source is `[count, columns]`;
-//! an index outside `[0, rows)` is refused here rather than read on the device.
+//! agree bit for bit. The rows themselves are `[rows, columns]`, the source is `[count, columns]` and
+//! the index view is `[count]`, which is the one relation [`Rows::launch`] can hold.
+//!
+//! # What an index outside `[0, rows)` does
+//!
+//! **It writes there.** The kernel takes the index as an address, `destination[indices[j]]`, and masks
+//! only the columns: an index of 16 127 against a 1 797-row destination stores into whatever the arena
+//! put next, because a device value cannot be checked on the host and this kernel states no bound.
+//!
+//! The guard is therefore **the object that builds the table**: its provenance must be the same canvas
+//! as the destination it is launched against, and a caller that cannot say which canvas a table came
+//! from must not launch it. A kernel-side assert was considered and rejected: it would put one
+//! instruction per scatter on every launch to detect a table a refusal upstream already makes
+//! unrepresentable.
 //!
 //! The program is a kernel program: one thread per (row, element) of the source, the row taken from
 //! the second axis and the element block from the third, so a row's elements are never split across
