@@ -592,6 +592,19 @@ impl Leader {
         Ok(leader)
     }
 
+    /// The programs `config` names for what this deployment launches.
+    ///
+    /// The configuration selects a backend for attention and for the grouped experts, which are a
+    /// causal language model's operators. A video deployment launches neither, so a slot filled for
+    /// them would pin a program no call reaches: every operator it runs is filled from the store.
+    fn named_programs(&self, config: &ServeConfig) -> crate::epoch::FilledPrograms {
+        let mut filled = crate::epoch::FilledPrograms::of(config);
+        if self.video_denoiser().is_some() {
+            filled.kernels.clear();
+        }
+        filled
+    }
+
     /// Prepares the epoch's programs and switches this node's main processes
     /// to them (§7.3 steps 2-3, §3): a main process reports ready without
     /// waiting for warmup and serves only once the switchover has installed
@@ -613,7 +626,7 @@ impl Leader {
         engines: Vec<u64>,
         world: u64,
     ) -> anyhow::Result<()> {
-        let filled = crate::epoch::FilledPrograms::of(config);
+        let filled = self.named_programs(config);
         // The startup switch installs the epoch's programs as its record names
         // them: the scheduling policy *and* the kernel of every operator the
         // deployment selects. A main process resolves no kernel itself — its
@@ -1546,7 +1559,7 @@ impl Leader {
         // which this decision does not resolve: the main process resolves
         // the modules it needs when it loads them (`resolve`), so the
         // selection and the revisions are what this call is for.
-        let filled = crate::epoch::FilledPrograms::of(target);
+        let filled = self.named_programs(target);
         let servers = self.program_servers(target);
         let leader_host = self.program_leader_host(target, &servers);
         // Bounded like the epoch install's: the client's two waits have no
