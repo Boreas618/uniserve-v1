@@ -1236,7 +1236,11 @@ fn stage_audio(args: &Args) -> Result<()> {
     //    *this* draw rather than one of its own.
     let latents = arena.tensor(
         DType::F32,
-        Shape::new(&[u64::from(minimax_h3::audio_vae::PCM_CHANNELS), channels, frames]),
+        Shape::new(&[
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
+            channels,
+            frames,
+        ]),
     )?;
     nn::Noise::new().draw(
         &forward,
@@ -1252,7 +1256,10 @@ fn stage_audio(args: &Args) -> Result<()> {
     // The window's own shape: `[samples, 2]`, interleaved, which is what `DecodedMedia.audio` is.
     let out = arena.tensor(
         DType::I16,
-        Shape::new(&[u64::from(samples), u64::from(minimax_h3::audio_vae::PCM_CHANNELS)]),
+        Shape::new(&[
+            u64::from(samples),
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
+        ]),
     )?;
 
     // 6. The decode, with the recorder installed for its duration: the walk is what says which programs
@@ -1297,22 +1304,31 @@ fn stage_audio(args: &Args) -> Result<()> {
     let latent_bytes = download(
         &stream,
         latents,
-        usize::try_from(4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames).unwrap_or(0),
+        usize::try_from(4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames)
+            .unwrap_or(0),
     )?;
     write_h3t(
         &directory.join("latents.h3t"),
-        &[u64::from(minimax_h3::audio_vae::PCM_CHANNELS), channels, frames],
+        &[
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
+            channels,
+            frames,
+        ],
         CONTAINER_F32,
         &latent_bytes,
     )?;
     let pcm = download(
         &stream,
         out,
-        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples)).unwrap_or(0),
+        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples))
+            .unwrap_or(0),
     )?;
     write_h3t(
         &directory.join("pcm.h3t"),
-        &[u64::from(samples), u64::from(minimax_h3::audio_vae::PCM_CHANNELS)],
+        &[
+            u64::from(samples),
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
+        ],
         CONTAINER_I16,
         &pcm,
     )?;

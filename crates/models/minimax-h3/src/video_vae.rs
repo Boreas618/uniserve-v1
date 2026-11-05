@@ -1340,9 +1340,33 @@ impl VideoDecoder {
     /// tiles share one set: they are used sequentially, and the arena never rewinds, so a per-tile
     /// reservation would grow the clip's footprint by the tile count. The plan states these once
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
+    /// The largest of this clip's decode tiles: what one tile's buffers are sized by.
+    ///
+    /// [`Tiles`] splits the clip's canvas into tiles of at most the configured tile size, so a tile at
+    /// the canvas's edge can be smaller than the rest and "the largest" and "the first in grid order"
+    /// are different questions. [`Self::scratch`] asks this one because the fourteen transformer
+    /// buffers are reserved once for a whole clip and reused by every tile: sizing them by the clip
+    /// reserved the grid's worth for a decode that holds one tile's, and [`Self::decode`] validates a
+    /// tile's block against this ceiling rather than against the clip's extents.
+    pub fn largest_tile(&self) -> Result<Canvas> {
+        let grid = Tiles::of(&self.config, &self.canvas)?.tiles(&self.config, &self.canvas);
+        grid.into_iter()
+            .map(|tile| tile.canvas)
+            .max_by_key(|tile| (tile.voxels(), tile.height, tile.width))
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "a canvas of {} x {} latent cells has no tile to decode",
+                    self.canvas.height, self.canvas.width
+                ))
+            })
+    }
+
     pub fn scratch(&self, f: &Forward) -> Result<TileScratch> {
-        let rows = self.canvas.rows();
-        let voxels = self.canvas.voxels();
+        // One tile's, not the clip's: the clip is decoded tile by tile and these fourteen buffers are
+        // reserved once and reused, so a clip-sized reservation is the grid's worth for one tile's use.
+        let tile = self.largest_tile()?;
+        let rows = tile.rows();
+        let voxels = tile.voxels();
         let width = u64::from(self.width);
         let ffn = width * u64::from(self.ffn_mult);
         let half = u64::from(rotary(&self.config)?.0 / 2);
@@ -1380,17 +1404,32 @@ impl VideoDecoder {
         out: TensorView,
         scratch: &TileScratch,
     ) -> Result<()> {
-        let rows = self.canvas.rows();
-        let voxels = self.canvas.voxels();
-        if latents.shape.rank() != 2 || latents.shape.dim(0) != voxels {
+        // A tile's extents, read from the arguments: the decoder decodes the clip tile by tile, so the
+        // block in hand is one tile's and the clip's own extents are its ceiling rather than its shape.
+        let voxels = if latents.shape.rank() == 2 {
+            latents.shape.dim(0)
+        } else {
+            0
+        };
+        let registers = u64::from(self.canvas.registers) + u64::from(self.canvas.tail);
+        let rows = voxels + registers;
+        let ceiling = self.largest_tile()?;
+        if latents.shape.rank() != 2
+            || voxels == 0
+            || voxels % u64::from(self.canvas.frames) != 0
+            || voxels > ceiling.voxels()
+        {
             return Err(Error::config(format!(
-                "the decoder reads {voxels} latent rows, not {:?}",
+                "the decoder reads one tile's latent rows - a multiple of {} frames' cells, at most \
+                 {} - not {:?}",
+                self.canvas.frames,
+                ceiling.voxels(),
                 latents.shape.dims()
             )));
         }
         if out.shape.rank() != 2 || out.shape.dim(0) != rows {
             return Err(Error::config(format!(
-                "the decoder writes {rows} token rows, not {:?}",
+                "the decoder writes {rows} token rows for this tile's {voxels} voxels, not {:?}",
                 out.shape.dims()
             )));
         }
