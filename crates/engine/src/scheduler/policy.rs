@@ -250,9 +250,14 @@ pub trait PolicySource: Send + Sync {
 ///
 /// The daemon names a program by backend, revision and arguments, never by
 /// content: this asks the host's Program Server to `resolve` it — the store's
-/// copy, or a build of it when the store misses it — for the baseline target
-/// this engine pinned at start, under the `scheduling` operator's single
-/// descriptor ([`program_server::manifest::POLICY_DESCRIPTOR`]).
+/// copy, or a build of it when the store misses it — under the `scheduling`
+/// operator's single descriptor ([`program_server::manifest::POLICY_DESCRIPTOR`]).
+///
+/// The key it resolves under is the store's wasm target, not a CPU triple: a
+/// policy is one artifact per revision, written at install for
+/// [`program_server::manifest::WASM_TARGET`], and it belongs to the whole
+/// architecture rather than to one CPU (§5.3). The host's precompile triple is
+/// wasmtime's business and lives in [`Engine::new`].
 ///
 /// One connection is kept and reused: a precopy is the only caller, and it
 /// runs on a thread of its own, so the lock is never held across a step.
@@ -268,28 +273,29 @@ const POLICY_OP: &str = "scheduling";
 
 impl ProgramSource {
     /// A source that resolves programs through the Program Server listening on
-    /// `socket`, for the target this host's engine precompiles for.
+    /// `socket`, under the store's key for a scheduling policy.
     ///
-    /// A host without a baseline target has no Program Server artifacts to
-    /// load, which is a precopy failure like any other.
-    pub fn connect(socket: impl Into<PathBuf>) -> Result<Self, PolicyError> {
-        let name = Engine::target().ok_or_else(|| PolicyError::Load {
-            message: format!(
-                "no baseline wasm target for this host (architecture {}): its Program Server \
-                 precompiles none",
-                std::env::consts::ARCH
-            ),
-        })?;
-        Ok(Self {
+    /// The key is [`program_server::manifest::WASM_TARGET`] and nothing finer.
+    /// Asking for the host's precompile triple instead named a path no install
+    /// writes and no policy package declares, so the resolve could not read the
+    /// artifact the install built; a host that cannot precompile a module still
+    /// fails, but in [`Engine::new`], which is where that target is chosen.
+    pub fn connect(socket: impl Into<PathBuf>) -> Self {
+        Self {
             socket: socket.into(),
-            target: program_server::Target::new(name),
+            target: program_server::Target::new(program_server::manifest::WASM_TARGET),
             client: std::sync::Mutex::new(None),
-        })
+        }
     }
 
     /// The socket the source asks.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The store key every resolve of this source asks for.
+    pub fn target(&self) -> &program_server::Target {
+        &self.target
     }
 
     /// With `self`'s connection open, for the caller to resolve through.
@@ -2062,14 +2068,17 @@ mod tests {
     }
 
     #[test]
-    fn a_host_without_a_baseline_target_has_no_program_server_artifacts() {
-        // `ProgramSource::connect` names the target the engine precompiles for;
-        // a host that has none cannot resolve a policy at all, and says so
-        // instead of loading the module for another host.
-        match ProgramSource::connect("/tmp/none.sock") {
-            Ok(source) => assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock")),
-            Err(error) => assert!(error.to_string().contains("architecture"), "{error}"),
-        }
+    fn a_policy_is_resolved_under_the_stores_wasm_key() {
+        // A policy is one artifact per revision, written at install for the
+        // store's wasm target (`Manifest::builds_for` answers that key and no
+        // other for a package with no kernel), so a source that named a CPU
+        // triple asked for a path no install writes and no package declares.
+        let source = ProgramSource::connect("/tmp/none.sock");
+        assert_eq!(
+            source.target().as_str(),
+            program_server::manifest::WASM_TARGET
+        );
+        assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock"));
     }
 }
 

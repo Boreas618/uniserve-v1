@@ -3718,8 +3718,8 @@ impl MainProcess {
 
 impl MainProcess {
     /// §7.3 step 2's policy half: every scheduler prepares the update's policy program on its own
-    /// state, from the module the Program Server resolves for this host's baseline target, and
-    /// answers on a channel the serve pass polls.
+    /// state, from the module the Program Server resolves under the store's wasm key, and answers on
+    /// a channel the serve pass polls.
     ///
     /// The build runs on the scheduler's own blocking thread, never here: a policy's module is
     /// compiled the first time it is asked for, and §2.4 forbids the control thread to wait on it.
@@ -3737,11 +3737,18 @@ impl MainProcess {
                 .collect(),
         )
         .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
-        let source = Arc::new(
-            ProgramSource::connect(&self.program_server)
-                .map_err(|error| anyhow::anyhow!("reaching the Program Server: {error}"))?,
-        );
+        let source = Arc::new(ProgramSource::connect(&self.program_server));
         let source: Arc<dyn PolicySource + Send + Sync> = source;
+        // The start marker of §7.3 step 2's policy half: the resolve that follows runs on a
+        // scheduler's blocking thread and prints its own target and spans, and without this line a
+        // log cannot tell a precopy that began from one whose command was never sent.
+        tracing::info!(
+            backend = %program.backend,
+            revision = program.revision,
+            schedulers = self.schedulers.len(),
+            socket = %self.program_server.display(),
+            "this precopy's policy preparation has begun"
+        );
         Ok(self
             .schedulers
             .iter()
