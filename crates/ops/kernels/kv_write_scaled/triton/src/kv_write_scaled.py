@@ -64,7 +64,7 @@ def _kv_write_scaled_kernel(
 
     ``source`` is ``[tokens, heads · head_dim]`` in full precision, the cache
     ``[pages, page, heads, head_dim]`` E4M3, ``scales`` and ``initialized`` the
-    page's f32 scale and i32 flag at ``[pages, 1, 1, 1]``, and ``slots`` the flat
+    page's f32 scale and u8 flag at ``[pages, 1, 1, 1]``, and ``slots`` the flat
     ``page · page_size + offset`` of each token (``-1`` skips it).
     Grid: ``[pages, ceil(heads · head_dim / BLOCK), 1]``.
     """
