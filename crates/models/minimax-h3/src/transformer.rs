@@ -651,15 +651,18 @@ impl Transformer {
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
-        for columns in [
-            u64::from(groups.count()),
-            18 * u64::from(hidden),
-            2 * u64::from(hidden),
+        //
+        // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
+        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
+        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
+        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
+        // i32 for all three named two keys no launch binds.
+        for (dtype, columns) in [
+            (nn::DType::I32, u64::from(groups.count())),
+            (dtype, 18 * u64::from(hidden)),
+            (dtype, 2 * u64::from(hidden)),
         ] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                nn::DType::I32,
-                columns,
-            )?);
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
         }
 
         // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
