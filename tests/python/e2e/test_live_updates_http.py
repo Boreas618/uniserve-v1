@@ -1325,7 +1325,7 @@ def _restart_while_streaming(
         # account of what it did with them, not a number of seconds.
         raise AssertionError(
             f"{error} (counts so far: {[len(read) for read in reads]}; "
-            f"stream errors: {[repr(one) for one in errors]}){log_tail(log)}"
+            f"stream errors: {[repr(one) for one in errors]}){log_tail(log, 200)}"
         ) from error
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
