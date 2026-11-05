@@ -11,7 +11,6 @@
 
 pub mod chat_completions;
 pub(crate) mod error;
-pub mod images;
 pub(crate) mod protocol;
 pub(crate) mod video_jobs;
 pub mod videos;

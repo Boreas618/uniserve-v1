@@ -43,7 +43,7 @@ Every option is checked by its type wherever it is stated, and an error names it
 
 Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host storage a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available storage less the reserve cannot hold is refused, unless the server runs a Mooncake connector, which has it stage pages through a pool of at most 256 MiB on each rank from its reserve), `--transfer-chunk-us N` sets how long one chunk of its Transfer Server's copies lasts at the link's bandwidth (1000 µs unless stated), `--nixl-library PATH` names NIXL's `libnixl_capi.so` (of the NIXL release the build binds, 1.5.1, with its UCX backend) that the Transfer Server loads for copies from other hosts, whose storage it registers pinned and outside UCX's registration cache; another host reads a read-only tensor in host storage only through a NIXL and UCX built with the read-only registration patches (`artifacts/native/build-ucx.sh` and `build-nixl.sh`, documented beside them) (the loader's search path finds the library unless stated; `UCX_NET_DEVICES` in the server's environment limits UCX to the host's usable RDMA ports), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the storage of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the storage it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, holding the token count the engine sizes its world's host KV cache at (`kv_cache_config.host_ratio` and `host_gib`), and a pool is allocated and pinned whole when the first worker maps it. A world shares the pools of the previous world whose pages have the same layout; a pool the host cannot hold first takes the place of the deployment's pools no world maps any more. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
 
-Some tables configure one model family: `chat_config` and `image_fetch_config` chat models (Qwen3, SenseNova, BAGEL, DiffusionGemma); `video_config`, `media_config` and `video_job_config` MiniMax-H3; `readout_config` and `diffusion_generation_config` DiffusionGemma. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
+Some tables configure one model family: `chat_config` and `image_fetch_config` the text and chat models (Qwen3); `video_config`, `media_config` and `video_job_config` MiniMax-H3. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
 
 ## Configuration file
 
@@ -308,20 +308,6 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 | --- | --- | --- |
 | `retention` | `"1h"` | Time a finished asynchronous job stays retrievable |
 | `max_bytes` | `"1GiB"` | Generated video the asynchronous jobs keep in shared memory |
-
-### `readout_config`
-
-The [DiffusionGemma serving guide](diffusion_gemma/serving.md) explains these options.
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `layout` | `"joint"` | `joint` packs System One questions into shared canvases; `independent` gives each its own prompt and canvas |
-| `canvas` | `"full"` | Canvas length: `full`, `compact`, or a positive multiple of 16 |
-| `candidates` | `"variants"` | `variants` sums supported answer spellings; `primary` reads the space-prefixed one |
-
-### `diffusion_generation_config`
-
-DiffusionGemma's block-diffusion sampling of every generated reply; each option stated replaces the checkpoint's `generation_config.json` value of the same name: `max_denoising_steps`, `entropy_bound`, `t_min`, `t_max`, `confidence_threshold` and `stability_threshold`.
 
 ## Deployment files
 

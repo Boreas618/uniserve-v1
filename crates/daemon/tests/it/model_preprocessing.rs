@@ -751,6 +751,29 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
     .unwrap()
 }
 
+/// A chat request that asks for image output is refused by name: no served
+/// profile generates images, so asking for one alone — or beside text — is a
+/// refusal, not a text answer.
+#[test]
+fn a_chat_request_for_image_output_is_refused_by_name() {
+    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    for modalities in [vec!["image"], vec!["text", "image"]] {
+        let request: daemon::openai::ChatCompletionRequest = serde_json::from_value(
+            serde_json::json!({
+                "model": SERVED_MODEL,
+                "messages": [{"role": "user", "content": "draw a bird"}],
+                "modalities": modalities,
+            }),
+        )
+        .unwrap();
+        let error = preprocess_chat(&processor, String::from("image-output"), request, Vec::new())
+            .err()
+            .unwrap_or_else(|| panic!("{modalities:?} was admitted"));
+        let message = error.to_error_response().error.message;
+        assert!(message.contains("image_output"), "{modalities:?}: {message}");
+    }
+}
+
 /// Dense and mixture-of-experts Qwen3 checkpoints serve tool calls only when
 /// their chat template asks for the JSON calls the Qwen3 parser reads; a
 /// template asking for another call format refuses requests with tools
