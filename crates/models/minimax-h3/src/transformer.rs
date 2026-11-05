@@ -656,18 +656,20 @@ impl Transformer {
             dtype,
             dtype,
         ));
-        // **And the four boundary projections, which the checkpoint stores at another type.** They
-        // read the stack's activation with a weight of the boundary type and carry a bias, so a row
-        // keyed from the stack alone states a product the runtime never makes: the omission stopped
-        // a run (`the refused gemm is input f32, weight bf16`). A component stored in one type has
+        // **And the boundary products, which cross the two types.** The boundary tensors are the
+        // F32 side and the block weights are the stack's, so the product reads an activation of the
+        // boundary type over a weight of the stack's: the forward's own record says
+        // `input_f32_weight_bf16`, and a statement keyed from the stack alone names that pair's
+        // mirror - a cell the runtime never asks for, while the one it does ask for stops the run
+        // (`the refused gemm is input f32, weight bf16`). A single-typed component has
         // `boundary == dtype` and states nothing here.
         if boundary != dtype {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 hidden,
-                boundary,
+                dtype,
                 WeightOrder::NxK,
                 true,
-                dtype,
+                boundary,
                 dtype,
             ));
         }
