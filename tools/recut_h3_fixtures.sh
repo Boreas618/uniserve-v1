@@ -81,6 +81,32 @@ run() {
 
 echo "re-cutting H3 fixtures at $commit"
 
+# The walk this tool drives is the only place a deployment's rows are stated, and the properties it
+# needs have been absent from the tips this tool has been run against more than once: each component's
+# own element type (`--types`), the offered canvases, the deployment's own packed bound (so no
+# `--rows`), and no `--dtype`. A walk without `--types` keys every row from one element type, so a
+# fixture cut from it describes one type where the model runs two - and no delta can see that, because
+# the fixture and the walk agree with each other. Diagnose it by name rather than letting the walk's
+# own flag error read as a tool fault.
+probe=$(mktemp)
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --samples 256 --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
+    --elements "$elements" --track "$track" >"$probe" 2>&1; then
+    if grep -q 'unknown flag --types' "$probe"; then
+        cat >&2 <<'EOF'
+the walk at this tip takes no `--types`, so it cannot state each component's own element type:
+  the walk is missing the deployment properties (--types/deployment_dtype, offered_canvases,
+  rows_bound, and no --dtype), and a fixture cut here would key every row from one element type.
+  Land the walk's element types first, then re-cut: the recorder keys its rows per component, so the
+  two enumerations cannot be compared until both do.
+EOF
+        rm -f "$probe"
+        exit 1
+    fi
+fi
+rm -f "$probe"
+
 # 1. The walks. No `--rows` and no `--dtype`: the deployment's own bound and each component's own
 #    type, both read from the checkpoint (or from `--types` where this host has no shards).
 echo 'walk:'
