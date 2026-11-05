@@ -338,7 +338,10 @@ mod tests {
             vec![reported(
                 &host,
                 7,
-                Kind::Promoted(Promoted { generation: 7 }),
+                Kind::Promoted(Promoted {
+                    generation: 7,
+                    program_generation: 0,
+                }),
             )],
         );
         driver.advance();

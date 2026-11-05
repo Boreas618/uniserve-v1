@@ -941,6 +941,18 @@ impl MainProcess {
         Ok(())
     }
 
+    /// The program generation this process holds and would serve from now on (§7.3).
+    ///
+    /// A prepared generation is the one a switchover takes, so it is what a promotion is about; a
+    /// process with none prepared holds the generation it was launched at, and a process that holds
+    /// neither states `0`, which is "unstated" on the wire.
+    fn served_generation(&self) -> u64 {
+        self.prepared
+            .first()
+            .map(|generation| generation.number())
+            .unwrap_or_else(|| self.update.current())
+    }
+
     /// §2.5: gives the parked process's cache segments back to the Storage Server, and states what
     /// went back and what stayed.
     ///
@@ -1429,10 +1441,16 @@ impl MainProcess {
                         self.serving = false;
                         self.pending_serve = true;
                     }
+                    // The two numbers answer different questions and both are needed: the launch
+                    // generation is what the epoch layer promotes a child by, and the program
+                    // generation is the one this process holds - the fact the daemon compares with
+                    // its own before it moves the frontend, so a promotion of a generation the
+                    // epoch has reverted is refused there instead of served here (§7.3, §2.5).
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Promoted(
                             proto::process::Promoted {
                                 generation: self.control.engine(),
+                                program_generation: self.served_generation(),
                             },
                         )),
                     });
