@@ -47,32 +47,20 @@ struct DecoderColumns {
     latents: Column,
     /// The clip's raster, `[channels, frames, rows, columns]`, in the decoder's own element type.
     raster: Column,
-    /// One column per table the largest layout declares, in `layout_tables` order.
-    ///
-    /// Each column takes its element type and length from the table it stages, because a decoder's
-    /// tables are not one type: the rotary tables and the copy offsets are the shapes the model
-    /// states and this file only copies them.
-    state: Vec<Column>,
 }
 
 impl DecoderColumns {
-    fn new(
-        device: DeviceId,
-        layout: &Layout,
-        dtype: DType,
-        tables: &[nn::capability::StateTable],
-    ) -> Result<Self> {
+    /// The clip's own two columns. **The tables are not here:** `Tables` holds them by
+    /// `(layout, name)` and `fill` puts the model's bytes in the cache the graph addresses
+    /// (`walk` reads `self.tables.views`), so a host column per table would be a second copy that
+    /// nothing reads — and the second copy is what let a staged buffer land in a table's place.
+    fn new(device: DeviceId, layout: &Layout, dtype: DType) -> Result<Self> {
         let video = layout.video;
         let voxels = u64::from(video.frames) * u64::from(video.height) * u64::from(video.width);
         let elements = voxels
             .checked_mul(u64::from(video.channels))
             .ok_or_else(|| Error::Invalid("a clip's latent extent overflows".into()))?;
         let latents = Column::new(device, dtype, elements)?;
-        let mut state = Vec::with_capacity(tables.len());
-        for table in tables {
-            let numel = table.shape.numel();
-            state.push(Column::new(device, table.dtype, numel)?);
-        }
         Ok(Self {
             latents,
             // Sized by `size_raster` when a bucket is first staged: the raster's frame count is the
@@ -80,7 +68,6 @@ impl DecoderColumns {
             // clip writes the decoded ones. One element until then, because a column of a length
             // this constructor cannot know must not pretend to a length it can.
             raster: Column::new(device, dtype, 1)?,
-            state,
         })
     }
 }
@@ -170,8 +157,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )
         })?;
         let dtype = model.element_type();
-        let tables = model.layout_tables(layout).map_err(Error::from)?;
-        let columns = DecoderColumns::new(binding.device, layout, dtype, &tables)?;
+        let columns = DecoderColumns::new(binding.device, layout, dtype)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -361,25 +347,24 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(buffers)
     }
 
-    /// Stages `bucket`'s columns: the model's tables, and the clip's latents when a batch states
-    /// them.
+    /// Stages `bucket`'s latents, and the model's own tables where the cache does not hold them.
     ///
-    /// **Every table is the model's, computed here.** `Decoder::prepare_layout` writes them from the
-    /// layout, and `layout_tables` states their count and shapes - the executor copies bytes it did
-    /// not compute. A batch that carried the tables as well would state the model's layout
-    /// arithmetic a second time, which `MediaColumns::staged` already rules out: "It does not own
-    /// what the model prepares on the device - the encoded conditioning rows, the latent
-    /// trajectory".
+    /// **Every table is the model's and every table lives in `Tables`.** `prepare_layout` writes the
+    /// bytes from the layout and `fill` puts them in the cache the captured graph addresses, keyed
+    /// by `(layout, name)` - so this function stages the clip's latents and nothing else. A batch
+    /// that carried tables would state the model's layout arithmetic a second time, which
+    /// `MediaColumns::staged` already rules out: "It does not own what the model prepares on the
+    /// device - the encoded conditioning rows, the latent trajectory".
     ///
-    /// A warm capture passes no latents, so the graph reads the model's own clip (`prepare_layout`'s
-    /// first buffer) rather than whatever the column held. A replay passes the batch's: a staged row
-    /// is the request's conditioning blob and its parameter record, and for a decode the blob is the
-    /// clip's latents.
+    /// A warm capture passes no latents, so the graph reads the model's own clip
+    /// (`prepare_layout`'s first buffer) rather than whatever the column held. A replay passes the
+    /// batch's: a staged row is the request's conditioning blob and its parameter record, and for a
+    /// decode the blob is the clip's latents.
     fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        let mut host = vec![Vec::new(); tables.len() + 1];
+        self.fill(bucket)?;
+        let mut host = vec![Vec::new(); 1];
         self.model
             .prepare_layout(&layout, &mut host)
             .map_err(Error::from)?;
@@ -398,9 +383,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 self.columns.latents.write(bytes)?;
             }
             None => self.columns.latents.write(&host[0])?,
-        }
-        for (column, bytes) in self.columns.state.iter_mut().zip(&host[1..]) {
-            column.write(bytes)?;
         }
         self.staged = Some(bucket);
         Ok(())
@@ -438,11 +420,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// Uploads the staged columns, in one place, so a capture and a replay agree on what the graph
     /// reads.
     fn upload(&self) -> Result<()> {
-        self.columns.latents.upload(&self.stream)?;
-        for column in &self.columns.state {
-            column.upload(&self.stream)?;
-        }
-        Ok(())
+        self.columns.latents.upload(&self.stream)
     }
 
     /// The clip's latents, `[voxels, channels]`, as the model reads them.
