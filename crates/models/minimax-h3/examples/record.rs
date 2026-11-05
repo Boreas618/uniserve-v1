@@ -273,7 +273,7 @@ fn run() -> Result<(), String> {
     // device and no shard, which is what makes the walk the second enumeration rather than the first.
     println!(
         "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [({}, {})], prompt lengths: [{}], \
-         packed rows: [{}], trajectory elements: [{}], element types: [{}], sparse attention: \
+         packed rows: [{}], trajectory elements: [{}], element types: {}, sparse attention: \
          {:?}, tensor-parallel degree 1, ulysses degree 1 - recorded from the model's own \
          forward at {}",
         request.clip,
@@ -283,7 +283,7 @@ fn run() -> Result<(), String> {
         request.rows,
         request.elements,
         request.types.as_deref().map_or_else(
-            || "unstated (pass --types <component-tensors.json>)".to_owned(),
+            || format!("[{}]", minimax_h3::load::UNSTATED),
             deployment_types,
         ),
         request.sparse,
@@ -942,12 +942,8 @@ fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
 /// derivable on a host with no shard (`nn::Checkpoint::open` reads a shard's header and `unopened`
 /// carries no names), which is why they arrive as a table rather than being read here.
 fn deployment_types(path: &Path) -> String {
-    match minimax_h3::load::element_types(path) {
-        Ok(found) => found
-            .iter()
-            .map(minimax_h3::load::StoredTypes::field)
-            .collect::<Vec<_>>()
-            .join(", "),
+    match minimax_h3::load::ElementTypes::read(path) {
+        Ok(stated) => format!("[{}] from {}", stated.field(), path.display()),
         Err(error) => format!("unreadable ({error})"),
     }
 }

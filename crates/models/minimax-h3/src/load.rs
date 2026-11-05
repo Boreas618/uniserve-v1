@@ -33,7 +33,7 @@
 //! place that reads it.
 
 use nn::{Block, BlockName};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audio_vae::AudioDecoder;
@@ -277,37 +277,126 @@ impl StoredTypes {
     }
 }
 
-/// The four components a deployment's header names, with the element types each stores weights in,
-/// read from a `component-tensors.json` the caller exported from the checkpoint's own headers.
-///
-/// The table is the checkpoint export's (`{"<component>": {"<tensor>": {"dtype": …, "shape": …}}}`),
-/// and it is a caller's artifact because reading it here needs no shard: the point of stating it is
-/// that a shardless host cannot read the types for itself.
-pub fn element_types(table: &Path) -> Result<Vec<StoredTypes>> {
-    const COMPONENTS: [&str; 4] = ["text_encoder", "transformer", "vae", "audio_vae"];
-    let text = std::fs::read_to_string(table)
-        .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
-    let table: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
-    let mut found = Vec::with_capacity(COMPONENTS.len());
-    for component in COMPONENTS {
-        let mut dtypes: Vec<(String, usize)> = Vec::new();
-        if let Some(tensors) = table.get(component).and_then(|value| value.as_object()) {
-            for meta in tensors.values() {
-                let Some(dtype) = meta.get("dtype").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                match dtypes.iter_mut().find(|(name, _)| name == dtype) {
-                    Some((_, count)) => *count += 1,
-                    None => dtypes.push((dtype.to_owned(), 1)),
+/// A deployment's statement of the four components' stored element types: what its header carries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ElementTypes {
+    /// The file the statement was read from, so a header can say where its numbers came from.
+    pub source: PathBuf,
+    /// The four components, in the header's own order.
+    pub components: Vec<StoredTypes>,
+}
+
+impl ElementTypes {
+    /// Read the statement from a table of either shape: a caller's export of the checkpoint's tensor
+    /// headers (`{component: {tensor: {dtype, shape}}}`), or the committed summary of one
+    /// (`{component: {dtype: count}}`).
+    ///
+    /// Both are one file because both are one fact - a checkpoint's element types - and the two
+    /// differ only in how much of the checkpoint they carry. The summary exists because an export is
+    /// an artifact (`artifacts/` is not in the tree) while a fixture's header must still state its
+    /// deployment on a host that has no export at all.
+    pub fn read(table: &Path) -> Result<Self> {
+        const COMPONENTS: [&str; 4] = ["text_encoder", "transformer", "vae", "audio_vae"];
+        let text = std::fs::read_to_string(table)
+            .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+        let table_json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+        let mut components = Vec::with_capacity(COMPONENTS.len());
+        for component in COMPONENTS {
+            let mut dtypes: Vec<(String, usize)> = Vec::new();
+            if let Some(value) = table_json.get(component).and_then(|value| value.as_object()) {
+                for (key, entry) in value {
+                    // A summary states the counts themselves: `{"BF16": 626}`.
+                    if let Some(count) = entry.as_u64() {
+                        dtypes.push((key.clone(), count as usize));
+                        continue;
+                    }
+                    // An export states each tensor's own header: `{"<name>": {"dtype": "BF16"}}`.
+                    let Some(dtype) = entry.get("dtype").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    match dtypes.iter_mut().find(|(name, _)| name == dtype) {
+                        Some((_, count)) => *count += 1,
+                        None => dtypes.push((dtype.to_owned(), 1)),
+                    }
                 }
             }
+            components.push(StoredTypes { component, dtypes });
         }
-        found.push(StoredTypes { component, dtypes });
+        Ok(Self {
+            source: table.to_owned(),
+            components,
+        })
+    }
+
+    /// The header's one field for all four components, such as
+    /// `text_encoder: BF16 x1058, transformer: F32 x12 + BF16 x626, …`.
+    pub fn field(&self) -> String {
+        self.components
+            .iter()
+            .map(StoredTypes::field)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Check the statement against a checkpoint's own shard headers, refusing a disagreement by
+    /// component, type and count.
+    ///
+    /// A statement that can be checked is checked, and one that cannot is not pretended to be: a host
+    /// with no shard cannot open the checkpoint, so its caller skips this - and that is exactly the
+    /// host the committed summary serves.
+    pub fn verify(&self, checkpoint: &nn::Checkpoint) -> Result<()> {
+        for stated in &self.components {
+            let found = count_stored_types(checkpoint, stated.component)?;
+            if found == stated.dtypes {
+                continue;
+            }
+            let show = |pairs: &[(String, usize)]| {
+                pairs
+                    .iter()
+                    .map(|(dtype, count)| format!("{dtype} x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            return Err(Error::checkpoint(format!(
+                "{}: the statement holds {} for {}, and the checkpoint's shards hold {}",
+                self.source.display(),
+                show(&stated.dtypes),
+                stated.component,
+                show(&found)
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One component's stored element types as its shards state them, counted per type.
+///
+/// Integer tensors are not weights and do not count, as in [`stored_types`].
+fn count_stored_types(
+    checkpoint: &nn::Checkpoint,
+    component: &str,
+) -> Result<Vec<(String, usize)>> {
+    let source = checkpoint.component(component)?;
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for name in source.names() {
+        let Some(location) = source.tensor(name) else {
+            continue;
+        };
+        if !location.dtype.is_float() {
+            continue;
+        }
+        let dtype = location.dtype.to_string();
+        match found.iter_mut().find(|(name, _)| *name == dtype) {
+            Some((_, count)) => *count += 1,
+            None => found.push((dtype, 1)),
+        }
     }
     Ok(found)
 }
 
+/// Where a deployment's element types stand when no table was given: stated by nothing, said so.
+pub const UNSTATED: &str = "unstated (pass --types <component-tensors.json>)";
 /// The element type a consumer takes for a whole component, refusing one of two by name.
 pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
     let found = stored_types(checkpoint, component)?;
@@ -735,4 +824,44 @@ fn sidecars(checkpoint: &nn::Checkpoint) -> Result<(Layout, Sidecars)> {
     let layout = Layout::detect(checkpoint.root())?;
     let sidecars = Sidecars::read_components(checkpoint, &layout)?;
     Ok((layout, sidecars))
+}
+
+#[cfg(test)]
+mod element_types_tests {
+    use super::*;
+
+    /// The committed summary and the export it was taken from are one fact in two shapes: a header
+    /// that stated a different field for the two would be a header nobody could compare.
+    #[test]
+    fn a_summary_and_an_export_state_the_same_deployment() {
+        let directory = std::env::temp_dir().join("h3-element-types-test");
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let summary = directory.join("summary.json");
+        let export = directory.join("export.json");
+        std::fs::write(
+            &summary,
+            r#"{"text_encoder": {"BF16": 2}, "transformer": {"F32": 1, "BF16": 1}, "vae": {"F32": 3}}"#,
+        )
+        .expect("the summary");
+        std::fs::write(
+            &export,
+            r#"{"text_encoder": {"block.0.weight": {"dtype": "BF16", "shape": [1]},
+                                 "block.1.weight": {"dtype": "BF16", "shape": [1]}},
+                "transformer": {"proj_in.weight": {"dtype": "F32", "shape": [1]},
+                                "block.0.weight": {"dtype": "BF16", "shape": [1]}},
+                "vae": {"decoder.0.weight": {"dtype": "F32", "shape": [1]},
+                        "decoder.1.weight": {"dtype": "F32", "shape": [1]},
+                        "decoder.2.weight": {"dtype": "F32", "shape": [1]}}}"#,
+        )
+        .expect("the export");
+
+        let stated = ElementTypes::read(&summary).expect("the summary reads");
+        let exported = ElementTypes::read(&export).expect("the export reads");
+        assert_eq!(stated.field(), exported.field());
+        assert!(stated.field().contains("text_encoder: BF16 x2"));
+        assert!(stated.field().contains("transformer: F32 x1 + BF16 x1"));
+        // A component the table says nothing about is said to be unstated rather than left out: a
+        // header that dropped the field would read as a deployment with no audio VAE.
+        assert!(stated.field().contains("audio_vae: unstated"));
+    }
 }
