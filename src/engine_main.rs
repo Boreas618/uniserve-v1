@@ -4251,6 +4251,13 @@ struct NativeModule {
     copy: Option<std::path::PathBuf>,
 }
 
+impl NativeModule {
+    /// Whether this module was loaded from a copy rather than from the store's own file.
+    fn copied(&self) -> bool {
+        self.copy.is_some()
+    }
+}
+
 impl Drop for NativeModule {
     fn drop(&mut self) {
         let Some(copy) = &self.copy else {
@@ -4266,9 +4273,109 @@ impl Drop for NativeModule {
     }
 }
 
+/// The file a native module's library is, and the path it is loaded from.
+///
+/// **Never by position.** A `paged_attention` module holds `module.so` beside `cubins/`, and `cubins`
+/// sorts before `module.so`, so taking the first file handed `dlopen` a cubin and the answer was
+/// `cannot open shared object file`. The library is the file that defines the entry the package
+/// declared, which is the property `dlopen` is for; a module whose files define it in more than one
+/// place, or in none, is refused by name with its files listed.
+///
+/// A module with siblings is never loaded from a copy: its entry receives no path - `ops::Entry`
+/// takes the call structure and the stream - so the object finds its own `cubins/` through the
+/// location it was built or placed at, and a copy carries neither. The warning says which of the two
+/// the object states for itself.
+fn native_library(
+    files: Vec<program_server::ModuleFile>,
+    entry: &str,
+) -> executor::Result<NativeModule> {
+    let invalid = |reason: String| executor::Error::Invalid(reason);
+    let siblings = files.len() > 1;
+    let chosen = match files.len() {
+        0 => return Err(invalid("a native module carries no library".to_owned())),
+        // One file: the module's library is that file, and there is no order to get wrong.
+        1 => 0,
+        _ => {
+            let defining: Vec<usize> = files
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| defines_entry(file, entry))
+                .map(|(index, _)| index)
+                .collect();
+            let names = |chosen: &[usize]| {
+                chosen
+                    .iter()
+                    .filter_map(|index| files.get(*index))
+                    .map(|file| file.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match defining.as_slice() {
+                [only] => *only,
+                [] => {
+                    return Err(invalid(format!(
+                        "no file of this native module defines the entry the package declared \
+                         ({entry}), so nothing in it is that module's library: {}",
+                        names(&(0..files.len()).collect::<Vec<_>>())
+                    )));
+                }
+                several => {
+                    return Err(invalid(format!(
+                        "several files of this native module define the entry the package declared \
+                         ({entry}), so its library is ambiguous: {}",
+                        names(several)
+                    )));
+                }
+            }
+        }
+    };
+    let file = files
+        .into_iter()
+        .nth(chosen)
+        .ok_or_else(|| invalid("the chosen library file is missing".to_owned()))?;
+    if siblings {
+        // The question a reader of a failed load has: how does this object find the files beside it?
+        tracing::info!(
+            library = %file.name,
+            files = chosen + 1,
+            origin = ?origin_in_runpath(&file),
+            "this native module's library sits beside other files of the module"
+        );
+    }
+    native_module(&file, !siblings)
+}
+
+/// Whether a file defines `entry` among the functions it exports.
+fn defines_entry(file: &program_server::ModuleFile, entry: &str) -> bool {
+    bytes_of(file)
+        .and_then(|bytes| defined_names(&bytes))
+        .is_some_and(|names| names.iter().any(|name| name == entry))
+}
+
+/// The file's bytes, read from the start: the handle the server sent may have been read already.
+fn bytes_of(file: &program_server::ModuleFile) -> Option<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut handle = &file.file;
+    handle.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::with_capacity(file.size as usize);
+    handle.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Whether the object states `$ORIGIN` in its run path: the one way it can find a sibling file by
+/// its own location. `None` when the object states no run path, or cannot be read.
+fn origin_in_runpath(file: &program_server::ModuleFile) -> Option<bool> {
+    let bytes = bytes_of(file)?;
+    let path = dynamic_string(&bytes, &[29, 15])?;
+    Some(path.contains("$ORIGIN"))
+}
+
 /// The path a native module is loaded from: the store's own file when it still has one, and a copy
 /// this process owns when the handle the server sent has outlived its name.
-fn native_module(file: &program_server::ModuleFile) -> executor::Result<NativeModule> {
+fn native_module(
+    file: &program_server::ModuleFile,
+    copy_allowed: bool,
+) -> executor::Result<NativeModule> {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
 
@@ -4286,7 +4393,16 @@ fn native_module(file: &program_server::ModuleFile) -> executor::Result<NativeMo
 
     // The handle names nothing this process can open: the server unlinked the file after sending
     // it, or the descriptor addresses something that is not a file. One copy, under a name no
-    // other module shares.
+    // other module shares - and only for a module that stands alone, because a copy is a different
+    // location and every path the module resolves from its own location would break.
+    if !copy_allowed {
+        return Err(invalid(format!(
+            "the library of this native module ({}) has no name this process can open, and the \
+             module holds files beside it: loading it from a copy would lose them, because the \
+             entry receives no path and the object finds them through its own location",
+            file.name
+        )));
+    }
     static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ordinal = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!("uniserve-native-{}", std::process::id()));
@@ -4326,9 +4442,7 @@ impl Resolved {
     /// Whether this module was loaded from a copy rather than from the store's own file: the one
     /// fact that tells a store whose handles name their files from a store whose do not.
     fn copied(&self) -> bool {
-        self.native
-            .as_ref()
-            .is_some_and(|native| native.copy.is_some())
+        self.native.as_ref().is_some_and(NativeModule::copied)
     }
 
     /// The module as `ops::install` takes it.
@@ -4397,85 +4511,125 @@ fn report_missing_entry(error: &ops::Error) {
 ///
 /// Only the dynamic symbol table and its string table are read, and every read is bounds-checked
 /// against the file. Anything this reader does not understand - another class, another byte order,
-/// a table that runs off the end - is `None`, so a diagnostic never becomes the fault it reports.
+/// a table that runs off the end - is `None`, so nothing here can become the fault it reports.
 fn defined_entries(path: &std::path::Path) -> Option<(usize, Vec<String>)> {
+    let bytes = std::fs::read(path).ok()?;
+    let names = defined_names(&bytes)?;
+    let first = names.iter().take(8).cloned().collect();
+    Some((names.len(), first))
+}
+
+/// Every function name an ELF object defines for the dynamic linker.
+///
+/// The same table `defined_entries` reads, whole: this is what answers whether a particular file is
+/// the library of a module - the file that defines the entry the package declared.
+fn defined_names(bytes: &[u8]) -> Option<Vec<String>> {
     const SHT_DYNSYM: u32 = 11;
-    const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
     const STT_FUNC: u8 = 2;
 
-    fn word(bytes: &[u8], at: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(
-            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
-        ))
-    }
+    let sections = sections(bytes)?;
+    let symbols = sections
+        .iter()
+        .position(|section| section.kind == SHT_DYNSYM)?;
+    let (symbols_at, symbols_size) = (sections[symbols].at, sections[symbols].size);
+    let strings = sections.get(sections[symbols].link)?;
+    let table = bytes.get(strings.at..strings.at.checked_add(strings.size)?)?;
 
-    fn half(bytes: &[u8], at: usize) -> Option<u16> {
-        Some(u16::from_le_bytes(
-            bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
-        ))
-    }
-
-    fn quarter(bytes: &[u8], at: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(
-            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
-        ))
-    }
-
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.get(0..4)? != b"\x7fELF" {
-        return None;
-    }
-    if *bytes.get(4)? != ELFCLASS64 || *bytes.get(5)? != ELFDATA2LSB {
-        return None;
-    }
-    let sections = word(&bytes, 0x28)? as usize;
-    let entry_size = half(&bytes, 0x3a)? as usize;
-    let count = half(&bytes, 0x3c)? as usize;
-
-    let mut symbols = None;
-    for index in 0..count {
-        let at = sections.checked_add(index.checked_mul(entry_size)?)?;
-        if quarter(&bytes, at.checked_add(4)?)? != SHT_DYNSYM {
-            continue;
-        }
-        symbols = Some((at, quarter(&bytes, at.checked_add(0x28)?)? as usize));
-        break;
-    }
-    let (symbols, strings) = symbols?;
-
-    // A section header's own body: where its bytes are in the file, and how many there are.
-    let body = |header: usize| -> Option<(usize, usize)> {
-        Some((
-            word(&bytes, header.checked_add(0x18)?)? as usize,
-            word(&bytes, header.checked_add(0x20)?)? as usize,
-        ))
-    };
-    let (symbols_at, symbols_size) = body(symbols)?;
-    let (strings_at, strings_size) = body(sections.checked_add(strings.checked_mul(entry_size)?)?)?;
-    let table = bytes.get(strings_at..strings_at.checked_add(strings_size)?)?;
-
-    let mut total = 0;
     let mut names = Vec::new();
     let limit = symbols_at.checked_add(symbols_size)?;
     let mut at = symbols_at;
     while at.checked_add(24)? <= limit {
-        let name = quarter(&bytes, at)? as usize;
+        let name = quarter(bytes, at)? as usize;
         let info = *bytes.get(at.checked_add(4)?)?;
-        let section = half(&bytes, at.checked_add(6)?)?;
+        let section = half(bytes, at.checked_add(6)?)?;
         at = at.checked_add(24)?;
         if name == 0 || section == 0 || (info & 0xf) != STT_FUNC {
             continue;
         }
         let tail = table.get(name..)?;
         let end = tail.iter().position(|held| *held == 0)?;
-        let text = std::str::from_utf8(&tail[..end]).ok()?;
-        total += 1;
-        if names.len() < 8 {
-            names.push(text.to_owned());
-        }
+        names.push(std::str::from_utf8(&tail[..end]).ok()?.to_owned());
     }
-    Some((total, names))
+    Some(names)
+}
+
+/// One section header, as much of it as this file reads.
+struct Section {
+    kind: u32,
+    at: usize,
+    size: usize,
+    link: usize,
+}
+
+/// The section headers of a 64-bit little-endian ELF object.
+fn sections(bytes: &[u8]) -> Option<Vec<Section>> {
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+
+    if bytes.get(0..4)? != b"\x7fELF"
+        || *bytes.get(4)? != ELFCLASS64
+        || *bytes.get(5)? != ELFDATA2LSB
+    {
+        return None;
+    }
+    let at = word(bytes, 0x28)? as usize;
+    let entry = half(bytes, 0x3a)? as usize;
+    let count = half(bytes, 0x3c)? as usize;
+    let mut sections = Vec::with_capacity(count.min(256));
+    for index in 0..count {
+        let header = at.checked_add(index.checked_mul(entry)?)?;
+        sections.push(Section {
+            kind: quarter(bytes, header.checked_add(4)?)?,
+            at: word(bytes, header.checked_add(0x18)?)? as usize,
+            size: word(bytes, header.checked_add(0x20)?)? as usize,
+            link: quarter(bytes, header.checked_add(0x28)?)? as usize,
+        });
+    }
+    Some(sections)
+}
+
+/// The run path an ELF object states, from the first dynamic entry of the given tags.
+fn dynamic_string(bytes: &[u8], tags: &[u64]) -> Option<String> {
+    const SHT_DYNAMIC: u32 = 6;
+
+    let sections = sections(bytes)?;
+    let dynamic = sections
+        .iter()
+        .find(|section| section.kind == SHT_DYNAMIC)?;
+    let strings = sections.get(dynamic.link)?;
+    let table = bytes.get(strings.at..strings.at.checked_add(strings.size)?)?;
+    let limit = dynamic.at.checked_add(dynamic.size)?;
+    let mut at = dynamic.at;
+    while at.checked_add(16)? <= limit {
+        let tag = word(bytes, at)?;
+        let value = word(bytes, at.checked_add(8)?)? as usize;
+        at = at.checked_add(16)?;
+        if !tags.contains(&tag) {
+            continue;
+        }
+        let tail = table.get(value..)?;
+        let end = tail.iter().position(|held| *held == 0)?;
+        return std::str::from_utf8(&tail[..end]).ok().map(str::to_owned);
+    }
+    None
+}
+
+fn word(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+fn half(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn quarter(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 /// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
@@ -4526,13 +4680,10 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
             let Some(entry) = module.entries.get(program_server::manifest::LAUNCH_ENTRY) else {
                 return Err(invalid("a native module states no launch entry".to_owned()));
             };
-            let Some(file) = files.next() else {
-                return Err(invalid("a native module carries no library".to_owned()));
-            };
             Ok(Resolved {
                 image: None,
                 metadata: None,
-                native: Some(native_module(&file)?),
+                native: Some(native_library(files.collect(), entry)?),
                 entry: entry.clone(),
             })
         }
@@ -5372,6 +5523,105 @@ mod tests {
             vec![("triton".to_owned(), 1)],
             "the package with a module for this target, whatever the others claim"
         );
+    }
+
+    /// The library of a multi-file native module is chosen by what it defines, never by position.
+    ///
+    /// The shape that failed a run: a `paged_attention` module holds `module.so` beside `cubins/`, and
+    /// `cubins/` sorts first, so the first file handed to `dlopen` was a cubin. Here two real objects
+    /// stand in for those files with the library named so it sorts **second**, and the entry declared
+    /// is one only it defines.
+    ///
+    /// The directory is the module: its entry receives no path, so the location the library is loaded
+    /// from is the only thing a module has to find the files beside it - which is why a module with
+    /// siblings is never loaded from a copy this process made.
+    #[test]
+    fn a_native_library_is_the_file_that_defines_the_entry_not_the_first_one() {
+        let Some(libc) = loaded_library("libc.so.6") else {
+            return;
+        };
+        let Some(libm) = loaded_library("libm.so.6") else {
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("uniserve-native-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a temporary directory for this test");
+        let sibling = directory.join("aa-sibling.so");
+        let library = directory.join("zz-module.so");
+        std::fs::copy(&libm, &sibling).expect("the sibling object is copied");
+        std::fs::copy(&libc, &library).expect("the library object is copied");
+
+        let module = native_library(
+            vec![
+                opened_file("aa-sibling.so", &sibling),
+                opened_file("zz-module.so", &library),
+            ],
+            "malloc",
+        )
+        .expect("the file that defines the entry is the module's library");
+        assert_eq!(
+            module.path, library,
+            "the library was resolved by position in the module, not by the entry it defines"
+        );
+        assert!(
+            !module.copied(),
+            "the library has a name of its own, so no copy is made"
+        );
+        assert!(
+            module.path.with_file_name("aa-sibling.so").is_file(),
+            "the module's sibling is not reachable from the location the library is loaded from"
+        );
+
+        // The same module with its library unlinked after the handle was taken: a copy would carry
+        // no sibling, so the module is refused by name rather than loaded from one.
+        let nameless = directory.join("nameless.so");
+        std::fs::copy(&libc, &nameless)
+            .expect("the library object is copied under a temporary name");
+        let handle = std::fs::File::open(&nameless).expect("the copy opens");
+        std::fs::remove_file(&nameless).expect("the copy is unlinked, as a store's handle may be");
+
+        let refused = match native_library(
+            vec![
+                opened_file("aa-sibling.so", &sibling),
+                program_server::ModuleFile {
+                    name: "nameless.so".to_owned(),
+                    size: std::fs::metadata(&sibling)
+                        .map(|meta| meta.len())
+                        .unwrap_or_default(),
+                    file: handle,
+                },
+            ],
+            "malloc",
+        ) {
+            Ok(_) => panic!("a module with siblings was loaded from a copy"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(
+            refused.contains("nameless.so") && refused.contains("copy"),
+            "the refusal names neither the file nor the copy: {refused}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The object a pattern names, as the process's own maps record it: a real ELF on this host.
+    fn loaded_library(pattern: &str) -> Option<std::path::PathBuf> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        maps.lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .find(|path| path.contains(pattern) && path.starts_with('/'))
+            .map(std::path::PathBuf::from)
+    }
+
+    /// One file of a module under test, opened the way the store's handles are.
+    fn opened_file(name: &str, path: &std::path::Path) -> program_server::ModuleFile {
+        program_server::ModuleFile {
+            name: name.to_owned(),
+            size: std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or_default(),
+            file: std::fs::File::open(path).expect("the test's object opens"),
+        }
     }
 
     /// The entry reader answers about a real object, and says nothing it cannot check.
