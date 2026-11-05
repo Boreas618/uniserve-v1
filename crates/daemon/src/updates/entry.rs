@@ -613,7 +613,8 @@ impl Leader {
             }
         }
         Err(UpdateError::Refused(
-            "no update is in flight: the deployment already serves the configuration the file              states"
+            "no update is in flight: the deployment already serves the configuration \
+             the file states"
                 .into(),
         ))
     }
