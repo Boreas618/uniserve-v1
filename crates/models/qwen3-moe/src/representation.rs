@@ -20,13 +20,14 @@
 //!
 //! - an algorithm this tree does not serve (`FP8`, `MXFP4`, `W4A16`, …), named with what is served;
 //! - a quantization method that is not ModelOpt's, named the same way;
-//! - `config.json` and `hf_quant_config.json` disagreeing about either field — a checkpoint written
-//!   by two tools is a checkpoint neither of them owns;
-//! - a declaration that quantizes a parameter whose role this tree serves dense (the embedding, the
-//!   vocabulary head, a norm, the router). Those are refused rather than encoded, because encoding
-//!   one would need a program this tree does not have, and reading it as dense would read packed
-//!   bytes as a matrix.
+//! - a parameter the shards store packed whose role this tree serves dense — a vocabulary head, a
+//!   norm, the router. Those are refused rather than encoded, because encoding one would need a
+//!   program this tree does not have, and reading it as dense would read packed bytes as a matrix.
+//!   A disagreement between `config.json` and `hf_quant_config.json` is not itself a refusal: the
+//!   tensors are the fact and both files are claims about them, so [`Representation::resolved`]
+//!   answers from the shard, and only a read with no shard falls back to the declaration.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -49,9 +50,16 @@ pub enum Representation {
         /// The modules the calibration left in their source dtype, as `config.json` writes them.
         excluded: Vec<String>,
         /// The same list as the export's own file writes it, when it wrote one. The two need not be
-        /// equal — they list different module classes — but a parameter they disagree about is a
-        /// checkpoint no single reading is right for, and [`Representation::adopts`] refuses it.
+        /// equal — they list different module classes — and neither decides a parameter once a
+        /// shard answers, which [`Representation::resolved`] arranges.
         also_excluded: Vec<String>,
+        /// The parameters whose shards store a `_scale` beside the weight, when a checkpoint said
+        /// so, or `None` for a representation read without a shard.
+        ///
+        /// `None` is a shapes walk: it states the declaration's intent, because it has no bytes to
+        /// check. `Some` is a load: the tensors are the fact and the declaration is a claim about
+        /// them, so a parameter the shard does not store packed is dense whatever a JSON says.
+        packed: Option<BTreeSet<String>>,
     },
 }
 
@@ -105,6 +113,7 @@ impl Representation {
             Self::Nvfp4 {
                 excluded,
                 also_excluded,
+                ..
             } => {
                 let mut summary = format!("nvfp4, {} module(s) excluded", excluded.len());
                 if !also_excluded.is_empty() {
@@ -115,47 +124,62 @@ impl Representation {
         }
     }
 
-    /// How the checkpoint stores `parameter`, whose role the caller states.
+    /// This representation with every parameter's packedness taken from what the shards hold.
     ///
-    /// A role this tree serves dense is refused when the declaration quantizes it: the refusal names
-    /// the parameter, the role and the declaration, because the alternative — reading a packed
-    /// `weight` as a matrix, or silently keeping it dense — produces a model that runs and measures
-    /// nothing.
-    pub fn adopts(&self, parameter: &str, role: Role) -> Result<Adopted> {
+    /// A declaration states what a calibration intended; a shard states what it did. The two can
+    /// differ — an exclusion list that names a module the export then quantized, or a declaration
+    /// that quantizes a vocabulary matrix whose shard holds BF16 — and the tensor is the fact. A
+    /// parameter whose shard stores a `_scale` beside its weight is packed; one without is dense.
+    ///
+    /// A caller with no checkpoint to read — a shapes walk — leaves this unset, and
+    /// [`Representation::adopts`] answers from the declaration instead.
+    pub fn resolved(&self, checkpoint: &nn::Checkpoint) -> Self {
         let Self::Nvfp4 {
             excluded,
             also_excluded,
+            ..
+        } = self
+        else {
+            return self.clone();
+        };
+        let packed = checkpoint
+            .names()
+            .filter_map(|name| name.strip_suffix("_scale"))
+            .map(str::to_owned)
+            .collect();
+        Self::Nvfp4 {
+            excluded: excluded.clone(),
+            also_excluded: also_excluded.clone(),
+            packed: Some(packed),
+        }
+    }
+
+    /// How the checkpoint stores `parameter`, whose role the caller states.
+    ///
+    /// A role this tree serves dense is refused when the parameter is packed: the refusal names the
+    /// parameter and the role, because the alternative — reading a packed `weight` as a matrix, or
+    /// silently keeping it dense — produces a model that runs and measures nothing. "Packed" is the
+    /// shard's answer when there is one ([`Representation::resolved`]) and the declaration's
+    /// otherwise.
+    pub fn adopts(&self, parameter: &str, role: Role) -> Result<Adopted> {
+        let Self::Nvfp4 {
+            excluded, packed, ..
         } = self
         else {
             return Ok(Adopted::Source);
         };
-        let excluded_here = excluded
-            .iter()
-            .any(|module| matches_module(module, parameter));
-        // The two files' lists may differ in names neither of them quantizes, but a parameter they
-        // disagree about is a checkpoint no single reading is right for.
-        if !also_excluded.is_empty()
-            && also_excluded
+        // The shard is the fact and a declaration is a claim about it. A declared exclusion can name
+        // a module the export then stored packed, and a declaration can quantize a parameter whose
+        // shard holds BF16 — the vocabulary matrix of the checkpoint this loader was first run
+        // against is both. Reading packed E2M1 as a matrix is the error that makes a model run and
+        // measure nothing, so the tensor decides, and only a representation read without a shard
+        // falls back to what its producer intended.
+        let quantized = match packed {
+            Some(packed) => packed.contains(parameter),
+            None => !excluded
                 .iter()
-                .any(|module| matches_module(module, parameter))
-                != excluded_here
-        {
-            return Err(Error::Config(format!(
-                "the checkpoint's two declarations disagree about `{parameter}`: `config.json` \
-                 {} it and `{DECLARATION_FILE}` {} it, and a packed tensor read as dense is a \
-                 matrix of E2M1",
-                if excluded_here {
-                    "excludes"
-                } else {
-                    "quantizes"
-                },
-                if excluded_here {
-                    "quantizes"
-                } else {
-                    "excludes"
-                },
-            )));
-        }
+                .any(|module| matches_module(module, parameter)),
+        };
         // A calibration quantizes a *module class* — ModelOpt's NVFP4 packs `Linear` and nothing
         // else — so a role outside that class is source by its class, not by being listed: the
         // checkpoint whose declaration this loader reads lists no norm and no vocabulary matrix, and
@@ -165,14 +189,15 @@ impl Representation {
         if !LinearClass::covers(role) {
             return Ok(Adopted::Source);
         }
-        match (role, excluded_here) {
-            (_, true) => Ok(Adopted::Source),
-            (Role::Projection, false) => Ok(Adopted::Quantized),
-            (role, false) => Err(Error::Config(format!(
-                "the checkpoint's NVFP4 calibration quantizes `{parameter}`, which is {}, and this \
-                 tree serves NVFP4 only for a linear projection: a quantized one would need a \
-                 program this tree does not have, and reading it as dense would read packed E2M1 as \
-                 a matrix. Exclude it in the calibration, or serve the role",
+        match (role, quantized) {
+            (_, false) => Ok(Adopted::Source),
+            (Role::Projection, true) => Ok(Adopted::Quantized),
+            (role, true) => Err(Error::Config(format!(
+                "the checkpoint stores `{parameter}` packed with a `_scale` beside it, and it is {}, \
+                 which this tree serves dense: NVFP4 is a linear projection's representation here, \
+                 so a quantized one needs a program this tree does not have, and reading it as dense \
+                 would read packed E2M1 as a matrix. Exclude it in the calibration, or serve the \
+                 role",
                 role.description(),
             ))),
         }
@@ -198,6 +223,7 @@ impl Representation {
                 Ok(Self::Nvfp4 {
                     excluded: declared.excluded.clone(),
                     also_excluded: declared.also_excluded.clone(),
+                    packed: None,
                 })
             }
             other => Err(Error::Config(format!(
@@ -717,6 +743,7 @@ mod tests {
             Representation::Nvfp4 {
                 excluded: vec!["lm_head".to_owned()],
                 also_excluded: Vec::new(),
+                packed: None,
             }
         );
 
@@ -764,7 +791,9 @@ mod tests {
             Adopted::Source
         );
 
-        // Now the one disagreement that matters: a projection one file packs and the other does not.
+        // A disagreement between the two files is no longer fatal on its own: a declaration is a
+        // claim and the shard is the fact, so a read without a shard answers from `config.json` and a
+        // load overrides both with what the checkpoint stores.
         std::fs::write(
             dir.join(DECLARATION_FILE),
             r#"{"quantization": {"quant_algo": "NVFP4",
@@ -772,12 +801,26 @@ mod tests {
         )
         .unwrap();
         let representation = Representation::read(&dir).expect("the algorithm still agrees");
-        let refused = representation
-            .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
-            .expect_err("a projection the two files disagree about");
-        let message = format!("{refused}");
-        assert!(message.contains("disagree about"), "{message}");
-        assert!(message.contains("q_proj"), "{message}");
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
+                .expect("a projection `config.json` packs"),
+            Adopted::Quantized
+        );
+        // The shard decides when there is one: a weight stored without a `_scale` beside it is
+        // dense whatever either file says, and one stored with a scale is packed even where the
+        // files say it was excluded.
+        let stored_dense = Representation::Nvfp4 {
+            excluded: vec!["model.layers.0.self_attn.q_proj".to_owned()],
+            also_excluded: Vec::new(),
+            packed: Some(BTreeSet::new()),
+        };
+        assert_eq!(
+            stored_dense
+                .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
+                .expect("a projection the shard stores dense"),
+            Adopted::Source
+        );
         // A parameter they agree about is still answered normally.
         assert_eq!(
             representation

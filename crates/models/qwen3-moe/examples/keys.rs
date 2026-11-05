@@ -111,6 +111,7 @@ fn main() -> ExitCode {
                     deployment.quantization = Some(Representation::Nvfp4 {
                         excluded: Vec::new(),
                         also_excluded: Vec::new(),
+                        packed: None,
                     })
                 }
                 other => {
