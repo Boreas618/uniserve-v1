@@ -303,6 +303,10 @@ fn main() {
     // list has that is absent here is typed drift. It exits before the header, so a diff of its
     // output against the file is the review artifact.
     let mut derived = false;
+    // Which attention backend the deployment runs. **One deployment runs one**, so this is what the
+    // file is a deployment of, not a filter over a union: without it the sparse selection's rows are
+    // absent, and a store built from the file serves the dense deployment and only that.
+    let mut sparse = false;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -323,6 +327,12 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            "--sparse" => {
+                // The value the walk takes (`tile_rows,sparsity,max_tiles`) is what the sparse
+                // deployment is; the generator only needs to know it is that deployment.
+                let _ = value(&mut arguments, "--sparse");
+                sparse = true;
+            }
             other => panic!("unknown flag {other}"),
         }
     }
@@ -391,6 +401,11 @@ fn main() {
                 audio: DType::F32,
             },
             clip_frames.clone(),
+            // **The tasks the deployment serves are its checkpoint's**, not this walk's: a task states
+            // the modulation cache's groups and a cache width is a program key, so a set narrower than
+            // the checkpoint serves leaves another task's requests without a cell.
+            minimax_h3::programs::Deployment::checkpoint_tasks(std::path::Path::new(&root))
+                .unwrap_or_else(|error| panic!("the checkpoint's tasks: {error}")),
         )
         .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
         // The serving partition, not the released default: `Partition::serving` derives the capacity
@@ -414,11 +429,7 @@ fn main() {
         let arrangement = partition
             .arrangement(dies)
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-        match deployment.denoiser_rows(
-            &partition,
-            &arrangement,
-            minimax_h3::modulation::Groups::of(true),
-        ) {
+        match deployment.denoiser_rows(&partition, &arrangement) {
             Ok(stated) => rows.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
         }
@@ -466,7 +477,7 @@ fn main() {
     };
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
-        lines.extend(rows(deployment, bound));
+        lines.extend(rows(deployment, bound, sparse));
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -575,6 +586,8 @@ fn main() {
                 audio: DType::F32,
             },
             clip_frames.clone(),
+            minimax_h3::programs::Deployment::checkpoint_tasks(std::path::Path::new(&root))
+                .unwrap_or_else(|error| panic!("the checkpoint's tasks: {error}")),
         )
         .unwrap_or_else(|error| panic!("the deployment's VAE rows are not statable: {error}"));
         match deployment.own_vae_rows() {
@@ -591,11 +604,7 @@ fn main() {
         let arrangement = partition
             .arrangement(dies)
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-        match deployment.denoiser_rows(
-            &partition,
-            &arrangement,
-            minimax_h3::modulation::Groups::of(true),
-        ) {
+        match deployment.denoiser_rows(&partition, &arrangement) {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
         }
@@ -757,7 +766,7 @@ fn header(
 /// Every row the DiT, the text encoder and the orchestration around them state at `deployment`'s
 /// element type. `bound` is the deployment's packed row bound: the gated activation's `wide` form is a
 /// property of `bound · width`, so a walk cannot state it without the bound it serves.
-fn rows(deployment: DType, bound: u32) -> Vec<(String, String)> {
+fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -2394,5 +2403,14 @@ fn rows(deployment: DType, bound: u32) -> Vec<(String, String)> {
     //   belong to the sampler's chain and the Qwen3 slice, the two residuals to a stream that folds
     //   its normalization in one launch, and the composition to the VSA chain's last step.
 
+    // **A deployment runs one attention backend.** The `vsa_*` selection and `sparse_attention` are the
+    // video-sparse deployment's rows: the dense deployment never launches them, and a file that held
+    // both would be a union of two deployments - the thing that made a store's size describe a model
+    // nobody runs. They are emitted under `--sparse` and nowhere else.
+    if !sparse {
+        lines.retain(|(operator, _)| {
+            !operator.starts_with("vsa_") && operator != "sparse_attention"
+        });
+    }
     lines
 }

@@ -329,6 +329,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             audio: audio_type,
         },
         samples.clone(),
+        // The tasks the checkpoint serves, which is what the deployment holds. **`--task` is not this**:
+        // it selects the serving partition the bound is derived at, while a task states the modulation
+        // cache's groups and a cache width is a program key. A walk narrowed to one task leaves another
+        // task's requests without a cell, and nothing in a fixture would show it.
+        Deployment::checkpoint_tasks(&root)?,
     )?;
     let attention = match (sparse, stated_attention) {
         (_, Some(contract)) => {
