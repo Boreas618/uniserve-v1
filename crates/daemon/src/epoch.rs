@@ -2197,9 +2197,6 @@ mod tests {
             ("decode_attention_backend", |config: &mut ServeConfig| {
                 config.decode_attention_backend = Some("trtllm".to_owned())
             }),
-            ("moe_config.exchange", |config: &mut ServeConfig| {
-                config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
-            }),
             ("moe_runner_backend", |config: &mut ServeConfig| {
                 config.moe_runner_backend = Some("cutlass".to_owned())
             }),
@@ -2236,6 +2233,30 @@ mod tests {
                 "{what} moves the programs"
             );
         }
+
+        // The exchange is a program only where experts are spread over ranks:
+        // a single-rank deployment's MoE block takes its local arm and launches
+        // no exchange at all (`nn::Moe::forward` routes through
+        // `forward_expert_parallel` only when an expert lives on another rank),
+        // so the setting moves nothing there — and filling the slot anyway
+        // would pin a program no call reaches.
+        let exchange_only = set(|config: &mut ServeConfig| {
+            config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
+        });
+        assert_eq!(
+            layer(&base, &Deployment::of(exchange_only.clone())),
+            Layer::None,
+            "at one rank the exchange setting moves nothing"
+        );
+        let mut spread = ServeConfig::default();
+        spread.moe_config.expert_parallel = true;
+        let mut spread_exchanged = spread.clone();
+        spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
+        assert_eq!(
+            layer(&Deployment::of(spread), &Deployment::of(spread_exchanged)),
+            Layer::Program,
+            "in an expert-parallel deployment the exchange moves the programs"
+        );
 
         // Only the epoch layer's values build the main process: the host
         // layer's and the program layer's leave the build config equal

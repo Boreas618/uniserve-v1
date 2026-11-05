@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
 use crate::output::reasoning::{Qwen3ReasoningParser, ReasoningDelta, ReasoningParser};
-use crate::output::text::TextDecodeOptions;
 use crate::output::tools::{Qwen25ToolParser, Tool, ToolParser};
 use crate::tokenizer::DynTokenizer;
 
