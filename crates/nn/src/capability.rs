@@ -1000,6 +1000,27 @@ pub trait Decoder {
             "this decoder splices no clips".to_owned(),
         ))
     }
+
+    /// The splices a timeline of `frames` frames is written in, in the order the frames are decoded.
+    ///
+    /// A timeline is not one clip: the checkpoint decodes it clip by clip, each clip overlapping its
+    /// predecessor by a fade, and the last one keeping its own tail. **Which frames each clip writes is
+    /// the block's arithmetic, not the runner's** - the frame count a timeline may hold, the body each
+    /// clip contributes and the overlap the fade reads all come from the checkpoint's decoding, so a
+    /// runner that spliced a timeline asks this and passes each [`Splice`] to [`splice`](Self::splice).
+    /// A splice's `first` is the destination frame in the raster handed to `splice`, so a runner that
+    /// gives each clip its own raster states `first: 0`.
+    ///
+    /// The default refuses by the block kind's name for the reason `splice` does: a block that cannot
+    /// write a timeline has no schedule to state.
+    fn splices(&self, frames: u32) -> Result<Vec<Splice>> {
+        Err(Error::shape(
+            "Decoder",
+            format!(
+                "this decoder states no splice schedule, and a timeline of {frames} frame(s) asked for one"
+            ),
+        ))
+    }
 }
 
 /// An autoregressive token model.

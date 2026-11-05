@@ -245,21 +245,32 @@ def extents_in(key):
     return found
 
 
-def classify(missing, shapes, rasters_of, sampled):
+def classify(missing, shapes, rasters_of, sampled, held=()):
     """Split the missing shapes by the question each absence answers.
 
-    Three answers, not one: a row the file lacks at every raster, a row the request's raster
-    decides, and a row the walk's own sample decides. A shape can be both of the last two -
-    `scaled_add ... columns_4096` is a canvas-class operator whose width is the walk's prompt
-    length - and the sample answers first, because it is the more specific claim: a shape counted
-    twice would make the remainder too small.
+    Four answers, not one: a row the file lacks at every raster, a row the request's raster
+    decides, a row the walk's own sample decides, and a row the file *holds* at another clip
+    length. A shape can be several of these - `scaled_add ... columns_4096` is a canvas-class
+    operator whose width is the walk's prompt length - and the sample answers first, because it
+    is the more specific claim: a shape counted twice would make the remainder too small.
+
+    **`frames differing` is not `missing`.** A program the file holds with `extent_124` and a
+    walk that launches with `extent_362` is one program at two clip lengths: the file needs a
+    row, but calling it a row the file lacks at every raster reads as a program no store can
+    build, and a run then stops at `no kernel` for a row `extent` alone decides. The program is
+    the key with its extent fields removed, so the match is on that and on nothing else.
 
     **A canvas-class operator is canvas-class only when the walks that produced it share one
     raster.** With a single raster the label absorbs every absence that does not depend on the
     raster - twelve rows a store must hold were filed under it that way - so the absence has to
     survive a change of canvas before the canvas is allowed to explain it.
     """
-    canvas, dependent, real = [], [], []
+    # The programs the file holds, by the key with its extent fields removed: a clip length reaches
+    # `extent` alone, so two rows of one program differ in exactly these numbers.
+    programs = {
+        (operator, without(key, EXTENTS)) for operator, key in held
+    }
+    canvas, dependent, frames, real = [], [], [], []
     for shape in missing:
         carried = sorted(
             (field, number)
@@ -273,9 +284,11 @@ def classify(missing, shapes, rasters_of, sampled):
             and len({tuple(rasters_of[path]) for path in shapes[shape]}) < 2
         ):
             canvas.append(shape)
+        elif (shape[0], without(shape[1], EXTENTS)) in programs:
+            frames.append(shape)
         else:
             real.append(shape)
-    return canvas, dependent, real
+    return canvas, dependent, frames, real
 
 
 # The extents a key carries: a launch decides these, so counting them apart from the rest of the
@@ -553,7 +566,7 @@ def by_shape(args):
     # The rasters each walk states, so a shape absent from walks of two *different* canvases is not
     # called canvas-class: the canvas cannot explain an absence that survives a change of canvas.
     stated = {path: statements(path)[0] for path in args.walk}
-    canvas, dependent, real = classify(missing, shapes, stated, sampled)
+    canvas, dependent, frames, real = classify(missing, shapes, stated, sampled, held)
     for operator, key in missing:
         shape = (operator, key)
         where = sorted(shapes[shape])
@@ -603,6 +616,13 @@ def by_shape(args):
         note = f"  [{'; '.join(multiples)}]" if multiples else ""
         print(f"{mark}: {operator}\t{key}{note}")
         print(f"    launched at {', '.join(launched_at)} by {', '.join(where)}")
+    if frames:
+        print(
+            f"\n{len(frames)} of these are programs the file holds at another clip length: its"
+            " `extent` is the frame count, so the entry it needs is a row of the same program"
+            " at the walk's own `extent` - not a program no store can build. A run that stops"
+            " at `no kernel` for one of these is stopped by the clip it was asked for."
+        )
     if canvas:
         fixture_says = fixture_text or "nothing"
         print(
@@ -622,6 +642,7 @@ def by_shape(args):
         print(
             f"\n{len(missing)} shape(s) a walk produced and the file cannot build at any element "
             f"type: {len(real)} at any raster (each stops a run at `no kernel`), "
+            f"{len(frames)} at a clip length the file states another way, "
             f"{len(canvas)} raster-class, {len(dependent)} the walk's own sample"
         )
         return 1
@@ -632,7 +653,7 @@ def by_shape(args):
 
 
 def self_test() -> int:
-    """Prove the classification: four absences, one answer each.
+    """Prove the classification: five absences, one answer each.
 
     The regression this guards is the one that made `0 at any raster` wrong: a canvas-class
     operator absent from walks of two different canvases is a row a store must hold, and the
@@ -646,6 +667,11 @@ def self_test() -> int:
     sample_row = ("scaled_residual", key(123456))
     twice_row = ("scaled_add", key(131072))
     once_row = ("scaled_add", key(4096))
+    # One program the file holds at 124 frames and a walk that launches at 362: the row is a
+    # clip-length difference, and calling it a row the file lacks reads as a program no store can
+    # build. The operator and the key minus its extents are the whole of the match.
+    clip_missing = ("video_vae", "dtype_f32_extent_362_axis_2")
+    clip_held = ("video_vae", "dtype_f32_extent_124_axis_2")
     # `scaled_add ... 4096` is also the walk's prompt length, so the sample answers it first:
     # the ordering in `classify` is part of what this test states.
     # `a` and `b` are two walks at the same canvas - the conditioned and the plain one a caller
@@ -655,27 +681,29 @@ def self_test() -> int:
         sample_row: {"a": {"f32"}},
         twice_row: {"a": {"bf16"}, "c": {"bf16"}},
         once_row: {"a": {"bf16"}},
+        clip_missing: {"a": {"f32"}},
     }
     rasters_of = {"a": [(256, 256)], "b": [(256, 256)], "c": [(1344, 768)]}
     sampled = {123456: "trajectory elements", 4096: "prompt length"}
-    canvas, dependent, real = classify(
-        sorted(shapes), shapes, rasters_of, sampled
+    canvas, dependent, frames, real = classify(
+        sorted(shapes), shapes, rasters_of, sampled, [clip_held]
     )
     assert canvas == [canvas_row], canvas
     # The order is the input's, so the test states membership rather than an ordering the
     # reader of the report never sees.
     assert set(dependent) == {sample_row, once_row}, dependent
+    assert frames == [clip_missing], frames
     assert real == [twice_row], real
 
     # The same absence in one walk only: the canvas may explain it, and the tool says so
     # rather than guessing.
     single = dict(rasters_of, c=[(256, 256)])
-    canvas, dependent, real = classify([twice_row], shapes, single, {})
-    assert canvas == [twice_row] and not real, (canvas, real)
+    canvas, dependent, frames, real = classify([twice_row], shapes, single, {})
+    assert canvas == [twice_row] and not real and not frames, (canvas, real, frames)
 
     # A row the file holds is not missing at all.
-    canvas, dependent, real = classify([], shapes, rasters_of, sampled)
-    assert not canvas and not dependent and not real
+    canvas, dependent, frames, real = classify([], shapes, rasters_of, sampled)
+    assert not canvas and not dependent and not real and not frames
 
     # `--wellformed` catches each of the three ways the file itself can be wrong: a header that
     # states a count it does not hold, a repeated line, and an operator `crates/ops` does not
