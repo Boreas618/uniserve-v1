@@ -660,7 +660,6 @@ impl fmt::Display for ScaledAddDescriptor {
         Key::new()
             .field("target", self.target)
             .field("source", self.source)
-            .field("columns", self.columns)
             .field("block", self.block)
             .finish(formatter)
     }
