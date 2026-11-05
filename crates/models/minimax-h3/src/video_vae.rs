@@ -507,6 +507,11 @@ pub struct VideoDecoder {
     place: Rows,
     /// The index table that places each voxel row of the stream.
     voxel_rows: Weight,
+    /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of the canvas rather than
+    /// a checkpoint tensor. The dense attention's flash backend serves the packed form only — it hands
+    /// the vendor's `cu_seqlens` path its offsets and refuses a null table — so one clip is the packed
+    /// form of one sequence and states its offsets.
+    offsets: Weight,
     config: VideoVaeConfig,
     ffn_mult: u32,
     /// Elements per head.
@@ -817,8 +822,10 @@ impl VideoDecoder {
             None,
             (head as f32).sqrt().recip(),
         )?;
+        // The packed form of one sequence: the flash backend refuses a null offsets table, so the
+        // launch states the offsets and the key is the one fa4 declares.
         programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, width, false,
+            dtype, dtype, dtype, width, true,
         ));
 
         Ok(programs.finish())
@@ -998,6 +1005,22 @@ impl VideoDecoder {
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
             voxel_rows: indices(loader, "video_vae.voxel_rows", 0, canvas.voxels() as u32)?,
+            offsets: {
+                // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
+                // created once with the weights and read by every clip's attention launch.
+                let rows = i32::try_from(canvas.rows())
+                    .map_err(|_| Error::config("a clip's rows exceed a sequence offset".to_owned()))?;
+                let mut bytes = Vec::with_capacity(8);
+                for offset in [0i32, rows] {
+                    bytes.extend_from_slice(&offset.to_le_bytes());
+                }
+                loader.constant(
+                    "video_vae.sequence_offsets",
+                    DType::I32,
+                    Shape::new(&[2]),
+                    &bytes,
+                )?
+            },
             attention: Attention::dense(
                 head,
                 heads,
@@ -1224,14 +1247,15 @@ impl VideoDecoder {
                 per_head(rotated_query),
                 per_head(rotated_key),
             )?;
-            // One sequence: the clip's rows, its registers and its tail attended together.
+            // One sequence: the clip's rows, its registers and its tail attended together, stated as
+            // the packed form of one sequence because the flash backend serves only that form.
             self.attention.attend_dense(
                 f,
                 per_head(rotated_query),
                 per_head(rotated_key),
                 per_head(value),
-                None,
-                None,
+                Some(self.offsets.view()),
+                Some(self.offsets.view()),
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
                 attended,
