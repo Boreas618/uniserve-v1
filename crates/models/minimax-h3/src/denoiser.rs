@@ -97,6 +97,17 @@ impl Arrangement {
 }
 
 /// The deployment's layout rule: how a request snaps, and what its tables are.
+/// The element type of the sample the trajectory accumulates, and of its noise.
+///
+/// The reference keeps its trajectory in FP32 and refuses any other type at its own entry
+/// (`denoiser.py:1206-1216`, and `precision.py` pins the video and audio latents' input and output
+/// there), so the draw, the patch and the unpatchify all read and write this one type - **not the
+/// stack's**, which is the checkpoint's. Both sites read this constant: the forward refuses a latent
+/// of another type by name ([`Denoiser::denoise_traced`]), and [`Denoiser::programs`] states the rows
+/// the launch will ask for. Keying those rows from the stack's type instead was a real store gap -
+/// a BF16 `unpatchify_video` row for a launch that asks for `dtype_f32`.
+pub const SAMPLE_DTYPE: DType = DType::F32;
+
 pub struct Layouts {
     config: DenoiserConfig,
     arrangement: Arrangement,
@@ -1492,6 +1503,23 @@ impl nn::capability::Denoiser for Denoiser {
             }
             _ => {}
         }
+        // The draw writes the trajectory, so it reads the sample's type: a latent of another type
+        // would launch a noise row the plan does not state, and `denoise` would refuse it one call
+        // later with the launch already made.
+        if out.video.dtype != SAMPLE_DTYPE {
+            return Err(flattened(Error::config(format!(
+                "the video latents are {} and the draw writes {SAMPLE_DTYPE}",
+                out.video.dtype
+            ))));
+        }
+        if let Some(audio) = out.audio
+            && audio.dtype != SAMPLE_DTYPE
+        {
+            return Err(flattened(Error::config(format!(
+                "the audio latents are {} and the draw writes {SAMPLE_DTYPE}",
+                audio.dtype
+            ))));
+        }
         let noise = nn::Noise::new();
         // The video's stream is drawn at the latent's **native** shape, `[channels, frames, height,
         // width]`, which is the buffer `denoise` reads and the solver folds a velocity into - its
@@ -2075,12 +2103,15 @@ impl Denoiser {
         let video = config.video_channels;
 
         // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
-        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(dtype));
+        // The first three read or write the **sample**, not the stack: the trajectory is FP32
+        // (`SAMPLE_DTYPE`, and the forward refuses any other), so a row keyed from `dtype` would name
+        // a program the launch never asks for.
+        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(SAMPLE_DTYPE));
         programs.launch::<Unpatchify>(
-            &nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor(),
+            &nn::layers::UnpatchifyVideo::new(SAMPLE_DTYPE, u64::from(video), 1, 2)?.descriptor(),
         );
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
-            dtype,
+            SAMPLE_DTYPE,
             NoiseKind::Normal,
             ops::noise::KeySource::Scalar,
         ));
@@ -2089,10 +2120,15 @@ impl Denoiser {
         ));
 
         // The three gathers outside the modulation: the prefix rows of the packed stream, the solver's
-        // step coefficient, and the trace's row copy the diagnosis takes.
-        for columns in [u64::from(config.hidden_size), 1] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
-        }
+        // step coefficient, and the trace's row copy the diagnosis takes. The wide one gathers the
+        // stack's packed rows; the one-column one gathers the **solver's coefficient**, which is an
+        // FP32 constant (`Solver::load` publishes the two tables as F32), so its row is the sample's
+        // type and not the stack's.
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
+            dtype,
+            u64::from(config.hidden_size),
+        )?);
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, 1)?);
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
@@ -2105,15 +2141,20 @@ impl Denoiser {
             )?);
         }
 
-        // The solver's step: one gated residual over the whole trajectory of each modality.
+        // The solver's step: one gated residual over the whole trajectory of each modality. The
+        // trajectory is the sample (`Solver::step` reads the sample and the velocity in one type,
+        // and the forward refuses a sample that is not `SAMPLE_DTYPE`), so these rows are the
+        // sample's type - keyed from the stack they would name a row no step ever launches.
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-            dtype,
+            SAMPLE_DTYPE,
             u64::from(video) * 4,
             false,
         )?);
         for count in elements {
             programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-                dtype, *count, false,
+                SAMPLE_DTYPE,
+                *count,
+                false,
             )?);
         }
         Ok(programs.finish())
@@ -2778,11 +2819,11 @@ impl Denoiser {
         // (`denoiser.py:1206-1216`: a latent input of any other type is a `ValueError`). A sample in
         // the stack's type would round the trajectory once per evaluation - a drift no shape refuses
         // and no page localises - so this refuses instead of running the cheaper arithmetic.
-        if video.dtype != DType::F32 {
+        if video.dtype != SAMPLE_DTYPE {
             return Err(Error::config(format!(
-                "the video latents are {} and a trajectory is FP32: the sample is what the solver \
-                 accumulates into, and the stack's own element type is {}",
-                video.dtype, dtype
+                "the video latents are {} and a trajectory is {SAMPLE_DTYPE}: the sample is what \
+                 the solver accumulates into, and the stack's own element type is {dtype}",
+                video.dtype
             )));
         }
         // The trajectory is FP32 and the stack is the deployment's, and the two are crossed twice
@@ -2814,7 +2855,7 @@ impl Denoiser {
         // solver - whose step reads one type for the sample and the velocity (`solver.rs`).
         // Allocating these in `cond.text.dtype` instead would round the trajectory itself at every
         // evaluation, which no shape refuses and no page shows.
-        let sample_dtype = video.dtype;
+        let sample_dtype = SAMPLE_DTYPE;
         let patch = nn::layers::Patch::new(channels, height, width)?;
         // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
         // It reads the token grid from `out`, so a clip of another length replays the same launch.
