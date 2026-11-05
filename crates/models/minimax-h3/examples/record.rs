@@ -164,6 +164,9 @@ fn run() -> Result<(), String> {
             ("text-encoder", text_encoder as Harness),
             ("vision-tower", vision_tower as Harness),
         ],
+        // The order above is the one a caller reads: the decoders, then the network, then the prompt's
+        // path. `all` is every harness this build can drive, and the audio halves answer by name while
+        // their extents table is missing rather than silently leaving the run short.
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
