@@ -324,6 +324,37 @@ fn main() {
                 vae, &rasters,
             ));
         }
+        // The two DiTs, from the same value: the arrangement comes from the partition's own
+        // capacity (`Partition::sized`), which is the one place that answers it.
+        let Some(&vae) = VAES.first() else {
+            panic!("the deployment states no VAE element type")
+        };
+        let deployment = minimax_h3::programs::Deployment::new(
+            config.clone(),
+            minimax_h3::programs::Types {
+                text_encoder: DType::BF16,
+                transformer: DType::F32,
+                video: vae,
+                audio: DType::F32,
+            },
+            clip_frames.clone(),
+        )
+        .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
+        let partition = minimax_h3::Partition::single();
+        let Some(dies) = config.denoisers.values().next() else {
+            panic!("the checkpoint states no DiT, so its arrangement is not statable")
+        };
+        let arrangement = partition
+            .arrangement(dies)
+            .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
+        match deployment.denoiser_rows(
+            &partition,
+            &arrangement,
+            minimax_h3::modulation::Groups::of(true),
+        ) {
+            Ok(stated) => rows.extend(stated),
+            Err(error) => panic!("the DiTs state no rows: {error}"),
+        }
         rows.sort();
         rows.dedup();
         eprintln!(
@@ -450,6 +481,24 @@ fn main() {
         match deployment.vae_rows() {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the audio VAE's rows are not statable: {error}"),
+        }
+        // The two DiTs, from the same value and the partition the deployment states. `elements` is empty
+        // by construction: the solver's residual width is a request's element count, so a row for it
+        // would be a program for numbers no request states until it arrives.
+        let partition = minimax_h3::Partition::single();
+        let Some(dies) = config.denoisers.values().next() else {
+            panic!("the checkpoint states no DiT, so its arrangement is not statable")
+        };
+        let arrangement = partition
+            .arrangement(dies)
+            .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
+        match deployment.denoiser_rows(
+            &partition,
+            &arrangement,
+            minimax_h3::modulation::Groups::of(true),
+        ) {
+            Ok(stated) => lines.extend(stated),
+            Err(error) => panic!("the DiTs state no rows: {error}"),
         }
     }
     let audio = &config.audio_vae;
