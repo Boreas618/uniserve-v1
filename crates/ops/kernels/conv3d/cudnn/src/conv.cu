@@ -380,9 +380,13 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   row_major(y_dims, y_strides);
   row_major(w_dims, w_strides);
   if (channels_last) {
+    // The activations and the output are the two operands a channels-last *memory format*
+    // reorders. The filter is not one: a checkpoint stores every module's weight packed in
+    // `[out, in, kd, kh, kw]`, which is the KCRS form the filter descriptor wants, and no
+    // framework's channels-last format touches module weights. Reordering it here reads the
+    // filter at the wrong offsets while the numbers still look like a convolution.
     channels_last_strides(x_dims, x_strides);
     channels_last_strides(y_dims, y_strides);
-    channels_last_strides(w_dims, w_strides);
   }
   if (transposed) {
     // The layer's weight is `[c, k, …]` in memory and `[k, c, …]` to the
