@@ -289,6 +289,59 @@ impl Checkpoint {
         })
     }
 
+    /// A pipeline whose components are the subdirectories of `root` and whose tensors are never read.
+    ///
+    /// It exists for a walk that states a model's extents without its bytes: every component handle
+    /// resolves, so a `load` that chooses a component per weight runs unchanged, and a `read` refuses
+    /// because no tensor is known. Unlike [`Checkpoint::open`], a component directory holding an index
+    /// and no shards is a component here rather than a directory that is skipped — which is what a
+    /// metadata-only deployment on a machine without the weights looks like.
+    pub fn unopened(root: &Path) -> Result<Self> {
+        let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let mut components = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| Error::Io {
+                path: root.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            components.insert(
+                name,
+                Self {
+                    root: path.clone(),
+                    roots: vec![path],
+                    files: Vec::new(),
+                    tensors: BTreeMap::new(),
+                    components: BTreeMap::new(),
+                    read: Mutex::new(BTreeSet::new()),
+                },
+            );
+        }
+        if components.is_empty() {
+            return Err(Error::Checkpoint {
+                path: root.to_path_buf(),
+                problem: "no component directory below it".to_owned(),
+            });
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            roots: vec![root.to_path_buf()],
+            files: Vec::new(),
+            tensors: BTreeMap::new(),
+            components,
+            read: Mutex::new(BTreeSet::new()),
+        })
+    }
+
     /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
     ///
     /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
@@ -466,6 +519,18 @@ impl Checkpoint {
 
     /// Read the tensor named `name` into host memory.
     pub fn read(&self, name: &str) -> Result<HostTensor> {
+        if self.files.is_empty() && self.tensors.is_empty() && !self.roots.is_empty() {
+            // No shard set was ever opened for this handle: either an unopened pipeline or one of its
+            // components. Say so, rather than reporting a name as absent from a table never filled.
+            if self.components.is_empty() {
+                return Err(Error::Checkpoint {
+                    path: self.root.clone(),
+                    problem: format!(
+                        "this handle states a component's extents and reads no tensor (`{name}` was asked for)"
+                    ),
+                });
+            }
+        }
         let location = self.tensors.get(name).ok_or_else(|| {
             if self.roots.len() == 1 {
                 return Error::MissingTensor(name.to_owned());
@@ -774,4 +839,49 @@ fn shape_of(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
         extents[axis] = extent as u64;
     }
     Ok(Shape::new(&extents[..dims.len()]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipeline handle names every component directory — including one that holds an index and no
+    /// shards, which `open` skips — and reading a tensor from it refuses by name rather than reporting
+    /// a name absent from a table that was never filled.
+    ///
+    /// This is what a walk over a metadata-only deployment uses: the weights' shapes come from the
+    /// model's own `load`, and the checkpoint is a handle to the component directories only.
+    #[test]
+    fn an_unopened_pipeline_names_components_and_reads_no_tensor() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        for component in ["vae", "text_encoder"] {
+            std::fs::create_dir(root.path().join(component)).expect("a component directory");
+        }
+        // An index with no shard beside it is what a metadata-only deployment looks like.
+        std::fs::write(
+            root.path()
+                .join("vae")
+                .join("diffusion_pytorch_model.safetensors.index.json"),
+            br#"{"weight_map":{}}"#,
+        )
+        .expect("an index");
+        std::fs::write(root.path().join("model_index.json"), b"{}").expect("a pipeline index");
+
+        let checkpoint = Checkpoint::unopened(root.path()).expect("the pipeline handle");
+        let mut names = checkpoint.components().collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, vec!["text_encoder", "vae"]);
+        assert!(checkpoint.component("vae").is_ok());
+        assert!(checkpoint.component("audio_vae").is_err());
+
+        let problem = checkpoint
+            .component("vae")
+            .expect("the vae handle")
+            .read("weight")
+            .expect_err("an unopened component reads nothing");
+        assert!(
+            problem.to_string().contains("reads no tensor"),
+            "the refusal says what this handle is: {problem}"
+        );
+    }
 }
