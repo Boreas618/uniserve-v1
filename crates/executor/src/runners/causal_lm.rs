@@ -1339,6 +1339,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
+        let entered = std::time::Instant::now();
         let shape = batch.shape;
         // What a refusal is about, said before it happens: the classes the rows carry are the fact
         // no other owner of this batch can report, and a batch that mixes them is refused for them.
@@ -1379,7 +1380,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             // The host figures are the submitting thread's; the page readback is the device
             // thread's, because a copy issued from here would put a second thread on this
             // runner's stream (2.4).
-            Self::dump_batch(self, bucket, &batch, &shape);
+            Self::dump_batch(self, bucket, &batch, &shape, entered.elapsed());
         }
         // The columns are staged here, on the submitting thread; everything that touches the
         // device is the replay job, which this executor's device thread performs in `serve`: the
@@ -1927,6 +1928,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
+                replay_ms = launched.elapsed().as_secs_f64() * 1e3,
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
@@ -2047,7 +2049,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ///
     /// The line is a string and the readback a page number, because the two are written on
     /// different threads: this runs at submit, on the scheduler's.
-    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape) {
+    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape, submit_ms: std::time::Duration) {
         let rows = shape.rows as usize;
         let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let page_of_slot = |slot: i32| -> Option<u32> {
@@ -2121,6 +2123,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         );
         // The page the readback names: the first live row's first page, which is the page a decode
         // must find the prefill's keys in.
+        let line = format!("{line} submit_ms={:.3}", submit_ms.as_secs_f64() * 1e3);
         let page = self
             .staging
             .batch_rows()
