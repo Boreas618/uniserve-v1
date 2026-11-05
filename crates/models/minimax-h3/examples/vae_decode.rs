@@ -2383,7 +2383,11 @@ fn latent_form(
 const CONTAINER_F32: u8 = 1;
 /// Interleaved `i16` PCM: the audio decoder's output, which is the wire format rather than a dtype the
 /// decode computes in.
-const CONTAINER_I16: u8 = 2;
+///
+/// **Code 6, because the container's numbering is established and 2 is `i64`**
+/// (`tools/dump_tables.py`'s `CODES`: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16). A code chosen by
+/// what looked free would have written an `i16` payload the reader took for a table of `i64`.
+const CONTAINER_I16: u8 = 6;
 
 /// Re-encode a latent payload from element type `held` to the decode's `dtype`.
 ///
