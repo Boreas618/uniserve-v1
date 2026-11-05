@@ -1976,6 +1976,56 @@ impl Replica {
         &self.hold
     }
 
+    /// Moves this replica onto an epoch switch's target when the switch serves it (§7.4).
+    ///
+    /// The target's child dials this daemon's request socket as it starts, and the switch commands
+    /// it on its process link from then on. The frontend of this process moves when the record says
+    /// the target serves: the responses the drained epoch ends then migrate to the client the hold
+    /// serves, and a switch that fails never moves it.
+    pub(crate) fn follow_switch(
+        self: &Arc<Self>,
+        control: Arc<EngineControl>,
+        mut spec: wire::EngineSpec,
+        engine: u64,
+        epoch: u64,
+        mut served: tokio::sync::watch::Receiver<u64>,
+    ) {
+        let replica = Arc::clone(self);
+        tokio::spawn(async move {
+            let sink = stats_sink(
+            replica.model_name.clone(),
+            Arc::clone(&replica.observer),
+            replica.ordinal,
+            );
+            let welcomed = spec.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                control.join_target(engine, welcomed, sink)
+            })
+            .await;
+            let client = match joined {
+                Ok(Ok(client)) => Arc::new(client),
+                Ok(Err(error)) => {
+                    warn!(engine, "the switch's target did not join: {error:#}");
+                    return;
+                }
+                Err(error) => {
+                    warn!(engine, "joining the switch's target ended: {error}");
+                    return;
+                }
+            };
+            while *served.borrow_and_update() < epoch {
+                if served.changed().await.is_err() {
+                    return;
+                }
+            }
+            spec.predecessor = None;
+            *locked(&replica.served) = Some(spec);
+            replica.hold.serve(Arc::clone(&client));
+            tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
+            info!(engine, epoch, "the switch's target serves this replica");
+        });
+    }
+
     /// Restarts the committed world while the caller owns its replacement
     /// lock. A pending commit must finish publication before calling this.
     pub(crate) async fn recover(self: &Arc<Self>) -> anyhow::Result<Arc<EngineClient>> {
