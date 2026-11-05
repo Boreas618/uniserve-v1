@@ -546,7 +546,7 @@ impl Scheduler {
     /// a free request row. When the executor reports admissible video
     /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
-    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerGroupId>> {
+    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::ExecutorGroupId>> {
         use ipc::MediaCall;
 
         let mut required = graph
@@ -772,7 +772,7 @@ impl Scheduler {
     /// on known workers.
     fn reserve_media(
         &mut self,
-        route_workers: &HashSet<crate::WorkerGroupId>,
+        route_workers: &HashSet<crate::ExecutorGroupId>,
         request_key: RequestKey,
         outputs: &[MediaOutput],
     ) -> Result<Option<MediaAllocations>, UnknownMediaWorker> {
@@ -1007,7 +1007,7 @@ impl Scheduler {
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
-    /// Whether some worker group prefills only (`WorkerGroupRole::Prefill`),
+    /// Whether some worker group prefills only (`ExecutorGroupRole::Prefill`),
     /// its requests decoding on decode groups.
     fn splits_prefill(&self) -> bool {
         !self.placement.prefill_groups.is_empty()
@@ -1015,7 +1015,7 @@ impl Scheduler {
 
     /// Why the image denoiser cannot denoise `req`'s images, if so: under
     /// CUDA graphs it denoises only the steps it captured
-    /// (`WorkerInfo::captured_images`), and a request's steps evaluate one
+    /// (`MainProcessInfo::captured_images`), and a request's steps evaluate one
     /// guidance branch up to its own branch count.
     fn uncaptured_image(&self, req: &GenerationRequest) -> Option<String> {
         let captured = self.info.captured_images.as_ref()?;
@@ -1055,7 +1055,7 @@ impl Scheduler {
     /// Why the image denoiser's step cannot hold `req`'s images, if so: a
     /// step evaluates one framed latent sequence (the image's latent rows
     /// and its `commit_marker_tokens`) per guidance branch, within the rows
-    /// and tokens the workers' step serves (`WorkerInfo::image_capacity`).
+    /// and tokens the workers' step serves (`MainProcessInfo::image_capacity`).
     fn exceeded_image_step(&self, req: &GenerationRequest) -> Option<String> {
         let capacity = self.info.image_capacity.as_ref()?;
         if !req.generates_images() || capacity.max_step_tokens == 0 {
@@ -1086,7 +1086,7 @@ impl Scheduler {
 
     /// Why the latent encoder cannot encode one of `req`'s input images, if
     /// so: under CUDA graphs it encodes only the image sizes it captured
-    /// (`WorkerInfo::captured_latents`), and a latent block states the size
+    /// (`MainProcessInfo::captured_latents`), and a latent block states the size
     /// its image resizes to.
     fn uncaptured_latent(&self, req: &GenerationRequest) -> Option<String> {
         let captured = self.info.captured_latents.as_ref()?;
@@ -1613,7 +1613,7 @@ impl Scheduler {
     pub(super) fn prefill_target(
         &self,
         state: &RequestState,
-    ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
+    ) -> Option<((crate::ExecutorGroupId, String), crate::kv_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
@@ -1664,7 +1664,7 @@ impl Scheduler {
     /// stays reserved on error.
     fn reserve_admission(
         &mut self,
-        target: &crate::WorkerGroupId,
+        target: &crate::ExecutorGroupId,
     ) -> Result<AdmissionReservation, &'static str> {
         let source = self
             .executor
@@ -1708,7 +1708,7 @@ impl Scheduler {
     pub(super) fn admit_running(
         &mut self,
         mut st: RequestState,
-        target: (crate::WorkerGroupId, String),
+        target: (crate::ExecutorGroupId, String),
         reservation: AdmissionReservation,
     ) {
         let id = st.req.request_id;
@@ -1797,7 +1797,7 @@ impl Scheduler {
     /// cached prefix to the host KV cache's hit, whose units are allocated
     /// now and loaded by its first call. A hit that no longer follows the
     /// device prefix the request acquired is released.
-    fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
+    fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::ExecutorGroupId) {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return;
         };
@@ -1879,7 +1879,7 @@ impl Scheduler {
 /// Resources a token request holds from the moment admission commits it.
 pub(super) struct AdmissionReservation {
     /// The prefill worker's endpoint, which keys its prefix-cache residency.
-    source: ipc::WorkerEndpoint,
+    source: ipc::MainProcessEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
 }
@@ -1905,7 +1905,7 @@ pub(super) enum HostHit {
 pub(super) fn host_prefix(
     kv_offload: &mut Option<KvOffloadManager>,
     state: &RequestState,
-    target: &(crate::WorkerGroupId, String),
+    target: &(crate::ExecutorGroupId, String),
     device_hit: usize,
     limit: usize,
     min_deepening: usize,
@@ -1955,7 +1955,7 @@ fn acquire_cached_prefix(
     state: &mut RequestState,
     pool: &BlockPool,
     stats: &SchedulerStats,
-    source: &ipc::WorkerEndpoint,
+    source: &ipc::MainProcessEndpoint,
 ) -> Result<(), &'static str> {
     let prompt = state.req.prompt_token_ids.clone();
     let has_context_images = state.has_context_images() || state.rebuilds_images();

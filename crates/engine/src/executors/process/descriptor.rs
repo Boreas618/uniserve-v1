@@ -1,4 +1,4 @@
-//! The defaults of the launch settings `WorkerProcessArgs` carries, the
+//! The defaults of the launch settings `ExecutorProcessArgs` carries, the
 //! launch descriptor a rank is started with, and the environment every rank
 //! is launched with, given the engine process's own.
 
@@ -8,9 +8,9 @@ use proto::request::{FlashInferBackend, GraphPolicy, LoadFormat};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::worker::WorkerProcessArgs;
+use crate::executors::ExecutorProcessArgs;
 
-impl WorkerProcessArgs {
+impl ExecutorProcessArgs {
     /// Call batches kept in flight against a rank unless a launch sets its
     /// queue depth.
     pub const DEFAULT_QUEUE_DEPTH: usize = 2;
@@ -38,14 +38,14 @@ impl WorkerProcessArgs {
     pub const DEFAULT_DTYPE: crate::ModelDtype = crate::ModelDtype::BFloat16;
 }
 
-impl Default for WorkerProcessArgs {
-    /// Returns worker launch settings suitable for a single local rank.
+impl Default for ExecutorProcessArgs {
+    /// Returns executor launch settings suitable for a single local rank.
     ///
     /// The tuning values are the `DEFAULT_*` constants of this type, which
     /// the `uniserve` command line also takes as its option defaults.
     fn default() -> Self {
         Self {
-            worker_id: "worker".into(),
+            worker_id: "executor".into(),
             // The engine's spec names the executable of its build; without
             // one, `uniserve` is looked up on the search path.
             executable: "uniserve".into(),
@@ -68,15 +68,15 @@ impl Default for WorkerProcessArgs {
             watchdog_timeout: Self::DEFAULT_WATCHDOG_TIMEOUT,
             model: String::new(),
             weights: None,
-            ranks: vec![crate::WorkerRank {
+            ranks: vec![crate::ExecutorRank {
                 host: "localhost".into(),
                 device: "cuda:0".into(),
             }],
             host: "localhost".into(),
             // One local rank running one component. A launch replaces this
             // with the components the model being served declared.
-            components: crate::WorkerGroupConfig::single_component(DEFAULT_COMPONENT, 1),
-            role: crate::WorkerGroupRole::Model,
+            components: crate::ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
+            role: crate::ExecutorGroupRole::Model,
             peers: Default::default(),
             stub: false,
             queue_depth: Self::DEFAULT_QUEUE_DEPTH,
@@ -135,7 +135,7 @@ impl Default for WorkerProcessArgs {
     }
 }
 
-impl WorkerProcessArgs {
+impl ExecutorProcessArgs {
     /// Returns one rank's index among the ranks on its own host and that
     /// host's rank count.
     ///
@@ -147,7 +147,7 @@ impl WorkerProcessArgs {
     pub(super) fn host_slot(&self, rank: u32) -> anyhow::Result<(u32, u32)> {
         let rank = rank as usize;
         let host = &self.ranks[rank].host;
-        let resident = |placed: &&crate::WorkerRank| &placed.host == host;
+        let resident = |placed: &&crate::ExecutorRank| &placed.host == host;
 
         // The rank's host index counts the ranks placed before it on its host.
         let index = self.ranks[..rank].iter().filter(resident).count();
@@ -192,7 +192,7 @@ impl WorkerProcessArgs {
         Ok(environment)
     }
 
-    /// Builds the typed launch descriptor the worker process consumes.
+    /// Builds the typed launch descriptor the executor process consumes.
     ///
     /// Every launch value is stated explicitly, so the launching side is the
     /// single source of defaults and the rank never re-derives one. The engine
@@ -250,7 +250,7 @@ impl WorkerProcessArgs {
             products_cross_hosts: self.transfer.products_cross_hosts(&self.worker_id, rank),
             queue_depth: depth,
             // The rank reports a stalled job after half of it: see
-            // `WorkerProcessArgs::watchdog_timeout`.
+            // `ExecutorProcessArgs::watchdog_timeout`.
             watchdog_timeout_ms: u64::try_from(self.watchdog_timeout.as_millis())
                 .unwrap_or(u64::MAX),
             model: self.model.clone(),
@@ -422,7 +422,7 @@ pub(super) fn worker_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerProcessArgs, worker_environment};
+    use super::{ExecutorProcessArgs, worker_environment};
     use ipc::StorageLaunch;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -447,7 +447,7 @@ mod tests {
     /// without the values that are optional.
     #[test]
     fn the_launch_descriptor_round_trips_through_a_frame() {
-        let args = WorkerProcessArgs::default();
+        let args = ExecutorProcessArgs::default();
         for (rendezvous, generation) in [(None, None), (Some("127.0.0.1:29500"), Some(7))] {
             let descriptor = args
                 .launch_descriptor(0, storage(), rendezvous, generation, None)

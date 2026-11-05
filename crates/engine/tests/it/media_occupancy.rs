@@ -23,7 +23,7 @@ use crossbeam_channel::Receiver;
 use engine::{
     BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError, ExecutorInfo,
     ExecutorSubmitError, PoolPlacement, RequestPlacement, SchedulerConfig, SimEngine, SimExecutor,
-    WorkerGroupId,
+    ExecutorGroupId,
 };
 use engine::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
@@ -84,9 +84,9 @@ impl Submission {
 struct Served {
     /// Media submissions in the order the executor accepted them.
     submissions: Vec<Submission>,
-    /// Each submitted media call with the worker its placement names for
+    /// Each submitted media call with the executor its placement names for
     /// every component reading its products, in submission order.
-    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerGroupId>)>,
+    readers: Vec<(RequestId, MediaCall, BTreeMap<String, ExecutorGroupId>)>,
     /// Every submitted media call with its placement, in submission order.
     calls: Vec<(Call, RequestPlacement)>,
     /// Every event each request's stream delivered.
@@ -364,7 +364,7 @@ fn serve_through(
 }
 
 /// Admission routes every component of a video request, so each call names
-/// the worker the request was routed to for every component that reads its
+/// the executor the request was routed to for every component that reads its
 /// products, and nothing for a call whose products no component reads.
 #[test]
 fn each_media_call_names_the_workers_routed_to_read_its_products() {
@@ -375,7 +375,7 @@ fn each_media_call_names_the_workers_routed_to_read_its_products() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), ExecutorGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     // The video graph: text conditioning feeds latent preparation on the
@@ -518,7 +518,7 @@ fn a_host_task_pool_admits_no_more_tasks_than_its_worker_advertises() {
         );
         served.assert_completed(request);
 
-        // Every host task of this worker lands on rank 0's host task pool,
+        // Every host task of this executor lands on rank 0's host task pool,
         // whose occupancy never exceeds the advertised capacity. With one rank
         // and one media unit, each host call places exactly one task, so
         // counting calls counts the pool's tasks.
@@ -734,7 +734,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         "the vision tokens precede the text encoding"
     );
     // The text encoding is submitted once its vision features exist, so it
-    // never waits in its worker's queue ahead of other calls.
+    // never waits in its executor's queue ahead of other calls.
     let (text_submission, text_batch) = served.submissions_of(request, MediaCall::TextEncoding)[0];
     assert!(
         !text_batch
@@ -832,7 +832,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), ExecutorGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     for (owner, call, readers) in &served.readers {
@@ -987,11 +987,11 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
     }
 }
 
-/// The simulator's components served from two worker pools: the condition
+/// The simulator's components served from two executor pools: the condition
 /// encoders on one, and the denoiser, decoders and muxer on the other, as a
 /// deployment that places its encoders apart from its denoiser serves them.
 ///
-/// Submission keeps the two rules a `WorkerExecutor` applies across pools. A
+/// Submission keeps the two rules a `Dispatcher` applies across pools. A
 /// pool without a free slot hands a batch back, as the encoder pool does
 /// once, for the first batch carrying the `hand_back` call. A call is
 /// accepted only after the call producing each of its inputs has been, since
@@ -1001,8 +1001,8 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
 struct PooledExecutor {
     inner: SimExecutor,
     info: ExecutorInfo,
-    /// The worker the simulator itself reports.
-    simulator: WorkerGroupId,
+    /// The executor the simulator itself reports.
+    simulator: ExecutorGroupId,
     /// The media call whose first batch is handed back, until it has been.
     hand_back: Option<MediaCall>,
     handed_back: Arc<AtomicBool>,
@@ -1047,11 +1047,11 @@ impl PooledExecutor {
         };
         let pools = [
             (
-                WorkerGroupId("encoders".to_owned()),
+                ExecutorGroupId("encoders".to_owned()),
                 pool(&["media_reader", "text_encoder", "latent_encoder"]),
             ),
             (
-                WorkerGroupId("generator".to_owned()),
+                ExecutorGroupId("generator".to_owned()),
                 pool(&[
                     "denoiser",
                     "video_decoder",
@@ -1091,11 +1091,11 @@ impl Executor for PooledExecutor {
         &self.info
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
     }
 
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
     }
 
@@ -1202,7 +1202,7 @@ fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
     assert!(latents.iter().all(|index| *index < preparation[0]));
 }
 
-/// A video worker's ranks each back only the results of the components they
+/// A video executor's ranks each back only the results of the components they
 /// execute and of the components that read them, and the engine places
 /// buffers in each rank's own pool: a rank that holds fewer results packs
 /// them from its own offset zero rather than at the offsets another rank's

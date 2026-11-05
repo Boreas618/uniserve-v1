@@ -1,20 +1,20 @@
-//! Scheduler-to-worker protocol and its rank transports.
+//! Scheduler-to-main-process protocol and its rank transports.
 //!
 //! [`NewRequest`] admits static state, [`Batch`] submits planned calls, and
-//! [`BatchOutput`] returns completions and products. [`WorkerInfo`] describes a
-//! loaded worker before execution begins. Numeric request, call, point,
-//! and generation identities remain stable across serialization.
+//! [`BatchOutput`] returns completions and products. [`MainProcessInfo`]
+//! describes a peer main process's ranks before execution begins. Numeric
+//! request, call, point, and generation identities remain stable across
+//! serialization.
 //!
-//! [`WorkerRequest`] and [`WorkerResponse`] are the envelopes exchanged per
+//! [`MainProcessRequest`] and [`MainProcessResponse`] are the envelopes exchanged per
 //! rank, each as the one message of a [`Frame`]: a length followed by the
 //! message in the binary encoding its `serde` derive describes. These message
-//! types are the only definition of the protocol, so the engine and the worker
-//! library must be built from the same sources. A [`Channel`] carries the
-//! frames over a stream connection: a Unix socket to a rank on the engine's
-//! node, TCP to a rank on another node. A rank connects to the engine, sends
-//! its [`Registration`] and receives its [`LaunchDescriptor`]; the worker
-//! runtime (`uniserve worker`) then serves its end until the connection
-//! closes.
+//! types are the only definition of the protocol, so the main processes of an
+//! epoch must be built from the same sources. A [`Channel`] carries the
+//! frames over a stream connection: a Unix socket to a rank on the scheduler's
+//! node, TCP to a rank on another node. A rank's main process connects to the
+//! scheduler's, sends its [`Registration`] and receives its
+//! [`LaunchDescriptor`], and then serves its end until the connection closes.
 
 use std::collections::{HashMap, HashSet};
 

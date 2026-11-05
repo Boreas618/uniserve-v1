@@ -1,7 +1,7 @@
 //! Rank membership and logical model-parallel degrees of worker components.
 //!
 //! A worker group names each numerical component it runs and the ordered
-//! ranks that run it (`WorkerGroupConfig::components` in the engine). A
+//! ranks that run it (`ExecutorGroupConfig::components` in the engine). A
 //! [`ComponentConfig`] either forms one model-parallel group over its ranks
 //! or, with a [`ComponentDistribution`], runs an independent local copy on
 //! every rank and deals independent units among them.

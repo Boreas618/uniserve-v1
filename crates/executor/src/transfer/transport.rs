@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
-use ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
+use ipc::{Locator, TransferTransport, Wake, MainProcessEndpoint};
 use platform::{DeviceId, Event, Stream};
 
 use super::backing::TransportBuffer;
@@ -81,7 +81,7 @@ impl TransportKind {
 #[derive(Clone, Debug)]
 pub struct TransportOptions {
     /// This rank, published in every locator.
-    pub source: WorkerEndpoint,
+    pub source: MainProcessEndpoint,
     /// This rank's reader slot in other ranks' acknowledgment headers.
     pub acknowledgment_slot: usize,
     /// Consumer slots of ranks on this host: shared memory serves them, the
@@ -113,7 +113,7 @@ pub(super) enum Backend {
 
 /// One mechanism's exports and reads.
 pub struct Transport {
-    pub(super) source: WorkerEndpoint,
+    pub(super) source: MainProcessEndpoint,
     pub(super) capacity: Arc<TransferCapacity>,
     pub(super) events: Arc<EventPool>,
     pub(super) reads: Arc<TransferPool>,
@@ -151,7 +151,7 @@ impl<'a> ExportView<'a> {
         })
     }
 
-    pub(super) fn locator(&self, source: &WorkerEndpoint, transport: TransferTransport) -> Locator {
+    pub(super) fn locator(&self, source: &MainProcessEndpoint, transport: TransferTransport) -> Locator {
         Locator {
             source: source.clone(),
             transport,
@@ -761,7 +761,7 @@ mod tests {
 
     fn locator(shape: Vec<u64>, offset: Vec<u64>) -> Locator {
         Locator {
-            source: WorkerEndpoint {
+            source: MainProcessEndpoint {
                 host: "n".into(),
                 address_space: "a".into(),
                 incarnation: "i".into(),

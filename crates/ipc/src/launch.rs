@@ -49,7 +49,7 @@ pub struct StorageLaunch {
     /// Whether the worker stands by for the worker of its scope: it maps
     /// the exclusive storages that worker holds without taking write
     /// access, warms up on scratch units, parks with the storages read-only
-    /// and serves once promoted (`WorkerRequest::Promote`).
+    /// and serves once promoted (`MainProcessRequest::Promote`).
     pub standby: bool,
     /// How the worker, parked as a standby, keeps the device storage of its
     /// graph pools and scratch (`worker_config.standby_storage`).
@@ -71,7 +71,7 @@ pub struct LaunchDescriptor {
     /// The engine's watchdog timeout in milliseconds (`worker_config.watchdog_timeout`):
     /// how long a batch may go without progress of the group's ranks before
     /// the engine replaces them. The rank reports a stalled job
-    /// ([`WorkerResponse::Stalled`](crate::WorkerResponse)) once one job has
+    /// ([`MainProcessResponse::Stalled`](crate::MainProcessResponse)) once one job has
     /// run for half of it, so the report precedes the engine's expiry; at
     /// least two.
     pub watchdog_timeout_ms: u64,

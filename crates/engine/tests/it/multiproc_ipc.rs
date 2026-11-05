@@ -1,18 +1,18 @@
 //! Multiprocess launch, request lifecycle, token execution, close and rank
 //! recovery.
 //!
-//! These tests launch real worker processes (`uniserve worker` with the
+//! These tests launch real executor processes (`uniserve executor` with the
 //! weightless stub model on CPU) and drive them through the engine's
-//! `WorkerGroup`, `WorkerExecutor` or `SchedulerHandle`, or through a raw
-//! `Channel` when the worker's own protocol handling is under test.
+//! `ExecutorGroup`, `Dispatcher` or `SchedulerHandle`, or through a raw
+//! `Channel` when the executor's own protocol handling is under test.
 //! Lifecycle batches (Start, Finish, Free) exercise registration, startup,
 //! Info, admission, retirement, close and signals; token batches run the
 //! stub's text runtime (prefill, decode, verification, sampling, logprobs and
 //! device token relays). The executable comes from
 //! `UNISERVE_WORKER_EXECUTABLE` or the repository environment's
 //! `.venv/bin/uniserve`. Several tests replace that executable with a
-//! small wrapper script that records a worker's process id, exits a chosen rank, starts a relaunched rank as a
-//! stand-in that reports changed worker info, registers under another build
+//! small wrapper script that records an executor's process id, exits a chosen rank, starts a relaunched rank as a
+//! stand-in that reports changed executor info, registers under another build
 //! or for an earlier launch, or holds a rank's exit until its peers have
 //! closed.
 //!
@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use engine::{
-    CallReaders, EngineConfig, Executor, RankBuffer, SchedulerHandle, WorkerFailure, WorkerGroup,
-    WorkerGroupConfig, WorkerProcessArgs,
+    CallReaders, EngineConfig, Executor, RankBuffer, SchedulerHandle, ExecutorFailure, ExecutorGroup,
+    ExecutorGroupConfig, ExecutorProcessArgs,
 };
 use engine::{DiffusionRequest, Event, Request};
 use ipc::{
@@ -55,7 +55,7 @@ static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// The five top logprobs a fresh request reports for its first token after
 /// the prompt `[7, 8]`, selected greedily under the nucleus `top_p`.
 fn first_token_logprobs(
-    executor: &mut WorkerGroup,
+    executor: &mut ExecutorGroup,
     batch_id: u64,
     request_id: u64,
     slot: u32,
@@ -202,7 +202,7 @@ fn token_batch(
 /// Encodes one registration frame per rank of `args`'s group, as `stated`
 /// gives it for each rank, in the hexadecimal form a wrapper script embeds.
 fn registration_frames(
-    args: &WorkerProcessArgs,
+    args: &ExecutorProcessArgs,
     stated: impl Fn(u32) -> ipc::Registration,
 ) -> anyhow::Result<Vec<String>> {
     (0..args.ranks.len())
@@ -251,7 +251,7 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
 
     args.executable = wrapper;
-    let reported = match WorkerGroup::spawn(args) {
+    let reported = match ExecutorGroup::spawn(args) {
         Ok(_) => anyhow::bail!("a rank of another build was accepted"),
         Err(error) => format!("{error:#}"),
     };
@@ -267,7 +267,7 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
 /// relaunched group serves again once its ranks are installed.
 #[test]
 fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Result<()> {
-    use engine::{WorkerExecutor, WorkerGroupId};
+    use engine::{Dispatcher, ExecutorGroupId};
     use std::os::unix::fs::PermissionsExt as _;
 
     // The wrapper records each launch's process id. A relaunched rank
@@ -284,16 +284,16 @@ fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Resul
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let relaunched = WorkerGroupId("relaunched".into());
-    let serving = WorkerGroupId("serving".into());
-    let spawn = |worker_id: &WorkerGroupId| -> anyhow::Result<WorkerGroup> {
+    let relaunched = ExecutorGroupId("relaunched".into());
+    let serving = ExecutorGroupId("serving".into());
+    let spawn = |worker_id: &ExecutorGroupId| -> anyhow::Result<ExecutorGroup> {
         let mut args = single_worker_args(&worker_id.0, 1);
         if *worker_id == relaunched {
             args.executable = wrapper.clone();
         }
-        WorkerGroup::spawn(args)
+        ExecutorGroup::spawn(args)
     };
-    let mut executor = WorkerExecutor::try_new(
+    let mut executor = Dispatcher::try_new(
         vec![
             (relaunched.clone(), spawn(&relaunched)?),
             (serving.clone(), spawn(&serving)?),
@@ -330,7 +330,7 @@ fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Resul
         }
     };
     let loss = loss
-        .downcast_ref::<WorkerFailure>()
+        .downcast_ref::<ExecutorFailure>()
         .context("expected the group's loss")?;
     assert_eq!(loss.worker_id, relaunched);
 
@@ -370,7 +370,7 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     let worker = serde_json::to_string(&worker_executable())?;
     let records = serde_json::to_string(directory.path())?;
     // Record process identities at the launch boundary; the numerical
-    // worker and the engine both execute their normal public paths.
+    // executor and the engine both execute their normal public paths.
     std::fs::write(
         &wrapper,
         format!(
@@ -385,12 +385,12 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
         max_cfg_branches: 1,
         ..Default::default()
     };
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    config.worker_groups = vec![ExecutorGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = worker_group_args();
     config.worker_process.executable = wrapper.clone();
@@ -442,12 +442,12 @@ fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
         max_cfg_branches: 1,
         ..Default::default()
     };
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    config.worker_groups = vec![ExecutorGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = worker_group_args();
     config.worker_process.executable = wrapper;
@@ -534,12 +534,12 @@ fn stub_engine_config(deployment: &str) -> EngineConfig {
         max_cfg_branches: 1,
         ..Default::default()
     };
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    config.worker_groups = vec![ExecutorGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = worker_group_args();
     config.worker_process.deployment = deployment.to_owned();
@@ -595,7 +595,7 @@ fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u3
     }
 }
 
-/// A deployment of a prefill group and a decode group (`WorkerGroupRole`)
+/// A deployment of a prefill group and a decode group (`ExecutorGroupRole`)
 /// prefills each request on the first, which exports the request's KV
 /// cache once its prompt is complete, and decodes it on the second, which
 /// installs that cache: requests generate what one model group generates,
@@ -657,12 +657,12 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> 
     let mut config = stub_engine_config("prefill-decode");
     let group = config.worker_groups.remove(0);
     config.worker_groups = [
-        ("prefill", engine::WorkerGroupRole::Prefill),
-        ("decode", engine::WorkerGroupRole::Decode),
+        ("prefill", engine::ExecutorGroupRole::Prefill),
+        ("decode", engine::ExecutorGroupRole::Decode),
     ]
     .into_iter()
-    .map(|(id, role)| WorkerGroupConfig {
-        id: engine::WorkerGroupId(id.into()),
+    .map(|(id, role)| ExecutorGroupConfig {
+        id: engine::ExecutorGroupId(id.into()),
         role,
         ..group.clone()
     })
@@ -767,12 +767,12 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
         ..Default::default()
     };
     config.max_batch = QUEUE_DEPTH * 8;
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    config.worker_groups = vec![ExecutorGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
     )];
     config.worker_process = worker_group_args();
     let engine = {
@@ -843,12 +843,12 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result
 
 #[test]
 fn placement_binds_ranks_to_the_engine_host_by_name() {
-    let named = WorkerGroupConfig::placed(
+    let named = ExecutorGroupConfig::placed(
         &["compute-0".to_owned()],
         "cpu",
         WORLD_SIZE,
         2,
-        WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
     );
     assert!(
         named.ranks.iter().all(|rank| rank.host == "compute-0"),
@@ -859,22 +859,22 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
     // joined the leader. No daemon runs on that host here, so the launch
     // fails naming the host whose ranks cannot start rather than waiting for
     // them or starting them in the wrong place.
-    let spawned = WorkerGroup::spawn(WorkerProcessArgs {
+    let spawned = ExecutorGroup::spawn(ExecutorProcessArgs {
         executable: worker_executable(),
         daemon: crate::support::daemon(),
         model: String::new(),
         host: "compute-0".into(),
-        ranks: WorkerGroupConfig::placed(
+        ranks: ExecutorGroupConfig::placed(
             &["compute-1".to_owned()],
             "cpu",
             WORLD_SIZE,
             2,
-            WorkerGroupConfig::single_component("model", WORLD_SIZE),
+            ExecutorGroupConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
         components: named.components.clone(),
         stub: true,
-        ..WorkerProcessArgs::default()
+        ..ExecutorProcessArgs::default()
     });
     let Err(error) = spawned else {
         panic!("a rank on a host no daemon runs on must not launch");
@@ -887,8 +887,8 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
 }
 
 /// Spawns the default two-rank stub group from `worker_group_args`.
-fn spawn_worker_group() -> anyhow::Result<WorkerGroup> {
-    WorkerGroup::spawn(worker_group_args())
+fn spawn_worker_group() -> anyhow::Result<ExecutorGroup> {
+    ExecutorGroup::spawn(worker_group_args())
 }
 
 /// Launch arguments for a two-rank stub group on the local host's CPU.
@@ -896,28 +896,28 @@ fn spawn_worker_group() -> anyhow::Result<WorkerGroup> {
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
 /// in flight. Tests adjust the returned value (for example components, executable or transfer edges)
 /// before spawning.
-fn worker_group_args() -> WorkerProcessArgs {
+fn worker_group_args() -> ExecutorProcessArgs {
     let executable = worker_executable();
-    let config = WorkerProcessArgs {
+    let config = ExecutorProcessArgs {
         stub: true,
         // The stub rank encodes many small images, so it keeps a larger
         // encoder cache than a served model's default.
         encoder_cache_entries: 1024,
-        ..WorkerProcessArgs::default()
+        ..ExecutorProcessArgs::default()
     };
-    WorkerProcessArgs {
+    ExecutorProcessArgs {
         executable,
         daemon: crate::support::daemon(),
         model: String::new(),
-        ranks: WorkerGroupConfig::placed(
+        ranks: ExecutorGroupConfig::placed(
             &["localhost".to_owned()],
             "cpu",
             WORLD_SIZE,
             2,
-            WorkerGroupConfig::single_component("model", WORLD_SIZE),
+            ExecutorGroupConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
-        components: WorkerGroupConfig::single_component("model", WORLD_SIZE),
+        components: ExecutorGroupConfig::single_component("model", WORLD_SIZE),
         queue_depth: QUEUE_DEPTH,
         max_total_tokens: Some(4096),
         block_size: Some(16),
@@ -951,7 +951,7 @@ trait SubmitPlaced {
     fn submit_placed(&mut self, batch: Batch) -> Result<(), engine::BatchSubmitError>;
 }
 
-impl SubmitPlaced for WorkerGroup {
+impl SubmitPlaced for ExecutorGroup {
     fn submit_placed(&mut self, mut batch: Batch) -> Result<(), engine::BatchSubmitError> {
         let spans = on_every_rank(std::mem::take(&mut batch.buffer_allocations));
         self.submit_batch(batch, &CallReaders::new(), &spans)
@@ -959,7 +959,7 @@ impl SubmitPlaced for WorkerGroup {
 }
 
 /// Submits one batch and waits up to 30 seconds for its result.
-fn execute(executor: &mut WorkerGroup, batch: Batch) -> anyhow::Result<engine::WorkerResult> {
+fn execute(executor: &mut ExecutorGroup, batch: Batch) -> anyhow::Result<engine::ExecutorResult> {
     executor.submit_placed(batch)?;
     executor
         .poll_batch(Duration::from_secs(30))?
@@ -994,10 +994,10 @@ fn text_admission(
 }
 
 // Products and transfers: tensor products published by one component or
-// worker and imported by another, cache exports, and the retirement of work
+// executor and imported by another, cache exports, and the retirement of work
 // that reads a failed or unreachable product.
 
-/// Device products cross worker processes over CUDA VMM with their values:
+/// Device products cross executor processes over CUDA VMM with their values:
 /// the source publishes two requests' transition flags (one false, one
 /// true), and target calls gated by them run exactly when the imported flag
 /// is true, whether they read the import directly or a copy a tensor
@@ -1005,18 +1005,18 @@ fn text_admission(
 #[test]
 #[ignore = "requires a CUDA device"]
 fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
-    use engine::{WorkerExecutor, WorkerGroupId};
+    use engine::{Dispatcher, ExecutorGroupId};
 
     let retire = Retire::default();
     let edges = "source->target=cuda_vmm";
-    let mut executor = WorkerExecutor::try_new(
+    let mut executor = Dispatcher::try_new(
         vec![
             (
-                WorkerGroupId("source".into()),
+                ExecutorGroupId("source".into()),
                 cuda_worker(&retire, "source", edges, None)?,
             ),
             (
-                WorkerGroupId("target".into()),
+                ExecutorGroupId("target".into()),
                 cuda_worker(&retire, "target", edges, None)?,
             ),
         ],
@@ -1050,7 +1050,7 @@ fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
         let prefilled = poll_logical(&mut executor)?.context("source prefill did not complete")?;
         assert_eq!(prefilled.results[0].output.status, CallStatus::Ok);
 
-        // The source republishes the flag as a product other workers read;
+        // The source republishes the flag as a product other executors read;
         // the target imports it over the source's one edge.
         let export = TensorRef {
             producer_call_id: CallId::new(batch_id + 1, 0),
@@ -1123,24 +1123,24 @@ fn device_products_cross_workers_over_cuda_vmm() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A request prefilled on a worker with a BF16 cache continues on a worker
+/// A request prefilled on an executor with a BF16 cache continues on an executor
 /// with an FP16 cache: its cache crosses the processes over CUDA VMM and is
 /// converted into the target's representation by the cache's conversion.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Result<()> {
-    use engine::{WorkerExecutor, WorkerGroupId};
+    use engine::{Dispatcher, ExecutorGroupId};
 
     let retire = Retire::default();
     let edges = "source->target=cuda_vmm";
-    let mut executor = WorkerExecutor::try_new(
+    let mut executor = Dispatcher::try_new(
         vec![
             (
-                WorkerGroupId("source".into()),
+                ExecutorGroupId("source".into()),
                 cuda_worker(&retire, "source", edges, None)?,
             ),
             (
-                WorkerGroupId("target".into()),
+                ExecutorGroupId("target".into()),
                 cuda_worker(
                     &retire,
                     "target",
@@ -1252,7 +1252,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
     Ok(())
 }
 
-/// A real model's request continues on another worker from the prefix cache it
+/// A real model's request continues on another executor from the prefix cache it
 /// installed and the token the source sampled: the target's greedy
 /// continuation of a prompt equals the source's token for token, since the
 /// installed pages hold the source's bytes. Cache and token cross over shared
@@ -1264,7 +1264,7 @@ fn a_converting_install_copies_the_cache_another_worker_exported() -> anyhow::Re
 #[test]
 #[ignore = "requires a CUDA device and the checkpoint UNISERVE_KV_INSTALL_MODEL names"]
 fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
-    // One mechanism at a time: each pair of workers holds two copies of the
+    // One mechanism at a time: each pair of executors holds two copies of the
     // model on the device.
     for edges in ["source->target=posix_shm", "source->target=cuda_vmm"] {
         continue_greedily_from_installed_cache(edges).with_context(|| edges.to_owned())?;
@@ -1273,15 +1273,15 @@ fn a_model_continues_greedily_from_installed_cache() -> anyhow::Result<()> {
 }
 
 /// Prefill a prompt on the source, export its cache and its sampled token to
-/// the target over `edges`, install both there, and compare both workers'
+/// the target over `edges`, install both there, and compare both executors'
 /// greedy continuations, the target's starting from the imported token.
 fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
-    use engine::{WorkerExecutor, WorkerGroupId};
+    use engine::{Dispatcher, ExecutorGroupId};
 
     let model = std::env::var("UNISERVE_KV_INSTALL_MODEL")?;
     let prompt: Vec<u32> = serde_json::from_str(&std::env::var("UNISERVE_KV_INSTALL_PROMPT")?)?;
     let retire = Retire::default();
-    let spawn = |worker_id: &str| -> anyhow::Result<WorkerGroup> {
+    let spawn = |worker_id: &str| -> anyhow::Result<ExecutorGroup> {
         let mut args = single_worker_args(worker_id, QUEUE_DEPTH);
         for rank in &mut args.ranks {
             rank.device = "cuda:0".into();
@@ -1292,15 +1292,15 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
         args.block_size = None;
         args.max_batch_tokens = 8192;
         args.attention_backend = "auto".into();
-        args.components = WorkerGroupConfig::single_component("model", 1);
+        args.components = ExecutorGroupConfig::single_component("model", 1);
         args.transfer = engine::TransferConfig::parse(edges)?;
         retire.add(&args);
-        WorkerGroup::spawn(args)
+        ExecutorGroup::spawn(args)
     };
-    let mut executor = WorkerExecutor::try_new(
+    let mut executor = Dispatcher::try_new(
         vec![
-            (WorkerGroupId("source".into()), spawn("source")?),
-            (WorkerGroupId("target".into()), spawn("target")?),
+            (ExecutorGroupId("source".into()), spawn("source")?),
+            (ExecutorGroupId("target".into()), spawn("target")?),
         ],
         engine::TransferConfig::parse(edges)?,
     )?;
@@ -1374,7 +1374,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
     let installed = poll_logical(&mut executor)?.context("cache install did not complete")?;
     assert_eq!(installed.results[0].output.status, CallStatus::Ok);
 
-    // Greedy continuations of the same prefix on both workers.
+    // Greedy continuations of the same prefix on both executors.
     let mut tokens = std::collections::BTreeMap::new();
     let mut last = None;
     for (worker, unit, base) in [("source", 1, 10), ("target", 7, 20)] {
@@ -1395,7 +1395,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
     let (last, sampled) = last.context("the source decoded")?;
 
     // The source publishes its last token and the target copies it into its
-    // own relay; one more step on each worker continues from that token, the
+    // own relay; one more step on each executor continues from that token, the
     // target's reading it from the device.
     let published = TensorRef {
         producer_call_id: CallId::new(14, 0),
@@ -1442,7 +1442,7 @@ fn continue_greedily_from_installed_cache(edges: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A one-token decode of `key` at `position` on `worker`, in batch and call
+/// A one-token decode of `key` at `position` on `executor`, in batch and call
 /// `batch_id`, over the request's unit `unit`.
 fn decode_batch(key: RequestKey, batch_id: u64, token: u32, unit: u32, position: u32) -> Batch {
     let mut decode = token_batch(
@@ -1460,10 +1460,10 @@ fn decode_batch(key: RequestKey, batch_id: u64, token: u32, unit: u32, position:
     decode
 }
 
-/// Run [`decode_batch`] on `worker` and return its output and the token
+/// Run [`decode_batch`] on `executor` and return its output and the token
 /// product it published.
 fn decode_step(
-    executor: &mut engine::WorkerExecutor,
+    executor: &mut engine::Dispatcher,
     worker: &str,
     key: RequestKey,
     batch_id: u64,
@@ -1482,7 +1482,7 @@ fn decode_step(
     Ok((decoded.results[0].output.clone(), sampled))
 }
 
-/// Launch arguments of a one-rank stub worker on the first visible CUDA
+/// Launch arguments of a one-rank stub executor on the first visible CUDA
 /// device, with a cache of `prefix_cache_dtype` (the model's dtype by default)
 /// and the transfer `edges`.
 fn cuda_worker(
@@ -1490,7 +1490,7 @@ fn cuda_worker(
     worker_id: &str,
     edges: &str,
     prefix_cache_dtype: Option<ipc::PrefixCacheDtype>,
-) -> anyhow::Result<WorkerGroup> {
+) -> anyhow::Result<ExecutorGroup> {
     let mut args = single_worker_args(worker_id, QUEUE_DEPTH);
     for rank in &mut args.ranks {
         rank.device = "cuda:0".into();
@@ -1498,18 +1498,18 @@ fn cuda_worker(
     args.kv_cache_dtype = prefix_cache_dtype;
     args.transfer = engine::TransferConfig::parse(edges)?;
     retire.add(&args);
-    WorkerGroup::spawn(args)
+    ExecutorGroup::spawn(args)
 }
 
-/// The deployments of a test's CUDA workers, retired at the host's Storage
-/// Server once the test's workers are gone: their device storage outlives
+/// The deployments of a test's CUDA executors, retired at the host's Storage
+/// Server once the test's executors are gone: their device storage outlives
 /// them there, and no later launch claims a test's deployment again. A test
-/// declares it before its workers, so that it drops after them.
+/// declares it before its executors, so that it drops after them.
 #[derive(Default)]
 struct Retire(std::sync::Mutex<Vec<String>>);
 
 impl Retire {
-    fn add(&self, args: &WorkerProcessArgs) {
+    fn add(&self, args: &ExecutorProcessArgs) {
         self.0.lock().unwrap().push(args.deployment.clone());
     }
 }
@@ -1547,7 +1547,7 @@ fn scalar_flag(request_key: RequestKey, producer: CallId, index: u16) -> TensorR
 /// `prefix` tokens, gated by `flag`, admitting the request with
 /// `admission` when given; returns the call's status.
 fn gated_prefill(
-    executor: &mut engine::WorkerExecutor,
+    executor: &mut engine::Dispatcher,
     batch_id: u64,
     key: RequestKey,
     admission: Option<NewRequest>,
@@ -1584,7 +1584,7 @@ fn gated_prefill(
 }
 
 /// Environment of a rank process `media_worker` serves: the launch arguments
-/// (JSON), the worker info template (a path), the media case, the path
+/// (JSON), the executor info template (a path), the media case, the path
 /// that receives the published media name, and, in the `planes` case, the
 /// directory that receives the cache table each launch descriptor carried.
 const MEDIA_WORKER_ARGS: &str = "UNISERVE_TEST_MEDIA_WORKER_ARGS";
@@ -1600,7 +1600,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
     use std::os::unix::fs::PermissionsExt as _;
 
     // The ranks are `media_worker` processes speaking the rank protocol. Each
-    // answers Info with a real stub group's worker info, completes every
+    // answers Info with a real stub group's executor info, completes every
     // call it receives and attaches a shared-memory media payload to a
     // completion, selected by case: a valid payload from rank 0
     // ("retained"), a payload on a call identity the batch never carried
@@ -1618,7 +1618,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
         let directory = tempfile::tempdir()?;
         let wrapper = directory.path().join("worker");
         let name_path = directory.path().join("media-name");
-        // `WorkerGroup` runs `<executable> <args>`, so the wrapper runs
+        // `ExecutorGroup` runs `<executable> <args>`, so the wrapper runs
         // this test binary's `media_worker` with those arguments.
         std::fs::write(
             &wrapper,
@@ -1631,7 +1631,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
         let mut args = worker_group_args();
         args.executable = wrapper;
-        let mut worker = WorkerGroup::spawn(args)?;
+        let mut worker = ExecutorGroup::spawn(args)?;
         let admission = text_admission(81, 1, 1)?;
         let batch = token_batch(
             1,
@@ -1712,8 +1712,8 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 }
 
 /// A rank process of `media_storage_is_owned_through_worker_result_validation`:
-/// it registers its channel endpoint like a worker, answers Info with
-/// the template worker info under its own identity, completes every call it
+/// it registers its channel endpoint like an executor, answers Info with
+/// the template executor info under its own identity, completes every call it
 /// receives as the stub's prefill of a request's first prompt tokens would,
 /// and attaches the case's media payload to a completion.
 ///
@@ -1721,7 +1721,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 /// into segments instead, and attaches no media: it records the cache table
 /// its launch descriptor carried (`<generation>-<rank>.json` under
 /// `MEDIA_WORKER_TABLES`), holds the leading segments the table names, as a
-/// relaunched worker lays its planes out, and answers
+/// relaunched executor lays its planes out, and answers
 /// `uniserve.release_cache` by giving back the segments from the one it
 /// names, with the count it then holds.
 #[test]
@@ -1729,7 +1729,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
 fn media_worker() -> anyhow::Result<()> {
     use ipc::{
         ArtifactHandle, BatchOutput, CallOutput, Channel, LaunchDescriptor, MediaOutput,
-        Registration, WorkerRequest, WorkerResponse,
+        Registration, MainProcessRequest, MainProcessResponse,
     };
 
     let Ok(arguments) = std::env::var(MEDIA_WORKER_ARGS) else {
@@ -1760,7 +1760,7 @@ fn media_worker() -> anyhow::Result<()> {
         server.wait(Duration::from_secs(60))?;
     };
     let case = std::env::var(MEDIA_WORKER_CASE)?;
-    let mut info: ipc::WorkerInfo =
+    let mut info: ipc::MainProcessInfo =
         serde_json::from_slice(&std::fs::read(std::env::var(MEDIA_WORKER_INFO)?)?)?;
     info.endpoint.address_space = format!("rust:{}", std::process::id());
     info.endpoint.incarnation = format!("media-rank-{}-{}", descriptor.rank, std::process::id());
@@ -1787,22 +1787,22 @@ fn media_worker() -> anyhow::Result<()> {
     };
     loop {
         let request = loop {
-            if let Some(request) = server.try_recv::<WorkerRequest>()? {
+            if let Some(request) = server.try_recv::<MainProcessRequest>()? {
                 break request;
             }
             server.wait(Duration::from_secs(1))?;
         };
         let response = match request {
-            WorkerRequest::Info { message_id } => WorkerResponse::Info {
+            MainProcessRequest::Info { message_id } => MainProcessResponse::Info {
                 message_id,
                 info: info.clone(),
             },
-            WorkerRequest::Close { message_id } => {
-                server.send(&WorkerResponse::Ok { message_id })?;
+            MainProcessRequest::Close { message_id } => {
+                server.send(&MainProcessResponse::Ok { message_id })?;
                 return Ok(());
             }
-            WorkerRequest::Promote { message_id } => WorkerResponse::Ok { message_id },
-            WorkerRequest::Hook {
+            MainProcessRequest::Promote { message_id } => MainProcessResponse::Ok { message_id },
+            MainProcessRequest::Hook {
                 message_id,
                 name,
                 payload,
@@ -1816,14 +1816,14 @@ fn media_worker() -> anyhow::Result<()> {
                     .as_mut()
                     .context("the template reports no KV cache")?;
                 cache.held_segments = cache.held_segments.min(u32::try_from(from)?);
-                WorkerResponse::Hooked {
+                MainProcessResponse::Hooked {
                     message_id,
                     result: serde_json::json!({ "held": cache.held_segments }).to_string(),
                 }
             }
-            WorkerRequest::Hook { message_id, .. } => WorkerResponse::Error {
+            MainProcessRequest::Hook { message_id, .. } => MainProcessResponse::Error {
                 message_id,
-                error: ipc::WorkerResponseError {
+                error: ipc::MainProcessResponseError {
                     message: "this worker runs no hooks".into(),
                     code: None,
                     fatal: false,
@@ -1832,7 +1832,7 @@ fn media_worker() -> anyhow::Result<()> {
                     calls: Vec::new(),
                 },
             },
-            WorkerRequest::Submit { message_id, batch } => {
+            MainProcessRequest::Submit { message_id, batch } => {
                 let mut completions: Vec<CallOutput> = batch
                     .calls
                     .iter()
@@ -1873,7 +1873,7 @@ fn media_worker() -> anyhow::Result<()> {
                         completion.call_id.request_index = 1000;
                     }
                 }
-                WorkerResponse::Result {
+                MainProcessResponse::Result {
                     message_id,
                     result: BatchOutput {
                         batch_id: batch.batch_id,
@@ -1889,9 +1889,9 @@ fn media_worker() -> anyhow::Result<()> {
     }
 }
 
-/// Launch arguments for a one-worker stub group `worker_id` that holds
+/// Launch arguments for a one-executor stub group `worker_id` that holds
 /// every stub component, with `queue_depth` batches in flight.
-fn single_worker_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs {
+fn single_worker_args(worker_id: &str, queue_depth: usize) -> ExecutorProcessArgs {
     let mut args = worker_group_args();
     let components = std::collections::BTreeMap::from([
         (
@@ -1904,7 +1904,7 @@ fn single_worker_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs 
         ),
     ]);
     let binding =
-        WorkerGroupConfig::placed(&["localhost".to_owned()], "cpu", 1, queue_depth, components);
+        ExecutorGroupConfig::placed(&["localhost".to_owned()], "cpu", 1, queue_depth, components);
     args.ranks = binding.ranks.clone();
     args.components = binding.components;
     args.queue_depth = queue_depth;
@@ -1912,11 +1912,11 @@ fn single_worker_args(worker_id: &str, queue_depth: usize) -> WorkerProcessArgs 
     args
 }
 
-/// Lifts a single-call worker batch into the logical form the executor
-/// accepts, placing it on `worker` with the batch's tables, pages, buffers
+/// Lifts a single-call executor batch into the logical form the executor
+/// accepts, placing it on `executor` with the batch's tables, pages, buffers
 /// and the external `inputs` it reads.
 fn place(mut batch: Batch, worker: &str, inputs: Vec<ipc::TensorExport>) -> engine::ExecutionBatch {
-    use engine::{ExecutionBatch, RequestPlacement, WorkerGroupId};
+    use engine::{ExecutionBatch, RequestPlacement, ExecutorGroupId};
 
     assert_eq!(batch.calls.len(), 1);
     let call = batch.calls.remove(0);
@@ -1927,7 +1927,7 @@ fn place(mut batch: Batch, worker: &str, inputs: Vec<ipc::TensorExport>) -> engi
         vec![(
             call,
             RequestPlacement {
-                worker: WorkerGroupId(worker.into()),
+                worker: ExecutorGroupId(worker.into()),
                 request_pool_idx: None,
                 block_tables: batch.block_tables,
                 new_cache_units: batch.new_cache_units,

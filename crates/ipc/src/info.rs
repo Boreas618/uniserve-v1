@@ -1,6 +1,6 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`WorkerInfo`]: what only
+//! A rank answers the engine's `Info` request with a [`MainProcessInfo`]: what only
 //! the loaded rank knows (its endpoint, supported calls, capacities and
 //! component outputs). The engine launched the rank and keeps what it launched
 //! it with (world, devices, transfer mechanisms, queue depth and component
@@ -219,7 +219,7 @@ pub struct EncoderPoolInfo {
     pub endpoint: Option<String>,
 }
 
-/// What an image encoder writes for one image (`WorkerInfo::image_encoders`):
+/// What an image encoder writes for one image (`MainProcessInfo::image_encoders`):
 /// one feature row per cache token of the block the features write, at
 /// most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +433,7 @@ impl PrefixCacheInfo {
 /// The tensor results one placed component declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentInfo {
-    /// Component name; `WorkerInfo::validate` requires it to be non-empty and
+    /// Component name; `MainProcessInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
     /// Named tensor results declared by the loaded computation. Their order
@@ -445,7 +445,7 @@ pub struct ComponentInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
     /// Result name; `OutputInfo::validate` requires it to be non-empty and
-    /// `WorkerInfo::validate` unique within its component.
+    /// `MainProcessInfo::validate` unique within its component.
     pub name: String,
     /// Element type of the result tensor.
     pub dtype: DType,
@@ -499,16 +499,16 @@ impl OutputInfo {
 /// process as one worker's rank and resolves an incarnation to that worker
 /// and rank itself, so a rank does not report them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerEndpoint {
+pub struct MainProcessEndpoint {
     /// Host identity, independent of process-local device ordinals.
     pub host: String,
-    /// Process lifetime identity; multiple Workers may share it.
+    /// Process lifetime identity; multiple main processes may share it.
     pub address_space: String,
     /// Lifetime identity of this loaded Worker rank.
     pub incarnation: String,
 }
 
-impl WorkerEndpoint {
+impl MainProcessEndpoint {
     /// Checks identities before accepting startup metadata or an export.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
@@ -670,13 +670,13 @@ pub struct CapturedImage {
 
 /// Post-load worker geometry, limits and supported work.
 ///
-/// [`WorkerInfo::validate`] checks only internal consistency; the rank runs it
+/// [`MainProcessInfo::validate`] checks only internal consistency; the rank runs it
 /// on the report it builds, and the engine takes the report as sent. Launch
 /// values
 /// (world size, devices, transfer mechanisms, queue depth and component
 /// placement) are the engine's and are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkerInfo {
+pub struct MainProcessInfo {
     /// Model-declared finite terminal-media computation, when supported.
     pub media_components: std::collections::BTreeMap<MediaCall, String>,
     /// What the deployment's video denoiser serves, when the model has one.
@@ -714,7 +714,7 @@ pub struct WorkerInfo {
     /// request's own context, and on a rank without an image denoiser.
     pub image_unconditional_token_ids: Option<Vec<u32>>,
     /// Identity of the loaded rank and its host address space.
-    pub endpoint: WorkerEndpoint,
+    pub endpoint: MainProcessEndpoint,
     /// Whether this rank's device exports a fabric allocation handle.
     ///
     /// A fabric handle is importable from another host inside the fabric
@@ -737,7 +737,7 @@ pub struct WorkerInfo {
     /// Model-defined units stored in one latent page.
     pub latent_page_units: u32,
     /// Physical latent pages including the reserved sentinel page, which
-    /// [`WorkerInfo::latent_capacity_units`] excludes.
+    /// [`MainProcessInfo::latent_capacity_units`] excludes.
     pub latent_pages: u32,
     /// The host latent pool of a video denoising rank whose host runs a
     /// Storage Server; `None` otherwise, and in the group's aggregate.
@@ -772,7 +772,7 @@ pub struct WorkerInfo {
     pub transfer_tickets: u32,
 }
 
-impl WorkerInfo {
+impl MainProcessInfo {
     /// Returns total latent capacity in model-defined units.
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.latent_pages.saturating_sub(1))
@@ -893,7 +893,7 @@ impl WorkerInfo {
     }
 }
 
-impl Default for WorkerInfo {
+impl Default for MainProcessInfo {
     /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
@@ -906,7 +906,7 @@ impl Default for WorkerInfo {
             diffusion_lm_step_rows: 0,
             image_unconditional_token_ids: None,
             fabric_handles: false,
-            endpoint: WorkerEndpoint {
+            endpoint: MainProcessEndpoint {
                 host: "simulation".into(),
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
