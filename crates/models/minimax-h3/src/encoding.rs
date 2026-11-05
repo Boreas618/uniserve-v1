@@ -2949,21 +2949,28 @@ mod tests {
             "a raster changes the pads' columns, not the frame statistics"
         );
 
-        // **The residuals are keyed on the levels' widths in pixels, so the raster moves them.** A
-        // block adds `rows(out)` to `rows(residual)`, and `rows` takes `dim(4)` of a
-        // `[1, channels, frames, height, width]` buffer as its columns - the width, not the channel
-        // count. The recorder is the independent witness: 672x1536 launches at 1536, 768, 384, 192 and
-        // 96, and 768x1024 at 1024, 512, 256, 128 and 64.
+        // **The residuals are not keyed on the levels' widths.** A block adds `rows(out)` to
+        // `rows(residual)` and `rows` takes `dim(4)` of the raster as its columns, but `columns` left
+        // `ScaledAddDescriptor` on purpose (`crates/ops/src/residual.rs`): the kernel takes the extent
+        // as an argument and derives the row width from the operand's own shape, so a key that named it
+        // stated one row per clip length the walk happened to name and left every other length with no
+        // kernel. One program therefore serves every level of every raster, and the raster moves the
+        // pads alone.
         let residuals = |rows: &[(String, String)]| -> Vec<String> {
             rows.iter()
                 .filter(|(name, _)| name == "scaled_add")
                 .map(|(_, key)| key.clone())
                 .collect()
         };
-        assert_ne!(
+        assert_eq!(
             residuals(&other),
             residuals(&programs),
-            "the residual columns are the levels' widths: a narrower raster launches narrower ones"
+            "one residual program serves every level width of every raster"
+        );
+        assert!(
+            residuals(&programs).iter().all(|key| !key.contains("columns_")),
+            "the residual's width is a launch argument, not a key field: {:?}",
+            residuals(&programs)
         );
         let stack = Stack::of(&config).expect("the stack");
         let extents = stack.extents(Extent {
@@ -2971,27 +2978,19 @@ mod tests {
             height: raster[0].0,
             width: raster[0].1,
         });
-        for extent in extents.iter().take(stack.widths.len()) {
-            let width = extent.width;
-            assert!(
-                residuals(&programs)
-                    .iter()
-                    .any(|key| key.contains(&format!("columns_{width}_"))),
-                "no residual row for a level {width} pixels wide: {:?}",
-                residuals(&programs)
-            );
-        }
-        // Levels can share a width - `[2, 2, 2, 2, 1, 1]` makes the last two the same - and the rows
-        // are a set, so the count is over the **distinct** widths rather than over the levels.
+        // The levels' widths are distinct quantities - `[2, 2, 2, 2, 1, 1]` makes the last two the
+        // same - and the block adds at each of them. **The row set does not grow with them**: the width
+        // is the operand's, so one program serves every level of every raster.
         let distinct: std::collections::BTreeSet<u32> = extents
             .iter()
             .take(stack.widths.len())
             .map(|extent| extent.width)
             .collect();
+        assert!(distinct.len() > 1, "the levels add at more than one width");
         assert_eq!(
             residuals(&programs).len(),
-            distinct.len(),
-            "one residual row per distinct level width: {:?}",
+            1,
+            "one residual program for every level width: {:?}",
             residuals(&programs)
         );
     }
@@ -3125,20 +3124,19 @@ mod tests {
             1,
             "one residual add for every stage, track and the projection: {residuals:?}"
         );
-        for extent in &extents {
-            assert!(
-                residuals
-                    .iter()
-                    .any(|key| key.contains(&format!("columns_{extent}_"))),
-                "no residual row for the stage's extent {extent}: {residuals:?}"
-            );
-        }
+        // **Not one row per extent, and none for the projection's channel-wide add either.** The
+        // extent is the operand's - `columns` left `ScaledAddDescriptor` because it changed no compiled
+        // code and it made a row set describe one track length - so the rows are one key and it names
+        // no columns. The extents below are what the launches pass, not what they compile.
         assert!(
-            residuals
-                .iter()
-                .any(|key| key.contains(&format!("columns_{channels}_"))),
-            "no residual row for the projection's {channels} channels: {residuals:?}"
+            extents.len() > 1,
+            "the stages add at more than one extent: {extents:?}"
         );
+        assert!(
+            residuals.iter().all(|key| !key.contains("columns_")),
+            "the residual's extent is a launch argument: {residuals:?}"
+        );
+        assert!(channels > 0, "the projection adds over its channels");
         // An unpadded track reaches no stage, so it states no program: the pad is the caller's, and a
         // row for the unpadded length would be a width no launch passes.
         assert!(

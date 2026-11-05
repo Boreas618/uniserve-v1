@@ -1129,13 +1129,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("the plan states {name}"))
         };
         let columns = 2048;
-        assert_eq!(
-            buffer("tokens").elements,
-            all_rows
-                * u64::from(crate::video_vae::TILE_PIXELS / 16)
-                * u64::from(crate::video_vae::TILE_PIXELS / 16)
-                * 3
-        );
+        // **The pixel count is the patch, and it is four times the voxels it unpacks** at this
+        // checkpoint: `out_channels × temporal_compression × spatial_compression²` is 3 · 4 · 16 · 16 =
+        // 3072 elements per latent voxel. A statement that dropped the temporal factor reserved a
+        // quarter of a tile's pixels, which is the same class as the half-sized plan the module's own
+        // comment records: a shortfall that surfaces mid-clip as an arena that "cannot give out".
+        let patch = u64::from(config.out_channels)
+            * u64::from(config.temporal_compression())
+            * u64::from(config.spatial_compression())
+            * u64::from(config.spatial_compression());
+        assert_eq!(buffer("tokens").elements, all_rows * patch);
         // The seam block: one tile's pixels at the raster's frame count, contiguous - the buffer every
         // blend copies its neighbour into, reserved once because every tile of a grid is the same size.
         assert_eq!(
