@@ -174,11 +174,13 @@ fn load(device: &platform::Device, module: Module<'_>) -> Result<Kernel> {
             metadata,
             entry,
         } => {
-            let mut metadata = match metadata {
+            // A module's own metadata names the kernel it holds. One package may build a different
+            // kernel per descriptor, as paged attention does per phase, so a package-wide entry
+            // names only one of them.
+            let metadata = match metadata {
                 Some(json) => CubinMetadata::parse(json)?,
                 None => CubinMetadata::named(entry),
             };
-            metadata.name = entry.to_owned();
             Kernel::load_cubin(device, image, metadata)
         }
         Module::Native { path, entry } => {

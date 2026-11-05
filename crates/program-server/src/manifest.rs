@@ -505,6 +505,17 @@ impl Manifest {
                 }
             }
             ModuleForm::Cubin | ModuleForm::Wasm | ModuleForm::Executable => {
+                // A Triton program's kernel symbol and parameters are in the metadata its compile
+                // writes. A package that does not name that file serves an image the main process
+                // cannot find the kernel of, which reads as a missing symbol on the first load.
+                if self.module.form == ModuleForm::Cubin
+                    && self.toolchain.kind == ToolchainKind::Triton
+                    && self.module.metadata.is_none()
+                {
+                    return Err(ManifestError::Invalid(
+                        "a Triton cubin module must name its metadata file in [module]".into(),
+                    ));
+                }
                 if self.module.entries_file.is_some() {
                     return Err(ManifestError::Invalid(
                         "only a native module has C entries; a cubin or wasm module has none, and \

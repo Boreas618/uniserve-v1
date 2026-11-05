@@ -13,8 +13,9 @@
 # recaptured graph computes the same product inside `ops::Tolerance::dot(k)`.
 #
 # The keys are the Qwen3-MoE slice's dense-layer products. The element types,
-# weight order, epilogue and contraction length are compile-time: `src/build.py`
-# derives them from `UNISERVE_DESCRIPTOR`, and refuses a descriptor this fixture
+# weight order and epilogue are compile-time: `src/build.py` derives them from
+# `UNISERVE_DESCRIPTOR`, the contraction length is the call's, and the script
+# refuses a descriptor this fixture
 # does not implement (a non-FP32 accumulate, or an input and weight of different
 # element types) by name.
 #
@@ -47,8 +48,8 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
-# `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
+# `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none`.
 [kernel.descriptors]
-dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32"], output = ["bf16", "f16", "f32"], order = ["nxk", "kxn"], epilogue = ["none", "bias"], k = ["768", "1536", "2048", "4096", "7168"] }
+dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32"], output = ["bf16", "f16", "f32"], order = ["nxk", "kxn"], epilogue = ["none", "bias"] }
 
 [parameters]

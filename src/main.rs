@@ -21,6 +21,7 @@ mod engine_plan;
 mod frontend;
 mod logging;
 mod program_server;
+mod rules;
 mod serve;
 mod storage;
 
@@ -130,6 +131,7 @@ fn main() -> Result<std::process::ExitCode> {
         Command::Frontend(args) => frontend::run(*args, &cli.log),
         Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
         Command::Storage(args) => Ok(storage::run(*args)),
+        Command::Rules => rules::run(),
         Command::External(arguments) => run_external(&arguments),
     }
 }

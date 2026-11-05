@@ -543,6 +543,22 @@ impl Connection {
             self.pending
                 .extend_from_slice(&head_bytes(&parts, chunked, content_length, closing));
             match handed.stream.opened().await {
+                // A held head promises one document, so a first frame that is
+                // itself empty is the same empty success the `Ended` arm below
+                // refuses: the client reads a 200 whose document is nothing.
+                // The body's own first frame states it, not the head, so the
+                // failure is written here with the status the client sees.
+                Opened::Frame(frame) if frame.is_empty() => {
+                    warn!(
+                        request = %handed.request_id,
+                        "a response's document opened with an empty frame, which a client reads as an empty success"
+                    );
+                    let error = crate::openai::error::ApiError::server_error(
+                        "the response's document was empty".to_owned(),
+                    );
+                    let document = Self::failure_document(&error);
+                    return self.write_failure(error, vec![document], closing).await;
+                }
                 Opened::Frame(frame) => opening = Some(frame),
                 Opened::Failed(error, frames) => {
                     return self.write_failure(error, frames, closing).await;
@@ -2614,6 +2630,30 @@ mod tests {
                 .body
                 .contains("the response ended before it wrote its document"),
             "{}",
+            response.body
+        );
+    }
+
+    /// A one-document response whose first frame is itself empty is a failure
+    /// too: the head is held for the document, and a zero-length document is
+    /// what a client reads as an empty success.
+    #[tokio::test]
+    async fn a_one_body_response_that_opens_with_an_empty_frame_states_a_server_error() {
+        let mut client = serve_document(Some(Step::Frames(vec![Bytes::new()])));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert!(
+            response.body.contains("the response's document was empty"),
+            "the failure names the empty document: {}",
             response.body
         );
     }

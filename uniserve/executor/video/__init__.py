@@ -28,7 +28,7 @@ from typing import Any
 
 import torch
 
-from uniserve import numerics
+from uniserve import numerics, video_rules
 from uniserve.executor.predicates import split
 from uniserve.executor.video.decoder import (
     AudioDecoder,
@@ -80,7 +80,6 @@ from uniserve.executor.video.plan import (
 )
 from uniserve.runner.denoiser import DenoiserRunner
 from uniserve.runner.encoder import EncoderRunner
-from uniserve.worker import library
 
 __all__ = ["VideoExecutor", "VideoRequest", "condition_spans"]
 
@@ -629,7 +628,7 @@ class VideoExecutor:
                 "grids its processor configs plan, which the model does not "
                 "keep"
             )
-        grid = library()["video_image_grid"]
+        grid = video_rules.video_image_grid
         grids = []
         for _, _, canvas in self.plan.admitted:
             t, h, w = grid(

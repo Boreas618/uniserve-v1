@@ -166,8 +166,8 @@ pub trait Runner: Send {
     /// Gives the runner the shadow harness of its device (7.3): the paired forward needs an
     /// allocator-backed twin region, so the executor carves it and installs it here. A runner that
     /// shadows no operator ignores it.
-    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow) {
-        let _ = shadow;
+    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow, page_set_bytes: u64) {
+        let _ = (shadow, page_set_bytes);
     }
 
     /// Gives the runner the device's counters, when its work adds to them.

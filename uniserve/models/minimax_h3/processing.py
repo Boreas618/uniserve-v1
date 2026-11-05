@@ -9,9 +9,10 @@ presentation. Those rules are the ``models`` crate's
 diffusers reference pipeline.
 
 This module calls the parts of the same rules that the model package and its
-tools use, through the worker library (``uniserve._worker``): the
-tasks, the canvas rule, the largest references a request may bring, which a
-denoiser provisions its condition capacity for, the canvas a target names
+tools use, through the ``uniserve rules`` command
+(``uniserve.video_rules``): the tasks, the canvas rule, the largest references
+a request may bring, which a denoiser provisions its condition capacity for,
+the canvas a target names
 among the canvases a deployment serves, and the frame count of a duration.
 The canvases the model generates, keyed by the names a request selects them
 with, are the model's own (``config.NAMED_CANVASES`` and
@@ -25,8 +26,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from uniserve import video_rules
 from uniserve.media import image
-from uniserve.worker import library
 
 from .packing import FPS, align_num_frames, video_latent_frames
 
@@ -62,7 +63,7 @@ class Task(StrEnum):
     REF2VA = "ref2va"
 
 
-_RULE_TASKS = tuple(str(name) for name in library()["video_tasks"]())
+_RULE_TASKS = tuple(str(name) for name in video_rules.video_tasks())
 if tuple(task.value for task in Task) != _RULE_TASKS:
     raise ImportError(
         f"processing.Task names {[task.value for task in Task]}, but the "
@@ -93,9 +94,7 @@ def canvas(aspect_width: float, aspect_height: float) -> image.Config:
     Raises:
         ValueError: The ratio is not positive or lies outside 1:4 to 4:1.
     """
-    values = library()["video_canvas"](
-        float(aspect_width), float(aspect_height)
-    )
+    values = video_rules.video_canvas(float(aspect_width), float(aspect_height))
     return _canvases(values)[0]
 
 
@@ -132,7 +131,7 @@ def reference_bounds(
     the generated duration. A denoiser sizes these shapes with its own
     packing to state the largest condition set it admits.
     """
-    images, frames, samples, canvases = library()["video_reference_bounds"](
+    images, frames, samples, canvases = video_rules.video_reference_bounds(
         int(num_frames), FPS, _frame_clips(), int(image_short_edge)
     )
     widest, tallest = _canvases(images)
@@ -161,7 +160,7 @@ def frame_count(seconds: float, max_seconds: float | None = None) -> int:
     """
     longest = None if max_seconds is None else float(max_seconds)
     return int(
-        library()["video_frame_count"](
+        video_rules.video_frame_count(
             float(seconds), longest, FPS, _frame_clips()
         )
     )
@@ -206,7 +205,7 @@ def named_canvas(
         [int(edge), str(ratio), raster.width, raster.height]
         for (edge, ratio), raster in canvases.items()
     ]
-    rejection, values = library()["video_named_canvas"](
+    rejection, values = video_rules.video_named_canvas(
         task.value, int(short_edge), aspect_ratio, served
     )
     _raise(rejection)
