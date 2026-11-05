@@ -231,14 +231,22 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
     let width = u64::from(denoiser.transformer.hidden_size);
 
     println!("\n## recomputed from {}\n", root.display());
-    // The condition capacity is the deployment's own, derived from the largest conditioned request
-    // it can be asked for - two keyframes at the largest canvas it offers - not the checkpoint's
-    // 192-row table, which is a statement about the reference's rasters.
-    let conditioned = minimax_h3::partition::condition_rows(
-        &config,
+    // The condition capacity a **served** process loads at is a capacity its store holds, and one
+    // store serves every task - so a deployment is sized at the widest conditioned task's, not at one
+    // task's. (A `max_kv_len` is exact and part of a program's key, so a stage loaded at a capacity no
+    // store holds finds no cell: the widest is always one the store has.)
+    let mut conditioned = 0;
+    for task in [
+        nn::capability::VideoTask::TextToVideoAudio,
         nn::capability::VideoTask::FirstLastToVideoAudio,
-    )?;
-    println!("condition capacity: {conditioned} rows (two keyframes at the largest canvas)");
+        nn::capability::VideoTask::ReferenceToVideoAudio,
+    ] {
+        conditioned = conditioned.max(minimax_h3::partition::condition_rows(&config, task)?);
+    }
+    println!(
+        "condition capacity: {conditioned} rows (the widest conditioned task, which is what a store \
+         holds and a stage loads at)"
+    );
     for frames in [124_u32, 362] {
         let capacity = Capacity {
             text_rows: 128,
