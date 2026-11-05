@@ -2064,6 +2064,41 @@ impl Replica {
             tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
         );
         reload_adapters(self, &client).await;
+        // The epoch's programs, before this process serves: a relaunched main
+        // process starts with none, and the epoch they belong to was installed
+        // for its predecessor, so nothing else sends them. Without this the
+        // process waits on a program-layer command that never comes and
+        // answers 503 to every request (§2.5, §7.5).
+        if let Some(epochs) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+            .map(|driver| Arc::clone(driver.epochs()))
+        {
+            let config = locked(&self.config).clone();
+            let host = config.host_identity.clone();
+            let engine = client
+                .engine()
+                .context("the relaunched engine states no number")?;
+            let handing = Arc::clone(&epochs);
+            let handed = tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+                Ok(joined) => joined
+                    .context("handing the epoch's programs to the relaunched engine")?
+                    .map_err(|failure| {
+                        anyhow::anyhow!(
+                            "the relaunched engine did not take the epoch's programs ({}): {}",
+                            failure.kind,
+                            failure.reason
+                        )
+                    })?,
+                Err(_) => anyhow::bail!(
+                    "the relaunched engine took the epoch's programs in neither Precopy, \
+                     Switchover nor Commit within {} s",
+                    SWITCH_TIMEOUT.as_secs()
+                ),
+            }
+        }
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
         self.start_standby();
