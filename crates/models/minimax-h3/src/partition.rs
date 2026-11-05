@@ -619,6 +619,13 @@ impl Partition {
     ///
     /// The capacity is the released table's, as in [`Self::single`]: a caller that states programs
     /// wants [`Self::serving`], which derives it from the task.
+    ///
+    /// **A partition built here is an exchange one, whatever a deployment states elsewhere**: this
+    /// constructor takes the degree and holds no projection, because the stack exchanges head
+    /// projections and gathers nothing (`attention::Attention::load` requests whole `to_q`/`to_k`/
+    /// `to_v`/`to_out` on every rank). A deployment that has a projection to state goes through
+    /// [`Self::serving`], which is the only constructor that can refuse the mode this stack does not
+    /// implement; a constructor that cannot refuse is the wrong one to hand a deployment to.
     pub fn new(
         config: &Config,
         ulysses_degree: usize,

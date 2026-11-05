@@ -1182,6 +1182,28 @@ fn encode(args: &Args) -> Result<(), String> {
     let prefix = arena
         .tensor(dtype, Shape::new(&[rows, hidden]))
         .map_err(show)?;
+    // The diagnosis's own views: one `[rows, channels * 4]` F32 buffer per **visual** condition, for
+    // the rows the video encoder emits before the anchor mixes the draw in and before the projection.
+    // They are what a reference's encode probe returns, so a harness that offered none could compare
+    // only the projected prefix - and a difference there cannot say whether the encoder or the
+    // projection made it.
+    let mut clean_views = Vec::new();
+    for plan in &plans {
+        if plan.rows == 0 {
+            continue;
+        }
+        clean_views.push(
+            arena
+                .tensor(
+                    DType::F32,
+                    Shape::new(&[
+                        u64::from(plan.rows),
+                        u64::from(dit.transformer.video_channels) * 4,
+                    ]),
+                )
+                .map_err(show)?,
+        );
+    }
     let text_bytes = pseudo_bytes(text_elements, dtype);
     upload_bytes(&stream, text, &text_bytes)?;
     upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
@@ -1301,7 +1323,13 @@ fn encode(args: &Args) -> Result<(), String> {
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?;
     clear_page(&directory)?;
-    let outcome = denoiser.prepare_conditioning(
+    let trace = minimax_h3::denoiser::ConditionTrace {
+        source: None,
+        refined: None,
+        draws: &[],
+        clean: &clean_views,
+    };
+    let outcome = denoiser.prepare_conditioning_traced(
         &forward,
         Conditioning {
             text,
@@ -1312,6 +1340,7 @@ fn encode(args: &Args) -> Result<(), String> {
             state: &state_views,
             step: None,
         },
+        Some(&trace),
     );
     if let Err(error) = outcome {
         write_page(&directory, &walk)?;
@@ -1386,6 +1415,44 @@ fn encode(args: &Args) -> Result<(), String> {
     // reference that re-derives the draw would be comparing a *convention* - which stream, which
     // counter, which index - and a seed mismatch reads as a defect in the encoder. One file removes
     // the convention; the projection stays the reference's own code.
+    // The encoder's unprojected rows, one file per visual condition: the value the reference's
+    // `--probe encode_rows` computes from the same pixels, so the comparison is one command rather
+    // than a rewrite of the reference's encoder. `rows.h3t` is the name it reads; a request of two
+    // visual conditions writes `rows_0.h3t` and `rows_1.h3t` and the case names them.
+    let mut rows_files = Vec::new();
+    for (index, view) in clean_views.iter().enumerate() {
+        let name = if clean_views.len() == 1 {
+            "rows.h3t".to_owned()
+        } else {
+            format!("rows_{index}.h3t")
+        };
+        let values = download(&stream, *view)?;
+        let elements = values.len() / 4;
+        write_h3t(
+            &directory.join(&name),
+            H3T_F32,
+            &[
+                u64::from(
+                    plans
+                        .iter()
+                        .filter(|plan| plan.rows > 0)
+                        .nth(index)
+                        .map_or(0, |plan| plan.rows),
+                ),
+                u64::from(dit.transformer.video_channels) * 4,
+            ],
+            &values[..elements * 4],
+        )?;
+        rows_files.push(name);
+    }
+    if !rows_files.is_empty() {
+        println!(
+            "wrote   {}: the encoder's unprojected rows, {} x {} FP32",
+            rows_files.join(", "),
+            plans.iter().map(|plan| plan.rows).max().unwrap_or(0),
+            u64::from(dit.transformer.video_channels) * 4
+        );
+    }
     let draw = download(&stream, noise)?;
     write_h3t(
         &directory.join("condition_noise.h3t"),
@@ -1558,6 +1625,10 @@ fn encode(args: &Args) -> Result<(), String> {
         })
         .collect::<Vec<String>>()
         .join(",");
+    // The encoder's unprojected rows, named rather than guessed: the reference's
+    // `--probe encode_rows` reads `rows.h3t` beside the pixels, and a request of several
+    // visual conditions writes one file each.
+    let encoder_rows_files = rows_files.join(",");
     let case = format!(
         "{{\n  \"stage\": \"encode\",\n  \"task\": \"{}\",\n  \"canvas\": [{}, {}],\n  \
          \"frames\": {},\n  \"image\": {},\n  \"prompt_tokens\": {},\n  \"seed\": {},\n  \
@@ -1569,6 +1640,8 @@ fn encode(args: &Args) -> Result<(), String> {
          \"pixels\": \"deterministic per-channel ramp, stated\",\n  \
          \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\",\n  \
          \"rows_file\": \"condition_rows.h3t\",\n  \"noise_file\": \"condition_noise.h3t\",\n  \
+         \"encoder_rows_file\": \"{encoder_rows_files}\",\n  \
+         \"encoder_rows\": \"the video encoder's patch rows before the anchor and the projection, FP32\",\n  \
          \"rows_container\": \"f32\",\n  \
          \"posterior_fields\": \"not written: the trace that carries them is not on the served entry point\"\n}}\n",
         task_name(args.task),
