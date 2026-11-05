@@ -295,7 +295,11 @@ impl Lifecycle {
         // node to set the prepared generation's parameters on and the bucket must be recaptured
         // rather than prepared from a structure nobody can address.
         let unannotated = walked.nodes.is_empty();
-        if unannotated || !served.same_structure(&walked.nodes)? {
+        // Which fact declined the rebind, when one did: a count, a node's kind, or an edge whose
+        // kind changed. A recapture that says only "the structure changed" leaves the reader to
+        // guess whether a program was built differently or the same program is ordered differently.
+        let mismatch = served.structure_mismatch(&walked.nodes)?;
+        if unannotated || mismatch.is_some() {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments. The generation being
             // replaced keeps its own graph and executable, which a revert serves from.
@@ -313,6 +317,7 @@ impl Lifecycle {
                 tracing::info!(
                     bucket = %bucket,
                     generation,
+                    mismatch = %mismatch.as_deref().unwrap_or("the walk's structure differs"),
                     "the launch structure changed; recaptured the bucket"
                 );
             }
@@ -333,10 +338,10 @@ impl Lifecycle {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
             for node in launch {
-                if node.kind()? != platform::GraphNodeKind::Kernel {
+                if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(walked.template.kernel_node_params(node)?);
+                params.push(walked.template.kernel_node_params(&node.node)?);
             }
             launches.push((*operator, *ordinal, params));
             *ordinal += 1;
@@ -521,7 +526,9 @@ pub(crate) fn hold_kernels(
 
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        let recorded = self.capture.borrow_mut().record();
+        // The walk's edges, not only its nodes: a programmatic edge orders less than a
+        // completion edge, and 4.5's rebind condition compares the structure those kinds make.
+        let recorded = self.capture.borrow_mut().record_walk();
         match recorded {
             Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
             Err(error) => {
