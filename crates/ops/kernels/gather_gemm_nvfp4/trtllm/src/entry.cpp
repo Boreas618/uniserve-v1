@@ -27,6 +27,7 @@
 #include "flashinfer/trtllm/fused_moe/runner.h"
 
 #include "entry.h"
+#include <exception>
 
 namespace {
 
@@ -180,7 +181,16 @@ int refuse_geometry(uniserve_gather_gemm_nvfp4_call* call) {
 
 }  // namespace
 
-extern "C" int uniserve_gather_gemm_nvfp4(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
+/// The launch itself: every check this entry makes, then the artifact's product.
+///
+/// It answers 0 or a refusal with `call->error` filled, and it may throw: the artifact's
+/// runner construction and its own `TLLM_CHECK`s raise `TllmException`, which is what the
+/// entry below turns into a message.
+int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
+  if (call == nullptr) {
+    return 1;
+  }
+  std::memset(call->error, 0, sizeof(call->error));
   if (call == nullptr) {
     return 1;
   }
@@ -271,4 +281,24 @@ extern "C" int uniserve_gather_gemm_nvfp4(uniserve_gather_gemm_nvfp4_call* call,
               bmm_workspace, /*useRoutingScalesOnInput=*/false, device, order, config,
               /*enable_pdl=*/false);
   return 0;
+}
+
+/// The operator's entry: the launch, and the artifact's exceptions turned into messages.
+///
+/// An exception raised inside the artifact's runner would otherwise cross this C boundary,
+/// where nothing may unwind: the process ends and the only message a log holds is the runtime's
+/// own (`internal error: entered unreachable code`), which names neither the operator nor the
+/// reason the artifact refused. A thrown `TllmException` states one, so it goes into the call's
+/// error buffer and the launch answers a refusal like every other one this entry makes.
+extern "C" int uniserve_gather_gemm_nvfp4(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
+  if (call == nullptr) {
+    return 1;
+  }
+  try {
+    return launch(call, stream);
+  } catch (std::exception const& thrown) {
+    return refuse(call, thrown.what());
+  } catch (...) {
+    return refuse(call, "the artifact's launch failed without stating why");
+  }
 }

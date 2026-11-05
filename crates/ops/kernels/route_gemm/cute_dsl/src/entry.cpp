@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <exception>
 
 namespace {
 
@@ -35,7 +36,7 @@ int32_t refuse(uniserve_route_call* call, const char* message) {
 
 }  // namespace
 
-extern "C" int32_t uniserve_route_gemm(const uniserve_route_call* call, void* stream) {
+int32_t launch(const uniserve_route_call* call, void* stream) {
   if (call == nullptr) {
     return 1;
   }
@@ -66,4 +67,24 @@ extern "C" int32_t uniserve_route_gemm(const uniserve_route_call* call, void* st
       call->experts,
       call->permuted_rows,
       reinterpret_cast<cudaStream_t>(stream));
+}
+
+/// The operator's entry: the launch, and an exception turned into a message.
+///
+/// An exception raised inside the kernel's own code would otherwise cross this C boundary,
+/// where nothing may unwind: the process ends and the only message a log holds is the runtime's
+/// own (`internal error: entered unreachable code`), which names neither the operator nor the
+/// reason. A thrown exception states one, so it goes into the call's error buffer and the entry
+/// answers a refusal like every other one it makes.
+extern "C" int32_t uniserve_route_gemm(const uniserve_route_call* call, void* stream) {
+  if (call == nullptr) {
+    return 1;
+  }
+  try {
+    return launch(const_cast<uniserve_route_call*>(call), stream);
+  } catch (std::exception const& thrown) {
+    return refuse(const_cast<uniserve_route_call*>(call), thrown.what());
+  } catch (...) {
+    return refuse(const_cast<uniserve_route_call*>(call), "the kernel's launch failed without stating why");
+  }
 }
