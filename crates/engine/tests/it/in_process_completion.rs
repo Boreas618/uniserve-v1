@@ -298,16 +298,25 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     );
 
     // The mechanism asked for a prefill and then a decode: one batch per phase
-    // per step, each stated with the shape its columns are served from.
-    let batches = serving.submitted();
-    let prefilled = batches
-        .iter()
-        .any(|batch| batch.shape.variant.name().starts_with("prefill"));
-    let decoded = batches
-        .iter()
-        .any(|batch| batch.shape.variant.name().starts_with("decode"));
+    // per step, each stated with the shape its columns are served from. The
+    // two batches come from two steps, so the second is waited for rather than
+    // read off a snapshot: the first token is the prefill's, and reading the
+    // pool the instant it arrives would measure the race, not the schedule.
+    let phase = |batches: &[Batch], name: &str| {
+        batches
+            .iter()
+            .any(|batch| batch.shape.variant.name().starts_with(name))
+    };
+    let deadline = Instant::now() + FIRST_TOKEN;
+    let batches = loop {
+        let batches = serving.submitted();
+        if (phase(&batches, "prefill") && phase(&batches, "decode")) || Instant::now() >= deadline {
+            break batches;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     assert!(
-        prefilled && decoded,
+        phase(&batches, "prefill") && phase(&batches, "decode"),
         "the pool was asked for both phases: {} batches",
         batches.len()
     );
@@ -357,10 +366,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
                 match event {
                     Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
                     refused @ (Event::Rejected { .. } | Event::Error { .. }) => {
-                        panic!(
-                            "request {} was refused, not queued: {refused:?}",
-                            index + 1
-                        )
+                        panic!("request {} was refused, not queued: {refused:?}", index + 1)
                     }
                     _ => {}
                 }
