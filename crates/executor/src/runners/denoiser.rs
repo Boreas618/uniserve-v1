@@ -48,6 +48,7 @@ use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::diag::Diag;
+use crate::runners::floor;
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
@@ -451,21 +452,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let offered = self.pool()?.reserved();
         let plans = self.buckets.clone();
         for plan in &plans {
-            let needed = match self.model.arena_bytes(&plan.warm.view()) {
-                Ok(bytes) => bytes,
-                // A model that states no plan is not a shortfall: the pool is then the only figure
-                // there is, and a capture that outgrows it refuses at its own launch by name. The
-                // refusal is not turned into a pass, which would be the same value as "it fits".
-                Err(_) => continue,
-            };
-            if needed > offered {
-                return Err(Error::Invalid(format!(
-                    "bucket {} needs {needed} B of arena for one evaluation and this device's share \
-                     is {offered} B: the model's plan is the floor, so a share below it serves \
-                     nothing - raise the device's graph share or drop a layout from the deployment",
-                    plan.bucket
-                )));
-            }
+            floor::checked(
+                plan.bucket,
+                self.model.arena_bytes(&plan.warm.view()),
+                offered,
+            )?;
         }
         for bucket in self.capture_order() {
             self.fill(bucket)?;

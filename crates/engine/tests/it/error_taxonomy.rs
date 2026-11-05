@@ -10,12 +10,14 @@
 //!   validators refuse are found before the program can serve: the command
 //!   answers with the reason, the serving program is untouched, and no revert
 //!   happens because nothing was replaced;
-//! - **the live step** refuses the sixth. A starved request is a condition of
-//!   serving, not of a program's answers: the program is switched in, admits a
-//!   request and never advances it, and the mechanism fails it once the
-//!   policy's own timeout passes — reported once with the request named, the
-//!   previous program instantiated on the state the mechanism holds, and that
-//!   program answering the next decision.
+//! - **the live step** decides the sixth, and it is not a policy failure. A
+//!   starved request is a condition of serving, not of a program's answers, so
+//!   the program is switched in, admits a request and never advances it, and
+//!   the mechanism acts on what could otherwise have been served: a request
+//!   starved while another request could still be served is that request's
+//!   failure, ended by name while the epoch serves on; a request starved with
+//!   nothing else resident is the epoch ending, by a name that states what was
+//!   resident. Neither burns the policy, which did nothing wrong.
 //!
 //! Nothing here is a test-only branch: the scheduler, the trial, the switch and
 //! the validators are the ones the epoch runs.
@@ -584,13 +586,16 @@ fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
 }
 
 #[test]
-fn a_starved_request_fails_the_policy() {
-    // One millisecond of starvation: the request is admitted by the plan and
-    // never given work, and §4.4's watchdog is the mechanism's, not the
-    // policy's, so a policy that answers every call correctly still fails.
-    // The program that starves must be able to name the request, so the
-    // request is queued before it is offered: its plan admits what the world
-    // already holds, and then gives it nothing.
+fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
+    // One millisecond of starvation: the request is admitted by the plan and never given work, and
+    // §4.4's watchdog is the mechanism's, not the policy's, so a policy that answers every call
+    // correctly still starves it.
+    //
+    // Nothing else is resident, so nothing could have been served: the epoch ends by that name - the
+    // failure string says "no batch formed for 1 resident request(s)" and states the resident set -
+    // and the request ends with the epoch. It is not a policy failure: the program that answers every
+    // decision correctly did nothing wrong, so no report is recorded and the previous program is not
+    // put back in.
     let world = World::serving(Toy::idle());
     let mut events = world
         .handle
@@ -600,18 +605,45 @@ fn a_starved_request_fails_the_policy() {
     world
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
         .expect("the starving program is instantiated before it serves");
-    let report = world.failed();
+    let terminal = eventually(|| events.try_recv().ok().filter(|event| event.is_terminal()));
     assert!(
-        report.reason.to_lowercase().contains("starv") && report.reason.contains('1'),
-        "the reason names the starved request: {}",
-        report.reason
+        terminal.is_terminal(),
+        "the request did not end with the epoch it was the whole of"
     );
-    // The program that serves on is the one before the starved one.
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
-    // The starved request is still the epoch's: the revert moves the policy,
-    // not the request, and the previous program may now serve it.
+    world.no_failure();
+}
+
+#[test]
+fn a_starved_request_fails_alone_while_the_epoch_serves() {
+    // Two requests, one of them admitted and given no work: the starved one fails by name and the
+    // epoch does not, because the other request was still queued and could have been served. One
+    // request's thirty seconds is not evidence that every request must be lost. (That the queued
+    // one is then served is the policy's decision, which this program does not make; what is
+    // asserted here is that the epoch is still there to make it.)
+    let world = World::serving(Toy::idle());
+    let mut starved = world
+        .handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+    let mut queued = world
+        .handle
+        .submit(text_request(2, 8, 4))
+        .expect("the second request is submitted");
+    stepped_past(&world, world.step());
+    // `PlanOnce` admits request 1 alone and gives it no work, so request 2 stays queued: the
+    // mechanism's starvation rule watches residents, so request 1 is the one that starves.
+    world
+        .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
+        .expect("the starving program is instantiated before it serves");
+    let terminal = eventually(|| starved.try_recv().ok().filter(|event| event.is_terminal()));
     assert!(
-        !events.try_recv().is_ok_and(|event| event.is_terminal()),
-        "the request was not ended by the policy's failure"
+        terminal.is_terminal(),
+        "the starved request was not ended"
+    );
+    // The epoch did not blame the program, and the other request is still the epoch's.
+    world.no_failure();
+    assert!(
+        !queued.try_recv().is_ok_and(|event| event.is_terminal()),
+        "the epoch ended a request that never starved"
     );
 }
