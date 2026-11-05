@@ -568,6 +568,14 @@ pub fn token_plan(
     mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
 ) -> Result<Plan> {
     let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
+    // A rank that fits no cache keeps no paged request, so nothing reads a page size and none is
+    // agreed: `plan_media` is that rank (`src/engine_plan.rs` reaches this for the media class).
+    // The halving loop must not see it - it asks every resident layer's attention for a size the
+    // rank never addresses, halves to zero and reports "no block size is read" about a block size
+    // nothing reads. One probe answers which rank this is; a preset needs none.
+    if request.block_size.is_none() && cache(MAX_BLOCK_SIZE)?.is_none() {
+        return Ok(layout.finish(None));
+    }
     let block_size =
         resolve_block_size(request.block_size, |size| Ok(cache(size)?.is_some()), group)?;
     let plan = cache(block_size)?.ok_or_else(|| {
@@ -1312,6 +1320,32 @@ mod tests {
         assert!(
             said.contains("plan_rank"),
             "a rank with a geometry must be pointed at `plan_rank`, and the refusal said {said:?}"
+        );
+    }
+
+    /// A rank that fits no cache plans no page size, and is not asked for one: the media class
+    /// keeps no paged request, so the halving loop would report that no block size is read - a
+    /// statement about a number nothing in the plan reads.
+    #[test]
+    fn a_rank_that_fits_no_cache_is_asked_for_no_block_size() {
+        let mut request = request();
+        request.block_size = None;
+        let planned = token_plan(
+            &request,
+            report(),
+            &facts(),
+            1,
+            /* width */ 64,
+            TOTAL,
+            crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
+            None,
+            &HostGroup::single(0),
+            |_| Ok(None),
+        )
+        .unwrap_or_else(|error| panic!("a rank that fits no cache must plan without one: {error}"));
+        assert!(
+            planned.cache.is_none(),
+            "a cacheless rank states no cache rather than a cache of no units"
         );
     }
 
