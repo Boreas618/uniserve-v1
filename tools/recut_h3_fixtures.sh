@@ -86,8 +86,10 @@ sparse=64,0.9,8192
 # them only when the walk refuses it. `rows_bound()` is the one authority, and h3-builder04 measured
 # the walk's bound (303056) apart from the serving path's (304912/304976) — so a constant here is a
 # second statement of a live disagreement. **They leave this file when the walk reads the bound.**
-rows_dense=306896
-rows_sparse=353152
+# No fallback bound. The walk derives it from the deployment (`rows_bound`), and a
+# number typed here describes whatever deployment was current when it was typed -
+# 306896 was the 256-clip era. A tip that demands `--rows` is refused below rather
+# than handed a constant.
 # The walk derived its track from the clip on one tip and required it on another, so this file
 # probes: it passes `--track` only when the walk refuses its absence. A file that states one
 # deployment's convention breaks on the other, which is how `--rows` and `--samples` both went wrong.
@@ -104,6 +106,11 @@ if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned "$conditioned" \
     --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" >/dev/null 2>&1; then
     rows_flag=(--rows)
+fi
+if [ ${#rows_flag[@]} -ne 0 ]; then
+    echo "the re-cut stops: this walk demands --rows, and the bound is the deployment's." >&2
+    echo "  A tool that types one describes a deployment it cannot be asked to be." >&2
+    exit 1
 fi
 
 staging=$(mktemp -d)
@@ -161,14 +168,14 @@ rm -f "$probe"
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
-    --samples "$samples" --rasters "$rasters" --tokens "$tokens" ${rows_flag:+"${rows_flag[@]}" "$rows_dense"} \
+    --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
     --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
     --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
-    --types "$types" ${rows_flag:+"${rows_flag[@]}" "$rows_sparse"} --sparse "$sparse" >"$walk_sparse"
+    --types "$types" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
