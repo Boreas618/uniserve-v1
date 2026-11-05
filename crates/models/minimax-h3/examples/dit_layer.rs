@@ -874,9 +874,15 @@ fn stage_denoise(args: &Args) -> Result<()> {
     // files of the same shape and different trajectories, which a comparator can only report as an
     // arithmetic difference. This statement is what lets it refuse the pair instead
     // (`compare_trajectory.py`), and the line below prints the same numbers for a reader.
+    // The grid and the step count are the third thing a pair can differ in: two sides can agree on
+    // every layout field and still have run different schedules - a FastH3 student's `blocks` grid
+    // against the base `uniform` one, or a shortened run against a whole one - and their
+    // trajectories then differ everywhere for a reason that is not arithmetic. Stated here, in the
+    // model's own word for the grid, so the comparator refuses that pair instead of tabulating it.
     let arrangement = format!(
         "{{\"frames\": {frames}, \"canvas\": [{}, {}], \"text_rows\": {}, \
-         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}}}\n",
+         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}, \
+         \"schedule\": {grid:?}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}}}\n",
         canvas.height,
         canvas.width,
         packing.text_rows,

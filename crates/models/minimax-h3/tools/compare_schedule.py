@@ -73,6 +73,15 @@ def compare_one(document: dict) -> list[str]:
     lines = []
     dit = document["dit"]
     statement = document["statement"]
+    # The dump states its grid twice - the model's word for it and the statement it evaluated. Two
+    # statements of one fact are how a table comes to compare a block grid against a uniform one and
+    # report arithmetic, so a dump whose two disagree is refused rather than compared.
+    if document["grid"] != statement["kind"]:
+        raise SystemExit(
+            f"{document['checkpoint']}: the dump's grid is {document['grid']!r} and the statement"
+            f" it was evaluated from is {statement['kind']!r}; one of the two is wrong and this"
+            " table would report the difference as arithmetic"
+        )
     lines.append(
         f"## {dit}: {statement['kind']} grid, {document['steps']} steps, "
         f"checkpoint {document['checkpoint']}, commit {document['commit']}"
@@ -171,6 +180,15 @@ def self_test() -> int:
     lines, _ = compare_one(short)
     if not any("SHAPE" in line for line in lines):
         failures.append("self-test 3: a length mismatch was not reported as a shape row")
+
+    disagreeing = json.loads(json.dumps(base))
+    disagreeing["grid"] = "blocks"
+    try:
+        compare_one(disagreeing)
+        failures.append("self-test 4: a dump whose grid and statement disagree was compared")
+    except SystemExit as error:
+        if "grid" not in str(error):
+            failures.append(f"self-test 4: the refusal does not name the grid: {error}")
 
     for failure in failures:
         print(failure)
