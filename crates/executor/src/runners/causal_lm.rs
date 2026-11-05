@@ -719,6 +719,16 @@ struct Sampled {
 /// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
 /// captured `argmax` operator applies on the device, and it is here in one place so the host path
 /// and its test cannot disagree about it.
+/// How many tokens a slot had committed **before** the step whose readback is `readback`.
+///
+/// The commit table answers the sampling position after the batch, and the batch commits the row's
+/// own token, so a row that ends a prompt answers 1 and a slot that already held four answers 5. The
+/// greedy host path is valid only for the first: it argmaxes the raw logits row, and the penalties a
+/// continuing slot carries are computed by the captured sampler and not by this path.
+fn committed_before(readback: i32) -> usize {
+    usize::try_from(readback).unwrap_or(0).saturating_sub(1)
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best = 0_usize;
     for (index, value) in values.iter().enumerate() {
@@ -1655,10 +1665,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
     /// decision is made here, once per request, before the token leaves this process.
     ///
-    /// The penalties are no-ops for a row whose slot has committed nothing, which is what a prompt
-    /// ending is: a row whose slot already holds committed tokens would need the penalized logits,
-    /// which the graph computes and this path does not, so it is **refused by name** rather than
-    /// argmaxed over the raw row.
+    /// The penalties are no-ops for a row whose slot has committed nothing *before this step*, which
+    /// is what a prompt ending is: a row whose slot already held committed tokens would need the
+    /// penalized logits, which the graph computes and this path does not, so it is **refused by
+    /// name** rather than argmaxed over the raw row. The readback states the position after this
+    /// batch's own token was committed, so the row's commit is subtracted before the test.
     fn greedy_first_tokens(
         &mut self,
         logits: TensorView,
@@ -1688,10 +1699,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 continue;
             }
             let slot = self.staging.slots(rows)[row];
+            // The readback is the slot's sampling position *after* this batch committed, and this
+            // batch committed the row's own token: a prompt ending reads 1 here, not 0. The figure
+            // the check needs is what the slot held before the step, so the row's own commit is
+            // taken out. Refusing on the raw readback refused every deployment's first token.
             let position = usize::try_from(slot)
                 .ok()
                 .and_then(|slot| sampling.get(slot).copied())
-                .unwrap_or(0);
+                .map_or(0, committed_before);
             if position > 0 {
                 return Err(Error::Invalid(format!(
                     "a greedy row of slot {slot} ends a prompt that already holds {position} \
@@ -3136,6 +3151,19 @@ mod sampled_output_tests {
             .is_err(),
             "the zeroed pose the capture used to state is not a draw"
         );
+    }
+
+
+    /// A prompt ending's own token is one the batch committed, so the readback the greedy host path
+    /// reads answers 1 for it and not 0. Refusing on that raw figure refused every deployment's
+    /// first token (the run at `091731ffb`: `a greedy row of slot 1 ends a prompt that already holds 1
+    /// committed token(s)`), and a slot that really did hold tokens is still refused.
+    #[test]
+    fn a_prompt_ending_holds_no_committed_token_before_its_own() {
+        assert_eq!(committed_before(1), 0, "a prompt ending's own token only");
+        assert_eq!(committed_before(5), 4, "four tokens before this step's");
+        assert_eq!(committed_before(0), 0, "an unread slot has none");
+        assert_eq!(committed_before(-1), 0, "a readback that never ran has none");
     }
 
 }
