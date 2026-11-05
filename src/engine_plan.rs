@@ -1238,7 +1238,12 @@ impl EpochPlan {
         // which the frontend plans a request against and no capacity figure implies.
         let mut info = planned.plan.info.clone();
         if let Served::Media(pipeline) = served {
-            info.video_denoiser = Some(denoiser_report(pipeline, &self.build.video)?);
+            let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+            info.video_denoiser = Some(denoiser_report(
+                pipeline,
+                &self.build.video,
+                &config.tasks(),
+            )?);
         }
         Ok((memory, info, graph))
     }
@@ -1850,11 +1855,13 @@ fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32
 
 /// What the placed denoisers serve, as the frontend plans a request against it.
 ///
-/// The tasks, the schedule and the shifts are the checkpoint's. The frame rule is the clip rule, the
+/// The tasks are the ones the checkpoint states it serves, which a distilled student narrows from
+/// what its network could run. The schedule and the shifts are its too. The frame rule is the clip rule, the
 /// rates are the model's output clock, and the canvases are the ones this deployment prepares.
 fn denoiser_report(
     pipeline: &minimax_h3::load::MinimaxH3,
     video: &daemon::options::VideoOptions,
+    checkpoint_tasks: &[nn::VideoTask],
 ) -> Result<ipc::VideoDenoiserInfo> {
     use minimax_h3::{AUDIO_SAMPLE_RATE, CLIP_FRAMES, CLIP_LATENTS, FPS};
     use models::video::{
@@ -1873,9 +1880,7 @@ fn denoiser_report(
             VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
             VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
         };
-        denoisers
-            .iter()
-            .any(|denoiser| denoiser.config().tasks.contains(&named))
+        checkpoint_tasks.contains(&named)
     };
     let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
     let steps = first.schedule().num_steps()?;
