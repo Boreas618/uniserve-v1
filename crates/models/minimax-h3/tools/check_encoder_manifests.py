@@ -102,6 +102,30 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
         "stepwise",
     ),
     "layer_norm/triton": ("dtype", "columns", "tile", "bias", "pdl"),
+    # Four operators whose fields the call sites state outright - no `row_tile` and no width-derived
+    # tile among them - so a key computed here is the call's own key and not a second implementation
+    # of `nn`. Two of the day's three store gaps were rows of these shapes: a `gelu` at the merger's
+    # width and a `scaled_residual` at the text stack's.
+    "embedding/triton": ("dtype", "ids", "hidden", "first", "rows", "block", "pdl"),
+    "gelu/triton": ("dtype", "columns", "block", "approximate", "pdl"),
+    "scaled_residual/triton": ("dtype", "columns", "block", "update_bias"),
+    # `rms_norm`'s tile is `row_tile(columns)` - the width rounded up to a power of two - which is the
+    # one derived field this tool computes. A wrong derivation here cannot pass silently: it produces a
+    # MISSING row that names a tile the fixture does not hold, which is a report to read, not a green.
+    "rms_norm/triton": ("dtype", "columns", "tile", "pdl"),
+    "snake/triton": ("dtype", "channels", "block", "pdl"),
+    "frame_moments/nvcc": ("dtype", "epsilon"),
+    "frame_norm_pad/nvcc": ("dtype", "channels_last", "centered", "single_pixel"),
+    "rope_apply/triton": (
+        "dtype",
+        "output",
+        "head_dim",
+        "heads",
+        "rotation",
+        "rows",
+        "block",
+        "pdl",
+    ),
 }
 
 # One call: the package, the fields its descriptor carries, and why it carries them.
@@ -163,10 +187,14 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
                     "head_dim": str(head_dim),
                     "q_heads": str(heads // degree),
                     "kv_heads": str(kv_heads // degree),
-                    "mask": "dense",
+                    # The reference hands the language stack
+                    # `VarlenInput(lengths, lengths, (True,) * len(counts))`
+                    # (`uniserve/models/encoder.py:482`), so the key is the causal form; the tower's
+                    # is `(False,)` (`qwen3_vl/vision.py:281`). One stage reads both.
+                    "mask": "causal",
                     "window": "false",
                 },
-                f"attention.rs: the text stack's dense attention, {heads}/{kv_heads} heads {why}",
+                f"attention.rs: the text stack's causal attention, {heads}/{kv_heads} heads {why}",
             )
         )
         calls.append(
@@ -208,7 +236,7 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
     calls.append(
         (
             "rms_norm/triton",
-            {"dtype": dtype, "columns": str(hidden)},
+            {"dtype": dtype, "columns": str(hidden), "tile": _row_tile(hidden), "pdl": "false"},
             "text_encoder.rs: a layer's norms",
         )
     )
@@ -233,6 +261,39 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
             "text_encoder.rs: the gated MLP's activation",
         )
     )
+    # The token table the prompt is gathered from: one row per vocabulary id, `hidden` wide, and
+    # eight ids per program. Its key carries the table's shape, not the request's token count, so one
+    # row covers every prompt (`embedding.rs:93`).
+    calls.append(
+        (
+            "embedding/triton",
+            {
+                "dtype": dtype,
+                "ids": "i32",
+                "hidden": str(hidden),
+                "first": "0",
+                "rows": str(text["vocab_size"]),
+                "block": "8",
+                "pdl": "false",
+            },
+            "text_encoder.rs: the token embedding the prompt is gathered from",
+        )
+    )
+    # The language stack's residual stream: each retained layer's down projection folded into
+    # `[tokens, hidden]` before the next layer's norm. It is the *text* width, and the tower's own
+    # residual (below) is 1152 - two rows, neither covering the other.
+    calls.append(
+        (
+            "scaled_residual/triton",
+            {
+                "dtype": dtype,
+                "columns": str(hidden),
+                "block": "1024",
+                "update_bias": "false",
+            },
+            "text_encoder.rs: the residual stream the layers write into",
+        )
+    )
     return calls
 
 
@@ -242,6 +303,7 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
     heads = vision["num_heads"]
     head_dim = hidden // heads
     ffn = vision["intermediate_size"]
+    merge = vision["spatial_merge_size"]
     calls: list[Call] = [
         (
             "layer_norm/triton",
@@ -276,14 +338,42 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
                 "head_dim": str(head_dim),
                 "heads": str(heads),
                 "rotation": "half",
+                "rows": "8",
                 "block": "128",
+                "pdl": "false",
             },
             "vision.rs: the tower's own rotation, host-computed factors",
         ),
         (
             "gelu/triton",
-            {"dtype": dtype, "columns": str(ffn), "approximate": "tanh"},
+            {"dtype": dtype, "columns": str(ffn), "block": "1024", "approximate": "tanh",
+             "pdl": "false"},
             "vision.rs: the MLP's activation",
+        ),
+        (
+            # The merger's activation is a **different** GELU from the MLP's: the reference builds
+            # `nn.GELU()` there and `gelu_pytorch_tanh` in the blocks (`vision.rs:49`), so the key
+            # differs in `approximate` as well as in width - `merge² · hidden` before the first
+            # projection, which is 4608 for this tower against the MLP's 4304.
+            "gelu/triton",
+            {
+                "dtype": dtype,
+                "columns": str(merge * merge * hidden),
+                "block": "1024",
+                "approximate": "exact",
+                "pdl": "false",
+            },
+            "vision.rs: the patch merger's activation",
+        ),
+        (
+            "scaled_residual/triton",
+            {
+                "dtype": dtype,
+                "columns": str(hidden),
+                "block": "1024",
+                "update_bias": "false",
+            },
+            "vision.rs: the tower's residual stream at its own 1152",
         ),
     ]
     return calls
@@ -309,14 +399,14 @@ def vae_calls(vae: dict) -> list[Call]:
         calls.append(
             (
                 "snake/triton",
-                {"dtype": "f32", "channels": str(width)},
+                {"dtype": "f32", "channels": str(width), "block": "1024", "pdl": "false"},
                 f"encoding.rs: a level's snake at {width} channels",
             )
         )
     calls.append(
         (
             "frame_moments/nvcc",
-            {"dtype": "f32"},
+            {"dtype": "f32", "epsilon": f"0x{_f32_bits(vae['norm_eps']):08x}"},
             "encoding.rs: the frame statistics a pre-activated convolution reads",
         )
     )
@@ -325,7 +415,11 @@ def vae_calls(vae: dict) -> list[Call]:
             "frame_norm_pad/nvcc",
             {
                 "dtype": "f32",
-                "channels_last": "true",
+                # `encoding.rs:998` builds `FrameNormPad::new` and never calls
+                # `with_channels_last`, so the frames are read channel-first (`frame.rs:150`).
+                # `single_pixel` is the request's frame count, not a field this tool can state: a clip
+                # of more than one frame is the encode path's case, and the fixture holds both rows.
+                "channels_last": "false",
                 "centered": "false",
                 "single_pixel": "false",
             },
