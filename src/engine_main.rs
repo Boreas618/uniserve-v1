@@ -4469,13 +4469,18 @@ impl Resolved {
 /// A refusal that names only its own variant is the one thing a log cannot act on: `platform: ...`
 /// with the driver's own message behind it says what failed, and the chain is where that message
 /// lives. Each cause is taken from `source`, so nothing here has to know which errors there are.
-fn causes(error: &dyn std::error::Error) -> String {
+fn causes<E: std::error::Error + std::fmt::Debug>(error: &E) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
         text.push_str(": ");
         text.push_str(&cause.to_string());
         source = cause.source();
+    }
+    // A failure whose own message is empty is the one a reader cannot act on, and an error type is
+    // free to have one: the whole value says what it was, so it is what gets said.
+    if text.trim().is_empty() {
+        return format!("{error:?}");
     }
     text
 }
