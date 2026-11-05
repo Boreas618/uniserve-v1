@@ -31,9 +31,12 @@ use crate::support::{self, Serving};
 /// The first answer of each world is its policy's precopy, which compiles the
 /// `fcfs` module inside a debug build; this case builds three worlds, and a
 /// bound that does not cover the compile reports a timeout for a world that is
-/// booting. The margin is the compile's, not the mechanism's: a mechanism that
-/// stopped answering still fails here, only later.
-const ANSWER: Duration = Duration::from_secs(180);
+/// booting. Three boots measured near a hundred seconds between them, so the
+/// bound is three times that: a careful margin costs nothing when the case is
+/// green and costs a whole round trip when it is short. The margin is the
+/// compile's, not the mechanism's: a mechanism that stopped answering still
+/// fails here, only later.
+const ANSWER: Duration = Duration::from_secs(300);
 
 /// How many tokens the running world generates before it parks.
 const GENERATED: usize = 3;
