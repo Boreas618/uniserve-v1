@@ -73,9 +73,17 @@ impl Batches for Pool {
     }
 }
 
+/// The configuration a main process holds: the simulation's facts, since these
+/// tests run no device.
+fn config() -> EngineConfig {
+    let mut config = EngineConfig::sim("in-process");
+    config.max_running_requests = 4;
+    config
+}
+
 #[test]
 fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
-    let batch_sink = Arc::new(Pool::new(vec![support::pool("model")]));
+    let batch_sink = Arc::new(Pool::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = batch_sink.clone();
     let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
 
@@ -108,7 +116,7 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
 fn a_config_of_more_than_one_rank_is_not_one_handle() {
     let mut config = config();
     config.data_parallel_size = 2;
-    let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![support::pool("model")]));
+    let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![crate::support::pool("model")]));
     let refused = SchedulerHandle::over_batches(config, batches)
         .err()
         .expect("one handle, one rank");
@@ -121,7 +129,7 @@ fn a_pool_that_states_no_ranks_is_refused_by_name() {
     let empty = Inventory {
         group: "model".to_owned(),
         ranks: Vec::new(),
-        ..support::pool("model")
+        ..crate::support::pool("model")
     };
     let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![empty]));
     let refused = SchedulerHandle::over_batches(config(), batches)
