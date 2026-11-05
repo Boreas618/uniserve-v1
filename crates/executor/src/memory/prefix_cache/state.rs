@@ -296,9 +296,15 @@ fn runs_of(
                 rows = rows.checked_add(cells.len() as u32).ok_or_else(|| {
                     Error::Invalid("a state page holds too many blocks".to_owned())
                 })?;
-                match runs.last_mut() {
-                    Some((held, run)) if *held == field => run.extend(cells),
-                    _ => runs.push((field, cells)),
+                // A run is one storage field's cells over every page, in page
+                // order: a second page's cells continue the field's run rather
+                // than opening a second run for the same field. Reading a page
+                // at a time and appending only to the last run split each field
+                // once per page, so the rows of a field were not the page-ordered
+                // list the transfer states.
+                match runs.iter_mut().find(|(held, _)| *held == field) {
+                    Some((_, run)) => run.extend(cells),
+                    None => runs.push((field, cells)),
                 }
             }
         }
