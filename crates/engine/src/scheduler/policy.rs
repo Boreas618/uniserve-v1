@@ -480,8 +480,10 @@ pub struct Candidate {
     module: PolicyModule,
     instance: PolicyInstance,
     /// The guest calls the trial made, which the counters carry once the
-    /// candidate is adopted.
-    calls: u64,
+    /// candidate is adopted. A trial leaves the program as it found it, so the
+    /// candidate serves on a second instance and the trialled one's counters
+    /// are read here before it is dropped.
+    trial: TrialCost,
     /// The snapshot the instance was instantiated on: the state its own
     /// knowledge starts from, which the mechanism seeds the recorder with when
     /// the candidate starts serving (§4.4).
@@ -558,6 +560,16 @@ struct Cost {
     decisions: scheduling::PolicyCost,
 }
 
+/// What a trial cost: the instance's decisions and the fuel it burned.
+///
+/// The instance that made them is dropped once the candidate exists, so these
+/// are kept beside it and added to the counters when it is adopted (§7.3).
+#[derive(Clone, Copy, Debug, Default)]
+struct TrialCost {
+    decisions: scheduling::PolicyCost,
+    fuel: u64,
+}
+
 impl Cost {
     /// Counts one call into `instance` around `call`.
     fn call<T>(
@@ -586,14 +598,18 @@ impl Cost {
 
     /// A trial's calls are counted when its candidate is adopted: they are
     /// calls the epoch's policy made, whether or not it goes on serving under
-    /// that program. Its fuel is already inside the instance's own total.
+    /// that program.
     ///
-    /// The instance is the record, not a count taken beside it: its
+    /// The trialled instance is the record, not a count taken beside it: its
     /// instantiation, the limits it read and every decision the trial asked
-    /// are all in its cost, so `calls` and the sum of the instances'
-    /// decisions are the same number by construction.
-    fn trial(&mut self, instance: &PolicyInstance) {
-        self.calls += instance.cost().each().map(|(_, calls)| calls).sum::<u64>();
+    /// are all in its cost, which [`Candidate`] carries because the trial's
+    /// instance is dropped. Adding it to the decisions as well as to the call
+    /// count keeps `calls` and the sum of the instances' decisions the same
+    /// number by construction.
+    fn trial(&mut self, trial: TrialCost) {
+        self.calls += trial.decisions.each().map(|(_, calls)| calls).sum::<u64>();
+        self.decisions = self.decisions + trial.decisions;
+        self.spent += trial.fuel;
     }
 }
 
@@ -747,7 +763,7 @@ impl PolicySlot {
         // candidate's are (§12): a counter that dropped them would report an
         // epoch whose first policy never called the guest.
         let mut cost = Cost::default();
-        cost.trial(&candidate.instance);
+        cost.trial(candidate.trial);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -894,28 +910,22 @@ impl PolicySlot {
 
         // Every decision of §4.4's table once, on the state that exists now and
         // without executing any of it. The calls are the trial's cost, counted
-        // once the candidate is adopted.
-        let mut calls = 0;
+        // once the candidate is adopted; `TrialCost` records them below.
         let plan = instance.dispatch(&room)?;
-        calls += 1;
         validators.plan(&plan)?;
         if let Some(shortage) = &shortage {
             let victims = instance.reclaim(shortage)?;
-            calls += 1;
             validators.victims(shortage, &victims)?;
         }
         if let Some((request, ranks)) = &arrival {
             let index = instance.route(request, ranks)?;
-            calls += 1;
             validators.route(request, ranks, index)?;
         }
         if let Some((call, replicas)) = &call {
             let index = instance.place(call, replicas)?;
-            calls += 1;
             validators.place(call, replicas, index)?;
         }
         let pages = instance.warm(&room)?;
-        calls += 1;
         validators.warm(&pages)?;
         tracing::debug!(
             pages = pages.len(),
@@ -923,7 +933,6 @@ impl PolicySlot {
         );
         if let Some(load) = &expert_load {
             let order = instance.experts(load)?;
-            calls += 1;
             validators.experts(load, &order)?;
         }
 
@@ -933,12 +942,16 @@ impl PolicySlot {
         // boundary's state, not from what the trial left behind. The candidate
         // is therefore a second instance of the same module on that state, and
         // the trialled one is dropped with the cost it counted.
+        let trial = TrialCost {
+            decisions: instance.cost(),
+            fuel: instance.fuel_consumed(),
+        };
         let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Candidate {
             program,
             module,
             instance,
-            calls,
+            trial,
             state: init.state,
             // A route-only precopy asks no warming decision: the room it has
             // is the routing one, and warming belongs to the precopy that
@@ -953,7 +966,7 @@ impl PolicySlot {
     /// switchover: only a later precopy's result can be the one the daemon's
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(&candidate.instance);
+        self.cost.trial(candidate.trial);
         self.candidate = Some(candidate);
     }
 
@@ -1212,7 +1225,7 @@ impl RoutePolicy {
         // Its trial's calls are the epoch's policy's, as a scheduler's first
         // policy counts them (§12).
         let mut cost = Cost::default();
-        cost.trial(&candidate.instance);
+        cost.trial(candidate.trial);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -1284,17 +1297,23 @@ impl RoutePolicy {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
         let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
-        let mut calls = 0;
         if let Some((request, ranks)) = &state.arrival {
             let index = instance.route(request, ranks)?;
-            calls += 1;
             validators.route(request, ranks, index)?;
         }
+        // The trial's calls are the epoch's policy's once the candidate is
+        // adopted, and serving starts on a second instance so the trial leaves
+        // the program as it found it (§7.3).
+        let trial = TrialCost {
+            decisions: instance.cost(),
+            fuel: instance.fuel_consumed(),
+        };
+        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Candidate {
             program,
             module,
             instance,
-            calls,
+            trial,
             state: init.state,
             // A route-only precopy asks no warming decision: the room it has
             // is the routing one, and warming belongs to the precopy that
@@ -1305,7 +1324,7 @@ impl RoutePolicy {
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(&candidate.instance);
+        self.cost.trial(candidate.trial);
         self.candidate = Some(candidate);
     }
 
