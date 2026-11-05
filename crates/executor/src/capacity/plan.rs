@@ -27,7 +27,6 @@ use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
     request_tensor_window,
 };
-use crate::capacity::graph_storage_bytes;
 use crate::config::Device;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
@@ -487,26 +486,19 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
     // The graph storage is the one figure that is a share of the DEVICE and not of what is left: a
     // rank reserves two pools of address space at open, one per generation a preparation may hold,
     // and books their mappings against the device's total.
-    let graph_bytes = match facts.device {
-        Device::Cuda(index) => graph_storage_bytes(
-            crate::capacity::device::total_bytes(index)? as i64,
-            true,
-            false,
+    // The graph range and the scratch region are one reservation (4.1, 4.5): the graph pools the
+    // rank captures into and the shadow a replaced operator runs in, both reserved at spawn and
+    // both out of the grant the cache is fitted into. `reserved_bytes` answers them as one figure
+    // so a caller cannot pass half of it - a plan fitted into the bytes the shadow will take leaves
+    // the rank to map past the device at its first shadow, after the model load and after every
+    // module installed.
+    let reserved_bytes = match facts.device {
+        Device::Cuda(index) => crate::capacity::reserved_bytes(
+            crate::capacity::device::total_bytes(index)?,
+            /* prepares */ true,
         ),
         Device::Cpu => 0,
     };
-    // The scratch region is reserved beside the graph range and out of the same grant: the shadow
-    // a replaced operator runs in is `graph_storage_budget_bytes`'s eighth, and the state
-    // snapshot joins it inside the fit. A rank that fitted its cache into the bytes the shadow will
-    // take maps past the device after the model is loaded, where the refusal costs the whole
-    // startup.
-    let shadow = match facts.device {
-        Device::Cuda(index) => {
-            crate::capacity::graph_scratch_bytes(crate::capacity::device::total_bytes(index)? as i64)
-        }
-        Device::Cpu => 0,
-    };
-    let reserved_bytes = graph_bytes.saturating_add(shadow);
     let request = CapacityRequest {
         device: facts.device,
         block_size: facts.block_size.map(|size| size as usize),
@@ -1162,8 +1154,17 @@ mod tests {
         );
         let shadow = crate::capacity::graph_scratch_bytes(E2E_TOTAL as i64);
         assert_eq!(shadow, 2_473_721_856, "the shadow region of that device");
+        // What a rank reserves before it fits a unit, from the one function that answers it: the
+        // graph range and the shadow together. A reservation that lost the shadow is the defect
+        // this case exists for, and it fails here before the admission cases below.
+        let reserved = crate::capacity::reserved_bytes(E2E_TOTAL, true);
+        assert_eq!(
+            reserved,
+            graph + shadow,
+            "the storage a rank reserves on this device: the graph range and the shadow region"
+        );
         // A generous grant, only to learn the plan's own fixed storage and unit size.
-        let planned = fitted(E2E_TOTAL, graph + shadow)
+        let planned = fitted(E2E_TOTAL, reserved)
             .expect("the deployment's device holds its own graph range and scratch");
         let fixed = planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
         let unit = planned
@@ -1174,15 +1175,15 @@ mod tests {
         // The least a cache serves is the sentinel unit and one page of its one group; the two
         // cases below give that twice, so a rounding in the reservation cannot decide the answer.
         let least = 2 * unit;
-        let with = fixed + graph + shadow + 2 * least;
+        let with = fixed + reserved + 2 * least;
         let without = with - shadow;
         assert!(
-            fitted(without, graph + shadow).is_err(),
+            fitted(without, reserved).is_err(),
             "a grant of {without} bytes holds the graph range and the fixed storage, and not the \
              {shadow}-byte shadow region: it must be refused, not fitted"
         );
-        let admitted = fitted(with, graph + shadow)
-            .expect("the same grant with the shadow region holds the cache");
+        let admitted =
+            fitted(with, reserved).expect("the same grant with the shadow region holds the cache");
         let units = admitted
             .info
             .prefix_cache
