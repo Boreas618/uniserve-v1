@@ -575,6 +575,7 @@ impl Leader {
             world: serving.world,
             segments: cache,
         });
+        let joining = (!dry_run).then(|| spec.clone());
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
             target: target_epoch,
@@ -587,7 +588,17 @@ impl Leader {
             previous_generation,
             spawn_generation,
         };
-        self.updates.apply(&previous, &next, change, dry_run)
+        let applied = self.updates.apply(&previous, &next, change, dry_run);
+        if let (Ok(_), Some(spec)) = (&applied, joining) {
+            replicas[0].follow_switch(
+                Arc::clone(control),
+                spec,
+                spawn_generation,
+                target_epoch,
+                epochs.served(),
+            );
+        }
+        applied
     }
 
     /// Commits the update in flight: the switch's, whose commit is a command

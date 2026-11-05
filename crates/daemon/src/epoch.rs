@@ -557,12 +557,25 @@ pub struct Epochs {
     commands: Mutex<Option<crate::supervision::ProcessCommands>>,
     /// The program-layer update in flight: its probation's record (§7.3).
     program: Mutex<Option<ProgramUpdate>>,
+    /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
+    /// this process follows it by moving its hold onto the target's engine.
+    served: tokio::sync::watch::Sender<u64>,
 }
 
 impl Epochs {
     /// No epoch was built and no process started yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// States that the frontend serves `epoch` from now on (§7.4).
+    pub fn announce_serve(&self, epoch: u64) {
+        self.served.send_replace(epoch);
+    }
+
+    /// The epoch the frontend was last told to serve, as it changes.
+    pub fn served(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.served.subscribe()
     }
 
     /// Records `record` as epoch `epoch`'s, replacing what was recorded of
