@@ -844,6 +844,21 @@ impl Scheduler {
             );
             return;
         };
+        // The per-request record is a denoising step's: the request's conditioning and the step,
+        // seed and canvas a draw is addressed by. Every other media family stages buffers this
+        // mechanism cannot state - a decode reads the clip's latents and the tables the model's
+        // `layout_tables` names, an encode reads the tokens its call carries - so a batch of one of
+        // those is refused here by name rather than stamped with a record shaped for another family
+        // (a decoder reads `inputs[0]` as a clip's latents, and two buffers for it would be a
+        // refusal about counts rather than about the fact that nobody stated them).
+        if media_call != ipc::MediaCall::Denoising {
+            tracing::debug!(
+                "a media batch is dropped: a {:?} batch's per-request buffers are the model's own \
+                 and the mechanism states no spelling for them yet",
+                media_call
+            );
+            return;
+        }
         let Ok(rows) = u32::try_from(batch.requests.len()) else {
             return;
         };
