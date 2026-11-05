@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example record -- --root /opt/uv/models/MiniMax-H3 --component all \
-//!     --dtype f16 --clip 256 --raster 480x832 --rows 32000 --extents h3-audio-extents.json \
+//!     --clip 260 --raster 672x1536 --extents h3-audio-extents.json \
 //!     --against notes/programs/minimax-h3-keys.txt
 //! ```
 //!
@@ -125,7 +125,9 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut component = String::from("all");
-    let mut clip = 256u32;
+    // A clip is `17n + 5` frames (the packing's rule, enforced below) and its soundtrack follows from it:
+    // 260 frames are 433 audio latent frames of 800 samples, so the two defaults are one deployment.
+    let mut clip = 260u32;
     // The first canvas the deployment offers: every harness that reads one raster (the denoiser's,
     // the decoder's) reads this one, and the others are added by `--raster`.
     let mut raster = {
@@ -145,7 +147,7 @@ fn run() -> Result<(), String> {
     // `--track`. They key the packed stream's offsets and the audio encoder's widths, so a
     // comparison of two deploments must pass the same pair to both enumerations.
     let mut tokens = 4096u32;
-    let mut track = 44_100u32;
+    let mut track = 346_400u32;
     let mut elements = 0u64;
     let mut against: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
@@ -364,6 +366,29 @@ fn run() -> Result<(), String> {
     // list once per raster is the one place the scope can be got wrong, so it is stated here rather
     // than in each harness: rows deduplicate, and a component that refuses on one canvas is named
     // with the canvas it refused on.
+    // **The track is the clip's, not an independent quantity, and the model's own arithmetic says so.**
+    // The walk derives `--track` from `--samples` (`packing::audio_latent_frames` then
+    // `audio_vae::track_samples`) and refuses a stated one that disagrees, so a recorder stating its own
+    // length records a deployment the walk cannot state: the audio encoder's residual widths and the
+    // conditioned stream's offsets are both keyed by it, and the two enumerations are only comparable
+    // when they were invoked identically. The rule is called here rather than restated.
+    {
+        let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+        let latents = minimax_h3::packing::audio_latent_frames(request.clip);
+        let implied = minimax_h3::audio_vae::track_samples(&config.audio_vae, latents);
+        if u64::from(request.track) != implied {
+            return Err(format!(
+                "--track states {} samples and a {}-frame clip's soundtrack is {} samples \
+                 ({} latent frames of {}): the track is the clip's, and the walk derives it",
+                request.track,
+                request.clip,
+                implied,
+                latents,
+                minimax_h3::audio_vae::samples_per_latent(&config.audio_vae),
+            ));
+        }
+    }
+
     let canvases = if request.rasters.is_empty() {
         vec![request.raster]
     } else {
