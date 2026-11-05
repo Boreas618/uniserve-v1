@@ -106,10 +106,19 @@ impl Table {
 
     /// The `[rows, width]` i32 view over this table's storage.
     fn view(&self) -> TensorView {
+        self.view_rows(self.rows)
+    }
+
+    /// The `[rows, width]` view over the table's first `rows` rows.
+    ///
+    /// A bucket narrower than the table addresses its own prefix of it: inside a captured graph
+    /// every per-sequence operand has the bucket's row count, and the page table is one of them -
+    /// so the table's storage is the generation's widest bucket while the view is the bucket'a own.
+    fn view_rows(&self, rows: u32) -> TensorView {
         TensorView::new(
             DevicePtr::new(self.buffer.address()),
             DType::I32,
-            Shape::new(&[u64::from(self.rows), u64::from(self.width)]),
+            Shape::new(&[u64::from(rows), u64::from(self.width)]),
         )
     }
 
@@ -226,13 +235,9 @@ impl ResidentCache {
             .tables
             .get(group)
             .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))?;
-        if slots.len() != table.rows as usize {
-            return Err(Error::Invalid(format!(
-                "a block table of group {group} needs {} row slots, got {}",
-                table.rows,
-                slots.len()
-            )));
-        }
+        // A batch narrower than the table's rows is the normal case: the table's storage is sized
+        // for the widest batch the generation may see, and a bucket gathers its own prefix of it.
+        let rows = row_count(group, table.rows, slots)?;
         let (pooled, pool_rows, width) = {
             let cache = self
                 .cache
@@ -248,8 +253,9 @@ impl ResidentCache {
         }
         let row_bytes = width as usize * 4;
         for (row, slot) in slots.iter().enumerate() {
+            let slot = *slot;
             let destination = table.row_address(row as u32);
-            if *slot < 0 {
+            if slot < 0 {
                 // SAFETY: the row lies inside this provider's column, which outlives the stream
                 // work, and the count is the row's own width.
                 unsafe {
@@ -257,7 +263,7 @@ impl ResidentCache {
                 }
                 continue;
             }
-            let slot = u32::try_from(*slot)
+            let slot = u32::try_from(slot)
                 .map_err(|_| Error::Invalid(format!("group {group} has no row slot {slot}")))?;
             if slot >= pool_rows {
                 return Err(Error::Invalid(format!(
@@ -273,8 +279,32 @@ impl ResidentCache {
                 platform::memcpy_async(destination, source, row_bytes, stream)?;
             }
         }
-        Ok(table.view())
+        // The view is the bucket's, not the table's: attention compares it with the batch's own
+        // sequence count, and inside a captured graph both are the bucket's rows.
+        Ok(table.view_rows(rows))
     }
+}
+
+
+/// The slot each row of a group's table gathers from.
+///
+/// A row the batch does not fill is `-1`: the attention kernel never reads past a row's `seq_lens`,
+/// so an absent row is never dereferenced, and the pool reserves no such slot - which is why `-1`
+/// and not `0` is the absent row. A batch wider than the table is refused, because a table one row
+/// short would silently drop a request's pages.
+fn row_count(group: usize, table_rows: u32, slots: &[i32]) -> Result<u32> {
+    if slots.is_empty() {
+        return Err(Error::Invalid(format!(
+            "group {group}'s block table was handed no row: a batch has at least one sequence"
+        )));
+    }
+    if slots.len() > table_rows as usize {
+        return Err(Error::Invalid(format!(
+            "a block table of group {group} has {table_rows} row slots and was handed {}",
+            slots.len()
+        )));
+    }
+    u32::try_from(slots.len()).map_err(|_| Error::Invalid("a batch's row count overflows".into()))
 }
 
 /// One layer's borrowed planes as the model's cache reads them.
@@ -573,6 +603,7 @@ impl std::fmt::Debug for ResidentCache {
 #[cfg(test)]
 mod tests {
     use crate::memory::allocation::ElementType;
+    use crate::runners::resident::row_count;
 
     /// The storage element types a plane can hold and whether they are kernel operand types.
     #[test]
@@ -593,4 +624,28 @@ mod tests {
             );
         }
     }
+
+    /// A bucket narrower than its group's table is the normal case of a warmup: the table's storage
+    /// is the generation's widest batch, and a batch gathers its own prefix. Attention compares the
+    /// page table's rows with the batch's own sequence count, so the answer is the batch's count and
+    /// not the table's - a table padded to its storage height states sequences the batch has not.
+    #[test]
+    fn a_batch_narrower_than_its_table_answers_its_own_row_count() {
+        assert_eq!(
+            row_count(0, 8, &[3, 4, 5, 6]).expect("four rows of an eight-row table"),
+            4,
+            "a narrower batch answered the table's height rather than its own row count"
+        );
+        assert_eq!(row_count(0, 2, &[7, 8]).expect("the table's height"), 2);
+        assert!(
+            row_count(0, 1, &[]).is_err(),
+            "a batch of no rows was answered as a table row"
+        );
+        let error = row_count(0, 4, &[1, 2, 3, 4, 5]).expect_err("five rows of a four-row table");
+        assert!(
+            error.to_string().contains("has 4 row slots and was handed 5"),
+            "the refusal does not name both figures: {error}"
+        );
+    }
+
 }
