@@ -107,6 +107,25 @@ struct Args {
 
 fn run() -> Result<(), String> {
     let args = Args::parse()?;
+    // The canvas is a **deployment** fact, and the store is built for the six the checkpoint offers:
+    // a raster outside them asks for a `frame_pad` class and a `scaled_add` ladder no served canvas
+    // needs, so the run would stop at a missing program after the whole load. Every stage refuses it,
+    // because the plan's numbers are a claim about the same case the device stage spends.
+    if !minimax_h3::NAMED_CANVASES
+        .iter()
+        .any(|canvas| canvas.width == args.width && canvas.height == args.height)
+    {
+        let offered = minimax_h3::NAMED_CANVASES
+            .iter()
+            .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
+            .collect::<Vec<String>>()
+            .join(", ");
+        return Err(format!(
+            "`{}x{}` is not a canvas the deployment offers, and the store is built for the ones it \
+             does: {}",
+            args.width, args.height, offered
+        ));
+    }
     match args.stage.as_str() {
         "weights" => weights(&args),
         "plan" => plan(&args),
@@ -125,11 +144,13 @@ impl Args {
             out: PathBuf::from("artifacts/h3-stage5"),
             stage: "weights".to_owned(),
             task: VideoTask::FirstLastToVideoAudio,
-            width: 256,
-            height: 256,
+            width: 1344,
+            height: 768,
             frames: 5,
             text_tokens: 15,
-            image: 256,
+            // The anchor's raster is the canvas's short edge, which is a whole number of the
+            // encoder's tiles at every served canvas: 768 = 3 x 256.
+            image: 768,
             seed: 0,
             device: 0,
             dtype: None,
@@ -647,9 +668,8 @@ fn encode(args: &Args) -> Result<(), String> {
     let store_root = args.store.clone().ok_or_else(|| {
         "stage `encode` needs a program store: pass --store <path> or set UNISERVE_STORE".to_owned()
     })?;
-    // `--image` is an **anchor's** raster. A reference is encoded at the canvas, so the flag means
-    // nothing on a `ref2va` run and stating it there would be a number the case file reports and the
-    // encoder never reads.
+    // `--image` is a **condition's** raster: an anchor is fitted to the canvas and a reference keeps
+    // the raster it arrives at, so the flag states both and the packing decides which applies.
     let anchors = args.task == VideoTask::FirstLastToVideoAudio;
     if !anchors {
         println!(
