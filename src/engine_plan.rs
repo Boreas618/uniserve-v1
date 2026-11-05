@@ -574,13 +574,21 @@ impl EpochPlan {
                 ));
             }
         }
-        let decode_buckets: Vec<executor::plan::Bucket> = candidates
-            .iter()
-            .map(|candidate| {
-                executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
-            })
-            .collect();
         let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+        // **A decode bucket is one decode unit, not the timeline.** The video decoder decodes a clip
+        // of the checkpoint's own window - `decode_latents` latent frames, `frames_out` native ones -
+        // and a timeline longer than one is spliced from its units. A bucket naming the deployment's
+        // whole clip asked one decode call for a raster no decoder produces.
+        let window = minimax_h3::video_vae::decode_latents(&config.video_vae)
+            * config.video_vae.temporal_compression();
+        let mut decode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        for candidate in &candidates {
+            let bucket =
+                executor::plan::Bucket::clip(window, candidate.height, candidate.width);
+            if !decode_buckets.contains(&bucket) {
+                decode_buckets.push(bucket);
+            }
+        }
         let hidden = config.text_encoder.hidden_size;
         let text = pipeline.text_encoder().context(
             "the checkpoint holds no text encoder, so a media request's prompt could not be \
@@ -1560,6 +1568,27 @@ fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Resul
         .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
 }
 
+/// The least legal timeline of at least `frames` frames (`17 * n + 5`).
+///
+/// A timeline is one 17-frame body per clip plus a 5-frame tail (`VideoPostprocessor::splices_of`),
+/// so the legal counts are 22, 39, 56, … A deployment states a duration in seconds and the model
+/// admits the least of those covering it: 4 s is 96 frames and snaps to 107, 15 s is 360 and snaps
+/// to 362.
+fn snap_frames(frames: u32) -> Result<u32> {
+    use minimax_h3::config::CLIP_FRAMES;
+    // The tail is the timeline's own: `Ref2Va`'s overlap frames, the same five the splice fades.
+    let tail = minimax_h3::output::Rgb::OVERLAP_FRAMES;
+    if frames < CLIP_FRAMES + tail {
+        bail!(
+            "this deployment's longest clip is {frames} frame(s) and a timeline is at least {} \
+             ({CLIP_FRAMES} body frames and a {tail}-frame tail)",
+            CLIP_FRAMES + tail
+        );
+    }
+    let beyond = frames - tail;
+    Ok(tail + beyond.div_ceil(CLIP_FRAMES) * CLIP_FRAMES)
+}
+
 /// The warm candidates a media deployment binds its denoiser with.
 ///
 /// **One candidate per (task, canvas, prompt capacity) the deployment serves.** A denoiser bucket is
@@ -1591,7 +1620,10 @@ fn media_candidates(
             video.max_seconds
         );
     }
-    let frames = frames as u32;
+    // **The timeline rule is the checkpoint's** (`17 * n + 5`): a deployment states a duration, and
+    // the frames it admits are the least legal timeline covering it. An unsnapped count captured a
+    // layout the splice could not write and the decoder could not decode.
+    let frames = snap_frames(frames as u32)?;
     for edge in &video.resolutions {
         let short_edge: u32 = edge
             .strip_suffix('p')
