@@ -6,9 +6,11 @@
 # own layer does not explain. Nothing here fails a build; a non-zero exit means an artifact could
 # not be produced, never that a number is bad.
 #
-# Stage 1 is the text encoder (prompt -> hidden), stage 3 is the sampler (the sigma ladder the
-# denoiser steps along). Neither needs the decoder, which is why they are the two stages a run can
-# reach today.
+# Stage 1 is the text encoder (prompt -> hidden), stage 2 the denoiser's blocks, stage 3 the sampler
+# (the sigma ladder the denoiser steps along), stage 4 the video encoder's rows and stage 5 the
+# conditioned path (`fl2va`) that binds it. Stages 4 and 5 compare **the encoder's own rows**, not
+# the projected prefix: a difference past the projection cannot say whether the encoder or the
+# projection made it.
 #
 # Usage:
 #   tools/diagnose_h3_numeric.sh <checkpoint root> [<out dir>]
@@ -128,6 +130,38 @@ Stage 2 (the denoiser) numeric half: the reference's probes, then ours against t
 COMMANDS
 sed 's/^/   /' "$run/stage2-commands.txt" | head -3
 
+
+# 2c. Stages 4 and 5: the video encoder, and the conditioned path that binds it. The comparison is
+#     over the rows the encoder emits - `rows.h3t`, `[rows, channels * 4]` FP32 - which the stage
+#     writes beside the pixels it read, and which the reference's own encode probe computes from the
+#     same pixels. Comparing the projected prefix instead would attribute the projection's rounding
+#     to the encoder.
+echo
+echo "== stages 4/5: the video encoder's rows"
+cargo run -q -p minimax-h3 --example conditioned -- --stage weights --root "$root" 2>&1 \
+    | grep -E '^(names|io|encoder|condition)' | sed 's/^/   /' || true
+
+cat >"$run/stage45-commands.txt" <<COMMANDS
+Stages 4 and 5 numeric half: the conditioned stage writes the encoder's unprojected rows, and the
+reference's probe compares them. Both run on the host that has the shards and a device.
+
+  # ours: one image, the encoder's tile walk, the posterior, the anchor and the projection
+  cargo run --release -p minimax-h3 --example conditioned -- --stage encode \\
+      --root $root --store <store> --out $run/stage5 --canvas 256x256 \\
+      --image 256 --frames 5 --text-tokens 15 --seed 0
+
+  # the reference on the same pixels, compared against $run/stage5/latent_encoder/rows.h3t
+  .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe encode_rows \\
+      --checkpoint $root --stack $run/stage5/latent_encoder --out $run/stage5
+
+The probe prints the relative L2 and the maximum absolute difference, or names the shape
+disagreement that stops the two rows being comparable. A case that carries no rows.h3t gets the
+reference side alone and the page says so - that is a stage that did not run, not an agreement.
+
+Recorded here rather than run because this host holds the indexes and none of the shards: the
+weights stage above answers the names, and the first payload read stops.
+COMMANDS
+sed 's/^/   /' "$run/stage45-commands.txt" | head -3
 
 # 3. The reading. A block is explained by its layer when the difference is at that layer's rounding:
 #    float32 evaluation order on a value near 1 is ~1.2e-07 absolute, and a table of indices is
