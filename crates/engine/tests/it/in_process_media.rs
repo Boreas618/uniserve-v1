@@ -154,15 +154,21 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
         .submit(text_request(1, 8))
         .expect("the text request is accepted");
     let deadline = Instant::now() + ANSWER;
-    let mut finished = false;
-    while Instant::now() < deadline && !finished {
-        if let Ok(event) = served.try_recv() {
-            finished = matches!(event, Event::Finished { .. });
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
+    let mut terminal = None;
+    while Instant::now() < deadline && terminal.is_none() {
+        match served.try_recv() {
+            // A rejected or failed request ends the stream as surely as a
+            // finished one; treating only `Finished` as an end is how a
+            // rejection reads as a timeout.
+            Ok(event) if event.is_terminal() => terminal = Some(event),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
         }
     }
-    assert!(finished, "the engine stops serving text after rejecting media");
+    assert!(
+        matches!(terminal, Some(Event::Finished { .. })),
+        "the engine stops serving text after rejecting media: {terminal:?}"
+    );
 
     engine.shutdown();
     assert!(!engine.is_dead(), "media rejection killed the engine");
@@ -193,16 +199,23 @@ fn text_is_served_before_any_rejection() {
     let mut served = engine
         .submit(text_request(1, 8))
         .expect("the text request is accepted");
+    // A token, not a terminal event: this is completion's wait, so a failure
+    // here means nothing was served, while a failure of the media case alone
+    // means it waited for the wrong event.
     let deadline = Instant::now() + ANSWER;
-    let mut finished = false;
-    while Instant::now() < deadline && !finished {
-        if let Ok(event) = served.try_recv() {
-            finished = matches!(event, Event::Finished { .. });
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
+    let mut served_any = false;
+    while Instant::now() < deadline && !served_any {
+        match served.try_recv() {
+            Ok(Event::TextToken { .. }) => served_any = true,
+            Ok(event) if event.is_terminal() => break,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
         }
     }
-    assert!(finished, "the deployment serves text before any rejection");
+    assert!(
+        served_any,
+        "the deployment serves text before any rejection: no token arrived"
+    );
 
     // A second text request separates a state the first request poisoned from
     // an admission that closed: if this one is refused too, nothing is being
@@ -211,18 +224,17 @@ fn text_is_served_before_any_rejection() {
         .submit(text_request(2, 8))
         .expect("the second text request is accepted");
     let deadline = Instant::now() + ANSWER;
-    let mut served_again = false;
-    while Instant::now() < deadline && !served_again {
-        if let Ok(event) = second.try_recv() {
-            served_again = matches!(event, Event::Finished { .. });
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
+    let mut terminal = None;
+    while Instant::now() < deadline && terminal.is_none() {
+        match second.try_recv() {
+            Ok(event) if event.is_terminal() => terminal = Some(event),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
         }
     }
     assert!(
-        served_again,
-        "a second text request is served: admission is open and the first request did not \
-         poison the engine"
+        matches!(terminal, Some(Event::Finished { .. })),
+        "a second text request is served: admission is open and the first request did not poison the engine: {terminal:?}"
     );
     engine.shutdown();
 }
