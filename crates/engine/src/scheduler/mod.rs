@@ -57,6 +57,11 @@ pub use stats::{
 };
 pub use stats_report::SchedulerStatsReporter;
 pub use world::{GroupCache, ParkedCache};
+/// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
+/// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
+/// keeps it rather than restated by whoever needs a phase id.
+pub use scheduling::guest::view::PhaseKind;
+pub use views::phase_id;
 
 mod admission;
 mod allocation;
