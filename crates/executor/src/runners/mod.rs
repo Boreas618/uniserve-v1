@@ -11,9 +11,11 @@
 
 pub mod causal_lm;
 pub(crate) mod columns;
+pub mod decoder;
 pub mod encoder;
-pub(crate) mod tables;
 pub mod lifecycle;
+pub(crate) mod tables;
 
 pub use causal_lm::CausalLmRunner;
+pub use decoder::DecoderRunner;
 pub mod resident;
