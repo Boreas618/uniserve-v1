@@ -528,6 +528,24 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
                count > 0;
     }
     if (built && !listed) {
+      // **The geometry is checked here, before the library is blamed.** cuDNN answers an implied
+      // output shape that disagrees with the stated one with no engines at all, not with a geometry
+      // error, so a graph whose arithmetic is wrong reads exactly like a shape the library cannot
+      // serve. The forward's axis is `(in + 2p - d(k-1) - 1)/s + 1` and the backward-data pass's is
+      // `(dy - 1)s - 2p + d(k-1) + 1`; both are recomputed from the stated input, weight and
+      // geometry, and the refusal prints them beside the stated output.
+      int64_t implied[3] = {0, 0, 0};
+      bool agrees = true;
+      for (int32_t axis = 0; axis < kSpatial; ++axis) {
+        const int64_t window =
+            static_cast<int64_t>(call.dilation[axis]) * (static_cast<int64_t>(call.kernel[axis]) - 1) + 1;
+        const int64_t spread = 2 * static_cast<int64_t>(call.padding[axis]);
+        const int64_t step = static_cast<int64_t>(call.stride[axis]);
+        const int64_t source = x_dims[axis + 2];
+        implied[axis] = transposed ? (source - 1) * step - spread + window
+                                   : (source + spread - window) / step + 1;
+        agrees = agrees && implied[axis] == y_dims[axis + 2];
+      }
       // **The graph travels with the refusal.** An empty engine list is an answer about one exact
       // request: these dims, these strides, this geometry, this element type and this permission.
       // A reader given only the sentence has to guess which of them cuDNN would not take - and the
@@ -539,8 +557,9 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
           "strides [%lld %lld %lld %lld %lld] type %d, w [%lld %lld %lld %lld %lld] type %d, "
           "y [%lld %lld %lld %lld %lld] type %d, kernel [%lld %lld %lld] stride [%lld %lld %lld] "
           "padding [%lld %lld %lld] dilation [%lld %lld %lld], tf32 %d, channels_last %d, "
-          "sm_count_target %s, device_property %s - the shortlist, the exhaustive list and the "
-          "fallback list all name none",
+          "geometry %s (the input, weight and geometry imply [%lld %lld %lld]), sm_count_target "
+          "%s, device_property %s - the shortlist, the exhaustive list and the fallback list all "
+          "name none",
           transposed ? "backward-data" : "forward", static_cast<long long>(x_dims[0]),
           static_cast<long long>(x_dims[1]), static_cast<long long>(x_dims[2]),
           static_cast<long long>(x_dims[3]), static_cast<long long>(x_dims[4]),
@@ -560,6 +579,8 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
           static_cast<long long>(call.padding[2]), static_cast<long long>(call.dilation[0]),
           static_cast<long long>(call.dilation[1]), static_cast<long long>(call.dilation[2]),
           static_cast<int>(call.tf32), static_cast<int>(call.channels_last),
+          agrees ? "agrees" : "DISAGREES", static_cast<long long>(implied[0]),
+          static_cast<long long>(implied[1]), static_cast<long long>(implied[2]),
           sm_counted ? "stated" : "not stated", device_named ? "stated" : "not stated");
       *status = refuse(error, why);
       built = false;
