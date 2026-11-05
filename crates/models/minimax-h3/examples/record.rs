@@ -48,6 +48,7 @@ use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
 use nn::capability::{VideoRequest, VideoTask};
 use minimax_h3::AttentionKind;
+use minimax_h3::output::{Splice, VideoPostprocessor};
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use minimax_h3::Partition;
 use nn::layers::{Linear, WeightOrder};
@@ -154,11 +155,13 @@ fn run() -> Result<(), String> {
             ("video-encoder", video_encoder as Harness),
             ("video-decoder", video_decoder as Harness),
             ("denoiser", denoiser as Harness),
+            ("video-postprocessor", video_postprocessor as Harness),
         ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
         "denoiser" => vec![("denoiser", denoiser as Harness)],
+        "video-postprocessor" => vec![("video-postprocessor", video_postprocessor as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -420,6 +423,81 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
     let run = decoder.decode(&forward, latents, positions, out, &scratch);
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
+}
+
+/// The post-processor's own blend: the clip's raster into the timeline's bytes.
+///
+/// It is the one decoded component with no checkpoint of its own — its two constants are the model's — so it
+/// measures whether the walk's rows are the launch's, not whether a store has them.
+fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
+    let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let mean = loader
+        .constant(
+            "video_postprocessor.pixel_mean",
+            DType::F32,
+            Shape::new(&[3]),
+            &bytes(&minimax_h3::output::PIXEL_MEAN),
+            "minimax-h3",
+        )
+        .map_err(|error| error.to_string())?;
+    let std = loader
+        .constant(
+            "video_postprocessor.pixel_std",
+            DType::F32,
+            Shape::new(&[3]),
+            &bytes(&minimax_h3::output::PIXEL_STD),
+            "minimax-h3",
+        )
+        .map_err(|error| error.to_string())?;
+    let post = VideoPostprocessor::new(request.dtype, mean, std).map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+    let splice = Splice::CLIP;
+    let (height, width) = request.raster;
+    let clip = arena
+        .tensor(
+            request.dtype,
+            Shape::new(&[
+                3,
+                u64::from(splice.overlap.1),
+                u64::from(height),
+                u64::from(width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    // A timeline's second clip blends against its predecessor's tail; the first has nothing to fade
+    // against and skips the seam, so the harness states the predecessor and the blend is recorded.
+    let previous = arena
+        .tensor(
+            request.dtype,
+            Shape::new(&[
+                3,
+                u64::from(splice.overlap.1 - splice.overlap.0),
+                u64::from(height),
+                u64::from(width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    let out = arena
+        .tensor(
+            DType::U8,
+            Shape::new(&[
+                u64::from(splice.frames()),
+                u64::from(height),
+                u64::from(width),
+                3,
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = post.forward(&forward, Some(previous), clip, &splice, out);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
