@@ -42,7 +42,7 @@ An answer that does not parse is incorrect, not a request failure. A failed requ
 
 ## Acceptance
 
-Each cell is measured twice with the same profile: a baseline run on the current implementation, and a candidate run with `--executable <new server binary>`. Both runs must be completed, valid `gsm8k` runs over the same `selected_rows` identity whose count is 1319, with `load.num_prompts` equal to that count and the same `workload.sampling`, `workload.provenance`, `workload.model` and resolved daemon model argument. A pair that fails a premise is reported as not comparable instead of a verdict.
+Each cell is measured twice with the same profile: a reference run on the existing implementation (`f1de185a2`), and a candidate run with `--executable <new server binary>`. Each cell is compared with itself — the same checkpoint, the same KV cache dtype — because two different cells differ in the fields below and a cross-cell pair is reported as not comparable. Both runs must be completed, valid `gsm8k` runs over the same `selected_rows` identity whose count is 1319, with `load.num_prompts` equal to that count and the same `workload.sampling`, `workload.provenance`, `workload.model` and resolved daemon model argument. A pair that fails a premise is reported as not comparable instead of a verdict.
 
 For baseline accuracy `p1 = correct1 / n1` and candidate accuracy `p2 = correct2 / n2`, with `n1 = n2 = 1319`:
 
