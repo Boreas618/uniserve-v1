@@ -6,7 +6,9 @@ fixed seed, whose MP4s land in a fixed directory under ``artifacts/``. This
 test holds ``uniserve_eval/check_h3.toml`` and its frozen manifests to that
 contract: each cell exactly once, one measured row at seed 0 and one warmup
 row at seed 42 copied unchanged from the performance workloads, condition
-media and their anchors kept, and a fixed per-cell MP4 directory. The only
+media and their anchors kept, and a fixed per-cell MP4 directory. The same six
+cells also run reversed, which is the candidate's obligation, and their MP4s
+go to a sibling directory so neither order overwrites the other. The only
 automatic checks of a run stay the video task's MP4 validity and the
 protected performance metrics; this test adds no check to the driver.
 """
@@ -51,9 +53,20 @@ class _Cell:
 
 
 # The cells the service offers: FastH3 DMD serves t2va and fl2va, FastH3
-# OmniRef serves ref2va, and base MiniMax-H3 serves t2va and fl2va through
-# its transformer partition and ref2va through its transformer_ref partition.
+# OmniRef serves ref2va, and base MiniMax-H3 serves t2va and fl2va through its
+# transformer partition and ref2va through its transformer_ref partition. The
+# order is the forward suite's: the reference cell first, which is how today's
+# implementation is measured (it shares one Storage Server key between the two
+# base servers on one checkpoint, so the cell that runs second inherits the
+# first's pages). The reversed suite is the candidate's obligation, and its
+# MP4s go to a sibling directory so neither order overwrites the other.
 _CELLS = {
+    "check-base-ref2va": _Cell(
+        "MiniMaxAI/MiniMax-H3",
+        "ref2va",
+        "w4",
+        "base-ref2va",
+    ),
     "check-fasth3-dmd-t2va": _Cell(
         "FastVideo/FastVideo-FastH3-8-Step-V2",
         "t2va",
@@ -84,13 +97,16 @@ _CELLS = {
         "w3",
         "base-fl2va",
     ),
-    "check-base-ref2va": _Cell(
-        "MiniMaxAI/MiniMax-H3",
-        "ref2va",
-        "w4",
-        "base-ref2va",
-    ),
 }
+
+#: The reversed suite's run order: the forward order with the reference cell
+#: moved from first to last, so the cell that inherited the first's pages runs
+#: last and a pass says the ordering requirement is gone.
+_REVERSED_ORDER = [name for name in _CELLS if name != "check-base-ref2va"] + [
+    "check-base-ref2va"
+]
+#: The reversed suite's cells, each the same request as its forward cell.
+_REVERSED = {f"{name}-reversed": _CELLS[name] for name in _REVERSED_ORDER}
 
 
 @pytest.fixture(scope="module")
@@ -131,18 +147,22 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
         "base-transformer",
         "base-reference",
     }
-    # The launch's default dtype is bfloat16 and an empty quantization
-    # loads the first precision preset, quality, so stating either would not
-    # change what the check set confirms, so a check cell names neither. No worker executable is pinned either, so a
-    # deployment launched with --executable runs the new build end to end.
+    # The launch's default dtype is bfloat16 and an empty quantization loads
+    # the first precision preset, quality, so stating either would not change
+    # what the check set confirms, so a check cell names neither. No worker
+    # executable is pinned either, so a deployment launched with --executable
+    # runs the new build end to end.
     for name, server in raw["servers"].items():
         assert "--worker-executable" not in server["command"], name
         for value in server["command"]:
             assert not value.startswith("dtype="), name
             assert not value.startswith("quantization."), name
     assert list(raw["suites"]["check-h3"]["points"]) == list(_CELLS)
-    assert set(raw["benchmarks"]) == set(_CELLS)
-    assert len(raw["benchmarks"]) == len(_CELLS)
+    assert list(raw["suites"]["check-h3-reversed"]["points"]) == [
+        f"{name}-reversed" for name in _REVERSED_ORDER
+    ]
+    assert set(raw["benchmarks"]) == set(_CELLS) | set(_REVERSED)
+    assert len(raw["benchmarks"]) == len(_CELLS) + len(_REVERSED)
     for name, cell in _CELLS.items():
         point = raw["benchmarks"][name]
         assert point["server"] in raw["servers"]
@@ -176,16 +196,39 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
                 "uniserve_eval/workloads/minimax_h3/check-"
             )
             assert (_PROFILE.parents[1] / manifest).is_file()
+    # A reversed cell is its forward cell: same server, model, frozen rows and
+    # task, and a sibling MP4 directory so neither order overwrites the other.
+    for name, cell in _REVERSED.items():
+        point = raw["benchmarks"][name]
+        forward_name = name.removesuffix("-reversed")
+        assert forward_name in _CELLS
+        forward = raw["benchmarks"][forward_name]
+        for key in ("server", "model", "dataset", "dataset_path", "task"):
+            assert point[key] == forward[key], name
+        assert (
+            point["load"]["warmup_manifest"]
+            == forward["load"]["warmup_manifest"]
+        )
+        assert point["video"]["task"] == cell.task
+        assert (
+            point["video"]["aspect_ratio"] == forward["video"]["aspect_ratio"]
+        )
+        assert point["video"]["media_dir"] == (
+            f"artifacts/minimax_h3/check-reversed/{cell.directory}"
+        )
 
 
 def test_the_suite_covers_every_cell_exactly_once(config) -> None:
     """The profile declares the expected cells, each once, in run order."""
-    assert set(config.benchmarks) == set(_CELLS)
-    assert len(config.benchmarks) == len(_CELLS)
+    assert set(config.benchmarks) == set(_CELLS) | set(_REVERSED)
+    assert len(config.benchmarks) == len(_CELLS) + len(_REVERSED)
     assert config.selected_points("check-h3") == tuple(
         config.benchmarks[name] for name in _CELLS
     )
-    for name, cell in _CELLS.items():
+    assert config.selected_points("check-h3-reversed") == tuple(
+        config.benchmarks[f"{name}-reversed"] for name in _REVERSED_ORDER
+    )
+    for name, cell in {**_CELLS, **_REVERSED}.items():
         point = config.benchmarks[name]
         assert point.video.task == cell.task
         assert point.provenance == {
@@ -271,6 +314,7 @@ def test_each_cell_measures_one_request_at_a_time(config, name: str) -> None:
 
 def test_every_cell_has_its_own_media_directory(config) -> None:
     """No two cells write MP4s to the same fixed directory."""
-    directories = [config.benchmarks[name].video.media_dir for name in _CELLS]
-    assert len(set(directories)) == len(_CELLS)
+    names = list(_CELLS) + list(_REVERSED)
+    directories = [config.benchmarks[name].video.media_dir for name in names]
+    assert len(set(directories)) == len(names)
     assert all(directory is not None for directory in directories)

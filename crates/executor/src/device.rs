@@ -791,11 +791,16 @@ impl Device {
                         self.device.0, self.shadow, runners,
                     )));
                 }
+                // A runner's share has two tenants: the twins a paired forward writes its outputs
+                // to and the page set its KV lives in, which holds a copy of every row's context.
+                // Each takes half, because a twin grows with a bucket's tokens and a page set with
+                // its rows' context, and neither figure is known before a batch names them.
+                let page_set = each / 2;
                 for named in &mut self.runners {
-                    let twins = ops::Twins::new(pools.allocator(), each)
+                    let twins = ops::Twins::new(pools.allocator(), each - page_set)
                         .map_err(|error| Error::Interface(error.to_string()))?;
                     let shadow = crate::shadow::Shadow::new(self.device, twins)?;
-                    named.runner.attach_shadow(shadow);
+                    named.runner.attach_shadow(shadow, page_set);
                 }
                 self.shadow_attached = true;
                 Ok(Step::Done(BatchOutput::default()))
