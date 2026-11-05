@@ -2103,6 +2103,28 @@ impl Denoiser {
             )?);
         }
 
+        // The crossings between the sample's element type and FP32. `ScaledAdd`'s key is the **pair**
+        // of element types, so a walk that states only same-type additions leaves each of these
+        // launches without a cell: the input projection widens the patched rows (video at
+        // `channels · 4` columns, audio at its feature count), each projection's FP32 output is
+        // narrowed into the packed rows at the hidden width, and the timestep pair's FP32 activation
+        // is narrowed into the modulation's width at the start of every evaluation. Each is one
+        // launch of the served path (`denoiser.rs`'s two projections and `modulation.rs`'s narrow).
+        let mut crossings = vec![
+            (nn::DType::F32, dtype, 4 * u64::from(config.video_channels)),
+            (dtype, nn::DType::F32, u64::from(config.hidden_size)),
+            (dtype, nn::DType::F32, u64::from(config.time_dim)),
+        ];
+        // A conditioned deployment carries audio, so its patched audio rows cross the boundary too.
+        if groups == crate::modulation::Groups::Conditioned {
+            crossings.push((nn::DType::F32, dtype, u64::from(config.audio_channels)));
+        }
+        for (target, source, columns) in crossings {
+            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
+                target, source, columns,
+            )?);
+        }
+
         // The solver's step: one gated residual over the whole trajectory of each modality.
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
             dtype,
@@ -3305,6 +3327,54 @@ mod tests {
         assert!(
             residuals.iter().any(|key| key.contains("columns_1000000")),
             "{residuals:?}"
+        );
+    }
+
+    /// The four crossings between the sample's element type and FP32 are programs of their own:
+    /// `ScaledAdd`'s key is the **pair** of element types, so a walk that states only same-type
+    /// additions leaves the served path's widens and narrows without a cell — the failure shows up as
+    /// a launch with no program, not as a shape. Each key here is one launch: the two input
+    /// projections' widenings (`channels · 4` for video, the audio feature count) and the two narrows
+    /// of a projection's FP32 output and of the timestep pair's activation into the modulation.
+    #[test]
+    fn the_denoiser_states_the_crossings_between_the_sample_and_fp32() {
+        let config = crate::config::tests_support::released_config();
+        let (_, denoiser) = config
+            .denoisers
+            .iter()
+            .next()
+            .expect("a released DiT partition");
+        let programs = Denoiser::programs(
+            &denoiser.transformer,
+            denoiser.attention,
+            nn::DType::BF16,
+            32_000,
+            Groups::of(true),
+            &crate::partition::Partition::single(),
+            &[1_000_000],
+            0,
+        )
+        .expect("the denoiser's programs");
+        let crossed: Vec<&str> = programs
+            .iter()
+            .filter(|(name, _)| name == "scaled_add")
+            .map(|(_, key)| key.as_str())
+            .filter(|key| {
+                key.starts_with("target_f32_source_bf16") || key.starts_with("target_bf16_source_f32")
+            })
+            .collect();
+        // The walk sorts its rows, so the expected set is compared in the same order it prints.
+        let mut crossed = crossed;
+        crossed.sort_unstable();
+        assert_eq!(
+            crossed,
+            vec![
+                "target_bf16_source_f32_columns_2688_block_1024",
+                "target_bf16_source_f32_columns_5376_block_1024",
+                "target_f32_source_bf16_columns_32_block_1024",
+                "target_f32_source_bf16_columns_96_block_1024",
+            ],
+            "one program per crossing, keyed by the pair of element types"
         );
     }
     use super::*;
