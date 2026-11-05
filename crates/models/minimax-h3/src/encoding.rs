@@ -1729,8 +1729,8 @@ impl VideoEncoder {
 
     /// The latent frames a **condition** of `frames` frames encodes to.
     ///
-    /// A condition is cut into clips of [`Stack::clip_frames`] frames, each yielding
-    /// [`Stack::clip_latents`] latent frames, and the last clip's trailing [`Stack::token_drop`] latent
+    /// A condition is cut into clips of `Stack::clip_frames` frames, each yielding
+    /// `Stack::clip_latents` latent frames, and the last clip's trailing `Stack::token_drop` latent
     /// frames are dropped - so 17 frames are 2 latent frames and 22 are 7. A single frame is a still and
     /// yields one (`encoding.py:104-111`; the network's causal front padding makes one frame one latent
     /// frame, `video_vae.py:1105-1113`).
