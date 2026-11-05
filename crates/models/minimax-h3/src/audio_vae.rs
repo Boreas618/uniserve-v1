@@ -1313,6 +1313,16 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
 }
 
 impl Decoder for BigVgan {
+    /// The element type this decoder computes in.
+    ///
+    /// `F32`: the audio decoder's arithmetic is single precision throughout - its weights are
+    /// stored in the checkpoint's type and stream at this one - so the latents column and the PCM
+    /// raster it writes are `f32` and `i16` respectively, and the PCM half states its own type at
+    /// the write (`DecodedMedia::audio`).
+    fn element_type(&self) -> nn::DType {
+        nn::DType::F32
+    }
+
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the

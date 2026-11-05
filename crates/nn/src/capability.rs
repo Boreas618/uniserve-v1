@@ -642,27 +642,40 @@ pub struct Step {
     pub sigma_next: f32,
 }
 
+/// One clip's decoded raster extent, as the runtime states it.
+///
+/// Frames, rows and columns of the **decoded** media, which is what a runtime bucket is keyed by.
+/// A decoder's tables and its arena are keyed by the latents the raster decodes from, and the
+/// ratios between the two are the checkpoint's - so the map is the decoder's to state and the
+/// runtime never learns it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Clip {
+    /// Frames of the decoded raster.
+    pub frames: u32,
+    /// Rows of one decoded frame.
+    pub height: u32,
+    /// Columns of one decoded frame.
+    pub width: u32,
+}
+
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
-    /// `[channels, frames, height, width]` decoded frames, channels on the leading axis.
+    /// `[channels, frames, height, width]` decoded frames, in the decoder's own channel order and
+    /// element type.
     ///
-    /// The decoder writes this through the view it is handed, so the axis order is a
-    /// contract between the executor's allocation and every decoder's write: a reader
-    /// who takes it for `[frames, channels, height, width]` addresses a correct buffer
-    /// at the wrong stride and nothing refuses it. `VideoDecoder::decode` states the
-    /// same order in its own refusal, and the two are one statement.
-    ///
-    /// A file's frames-major order is the writer's conversion, not the decoder's.
+    /// Channels first, as the media this boundary carries is stated everywhere else: the latents, the
+    /// conditioning's pixels and its anchoring draw are all `[channels, frames, height, width]`, and
+    /// the layers that place a decoded tile - the unpatchify, the seam blends and the byte step - read
+    /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
+    /// `[frames, height, width, channels]` for a file converts once, where it writes.
     pub video: Option<TensorView>,
-    /// `[samples, 2]` interleaved stereo, one pair per sample.
+    /// `[samples, 2]` interleaved stereo PCM, `i16`, at the decoder's own sample rate.
     ///
-    /// The decoder writes this through the view it is handed, so the order is the contract
-    /// and not a display choice: `AudioVaeDecoder`'s own doc calls `out.audio` "the
-    /// request's `[samples, 2]` window", and a `[channels, samples]` reading would put
-    /// sample `i` of the left channel where sample `0` of the right belongs.
-    ///
-    /// A file's layout is the writer's conversion, as with `video`.
+    /// Two channels, interleaved: one row per sample frame, the left channel's value before the
+    /// right's. The wire format and the file format both want that order, so the decoder writes it and
+    /// no caller transposes. The channel count is fixed - `output::Pcm::CHANNELS` is two - because this
+    /// checkpoint's soundtrack is stereo.
     pub audio: Option<TensorView>,
 }
 
@@ -857,6 +870,37 @@ pub trait Decoder {
     /// already the right length; the executor uploads it. Host bytes only: no allocation, no
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+
+    /// The element type this decoder reads its latents in and writes its decoded media in.
+    ///
+    /// The runner allocates the latents column and the raster column before a graph exists, and a
+    /// buffer's width in bytes is irreversible into an element type: a `[voxels, channels]` column
+    /// of `u16` and of `bf16` are the same bytes. The design's `dtype = "auto"` reads this from the
+    /// checkpoint rather than choosing it, so the model states it here and no runner infers it from
+    /// a byte count or from its deployment's configuration.
+    ///
+    /// Required rather than defaulted: a decoder that does not say has no honest answer to give, and
+    /// the point of this boundary is that the alternative - guessing - is silent.
+    fn element_type(&self) -> DType;
+
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and
+    /// this decoder's tables, scratch and arena are keyed by its latents. The ratios between them
+    /// belong to the checkpoint, so the decoder states the map: a runtime that computed it would be
+    /// holding model knowledge, and the first deployment with another temporal or spatial
+    /// compression would find it in two places.
+    ///
+    /// A decoder whose decoded raster is not its latent layout scaled by ratios it knows refuses by
+    /// name, the way [`Decoder::splice`] does, rather than answering with a layout that reads as
+    /// one.
+    fn layout_of(&self, clip: Clip) -> Result<Layout> {
+        let _ = clip;
+        Err(Error::shape(
+            "Decoder",
+            "this decoder states no latent layout for a clip's raster".to_owned(),
+        ))
+    }
 
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(
