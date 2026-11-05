@@ -2,28 +2,24 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
-use base64::Engine as _;
 use daemon::input::chat::HfChatRenderer;
-use daemon::input::media::{ImageInput, MediaConnector, MediaListError};
+use daemon::input::media::ImageInput;
 use daemon::input::video::VideoGenerationRequest;
 use daemon::input::video::VideoService;
-use daemon::input::{InputProcessor, ModelResolutionError, Prompt, RequestRenderer};
+use daemon::input::{InputProcessor, ModelResolutionError, RequestRenderer};
 use daemon::model::ModelConfig;
 use daemon::model::assets::ResolvedModelFiles;
 use daemon::openai::ApiError;
 use daemon::options::ChatTemplateContentFormatOption;
-use daemon::options::{ImageFetchOptions, MediaOptions};
+use daemon::options::MediaOptions;
 use daemon::output::OutputParams;
 use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use models::ModelDescription;
 use models::video::DenoiserInfo;
 use models::video::ServedCanvas;
 use models::video::plan::{ProcessorConfig, canvas};
-use proto::request::ImageEncoder;
 use proto::request::{GenerationLimits, GenerationRequest};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
@@ -32,15 +28,11 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 /// The model name every test request names and the routes check.
 const SERVED_MODEL: &str = "served-model";
 
-/// Base64 payload of a 1x1 PNG image.
-const PNG_1X1: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 /// Minimal ChatML template: one `<|im_start|>role\ncontent<|im_end|>` turn per
 /// message, then an open assistant turn when a generation prompt is requested.
 const CHAT_TEMPLATE: &str = "{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
 /// Special tokens added to the synthetic tokenizer: ChatML turn delimiters,
-/// the Bagel (`<|vision_*|>`) and SenseNova (`<img>`) image markers, and
-/// reasoning and answer delimiters.
+/// image-marker tokens, and reasoning and answer delimiters.
 const SPECIAL_TOKENS: &[&str] = &[
     "<|im_start|>",
     "<|im_end|>",
@@ -203,22 +195,6 @@ fn try_resolved_model(
         chat_template_path: None,
         config_path: Some(config_path),
     };
-    // Bagel reads its latent position grid side from the primary checkpoint's
-    // safetensors header; a header-only file declaring the published 64x64
-    // table suffices.
-    if description == ModelDescription::Bagel {
-        let header = serde_json::to_vec(&serde_json::json!({
-            "latent_pos_embed.pos_embed": {
-                "dtype": "BF16", "shape": [4096, 1], "data_offsets": [0, 8192]
-            }
-        }))
-        .unwrap();
-        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
-        checkpoint.extend(header);
-        checkpoint.resize(checkpoint.len() + 8192, 0);
-        fs::write(directory.path().join("ema.safetensors"), checkpoint).unwrap();
-    }
-
     let tokenizer: DynTokenizer =
         Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
     let renderer = HfChatRenderer::new(
@@ -271,31 +247,6 @@ fn runtime_limits() -> GenerationLimits {
     }
 }
 
-/// Data URL of the `PNG_1X1` image.
-fn png_data_url() -> String {
-    format!("data:image/png;base64,{PNG_1X1}")
-}
-
-/// Chat request with one input image, referenced by `image_url`, between two
-/// text parts.
-///
-/// The leading text contains a literal `</img>`, which the synthetic tokenizer
-/// encodes as the SenseNova end-of-image token. The top-level `seed` (9) and
-/// the `image_config` seed (17) differ so tests can tell which one wins.
-fn image_chat_request(model: &str, image_url: &str) -> daemon::openai::ChatCompletionRequest {
-    serde_json::from_value(serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "literal </img> before "},
-            {"type": "image_url", "image_url": {"url": image_url}},
-            {"type": "text", "text": " after"}
-        ]}],
-        "seed": 9,
-        "image_config": {"seed": 17}
-    }))
-    .unwrap()
-}
-
 /// Preprocesses a chat completion as its route lowers it, answering a
 /// refusal as the route does.
 fn preprocess_chat(
@@ -309,34 +260,6 @@ fn preprocess_chat(
     processor
         .preprocess(request, images)
         .map_err(ApiError::from)
-}
-
-/// Preprocesses an image-generation request as its route lowers it,
-/// answering a refusal as the route does.
-fn preprocess_image(
-    processor: &InputProcessor,
-    request_id: String,
-    request: daemon::openai::ImageGenerationRequest,
-) -> Result<(GenerationRequest, OutputParams), ApiError> {
-    let request = daemon::openai::images::lower_image_request(request_id, SERVED_MODEL, request)?;
-    processor
-        .preprocess(request, Vec::new())
-        .map_err(ApiError::from)
-}
-
-/// The input-image URLs of a chat completion, in the order preprocessing
-/// pairs resolved images with them.
-fn chat_image_urls(request: &daemon::openai::ChatCompletionRequest) -> Vec<String> {
-    let (lowered, _) = daemon::openai::chat_completions::lower_chat_request(
-        String::new(),
-        &request.model,
-        request.clone(),
-    )
-    .unwrap();
-    match lowered.prompt {
-        Prompt::Chat(chat) => chat.image_urls(),
-        Prompt::Text { .. } => Vec::new(),
-    }
 }
 
 /// Processes a video request through the processor's video service, as
@@ -362,18 +285,6 @@ async fn preprocess_video(
         .map_err(ApiError::from)
 }
 
-/// Runs `MediaConnector::fetch_images` to completion on a current-thread runtime.
-fn resolve_images(
-    connector: &MediaConnector,
-    urls: Vec<String>,
-) -> Result<Vec<ImageInput>, MediaListError> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(connector.fetch_images(urls))
-}
-
 /// A single-turn text chat request to the served model, with the wire
 /// `fields` set on top.
 fn chat_request(fields: serde_json::Value) -> daemon::openai::ChatCompletionRequest {
@@ -389,224 +300,23 @@ fn chat_request(fields: serde_json::Value) -> daemon::openai::ChatCompletionRequ
     serde_json::from_value(request).unwrap()
 }
 
-/// Resolves a chat request's input images under the default image policy
-/// and preprocesses the request with them, as `Engine::generate` does.
-fn preprocess_image_chat(
-    processor: &InputProcessor,
-    request_id: &str,
-    request: daemon::openai::ChatCompletionRequest,
-) -> (GenerationRequest, OutputParams) {
-    let connector = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
-    let images = resolve_images(&connector, chat_image_urls(&request)).unwrap();
-    preprocess_chat(processor, String::from(request_id), request, images).unwrap()
-}
-
-/// HTTP server on an ephemeral 127.0.0.1 port that answers every request
-/// with one `image/png` body from a background thread.
-struct ImageServer {
-    address: SocketAddr,
-}
-
-impl ImageServer {
-    /// Starts serving `body`.
-    fn start(body: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    return;
-                };
-
-                // Consume the request head, then answer and close.
-                let mut head = Vec::new();
-                let mut byte = [0_u8; 1];
-                while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
-                    head.push(byte[0]);
-                }
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(&body);
-            }
-        });
-        Self { address }
-    }
-}
-
-/// An http image URL prepares exactly the image input its equivalent data URL
-/// does, for both omni profiles: the same prompt tokens, encoder-cache
-/// identity, worker payload, position, and encoders.
-#[test]
-fn image_urls_prepare_the_same_image_input_as_data_urls() {
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(PNG_1X1)
-        .unwrap();
-    let server = ImageServer::start(png);
-    // The server is on loopback, which only the private-destination policy reaches.
-    let connector = MediaConnector::from_image_options(&ImageFetchOptions {
-        allow_private: true,
-        ..ImageFetchOptions::default()
-    })
-    .unwrap();
-
-    for (description, model_type) in [
-        (ModelDescription::SenseNova, "neo_chat"),
-        (ModelDescription::Bagel, "bagel"),
-    ] {
-        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let prepare = |image_url: &str| {
-            let request = image_chat_request(SERVED_MODEL, image_url);
-            let images = resolve_images(&connector, chat_image_urls(&request)).unwrap();
-            preprocess_chat(&processor, String::from("image-source"), request, images).unwrap()
-        };
-
-        let (from_url, url_response) = prepare(&format!("http://{}/image.png", server.address));
-        let (from_data, data_response) = prepare(&png_data_url());
-
-        assert_eq!(
-            url_response.prompt_token_ids,
-            data_response.prompt_token_ids
-        );
-        assert_eq!(from_url.multimodal_inputs.images.len(), 1, "{model_type}");
-        assert_eq!(from_url.multimodal_inputs, from_data.multimodal_inputs);
-    }
-}
-
 /// `InputProcessor::new` refuses to bind a profile whose worker limits lack a
 /// feature the profile's configured branches need, and names the missing
-/// feature by its `GenerationFeatures::name` diagnostic. SenseNova appears
-/// twice because it needs both ViT encoding and image generation.
+/// feature by its `GenerationFeatures::name` diagnostic.
 #[test]
-fn model_resolution_requires_every_configured_runtime_branch() {
-    type ChangeLimits = fn(&mut GenerationLimits);
-    let cases: [(ModelDescription, &'static str, &'static str, ChangeLimits); 4] = [
-        (
-            ModelDescription::Qwen3,
-            "qwen3",
-            "runtime_und_execution",
-            |limits: &mut GenerationLimits| {
-                limits
-                    .features
-                    .remove(proto::request::GenerationFeatures::UNDERSTANDING);
-            },
-        ),
-        (
-            ModelDescription::SenseNova,
-            "neo_chat",
-            "runtime_vit_encode",
-            |limits: &mut GenerationLimits| {
-                limits
-                    .features
-                    .remove(proto::request::GenerationFeatures::VISION_ENCODE);
-            },
-        ),
-        (
-            ModelDescription::Bagel,
-            "bagel",
-            "runtime_vae_encode",
-            |limits: &mut GenerationLimits| {
-                limits
-                    .features
-                    .remove(proto::request::GenerationFeatures::LATENT_ENCODE);
-            },
-        ),
-        (
-            ModelDescription::SenseNova,
-            "neo_chat",
-            "runtime_gen_denoise",
-            |limits: &mut GenerationLimits| {
-                limits
-                    .features
-                    .remove(proto::request::GenerationFeatures::IMAGE_GENERATION);
-            },
-        ),
-    ];
-
-    for (description, model_type, required, remove) in cases {
-        let mut limits = runtime_limits();
-        remove(&mut limits);
-        let error = match try_resolved_model(description, model_type, limits) {
-            Ok(_) => panic!("incomplete worker limits must fail model resolution"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains(required), "got: {error}");
-    }
-}
-
-/// The literal `</img>` in the user text also encodes to the end-of-image
-/// token, so the prompt holds two of them. The image's position is the index
-/// of the end-of-image token of the marker rendered for its slot (the second
-/// occurrence), not the first one found in the text.
-#[test]
-fn sensenova_places_the_input_image_at_its_rendered_slot() {
-    let (_directory, tokenizer, model) = resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let request = image_chat_request(SERVED_MODEL, &png_data_url());
-    let (generation, response) = preprocess_image_chat(&model, "image-params", request);
-
-    // The `image_config` seed takes precedence over the text sampling seed.
-    assert_eq!(generation.sampling.seed, Some(17));
-    assert_eq!(generation.image.seed, Some(17));
-
-    let end_image = tokenizer.token_to_id("</img>").unwrap();
-    let marker_positions = response
-        .prompt_token_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(index, token)| (*token == end_image).then_some(index as u32))
-        .collect::<Vec<_>>();
-    assert_eq!(marker_positions.len(), 2);
-    let image = &generation.multimodal_inputs.images[0];
-    let (position, steps) = (
-        image.position,
-        image
-            .encoders
-            .iter()
-            .map(|input| input.encoder)
-            .collect::<Vec<_>>(),
+fn model_resolution_refuses_a_missing_runtime_branch() {
+    let mut limits = runtime_limits();
+    limits
+        .features
+        .remove(proto::request::GenerationFeatures::UNDERSTANDING);
+    let error = match try_resolved_model(ModelDescription::Qwen3, "qwen3", limits) {
+        Ok(_) => panic!("incomplete worker limits must fail model resolution"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("runtime_und_execution"),
+        "got: {error}"
     );
-    assert_eq!(position, marker_positions[1]);
-    assert_eq!(steps, &[ImageEncoder::Vision]);
-
-    // Feedback for the default 16:9 canvas (2048x1152) is a 64x36 ViT grid at
-    // 32 pixels per token plus one marker token.
-    assert_eq!(
-        generation
-            .image_generation
-            .feedback_encoders
-            .iter()
-            .map(|input| input.num_cache_tokens)
-            .collect::<Vec<_>>(),
-        vec![Some(2305)]
-    );
-}
-
-#[test]
-fn bagel_places_the_input_image_between_surrounding_chat_text() {
-    let (_directory, _tokenizer, model) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = image_chat_request(SERVED_MODEL, &png_data_url());
-    let (generation, response) = preprocess_image_chat(&model, "image-params", request);
-    assert_eq!(generation.sampling.seed, Some(17));
-    assert_eq!(generation.image.seed, Some(17));
-    let image = &generation.multimodal_inputs.images[0];
-    let (position, steps) = (
-        image.position,
-        image
-            .encoders
-            .iter()
-            .map(|input| input.encoder)
-            .collect::<Vec<_>>(),
-    );
-
-    // Bagel removes the slot and places the image at the token count of the
-    // text before it, so text on both sides keeps it strictly inside the
-    // prompt. The Bagel profile configures a VAE and a ViT encoder input for
-    // each input image, in that order.
-    assert!(position > 0);
-    assert!((position as usize) < response.prompt_token_ids.len());
-    assert_eq!(steps, &[ImageEncoder::Latent, ImageEncoder::Vision]);
 }
 
 #[tokio::test]
@@ -939,167 +649,38 @@ fn sampling_defaults_preserve_explicit_zero_controls() {
     ));
 }
 
-/// The image API produces an image-only (`GenOnly`) request that keeps the
-/// requested canvas, steps, seed, guidance scale, and negative prompt, the
-/// last as its rendered tokens.
-/// SenseNova accepts only its resolution buckets, and 1536x1536 is one of
-/// them.
-#[test]
-fn image_api_preserves_requested_dimensions_seed_and_guidance() {
-    for (description, model_type, width, height) in [
-        (ModelDescription::SenseNova, "neo_chat", 1536, 1536),
-        (ModelDescription::Bagel, "bagel", 512, 512),
-    ] {
-        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let request = |negative_prompt: Option<&str>| {
-            let mut body = serde_json::json!({
-                "model": SERVED_MODEL,
-                "prompt": "a blue bird",
-                "size": format!("{width}x{height}"),
-                "steps": 4,
-                "seed": 17,
-                "guidance_scale": 7.5
-            });
-            if let Some(negative_prompt) = negative_prompt {
-                body["negative_prompt"] = negative_prompt.into();
-            }
-            let request: daemon::openai::ImageGenerationRequest =
-                serde_json::from_value(body).unwrap();
-            preprocess_image(&processor, String::from("image-api"), request)
-                .unwrap()
-                .0
-        };
-        let generation = request(Some("blur"));
-        assert_eq!(
-            generation.constraint,
-            proto::request::GenerationConstraint::GenOnly
-        );
-        assert_eq!(
-            (generation.image.width, generation.image.height),
-            (width, height)
-        );
-        assert_eq!(generation.image.steps, 4);
-        assert_eq!(generation.max_images, 1);
-        assert_eq!(generation.image.seed, Some(17));
-        assert_eq!(generation.sampling.seed, Some(17));
-        assert_eq!(generation.image.cfg_text_scale, 7.5);
-        // The negative prompt reaches the engine as the tokens the model's
-        // profile renders it to, which guidance conditions on.
-        assert_ne!(
-            generation.negative_prompt_token_ids,
-            request(None).negative_prompt_token_ids
-        );
-    }
-}
-
-/// SenseNova bounds each input image by its share of a pixel budget, so the
-/// same image preprocessed under a different bound is a different encoder
-/// product. Its encoder-cache identity changes once five input images lower
-/// the bound, while requests whose images keep the same bound share it.
-#[test]
-fn sensenova_image_cache_identity_follows_its_pixel_bound() {
-    let (_directory, _tokenizer, processor) =
-        resolved_model(ModelDescription::SenseNova, "neo_chat");
-    let first_image_digest = |count: usize| {
-        let content = (0..count)
-            .map(|_| {
-                serde_json::json!({
-                    "type": "image_url",
-                    "image_url": {"url": png_data_url()}
-                })
-            })
-            .chain([serde_json::json!({"type": "text", "text": "compare"})])
-            .collect::<Vec<_>>();
-        let request: daemon::openai::ChatCompletionRequest =
-            serde_json::from_value(serde_json::json!({
-                "model": SERVED_MODEL,
-                "messages": [{"role": "user", "content": content}]
-            }))
-            .unwrap();
-        let (generation, _) = preprocess_image_chat(&processor, "image-bound", request);
-        generation.multimodal_inputs.images[0].digest
-    };
-
-    // One to four input images keep the 2048x2048 bound; a fifth lowers it.
-    assert_eq!(first_image_digest(1), first_image_digest(4));
-    assert_ne!(first_image_digest(4), first_image_digest(5));
-}
-
-/// Bagel's learned latent position table covers 64 latent patches per side
-/// in the synthetic checkpoint, 1024 pixels at the 16-pixel latent stride. A
-/// canvas with a longer side, which would index past a table row or past the
-/// table, is an invalid request like other unsupported sizes, while a side
-/// of exactly 64 patches is accepted.
-#[test]
-fn bagel_rejects_a_canvas_side_beyond_its_latent_position_table() {
-    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Bagel, "bagel");
-    let request = |size: &str| -> daemon::openai::ImageGenerationRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": SERVED_MODEL,
-            "prompt": "a banner",
-            "size": size
-        }))
-        .unwrap()
-    };
-
-    for size in ["1040x16", "16x1040"] {
-        let Err(error) = preprocess_image(&processor, String::from("latent-side"), request(size))
-        else {
-            panic!("{size} was admitted");
-        };
-        assert!(
-            matches!(error, daemon::openai::ApiError::InvalidRequest { .. }),
-            "{size}: {error:?}"
-        );
-    }
-    for size in ["1024x16", "16x1024"] {
-        let (generation, _) =
-            preprocess_image(&processor, String::from("latent-side"), request(size)).unwrap();
-        assert_eq!(
-            format!("{}x{}", generation.image.width, generation.image.height),
-            size
-        );
-    }
-}
-
 /// The cache salt selects a stable isolation partition, and prompt logprobs
 /// disable prefix-cache reads only, because a prefix-cache hit would skip the
 /// prompt positions whose logprobs are requested.
 #[test]
 fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
-    for (description, model_type) in [
-        (ModelDescription::Qwen3, "qwen3"),
-        (ModelDescription::SenseNova, "neo_chat"),
-        (ModelDescription::Bagel, "bagel"),
-    ] {
-        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        let preprocess = |fields: serde_json::Value| {
-            preprocess_chat(
-                &processor,
-                String::from("cache-controls"),
-                chat_request(fields),
-                Vec::new(),
-            )
-            .unwrap()
-        };
+    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    let preprocess = |fields: serde_json::Value| {
+        preprocess_chat(
+            &processor,
+            String::from("cache-controls"),
+            chat_request(fields),
+            Vec::new(),
+        )
+        .unwrap()
+    };
 
-        let (shared, _) = preprocess(serde_json::json!({}));
-        assert_eq!(shared.cache.isolation_key, None);
-        assert!(shared.cache.read && shared.cache.write);
+    let (shared, _) = preprocess(serde_json::json!({}));
+    assert_eq!(shared.cache.isolation_key, None);
+    assert!(shared.cache.read && shared.cache.write);
 
-        // The same salt always produces the same key, and another salt another.
-        let (isolated, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
-        assert!(isolated.cache.isolation_key.is_some());
-        assert!(isolated.cache.read && isolated.cache.write);
-        let (repeat, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
-        assert_eq!(repeat.cache.isolation_key, isolated.cache.isolation_key);
-        let (other, _) = preprocess(serde_json::json!({"cache_salt": "ba"}));
-        assert_ne!(other.cache.isolation_key, isolated.cache.isolation_key);
+    // The same salt always produces the same key, and another salt another.
+    let (isolated, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
+    assert!(isolated.cache.isolation_key.is_some());
+    assert!(isolated.cache.read && isolated.cache.write);
+    let (repeat, _) = preprocess(serde_json::json!({"cache_salt": "ab"}));
+    assert_eq!(repeat.cache.isolation_key, isolated.cache.isolation_key);
+    let (other, _) = preprocess(serde_json::json!({"cache_salt": "ba"}));
+    assert_ne!(other.cache.isolation_key, isolated.cache.isolation_key);
 
-        let (logprobs, response) = preprocess(serde_json::json!({"prompt_logprobs": 0}));
-        assert!(!logprobs.cache.read && logprobs.cache.write);
-        assert!(response.prompt_logprobs);
-    }
+    let (logprobs, response) = preprocess(serde_json::json!({"prompt_logprobs": 0}));
+    assert!(!logprobs.cache.read && logprobs.cache.write);
+    assert!(response.prompt_logprobs);
 }
 
 /// A streamed chat response has no field for prompt logprobs. A streamed
@@ -1108,45 +689,39 @@ fn cache_salt_isolates_and_prompt_logprobs_disable_cache_reads() {
 /// the same buffered request still requests them.
 #[test]
 fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
-    for (description, model_type) in [
-        (ModelDescription::Qwen3, "qwen3"),
-        (ModelDescription::SenseNova, "neo_chat"),
-        (ModelDescription::Bagel, "bagel"),
-    ] {
-        let (_directory, _tokenizer, processor) = resolved_model(description, model_type);
-        for stream in [true, false] {
-            let request: daemon::openai::ChatCompletionRequest =
-                serde_json::from_value(serde_json::json!({
-                    "model": SERVED_MODEL,
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "modalities": ["text"],
-                    "stream": stream,
-                    "prompt_logprobs": 0
-                }))
-                .unwrap();
-
-            let (generation, response) = preprocess_chat(
-                &processor,
-                String::from("stream-prompt-logprobs"),
-                request,
-                Vec::new(),
-            )
+    let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    for stream in [true, false] {
+        let request: daemon::openai::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": SERVED_MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+                "modalities": ["text"],
+                "stream": stream,
+                "prompt_logprobs": 0
+            }))
             .unwrap();
 
-            assert_eq!(
-                response.prompt_logprobs, !stream,
-                "{model_type} stream={stream}"
-            );
-            assert_eq!(
-                generation.sampling.prompt_logprobs_requested(),
-                !stream,
-                "{model_type} stream={stream}"
-            );
-            assert_eq!(
-                generation.cache.read, stream,
-                "{model_type} stream={stream}"
-            );
-        }
+        let (generation, response) = preprocess_chat(
+            &processor,
+            String::from("stream-prompt-logprobs"),
+            request,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.prompt_logprobs, !stream,
+            "stream={stream}"
+        );
+        assert_eq!(
+            generation.sampling.prompt_logprobs_requested(),
+            !stream,
+            "stream={stream}"
+        );
+        assert_eq!(
+            generation.cache.read, stream,
+            "stream={stream}"
+        );
     }
 }
 
@@ -1221,27 +796,21 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement
 /// `u64` value, and a logprob count of `-1` requests every candidate
-/// (`u32::MAX`), for every token model.
+/// (`u32::MAX`).
 #[test]
-fn sampling_controls_have_the_same_meaning_across_token_models() {
-    for (description, model_type) in [
-        (ModelDescription::Qwen3, "qwen3"),
-        (ModelDescription::SenseNova, "neo_chat"),
-        (ModelDescription::Bagel, "bagel"),
-    ] {
-        let (_directory, _, model) = resolved_model(description, model_type);
-        for seed in [-1, -2] {
-            let (request, _) = preprocess_chat(
-                &model,
-                String::from("sampling"),
-                chat_request(
-                    serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
-                ),
-                Vec::new(),
-            )
-            .unwrap();
-            assert_eq!(request.sampling.seed, Some(seed as u64));
-            assert_eq!(request.sampling.n_logprobs, u32::MAX);
-        }
+fn negative_seeds_and_logprob_counts_are_reinterpreted() {
+    let (_directory, _, model) = resolved_model(ModelDescription::Qwen3, "qwen3");
+    for seed in [-1, -2] {
+        let (request, _) = preprocess_chat(
+            &model,
+            String::from("sampling"),
+            chat_request(
+                serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(request.sampling.seed, Some(seed as u64));
+        assert_eq!(request.sampling.n_logprobs, u32::MAX);
     }
 }

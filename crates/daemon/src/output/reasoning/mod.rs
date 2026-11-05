@@ -3,20 +3,15 @@
 //! A parser splits a stream of decoded text deltas into reasoning text and
 //! visible content by matching delimiter text such as `<think>` and
 //! `</think>`. [`DelimitedReasoningParser`] implements the state machine;
-//! [`Qwen3ReasoningParser`] and [`Gemma4ReasoningParser`] configure it for
-//! their chat output formats behind the [`ReasoningParser`] interface that the
-//! chat output stage consumes, and the multimodal output filter in
-//! `output::omni` configures it from a profile's
-//! `OutputFilterPolicy`.
+//! [`Qwen3ReasoningParser`] configures it for its chat output format behind
+//! the [`ReasoningParser`] interface that the chat output stage consumes.
 
 mod delimited;
-mod gemma4;
 mod qwen3;
 
 use thiserror::Error;
 
 pub use self::delimited::DelimitedReasoningParser;
-pub use self::gemma4::Gemma4ReasoningParser;
 pub use self::qwen3::Qwen3ReasoningParser;
 
 /// Incremental split of one generation's decoded text into reasoning and
