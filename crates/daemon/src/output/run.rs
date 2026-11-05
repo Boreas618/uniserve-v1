@@ -558,15 +558,7 @@ impl<S: ResponseSink> GenerationRun<S> {
                 tokenizer.clone(),
                 parser.parse_reasoning,
             )?,
-            handoff::parser::Kind::ParserKindGemma4 => ChatOutputProcessor::gemma4(
-                parser.parse_tools,
-                &mut decode_options,
-                tokenizer.clone(),
-                parser.parse_reasoning,
-            )?,
-            handoff::parser::Kind::ParserKindSenseNova | handoff::parser::Kind::ParserKindNone => {
-                ChatOutputProcessor::new(None, None)
-            }
+            handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
         };
         if let Some(parsers) = state.processor {
             processor.resume(parsers);

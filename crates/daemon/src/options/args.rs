@@ -528,8 +528,6 @@ mod tests {
             "--set",
             "flashinfer_config.workspace_size=1GiB",
             "--set",
-            "readout_config.canvas=64",
-            "--set",
             "server_config.host=0.0.0.0",
         ])
         .unwrap();
@@ -549,10 +547,6 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(config.flashinfer_config.workspace_size, 1 << 30);
-        assert_eq!(
-            config.readout_config.canvas,
-            crate::options::CanvasMode::Fixed(64)
-        );
         assert_eq!(config.server_config.host, "0.0.0.0");
     }
 
@@ -663,12 +657,11 @@ mod tests {
 
     #[test]
     fn exported_options_remain_valid_for_their_model_family() {
-        use models::ModelDescription::{DiffusionGemma, MiniMaxH3, Qwen3};
+        use models::ModelDescription::{MiniMaxH3, Qwen3};
 
         for (description, setting) in [
             (Qwen3, "chat_config.reasoning_parser=none"),
             (MiniMaxH3, "video_config.max_seconds=5"),
-            (DiffusionGemma, "readout_config.canvas=compact"),
         ] {
             let (config, stated) = resolved(&["m", "--set", setting]).unwrap();
             config.validate(&stated).unwrap();
@@ -997,10 +990,10 @@ mod tests {
     /// rather than ignored; unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use models::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
+        use models::ModelDescription::{MiniMaxH3, Qwen3};
 
         let (_, defaults) = resolved(&["m"]).unwrap();
-        for description in [Qwen3, Bagel, MiniMaxH3, DiffusionGemma] {
+        for description in [Qwen3, MiniMaxH3] {
             assert!(defaults.refuse_foreign_options(description).is_ok());
         }
 
@@ -1008,10 +1001,10 @@ mod tests {
             let (_, stated) = resolved(&["m", "--set", set]).unwrap();
             stated.refuse_foreign_options(description).is_err()
         };
-        assert!(refused("readout_config.canvas=compact", Qwen3));
-        assert!(!refused("readout_config.canvas=compact", DiffusionGemma));
-        assert!(refused("video_config.max_seconds=5", DiffusionGemma));
+        assert!(refused("video_config.max_seconds=5", Qwen3));
         assert!(!refused("video_config.max_seconds=5", MiniMaxH3));
+        assert!(refused("chat_config.reasoning_parser=none", MiniMaxH3));
+        assert!(!refused("chat_config.reasoning_parser=none", Qwen3));
         // A video pipeline schedules no token batches and renders no chat.
         for token_option in [
             "max_num_batched_tokens=2048",
