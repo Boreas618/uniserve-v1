@@ -1229,7 +1229,13 @@ fn encode(args: &Args) -> Result<(), String> {
         let mut pixels_host = Vec::new();
         let pixels = match plan.pixels {
             Some(extent) => {
+                // **The condition's pixels are a scene, five axes**: `[1, channels, frames, height,
+                // width]`. The encoder's own input is the four-axis raster `[channels, frames,
+                // height, width]`, and the conditioned path reads the batch axis before it takes the
+                // tile views - a four-axis buffer is refused with its own shape, which is what this
+                // harness earned until the axis was here.
                 let shape = Shape::new(&[
+                    1,
                     channels,
                     u64::from(extent.frames),
                     u64::from(extent.height),
