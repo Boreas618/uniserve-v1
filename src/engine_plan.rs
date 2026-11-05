@@ -798,9 +798,14 @@ impl EpochPlan {
             bos: None,
             eos: None,
             end_of_image: None,
-            // A media request generates a clip, not tokens, so the generation limits of a causal
-            // language model do not apply.
-            generation_limits: None,
+            // A media request generates a clip, not tokens, so no understanding feature is served;
+            // the engine still needs the two lower bounds, as the frontend's arm for this class
+            // states them (`crates/frontend/src/model/generation.rs`).
+            generation_limits: Some(GenerationLimits {
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..GenerationLimits::default()
+            }),
             max_model_len: self.build.max_model_len.map(|length| length.get()),
             watchdog_timeout: Some(self.watchdog_timeout()),
         })
