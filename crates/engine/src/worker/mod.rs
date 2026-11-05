@@ -182,8 +182,6 @@ pub struct WorkerProcessArgs {
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's; the rank parses it.
     pub worker_mesh: Option<String>,
-    /// Optional process-world communication backend.
-    pub distributed_backend: Option<String>,
     /// Module graph coverage policy.
     pub graph_policy: GraphPolicy,
     /// Strictly increasing decode batch sizes captured as CUDA graphs;
