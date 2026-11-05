@@ -526,11 +526,10 @@ impl Roster for ProcessRoster {
 
     fn serve(&mut self, epoch: u64, requests: &str) {
         self.requests = requests.to_owned();
+        // A frontend in this process follows the epochs' record, and one of its own hears the
+        // command below: either way the record says what serves.
+        self.epochs.announce_serve(epoch);
         let Some(frontend) = self.frontend else {
-            tracing::warn!(
-                epoch,
-                "the frontend is not connected: nothing serves the epoch"
-            );
             return;
         };
         if let Err(error) = self.link.commands.send(

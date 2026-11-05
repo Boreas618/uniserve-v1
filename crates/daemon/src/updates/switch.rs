@@ -247,6 +247,8 @@ pub(crate) struct Switch {
     update: Update,
     /// The target epoch's number, which the record is kept under.
     target: u64,
+    /// The hosts whose targets the daemon has yet to give their programs.
+    awaiting_programs: BTreeSet<String>,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
     /// The launch generation the target's children are started at.
@@ -353,6 +355,7 @@ impl Switch {
             build: start.build,
             requests,
             phase: Phase::Preparing,
+            awaiting_programs: BTreeSet::new(),
             retire: discarded,
             park_sent: BTreeSet::new(),
             parked: BTreeSet::new(),
@@ -501,6 +504,18 @@ impl Switch {
             return;
         }
         self.parked.insert(host.to_owned());
+        self.progress(roster);
+    }
+
+    /// States that `hosts`' targets are given their programs by the daemon, so none of them is
+    /// promoted before it holds them: a target parks before any `Precopy` names a generation.
+    pub(crate) fn await_programs(&mut self, hosts: impl IntoIterator<Item = String>) {
+        self.awaiting_programs.extend(hosts);
+    }
+
+    /// `host`'s target took its programs.
+    pub(crate) fn handed(&mut self, roster: &mut impl Roster, host: &str) {
+        self.awaiting_programs.remove(host);
         self.progress(roster);
     }
 
@@ -993,7 +1008,9 @@ impl Switch {
     fn progress(&mut self, roster: &mut impl Roster) {
         let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
         match self.phase {
-            Phase::Preparing if hosts.is_subset(&self.parked) => {
+            Phase::Preparing
+                if hosts.is_subset(&self.parked) && self.awaiting_programs.is_empty() =>
+            {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());
                 for node in &self.nodes {

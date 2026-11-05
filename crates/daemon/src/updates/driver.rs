@@ -116,6 +116,23 @@ impl Driver {
         }
     }
 
+    /// States that the running switch's target on `host` is given its programs by the daemon.
+    pub(crate) fn await_programs(&self, host: &str) {
+        let mut state = self.lock();
+        if let Some(running) = state.switch.as_mut() {
+            running.await_programs([host.to_owned()]);
+        }
+    }
+
+    /// The running switch's target on `host` took its programs.
+    pub(crate) fn handed(&self, host: &str) {
+        let mut state = self.lock();
+        let State { roster, switch } = &mut *state;
+        if let Some(running) = switch.as_mut() {
+            running.handed(roster, host);
+        }
+    }
+
     /// The operator commits the trial. `true` when a switch was there to
     /// commit; the acknowledgement arrives through [`Driver::advance`].
     pub(crate) fn commit(&self) -> bool {
