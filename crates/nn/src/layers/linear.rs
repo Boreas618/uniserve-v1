@@ -448,7 +448,7 @@ impl Nvfp4Linear {
         bias: bool,
         output: DType,
     ) -> Result<GemmDescriptor> {
-        Ok(GemmDescriptor {
+        let descriptor = GemmDescriptor {
             packed: DType::U8,
             scale: DType::F8E4M3,
             accumulate: ACCUMULATE,
@@ -459,12 +459,16 @@ impl Nvfp4Linear {
             n,
             k,
             pdl: false,
-        })
+        };
+        // The walk's own statement of the pair, refused here if it ever stops being one: this is the
+        // descriptor the key file and the fixture are built from.
+        ops::fp4::check_gemm(&descriptor)?;
+        Ok(descriptor)
     }
 
     /// This projection's descriptor for `rows` activation rows, keyed by their class.
     pub fn descriptor(&self, rows: u32, output: DType) -> Result<GemmDescriptor> {
-        Ok(GemmDescriptor {
+        let descriptor = GemmDescriptor {
             packed: DType::U8,
             scale: self.scales.dtype(),
             accumulate: ACCUMULATE,
@@ -479,7 +483,11 @@ impl Nvfp4Linear {
             n: self.n,
             k: self.k,
             pdl: false,
-        })
+        };
+        // The scale's type is the checkpoint's own statement, so a plane declared as anything but
+        // E4M3 makes a key no store built - refused here, where the layer can say which plane.
+        ops::fp4::check_gemm(&descriptor)?;
+        Ok(descriptor)
     }
 
     /// The arena one launch of this projection carves for a request of `rows` activation rows.
@@ -675,6 +683,59 @@ mod tests {
         assert_eq!(projection.n(), 8);
         assert_eq!(projection.weight().dtype, DType::U8);
         assert_eq!(projection.weight().shape.dims(), &[8, 32]);
+    }
+
+    /// A scales plane declared as bytes is refused where the key is built, not at the launch.
+    ///
+    /// The block scales of an NVFP4 weight are E4M3 and the packed pairs are bytes; a checkpoint
+    /// whose scales plane says otherwise would key `scale_u8`, which no store built, and the launch
+    /// would report a missing program rather than the declared type. The refusal is one line in the
+    /// product's own check, called here as the descriptor is built.
+    #[test]
+    fn a_scales_plane_declared_as_bytes_is_refused_where_the_key_is_built() {
+        // The fixture's scales plane is `U8`, which is the wrong declaration this test needs.
+        let scales = packed(8, 64, ScaleLayout::Swizzled128X4);
+        let projection =
+            Nvfp4Linear::new(&scales, None, ScaleLayout::Swizzled128X4, DType::BF16, 128).unwrap();
+        let error = projection
+            .descriptor(16, DType::BF16)
+            .expect_err("a byte scales plane is not an NVFP4 operand");
+        let text = error.to_string();
+        assert!(
+            text.contains("f8e4m3 block scale"),
+            "the refusal names the pair: {text}"
+        );
+    }
+
+    /// The walk's descriptor and a loaded projection's are one key.
+    ///
+    /// `descriptor_of` states the operand types from the geometry alone, which is what the key walk
+    /// and the fixture use; `descriptor` states the scales' type from the checkpoint's own plane. A
+    /// checkpoint whose scales plane is declared as anything but E4M3 makes the two keys differ, and
+    /// the launch then asks the store for a program the walk never named - with every number in the
+    /// key looking plausible. This pins the pair this deployment's checkpoint states.
+    #[test]
+    fn the_walk_and_a_loaded_projection_state_one_key() {
+        let (n, k, rows) = (8_u64, 64_u64, 16_u32);
+        let layout = ScaleLayout::Swizzled128X4;
+        let mut scales = packed(n, k, layout);
+        scales.scales = weight(DType::F8E4M3, layout.shape(n, k).dims());
+        let projection = Nvfp4Linear::new(&scales, None, layout, DType::BF16, 128).unwrap();
+
+        let loaded = projection.descriptor(rows, DType::BF16).expect("a key");
+        let walked =
+            Nvfp4Linear::descriptor_of(rows, n as u32, k as u32, layout, false, DType::BF16)
+                .expect("the walk's key");
+
+        assert_eq!(loaded.packed, walked.packed, "the packed bytes");
+        assert_eq!(
+            loaded.scale, walked.scale,
+            "the block scale: the checkpoint's plane and the walk's literal must be one type"
+        );
+        assert_eq!(loaded.m, walked.m, "the row class");
+        assert_eq!(loaded.n, walked.n);
+        assert_eq!(loaded.k, walked.k);
+        assert_eq!(loaded.layout, walked.layout);
     }
 
     #[test]

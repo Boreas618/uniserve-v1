@@ -469,6 +469,17 @@ impl Executor {
     /// The answer comes from the plan the runners stated at spawn, not from the device thread: the
     /// mechanism forms a media batch only where this answers, so a missing answer is the executor
     /// saying it does not serve the computation rather than a check nobody makes.
+    ///
+    /// # What the caller must state
+    ///
+    /// `Buckets::select_media` matches the extent **exactly**, so the answer is only as good as the
+    /// extent the computation carries. An encode is sized by rows and tokens like a prefill and its
+    /// buckets carry [`crate::plan::Extent::None`], so `None` selects one. **A denoise bucket carries
+    /// the model's `Layout` and a decode bucket its `Clip`, so a computation stating `Extent::None`
+    /// selects neither** — and that is a caller's omission, not this device's answer: the layout is
+    /// the model's arithmetic and no caller may compute it, while the clip's `frames`, `height` and
+    /// `width` are the request's own. A caller that cannot state either asks a runner for the bucket
+    /// its warm request names instead of asking this function to reverse one.
     pub fn media(&self, computation: &crate::plan::Computation) -> Option<crate::plan::Bucket> {
         self.media.select_media(computation)
     }

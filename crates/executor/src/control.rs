@@ -352,6 +352,11 @@ impl Control {
         Ok(self.attached.len())
     }
 
+    /// How many attached daemons are connected now.
+    pub fn live_attached(&self) -> usize {
+        self.attached.iter().flatten().count()
+    }
+
     /// How many attached fronts this process has ever had, live or not: the
     /// indices stay in place so no request's record moves when one detaches.
     pub fn attached_fronts(&self) -> usize {

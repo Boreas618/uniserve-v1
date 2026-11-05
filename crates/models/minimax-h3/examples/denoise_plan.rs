@@ -323,7 +323,8 @@ fn run() -> Result<(), String> {
             continue;
         }
         exact += usize::from(used == reserved);
-        slack += i128::try_from(reserved - used).unwrap_or(i128::MAX);
+        // `u64 -> i128` is infallible: the slack of a plan is not a place to hide a `MAX`.
+        slack += i128::from(reserved - used);
         println!(
             "{:>5}x{:<5} {:>4} frames {:>4} tokens: {} buffer(s), {reserved} B planned, {used} B taken, {}",
             case.height,

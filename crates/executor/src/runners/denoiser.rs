@@ -109,8 +109,20 @@ impl WarmRequest {
 /// The figures a denoiser's columns are sized by, which the deployment states once at open.
 #[derive(Clone, Copy, Debug)]
 pub struct DenoiserShape {
-    /// The element type the latents and the packed conditioning rows are stored in.
-    pub dtype: DType,
+    /// The element type of the **stack**: the packed conditioning rows a step reads and the
+    /// checkpoint's own arithmetic. The text encoder writes these, so this is the encoder's type.
+    pub stack: DType,
+    /// The element type of the **sample**: the trajectory the solver accumulates into, and its
+    /// noise. It is the model's own statement rather than this runner's
+    /// (`minimax_h3::denoiser::SAMPLE_DTYPE` is FP32) and it is not the stack's: the reference keeps
+    /// its trajectory in FP32 and refuses any other type at its entry, because a sample in the
+    /// stack's type would round the trajectory once per evaluation.
+    ///
+    /// **Two types, therefore two sizes.** A latent column sized at the stack's type is half the
+    /// bytes the model reads, so a runner that held one type here would refuse every step with
+    /// "the video latents are bf16 and a trajectory is f32" and the arena floor would be short by the
+    /// trajectory's own size.
+    pub sample: DType,
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
     pub width: u32,
@@ -223,10 +235,10 @@ impl DenoiseColumns {
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
         let text = width * u64::from(shape.width.max(1));
         Ok(Self {
-            video: Column::new(device, shape.dtype, rows * video)?,
-            audio: Column::new(device, shape.dtype, rows * audio)?,
-            text: Column::new(device, shape.dtype, rows * text)?,
-            source: Column::new(device, shape.dtype, rows * text)?,
+            video: Column::new(device, shape.sample, rows * video)?,
+            audio: Column::new(device, shape.sample, rows * audio)?,
+            text: Column::new(device, shape.stack, rows * text)?,
+            source: Column::new(device, shape.stack, rows * text)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
         })
@@ -238,19 +250,19 @@ impl DenoiseColumns {
         let rows = u64::from(rows.max(1));
         Staged::zero(
             &mut self.staged.video,
-            rows * latent_bytes(&layout.video, shape.dtype)?,
+            rows * latent_bytes(&layout.video, shape.sample)?,
         )?;
         let audio = match layout.audio {
-            Some(audio) => latent_bytes(&audio, shape.dtype)?,
-            None => shape.dtype.bytes().unwrap_or(1),
+            Some(audio) => latent_bytes(&audio, shape.sample)?,
+            None => shape.sample.bytes().unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
         let text = u64::from(shape.width.max(1));
         let bytes = shape
-            .dtype
+            .stack
             .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.dtype)))?;
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.stack)))?;
         Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
         // The conditioner folds these into `text`, so a warm capture must read defined features as
         // well as defined rows: an uninitialised buffer would make the capture's output depend on
@@ -319,6 +331,43 @@ fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (
     (rows, width)
 }
 
+/// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
+///
+/// A row is the layout's **capacity** - `text_rows + condition_rows` rows of `width` - and a
+/// product holds the request's own rows, which the encoder wrote. The prefix's rows past the
+/// request's are the padding the packing names, and its value is zeros
+/// (`packing::DensePacking::zero_row`). So a short product fills the row's front and the rest is
+/// zeroed rather than refused.
+///
+/// **A product longer than the row is refused**, and by name: it is not padding, it is a plan
+/// disagreement - the store holds more of the request's rows than the layout those rows are copied
+/// into can carry - and truncating it would drop states the denoiser was told are there.
+fn fills(
+    request: ipc::RequestKey,
+    kind: Product,
+    available: u64,
+    bytes: u64,
+) -> Result<(u64, u64)> {
+    if available == 0 {
+        return Err(Error::Invalid(format!(
+            "request {} presents no byte(s) of {} where a row of {bytes} bytes must be filled: an \
+             empty region is a product no call wrote",
+            request.request_id.0,
+            kind.name()
+        )));
+    }
+    if available > bytes {
+        return Err(Error::Invalid(format!(
+            "request {} presents {available} byte(s) of {} where a row holds {bytes}: the store's \
+             region is longer than the conditioning block it is copied into, so the deployment's \
+             text capacity is below the rows the request was encoded with",
+            request.request_id.0,
+            kind.name()
+        )));
+    }
+    Ok((available, bytes - available))
+}
+
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
 /// A free function so the presence rule is testable without a runner: constructing one takes a
@@ -327,11 +376,12 @@ fn missing_product(
     products: &dyn Products,
     request: ipc::RequestKey,
     kinds: &[Product],
-    device: platform::DeviceId,
-    stream: StreamId,
 ) -> Result<Option<Product>> {
+    // **Presence, not placement.** Whether a product exists is a fact about the store; where a
+    // reader wants it is `copy_into`'s question. Asking `borrow` here made a deployment that puts
+    // the text encoder on its own GPU refuse every step with "no call produced it".
     for kind in kinds {
-        if products.borrow(request, *kind, device, stream)?.is_none() {
+        if !products.holds(request, *kind) {
             return Ok(Some(*kind));
         }
     }
@@ -655,7 +705,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// A view shorter than the row it must fill is refused by name: a short copy would leave the
     /// tail of the row holding the previous request's values, which is worse than a refusal because
     /// the graph runs either way.
-    fn seed(&self, bucket: Bucket) -> Result<()> {
+    fn seed(&mut self, bucket: Bucket) -> Result<()> {
         // A replay always follows the `submit` that produced it, and that submit is what names the
         // rows: an empty set means the batch was served already, or a job outlived its submit. The
         // graph would then read the host columns - which are a warm capture's zeros - so this is
@@ -668,48 +718,60 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                  rather than a request's conditioning"
             )));
         }
-        let Some(products) = self.products.as_ref() else {
+        let Some(products) = self.products.clone() else {
             return Ok(());
         };
+        // The rows and the stream are copied out before the columns are borrowed mutably: the
+        // padding below writes a column's host side, which is the memory its graph reads.
+        let pending = self.pending.clone();
+        let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
         let (rows, width) = conditioning_row(&self.shape, &layout);
-        let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
+        let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
         })?);
         let bytes = rows * width * element;
-        for row in &self.pending {
+        for row in &pending {
             let (request, index) = (row.request, row.index);
             for (kind, column) in [
-                (Product::Text, &self.columns.text),
-                (Product::Source, &self.columns.source),
+                (Product::Text, &mut self.columns.text),
+                (Product::Source, &mut self.columns.source),
             ] {
-                let Some(view) = products.borrow(request, kind, self.device, self.stream_id())?
-                else {
+                // **The copy is the store's, not this runner's.** A deployment can put the text
+                // phase on its own GPU, so the product may be on another device or another stream,
+                // and only the store holds both ends: it waits on the producer's write before this
+                // stream copies. A runner issuing its own `memcpy_async` from another device's
+                // region would be reading bytes no ordering protects.
+                let Some(published) = products.product(request, kind)? else {
                     return Err(products::absent(request, kind));
                 };
-                let available = view.byte_len()?;
-                if available < bytes {
-                    return Err(Error::Invalid(format!(
-                        "request {} presents {} byte(s) of {} where a row of bucket {bucket} needs \
-                         {bytes}: the store's region is shorter than the row it must fill",
-                        request.request_id.0,
-                        available,
-                        kind.name()
-                    )));
+                let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
+                let destination = TensorView::new(
+                    ops::DevicePtr::new(column.host.address() + u64::from(index) * bytes),
+                    self.shape.stack,
+                    Shape::new(&[copied / u64::from(element)]),
+                );
+                if !products.copy_into(request, kind, &destination, &stream)? {
+                    return Err(products::absent(request, kind));
                 }
-                // SAFETY: both ranges are device memory that outlives this copy - the column is the
-                // runner's, allocated for the largest bucket it serves, and the span being written
-                // is one row inside it; the store's region belongs to the request, which is in
-                // flight until the executor forgets it. The copy is on the runner's own stream, so
-                // the graph that reads it is ordered after it.
-                unsafe {
-                    platform::memcpy_async(
-                        column.host.address() + u64::from(index) * bytes,
-                        view.ptr.address(),
-                        usize::try_from(bytes)
-                            .map_err(|_| Error::Invalid("a row is larger than memory".into()))?,
-                        &self.stream,
-                    )?;
+                // The rest of the row is the packing's zero row. A layout's prefix is the
+                // **deployment's capacity** (`DensePacking::text_rows` - "a layout holds every
+                // prompt that fits it") while the encoder publishes the request's own rows, so the
+                // tail is the padding the packing names and its value is zeros
+                // (`DensePacking::zero_row`). It is written here, on the host side of the column,
+                // because that is the memory the captured graph reads: a column's device view is
+                // its pinned buffer's address (`columns.rs`), so these bytes are the graph's.
+                if zeroed > 0 {
+                    let start = usize::try_from(u64::from(index) * bytes + copied)
+                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
+                    let end = usize::try_from(u64::from(index) * bytes + bytes)
+                        .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
+                    // SAFETY: `start..end` is inside this column's row `index`, which the column
+                    // was sized for, and no copy or launch writes it concurrently: the front copy
+                    // is issued on the stream before the launch and covers `..start` alone.
+                    unsafe {
+                        column.host.as_mut_slice()[start..end].fill(0);
+                    }
                 }
             }
         }
@@ -765,6 +827,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// **No copy**: the captured graph updates the latents in place, so the column *is* the
     /// trajectory and what the store records is a view of it. That is the handoff to a decode, and
     /// it is why the store's `VideoLatents` is a name for memory rather than a second buffer.
+    ///
+    /// **The same lifetime rule as the encoder's text states**: a second batch's step zero gives its
+    /// own request the same row of this column (`prepare_latents` writes it), so a second media batch
+    /// on this runner before the first request's trajectory is forgotten replaces the bytes the first
+    /// request's product still names - silently, because the view is a name and not a copy. One
+    /// in-flight batch per runner, and the rule is execution's to keep (an encode and a denoise are
+    /// the same shape: a captured graph addresses one output region per row).
     fn publish(&self, bucket: Bucket) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Ok(());
@@ -772,19 +841,23 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         for row in &self.pending {
             let request = row.request;
             let latents = self.latents(bucket, row.index)?;
+            let written = products::written_on(&self.stream)?;
             products.publish(
                 request,
                 Product::VideoLatents,
                 self.device,
                 self.stream_id(),
+                Some(written),
                 &latents.video,
             )?;
             if let Some(audio) = latents.audio {
+                let written = products::written_on(&self.stream)?;
                 products.publish(
                     request,
                     Product::AudioLatents,
                     self.device,
                     self.stream_id(),
+                    Some(written),
                     &audio,
                 )?;
             }
@@ -802,13 +875,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             return Err(products::no_store(request));
         };
         let kinds = step_products(&layout_of(bucket)?);
-        match missing_product(
-            products.as_ref(),
-            request,
-            kinds,
-            self.device,
-            self.stream_id(),
-        )? {
+        match missing_product(products.as_ref(), request, kinds)? {
             Some(kind) => Err(products::absent(request, kind)),
             None => Ok(()),
         }
@@ -900,8 +967,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Copies the staged host sides to the device, in one place, so a capture and a replay agree on
-    /// what the graph reads.
+    /// Copies the staged host sides to the device, **every column**, for a walk.
+    ///
+    /// A capture has no trajectory and must still read defined values, so it stages zeros into the
+    /// latent columns and uploads them here. A replay does not: see [`Self::upload_step`].
     fn upload(&mut self) -> Result<()> {
         let stream = self.stream.clone();
         // The host side and the device column are two fields of one value, so the copy borrows
@@ -921,6 +990,33 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
+        self.columns.text.upload(&stream)?;
+        self.columns.source.upload(&stream)?;
+        self.columns.step.upload(&stream)?;
+        Ok(())
+    }
+
+    /// Copies the columns a **replay** writes from the host: the conditioning rows and the step's
+    /// index.
+    ///
+    /// **The trajectory is not one of them.** The captured graph advances the latents *in place* —
+    /// that is the whole of a diffusion step — while the staged buffer holds a warm capture's zeros,
+    /// so uploading it before every replay would restart the trajectory at zero whenever a step
+    /// began. Nothing refused: step one would advance zeros, and the clip would be the draw plus one
+    /// step rather than the schedule. The draw at step zero writes the whole block itself
+    /// (`first_step`), so the column never needs this path for its initial values.
+    fn upload_step(&mut self) -> Result<()> {
+        let stream = self.stream.clone();
+        let DenoiseColumns {
+            text,
+            source,
+            step,
+            staged,
+            ..
+        } = &mut self.columns;
+        text.write(&staged.text)?;
+        source.write(&staged.source)?;
+        step.write(&staged.step)?;
         self.columns.text.upload(&stream)?;
         self.columns.source.upload(&stream)?;
         self.columns.step.upload(&stream)?;
@@ -1143,9 +1239,11 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 bucket, generation, ..
             } => {
                 let stream = self.stream.clone();
-                self.upload()?;
+                // What a replay writes from the host: the conditioning rows and the step index. The
+                // trajectory is the column's own, advanced in place by the previous step.
+                self.upload_step()?;
                 // The conditioning is the store's, and it overwrites the rows the upload just wrote:
-                // that order is why one upload covers every column.
+                // that order is why one upload covers every column it writes.
                 self.seed(*bucket)?;
                 // The first step's trajectory is drawn and folded here, on the arena the graph
                 // below addresses, so the graph advances a trajectory rather than a warm capture's
@@ -1459,9 +1557,33 @@ mod product_tests {
             _kind: Product,
             _device: platform::DeviceId,
             _stream: StreamId,
+            _written: Option<Arc<platform::Event>>,
             _view: &TensorView,
         ) -> Result<()> {
+            // The presence rule reads the store; who published what is `Store::held`'s own setup.
             Ok(())
+        }
+
+        fn holds(&self, _request: ipc::RequestKey, kind: Product) -> bool {
+            self.held.contains(&kind)
+        }
+
+        fn product(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+        ) -> Result<Option<products::Published>> {
+            unreachable!("the presence rule reads existence, not a placement")
+        }
+
+        fn copy_into(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+            _destination: &TensorView,
+            _stream: &platform::Stream,
+        ) -> Result<bool> {
+            unreachable!("the presence rule never copies")
         }
 
         fn forget(&self, _request: ipc::RequestKey) -> usize {
@@ -1487,6 +1609,40 @@ mod product_tests {
         ipc::RequestKey::new(1, ipc::RequestId(41), 0)
     }
 
+    /// The capacity rule a served request depends on: the layout's conditioning block is the
+    /// **deployment's** capacity, the product holds the request's own rows, and the difference is
+    /// the packing's zero row.
+    ///
+    /// Both directions matter. A short product is padded rather than refused - refusing it is every
+    /// request, because a prompt is shorter than the prefix capacity a deployment plans for. A long
+    /// one is refused by name: it is not padding but a plan disagreement, and truncating it would
+    /// drop states the denoiser was told are there.
+    #[test]
+    fn a_short_product_fills_the_rows_front_and_a_long_one_is_refused() {
+        let (copied, zeroed) = fills(request(), Product::Text, 300, 512).expect("a short product");
+        assert_eq!((copied, zeroed), (300, 212));
+
+        let exact = fills(request(), Product::Text, 512, 512).expect("an exact product");
+        assert_eq!(exact, (512, 0));
+
+        let refusal = fills(request(), Product::Text, 640, 512)
+            .expect_err("a product longer than the block")
+            .to_string();
+        assert!(
+            refusal.contains("640"),
+            "the refusal names what it got: {refusal}"
+        );
+        assert!(
+            refusal.contains("512"),
+            "and what the block holds: {refusal}"
+        );
+
+        let empty = fills(request(), Product::Text, 0, 512)
+            .expect_err("a product no call wrote")
+            .to_string();
+        assert!(empty.contains("no byte(s)"), "{empty}");
+    }
+
     /// The rule a step depends on: the refusal names **the first kind the store lacks, in the
     /// runner's own order**, so a failure says which call never ran rather than that something did.
     #[test]
@@ -1495,14 +1651,8 @@ mod product_tests {
             held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
             Some(Product::Source),
@@ -1522,14 +1672,8 @@ mod product_tests {
             held: CONDITIONED_STEP_PRODUCTS.to_vec(),
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(missing, None);
         assert_eq!(
             store.asked.lock().unwrap().len(),
@@ -1568,14 +1712,8 @@ mod product_tests {
             held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
             Some(Product::Source),
