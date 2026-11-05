@@ -1360,6 +1360,7 @@ fn prepare_request(message: wire::Prepare) -> Result<PrepareRequest> {
                 wire::ProgramPhase::try_from(program.phase)
                     .map_err(|_| Error::Protocol("unknown program phase".into()))?,
             )?,
+            part: None,
         };
         let selector = match program.selector {
             Some(wire::program_request::Selector::Backend(backend)) => Selector::Latest {

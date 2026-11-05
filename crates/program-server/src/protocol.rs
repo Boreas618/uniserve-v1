@@ -621,6 +621,7 @@ impl Client {
                             phase: wire::ProgramPhase::try_from(program.phase)
                                 .map_err(|_| Error::Protocol("unknown phase".into()))?
                                 .try_into()?,
+                                part: None,
                         };
                         let program = program.program.ok_or_else(|| {
                             Error::Protocol("a chosen program carries no program".into())

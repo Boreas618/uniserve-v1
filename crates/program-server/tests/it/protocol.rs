@@ -319,6 +319,7 @@ fn the_four_phases_of_a_program_slot_travel_whole() {
                 slot: ProgramSlot {
                     op: "attention".into(),
                     phase: Some(*phase),
+                    part: None,
                 },
                 selector: Selector::Latest {
                     backend: "triton".into(),

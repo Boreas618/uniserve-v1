@@ -186,6 +186,7 @@ impl ProgramCommand {
                     let slot = program_server::ProgramSlot {
                         op: kernel.op,
                         phase,
+                        part: None,
                     };
                     programs.insert(slot, program_from_wire(program)?);
                 }

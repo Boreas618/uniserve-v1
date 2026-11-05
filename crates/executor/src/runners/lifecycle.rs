@@ -515,6 +515,22 @@ impl Lifecycle {
     }
 }
 
+/// Walks a bucket once for real, then records the same walk.
+///
+/// The first launch of an operator does host work of its own, such as building a GEMM plan and its
+/// workspace, and no recording can carry that: inside one the operator refuses, because its plan
+/// was never built. So the bucket's first capture walks it outside the recording first, which leaves
+/// every operator ready, and the recording then holds launches alone. A rebind needs no such walk:
+/// its new operators are warmed by the shadow pass.
+pub(crate) fn warmed_capture(
+    stream: &platform::Stream,
+    mut walk: impl FnMut() -> Result<()>,
+) -> Result<Walked> {
+    walk()?;
+    stream.synchronize()?;
+    walk_capture(stream, walk)
+}
+
 pub(crate) fn walk_capture(
     stream: &platform::Stream,
     walk: impl FnOnce() -> Result<()>,
