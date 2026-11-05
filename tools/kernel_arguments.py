@@ -37,6 +37,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -197,6 +198,37 @@ def rust_launch(op: str) -> tuple[pathlib.Path, str] | None:
     return None
 
 
+def match_arms(chain: str) -> set[tuple[str, ...]]:
+    """The distinct word lists a chain's `match` arms pack.
+
+    Empty for a chain with no `match`. An arm that packs nothing is the empty tuple, which is a
+    finding - the chain's words live elsewhere - and not the absence of arms.
+    """
+    return {
+        tuple(packed(arm)[0]) for arm in re.findall(r"=>\s*\{([^{}]*)\}", chain)
+    }
+
+
+def _one_arm(chain: str) -> str:
+    """The chain with its `match` replaced by one arm's words, for the arms that agree.
+
+    The words the chain packs outside the `match` stay; the arms become one list because every arm
+    stated the same one. Which element of the choice a call takes is a descriptor's business, which
+    is why a disagreement is the caller's to refuse and never this function's to pick.
+    """
+    opening = chain.index("{", chain.index("match"))
+    depth, index = 1, opening + 1
+    while index < len(chain) and depth:
+        if chain[index] == "{":
+            depth += 1
+        elif chain[index] == "}":
+            depth -= 1
+        index += 1
+    arm = next(iter(match_arms(chain)))
+    words = "".join(f".{word}()" for word in arm)
+    return chain[:opening] + "{" + words + "}" + chain[index:]
+
+
 def packed(chain: str) -> tuple[list[str], bool, bool]:
     """The word kinds one chain packs, whether a loop packs an unstated run, and whether an `else`.
 
@@ -219,6 +251,13 @@ def packed(chain: str) -> tuple[list[str], bool, bool]:
                 depth -= 1
             index += 1
         chain = chain[:start] + chain[index:]
+    # A `match` counts one arm, not all of them: `topk_softmax` packed thirteen words against an
+    # entry that takes eleven, because both arms were read. The arms are not a choice about the
+    # entry's parameters, so the ones that agree are one list and a caller refuses the ones that
+    # do not (`match_arms` is how it asks).
+    arms = match_arms(chain)
+    if len(arms) == 1 and not any(len(arm) == 0 for arm in arms):
+        chain = _one_arm(chain)
     words = [
         PACKERS[name]
         for name in re.findall(r"\.([a-z0-9_]+)\(", chain)
@@ -534,33 +573,15 @@ def native_parameters(
     # A chain that chooses its words in a `match` arm is not one list: counting every arm counted
     # thirteen words for `topk_softmax`, whose entry takes eleven. Which arm a call takes is a
     # descriptor's business, so the comparison stops and says so rather than picking one.
-    if re.search(r"\bmatch\b", chain):
-        arms = {
-            tuple(packed(arm)[0])
-            for arm in re.findall(r"=>\s*\{([^{}]*)\}", chain)
-        }
-        if len(arms) == 1 and not any(len(arm) == 0 for arm in arms):
-            # Every arm packs the same words, so the arms are not a choice about the entry's
-            # parameters and the list they agree on is the chain's one packing.
-            # Keep the words the chain packs outside the `match` and take one arm's for the rest.
-            opening = chain.index("{", chain.index("match"))
-            depth, index = 1, opening + 1
-            while index < len(chain) and depth:
-                if chain[index] == "{":
-                    depth += 1
-                elif chain[index] == "}":
-                    depth -= 1
-                index += 1
-            arm = next(iter(arms))
-            chain = chain[:opening] + "{" + "".join(f".{word}()" for word in arm) + "}" + chain[index:]
-        else:
-            words = packed(chain)[0]
-            return (
-                "gap",
-                f"{op}/{package.name}: the chain packs {len(words)} word(s) across "
-                f"{len(arms)} distinct match arm(s), and its entry's parameter list is one arm's "
-                f"packing - not compared rather than guessed",
-            )
+    arms = match_arms(chain)
+    if arms and (len(arms) != 1 or any(len(arm) == 0 for arm in arms)):
+        words = packed(chain)[0]
+        return (
+            "gap",
+            f"{op}/{package.name}: the chain packs {len(words)} word(s) across "
+            f"{len(arms)} distinct match arm(s), and its entry's parameter list is one arm's "
+            f"packing - not compared rather than guessed",
+        )
     words = packed(chain)[0]
     if not words:
         return None
@@ -767,11 +788,20 @@ def sweep(
                     f"compares that declaration with the Rust structure it mirrors"
                 )
             elif backend is None:
-                # The row names no backend and the operator states none a cell could be read from,
-                # so the honest report is that the row is unattributable rather than unbuilt.
+                # The row names no backend and the operator states no single one a cell could be
+                # read from - every backend it states is native, or several Triton ones exist. The
+                # store may well hold cells under some of them, so the report names what it holds
+                # rather than claiming it holds nothing: "no cell under any backend" was a claim
+                # this reader could not make, and a reader who checked found two (`f32` and `fa4`).
+                holding = (
+                    sorted(p.name for p in (store / op).iterdir() if p.is_dir())
+                    if (store / op).is_dir()
+                    else []
+                )
                 gaps.append(
-                    f"{finding} {descriptor}: the row names no backend, and the store holds no "
-                    f"cell for it under any backend the operator states"
+                    f"{finding} {descriptor}: the row names no backend and none can be attributed "
+                    f"to it; the store holds cell(s) under "
+                    f"{', '.join(holding) if holding else 'no backend'}"
                 )
             elif _native_package(package):
                 # A native package is not a Triton cell, so no build produces a `metadata.json` for
@@ -868,6 +898,88 @@ def sweep(
     return problems, gaps, cells
 
 
+def self_test() -> list[str]:
+    """The comparison's own rules, on fixtures small enough to read.
+
+    Every case here is one the instrument got wrong once: a canonical spelling that made two equal
+    fields look different, a pairing chosen by position, a chain that counted both arms of a
+    conditional, and a disagreement that did not say where. **A comparison that has only ever agreed
+    is untested**, so the cases include pairs that must differ.
+    """
+    problems: list[str] = []
+
+    def expect(name: str, got, want) -> None:
+        if got != want:
+            problems.append(f"{name}: got {got!r}, wanted {want!r}")
+
+    # One storage type, two spellings. A header that widened a field moves every field after it, so
+    # these must compare equal only when they are the same width.
+    expect("mut c_void", _storage("*mut c_void", True), _storage("void*", False))
+    expect("const i32", _storage("*const i32", True), _storage("const int32_t*", False))
+    expect("i64 array", _storage("[i64; 5]", True), _storage("int64_t[5]", False))
+    expect("byte array", _storage("[u8; 512]", True), _storage("char[512]", False))
+    if _storage("[i32; 3]", True) == _storage("int64_t[3]", False):
+        problems.append("a narrowed field compares equal to a widened one")
+
+    # A named length is a number, not a name, and a chain that chooses in an `else` or a `match`
+    # packs one arm's words rather than both.
+    expect(
+        "else arm",
+        packed("a.view(x).i32(1); }\n else {\n b.pointer(y).i32(2); }")[0],
+        ["tensor", "i32"],
+    )
+    expect(
+        "match arms agreeing",
+        packed("x.view(a); match y { Some(_) => { p.pointer(q).i32(1) } None => { p.pointer(r).i32(2) } }; z.view(b)")[0],
+        ["tensor", "pointer", "i32", "tensor"],
+    )
+
+    # The best pairing is chosen by comparison, and a disagreement names the position and both
+    # spellings rather than only the counts.
+    with tempfile.TemporaryDirectory() as place:
+        root = pathlib.Path(place)
+        source = root / "ops.rs"
+        source.write_text(
+            'const NAME: &\'static str = "toy";\n'
+            "pub struct ToyCall {\n    pub left: i32,\n    pub right: i64,\n}\n"
+            "pub struct OtherCall {\n    pub one: f32,\n    pub two: f32,\n}\n"
+        )
+        header = root / "toy.h"
+        header.write_text(
+            "struct uniserve_toy_call {\n  int32_t left;\n  int64_t right;\n};\n"
+        )
+        globals()["OPS"] = root
+        try:
+            found = rust_calls("toy")
+            expect("two structures read", len(found[1]), 2)
+            declared = header_structs(header)[0][1]
+            best = min(found[1], key=lambda held: _differences(held[1], declared))
+            expect("the matching structure is chosen", best[0], "ToyCall")
+            expect("and it agrees", _differences(best[1], declared), (0, 0))
+
+            widened = root / "wide.h"
+            widened.write_text(
+                "struct uniserve_toy_call {\n  int32_t left;\n  int32_t right;\n};\n"
+            )
+            wider = header_structs(widened)[0][1]
+            self_test.problem = [
+                f"position {index}: {left_name} {left}, {right_name} {right}"
+                for index, ((left_name, left), (right_name, right)) in enumerate(
+                    zip(best[1], wider)
+                )
+                if left_name != right_name
+                or _storage(left, True) != _storage(right, False)
+            ]
+            expect(
+                "a widened field is named by position",
+                self_test.problem,
+                ["position 1: right i64, right int32_t"],
+            )
+        finally:
+            globals()["OPS"] = OPS
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -897,11 +1009,23 @@ def main() -> int:
         help="compare each native package's call structure with the Rust one it mirrors",
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the comparison's own rules on small fixtures and exit 1 on a failure",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print one record of what was compared, for a caller to keep under artifacts/",
     )
     arguments = parser.parse_args()
+
+    if arguments.self_test:
+        failures = self_test()
+        print(f"{len(failures)} self-test failure(s)")
+        for failure in failures:
+            print(f"  failure: {failure}")
+        return 1 if failures else 0
 
     def record(mode: str, compared: int, problems: list[str], gaps: list[str]) -> None:
         """One machine-readable statement of a run: what mode, what it reached, what it found."""
@@ -925,41 +1049,42 @@ def main() -> int:
 
 
 
-    if arguments.native:
-        problems, gaps, compared = native(arguments.verbose)
-        if arguments.json:
-            record("native", compared, problems, gaps)
-            return 1 if (arguments.check and problems) else 0
-        for problem in problems:
-            print(f"  problem: {problem}")
-        for gap in gaps:
-            print(f"  gap:     {gap}")
-        return 1 if (arguments.check and problems) else 0
-
-    if arguments.fixture:
-        if not arguments.store:
-            print(
-                "--fixture needs --store: the cells are what the comparison reads"
+    # A run may ask for both comparisons, and the harness asks for both in one check: the artifact
+    # sweep is what a built storeanswers and the native comparison needs no store at all, so one
+    # invocation is one line in the count and neither mode is a second entry in a table keyed by name.
+    if arguments.native or arguments.fixture:
+        problems: list[str] = []
+        gaps: list[str] = []
+        if arguments.native:
+            found, missing, compared = native(arguments.verbose)
+            problems.extend(found)
+            gaps.extend(missing)
+            if arguments.json:
+                record("native", compared, found, missing)
+        if arguments.fixture:
+            if not arguments.store:
+                print("--fixture needs --store: the cells are what the comparison reads")
+                return 2
+            found, missing, compared = sweep(
+                pathlib.Path(arguments.fixture),
+                pathlib.Path(arguments.store),
+                arguments.target,
             )
-            return 2
-        problems, gaps, compared = sweep(
-            pathlib.Path(arguments.fixture),
-            pathlib.Path(arguments.store),
-            arguments.target,
-        )
-        if arguments.json:
-            record(
-                f"cells {arguments.fixture} against {arguments.store}",
-                compared,
-                problems,
-                gaps,
-            )
-            return 1 if (arguments.check and problems) else 0
-        print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
-        for problem in problems:
-            print(f"  problem: {problem}")
-        for gap in gaps:
-            print(f"  gap:     {gap}")
+            problems.extend(found)
+            gaps.extend(missing)
+            if arguments.json:
+                record(
+                    f"cells {arguments.fixture} against {arguments.store}",
+                    compared,
+                    found,
+                    missing,
+                )
+        if not arguments.json:
+            print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
+            for problem in problems:
+                print(f"  problem: {problem}")
+            for gap in gaps:
+                print(f"  gap:     {gap}")
         return 1 if (arguments.check and problems) else 0
 
     operators = arguments.operator or sorted(

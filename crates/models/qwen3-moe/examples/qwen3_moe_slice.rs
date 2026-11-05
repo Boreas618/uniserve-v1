@@ -60,7 +60,7 @@
 //! serve path. This is a numerics harness. Its results are for comparing against a reference, and
 //! its failures are for naming the operator and the key that produced them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -2042,8 +2042,8 @@ mod tests {
             KvPages::Bf16,
             super::Encoded {
                 declared: true,
-                tokens: Some(15),
-                generated: Some(1),
+                tokens: Some(128),
+                generated: None,
             },
         )
         .expect("the fixture");
@@ -2051,21 +2051,86 @@ mod tests {
             .iter()
             .filter(|(operator, _)| operator == "nvfp4_gemm")
             .count();
-        // The product is compiled per row count: every `m_15` and `m_1` row the fixture names, and
-        // no row for a count this run will not launch.
-        assert_eq!(packed, 6, "{encoded:?}");
+        // The product is compiled per row count: the rows the fixture names at the one count this
+        // run launches, and no row for a count it does not.
+        assert_eq!(packed, 3, "{encoded:?}");
         for operator in ["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"] {
             assert!(
                 encoded.iter().any(|(name, _)| name == operator),
                 "{operator} missing"
             );
         }
+        // An encoded deployment launches the shared operators too: its embedding, norms, attention
+        // and sampler are the same programs a dense deployment launches. A list that dropped them
+        // let the NVFP4 run load 288 packed weights and then stop at its first launch, naming an
+        // operator its store held.
+        assert!(
+            encoded.iter().any(|(operator, _)| operator == "embedding"),
+            "the embedding is a shared program: {encoded:?}"
+        );
         assert!(
             !encoded
                 .iter()
                 .any(|(_, descriptor)| descriptor.contains("_m_7_")),
             "a row count this run will not launch"
         );
+        // A count the fixture names no row for is refused with both numbers, before any launch: the
+        // alternative is a run that installs nothing for its product and reports a missing kernel
+        // for a row its store never had.
+        // The launch states the smallest class that holds its rows, so a prompt of 16 rows is
+        // served by the `m_128` cells exactly as a prompt of 128 rows is.
+        let short = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded {
+                declared: true,
+                tokens: Some(16),
+                generated: None,
+            },
+        )
+        .expect("a prompt of 16 rows is served by the m_128 class");
+        assert_eq!(
+            short
+                .iter()
+                .filter(|(operator, _)| operator == "nvfp4_gemm")
+                .count(),
+            3,
+            "{short:?}"
+        );
+        // A continuation's single row is the same class, so `--generate` is not refused either.
+        assert!(
+            super::needed_keys(
+                root,
+                Stage::Decode,
+                false,
+                KvPages::Bf16,
+                super::Encoded {
+                    declared: true,
+                    tokens: Some(16),
+                    generated: Some(1),
+                },
+            )
+            .is_ok(),
+            "a continuation launches the same class"
+        );
+        // A batch above the largest class has no row at all, and is refused naming both numbers.
+        let large = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded {
+                declared: true,
+                tokens: Some(5000),
+                generated: None,
+            },
+        )
+        .expect_err("a batch above the largest class");
+        let message = format!("{large}");
+        assert!(message.contains("5000"), "{message}");
+        assert!(message.contains("4096"), "{message}");
     }
 
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
@@ -2749,6 +2814,26 @@ fn needed_keys(
         ))
     })?;
     let mut keys = Vec::new();
+    // A packed product is compiled per row class, so the classes the fixture names for it are the
+    // only ones a run can install.
+    let mut stated: BTreeSet<u32> = BTreeSet::new();
+    // The launch states the smallest class that holds its rows (`nn::layers::packed_rows`), never
+    // the raw count: a 16-row prompt asks for `m_128` exactly as a 128-row one does, and a
+    // continuation's single row asks for the same class. Comparing a raw count with the fixture's
+    // classes instead would refuse every prompt shorter than the first class and every
+    // continuation, which is the whole of a decode deployment.
+    let mut classes: Vec<u32> = Vec::new();
+    for count in [encoded.tokens, encoded.generated].into_iter().flatten() {
+        let rows = u32::try_from(count).unwrap_or(u32::MAX);
+        let class = nn::layers::packed_rows(rows).map_err(|error| {
+            Failure::message(format!(
+                "a batch of {count} row(s) has no packed row class: {error}"
+            ))
+        })?;
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2772,11 +2857,22 @@ fn needed_keys(
         // packed product is compiled per row count, so only the counts this run will launch are
         // required - the prompt's, and one row when a continuation will follow it.
         let packed_row = operator == "nvfp4_gemm"
-            && [encoded.tokens, encoded.generated]
-                .into_iter()
-                .flatten()
-                .any(|rows| descriptor.contains(&format!("_m_{rows}_")));
-        if encoded.declared != (packed_row || ENCODED_OPERATORS.contains(&operator)) {
+            && classes
+                .iter()
+                .any(|class| descriptor.contains(&format!("_m_{class}_")));
+        if operator == "nvfp4_gemm"
+            && let Some(rows) = packed_rows_in(descriptor)
+        {
+            stated.insert(rows);
+        }
+        // A packed operator belongs to an encoded deployment and to no other: a dense one has no
+        // use for it, and a packed product whose row count this run will not launch is not a
+        // program it asks for. Every other operator belongs to both — an NVFP4 checkpoint's
+        // embedding, norms, attention and sampler launch the same programs a dense checkpoint's do
+        // — so a filter that dropped those would load and then fail at its first launch, naming an
+        // operator its own store holds.
+        let packed_operator = operator == "nvfp4_gemm" || ENCODED_OPERATORS.contains(&operator);
+        if packed_operator && (!encoded.declared || (operator == "nvfp4_gemm" && !packed_row)) {
             continue;
         }
         if !required(stage, operator, sampling) {
@@ -2784,7 +2880,38 @@ fn needed_keys(
         }
         keys.push((operator.to_owned(), descriptor.to_owned()));
     }
+    // A count the fixture names no row for is a program this run cannot install, and the launch
+    // would report it as a missing kernel for a row the store never had. Name both numbers here,
+    // where a run learns what to regenerate instead of where it stops.
+    if encoded.declared {
+        for class in &classes {
+            if !stated.contains(class) {
+                return Err(Failure::message(format!(
+                    "the fixture states no `nvfp4_gemm` row for the {class}-row class, which this \
+                     run launches: it states {}. A packed product is compiled per row class, so a \
+                     class the fixture does not name has no program to install — regenerate the \
+                     fixture for this deployment's classes.",
+                    stated
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    }
     Ok(keys)
+}
+
+/// The row count a `nvfp4_gemm` descriptor names, which is the batch it was compiled for.
+fn packed_rows_in(descriptor: &str) -> Option<u32> {
+    let mut fields = descriptor.split('_');
+    while let Some(field) = fields.next() {
+        if field == "m" {
+            return fields.next().and_then(|value| value.parse().ok());
+        }
+    }
+    None
 }
 
 /// Whether `stage` launches `operator`, which decides whether a missing key is fatal.

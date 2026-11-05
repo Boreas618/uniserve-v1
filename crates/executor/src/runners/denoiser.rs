@@ -49,6 +49,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::diag::Diag;
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -155,6 +156,7 @@ struct Staged {
     video: Vec<u8>,
     audio: Vec<u8>,
     text: Vec<u8>,
+    source: Vec<u8>,
     step: Vec<u8>,
 }
 
@@ -196,6 +198,13 @@ struct DenoiseColumns {
     audio: Column,
     /// `[requests x (text_rows + condition_rows) x width]` conditioning rows.
     text: Column,
+    /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
+    ///
+    /// A model with a conditioner between the encoder and the denoiser reads these and folds them
+    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]), so both buffers are the same
+    /// shape and both are the runner's: the conditioner runs inside a captured forward, and a buffer
+    /// it allocated would be a capture that allocates.
+    source: Column,
     /// `[1]` `i64`: the step index the coefficients are selected by (`Conditioning::step`).
     step: Column,
     /// The host side of each column.
@@ -216,6 +225,7 @@ impl DenoiseColumns {
             video: Column::new(device, shape.dtype, rows * video)?,
             audio: Column::new(device, shape.dtype, rows * audio)?,
             text: Column::new(device, shape.dtype, rows * text)?,
+            source: Column::new(device, shape.dtype, rows * text)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
         })
@@ -241,6 +251,10 @@ impl DenoiseColumns {
             .bytes()
             .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.dtype)))?;
         Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
+        // The conditioner folds these into `text`, so a warm capture must read defined features as
+        // well as defined rows: an uninitialised buffer would make the capture's output depend on
+        // whatever the allocator last held.
+        Staged::zero(&mut self.staged.source, rows * width * text * bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -265,6 +279,45 @@ pub struct Prepared {
     pub audio: Vec<u8>,
     /// The encoded conditioning rows, `[text_rows + condition_rows, width]`.
     pub text: Vec<u8>,
+    /// The text encoder's own features, the same shape as `text`: what a model's conditioner folds
+    /// into those rows before the first evaluation ([`nn::Denoiser::prepare_conditioning`]).
+    ///
+    /// It is a separate buffer and not a second name for `text` because the fold is in place over
+    /// `text` while reading these, so one buffer would have the conditioner overwrite its own input.
+    pub source: Vec<u8>,
+}
+
+/// The products one denoising step reads, in the order a refusal names them.
+///
+/// **This is the list the runner places into `Conditioning`, and nothing else.** A step here reads
+/// the encoded conditioning rows (`text`, and `source`, the encoder's own features that
+/// `Denoiser::prepare_conditioning` folds into `text` before the first evaluation) and the
+/// trajectory it advances (`latents`). `images` and `audio` are `Conditioning` fields another model
+/// fills; this runner passes `None` for both, so requiring them would refuse every step of a model
+/// that does not use them - which is what a list written from the capability's fields rather than
+/// from this file's own assembly would do.
+///
+/// The request's raw condition media is not here either: it is an input to the conditioning rather
+/// than a row of it, it is per condition, and the scheduler names it
+/// (`crate::runners::products`).
+const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source, Product::Latents];
+
+/// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
+///
+/// A free function so the presence rule is testable without a runner: constructing one takes a
+/// device, and the rule is about a store rather than about a device.
+fn missing_product(
+    products: &dyn Products,
+    request: ipc::RequestKey,
+    device: platform::DeviceId,
+    stream: StreamId,
+) -> Result<Option<Product>> {
+    for kind in STEP_PRODUCTS {
+        if products.borrow(request, *kind, device, stream)?.is_none() {
+            return Ok(Some(*kind));
+        }
+    }
+    Ok(None)
 }
 
 /// One bucket and the request it was derived from.
@@ -292,6 +345,11 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     columns: DenoiseColumns,
+    /// The epoch's product store: what a call of this request produced for this one to read.
+    ///
+    /// `None` until the executor attaches it, and a step that needs a product without one refuses by
+    /// name rather than staging zeros.
+    products: Option<Arc<dyn Products>>,
     /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
     diag: Diag,
     /// The step of the schedule the staged batch is, which names the diagnosis dumps.
@@ -352,6 +410,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             counters: None,
             tables: Tables::new(),
             columns,
+            products: None,
             diag: Diag::from_env(),
             staged_step: None,
         })
@@ -518,9 +577,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let text = view
             .at(view.offset_elements(u64::from(index) * rows * width))
             .reshape(Shape::new(&[rows, width]));
+        let features = self.columns.source.shaped(&[rows * width]);
+        let source = features
+            .at(features.offset_elements(u64::from(index) * rows * width))
+            .reshape(Shape::new(&[rows, width]));
         Ok(Conditioning {
             text,
-            source: None,
+            source: Some(source),
             media,
             images: None,
             audio: None,
@@ -584,7 +647,35 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             &request.text,
             "conditioning rows",
         )?;
+        if request.source.len() as u64 != bytes {
+            return Err(Error::Invalid(format!(
+                "a step of bucket {bucket} carries {} byte(s) of encoder features and the layout \
+                 states {bytes}, which is the conditioning rows' own extent",
+                request.source.len()
+            )));
+        }
+        Staged::place(
+            &mut self.columns.staged.source,
+            offset,
+            &request.source,
+            "encoder features",
+        )?;
         Ok(())
+    }
+
+    /// Refuses a step whose request has no store, or whose store lacks one of the kinds it reads.
+    ///
+    /// The kinds are [`STEP_PRODUCTS`], and they are what this file places into a `Conditioning`.
+    /// A store that answers `None` for one of them is refused by name - which is the difference
+    /// between a step that fails because nobody ran the encoder and one that runs on zeros.
+    fn require_products(&self, request: ipc::RequestKey) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            return Err(products::no_store(request));
+        };
+        match missing_product(products.as_ref(), request, self.device, self.stream_id())? {
+            Some(kind) => Err(products::absent(request, kind)),
+            None => Ok(()),
+        }
     }
 
     /// The model's prepared inputs for `request`, when this runner holds them.
@@ -697,16 +788,19 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             video,
             audio,
             text,
+            source,
             step,
             staged,
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
         text.write(&staged.text)?;
+        source.write(&staged.source)?;
         step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
         self.columns.text.upload(&stream)?;
+        self.columns.source.upload(&stream)?;
         self.columns.step.upload(&stream)?;
         Ok(())
     }
@@ -808,8 +902,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             let stated_request = media.request(index)?;
             let index = u32::try_from(index)
                 .map_err(|_| Error::Invalid("a batch of more requests than rows".into()))?;
-            // What a step also reads is the model's own preparation, and a runner that invented it
-            // would stage a trajectory nobody produced: the refusal names both halves.
+            // What a step also reads is produced by other calls of the same request - the text
+            // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
+            // and never derived here.
+            self.require_products(stated_request.request)?;
             let prepared = self.prepared(stated_request.request).ok_or_else(|| {
                 Error::Invalid(format!(
                     "a denoise step of bucket {bucket} names request {} at row {index}, whose \
@@ -914,6 +1010,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
         self.counters = Some(counters);
+    }
+
+    fn attach_products(&mut self, products: Arc<dyn Products>) {
+        self.products = Some(products);
     }
 
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
@@ -1153,5 +1253,104 @@ mod tests {
         fn prepare_evaluation(&self, _index: u32, _out: &mut [Vec<u8>]) -> nn::Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod product_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A product store that answers for exactly the kinds it was given.
+    struct Store {
+        held: Vec<Product>,
+        asked: Mutex<Vec<Product>>,
+    }
+
+    impl Products for Store {
+        fn publish(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+            _device: platform::DeviceId,
+            _stream: StreamId,
+            _view: &TensorView,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn borrow(
+            &self,
+            _request: ipc::RequestKey,
+            kind: Product,
+            _device: platform::DeviceId,
+            _stream: StreamId,
+        ) -> Result<Option<TensorView>> {
+            self.asked.lock().unwrap().push(kind);
+            Ok(self
+                .held
+                .contains(&kind)
+                .then(|| TensorView::new(ops::DevicePtr::new(0), DType::BF16, Shape::new(&[1, 1]))))
+        }
+    }
+
+    fn request() -> ipc::RequestKey {
+        ipc::RequestKey::new(1, ipc::RequestId(41), 0)
+    }
+
+    /// The rule a step depends on: the kind it refuses names the first product no call produced, in
+    /// the model's own order, so a failure says whether the encoder ran or the trajectory is missing.
+    #[test]
+    fn the_first_absent_kind_is_the_one_a_step_refuses() {
+        let store = Store {
+            held: vec![Product::Text, Product::Source],
+            asked: Mutex::new(Vec::new()),
+        };
+        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
+            .expect("a store answers");
+        assert_eq!(
+            missing,
+            Some(Product::Latents),
+            "the trajectory is the first kind this store lacks"
+        );
+        assert!(
+            products::absent(request(), Product::Latents)
+                .to_string()
+                .contains("latents"),
+            "the refusal names the kind"
+        );
+    }
+
+    /// A store holding every kind a step reads has nothing missing, and it is asked in one pass.
+    #[test]
+    fn a_store_holding_every_kind_leaves_nothing_missing() {
+        let store = Store {
+            held: STEP_PRODUCTS.to_vec(),
+            asked: Mutex::new(Vec::new()),
+        };
+        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
+            .expect("a store answers");
+        assert_eq!(missing, None);
+        assert_eq!(
+            store.asked.lock().unwrap().len(),
+            STEP_PRODUCTS.len(),
+            "each kind is asked once"
+        );
+    }
+
+    /// A step with no store at all is a different fact from one whose store lacks a kind, and it says
+    /// so: the first is the executor not having attached one, the second is a call that never ran.
+    #[test]
+    fn no_store_is_its_own_refusal() {
+        let refusal = products::no_store(request()).to_string();
+        assert!(
+            refusal.contains("no product store"),
+            "the refusal names the attached store: {refusal}"
+        );
+        assert_eq!(
+            Product::Latents.name(),
+            "latents",
+            "a kind is named as the design names it"
+        );
     }
 }
