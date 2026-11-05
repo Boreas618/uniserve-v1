@@ -259,6 +259,17 @@ def main(argv: list[str] | None = None) -> int:
             "statement of one truth"
         )
 
+    # Two sets, two answers, and only one of them is a defect: a delivery rung
+    # outside the rule is a clip the model cannot serve, while a rule rung the
+    # delivery does not drive is a scheduling choice - inventory nobody asks
+    # for, which a store should not hold. The second is reported, never failed.
+    undriven = [rung for rung in clause if rung not in set(stated_rungs)]
+    print(
+        f"{len(stated_rungs)} delivery rung(s), every one inside the rule; the "
+        f"rule admits {len(clause)} and the delivery does not drive "
+        f"{len(undriven)} of them, which is a choice about what to serve"
+    )
+
     stated_header, stated = generate("--frames", ",".join(map(str, clause)))
     if ladder(stated_header) != clause:
         raise SystemExit(
@@ -292,6 +303,10 @@ def self_test() -> int:
     default_rungs = defaults()
     refused, allowed = requestable(default_rungs, rungs)
     assert len(refused) + len(allowed) == len(default_rungs)
+    # The second direction is not a defect: a rule rung the delivery does not
+    # drive is inventory no run asks for. Thirty-eight of fifty-nine is the
+    # delivery's own number and it must read as a choice, not a shortfall.
+    assert all(rung not in {22, 39} for rung in rungs[2:])
     print(
         "ok   requestability both ways, the row comparison both ways, and the "
         "header's parse"
