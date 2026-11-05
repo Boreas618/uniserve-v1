@@ -396,13 +396,29 @@ impl fmt::Debug for Strides {
 /// the operator can pass them as launch parameters; the innermost stride is 1 by the rule and never
 /// travels.
 pub fn row_writable(out: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK]> {
+    row_layout(out, op, "destination")
+}
+
+/// The outer strides of a **source** read a row at a time.
+///
+/// The same rule as [`row_writable`] — a unit-strided last axis and outer strides that do not let
+/// one row overlap the next — stated for an operand rather than a destination. A source may be a
+/// view inside a larger buffer (a tile of a raster, or the seam band between two of them), so the
+/// operator needs its strides; a source whose last axis is not contiguous cannot be read a row at a
+/// time at all and is refused by name.
+pub fn row_readable(source: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK]> {
+    row_layout(source, op, "source")
+}
+
+fn row_layout(view: &TensorView, op: &'static str, role: &str) -> Result<[u64; MAX_RANK]> {
+    let out = view;
     let strides = out.strides.as_slice();
     let mut outer = [0_u64; MAX_RANK];
     if strides.last() != Some(&1) {
         return Err(Error::argument(
             op,
             format!(
-                "a destination written a row at a time must be unit-strided along its last axis; \
+                "a {role} read or written a row at a time must be unit-strided along its last axis; \
                  found strides {:?}",
                 out.strides
             ),
@@ -414,7 +430,7 @@ pub fn row_writable(out: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK
             return Err(Error::argument(
                 op,
                 format!(
-                    "axis {axis} of the destination advances by {} but its inner axes span {inner}: \
+                    "axis {axis} of the {role} advances by {} but its inner axes span {inner}: \
                      the rows would overlap",
                     strides[axis]
                 ),
