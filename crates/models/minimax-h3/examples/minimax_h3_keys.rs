@@ -516,19 +516,24 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         .to_string(),
     );
     // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
-    // residual's width there is one column and the kernel's `WIDTH` is one.
-    for dtype in [deployment, DType::F32] {
-        push(
-            "scaled_residual",
-            ScaledResidualDescriptor {
-                dtype,
-                columns: 1,
-                block: ops::residual::RESIDUAL_BLOCK,
-                update_bias: false,
-            }
-            .to_string(),
-        );
-    }
+    // residual's width there is one column and the kernel's `WIDTH` is one. **The step is the
+    // sample's, not the stack's**: `Denoiser::programs` keys it from `SAMPLE_DTYPE`, and the forward
+    // refuses a sample that is not that type - so FP32 is the only type at which a one-column
+    // residual is launched, and a deployment-typed row here would be a cell nothing reads.
+    //
+    // The refiner's identity residual is the model's other one-column launcher, and it has its own
+    // owner: `TokenRefiner::programs` states it from the scale it loads, so this file does not
+    // restate a width the refiner already states (`specs/worker.md`: one object states a key).
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: DType::F32,
+            columns: 1,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
