@@ -819,10 +819,35 @@ fn stage_decode(args: &Args) -> Result<()> {
         element_of(dtype)?,
         &transposed,
     )?;
+    // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
+    // whole-raster residual: a seam that is faded with the wrong weight moves a band of a few dozen
+    // pixels, and the maximum over a 25-frame raster is somewhere else. The grid knows where every
+    // overlap is - each tile names the band it shares with the tile above and to its left, in output
+    // pixels - so the case states the bands and the comparator reports a row per band. The reference
+    // probe copies this `case.json` verbatim, so both sides are compared on the same bands rather
+    // than on two readings of the grid.
+    let ratio = config.video_vae.spatial_compression();
+    let mut seams = Vec::new();
+    for tile in &tiles {
+        for (axis, extent, start) in [
+            ("rows", tile.above, tile.latent_rows.0),
+            ("columns", tile.left, tile.latent_columns.0),
+        ] {
+            if extent == 0 {
+                continue;
+            }
+            let offset = start * ratio;
+            seams.push(format!(
+                "{{\"axis\": \"{axis}\", \"start\": {offset}, \"end\": {}}}",
+                offset + extent
+            ));
+        }
+    }
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
          \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
-         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}}}\n",
+         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}, \
+         \"seams\": [{}], \"checkpoint\": \"{}\"}}\n",
         height,
         width_px,
         canvas.frames,
@@ -832,6 +857,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         if generated { "generated" } else { "supplied" },
         tiles.len(),
         rows,
+        seams.join(", "),
+        args.root.display(),
     );
     std::fs::write(directory.join("case.json"), case).map_err(|error| {
         Failure::message(format!(
