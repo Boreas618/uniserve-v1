@@ -1191,7 +1191,12 @@ impl MainProcess {
         match self.update.action(&failure) {
             Action::Discard => {
                 let generation = self.update.phase().generation().unwrap_or_default();
-                self.update.precopy_failed(generation, failure.clone())?;
+                if let Err(error) = self.update.precopy_failed(generation, failure.clone()) {
+                    // The precopy this failure belongs to is no longer the one in flight - a revert
+                    // or a later precopy took its place. The failure is still reported, and a
+                    // serving process is not ended over bookkeeping that moved on.
+                    tracing::warn!(generation, %error, "a precopy failure arrived for no precopy");
+                }
                 self.report(ProgramStatus::PrecopyFailed {
                     generation,
                     failure,
@@ -1847,7 +1852,7 @@ impl MainProcess {
                 );
             }
         }
-        resolve_slots(named, &chosen, &built).map_err(invalid)
+        resolve_slots(named, &chosen, &built, &listing.packages).map_err(invalid)
     }
 
     /// One operator's program from this host's store, for a walk that named an operator the
@@ -2667,7 +2672,21 @@ impl MainProcess {
         // revert has nothing to undo.
         self.prepared = std::mem::take(&mut precopy.next);
         self.prepared_programs = precopy.programs.clone();
-        self.update.precopied(generation)?;
+        if let Err(error) = self.update.precopied(generation) {
+            // The generation this precopy built is not the one the machine waits for - a revert or a
+            // later precopy took its place while the builds ran. The revert path discards what was
+            // built and answers by name; the process goes on serving what it served.
+            tracing::warn!(generation, %error, "a precopy finished for an update that moved on");
+            return self.revert(
+                generation,
+                UpdateFailure::Precopy {
+                    reason: format!(
+                        "the precopy finished for a generation that is not in flight: {error}"
+                    ),
+                },
+            )
+            .map(|_| ());
+        }
         let mut uncompared = self.uncompared();
         if precopy.changed.is_empty() {
             // "Nothing to compare" and "nobody compared it" are different facts, and only one of
@@ -2843,7 +2862,19 @@ impl MainProcess {
         // generation that served before it. So a warmup that fails is a revert of a generation that
         // *served* - a reverse switchover on every device - and not a discard of one that never
         // cut over, which is what the phase decides, and it cannot be asked before this line.
-        self.update.switchover(generation, Instant::now())?;
+        if let Err(error) = self.update.switchover(generation, Instant::now()) {
+            // The devices cut over and the machine did not: a switchover for a generation the
+            // update is not on probation for is a stale message, and the state that holds is the
+            // generation that served. The reverse switchover runs, and its answer is what the
+            // daemon reads - a protocol message does not end a process that can still serve.
+            tracing::warn!(generation, %error, "a switchover names no generation on probation");
+            let failure = UpdateFailure::Threshold {
+                reason: format!(
+                    "the switchover names a generation that is not on probation: {error}"
+                ),
+            };
+            return self.revert(generation, failure);
+        }
         self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
         // The programs move with the generations, as one record: the next precopy's changed set is
         // measured against what serves, and a revert serves the programs the retired pair holds.
@@ -2924,14 +2955,17 @@ impl MainProcess {
     /// §7.3 step 5: probation ended in a commit; the previous generation is kept
     /// until its purge.
     fn commit(&mut self, generation: u64) -> Result<ProgramStatus> {
-        self.update.commit(generation)?;
-        // Probation ended in a commit, so the generation before the update can never serve again.
-        // Its graphs and kernels live until the purge, which is the executor's book to keep - and
-        // the programs it was built from go with the record of it, since no revert can serve it.
-        self.retired.clear();
-        self.retired_programs.clear();
-        self.commit_policy(generation);
-        Ok(ProgramStatus::Committed { generation })
+        let status = answer_commit(&mut self.update, generation);
+        if matches!(status, ProgramStatus::Committed { .. }) {
+            // Probation ended in a commit, so the generation before the update can never serve
+            // again. Its graphs and kernels live until the purge, which is the executor's book to
+            // keep - and the programs it was built from go with the record of it, since no revert
+            // can serve it.
+            self.retired.clear();
+            self.retired_programs.clear();
+            self.commit_policy(generation);
+        }
+        Ok(status)
     }
 
     /// §2.3, §7.4 step 2: the epoch drains at the boundary its schedulers reach, and the process
@@ -3317,7 +3351,13 @@ impl MainProcess {
             return Ok(ProgramStatus::Purged { generation });
         }
         if let Err(error) = self.update.request_purge(generation) {
-            bail!("purging generation {generation}: {error}");
+            // A purge for a generation this process holds nothing of - one it never built, or one a
+            // revert already released - asks for a release that has happened, and the honest answer
+            // is that this process holds nothing of it. The warning is what tells a race from a
+            // store-side mistake; neither is a reason to end a serving process.
+            tracing::warn!(generation, %error, "a purge names a generation no update holds");
+            self.released.insert(generation);
+            return Ok(ProgramStatus::Purged { generation });
         }
         // A purge has no policy half: the scheduling policy is one program per epoch and its
         // modules are released with the scheduler, not with a generation's graphs.
@@ -3338,7 +3378,12 @@ impl MainProcess {
                 });
             }
         }
-        self.update.purged(generation)?;
+        if let Err(error) = self.update.purged(generation) {
+            // The release happened on every device; only the bookkeeping did not recognise the
+            // generation. Recording it is the whole of the answer, and the warning keeps the race
+            // in the log rather than in the exit code.
+            tracing::warn!(generation, %error, "a purged generation no update held");
+        }
         self.released.insert(generation);
         Ok(ProgramStatus::Purged { generation })
     }
@@ -5584,6 +5629,34 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 /// This is the answer for an operator nothing has captured yet - the package that states its keys
 /// in its manifest but has no module for this host - which is what `select_programs` cannot see,
 /// because its own question is what this host can launch *now*.
+/// The answer to a `Commit`.
+///
+/// A commit whose generation is not on probation names nothing the machine holds: the daemon may be
+/// one message behind the revert that its own rollback threshold caused, so its commit arrives after
+/// the update ended. The state that holds is the one before the update - it serves, nothing was
+/// committed - and that is the answer. A protocol message never ends a process that can still serve.
+fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+    match update.commit(generation) {
+        Ok(()) => ProgramStatus::Committed { generation },
+        Err(error) => {
+            tracing::warn!(
+                generation,
+                serving = update.current(),
+                %error,
+                "a commit names a generation that is not on probation"
+            );
+            ProgramStatus::Reverted {
+                generation,
+                reason: format!(
+                    "the commit names a generation that is not in flight ({error}): generation {} \
+                     serves",
+                    update.current()
+                ),
+            }
+        }
+    }
+}
+
 fn declared_program(
     packages: &[program_server::protocol::ListedPackage],
     operator: &str,
@@ -5842,6 +5915,7 @@ fn resolve_slots(
     named: &Programs,
     chosen: &BTreeMap<String, Vec<(String, u32)>>,
     built: &BTreeMap<(String, String, u32), Vec<String>>,
+    packages: &[program_server::protocol::ListedPackage],
 ) -> std::result::Result<(Programs, Candidates), String> {
     let keys_of = |op: &str, program: &Program| -> Vec<String> {
         built
@@ -5880,24 +5954,48 @@ fn resolve_slots(
             .iter()
             .find(|(_, program)| keys_of(&op, program).is_empty())
         {
+            // What the store has built for the operator, and what it holds without a module: the
+            // two are different facts and the message states both, because a package that is
+            // declared and unbuilt is a store build away from serving, while a package that is not
+            // there at all is a deployment question.
             let held: Vec<String> = chosen
                 .get(&op)
                 .into_iter()
                 .flatten()
                 .map(|(backend, revision)| format!("{backend} revision {revision}"))
                 .collect();
-            return Err(format!(
+            let built_here = |backend: &str, revision: u32| {
+                chosen
+                    .get(&op)
+                    .is_some_and(|held| held.iter().any(|(b, r)| b == backend && *r == revision))
+            };
+            let declared: Vec<String> = packages
+                .iter()
+                .filter(|package| package.op == op && !built_here(&package.backend, package.revision))
+                .map(|package| format!("{} revision {}", package.backend, package.revision))
+                .collect();
+            let mut answer = format!(
                 "the deployment names {op}/{} revision {} and this host has built no module of it \
-                 for its targets: the store holds {} - build the named package for this host's \
-                 targets, or name a backend the store holds",
+                 for its targets: the store holds {}",
                 program.backend,
                 program.revision,
                 if held.is_empty() {
-                    format!("no package of {op}")
+                    format!("no built package of {op}")
                 } else {
                     held.join(", ")
                 }
-            ));
+            );
+            if !declared.is_empty() {
+                answer.push_str(&format!(
+                    " and declares {} without a module for this host's targets",
+                    declared.join(", ")
+                ));
+            }
+            answer.push_str(
+                " - build the named package for this host's targets, or name a backend the store \
+                 holds",
+            );
+            return Err(answer);
         }
         // A deployment that states a backend per phase - a prefill attention backend and a decode
         // one - has already said which keys each of them covers, so nothing here is decided from
@@ -6449,7 +6547,7 @@ mod tests {
         );
 
         let (programs, candidates) =
-            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6520,7 +6618,7 @@ mod tests {
         );
 
         let (programs, _) =
-            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6982,10 +7080,10 @@ mod tests {
             },
         );
 
-        let (unnamed, _) = resolve_slots(&Programs::new(), &chosen, &built)
+        let (unnamed, _) = resolve_slots(&Programs::new(), &chosen, &built, &[])
             .expect("the store decides when nothing is named");
         let (with_name, _) =
-            resolve_slots(&named, &chosen, &built).expect("the named package is built here");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the named package is built here");
 
         let slots = |programs: &Programs| {
             let mut held: Vec<(String, Option<PhaseKind>, String)> = programs
@@ -7045,7 +7143,15 @@ mod tests {
             },
         );
 
-        let error = resolve_slots(&named, &chosen, &built)
+        // The store holds the named package and has never built it: that is a store build away
+        // from serving, and the refusal says so rather than naming a substitution.
+        let packages = vec![program_server::protocol::ListedPackage {
+            op: "paged_attention".to_owned(),
+            backend: "trtllm".to_owned(),
+            revision: 1,
+            modules: Vec::new(),
+        }];
+        let error = resolve_slots(&named, &chosen, &built, &packages)
             .expect_err("nothing of the named package was built here");
         assert!(
             error.contains("paged_attention/trtllm revision 1"),
@@ -7054,6 +7160,10 @@ mod tests {
         assert!(
             error.contains("fa4 revision 1"),
             "the refusal does not name what the store holds instead: {error}"
+        );
+        assert!(
+            error.contains("declares trtllm revision 1 without a module"),
+            "the refusal does not tell a declared-but-unbuilt package from a missing one: {error}"
         );
     }
 
@@ -7081,6 +7191,82 @@ mod tests {
             declared_program(&packages, "paged_attention"),
             None,
             "an operator the store holds no package of was answered"
+        );
+    }
+
+
+    /// The state a daemon's late messages meet: an update that went to probation and was reverted by
+    /// the rollback threshold, so every command still in flight names a generation no longer there.
+    fn update_on_probation_then_reverted() -> executor::hot_update::HotUpdate {
+        let mut update = executor::hot_update::HotUpdate::new(1);
+        update.begin_precopy(2).expect("a precopy may begin");
+        update.precopied(2).expect("the precopy lands");
+        update
+            .switchover(2, Instant::now())
+            .expect("the switchover takes effect");
+        update
+            .revert(
+                2,
+                UpdateFailure::Threshold {
+                    reason: "the rollback threshold".into(),
+                },
+            )
+            .expect("the revert lands");
+        update
+    }
+
+    /// A commit that races the revert is answered with the state that holds, and the process keeps
+    /// serving the generation before the update. Ending the main process over it is the failure this
+    /// test exists for: a message whose whole job is to be answered must not kill its answerer.
+    #[test]
+    fn a_commit_after_a_revert_answers_with_the_generation_that_serves() {
+        let mut update = update_on_probation_then_reverted();
+        match answer_commit(&mut update, 2) {
+            ProgramStatus::Reverted { generation, reason } => {
+                assert_eq!(generation, 2);
+                assert!(
+                    reason.contains("not in flight"),
+                    "the answer does not say why the commit did not apply: {reason}"
+                );
+                assert!(
+                    reason.contains("generation 1 serves"),
+                    "the answer does not name what serves instead: {reason}"
+                );
+            }
+            other => panic!("a raced commit answered {other:?} rather than the state that holds"),
+        }
+        assert_eq!(
+            update.current(),
+            1,
+            "the generation before the update does not serve after a raced commit"
+        );
+    }
+
+    /// The rest of the family after the same revert: a purge, a second revert and a second precopy
+    /// each name a generation no longer in flight, and the machine answers each without leaving the
+    /// generation that serves.
+    #[test]
+    fn the_program_commands_after_a_revert_all_name_what_they_cannot_apply() {
+        let mut update = update_on_probation_then_reverted();
+        assert!(
+            update.request_purge(2).is_err(),
+            "the reverted generation is still awaiting a purge, so this test proves nothing"
+        );
+        assert!(update.commit(2).is_err());
+        assert!(
+            update
+                .revert(2, UpdateFailure::Threshold { reason: "again".into() })
+                .is_err(),
+            "a revert of a generation that is not on probation applied"
+        );
+        assert!(
+            update.precopied(2).is_err(),
+            "a precopy with none in flight applied"
+        );
+        assert_eq!(
+            update.current(),
+            1,
+            "the serving generation moved under commands it could not apply"
         );
     }
 

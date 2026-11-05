@@ -226,13 +226,10 @@ impl ResidentCache {
             .tables
             .get(group)
             .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))?;
-        if slots.len() != table.rows as usize {
-            return Err(Error::Invalid(format!(
-                "a block table of group {group} needs {} row slots, got {}",
-                table.rows,
-                slots.len()
-            )));
-        }
+        // A batch narrower than the table's rows is the normal case: the table is sized for the
+        // widest batch the generation may see, and a bucket with fewer rows fills its own and pads
+        // the rest. A batch *wider* than the table is a sizing defect and is refused by name.
+        let rows = rows_for(group, table.rows, slots)?;
         let (pooled, pool_rows, width) = {
             let cache = self
                 .cache
@@ -247,9 +244,10 @@ impl ResidentCache {
             )));
         }
         let row_bytes = width as usize * 4;
-        for (row, slot) in slots.iter().enumerate() {
+        for (row, slot) in rows.iter().enumerate() {
+            let slot = *slot;
             let destination = table.row_address(row as u32);
-            if *slot < 0 {
+            if slot < 0 {
                 // SAFETY: the row lies inside this provider's column, which outlives the stream
                 // work, and the count is the row's own width.
                 unsafe {
@@ -257,7 +255,7 @@ impl ResidentCache {
                 }
                 continue;
             }
-            let slot = u32::try_from(*slot)
+            let slot = u32::try_from(slot)
                 .map_err(|_| Error::Invalid(format!("group {group} has no row slot {slot}")))?;
             if slot >= pool_rows {
                 return Err(Error::Invalid(format!(
@@ -275,6 +273,25 @@ impl ResidentCache {
         }
         Ok(table.view())
     }
+}
+
+
+/// The slot each row of a group's table gathers from.
+///
+/// A row the batch does not fill is `-1`: the attention kernel never reads past a row's `seq_lens`,
+/// so an absent row is never dereferenced, and the pool reserves no such slot - which is why `-1`
+/// and not `0` is the absent row. A batch wider than the table is refused, because a table one row
+/// short would silently drop a request's pages.
+fn rows_for(group: usize, table_rows: u32, slots: &[i32]) -> Result<Vec<i32>> {
+    if slots.len() > table_rows as usize {
+        return Err(Error::Invalid(format!(
+            "a block table of group {group} has {table_rows} row slots and was handed {}",
+            slots.len()
+        )));
+    }
+    let mut rows = vec![-1_i32; table_rows as usize];
+    rows[..slots.len()].copy_from_slice(slots);
+    Ok(rows)
 }
 
 /// One layer's borrowed planes as the model's cache reads them.
@@ -573,6 +590,7 @@ impl std::fmt::Debug for ResidentCache {
 #[cfg(test)]
 mod tests {
     use crate::memory::allocation::ElementType;
+    use crate::runners::resident::rows_for;
 
     /// The storage element types a plane can hold and whether they are kernel operand types.
     #[test]
@@ -593,4 +611,30 @@ mod tests {
             );
         }
     }
+
+    /// A bucket narrower than its group's table is the normal case of a warmup: the table is sized
+    /// for the widest batch the generation may see, so the rows a batch does not fill are `-1` -
+    /// never dereferenced, and never a request's pages. A batch wider than the table is a sizing
+    /// defect, and it is refused with both figures rather than dropping a row.
+    #[test]
+    fn a_batch_narrower_than_its_table_pads_the_rows_it_does_not_fill() {
+        assert_eq!(
+            rows_for(0, 8, &[3, 4, 5, 6]).expect("four rows of an eight-row table"),
+            vec![3, 4, 5, 6, -1, -1, -1, -1]
+        );
+        assert_eq!(
+            rows_for(0, 2, &[7, 8]).expect("the table's own width"),
+            vec![7, 8]
+        );
+        assert_eq!(
+            rows_for(0, 1, &[]).expect("a batch of no rows"),
+            vec![-1]
+        );
+        let error = rows_for(0, 4, &[1, 2, 3, 4, 5]).expect_err("five rows of a four-row table");
+        assert!(
+            error.to_string().contains("has 4 row slots and was handed 5"),
+            "the refusal does not name both figures: {error}"
+        );
+    }
+
 }
