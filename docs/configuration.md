@@ -75,7 +75,7 @@ retention = "30m"
 
 Each option's destination follows what its value is used for (§7.7 of `specs/worker.md`): a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the frontend or the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
-The split adds three backend-name fields that this file does not yet list — `prefill_attention_backend`, `decode_attention_backend` and `moe_runner_backend` — and `quantization` replaces `quantization_config`.
+Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`). `quantization` replaces `quantization_config`.
 
 ### Top level
 
@@ -85,8 +85,8 @@ The split adds three backend-name fields that this file does not yet list — `p
 | Build config | `max_model_len`, `dtype`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
 | Host layer, frontend | `mm_processor_kwargs` |
-| Program backend name | `attention_backend` (attention) |
-| Program parameter | `max_num_batched_tokens` (the scheduling policy's bound) |
+| Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase; read at `crates/daemon/src/epoch.rs:1293-1299` |
+| Program parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
 | Retired | `quantization_config`, replaced by `quantization` |
 
 | Option | Default | Meaning |
@@ -161,6 +161,8 @@ The split adds three backend-name fields that this file does not yet list — `p
 
 **Destination, per field:** `policy` is a program backend name (the scheduling policy); `max_queued_requests`, `chunked_prefill_size` and `max_batch` are program parameters of that policy, bounded by the build config's limits.
 
+**Read at:** `policy` in `crates/daemon/src/epoch.rs:1235`; `chunked_prefill_size` `:1379`; `max_queued_requests` `:1383`; `max_batch` `:1372`, where the captured decode graphs' rows bound it. `max_num_batched_tokens` is read at `:1364-1366`, and a value above the catalog is refused at load rather than clamped.
+
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -172,6 +174,8 @@ The split adds three backend-name fields that this file does not yet list — `p
 ### `speculative_config`
 
 **Destination, per field:** `num_draft_tokens` is build config (it sizes the draft the main process builds); `expected_speedup` and `refill_token_cost` are program parameters of the scheduling policy.
+
+**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` `crates/daemon/src/epoch.rs:1388`; `refill_token_cost` `:1389`.
 
 
 Speculative decoding with the model's own drafter, the multi-token prediction layer of a Qwen3.5 checkpoint (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request an epoch change moved from an epoch that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / g` exceed the refill's tokens times `k`, both sides in decode steps, with `g` the speedup speculation gives a request and `k` the time of evaluating one context token. Each scheduler measures both from what its epoch executes, as averages over about the last sixteen observations: a verification carrying drafts commits `s` tokens, the workers' decoding step takes `v` with drafts and `d` without, and a prompt step `p` per token; speculating, a request takes `v / s` per token in place of `d`, so `g = s * d / v` and `k = p / d`, and while every step has carried drafts `d` is `v`. An epoch whose verification steps cost as many decode steps as they commit tokens (`g` at most `1`) refills nothing; until it has measured what it needs, an epoch refills, which measures it. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request (Qwen3.5) serves eagerly in any case.
@@ -246,6 +250,8 @@ Each entry is the median over the point's reports of the step time over its run'
 
 **Destination, per field:** `expert_parallel` and `microbatches` are build config; `exchange` is a program backend name (expert exchange).
 
+**Read at:** `exchange` in `crates/daemon/src/epoch.rs:1212`, where it becomes the expert-exchange operator's backend; `moe_runner_backend` `:1218`.
+
 
 [Expert parallelism](expert_parallelism.md) describes each exchange.
 
@@ -270,6 +276,8 @@ Each entry is the median over the point's reports of the step time over its run'
 ### `flashinfer_config`
 
 **Destination: program parameters** of the FlashInfer attention program.
+
+**Read at:** `crates/daemon/src/epoch.rs:1300`, which turns the section into the attention program's TOML arguments; an argument the program does not declare reaches it as data rather than being dropped here.
 
 
 | Option | Default | Meaning |
