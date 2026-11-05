@@ -250,10 +250,18 @@ const NORM_EPSILON: f32 = 1e-5;
 /// that widen into a head or narrow out of it state both types inside `rows()`, and those rows stay.
 const DEPLOYMENTS: [DType; 1] = [DType::BF16];
 
-/// The element types a video VAE may be stored and run in: FP16 at `dtype = "auto"`, FP32 where the
-/// deployment states it. Its programs are the ones the *checkpoint's* representation decides, which is
-/// the opposite of the stack above - so these rows carry both and nothing else about them moves.
-const VAES: [DType; 2] = [DType::F16, DType::F32];
+/// The element type the video VAE is: **F32, as the checkpoint stores it.**
+///
+/// This was `[F16, F32]`, on the design's sentence that the video VAE decoder runs at FP16. The
+/// measurement is the other way: `component-tensors.json` counts 703 `vae` tensors and 1087
+/// `audio_vae` tensors, **none of them F16**, and the device's own arena line settles it - the decoder
+/// asks `14 721 024 B = 1797 rows x 2048 columns x 4`, which is a residual stream at F32. With
+/// `dtype = "auto"` converting nothing, no invocation selects an F16 cell, and both deployments' walks
+/// state zero F16 rows.
+///
+/// A deployment that runs the VAE at FP16 is **a different checkpoint**, not a different run: it would
+/// be loaded converted, and its own walk would state its own rows.
+const VAES: [DType; 1] = [DType::F32];
 
 /// The value a flag was given, or a message naming the flag that was given none.
 ///
@@ -688,9 +696,11 @@ fn header(
         clip_frames,
     );
     println!(
-        "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
-         {}; a run states which deployment it serves and a store built from this file serves all of \
-         them, which is why one operator appears at more than one element type.",
+        "# deployment: **one deployment** - the stack at {} and the video VAE at {}, which are the \
+         checkpoint's own storage and what `dtype = \"auto\"` loads without converting. An operator \
+         appears at more than one element type only where a site crosses between them (a widening into \
+         a head, a table the reference computes in F32), and each such row is stated by the site that \
+         takes both.",
         DEPLOYMENTS
             .iter()
             .map(|dtype| format!("{dtype:?}"))
@@ -2350,7 +2360,6 @@ fn rows(deployment: DType, bound: u32) -> Vec<(String, String)> {
         (deployment, ops::rows::Mode::Replace, HIDDEN),
         // The voxel rows' own width, at the VAE's representation rather than the stack's.
         (VAES[0], ops::rows::Mode::Replace, VAE_WIDTH),
-        (VAES[1], ops::rows::Mode::Replace, VAE_WIDTH),
     ] {
         push(
             "rows",
