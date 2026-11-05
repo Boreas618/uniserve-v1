@@ -12,7 +12,10 @@
 
 use ops::Op;
 
-use crate::config::{Config, MAX_FRAMES};
+use crate::config::{AttentionKind, Config, MAX_FRAMES};
+use crate::denoiser::Arrangement;
+use crate::modulation::Groups;
+use crate::partition::Partition;
 use crate::{Error, Result};
 
 /// The launches a component makes, as the operator and the key its descriptor states.
@@ -87,11 +90,12 @@ pub struct Deployment {
     pub canvases: Vec<(u32, u32)>,
     /// The clip lengths the delivery serves, in video frames.
     ///
-    /// **The delivery states these; the packing only accepts them.** They are not every length the
-    /// packing admits: the audio rows key on a track's extent today, so a deployment that listed all
-    /// 58 admissible clips would ship 58 widths per stage for requests its stages never drive.
-    /// [`Deployment::admissible`] gives the packing's own set, and [`Deployment::new`] refuses a rung
-    /// outside it by name - so a delivery cannot state a clip the model would refuse.
+    /// **A supplied clip and a generated clip obey different rules, and this is the supplied one.**
+    /// A generated timeline is `17n + 5` frames ([`Deployment::generated`]); a clip a request hands
+    /// the model - a reference video, the track `ref2va` conditions on - is any length the encoder
+    /// divides ([`crate::encoding::Clip::latent_frames`]). The audio rows follow the second rule, so
+    /// a delivery that listed only the first would refuse the lengths its own stages drive.
+    /// [`Deployment::new`] refuses a rung the encoder refuses, by name.
     pub rungs: Vec<u32>,
 }
 
@@ -109,13 +113,11 @@ impl Deployment {
             .iter()
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
-        let admissible = Self::admissible();
+        let dies = dies.clone();
         for rung in &rungs {
-            if !admissible.contains(rung) {
+            if let Err(error) = dies.clip.latent_frames(*rung) {
                 return Err(Error::config(format!(
-                    "a {rung}-frame clip is not one the packing accepts: the rule admits {} frames \
-                     up to {MAX_FRAMES}",
-                    admissible.len()
+                    "a {rung}-frame clip is not one the encoder accepts: {error}"
                 )));
             }
         }
@@ -127,12 +129,14 @@ impl Deployment {
         })
     }
 
-    /// The clip lengths the packing accepts, computed from its own rule rather than listed.
+    /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
+    /// than listed: `17n + 5` up to [`MAX_FRAMES`].
     ///
-    /// The rule is `17n + 5` up to [`MAX_FRAMES`]; the first rung is the shortest clip one window
-    /// holds. A listed ladder is a second statement of the rule and drifts from it at the first
-    /// change - which is why the ladder this crate shipped for two days was wrong at both ends.
-    pub fn admissible() -> Vec<u32> {
+    /// A listed ladder is a second statement of the rule and drifts from it at the first change.
+    /// These are not the rungs a delivery serves - see [`Deployment::rungs`], which is the supplied
+    /// clip's rule - and confusing the two is how a ladder of stage lengths came to be read as a list
+    /// of clips no request can name.
+    pub fn generated() -> Vec<u32> {
         let mut rungs = Vec::new();
         let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
         while frames <= MAX_FRAMES {
@@ -164,23 +168,92 @@ impl Deployment {
             .collect()
     }
 
-    /// The rows the two audio VAEs and the video VAE state: the components whose whole argument is
-    /// the deployment's own canvases, rungs and element types.
+    /// The rows the text encoder and its vision tower state, at the prompt length the deployment
+    /// holds.
     ///
-    /// A component that also takes a request extent (the prompt's length, the trajectory's elements,
-    /// the packed row bound) is stated by [`Deployment::rows`], which is the one function downstream
-    /// reads.
-    pub fn vae_rows(&self) -> Result<Vec<(String, String)>> {
+    /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
+    /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
+    /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
+    pub fn text_rows(&self, partition: &Partition, tokens: u32) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        let latents = self.latents();
-        let samples = self.samples();
+        programs.extend(crate::text_encoder::TextEncoder::programs(
+            &self.config.text_encoder,
+            partition,
+            self.types.text_encoder,
+            tokens,
+        )?);
+        programs.extend(crate::vision::VisionTower::programs(
+            &self.config.text_encoder.vision,
+            self.types.text_encoder,
+            tokens,
+        )?);
+        Ok(programs.finish())
+    }
+
+    /// The rows the two DiTs state: their stacks, the orchestration around them, and the
+    /// conditioner.
+    ///
+    /// Three facts are the caller's and are handed in rather than held, because they are the
+    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement, the
+    /// tensor-parallel placement, and whether the modulation cache is the conditioned one. The
+    /// packed row bound is not among them: it is derived from the arrangement by the layout rule
+    /// (`Layouts::rows_bound`), which is the one place that answers it.
+    ///
+    /// `elements` is empty by construction. The solver's residual is one operator over the whole
+    /// trajectory, so its width is a request's element count - a row for it would compile a program
+    /// for numbers no request states until it arrives, which is the class this file keeps naming:
+    /// **a runtime quantity that sizes a launch is an argument, not a key.**
+    pub fn denoiser_rows(
+        &self,
+        partition: &Partition,
+        arrangement: &Arrangement,
+        groups: Groups,
+    ) -> Result<Vec<(String, String)>> {
+        let mut programs = Programs::default();
+        for config in self.config.denoisers.values() {
+            let rules = crate::denoiser::Layouts::new(config.clone(), *arrangement)?;
+            let rows = rules.rows_bound()?;
+            let tiles = match config.attention {
+                AttentionKind::Dense => 0,
+                _ => rows
+                    .div_ceil(config.attention.capacity_rows())
+                    .next_power_of_two(),
+            };
+            programs.extend(crate::denoiser::Denoiser::programs(
+                &config.transformer,
+                config.attention,
+                self.types.transformer,
+                rows,
+                groups,
+                partition,
+                &[],
+                tiles,
+            )?);
+        }
+        Ok(programs.finish())
+    }
+
+    /// The rows the two audio VAEs and the video VAE state, at the request extents a walk states.
+    ///
+    /// The rasters and the clip ladder are arguments because they are the delivery's: a walk states
+    /// which clips it drives, and [`Deployment::own_vae_rows`] is the same statement at this
+    /// checkpoint's own canvases and the caller's rungs. A component that also takes the prompt's
+    /// length or the trajectory's elements is stated by [`Deployment::text_rows`] and
+    /// [`Deployment::denoiser_rows`].
+    pub fn vae_rows(
+        &self,
+        rasters: &[(u32, u32)],
+        latents: &[u32],
+        samples: &[u32],
+    ) -> Result<Vec<(String, String)>> {
+        let mut programs = Programs::default();
         programs.extend(crate::audio_vae::AudioDecoder::programs(
             &self.config.audio_vae,
-            &latents,
+            latents,
         )?);
         programs.extend(crate::encoding::AudioEncoder::programs(
             &self.config.audio_vae,
-            &samples,
+            samples,
         )?);
         programs.extend(crate::video_vae::VideoDecoder::programs(
             &self.config.video_vae,
@@ -188,12 +261,17 @@ impl Deployment {
         )?);
         programs.extend(crate::output::VideoPostprocessor::programs(
             self.types.video,
-            &self.canvases,
+            rasters,
         ));
         programs.extend(crate::encoding::VideoEncoder::programs(
             &self.config.video_vae,
-            &self.canvases,
+            rasters,
         )?);
         Ok(programs.finish())
+    }
+
+    /// The same rows at this checkpoint's own canvases and the rungs the delivery states.
+    pub fn own_vae_rows(&self) -> Result<Vec<(String, String)>> {
+        self.vae_rows(&self.canvases, &self.latents(), &self.samples())
     }
 }
