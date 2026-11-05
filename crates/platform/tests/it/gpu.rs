@@ -14,12 +14,12 @@ use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
     Algorithm, Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution,
     ConvolutionArgs, CopyBatch, Cudnn, DataType, Device, DeviceAllocation, DeviceAttribute,
-    DeviceId, DevicePtr, DeviceRange, Engine, Error, Event, EventFlags, FunctionAttribute,
-    GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library,
-    Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
-    Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
-    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, WaitValue, memcpy_async,
-    memset_2d_d8, memset_d8, memset_d32, reclaim,
+    DeviceId, DevicePtr, DeviceRange, EdgeKind, Engine, Error, Event, EventFlags,
+    FunctionAttribute, GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion,
+    LaunchConfig, Library, Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping,
+    PinnedBuffer, PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder,
+    Stream, Strided, StridedCopy, Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec,
+    WaitValue, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -1369,6 +1369,74 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
             );
         }
     }
+}
+
+/// A dependency a kernel triggers early is walked, and the walk states which
+/// kind of edge it found.
+///
+/// **The shape this catches:** a captured graph whose second kernel launches
+/// programmatically carries non-default edge data, and the driver refuses a
+/// query for dependent nodes that does not ask for that data -
+/// `CUDA_ERROR_LOSSY_QUERY`. The same rule governs the capture's own frontier
+/// query, so both are exercised here: `record` after the programmatic launch is
+/// the frontier query, and `edges` is the walk.
+///
+/// Both kinds are read, because a walk that answered one kind for both would
+/// pass half of this test: a plain pair is a completion edge, a programmatic
+/// launch is not.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_programmatic_dependency_is_walked_and_its_kind_is_read() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    // Capture one pair with `pdl` as stated and answer the graph's edge kinds.
+    let mut capture_pair = |pdl: bool| {
+        let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+        let mut first = 7u32;
+        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut first).cast()];
+        write
+            .launch_ex(
+                &stream,
+                &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+                &mut parameters,
+            )
+            .unwrap();
+        assert_eq!(capture.record().unwrap().len(), 1, "the first launch");
+
+        let mut second = 9u32;
+        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut second).cast()];
+        let launch = LaunchConfig {
+            pdl,
+            ..LaunchConfig::new([1, 1, 1], [8, 1, 1])
+        };
+        write.launch_ex(&stream, &launch, &mut parameters).unwrap();
+        // The frontier query the walk runs first: a null edge-data array here
+        // was the second half of the same defect.
+        assert_eq!(capture.record().unwrap().len(), 1, "the second launch");
+        let graph = capture.end().unwrap();
+        assert_eq!(graph.node_count().unwrap(), 2);
+        let edges = graph.edges().unwrap();
+        assert_eq!(edges.len(), 1, "one dependency joins the two launches");
+        edges[0].kind
+    };
+
+    assert_eq!(
+        capture_pair(false),
+        EdgeKind::Completion,
+        "a plain launch orders the second kernel after the first one completes"
+    );
+    assert_eq!(
+        capture_pair(true),
+        EdgeKind::Programmatic,
+        "a programmatic launch lets the second kernel start before the first finishes, \
+         and the graph states that"
+    );
 }
 
 /// Capture records the node each launch adds: nothing before the first launch,
