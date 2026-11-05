@@ -560,8 +560,12 @@ pub(crate) struct MainProcess {
     /// the first `Serve`, and the first token must not pay for a mechanism it did not use.
     slept: bool,
     blocking: ThreadPool,
-    /// The blocking lane module loads run on (§2.4, §7.3 step 2).
-    modules: Lane<Install>,
+    /// The blocking lane the store's listing and the module loads run on (§2.4, §7.3 step 2).
+    modules: Lane<ModuleWork>,
+    /// The store's listing read for the precopy in flight (§7.3 step 2). The lane reads it once and
+    /// every later reader of that precopy - the keys a package declares, the candidates an operator
+    /// has - answers from here, so the unbounded call is made where the lane is and never twice.
+    store: Option<program_server::Listing>,
     /// The program-layer update's phases and bookkeeping (§7.3).
     update: HotUpdate,
     /// The stall and sticky-error rules of §2.4.
@@ -753,7 +757,7 @@ impl MainProcess {
         // is what is left, not what was there before the load. Pools sized first and weights after
         // would over-commit the device by exactly the model's size.
         let blocking = ThreadPool::new(plan.blocking_limits());
-        let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
+        let modules = blocking.lane::<ModuleWork>(BlockingKind::ModuleLoad)?;
         let programs = Arc::new(Mutex::new(Client::connect(plan.program_server())?));
 
         // §2.4's watchdog exists before any device command: `start`'s own commands
@@ -831,6 +835,7 @@ impl MainProcess {
             slept: false,
             blocking,
             modules,
+            store: None,
             update,
             watchdog,
             programs,
@@ -1528,8 +1533,8 @@ impl MainProcess {
     }
 
     /// §7.3 step 2, first half: states the new generation to the Program Server
-    /// and admits one install per device on the module-load lane, whose
-    /// builds run while serving goes on.
+    /// and admits the lane's work - the store's listing, then one install per
+    /// device - whose builds run while serving goes on.
     fn start_precopy(
         &mut self,
         generation: u64,
@@ -1554,79 +1559,76 @@ impl MainProcess {
         // A `Precopy` that names no kernel program is the startup switch: the daemon states the
         // scheduling policy alone, because on a host that runs the worker path there is no kernel
         // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
-        // installs what it can actually launch, so an unnamed set is resolved from the store's
-        // listing rather than captured into an empty generation.
+        // installs what it can actually launch, so the store's listing is read first, on the module
+        // lane, rather than capturing an empty generation.
         //
         // A policy-only *update* also names no kernel, and resolving there would be wrong twice
         // over: every operator would be re-installed as a new generation, so every kernel's `Arc`
         // would differ from the serving one and every captured bucket would be rebound or
         // recaptured for a change no program made. The two states are told apart by what this
         // process already serves - a startup has no kernel at all, an update has all of them.
+        //
+        // Each precopy reads the store at most once, and never one precopy's answer in another's
+        // place: a package built between two updates is a program the second one may install.
+        //
+        // The first generation's read is the lane's. An update's - the keys a package declares, the
+        // candidates an operator has - is still made here, on the control thread, by whichever step
+        // asks for it first; it is the same call the startup switch no longer makes, and the step
+        // that would carry it to the lane is the candidate walk, not this one.
+        self.store = None;
         let never_installed = self
             .generations
             .iter()
             .all(|generation| generation.is_empty());
-        let resolved;
-        let mut candidates = Candidates::new();
-        let programs = if never_installed {
-            // A named program chooses its operator's implementation - its backend and revision -
-            // and never states the operator set: a deployment that pins one operator's kernel
-            // still runs every other operator its buckets launch. So the epoch's first generation
-            // takes this host's store as its set and the deployment's named programs overlaid on
-            // it by operator, which is the only reading under which `kernels=1` on a host that
-            // built twenty-seven launches a model rather than a fragment.
-            match self.listed_programs() {
-                Ok((mut listed, ordered)) => {
-                    let named = programs.len();
-                    overlay_named(&mut listed, programs);
-                    tracing::info!(
-                        operators = listed.len(),
-                        named,
-                        alternative = ordered.values().filter(|held| held.len() > 1).count(),
-                        "this host's built programs, with the deployment's named ones overlaid"
-                    );
-                    candidates = ordered;
-                    resolved = listed;
-                    &resolved
+        let mut precopy = Precopy {
+            generation,
+            reply,
+            policy: policy.clone(),
+            programs: programs.clone(),
+            candidates: Candidates::new(),
+            tried: std::collections::BTreeSet::new(),
+            backends: BTreeMap::new(),
+            unavailable: UnavailableCell::default(),
+            stage_name: "modules",
+            since: Instant::now(),
+            warned: false,
+            learned: BTreeMap::new(),
+            policy_requested: false,
+            next: Vec::new(),
+            policies: Vec::new(),
+            stage: PrecopyStage::Done,
+        };
+
+        if never_installed {
+            // The store's listing is the lane's first work and the one call that leaves this
+            // process before a module does: it is admitted where a build is admitted, so a store
+            // that never answers costs the lane's capacity and not the control thread.
+            let list = ListStore {
+                programs: Arc::clone(&self.programs),
+            };
+            match self.modules.admit(ModuleWork::List(list)) {
+                Ok(task) => {
+                    precopy.stage = PrecopyStage::Modules(ModuleLane::Listing(task));
+                    self.precopy = Some(precopy);
+                    return Ok(());
                 }
-                // The store describes nothing for this host's targets. With no named program there
-                // is nothing to install at all and the listing's own refusal is the answer; with a
-                // named one, the named set is installed and the walk reports what it cannot bind.
-                Err(failure) if programs.is_empty() => {
-                    return self.abandon_precopy(generation, failure, reply);
-                }
-                // A first generation that could not take the store's set holds only what the
-                // deployment named - one operator pinned while the model's buckets launch every
-                // other one. Nothing can bind that generation, so it is refused here, where the
-                // figures are, rather than submitted to the devices: a device stage handed such a
-                // generation recaptures the catalogue bucket by bucket and answers nothing for
-                // minutes, which is a hang to every reader of the log.
-                Err(failure) => {
+                Err(error) => {
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
-                            reason: format!(
-                                "the epoch's first generation would hold {} of the operators its \
-                                 buckets launch: {}",
-                                programs.len(),
-                                match failure {
-                                    UpdateFailure::Precopy { reason } => reason,
-                                    other => format!("{other:?}"),
-                                }
-                            ),
+                            reason: format!("admitting the store's listing: {error}"),
                         },
                         reply,
                     );
                 }
             }
-        } else {
-            programs
-        };
+        }
 
         tracing::info!(
             generation,
             operators = programs.len(),
-            candidates = candidates
+            candidates = precopy
+                .candidates
                 .values()
                 .filter(|ordered| ordered.len() > 1)
                 .count(),
@@ -1637,37 +1639,72 @@ impl MainProcess {
             Ok(admitted) => admitted,
             Err(failure) => return self.abandon_precopy(generation, failure, reply),
         };
-
-        self.precopy = Some(Precopy {
-            generation,
-            reply,
-            policy: policy.clone(),
-            programs: programs.clone(),
-            candidates,
-            tried: std::collections::BTreeSet::new(),
-            backends: BTreeMap::new(),
-            unavailable,
-            stage_name: "modules",
-            since: Instant::now(),
-            warned: false,
-            learned: BTreeMap::new(),
-            policy_requested: false,
-            next: Vec::new(),
-            policies: Vec::new(),
-            stage: PrecopyStage::Modules(tasks),
-        });
+        precopy.unavailable = unavailable;
+        precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
+        self.precopy = Some(precopy);
         Ok(())
     }
+
+    /// The epoch's first generation: the store's set, with the deployment's named programs overlaid
+    /// by operator (§7.3 step 2).
+    ///
+    /// A named program chooses its operator's implementation - its backend and revision - and never
+    /// states the operator set: a deployment that pins one operator's kernel still runs every other
+    /// operator its buckets launch. So the first generation takes this host's store as its set and
+    /// the named programs overlaid on it, which is the only reading under which `kernels=1` on a
+    /// host that built twenty-seven launches a model rather than a fragment.
+    fn first_generation(
+        &self,
+        named: &Programs,
+    ) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
+        let (mut listed, ordered) = match self.listed_programs() {
+            Ok(resolved) => resolved,
+            // The store describes nothing for this host's targets. With no named program there is
+            // nothing to install at all and the listing's own refusal is the answer; with a named
+            // one, the named set is installed and the walk reports what it cannot bind.
+            Err(failure) if named.is_empty() => return Err(failure),
+            // A first generation that could not take the store's set holds only what the deployment
+            // named - one operator pinned while the model's buckets launch every other one. Nothing
+            // can bind that generation, so it is refused here, where the figures are, rather than
+            // submitted to the devices: a device stage handed such a generation recaptures the
+            // catalogue bucket by bucket and answers nothing for minutes, which is a hang to every
+            // reader of the log.
+            Err(failure) => {
+                let reason = match failure {
+                    UpdateFailure::Precopy { reason } => reason,
+                    other => format!("{other:?}"),
+                };
+                return Err(UpdateFailure::Precopy {
+                    reason: format!(
+                        "the epoch's first generation would hold {} of the operators its buckets \
+                         launch: {reason}",
+                        named.len()
+                    ),
+                });
+            }
+        };
+        let named_count = named.len();
+        overlay_named(&mut listed, named);
+        tracing::info!(
+            operators = listed.len(),
+            named = named_count,
+            alternative = ordered.values().filter(|held| held.len() > 1).count(),
+            "this host's built programs, with the deployment's named ones overlaid"
+        );
+        Ok((listed, ordered))
+    }
+
     /// The Program Server's store as it stands: every installed package, its revision and the
     /// descriptors its modules cover for each target.
     fn listing(&self) -> std::result::Result<program_server::Listing, String> {
-        // The one call that leaves this process before a generation is prepared, and the one with no
-        // deadline of its own: the client's connect and reply read are unbounded, so a store that
-        // never answers holds whoever asked. Both sides say so - a line before the call and one with
-        // the count after it - so a run attributes the wait from its log rather than by inference.
-        // Every caller of this function runs on the control thread today, which is why that thread
-        // must not be the one to ask; a staging call that blocks it stops commands, events, metrics
-        // and the watchdog together.
+        // One read per precopy, on the module-load lane; every later reader of that precopy answers
+        // from it. The update asks twice - once for the set, once for the keys a package declares -
+        // and a second read here would put the unbounded call back on the control thread, which is
+        // where the lane exists to keep it from. A reader with no listing in hand is one outside a
+        // precopy, and it reads the store with the lines below.
+        if let Some(store) = &self.store {
+            return Ok(store.clone());
+        }
         tracing::info!("asking the Program Server for its installed programs");
         let mut client = self
             .programs
@@ -1812,7 +1849,7 @@ impl MainProcess {
         &mut self,
         programs: &Programs,
         learned: &BTreeMap<String, Vec<String>>,
-    ) -> std::result::Result<(Vec<Arc<HostTask<Install>>>, UnavailableCell), UpdateFailure> {
+    ) -> std::result::Result<(Vec<Arc<HostTask<ModuleWork>>>, UnavailableCell), UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         // The Program Server's listing, read at most once and only when a program's keys cannot be
         // taken from a generation that already launched it: the epoch's first generation has
@@ -1900,7 +1937,7 @@ impl MainProcess {
                 },
                 unavailable: Arc::clone(&unavailable),
             };
-            match self.modules.admit(install) {
+            match self.modules.admit(ModuleWork::Install(install)) {
                 Ok(task) => tasks.push(task),
                 Err(error) => {
                     return Err(invalid(format!("admitting a module load: {error}")));
@@ -2132,18 +2169,112 @@ impl MainProcess {
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
-            PrecopyStage::Modules(tasks) => {
+            PrecopyStage::Modules(ModuleLane::Listing(task)) => {
+                let answer = match task.outcome() {
+                    // The store has not answered yet: the lane keeps the task and this pass ends
+                    // with the precopy where it was, as every stage of §7.3 step 2 does.
+                    None => {
+                        precopy.stage = PrecopyStage::Modules(ModuleLane::Listing(task));
+                        self.precopy = Some(precopy);
+                        return Ok(());
+                    }
+                    Some(Outcome::Success(answer)) => match &*answer {
+                        ModuleAnswer::Listed(listing) => listing.clone(),
+                        // This stage holds the listing alone; an install here is a fault in this
+                        // process, and it is refused by name rather than read as a listing.
+                        ModuleAnswer::Installed(_) => {
+                            return self.abandon_precopy(
+                                generation,
+                                UpdateFailure::Precopy {
+                                    reason: "the module lane answered the store's listing with a \
+                                             kernel load"
+                                        .to_owned(),
+                                },
+                                precopy.reply,
+                            );
+                        }
+                    },
+                    // The listing's own refusal already names the read: it is the store's answer,
+                    // not the store, that failed.
+                    Some(Outcome::Failed(error)) => {
+                        return self.abandon_precopy(
+                            generation,
+                            UpdateFailure::Precopy {
+                                reason: format!("reading the Program Server's store: {error}"),
+                            },
+                            precopy.reply,
+                        );
+                    }
+                    Some(Outcome::Cancelled) => {
+                        return self.abandon_precopy(
+                            generation,
+                            UpdateFailure::Precopy {
+                                reason: "the store's listing was cancelled".to_owned(),
+                            },
+                            precopy.reply,
+                        );
+                    }
+                };
+
+                // The store has said what it holds: the first generation's set is resolved from it
+                // and the installs are admitted on this same lane, behind the listing.
+                self.store = Some(answer);
+                let named = precopy.programs.clone();
+                let (resolved, candidates) = match self.first_generation(&named) {
+                    Ok(resolved) => resolved,
+                    Err(failure) => {
+                        return self.abandon_precopy(generation, failure, precopy.reply)
+                    }
+                };
+                tracing::info!(
+                    generation,
+                    operators = resolved.len(),
+                    candidates = candidates
+                        .values()
+                        .filter(|ordered| ordered.len() > 1)
+                        .count(),
+                    devices = self.executors.len(),
+                    "this process is installing the generation the daemon named"
+                );
+                let (tasks, unavailable) = match self.admit_installs(&resolved, &BTreeMap::new()) {
+                    Ok(admitted) => admitted,
+                    Err(failure) => {
+                        return self.abandon_precopy(generation, failure, precopy.reply)
+                    }
+                };
+                precopy.programs = resolved;
+                precopy.candidates = candidates;
+                precopy.unavailable = unavailable;
+                precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
+                self.precopy = Some(precopy);
+                Ok(())
+            }
+            PrecopyStage::Modules(ModuleLane::Installs(tasks)) => {
                 let mut loaded = Vec::with_capacity(tasks.len());
                 for task in &tasks {
                     match task.outcome() {
                         None => {
                             // A build is still running: the tasks keep their
                             // results and the lane keeps its capacity.
-                            precopy.stage = PrecopyStage::Modules(tasks);
+                            precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
-                        Some(Outcome::Success(entries)) => loaded.push((*entries).clone()),
+                        Some(Outcome::Success(answer)) => match &*answer {
+                            ModuleAnswer::Installed(entries) => loaded.push(entries.clone()),
+                            // This stage holds installs; the listing has its own arm above.
+                            ModuleAnswer::Listed(_) => {
+                                return self.abandon_precopy(
+                                    generation,
+                                    UpdateFailure::Precopy {
+                                        reason: "the module lane answered a kernel load with the \
+                                                 store's listing"
+                                            .to_owned(),
+                                    },
+                                    precopy.reply,
+                                );
+                            }
+                        },
                         Some(Outcome::Failed(error)) => {
                             // A program the store refused for a shape of this generation is not
                             // yet a failed generation: the operator may have another program this
@@ -2156,7 +2287,8 @@ impl MainProcess {
                             if let Some(refused) = refused {
                                 match self.advance_candidate(&mut precopy, &refused) {
                                     Advance::Retry(fresh) => {
-                                        precopy.stage = PrecopyStage::Modules(fresh);
+                                        precopy.stage =
+                                            PrecopyStage::Modules(ModuleLane::Installs(fresh));
                                         self.precopy = Some(precopy);
                                         return Ok(());
                                     }
@@ -2346,7 +2478,7 @@ impl MainProcess {
                                         );
                                     }
                                 };
-                            precopy.stage = PrecopyStage::Modules(tasks);
+                            precopy.stage = PrecopyStage::Modules(ModuleLane::Installs(tasks));
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
@@ -3894,7 +4026,7 @@ type UnavailableCell = Arc<Mutex<Option<Unavailable>>>;
 /// What the walk does when a program cannot serve a shape of this generation (§7.3 step 2).
 enum Advance {
     /// The operator's next candidate was chosen and its install admitted.
-    Retry(Vec<Arc<HostTask<Install>>>),
+    Retry(Vec<Arc<HostTask<ModuleWork>>>),
     /// Every program this host built for the operator has been tried.
     Exhausted(String),
     /// The programs are the daemon's, so there is no candidate to move to.
@@ -3926,6 +4058,91 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the daemon may take to answer this rank's storage claim (§8): starting a Storage
 /// Server for the node is the slow part, and it is the daemon's to do.
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The store's listing, on the module-load lane (§2.4, §7.3 step 2).
+///
+/// This is the one call that leaves this process before a generation is prepared, and the one
+/// with no deadline of its own: the client's connect and its reply read are unbounded, so a store
+/// that never answers holds whoever asked. On the lane that cost is a build slot. On the control
+/// thread it would be the thread itself - the one that answers the daemon, the requests, the
+/// metrics and the watchdog, whose silence reads exactly like a stalled device.
+struct ListStore {
+    programs: Arc<Mutex<Client>>,
+}
+
+impl HostAction for ListStore {
+    type Output = program_server::Listing;
+
+    fn run(&self) -> executor::Result<Self::Output> {
+        tracing::info!("asking the Program Server for its installed programs");
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+        let listing = client.list().map_err(|error| {
+            executor::Error::Invalid(format!("reading the Program Server's store: {error}"))
+        })?;
+        tracing::info!(
+            packages = listing.packages.len(),
+            "the Program Server's listing answered"
+        );
+        Ok(listing)
+    }
+
+    /// Nothing to give back: the client this action borrows belongs to the process, and its reply
+    /// holds no device or pinned memory.
+    fn release(&self) -> executor::Result<()> {
+        Ok(())
+    }
+
+    fn input_outcome(&self) -> Outcome {
+        Outcome::Success(())
+    }
+}
+
+/// One piece of the module-load lane's work (§2.4, §7.3 step 2).
+///
+/// The lane has two tenants and one order: the store's listing, which says what this host has
+/// built, and the installs that follow from it. Keeping them in one lane keeps that order where
+/// it belongs - nothing is installed before the store has said what it holds - and keeps both off
+/// the control thread.
+enum ModuleWork {
+    List(ListStore),
+    Install(Install),
+}
+
+impl HostAction for ModuleWork {
+    type Output = ModuleAnswer;
+
+    fn run(&self) -> executor::Result<Self::Output> {
+        match self {
+            Self::List(list) => list.run().map(ModuleAnswer::Listed),
+            Self::Install(install) => install.run().map(ModuleAnswer::Installed),
+        }
+    }
+
+    fn release(&self) -> executor::Result<()> {
+        match self {
+            Self::List(list) => list.release(),
+            Self::Install(install) => install.release(),
+        }
+    }
+
+    fn input_outcome(&self) -> Outcome {
+        match self {
+            Self::List(list) => list.input_outcome(),
+            Self::Install(install) => install.input_outcome(),
+        }
+    }
+}
+
+/// What one piece of the module lane's work answered.
+enum ModuleAnswer {
+    /// The store's catalog: every package this host has built, with its modules.
+    Listed(program_server::Listing),
+    /// One device's kernels for the generation being prepared.
+    Installed(Vec<KernelEntry>),
+}
 
 /// One device's half of §7.3 step 2, on the module-load lane: the Program
 /// Server compiles and caches what the generation's descriptors need, each
@@ -4312,9 +4529,8 @@ impl Precopy {
 
 /// The stage a precopy is in.
 enum PrecopyStage {
-    /// The module-load lane builds, resolves and installs each device's
-    /// kernels.
-    Modules(Vec<Arc<HostTask<Install>>>),
+    /// The module-load lane, in the two steps the update runs it in (§7.3 step 2).
+    Modules(ModuleLane),
     /// The executors rebind or recapture their buckets.
     Executors(Vec<Submission>),
     /// The shadow pass compares the new implementations on the resident requests, one step per
@@ -4322,6 +4538,14 @@ enum PrecopyStage {
     Shadow(Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>),
     /// A stage being replaced; the driver never observes it.
     Done,
+}
+
+/// The module-load lane's two steps, in the order the update needs them.
+enum ModuleLane {
+    /// The store's listing, alone on the lane: the installs are derived from it.
+    Listing(Arc<HostTask<ModuleWork>>),
+    /// One install per device for the generation the listing resolved.
+    Installs(Vec<Arc<HostTask<ModuleWork>>>),
 }
 
 /// A wait of the control path: when it began and when it was last reported.
@@ -4465,7 +4689,11 @@ fn pending_work(
     policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
 ) -> String {
     match stage {
-        PrecopyStage::Modules(tasks) => {
+        PrecopyStage::Modules(ModuleLane::Listing(task)) => match task.outcome() {
+            None => "the Program Server's store listing".to_owned(),
+            Some(_) => "the store's listing (answered)".to_owned(),
+        },
+        PrecopyStage::Modules(ModuleLane::Installs(tasks)) => {
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
             format!("{answered} of {} kernel load(s) answered", tasks.len())
         }
