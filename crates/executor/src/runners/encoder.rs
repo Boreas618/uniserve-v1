@@ -85,6 +85,32 @@ impl EncoderColumns {
     }
 }
 
+/// The token span each request of a batch owns, as `(first row, count)`.
+///
+/// A call's span is its **real** tokens and the mechanism's offsets are their boundaries, so the
+/// first row is the offset itself rather than a sum of the rows before it: a batch whose first span
+/// does not begin at zero - a padded or offset allocation - keeps the rows the mechanism named,
+/// which a running sum would silently shift. A span that runs backwards, or a row count that does
+/// not fit, is refused rather than wrapped.
+fn spans(offsets: &[i32]) -> Result<Vec<(u32, u32)>> {
+    let mut spans = Vec::with_capacity(offsets.len().saturating_sub(1));
+    for window in offsets.windows(2) {
+        let rows = window[1].checked_sub(window[0]).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a call's span runs backwards: {} then {}",
+                window[0], window[1]
+            ))
+        })?;
+        let first = u32::try_from(window[0]).map_err(|_| {
+            Error::Invalid("a request's first token row does not fit a count".into())
+        })?;
+        let rows = u32::try_from(rows)
+            .map_err(|_| Error::Invalid("a request's token rows do not fit a count".into()))?;
+        spans.push((first, rows));
+    }
+    Ok(spans)
+}
+
 /// The encoder's runner: one device stream, the buckets its plan captures, and its model.
 pub struct EncoderRunner<M: Encoder + Send + Sync> {
     id: RunnerId,
@@ -328,13 +354,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         // token rows that request covers (`Batch::media`'s record is where a request is named).
         self.pending.clear();
         if let Some(media) = &batch.media {
-            for (index, window) in threads.query_offsets.windows(2).enumerate() {
-                let first = u32::try_from(window[0]).map_err(|_| {
-                    Error::Invalid("a request's first token row does not fit a count".into())
-                })?;
-                let rows = u32::try_from(window[1] - window[0]).map_err(|_| {
-                    Error::Invalid("a request's token rows do not fit a count".into())
-                })?;
+            for (index, (first, rows)) in spans(&threads.query_offsets)?.into_iter().enumerate() {
                 self.pending
                     .push((media.request(index)?.request, first, rows));
             }
@@ -661,5 +681,33 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let stream = self.stream.clone();
         let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.rebind(bucket, generation, walked, &kernels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request's span is the pair of offsets the mechanism wrote, not the sum of the rows before
+    /// it: a batch whose first span begins at zero answers the same pair either way, and one that
+    /// does not is the case a sum would shift without saying so.
+    ///
+    /// The publisher reads this pair to place each request's rows in the hidden column, so a shift
+    /// here is a product that names another request's tokens - bytes that read as a prompt and are
+    /// not one.
+    #[test]
+    fn a_span_is_the_offsets_and_not_a_running_sum() {
+        assert_eq!(
+            spans(&[0, 4, 6, 6]).expect("a tiling of the batch's own rows"),
+            vec![(0, 4), (4, 2), (6, 0)]
+        );
+        assert_eq!(
+            spans(&[5, 9]).expect("a batch whose first span begins at row five"),
+            vec![(5, 4)]
+        );
+        assert!(
+            spans(&[9, 5]).is_err(),
+            "a span that runs backwards is refused rather than wrapped"
+        );
     }
 }
