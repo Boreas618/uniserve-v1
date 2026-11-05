@@ -48,6 +48,20 @@ SKIP_MARKERS = (
     "a module directory",
 )
 
+#: A check's own verdict on the arithmetic it did. A marker says a part of the check could not run
+#: here; a verdict says a part that *did* run disagreed with its reference, and that outranks the
+#: marker: `modulated_rms_norm` prints "…'s E4M3 output needs a device" for one output and then
+#: `FAIL: hand-computed …` for the hand case, and it was reported as skipped — a real arithmetic
+#: failure filed under a platform limitation.
+FAILURE_VERDICTS = ("FAIL", "DIFFERS")
+
+#: Checks that are kept as **byte-identical copies** in more than one package, because each copy's
+#: `default_op()` names its own operator from the package it lives in. A fix landed in one copy and
+#: not the other is invisible to every other instrument: the two `modulation_check.py` copies diverged
+#: once, and the `gated_residual` copy then launched the modulated form's kernel against the gated
+#: literals for a whole stretch. The sweep compares them before it runs anything.
+SHARED_CHECKS = ("modulation_check.py",)
+
 
 def is_check(path):
     """Whether `path` is a check rather than a module a check imports."""
@@ -89,6 +103,11 @@ def run_one(package, script, timeout):
     head = output[0] if output else ""
     if completed.returncode == 0:
         return ("passed", tail, "")
+    verdict = next(
+        (line for line in output if line.startswith(FAILURE_VERDICTS)), None
+    )
+    if verdict is not None:
+        return ("failed", verdict, "")
     if any(marker in head or marker in tail for marker in SKIP_MARKERS):
         return ("skipped", head or tail, "")
     if completed.returncode < 0:
@@ -137,12 +156,22 @@ def main():
     options = parser.parse_args()
 
     found = packages(options.kernels)
+    diverged = []
+    for name in SHARED_CHECKS:
+        copies = sorted(script for _, scripts in found for script in scripts if script.name == name)
+        if len(copies) > 1 and len({script.read_bytes() for script in copies}) > 1:
+            diverged.append(
+                f"{name}: {len(copies)} copies are not identical — "
+                + ", ".join(str(script.parent.parent.parent.name) for script in copies)
+            )
     jobs = [
         (package, script)
         for package, scripts in found
         for script in scripts
     ]
     outcomes = {"passed": [], "skipped": [], "failed": [], "timeout": [], "contended": []}
+    for line in diverged:
+        outcomes["failed"].append((line.split(":")[0], line, 1))
     with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
         futures = {
             pool.submit(run_one, package, script, options.timeout): (package, script)

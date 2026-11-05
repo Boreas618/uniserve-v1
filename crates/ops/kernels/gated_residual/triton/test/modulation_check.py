@@ -546,11 +546,26 @@ def check_hand(form):
         relative = gamma(width) + 8.0 * UNIT_ROUNDOFF["f32"]
 
     difference = (got.double() - expect).abs()
-    outside = (~(difference <= relative * expect.abs())).sum().item()
+    # The standard rounding bound, as every operator in this crate declares it: a term relative to
+    # the result plus a floor set by the operands' own magnitudes. The relative term alone cannot
+    # cover an element that cancels — the modulated form's literal at [1,1] is 0.009 while the
+    # operands that produce it are of order one — so a relative-only bound there asks the f32 chain
+    # to be exact where no chain can be, and reports a correct program as failing by three bounds.
+    floor = UNIT_ROUNDOFF["f32"] * torch.tensor(
+        [HAND["value"], HAND["update"]], dtype=torch.float64
+    ).abs().sum(0)
+    if form == "modulated":
+        # The chain's remaining operands, each of which contributes its own rounding.
+        for name in ("weight", "shift", "scale", "gate"):
+            floor = floor + UNIT_ROUNDOFF["f32"] * torch.tensor(
+                HAND[name], dtype=torch.float64
+            ).abs()
+    outside = (~(difference <= relative * expect.abs() + floor)).sum().item()
     print(
         f"{'exact' if outside == 0 else 'FAIL'}: hand-computed {rows} x {width}, f32 — "
         f"max absolute {difference.max().item():.3e}, bound {relative:.3e} "
-        f"({outside} outside)"
+        f"({outside} outside, with the operands' floor "
+        f"{(~(difference <= floor)).sum().item()} outside)"
     )
     return outside
 
