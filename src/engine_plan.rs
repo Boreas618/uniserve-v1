@@ -793,14 +793,23 @@ impl EpochPlan {
             kv_cache_dtype: None,
             host_cache: None,
             // A media rank captures graphs per bucket, and a bucket of this class is not sized by
-            // tokens: the tiers a policy is checked against do not exist here.
-            graph_tiers: None,
-            bos: None,
-            eos: None,
-            end_of_image: None,
-            // A media request generates a clip, not tokens, so the generation limits of a causal
-            // language model do not apply.
-            generation_limits: None,
+            // tokens: the tiers a policy is checked against do not exist here, which is what an
+            // empty list states (`SchedulerConfig::graph_tiers`).
+            graph_tiers: Some(Vec::new()),
+            // The media class decodes no tokens, so no tokenizer fact reaches a scheduler call: `0`
+            // stands for the absence of a token, as a causal LM's `end_of_image` does, and the list
+            // of terminating tokens is empty.
+            bos: Some(0),
+            eos: Some(Vec::new()),
+            end_of_image: Some(0),
+            // A media request generates a clip, not tokens, so no understanding feature is served;
+            // the engine still needs the two lower bounds, as the frontend's arm for this class
+            // states them (`crates/frontend/src/model/generation.rs`).
+            generation_limits: Some(GenerationLimits {
+                latent_downsample: 1,
+                max_cfg_branches: 1,
+                ..GenerationLimits::default()
+            }),
             max_model_len: self.build.max_model_len.map(|length| length.get()),
             watchdog_timeout: Some(self.watchdog_timeout()),
         })
@@ -1178,8 +1187,13 @@ impl EpochPlan {
         // The plan's own account of this rank is what the scheduler is told about its pool: the
         // capacities it fitted, the cache it holds and where it is. It is the same `MainProcessInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
-        // rank rather than a second one derived here.
-        Ok((memory, planned.plan.info.clone(), graph))
+        // rank rather than a second one derived here. A media rank adds what its denoiser serves,
+        // which the frontend plans a request against and no capacity figure implies.
+        let mut info = planned.plan.info.clone();
+        if let Served::Media(pipeline) = served {
+            info.video_denoiser = Some(denoiser_report(pipeline, &self.build.video)?);
+        }
+        Ok((memory, info, graph))
     }
 
     /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
@@ -1269,8 +1283,13 @@ pub(crate) fn media_rank_report(
     // hold nothing any pool asks for.
     let mut media_components = std::collections::BTreeMap::new();
     media_components.insert(MediaCall::TextEncoding, "text_encoder".to_owned());
+    media_components.insert(MediaCall::LatentPreparation, "transformer".to_owned());
     media_components.insert(MediaCall::Denoising, "transformer".to_owned());
     media_components.insert(MediaCall::VideoDecoding, "video_decoder".to_owned());
+    media_components.insert(MediaCall::AudioDecoding, "audio_decoder".to_owned());
+    media_components.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
+    media_components.insert(MediaCall::AudioEncoding, "muxer".to_owned());
+    media_components.insert(MediaCall::Muxing, "muxer".to_owned());
     let supported_calls: Vec<ipc::CallKind> = media_components
         .keys()
         .copied()
@@ -1773,8 +1792,110 @@ fn media_candidates(
 /// costs no device storage. The one per-canvas figure is the attention block's row bound, taken as
 /// the largest.
 fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32, u32)>> {
-    use minimax_h3::config::NAMED_CANVASES;
     let mut canvases: Vec<(u32, u32)> = Vec::new();
+    for canvas in named_canvases(video)? {
+        if !canvases.contains(&(canvas.width, canvas.height)) {
+            canvases.push((canvas.width, canvas.height));
+        }
+    }
+    Ok(canvases)
+}
+
+/// What the placed denoisers serve, as the frontend plans a request against it.
+///
+/// The tasks, the schedule and the shifts are the checkpoint's. The frame rule is the clip rule, the
+/// rates are the model's output clock, and the canvases are the ones this deployment prepares.
+fn denoiser_report(
+    pipeline: &minimax_h3::load::MinimaxH3,
+    video: &daemon::options::VideoOptions,
+) -> Result<ipc::VideoDenoiserInfo> {
+    use minimax_h3::{AUDIO_SAMPLE_RATE, CLIP_FRAMES, CLIP_LATENTS, FPS};
+    use models::video::{
+        Canvas, DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas, VideoTask,
+    };
+    let denoisers: Vec<_> = [pipeline.transformer(), pipeline.transformer_ref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let Some(first) = denoisers.first() else {
+        bail!("this media rank places no denoiser, so it serves no task");
+    };
+    let served = |task: VideoTask| {
+        let named = match task {
+            VideoTask::T2va => nn::VideoTask::TextToVideoAudio,
+            VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
+            VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
+        };
+        denoisers
+            .iter()
+            .any(|denoiser| denoiser.config().tasks.contains(&named))
+    };
+    let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
+    let steps = first.schedule().num_steps()?;
+    let shifts = &first.config().schedule.shifts;
+    // The fewest frames are one whole clip and the tail, and the tail's latent frames are what the
+    // timeline holds past the clip's.
+    let min_frames = CLIP_FRAMES + CLIP_LATENTS;
+    let latent_frames = minimax_h3::packing::video_latent_frames(min_frames)?;
+    let report = DenoiserInfo {
+        tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
+        schedule_points: steps + 1,
+        video_shift: f64::from(shifts.video),
+        audio_shift: f64::from(shifts.audio),
+        frame_rate: FPS,
+        audio_sample_rate: AUDIO_SAMPLE_RATE,
+        frames: FrameClips {
+            min_frames,
+            clip_frames: CLIP_FRAMES,
+            clip_latent_frames: CLIP_LATENTS,
+            tail_latent_frames: latent_frames - CLIP_LATENTS,
+        },
+        canvases: named_canvases(video)?
+            .into_iter()
+            .map(|canvas| ServedCanvas {
+                short_edge: canvas.short_edge,
+                aspect_ratio: canvas.name(),
+                canvas: Canvas {
+                    width: canvas.width,
+                    height: canvas.height,
+                },
+            })
+            .collect(),
+        references: if tasks.contains(&VideoTask::Ref2va) {
+            // The counts the checkpoint documents for a reference request.
+            ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+                image_short_edge: 2048,
+            }
+        } else {
+            ReferenceLimits::default()
+        },
+    };
+    report
+        .validate()
+        .map_err(|reason| anyhow::anyhow!("the denoiser's report: {reason}"))?;
+    Ok(ipc::VideoDenoiserInfo {
+        tasks: tasks
+            .iter()
+            .map(|task| ipc::VideoTaskInfo {
+                name: task.as_str().to_owned(),
+                conditioned: *task != VideoTask::T2va,
+            })
+            .collect(),
+        denoise_steps: steps,
+        description: report.encode().context("encoding the denoiser's report")?,
+    })
+}
+
+/// The named canvases this deployment prepares, each resolution class at each aspect ratio.
+fn named_canvases(
+    video: &daemon::options::VideoOptions,
+) -> Result<Vec<&'static minimax_h3::Canvas>> {
+    use minimax_h3::config::NAMED_CANVASES;
+    let mut canvases: Vec<&'static minimax_h3::Canvas> = Vec::new();
     for edge in &video.resolutions {
         let short_edge: u32 = edge
             .strip_suffix('p')
@@ -1804,9 +1925,7 @@ fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32
                             .join(", ")
                     )
                 })?;
-            if !canvases.contains(&(canvas.width, canvas.height)) {
-                canvases.push((canvas.width, canvas.height));
-            }
+            canvases.push(canvas);
         }
     }
     if canvases.is_empty() {
@@ -2103,6 +2222,7 @@ fn host_phases() -> Vec<PhaseId> {
         engine::PhaseKind::VideoEncode,
         engine::PhaseKind::AudioEncode,
         engine::PhaseKind::Mux,
+        engine::PhaseKind::LatentPrepare,
     ]
     .into_iter()
     .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
@@ -2127,6 +2247,7 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             Variant::VideoEncode => engine::PhaseKind::VideoEncode,
             Variant::AudioEncode => engine::PhaseKind::AudioEncode,
             Variant::Mux => engine::PhaseKind::Mux,
+            Variant::LatentPrepare => engine::PhaseKind::LatentPrepare,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill

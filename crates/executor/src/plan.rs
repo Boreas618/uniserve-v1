@@ -81,6 +81,10 @@ pub enum Variant {
     AudioEncode,
     /// One request's encoded units and track assembled into its MP4, on the host.
     Mux,
+    /// One request's trajectory opened. The denoiser draws the request's noise at its first step,
+    /// so this call computes nothing: it is the mechanism's step between a prompt's encoding and
+    /// the first denoising call.
+    LatentPrepare,
 }
 
 impl Variant {
@@ -98,6 +102,7 @@ impl Variant {
             Self::VideoEncode => "video_encode",
             Self::AudioEncode => "audio_encode",
             Self::Mux => "mux",
+            Self::LatentPrepare => "latent_prepare",
         }
     }
 
@@ -116,6 +121,7 @@ impl Variant {
                 | Self::VideoEncode
                 | Self::AudioEncode
                 | Self::Mux
+                | Self::LatentPrepare
         )
     }
 
@@ -125,7 +131,10 @@ impl Variant {
     /// the process's media lane does. A bucket of one states which device serves the call and never
     /// an extent, so no canvas narrows it.
     pub const fn host(self) -> bool {
-        matches!(self, Self::VideoEncode | Self::AudioEncode | Self::Mux)
+        matches!(
+            self,
+            Self::VideoEncode | Self::AudioEncode | Self::Mux | Self::LatentPrepare
+        )
     }
 
     /// The computation a media call is, and `None` for a call no variant states yet.
@@ -149,7 +158,8 @@ impl Variant {
             ipc::MediaCall::VideoEncoding => Some(Self::VideoEncode),
             ipc::MediaCall::AudioEncoding => Some(Self::AudioEncode),
             ipc::MediaCall::Muxing => Some(Self::Mux),
-            ipc::MediaCall::MediaReading | ipc::MediaCall::LatentPreparation => None,
+            ipc::MediaCall::LatentPreparation => Some(Self::LatentPrepare),
+            ipc::MediaCall::MediaReading => None,
         }
     }
 
@@ -998,12 +1008,12 @@ mod tests {
         // A call no variant states is served nowhere, and the mechanism reads that as the
         // capability it is.
         let unstated = Computation {
-            call: ipc::MediaCall::LatentPreparation,
+            call: ipc::MediaCall::MediaReading,
             rows: 1,
             tokens: 0,
             extent: Extent::None,
         };
-        assert!(!unstated.stated(), "a latent preparation states no variant");
+        assert!(!unstated.stated(), "a media read states no variant");
         assert_eq!(plan.select_media(&unstated), None);
         assert_eq!(tracks.select_media(&unstated), None);
     }
