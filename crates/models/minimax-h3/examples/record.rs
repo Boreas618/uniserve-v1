@@ -201,13 +201,9 @@ fn run() -> Result<(), String> {
     }
 
     let dtype = dtype.ok_or("--dtype is the deployment's own element type and has no default")?;
-    // A row set without its element types is as unattributable as one without its tree: a row is keyed
-    // by a type, and a reader who cannot see which type each component holds cannot tell a differing
-    // row from a differing deployment. Required, like the fixture's `--commit`.
-    let types = types.ok_or(
-        "--types is the caller's `component-tensors.json`, the four components' stored element types, \
-         and it has no default: a recording that does not state them cannot be attributed",
-    )?;
+    // The caller's tensor table is an artifact of an export, not a file in the tree, so it is stated
+    // when it is at hand and said to be unstated when it is not: requiring it would make a recording
+    // refuse on a host that simply has not exported one.
     let table = match extents.as_deref() {
         Some(path) => read_extents(path)?,
         None => BTreeMap::new(),
@@ -221,7 +217,7 @@ fn run() -> Result<(), String> {
         tokens,
         track,
         elements,
-        types: Some(types),
+        types,
         extents: table,
         sparse,
     };
@@ -286,7 +282,10 @@ fn run() -> Result<(), String> {
         request.tokens,
         request.rows,
         request.elements,
-        deployment_types(request.types.as_deref().expect("--types is required")),
+        request.types.as_deref().map_or_else(
+            || "unstated (pass --types <component-tensors.json>)".to_owned(),
+            deployment_types,
+        ),
         request.sparse,
         request.root.display()
     );

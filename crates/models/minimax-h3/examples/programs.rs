@@ -171,17 +171,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("both --samples and --rasters are the deployment's and have no default".into());
     }
     let dtype = dtype.ok_or("--dtype is the checkpoint's and has no default")?;
-    // A row set without its element types is as unattributable as one without its tree: the header
-    // states both, and the fixture's generator copies the deployment line and drops every other.
-    let types = types.ok_or(
-        "--types is the caller's component-tensors.json and has no default: a deployment \
-         states the element types its four components store",
-    )?;
-    let element_types = minimax_h3::load::element_types(&types)?
-        .iter()
-        .map(minimax_h3::load::StoredTypes::field)
-        .collect::<Vec<_>>()
-        .join(", ");
+    // The four types are stated when the caller's table is at hand, and said to be unstated when it is
+    // not: the table is an artifact of an export (`artifacts/` is not in the tree), so requiring it
+    // would make the walk refuse on a host that simply has not exported one. A row set without its
+    // element types is still unattributable - that is a statement about the header, and the gate is
+    // the fixture's generator rather than this diagnostic.
+    let element_types = match types.as_deref() {
+        Some(table) => minimax_h3::load::element_types(table)?
+            .iter()
+            .map(minimax_h3::load::StoredTypes::field)
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "unstated (pass --types <component-tensors.json>)".to_owned(),
+    };
     if tokens.is_empty() {
         return Err("--tokens is the deployment's and has no default".into());
     }
