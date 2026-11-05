@@ -4350,6 +4350,118 @@ impl Resolved {
     }
 }
 
+/// States what an object defines when the entry a package declared is not among its symbols.
+///
+/// `dlsym` answers yes or no and nothing else, so a `NativeSymbol` failure names the entry that was
+/// looked for and leaves "what does this object have" unanswered - the fact that turns the failure
+/// into a fix. The line never changes the failure: the install still returns exactly what it did.
+fn report_missing_entry(error: &ops::Error) {
+    let ops::Error::Platform(platform::Error::NativeSymbol { path, symbol, .. }) = error else {
+        return;
+    };
+    match defined_entries(path) {
+        Some((total, names)) => tracing::warn!(
+            symbol = %symbol,
+            path = %path.display(),
+            defined = total,
+            entries = %names.join(", "),
+            "the object does not define the entry the package declared: these are the entries it \
+             does define"
+        ),
+        None => tracing::warn!(
+            symbol = %symbol,
+            path = %path.display(),
+            "the object does not define the entry the package declared, and this process could \
+             not read the object's own entry table"
+        ),
+    }
+}
+
+/// The functions an ELF object defines for the dynamic linker, by name: how many, and the first few.
+///
+/// Only the dynamic symbol table and its string table are read, and every read is bounds-checked
+/// against the file. Anything this reader does not understand - another class, another byte order,
+/// a table that runs off the end - is `None`, so a diagnostic never becomes the fault it reports.
+fn defined_entries(path: &std::path::Path) -> Option<(usize, Vec<String>)> {
+    const SHT_DYNSYM: u32 = 11;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const STT_FUNC: u8 = 2;
+
+    fn word(bytes: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn half(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn quarter(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.get(0..4)? != b"\x7fELF" {
+        return None;
+    }
+    if *bytes.get(4)? != ELFCLASS64 || *bytes.get(5)? != ELFDATA2LSB {
+        return None;
+    }
+    let sections = word(&bytes, 0x28)? as usize;
+    let entry_size = half(&bytes, 0x3a)? as usize;
+    let count = half(&bytes, 0x3c)? as usize;
+
+    let mut symbols = None;
+    for index in 0..count {
+        let at = sections.checked_add(index.checked_mul(entry_size)?)?;
+        if quarter(&bytes, at.checked_add(4)?)? != SHT_DYNSYM {
+            continue;
+        }
+        symbols = Some((at, quarter(&bytes, at.checked_add(0x28)?)? as usize));
+        break;
+    }
+    let (symbols, strings) = symbols?;
+
+    // A section header's own body: where its bytes are in the file, and how many there are.
+    let body = |header: usize| -> Option<(usize, usize)> {
+        Some((
+            word(&bytes, header.checked_add(0x18)?)? as usize,
+            word(&bytes, header.checked_add(0x20)?)? as usize,
+        ))
+    };
+    let (symbols_at, symbols_size) = body(symbols)?;
+    let (strings_at, strings_size) = body(sections.checked_add(strings.checked_mul(entry_size)?)?)?;
+    let table = bytes.get(strings_at..strings_at.checked_add(strings_size)?)?;
+
+    let mut total = 0;
+    let mut names = Vec::new();
+    let limit = symbols_at.checked_add(symbols_size)?;
+    let mut at = symbols_at;
+    while at.checked_add(24)? <= limit {
+        let name = quarter(&bytes, at)? as usize;
+        let info = *bytes.get(at.checked_add(4)?)?;
+        let section = half(&bytes, at.checked_add(6)?)?;
+        at = at.checked_add(24)?;
+        if name == 0 || section == 0 || (info & 0xf) != STT_FUNC {
+            continue;
+        }
+        let tail = table.get(name..)?;
+        let end = tail.iter().position(|held| *held == 0)?;
+        let text = std::str::from_utf8(&tail[..end]).ok()?;
+        total += 1;
+        if names.len() < 8 {
+            names.push(text.to_owned());
+        }
+    }
+    Some((total, names))
+}
+
 /// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
 /// install (§4.2): a scheduling policy's wasm program and a program the main process runs as its
 /// own process are not kernels.
@@ -4503,13 +4615,15 @@ impl HostAction for Install {
                 if module.copied() {
                     copies += 1;
                 }
-                let entry = ops::install(&self.device, operator, &key, module.as_ops()?).map_err(
-                    |error| {
-                        executor::Error::Invalid(format!(
+                let entry = match ops::install(&self.device, operator, &key, module.as_ops()?) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        report_missing_entry(&error);
+                        return Err(executor::Error::Invalid(format!(
                             "installing {operator} for {key}: {error}"
-                        ))
-                    },
-                )?;
+                        )));
+                    }
+                };
                 if let Some(entry) = entry {
                     entries.push(entry);
                 }
@@ -5107,7 +5221,9 @@ mod tests {
 
         assert_eq!(listed.len(), 3, "the overlay changed the operator set");
         assert_eq!(
-            listed.get(&slot("paged_attention")).map(|held| held.backend.as_str()),
+            listed
+                .get(&slot("paged_attention"))
+                .map(|held| held.backend.as_str()),
             Some("trtllm"),
             "the deployment's own choice did not replace the store's default"
         );
@@ -5222,6 +5338,37 @@ mod tests {
             chosen[op],
             vec![("triton".to_owned(), 1)],
             "the package with a module for this target, whatever the others claim"
+        );
+    }
+
+    /// The entry reader answers about a real object, and says nothing it cannot check.
+    ///
+    /// Every Linux process has its C library loaded, and this one is asked about the object the maps
+    /// name: the count and the first names are the reader's own answer, not a restatement of it. A
+    /// host whose maps name no such path is the one case where the test has nothing to ask.
+    #[test]
+    fn the_entry_reader_lists_the_functions_an_object_defines() {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let libc = maps
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .find(|path| path.contains("libc.so.6") && path.starts_with('/'))
+            .map(str::to_owned);
+        let Some(libc) = libc else {
+            return;
+        };
+        let (total, names) = defined_entries(std::path::Path::new(&libc))
+            .unwrap_or_else(|| panic!("{libc} is a loaded object and its entries were not read"));
+        assert!(
+            total > 100,
+            "{libc} defines {total} functions, too few for a C library"
+        );
+        assert_eq!(names.len(), 8, "the first names of {libc}: {names:?}");
+        assert!(
+            names.iter().all(
+                |name| name.starts_with(|held: char| held.is_ascii_alphabetic() || held == '_')
+            ),
+            "a name read out of an object is not a name: {names:?}"
         );
     }
 }
