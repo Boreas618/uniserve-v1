@@ -85,10 +85,14 @@ impl Serving {
                     *call,
                     vec![if self.by_extent {
                         // A function of the extent, so a continuation samples
-                        // what the uninterrupted request sampled next, and
-                        // clamped into the window the simulated model's own
-                        // tokens occupy, so an id never leaves the vocabulary
-                        // its callers expect.
+                        // what the uninterrupted request sampled next. The
+                        // modulo is a vocabulary bound, not a matching device:
+                        // ids stay inside the 5 000-wide window the simulated
+                        // model's own tokens occupy (`sim_text_token`), which
+                        // keeps the id a legal token. It cannot hide a
+                        // successor that prefilled the prompt again: that
+                        // difference is read from the batch's shape and row
+                        // extent, never from the token.
                         SAMPLED + (seen % 5_000)
                     } else {
                         SAMPLED + index as u32
