@@ -452,33 +452,26 @@ impl ClipDecoder {
             * u64::from(config.temporal_compression())
             * u64::from(spatial)
             * u64::from(spatial);
-        // **The table is the deployment's own seam set, derived from the canvases it serves.** The grid
-        // spreads its slack over the seams, so a seam's width (in output pixels, which is what the
-        // blend writes and what `cross_fade` is given) is whatever that canvas's grid arithmetic
-        // gives: over the offered canvases the launched widths are 64 to 128, while a ladder of
-        // alignment steps to the tile size states 24 widths of which 8 ever launch. A ladder beside
-        // the grids is a second answer to the same question, so this walks the grids instead: a width
-        // exists here exactly when a served canvas launches it, and a canvas added to the model adds
-        // its seams without anyone editing a list.
+        // **The table is a ladder, and the set it must cover is not this function's to read.** A seam's
+        // width (in output pixels, which is what the blend writes and what `cross_fade` is given) is
+        // whatever the canvas's grid arithmetic gives: over the six default canvases it runs 64 to
+        // 128. But `offered_canvases()` is only the table a deployment serves when its checkpoint
+        // states **no** ladder (`config/canvas.rs`), and a checkpoint that states one may serve
+        // canvases this table does not name. Deriving the blends from the default table therefore
+        // narrows the decoder to the default deployment: a ladder canvas whose seams are wider would
+        // find no module and stop mid-clip, which is the error an excess never causes.
         //
-        // One compiled blend serves every seam of one width, so building this once at load is what
-        // lets one decoder block serve every canvas: the grid itself is recomputed per request.
-        let mut blends: Vec<(u32, u32, CrossFade)> = Vec::new();
-        for offered in crate::config::offered_canvases() {
-            let canvas = Canvas::clip(config, offered.height / spatial, offered.width / spatial);
-            let tiles = crate::video_vae::Tiles::of(config, &canvas)?.tiles(config, &canvas);
-            for tile in &tiles {
-                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
-                    if extent == 0
-                        || blends
-                            .iter()
-                            .any(|(width, side, _)| *width == extent && *side == axis)
-                    {
-                        continue;
-                    }
-                    blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
-                }
+        // So the ladder stays - every alignment step from `MINIMUM_OVERLAP` to the tile size, on both
+        // axes - and the test beside it asserts the deployment's realized seams are inside it. An
+        // extra class costs a compile; a missing one stops a run.
+        let alignment = spatial;
+        let mut blends = Vec::new();
+        let mut extent = crate::video_vae::MINIMUM_OVERLAP;
+        while extent < crate::video_vae::TILE_PIXELS {
+            for axis in [2, 3] {
+                blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
             }
+            extent += alignment;
         }
         Ok(Self {
             unpatchify,
@@ -1367,15 +1360,17 @@ mod tests {
         clip.write_tile(&f, &tiles[1], tokens, decoded, blended, seam)
             .expect("a contiguous seam writes the tile");
     }
-    /// The blend table and the deployment's seams are one set, in both directions.
+    /// Every seam the default canvases produce is in the blend table.
     ///
-    /// The table is derived from the offered canvases' own grids, so a width exists in it exactly
-    /// when a served canvas produces that width on that axis. Each direction fails differently: a
-    /// seam with no module stops a clip decode at that seam rather than at a load, and a module no
-    /// seam reads is a store cell no launch asks for - which is what the ladder of alignment steps
-    /// this replaced produced, 24 widths stated against 8 launched.
+    /// The table is a ladder and the deployment launches only what its grids realize, so **the ladder
+    /// may be wider than the deployment and must never be narrower**: a seam this test cannot find is
+    /// a width a canvas needs and the decoder has no module for, which stops a clip decode at that
+    /// seam rather than at a load. The reverse direction is not asserted, because the canvases this
+    /// reads are the *default* table: a checkpoint that states its own ladder may serve canvases that
+    /// produce wider seams, and a table derived from the default set would be narrow at exactly
+    /// those.
     #[test]
-    fn the_blend_table_and_the_offered_canvases_seams_are_one_set() {
+    fn every_seam_the_offered_canvases_produce_is_in_the_blend_table() {
         let config = crate::video_vae::tests::video_config();
         let decoder = ClipDecoder::new(&config, DType::F32).expect("a clip decoder");
         let ratio = config.spatial_compression();
@@ -1406,13 +1401,6 @@ mod tests {
                 "the deployment launches a {extent}-pixel seam along axis {axis} and the table is \
                  {} widths on two axes: a missing module stops the clip decode here",
                 decoder.blends().len()
-            );
-        }
-        for (width, side, _) in decoder.blends() {
-            assert!(
-                realized.contains(&(*width, *side)),
-                "the table carries a {width}-pixel seam along axis {side} that no offered canvas \
-                 produces: a store cell no launch reads"
             );
         }
     }

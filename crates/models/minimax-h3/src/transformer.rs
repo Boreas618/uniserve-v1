@@ -655,9 +655,9 @@ impl Transformer {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
             dtype,
+            dtype,
             WeightOrder::NxK,
             false,
-            dtype,
             dtype,
         ));
         // **And the boundary products, which cross the two types.** The boundary tensors are the
