@@ -121,6 +121,13 @@ fn until_terminal(events: &mut engine::EventRx) -> (Vec<u32>, Event) {
 
 /// A request whose group is lost leaves as migratable, and a continuation
 /// carrying its tokens generates the reference's sequence.
+///
+/// What this case states holds in process: the continuation's tokens equal
+/// the uninterrupted reference's, and a killed pid is only how the loss was
+/// caused. The other half — that a real process dies, a real one replaces it
+/// and requests migrate without failing — is measured end to end on GPUs by
+/// the caller, and a simulation cannot stand in for it, so no unit case here
+/// claims it.
 #[test]
 fn a_request_on_a_lost_group_migrates_and_continues_after_the_relaunch() {
     // The reference: the same request id, uninterrupted, over the same group.
