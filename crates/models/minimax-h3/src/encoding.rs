@@ -1309,6 +1309,14 @@ impl VideoEncoder {
             crate::config::SpatialPadding::Reflect
         );
         // A pad's block split is its output's column count, so each extent's pad is its own row.
+        //
+        // **This is the one tile rule, and it has a fallback no pad of this model takes.** `tiles_of`
+        // returns `(PAD_PIXELS, PAD_CHANNELS) = (32, 64)` when the source's columns are not unit-strided
+        // or the output is not row-major; the encoder's arena allocates every padded frame contiguous
+        // and reads its source's columns unit-strided, so the branch is unreachable here and the block
+        // is always `min(ROW_PIXELS, next_power_of_two(columns))` pixels with `ROW_ELEMENTS` divided
+        // by it. Stated here because the reachable classes are four and the fallback looks like a
+        // fifth: a list carrying `block_pixels_32_block_channels_64` would be one no launch asks for.
         let pad = |programs: &mut Programs, columns: u64| {
             let (block_pixels, block_channels) =
                 ops::frame::FramePadDescriptor::tiles_of(true, true, columns);

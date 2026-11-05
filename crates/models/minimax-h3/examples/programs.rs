@@ -150,8 +150,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
-    if samples.is_empty() || rasters.is_empty() {
-        return Err("both --samples and --rasters are the deployment's and have no default".into());
+    if samples.is_empty() {
+        return Err("--samples is the deployment's and has no default".into());
+    }
+    // **The canvases are the deployment's, not the caller's.** A row keyed for a raster the engine
+    // can never be asked for is a cell no launch reads, and a stated raster outside the served set
+    // was exactly that: `480x832` is the encoder's own test raster, and its `scaled_add columns
+    // 399360` is the seam blend over a canvas this deployment does not serve.
+    let offered: Vec<(u32, u32)> = minimax_h3::config::offered_canvases()
+        .iter()
+        .map(|canvas| (canvas.height, canvas.width))
+        .collect();
+    if rasters.is_empty() {
+        rasters = offered.clone();
+    } else {
+        for (height, width) in &rasters {
+            if !offered.contains(&(*height, *width)) {
+                return Err(format!(
+                    "--rasters {height}x{width} is not one of the deployment's offered canvases \
+                     {offered:?}: a row keyed for a canvas no request can name is a cell no launch \
+                     reads"
+                )
+                .into());
+            }
+        }
     }
     let dtype = dtype.ok_or("--dtype is the checkpoint's and has no default")?;
     if tokens.is_empty() {
