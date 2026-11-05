@@ -117,14 +117,14 @@ def build(package, key, target, out_dir):
     environment["PYTHONPATH"] = python_path + (os.pathsep + existing if existing else "")
     out_dir.mkdir(parents=True, exist_ok=True)
     command = {
-        "triton": ["/opt/uv/venv/bin/python", script],
-        "cuda": ["/opt/uv/venv/bin/python", script],
-        "cutlass": ["/opt/uv/venv/bin/python", script],
-        "cute_dsl": ["/opt/uv/venv/bin/python", script],
-        "nvcc": ["/opt/uv/venv/bin/python", script],
+        "triton": [python, script],
+        "cuda": [python, script],
+        "cutlass": [python, script],
+        "cute_dsl": [python, script],
+        "nvcc": [python, script],
     }.get(source["kind"])
     if command is None:
-        command = ["/opt/uv/venv/bin/python", script]
+        command = [python, script]
     try:
         finished = subprocess.run(
             command,
@@ -175,6 +175,13 @@ def main():
     parser.add_argument("--root", required=True, help="the store root to assemble")
     parser.add_argument("--kernels", default="crates/ops/kernels")
     parser.add_argument("--target", default="sm_100a")
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="the interpreter that runs each package's compile script; it must carry the "
+             "toolchain the package declares (Triton, CuTe DSL, nvcc), so it is named rather "
+             "than assumed to be this one",
+    )
     parser.add_argument("--revision", type=int, default=1)
     args = parser.parse_args()
 
@@ -242,7 +249,7 @@ def main():
         failures = []
         for package in candidates:
             directory = root / op / package["backend"] / str(args.revision) / args.target / key
-            failure = build(package, key, args.target, directory)
+            failure = build(package, key, args.target, directory, args.python)
             if failure:
                 failures.append(f"{package['backend']}: {failure}")
                 continue
