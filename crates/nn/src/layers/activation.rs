@@ -101,7 +101,15 @@ impl GatedActivation {
         elements: u64,
         stepwise: bool,
     ) -> Result<activation::ActAndMulDescriptor> {
-        Self::descriptor_of(dtype, width, activation, 2 * width, 2 * width, elements, stepwise)
+        Self::descriptor_of(
+            dtype,
+            width,
+            activation,
+            2 * width,
+            2 * width,
+            elements,
+            stepwise,
+        )
     }
 
     /// `out = act(gate) · value`.
@@ -576,7 +584,11 @@ mod tests {
         let value = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
         let gate = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
 
-        assert_eq!(gate.strides.get(0), 2 * width, "the half keeps the packed stride");
+        assert_eq!(
+            gate.strides.get(0),
+            2 * width,
+            "the half keeps the packed stride"
+        );
 
         let derived = GatedActivation::descriptor_of(
             DType::BF16,
@@ -588,9 +600,14 @@ mod tests {
             true,
         )
         .expect("the halves' descriptor");
-        let stated =
-            GatedActivation::packed_descriptor_of(DType::BF16, width, Activation::Silu, rows * width, true)
-                .expect("the packed descriptor");
+        let stated = GatedActivation::packed_descriptor_of(
+            DType::BF16,
+            width,
+            Activation::Silu,
+            rows * width,
+            true,
+        )
+        .expect("the packed descriptor");
         assert_eq!(derived, stated);
     }
 }

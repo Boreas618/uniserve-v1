@@ -316,7 +316,10 @@ impl Checkpoint {
             if !path.is_dir() {
                 continue;
             }
-            let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            let Some(name) = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
                 continue;
             };
             components.insert(
@@ -726,10 +729,11 @@ struct HeaderTensor {
 /// cannot express is refused here, at open, with the tensor in the message, rather than reach a
 /// launch that would misread its bytes.
 fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTensor)>)> {
-    let (header, metadata) = SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
-        path: path.to_path_buf(),
-        problem: format!("the safetensors header does not parse: {problem}"),
-    })?;
+    let (header, metadata) =
+        SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("the safetensors header does not parse: {problem}"),
+        })?;
     let header = header as u64;
     let payload = bytes.len() as u64 - header;
 
@@ -776,7 +780,9 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
     let refuses = |kind: &str| {
         Err(Error::Checkpoint {
             path: path.to_path_buf(),
-            problem: format!("tensor `{tensor}` is `{kind}`, which the operator ABI has no type for"),
+            problem: format!(
+                "tensor `{tensor}` is `{kind}`, which the operator ABI has no type for"
+            ),
         })
     };
     match dtype {
@@ -925,7 +931,9 @@ mod tests {
     fn a_shards_tensors_read_back_at_their_own_offsets_and_types() {
         let root = tempfile::tempdir().expect("a temp directory");
         // Two elements of BF16: 2 × 3 extents, twelve bytes.
-        let halfs: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+        let halfs: [u8; 12] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        ];
         // Four I32 elements, sixteen bytes.
         let words: [u8; 16] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -977,5 +985,4 @@ mod tests {
             "the refusal names the tensor and the type: {message}"
         );
     }
-
 }

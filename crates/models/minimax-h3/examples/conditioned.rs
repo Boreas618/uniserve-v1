@@ -107,6 +107,25 @@ struct Args {
 
 fn run() -> Result<(), String> {
     let args = Args::parse()?;
+    // The canvas is a **deployment** fact, and the store is built for the six the checkpoint offers:
+    // a raster outside them asks for a `frame_pad` class and a `scaled_add` ladder no served canvas
+    // needs, so the run would stop at a missing program after the whole load. Every stage refuses it,
+    // because the plan's numbers are a claim about the same case the device stage spends.
+    if !minimax_h3::NAMED_CANVASES
+        .iter()
+        .any(|canvas| canvas.width == args.width && canvas.height == args.height)
+    {
+        let offered = minimax_h3::NAMED_CANVASES
+            .iter()
+            .map(|canvas| format!("{}x{}", canvas.width, canvas.height))
+            .collect::<Vec<String>>()
+            .join(", ");
+        return Err(format!(
+            "`{}x{}` is not a canvas the deployment offers, and the store is built for the ones it \
+             does: {}",
+            args.width, args.height, offered
+        ));
+    }
     match args.stage.as_str() {
         "weights" => weights(&args),
         "plan" => plan(&args),
@@ -125,11 +144,13 @@ impl Args {
             out: PathBuf::from("artifacts/h3-stage5"),
             stage: "weights".to_owned(),
             task: VideoTask::FirstLastToVideoAudio,
-            width: 256,
-            height: 256,
+            width: 1344,
+            height: 768,
             frames: 5,
             text_tokens: 15,
-            image: 256,
+            // The anchor's raster is the canvas's short edge, which is a whole number of the
+            // encoder's tiles at every served canvas: 768 = 3 x 256.
+            image: 768,
             seed: 0,
             device: 0,
             dtype: None,
@@ -412,6 +433,55 @@ fn largest_tile(pixels: Extent) -> Result<Extent, String> {
         .ok_or_else(|| "the tile plan of this raster holds no tile".to_owned())
 }
 
+/// The conditions a task's case carries, and the counts a request states for them.
+///
+/// One statement of the case for both stages: `plan` sizes the buffers the request needs and `encode`
+/// runs it, and two constructions of one request is how the printed numbers and the run drift apart.
+///
+/// `fl2va` anchors the first and the last generated frame; `ref2va` carries one reference clip of
+/// [`minimax_h3::CLIP_LATENTS`] latent frames with a soundtrack as long as the clip plays. `t2va` has
+/// no condition at all, so it is another stage's case and this one refuses it.
+fn case_conditions(args: &Args) -> Result<(Vec<ConditionShape>, u32, u32, u32), String> {
+    match args.task {
+        VideoTask::FirstLastToVideoAudio => {
+            let conditions = [ConditionRole::FirstFrame, ConditionRole::LastFrame]
+                .into_iter()
+                .map(|role| ConditionShape {
+                    role,
+                    frames: 1,
+                    height: args.image,
+                    width: args.image,
+                    audio_samples: 0,
+                })
+                .collect();
+            Ok((conditions, 1, 1, 0))
+        }
+        VideoTask::ReferenceToVideoAudio => {
+            // The reference is a still with a soundtrack, at `--image`'s raster: the checkpoint's
+            // condition capacity bounds a reference clip, not this harness. It is 192 rows - nine
+            // images, three videos and two keyframes of 64-row units (`RELEASED_CONDITION_ROWS`) -
+            // so a reference video is admissible at up to three 64-row frames, while a full-canvas
+            // reference at 1344x768 is 1008 rows and the packing refuses it, correctly.
+            let samples = minimax_h3::CLIP_FRAMES * minimax_h3::AUDIO_SAMPLE_RATE / minimax_h3::FPS;
+            let conditions = vec![ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 1,
+                // The shape states **pixels**: the packing reduces them to the latent raster its own
+                // `Visual` carries, so dividing here would divide twice.
+                height: args.image,
+                width: args.image,
+                audio_samples: samples,
+            }];
+            Ok((conditions, 0, 0, 1))
+        }
+        VideoTask::TextToVideoAudio => Err(
+            "`t2va` carries no condition, and this stage is the conditioned path: run `fl2va` or \
+             `ref2va` here, and `t2va` in stage 3"
+                .to_owned(),
+        ),
+    }
+}
+
 /// The host stage that sizes the case: every plan the device stage will reserve, and its total.
 ///
 /// A reservation is the number this prints - not a flag - and a harness whose fixed pool is smaller
@@ -434,24 +504,18 @@ fn plan(args: &Args) -> Result<(), String> {
     // The deployment's type for the terms the refiner reads and writes; the condition views are FP32
     // and are counted at 4 bytes below whatever this is.
     let dtype = args.dtype.unwrap_or(DType::BF16);
-    let condition = ConditionShape {
-        role: ConditionRole::FirstFrame,
-        frames: 1,
-        height: args.image,
-        width: args.image,
-        audio_samples: 0,
-    };
+    let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
         task: args.task,
         width: args.width,
         height: args.height,
         frames: args.frames,
-        fps: 24,
-        first_frames: 1,
-        last_frames: 0,
-        references: 0,
+        fps: minimax_h3::FPS,
+        first_frames,
+        last_frames,
+        references,
         text_tokens: args.text_tokens,
-        conditions: std::slice::from_ref(&condition),
+        conditions: &conditions,
         vision_spans: &[],
     };
     let (one, packing) = layouts.layout(&request).map_err(show)?;
@@ -485,6 +549,14 @@ fn plan(args: &Args) -> Result<(), String> {
         args.image,
         args.text_tokens
     );
+    // The conditions the run will encode, stated by the same function the device stage uses: a plan
+    // that named only the canvas would describe a request the run does not make.
+    for (index, shape) in conditions.iter().enumerate() {
+        println!(
+            "condition {index}: {:?}, {} frame(s) at {}x{} px, {} samples",
+            shape.role, shape.frames, shape.height, shape.width, shape.audio_samples
+        );
+    }
     println!(
         "rows: text capacity {}, condition capacity {}, prefix {} rows of {}",
         one.text_rows,
@@ -560,13 +632,57 @@ fn plan(args: &Args) -> Result<(), String> {
 }
 
 /// The device stage: one image through the encoder, the posterior and the projection.
+/// One condition of a request, as this harness builds it.
+///
+/// Every geometric field is the model's: a piece's latent frames and raster come from the packing's
+/// `Visual`, its packed rows from the same place, and the anchoring draw's start and element count
+/// from the layout's own cursor. The harness states only what the checkpoint cannot - the pixels, the
+/// samples, and the ramp that fills them.
+struct PiecePlan {
+    /// Where the piece anchors, which is the role the conditioner writes its rows under.
+    role: MediaRole,
+    /// Packed visual rows the layout reserves for the piece.
+    rows: u32,
+    /// Packed audio rows it reserves.
+    audio_rows: u32,
+    /// The pixels' extent in the encoder's own order, absent for an audio-only reference.
+    pixels: Option<Extent>,
+    /// The anchoring draw's latent extent, absent for an audio-only reference.
+    draw: Option<Extent>,
+    /// Where the draw starts in the request's noise stream.
+    draw_start: u64,
+    /// The samples the soundtrack's encoder reads, absent when the piece has no soundtrack.
+    samples: Option<u64>,
+}
+
+/// One piece's buffers, allocated: the views the conditioner reads and the host bytes they were
+/// filled from.
+struct PieceBuffers {
+    pixels: Option<TensorView>,
+    pixels_host: Vec<u8>,
+    draw: Option<TensorView>,
+    audio: Option<TensorView>,
+}
+
 fn encode(args: &Args) -> Result<(), String> {
     let store_root = args.store.clone().ok_or_else(|| {
         "stage `encode` needs a program store: pass --store <path> or set UNISERVE_STORE".to_owned()
     })?;
-    if !args
-        .image
-        .is_multiple_of(minimax_h3::video_vae::TILE_PIXELS)
+    // `--image` is a **condition's** raster: an anchor is fitted to the canvas and a reference keeps
+    // the raster it arrives at, so the flag states both and the packing decides which applies.
+    let anchors = args.task == VideoTask::FirstLastToVideoAudio;
+    if !anchors {
+        println!(
+            "case: {} has no anchor, so --image {} is unused and the reference is encoded at the \
+             canvas",
+            task_name(args.task),
+            args.image
+        );
+    }
+    if anchors
+        && !args
+            .image
+            .is_multiple_of(minimax_h3::video_vae::TILE_PIXELS)
     {
         return Err(format!(
             "the condition image is {} px and the encoder's tile is {} px, so a raster that is not a \
@@ -575,7 +691,7 @@ fn encode(args: &Args) -> Result<(), String> {
             minimax_h3::video_vae::TILE_PIXELS
         ));
     }
-    if args.image != args.width.min(args.height) && args.image != args.width {
+    if anchors && args.image != args.width.min(args.height) && args.image != args.width {
         return Err(format!(
             "a first-frame anchor is fitted to the generated canvas, and {} px is neither the \
              canvas's {} px nor its short edge {}: the packing would refuse it",
@@ -608,26 +724,22 @@ fn encode(args: &Args) -> Result<(), String> {
     let arrangement = partition.arrangement(&dit).map_err(show)?;
     let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
 
-    // 3. The case: one first-frame anchor at the canvas, and a request the deployment lays out
-    //    with its own rule.
-    let condition = ConditionShape {
-        role: ConditionRole::FirstFrame,
-        frames: 1,
-        height: args.image,
-        width: args.image,
-        audio_samples: 0,
-    };
+    // 3. The case: the conditions the task names, and a request the deployment lays out with its own
+    //    rule. `fl2va` anchors the first and the last generated frame; `ref2va` carries one reference
+    //    clip with its own soundtrack. `t2va` has no condition at all, so it is another stage's case
+    //    and this one refuses it rather than running an unconditioned request down a conditioned path.
+    let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
         task: args.task,
         width: args.width,
         height: args.height,
         frames: args.frames,
-        fps: 24,
-        first_frames: 1,
-        last_frames: 0,
-        references: 0,
+        fps: minimax_h3::FPS,
+        first_frames,
+        last_frames,
+        references,
         text_tokens: args.text_tokens,
-        conditions: std::slice::from_ref(&condition),
+        conditions: &conditions,
         vision_spans: &[],
     };
     let (layout, packing) = layouts.layout(&request).map_err(show)?;
@@ -746,10 +858,14 @@ fn encode(args: &Args) -> Result<(), String> {
             segment.audio_rows()
         );
     }
-    if pieces.len() != 1 {
+    // A conditioned task packs one piece per condition: `fl2va` anchors the first and the last
+    // generated frame, and `ref2va` carries a reference with its own soundtrack. This stage runs the
+    // request's own pieces - refusing a second one is how both tasks stayed unexercised while the
+    // only path under test was a single still.
+    if segments.is_empty() {
         return Err(format!(
-            "this stage's case is one image, and the model packed {} pieces for it",
-            pieces.len()
+            "a {} request packs no condition, and this stage's case is the conditioned path",
+            task_name(args.task)
         ));
     }
     if piece_rows as u64 > u64::from(layout.condition_rows) {
@@ -805,6 +921,86 @@ fn encode(args: &Args) -> Result<(), String> {
         * u64::from(latent.frames)
         * u64::from(latent.height)
         * u64::from(latent.width);
+    // The request's pieces, from the layout's own cursors: `condition_offsets` states each draw's
+    // start and element count, so a harness that derived either would be a second statement of the
+    // packing's arithmetic.
+    let offsets = layouts.condition_offsets(&request).map_err(show)?;
+    if offsets.len() != segments.len() {
+        return Err(format!(
+            "the model packed {} conditions and gave {} draw cursors",
+            segments.len(),
+            offsets.len()
+        ));
+    }
+    let channels = u64::from(config.video_vae.in_channels);
+    let video_channels = u64::from(dit.transformer.video_channels);
+    // The audio encoder reads a track's samples; its latent frames are what the packing counts, so
+    // the hop is the one conversion between the two - and it is the checkpoint's own, which
+    // `Config::check` has already refused a mismatch on.
+    let hop = u64::from(minimax_h3::AUDIO_HOP);
+    let mut plans: Vec<PiecePlan> = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let (start, elements) = offsets[index];
+        let draw = segment.visual.map(|visual| Extent {
+            frames: visual.frames,
+            height: visual.raster.height,
+            width: visual.raster.width,
+        });
+        let expected = draw.map_or(0, |extent| {
+            video_channels
+                * u64::from(extent.frames)
+                * u64::from(extent.height)
+                * u64::from(extent.width)
+        });
+        if elements != expected {
+            return Err(format!(
+                "condition {index} draws {elements} elements and its visual holds {expected}: the \
+                 layout's cursor and the packing's raster disagree"
+            ));
+        }
+        plans.push(PiecePlan {
+            role: match segment.anchor {
+                Some(minimax_h3::packing::Anchor::FirstFrame) => MediaRole::FirstFrame,
+                Some(minimax_h3::packing::Anchor::LastFrame) => MediaRole::LastFrame,
+                None => MediaRole::Reference,
+            },
+            rows: segment.video_rows(),
+            audio_rows: segment.audio_rows(),
+            // A piece's pixels follow its own latent raster, not the canvas: an anchor is fitted to
+            // the canvas while a reference keeps the raster it arrives at, and the packing's
+            // `Visual` states which.
+            pixels: segment.visual.map(|visual| Extent {
+                frames: u32::from(visual.frames > 0),
+                height: visual.raster.height * minimax_h3::packing::LATENT_COMPRESSION,
+                width: visual.raster.width * minimax_h3::packing::LATENT_COMPRESSION,
+            }),
+            draw,
+            draw_start: start,
+            samples: (segment.audio_frames > 0).then(|| u64::from(segment.audio_frames) * hop),
+        });
+    }
+    // The pieces after the first are the harness's own cost: the first one's pixels and draw are
+    // already in `pixel_elements` and `draw_elements`.
+    let mut extras = 0_u64;
+    for plan in plans.iter().skip(1) {
+        if let Some(extent) = plan.pixels {
+            extras += channels
+                * u64::from(extent.frames)
+                * u64::from(extent.height)
+                * u64::from(extent.width)
+                * 4;
+        }
+        if let Some(extent) = plan.draw {
+            extras += video_channels
+                * u64::from(extent.frames)
+                * u64::from(extent.height)
+                * u64::from(extent.width)
+                * 4;
+        }
+        if let Some(samples) = plan.samples {
+            extras += samples * 4;
+        }
+    }
     let tables = table_bytes(&constant_specs) + table_bytes(&state_specs);
     // Every element this harness allocates for itself is four bytes except the two text buffers,
     // which are the deployment's type: the draws and the pixels are FP32 by the contract.
@@ -813,7 +1009,8 @@ fn encode(args: &Args) -> Result<(), String> {
         + encoder_bytes
         + tables
         + (text_elements + source_elements + prefix_elements) * width
-        + (pixel_elements + draw_elements) * 4;
+        + (pixel_elements + draw_elements) * 4
+        + extras;
     let arena_bytes = needed;
     let allocator = weights.allocator();
     let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
@@ -870,82 +1067,117 @@ fn encode(args: &Args) -> Result<(), String> {
     let prefix = arena
         .tensor(dtype, Shape::new(&[rows, hidden]))
         .map_err(show)?;
-    // The pixels are the *encoder's* input, `[channels, frames, height, width]`: the buffer is
-    // allocated in that order and filled in it, because a runner that filled the other order and
-    // transposed on the way in would be one stride away from a silently permuted image.
-    let channels = u64::from(config.video_vae.in_channels);
-    let image = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[
-                channels,
-                u64::from(pixels.frames),
-                u64::from(pixels.height),
-                u64::from(pixels.width),
-            ]),
-        )
-        .map_err(show)?;
-    let noise = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[
-                u64::from(dit.transformer.video_channels),
-                u64::from(latent.frames),
-                u64::from(latent.height),
-                u64::from(latent.width),
-            ]),
-        )
-        .map_err(show)?;
     let text_bytes = pseudo_bytes(text_elements, dtype);
     upload_bytes(&stream, text, &text_bytes)?;
     upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
-    // The pixels are the encoder's input in the encoder's own order, `[channels, frames, height,
-    // width]`, normalised: the order `pixels.h3t` is written in below and the one the reference
-    // probe reads, so no transpose can sit between this ramp and the convolution. A deterministic
-    // ramp stands in for an image, and the case says so.
-    let mut pixels_host = Vec::with_capacity(pixel_elements as usize * 4);
-    for plane in 0..channels {
-        for element in 0..(pixel_elements / channels) {
-            let value = ((element + plane) % 255) as f32 / 255.0;
-            pixels_host.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    upload_bytes(&stream, image, &pixels_host)?;
-    // The anchoring draw sits at the offset the model gives the piece - not at zero by assumption:
-    // a condition is drawn before the video and audio latents, and an audio-only reference takes a
-    // zero-length entry at the cursor rather than no entry, so the index alignment survives.
-    let offsets = layouts.condition_offsets(&request).map_err(show)?;
-    let (start, elements) = offsets
-        .first()
-        .copied()
-        .ok_or_else(|| "the model gave no condition offset for a one-piece request".to_owned())?;
-    if elements != noise.shape.numel() {
-        return Err(format!(
-            "the piece's draw is {elements} elements and this harness allocated {}",
-            noise.shape.numel()
-        ));
-    }
-    let noise_layer = nn::Noise::new();
-    noise_layer
-        .draw(
-            &forward,
-            noise,
-            nn::NoiseKey::Scalar(args.seed),
-            0,
-            0,
-            start,
-        )
-        .map_err(show)?;
 
-    // 8. The served entry point, once per request, over the layout the deployment made.
-    let media = [MediaInput {
-        role: MediaRole::FirstFrame,
-        rows: pieces[0].0,
-        audio_rows: pieces[0].1,
-        pixels: Some(image),
-        audio: None,
-        noise: Some(noise),
-    }];
+    // The pixels are the *encoder's* input, `[channels, frames, height, width]`, and each anchoring
+    // draw is `[video channels, latent frames, height, width]`: both are allocated in that order and
+    // filled in it, because a runner that filled the other order and transposed on the way in would
+    // be one stride away from a silently permuted image. A deterministic ramp stands in for an image
+    // and for a track, one phase per condition, and the case says so.
+    let noise_layer = nn::Noise::new();
+    let mut buffers: Vec<PieceBuffers> = Vec::with_capacity(plans.len());
+    for (index, plan) in plans.iter().enumerate() {
+        let mut pixels_host = Vec::new();
+        let pixels = match plan.pixels {
+            Some(extent) => {
+                let shape = Shape::new(&[
+                    channels,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ]);
+                let view = arena.tensor(DType::F32, shape).map_err(show)?;
+                let plane =
+                    u64::from(extent.frames) * u64::from(extent.height) * u64::from(extent.width);
+                pixels_host = vec![0_u8; usize::try_from(channels * plane * 4).map_err(show)?];
+                for channel in 0..channels {
+                    for element in 0..plane {
+                        let value = ((element + channel + index as u64) % 255) as f32 / 255.0;
+                        let at = ((channel * plane + element) * 4) as usize;
+                        pixels_host[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+                upload_bytes(&stream, view, &pixels_host)?;
+                Some(view)
+            }
+            None => None,
+        };
+        let draw = match plan.draw {
+            Some(extent) => {
+                let shape = Shape::new(&[
+                    video_channels,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ]);
+                let view = arena.tensor(DType::F32, shape).map_err(show)?;
+                // The draw sits at the offset the model gives the piece - not at zero by assumption:
+                // a condition is drawn before the video and audio latents, and an audio-only
+                // reference takes a zero-length entry at the cursor rather than no entry, so the
+                // index alignment survives.
+                noise_layer
+                    .draw(
+                        &forward,
+                        view,
+                        nn::NoiseKey::Scalar(args.seed),
+                        0,
+                        0,
+                        plan.draw_start,
+                    )
+                    .map_err(show)?;
+                Some(view)
+            }
+            None => None,
+        };
+        let audio = match plan.samples {
+            Some(samples) => {
+                // The audio encoder reads `[batch, 1, samples]` and writes channel-major rows, so the
+                // harness hands it the track and nothing else.
+                let view = arena
+                    .tensor(DType::F32, Shape::new(&[1, 1, samples]))
+                    .map_err(show)?;
+                let mut host = Vec::with_capacity(usize::try_from(samples * 4).map_err(show)?);
+                for sample in 0..samples {
+                    let phase = (sample % 480) as f32 / 480.0;
+                    let value = ((index as f32) * 0.25 + phase).sin() * 0.5;
+                    host.extend_from_slice(&value.to_le_bytes());
+                }
+                upload_bytes(&stream, view, &host)?;
+                Some(view)
+            }
+            None => None,
+        };
+        buffers.push(PieceBuffers {
+            pixels,
+            pixels_host,
+            draw,
+            audio,
+        });
+    }
+    let first = buffers
+        .first()
+        .ok_or_else(|| "the request packed no condition to encode".to_owned())?;
+    let noise = first
+        .draw
+        .ok_or_else(|| "the first condition carries no draw".to_owned())?;
+    let pixels_host = first.pixels_host.clone();
+
+    // 8. The served entry point, once per request, over the layout the deployment made: every
+    //    condition the packing named, in request order, with the role its anchor gives it.
+    let media: Vec<MediaInput> = plans
+        .iter()
+        .zip(&buffers)
+        .map(|(plan, buffer)| MediaInput {
+            role: plan.role,
+            rows: plan.rows,
+            audio_rows: plan.audio_rows,
+            pixels: buffer.pixels,
+            audio: buffer.audio,
+            noise: buffer.draw,
+        })
+        .collect();
     // A stop inside the conditioner still leaves the walk behind: the launches that led to it are the
     // evidence a cold start produces, and a stage that writes nothing on failure costs a round (the
     // rule `dt_layer` and `vae_decode` were both given this round). The page's files are cleared
@@ -1065,6 +1297,54 @@ fn encode(args: &Args) -> Result<(), String> {
         ],
         &pixels_host,
     )?;
+    // Every further condition's own input and draw, beside the first piece's: a comparison of
+    // `fl2va` needs both anchors and a `ref2va` reference needs its own pixels, and a harness that
+    // wrote only piece 0 would leave the second condition without an input to compare against.
+    for (index, (plan, buffer)) in plans.iter().zip(&buffers).enumerate().skip(1) {
+        if let (Some(extent), Some(_)) = (plan.pixels, buffer.pixels) {
+            write_h3t(
+                &directory.join(format!("pixels.{index}.h3t")),
+                H3T_F32,
+                &[
+                    channels,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ],
+                &buffer.pixels_host,
+            )?;
+        }
+        if let (Some(extent), Some(view)) = (plan.draw, buffer.draw) {
+            let values = download(&stream, view)?;
+            write_h3t(
+                &directory.join(format!("condition_noise.{index}.h3t")),
+                H3T_F32,
+                &[
+                    u64::from(dit.transformer.video_channels),
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ],
+                &values,
+            )?;
+        }
+        println!(
+            "condition {index} ({}): {} visual rows, {} audio rows, {} samples{}",
+            match plan.role {
+                MediaRole::FirstFrame => "first frame",
+                MediaRole::LastFrame => "last frame",
+                MediaRole::Reference => "reference",
+            },
+            plan.rows,
+            plan.audio_rows,
+            plan.samples.unwrap_or(0),
+            if plan.pixels.is_some() {
+                ""
+            } else {
+                ", audio only"
+            }
+        );
+    }
     // The block-by-block diagnosis (`specs/worker.md` 10): the **candidate's half** of a comparison
     // whose reference half is `tools/dump_*.py`. Each file is a tensor this stage already produced,
     // in the container the python dumpers write, under the block name the protocol's table gives - a
@@ -1145,12 +1425,31 @@ fn encode(args: &Args) -> Result<(), String> {
             args.commit.as_deref().unwrap_or("unstated")
         );
     }
+    // What this run conditioned on, in request order: the roles the anchors gave each piece and the
+    // rows the packing reserved for it. A `case.json` that named only the count could not tell a
+    // two-anchor run from a reference one.
+    let conditions = plans
+        .iter()
+        .map(|plan| {
+            format!(
+                "{}:{}",
+                match plan.role {
+                    MediaRole::FirstFrame => "first",
+                    MediaRole::LastFrame => "last",
+                    MediaRole::Reference => "reference",
+                },
+                plan.rows + plan.audio_rows
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(",");
     let case = format!(
         "{{\n  \"stage\": \"encode\",\n  \"task\": \"{}\",\n  \"canvas\": [{}, {}],\n  \
          \"frames\": {},\n  \"image\": {},\n  \"prompt_tokens\": {},\n  \"seed\": {},\n  \
          \"dtype\": \"{}\",\n  \"text_rows\": {},\n  \"condition_rows\": {},\n  \
          \"prefix_rows\": {},\n  \"hidden\": {},\n  \"pieces\": {},\n  \
-         \"piece_rows\": [{}, {}],\n  \"pixels_file\": \"pixels.h3t\",\n  \
+         \"conditions\": \"{}\",\n  \"piece_rows\": [{}, {}],\n  \
+         \"pixels_file\": \"pixels.h3t\",\n  \
          \"pixels_shape\": [{}, {}, {}, {}],\n  \
          \"pixels\": \"deterministic per-channel ramp, stated\",\n  \
          \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\",\n  \
@@ -1170,6 +1469,7 @@ fn encode(args: &Args) -> Result<(), String> {
         rows,
         hidden,
         segments.len(),
+        conditions,
         pieces[0].0,
         pieces[0].1,
         channels,

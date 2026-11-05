@@ -234,7 +234,10 @@ impl ClipEncoder {
         // operators key on the extent they reduce over, and a tile is a smaller raster, not a
         // different operator.
         for (height, width) in extents {
-            programs.extend(crate::encoding::VideoEncoder::programs(config, &[(height, width)])?);
+            programs.extend(crate::encoding::VideoEncoder::programs(
+                config,
+                &[(height, width)],
+            )?);
         }
         Ok(programs.finish())
     }

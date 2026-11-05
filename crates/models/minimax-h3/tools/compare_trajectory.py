@@ -255,8 +255,20 @@ def movement(previous: np.ndarray, current: np.ndarray) -> float:
     )
 
 
-def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
-    """Pair two trees and report every evaluation, refusing what it cannot interpret."""
+ONE_SIDE = "reference not run"
+
+
+def compare(ref: pathlib.Path | None, got: pathlib.Path) -> dict[str, object]:
+    """Pair two trees and report every evaluation, refusing what it cannot interpret.
+
+    `ref` may be `None`, which is the honest form of a table whose reference has not been
+    produced yet: this side's evaluations are listed with every comparison column reading
+    `reference not run`, so the page states what exists and what does not instead of being
+    absent until both sides do. The paired reading is unchanged - a reference that is named
+    but unreadable, or that disagrees about the arrangement, is still refused by name.
+    """
+    if ref is None:
+        return _one_side(got)
     their_layout, our_layout = arrangements(ref, got)
     theirs, ours = evaluations(ref), evaluations(got)
     missing_ours = sorted(set(theirs) - set(ours))
@@ -334,6 +346,42 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
     return report
 
 
+def _one_side(got: pathlib.Path) -> dict[str, object]:
+    """This side's evaluations, with the reference's columns unmeasured and named so."""
+    # A one-sided table still has to be about a schedule: a trajectory whose grid and step count
+    # are unstated could not be paired with any reference later, so the statement is required now
+    # rather than discovered when the reference arrives.
+    our_layout, _ = arrangements(got, got)
+    ours = evaluations(got)
+    if not ours:
+        raise SystemExit(
+            f"{got} holds no trajectory: a page with neither side run is written by naming the"
+            " command that produces each, not by tabulating nothing"
+        )
+    report: dict[str, object] = {
+        "ref": ONE_SIDE,
+        "got": str(got),
+        "layout": {"ref": ONE_SIDE, "got": our_layout},
+        "modalities": {},
+    }
+    for modality in MODALITIES:
+        keys = sorted(index for name, index in ours if name == modality)
+        if not keys:
+            continue
+        report["modalities"][modality] = [
+            {
+                "evaluation": index,
+                "state": ONE_SIDE,
+                "got_written": written(ours[(modality, index)]),
+                # The sample's own element count, which is what tells a reader whether this side
+                # wrote the trajectory it claims to: the numbers beside it are unmeasured.
+                "elements": int(load(ours[(modality, index)]).size),
+            }
+            for index in keys
+        ]
+    return report
+
+
 def table(report: dict[str, object]) -> str:
     """The report as the table a caller reads."""
     # The arrangement first: a reader who sees two different row counts on the first two lines has
@@ -348,6 +396,12 @@ def table(report: dict[str, object]) -> str:
     )
     for modality, rows in report["modalities"].items():
         for row in rows:
+            if row.get("state") == ONE_SIDE:
+                lines.append(
+                    f"{modality:<9} e{row['evaluation']:<10} {ONE_SIDE:<13}"
+                    f" {ONE_SIDE:<12} {ONE_SIDE:<8} {ONE_SIDE:<6} {row['elements']}"
+                )
+                continue
             lines.append(
                 f"{modality:<9} e{row['evaluation']:<10} {row['rel_l2']:<13.6e}"
                 f" {row['max_abs']:<12.6e} {row['cosine']:<8.5f}"
@@ -468,7 +522,10 @@ def self_test() -> int:
             checks.append(("an unstated reference grid is refused", False))
         except SystemExit as error:
             checks.append(
-                ("an unstated reference grid is refused", "omits schedule" in str(error))
+                (
+                    "an unstated reference grid is refused",
+                    "omits schedule" in str(error),
+                )
             )
         # Half a statement is refused too: a tree naming its grid but not its step count would be
         # read as agreeing about the steps.
@@ -493,7 +550,9 @@ def self_test() -> int:
             arrangements(ref, got)
             checks.append(("this side's own grid is required", False))
         except SystemExit as error:
-            checks.append(("this side's own grid is required", "schedule" in str(error)))
+            checks.append(
+                ("this side's own grid is required", "schedule" in str(error))
+            )
         for side in (ref, got):
             (side / "layout.json").write_text(json.dumps(full) + "\n")
         # A non-finite element is refused by name rather than reported as a number.
@@ -618,9 +677,10 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
-    if args.ref is None or args.got is None:
+    if args.got is None:
         parser.error(
-            "--ref and --got name the two trees, or --self-test proves the harness"
+            "--got names this model's tree; --ref names the reference's, or is omitted to write"
+            " the table with every comparison column reading `reference not run`"
         )
     report = compare(args.ref, args.got)
     print(table(report))

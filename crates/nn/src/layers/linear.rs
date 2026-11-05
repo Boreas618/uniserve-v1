@@ -576,7 +576,11 @@ impl Nvfp4Linear {
         let encoded_scales = if encoded_scale_shape == scale_shape {
             scales
         } else {
-            prefix_rows(scales, encoded_scale_shape.rows(), encoded_scale_shape.last())
+            prefix_rows(
+                scales,
+                encoded_scale_shape.rows(),
+                encoded_scale_shape.last(),
+            )
         };
         let quantize = self.encode_descriptor();
         let encoded = QuantizeArgs {
