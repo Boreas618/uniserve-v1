@@ -623,9 +623,10 @@ fn stage_decode(args: &Args) -> Result<()> {
                 u64::from(args.latent_height),
                 u64::from(args.latent_width),
             ];
-            if held == container && extents == wanted {
+            let form = latent_form(held, &extents, &wanted, &trajectory, container);
+            if form == LatentForm::Own {
                 (payload, false)
-            } else if extents == trajectory {
+            } else if form == LatentForm::Trajectory {
                 println!(
                     "latents: {} - trajectory form {extents:?} of element code {held}, converted to \
                      {dtype}",
@@ -1312,6 +1313,39 @@ fn read_container(path: &Path) -> Result<(u8, Vec<u64>, Vec<u8>)> {
     Ok((held, extents, bytes[6 + rank * 8..].to_vec()))
 }
 
+/// Which of the two containers this stage reads a supplied latent in.
+///
+/// The two forms differ in **rank and in element type**, and both differences are load-bearing: the
+/// stage's own container is `[1, C, frames, H, W]` at the decode's type, and a denoiser's trajectory
+/// is `[C, frames, H, W]` because the sample is FP32. A file that matches neither is neither - and it
+/// is refused with both forms named, never reinterpreted, because the byte count of the two is the same
+/// and a wrong rank read as a length would put a permuted latent through the decoder silently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LatentForm {
+    /// `[1, C, frames, H, W]` at the decode's element type: the stage's own, read as it stands.
+    Own,
+    /// `[C, frames, H, W]`: a trajectory, narrowed to the decode's type by [`convert_latents`].
+    Trajectory,
+    /// Neither, and the caller must be told both.
+    Neither,
+}
+
+fn latent_form(
+    held: u8,
+    extents: &[u64],
+    wanted: &[u64; 5],
+    trajectory: &[u64; 4],
+    container: u8,
+) -> LatentForm {
+    if held == container && extents == wanted {
+        LatentForm::Own
+    } else if extents == trajectory {
+        LatentForm::Trajectory
+    } else {
+        LatentForm::Neither
+    }
+}
+
 /// The container's element code for FP32, which is what a denoiser's trajectory holds.
 const CONTAINER_F32: u8 = 1;
 
@@ -1533,7 +1567,7 @@ fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTAINER_F32, Failure, convert_latents, gather_tile};
+    use super::{CONTAINER_F32, Failure, LatentForm, convert_latents, gather_tile, latent_form};
     use nn::DType;
 
     /// The one narrowing the pipeline makes: a denoiser's FP32 latent, read by a decode whose element
@@ -1607,6 +1641,26 @@ mod tests {
     fn a_raster_that_ends_early_is_refused() {
         let mut out = Vec::new();
         assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), &mut out).is_err());
+    }
+
+    /// The two containers are told apart by rank and by element type, and neither is guessed from a
+    /// length: the same byte count reads as a permuted latent if the rank is ignored.
+    #[test]
+    fn the_two_container_forms_are_told_apart_and_a_third_is_neither() {
+        let wanted = [1, 24, 7, 16, 16];
+        let trajectory = [24, 7, 16, 16];
+        let own = latent_form(5, &wanted, &wanted, &trajectory, 5);
+        assert_eq!(own, LatentForm::Own);
+        // A trajectory at FP32: the rank is one shorter and the code is the sample's.
+        let sampled = latent_form(1, &trajectory, &wanted, &trajectory, 5);
+        assert_eq!(sampled, LatentForm::Trajectory);
+        // The stage's own shape at the wrong element type is neither: a decode reading bytes labelled
+        // one width from a buffer of another is a page of nonsense, not a conversion.
+        let mismatched = latent_form(1, &wanted, &wanted, &trajectory, 5);
+        assert_eq!(mismatched, LatentForm::Neither);
+        // And a trajectory of the right rank but the wrong clip length is neither too.
+        let short = latent_form(1, &[24, 7, 16, 8], &wanted, &trajectory, 5);
+        assert_eq!(short, LatentForm::Neither);
     }
 
     /// An element type this stage has no conversion to is refused by name rather than reinterpreted as
