@@ -18,7 +18,7 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --set cuda_graph_config.policy=off \
   --set video_config.text_capacities=1024,10240
 
-uniserve serve --config fasth3.toml --set quantization_config.mode=performance
+uniserve serve --config fasth3.toml --set quantization.mode=performance
 ```
 
 | Flag | Path |
@@ -58,7 +58,7 @@ max_running_requests = 2
 [server_config]
 host = "0.0.0.0"
 
-[quantization_config]
+[quantization]
 mode = "quality"
 
 [cuda_graph_config]
@@ -75,19 +75,19 @@ retention = "30m"
 
 Each option's destination follows what its value is used for (§7.7 of `specs/worker.md`): a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the frontend or the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
-Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`). `quantization` replaces `quantization_config`.
+Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`).
 
 ### Top level
 
 | Destination | Options |
 | --- | --- |
 | Deployment identity, cannot change | `model`, `served_model_name` |
-| Build config | `max_model_len`, `dtype`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
+| Build config | `max_model_len`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
 | Host layer, frontend | `mm_processor_kwargs` |
 | Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase; read at `crates/daemon/src/epoch.rs:1293-1299` |
 | Program parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
-| Retired | `quantization_config`, replaced by `quantization` |
+| Retired, refused by name | `quantization_config`: the option is stated as `quantization`, and the retired spelling is refused with the name to state instead |
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -95,7 +95,7 @@ Three backend-name fields the split names already exist in the code and are read
 | `served_model_name` | `model` | The single model name the API serves |
 | `max_model_len` | The checkpoint's `max_position_embeddings`, 8192 when it declares none; 16384 prompt tokens for a MiniMax-H3 pipeline | Longest sequence a request may reach, in tokens |
 | `dtype` | `"bfloat16"` | Element type of parameters and activations: `bfloat16`, `float16` or `float32` |
-| `quantization_config` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the model's default |
+| `quantization` | `{}` | Precision policy: `mode` (`quality`, `balanced`, `performance`, `maximum`) and per-component selections under `components`; empty selects the checkpoint's own quantization |
 | `mm_processor_kwargs` | `{}` | Options of the model's multimodal processor; MiniMax-H3 takes `reference_image_short_edge` and `enlarge_references` ([FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity)) |
 | `attention_backend` | `"auto"` | Attention provider: `auto` selects a native kernel per call; `flashinfer`, `trtllm`, `flash_attn_4`, `torch`, `prefix_block`, `flash_attn` or `sgl_kernel` serves every call |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
