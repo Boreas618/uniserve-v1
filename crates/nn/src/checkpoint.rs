@@ -730,7 +730,13 @@ fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTen
         path: path.to_path_buf(),
         problem: format!("the safetensors header does not parse: {problem}"),
     })?;
-    let header = header as u64;
+    // **The crate answers the header's JSON length, not the payload's offset.** `read_metadata`
+    // reads the file's leading eight bytes as `n` and parses the body from `N_LEN..N_LEN + n`,
+    // then answers `Ok((n, metadata))` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts at
+    // `N_LEN + n`. Adding `n` alone shifts every tensor eight bytes early — the right shape over
+    // the wrong bytes, which is why the read-back test asserts content rather than length.
+    const HEADER_PREFIX: u64 = 8;
+    let header = HEADER_PREFIX + header as u64;
     let payload = bytes.len() as u64 - header;
 
     // The crate answers its tensors in a hash map's order; the checkpoint keys them by name and a
@@ -902,6 +908,12 @@ mod tests {
             ));
         }
         body.push('}');
+
+        // The format states the header length as a multiple of 8 so that the payload is
+        // 8-byte aligned, and every real exporter obeys it; JSON permits the trailing spaces a
+        // padded body needs. A fixture that omits a rule the real files obey tests the fixture.
+        let padded = body.len().div_ceil(8) * 8;
+        body.push_str(&" ".repeat(padded - body.len()));
 
         let mut file = Vec::new();
         file.extend_from_slice(&(body.len() as u64).to_le_bytes());
