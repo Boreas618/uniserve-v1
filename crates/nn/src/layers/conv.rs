@@ -81,6 +81,14 @@ pub struct Conv3d {
     bias: Option<Weight>,
     geometry: ConvGeometry,
     tf32: bool,
+    /// Whether this convolution reads and writes channels-last (NDHWC) tensors.
+    ///
+    /// The reference's stride-1 padded convolutions read channels-last and its strided ones
+    /// channels-first, because the two orders can select different algorithms and, for a strided
+    /// convolution, different rounding. **Stated per layer, never inferred from the stride**: a 1x1
+    /// stride-1 convolution is channels-first in the reference (`conv_shortcut`, `quant_conv`), and
+    /// deriving the order from the stride gets exactly those wrong.
+    channels_last: bool,
 }
 
 impl Conv3d {
@@ -90,6 +98,7 @@ impl Conv3d {
         bias: Option<Weight>,
         geometry: ConvGeometry,
         tf32: bool,
+        channels_last: bool,
     ) -> Result<Self> {
         if weight.shape().rank() != 5 {
             return Err(Error::shape(
@@ -102,6 +111,7 @@ impl Conv3d {
             bias,
             geometry,
             tf32,
+            channels_last,
         })
     }
 
@@ -120,6 +130,7 @@ impl Conv3d {
             3,
             false,
             self.tf32,
+            self.channels_last,
         )
     }
 
@@ -135,6 +146,7 @@ impl Conv3d {
             3,
             false,
             self.tf32,
+            self.channels_last,
         )
     }
 
@@ -150,6 +162,7 @@ impl Conv3d {
         output: DType,
         geometry: ConvGeometry,
         tf32: bool,
+        channels_last: bool,
     ) -> Descriptor {
         Descriptor {
             input,
@@ -158,6 +171,7 @@ impl Conv3d {
             geometry: geometry.descriptor(),
             bias,
             tf32,
+            channels_last,
             rank: 3,
             transposed: false,
         }
@@ -207,6 +221,7 @@ impl Conv1d {
             1,
             false,
             self.tf32,
+            false,
         )
     }
 
@@ -221,6 +236,7 @@ impl Conv1d {
             1,
             false,
             self.tf32,
+            false,
         )
     }
 
@@ -244,6 +260,7 @@ impl Conv1d {
             geometry: geometry.descriptor(),
             bias,
             tf32,
+            channels_last: false,
             rank: 1,
             transposed: false,
         }
@@ -293,6 +310,7 @@ impl ConvTranspose1d {
             1,
             true,
             self.tf32,
+            false,
         )
     }
 
@@ -307,6 +325,7 @@ impl ConvTranspose1d {
             1,
             true,
             self.tf32,
+            false,
         )
     }
 
@@ -330,6 +349,7 @@ impl ConvTranspose1d {
             geometry: geometry.descriptor(),
             bias,
             tf32,
+            channels_last: false,
             rank: 1,
             transposed: true,
         }
@@ -354,6 +374,7 @@ fn descriptor_of(
     rank: u32,
     transposed: bool,
     tf32: bool,
+    channels_last: bool,
 ) -> Descriptor {
     Descriptor {
         input,
@@ -362,6 +383,7 @@ fn descriptor_of(
         geometry: geometry.descriptor(),
         bias: bias.is_some(),
         tf32,
+        channels_last,
         rank,
         transposed,
     }
@@ -384,6 +406,7 @@ fn launch(
     rank: u32,
     transposed: bool,
     tf32: bool,
+    channels_last: bool,
 ) -> Result<()> {
     if bias.is_some_and(|bias| bias.dtype() != out.dtype) {
         return Err(Error::shape(
@@ -400,6 +423,7 @@ fn launch(
         rank,
         transposed,
         tf32,
+        channels_last,
     );
     let args = Args {
         input,
