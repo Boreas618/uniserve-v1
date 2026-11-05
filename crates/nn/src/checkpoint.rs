@@ -729,10 +729,11 @@ struct HeaderTensor {
 /// cannot express is refused here, at open, with the tensor in the message, rather than reach a
 /// launch that would misread its bytes.
 fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTensor)>)> {
-    let (header, metadata) = SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
-        path: path.to_path_buf(),
-        problem: format!("the safetensors header does not parse: {problem}"),
-    })?;
+    let (header, metadata) =
+        SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("the safetensors header does not parse: {problem}"),
+        })?;
     // **The crate answers the header's JSON length, not the payload's offset.** `read_metadata`
     // reads the file's leading eight bytes as `n` and parses the body from `N_LEN..N_LEN + n`,
     // then answers `Ok((n, metadata))` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts at
