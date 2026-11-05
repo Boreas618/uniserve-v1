@@ -74,7 +74,9 @@ fn main() -> ExitCode {
         argv.next();
     }
     let Some(fixture) = fixture else {
-        eprintln!("usage: key_coverage --fixture <path> [--target sm_100a] [--kernels crates/ops/kernels]");
+        eprintln!(
+            "usage: key_coverage --fixture <path> [--target sm_100a] [--kernels crates/ops/kernels]"
+        );
         return ExitCode::from(2);
     };
 
@@ -123,16 +125,16 @@ fn main() -> ExitCode {
                     double_claimed.push((op, key, covering.claimants.clone()));
                 }
                 println!(
-                "covered\t{op}\t{}\t{}\t{}\t{key}",
-                covering.backend,
-                match covering.form {
-                    ModuleForm::Cubin => "cubin",
-                    ModuleForm::Native => "native",
-                    ModuleForm::Wasm => "wasm",
-                    ModuleForm::Executable => "executable",
-                },
-                covering.metadata.as_deref().unwrap_or("-"),
-            )
+                    "covered\t{op}\t{}\t{}\t{}\t{key}",
+                    covering.backend,
+                    match covering.form {
+                        ModuleForm::Cubin => "cubin",
+                        ModuleForm::Native => "native",
+                        ModuleForm::Wasm => "wasm",
+                        ModuleForm::Executable => "executable",
+                    },
+                    covering.metadata.as_deref().unwrap_or("-"),
+                )
             }
             Err(reason) => {
                 uncovered += 1;
