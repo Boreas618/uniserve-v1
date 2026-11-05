@@ -530,14 +530,14 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let decode = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?;
+        let decode = minimax_h3::decoding::video_arena(&config.video_vae, &latent, nn::DType::F32)?;
         distinct_names(
             &format!("the decode plan at {}x{}", canvas.width, canvas.height),
             &decode,
         );
         let arena: u64 = decode.iter().map(|buffer| buffer.bytes()).sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
-            for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
+            for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent, nn::DType::F32)? {
                 let bytes = buffer.bytes();
                 println!("    {} {} {} B", buffer.name, buffer.element, bytes);
             }
@@ -670,7 +670,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
-    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
+    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile, nn::DType::F32)?
         .iter()
         .map(|buffer| buffer.bytes())
         .sum();

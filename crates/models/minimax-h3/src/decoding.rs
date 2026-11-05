@@ -229,10 +229,29 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
+/// The plan's name for a float element type a decode holds.
+///
+/// The names are [`Buffer::width`]'s own, so a plan cannot declare a type the arena cannot size.
+fn element_name(dtype: nn::DType) -> Result<&'static str> {
+    match dtype {
+        nn::DType::F16 => Ok("f16"),
+        nn::DType::BF16 => Ok("bf16"),
+        nn::DType::F32 => Ok("f32"),
+        other => Err(Error::config(format!(
+            "{other:?} is not an element type a decode holds: f16, bf16 or f32"
+        ))),
+    }
+}
+
 pub fn video_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
+    dtype: nn::DType,
 ) -> Result<Vec<Buffer>> {
+    // Every buffer a decode holds is the element type its weights are stored in - the checkpoint's,
+    // not a convention. Declaring a wider type than the reservation would leave the arena short by a
+    // factor the executor cannot see, and declaring a narrower one wastes the budget.
+    let element = element_name(dtype)?;
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
     let ffn = u64::from(config.decoder_ffn_mult);
@@ -274,22 +293,22 @@ pub fn video_arena(
     Ok(vec![
         Buffer {
             name: "decoded".to_owned(),
-            element: "f16",
+            element,
             elements: raster * channels,
         },
         Buffer {
             name: "tokens".to_owned(),
-            element: "f16",
+            element,
             elements: tokens_rows * patch,
         },
         Buffer {
             name: "stream".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "projected".to_owned(),
-            element: "f16",
+            element,
             elements: voxels * columns,
         },
         Buffer {
@@ -304,52 +323,52 @@ pub fn video_arena(
         },
         Buffer {
             name: "normalized".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "query".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "key".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "value".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "rotated_query".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "rotated_key".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "attended".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "update".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "gate_up".to_owned(),
-            element: "f16",
+            element,
             elements: rows * 2 * columns * ffn,
         },
         Buffer {
             name: "gated".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns * ffn,
         },
     ])
@@ -904,7 +923,7 @@ mod tests {
     fn the_video_arena_holds_one_tiles_scratch_and_every_tiles_tokens() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
-        let arena = video_arena(&config, &canvas).expect("the arena");
+        let arena = video_arena(&config, &canvas, nn::DType::F32).expect("the arena");
         // The served 768x1344 canvas at 256/64 is 4 rows of 7 tiles, each 16x16 latent voxels of
         // 7 frames.
         assert_eq!(canvas.frames, 7);
@@ -934,7 +953,11 @@ mod tests {
             .find(|buffer| buffer.name == "tokens")
             .expect("the token buffer");
         assert_eq!(tokens.elements, 28 * 1797 * patch);
-        assert_eq!(tokens.bytes(), tokens.elements * 2);
+        // Every buffer a decode holds is declared at the element type its weights are stored in, so
+        // the bytes follow from the plan's own width and not from a convention: declaring f16 over an
+        // f32 reservation leaves the arena short by half, which is what the executor sizes from.
+        assert_eq!(tokens.width().expect("a declared type"), 4);
+        assert_eq!(tokens.bytes(), tokens.elements * 4);
         // The two rotary factor tables the code reserves, in the position it reserves them: half the
         // rotated width each, so their sum is the rotated width - not the head.
         let cosine = arena

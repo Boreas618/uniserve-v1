@@ -2070,7 +2070,20 @@ impl Denoiser {
         programs.extend(Transformer::programs(
             config, attention, dtype, rows, groups, partition, tiles,
         )?);
-        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
+        // The refiner's own rows key from the type its features arrive in, and a conditioned
+        // deployment's conditioner hands them FP32 (`conditioning.rs`: the conditioned path works in
+        // FP32 from the draw to the projection, and the refiner's working buffer takes the features'
+        // type). A walk that stated them at the stack's bulk type left five launches - the refiner's
+        // attention, per-head norm, gated activation and two logits gathers - without a cell, which is
+        // what the recorder found.
+        let refiner_type = match groups {
+            Groups::Generated => dtype,
+            Groups::Conditioned => nn::DType::F32,
+        };
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config,
+            refiner_type,
+        )?);
 
         let video = config.video_channels;
 
