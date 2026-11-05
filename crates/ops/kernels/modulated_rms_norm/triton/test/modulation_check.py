@@ -396,7 +396,10 @@ def check_gated(case, generator, dtype, width, rows, gate, indices):
         gate,
         indices,
         case["gate_stride"],
-        elements,
+        # The kernel takes the ROW count and multiplies it by the width it was compiled for; the
+        # element count here masked every lane live past the activation and past `indices`, which
+        # the interpreter answered by reading out of bounds.
+        rows,
         WIDTH=width,
         BLOCK=GATED_BLOCK,
     )
@@ -474,15 +477,22 @@ HAND = {
 }
 
 
-def check_hand(operator):
-    """Run the hand-computed case of one form and compare every element with its literal."""
+def check_hand(form):
+    """Run the hand-computed case of one form and compare every element with its literal.
+
+    `form` is `modulated` or `gated` — the same two words `HAND` is keyed by and the same derivation
+    the descriptor's key uses. It selects **both** the literal table and the kernel, which is the
+    point: branching on the operator's name here instead would run one form's kernel against the
+    other form's literals whenever the caller passed a form, and the mismatch would read as an
+    arithmetic defect in a kernel that is correct.
+    """
     width = HAND["width"]
     rows = len(HAND["value"])
     gate = torch.tensor(HAND["gate"], dtype=torch.float32)
     indices = torch.tensor(HAND["indices"], dtype=torch.int64)
-    expect = torch.tensor(HAND[operator], dtype=torch.float64)
+    expect = torch.tensor(HAND[form], dtype=torch.float64)
 
-    if operator == "gated_residual":
+    if form == "gated":
         import gated_residual as kernels
 
         elements = rows * width
@@ -496,7 +506,7 @@ def check_hand(operator):
             gate,
             indices,
             width,
-            elements,
+            rows,
             WIDTH=width,
             BLOCK=GATED_BLOCK,
         )
@@ -536,11 +546,26 @@ def check_hand(operator):
         relative = gamma(width) + 8.0 * UNIT_ROUNDOFF["f32"]
 
     difference = (got.double() - expect).abs()
-    outside = (~(difference <= relative * expect.abs())).sum().item()
+    # The standard rounding bound, as every operator in this crate declares it: a term relative to
+    # the result plus a floor set by the operands' own magnitudes. The relative term alone cannot
+    # cover an element that cancels — the modulated form's literal at [1,1] is 0.009 while the
+    # operands that produce it are of order one — so a relative-only bound there asks the f32 chain
+    # to be exact where no chain can be, and reports a correct program as failing by three bounds.
+    floor = UNIT_ROUNDOFF["f32"] * torch.tensor(
+        [HAND["value"], HAND["update"]], dtype=torch.float64
+    ).abs().sum(0)
+    if form == "modulated":
+        # The chain's remaining operands, each of which contributes its own rounding.
+        for name in ("weight", "shift", "scale", "gate"):
+            floor = floor + UNIT_ROUNDOFF["f32"] * torch.tensor(
+                HAND[name], dtype=torch.float64
+            ).abs()
+    outside = (~(difference <= relative * expect.abs() + floor)).sum().item()
     print(
         f"{'exact' if outside == 0 else 'FAIL'}: hand-computed {rows} x {width}, f32 — "
         f"max absolute {difference.max().item():.3e}, bound {relative:.3e} "
-        f"({outside} outside)"
+        f"({outside} outside, with the operands' floor "
+        f"{(~(difference <= floor)).sum().item()} outside)"
     )
     return outside
 
