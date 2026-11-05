@@ -59,10 +59,15 @@ pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
         VideoTask::TextToVideoAudio => 0,
         VideoTask::FirstLastToVideoAudio => 2 * frame_rows,
         VideoTask::ReferenceToVideoAudio => {
-            // One reference at the canvas, and a soundtrack as long as one clip plays: the packing
-            // counts a track in latent steps, and every step is a stereo row.
+            // A reference **with a soundtrack is a clip** (`an H3 image reference carries no audio`),
+            // so it is `CLIP_FRAMES` pixel frames and the packing's own rule reduces them to latent
+            // frames - not one frame with a track beside it. One latent frame fewer is a capacity
+            // that refuses the request it was derived for.
+            let clip = crate::encoding::Clip::of(&config.video_vae)?;
+            let latents = clip.latent_frames(crate::CLIP_FRAMES)?;
+            // The track is one clip long, and the packing counts it in latent steps of stereo rows.
             let samples = crate::CLIP_FRAMES * crate::AUDIO_SAMPLE_RATE / crate::FPS;
-            frame_rows + crate::AUDIO_CHANNELS * samples.div_ceil(crate::AUDIO_HOP)
+            latents * frame_rows + crate::AUDIO_CHANNELS * samples.div_ceil(crate::AUDIO_HOP)
         }
     };
     capacity(config, dit, rows)
@@ -662,10 +667,12 @@ mod tests {
             condition_rows(&config, VideoTask::FirstLastToVideoAudio).expect("a capacity"),
             2048
         );
-        // A reference is one frame plus the soundtrack of one clip: 1008 + 2 x 29 latent steps.
+        // A reference **with a soundtrack is a clip**: `CLIP_FRAMES` pixel frames, which the
+        // packing reduces to two latent frames at 1008 patch rows each, plus the soundtrack of one
+        // clip (29 latent steps of two channels) - 2 x 1008 + 58 = 2074, in whole units.
         assert_eq!(
             condition_rows(&config, VideoTask::ReferenceToVideoAudio).expect("a capacity"),
-            1088
+            2112
         );
         // An unconditioned task still reserves one unit, because an arrangement refuses zero.
         assert_eq!(
