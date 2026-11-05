@@ -12,7 +12,6 @@ use executor::batch::{
     SubmissionId,
 };
 use executor::completion::Outcome;
-use executor::plan::Variant;
 use ipc::{ComponentConfig, TimingCounters, WorkerEndpoint, WorkerInfo};
 
 /// The token this pool samples for the `index`th call of every batch.
@@ -68,20 +67,7 @@ impl Serving {
     /// cache the call leaves behind — so a prefill of eight prompt tokens
     /// leaves eight, and a decode of one token on top leaves nine. The
     /// mechanism's next call reads them to know what a successor may read.
-    fn serve(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        // Each computation is answered in the shape it returns: a forward
-        // samples a token, and an encode returns the conditioning the denoiser
-        // reads and samples nothing. A computation this pool does not state is
-        // refused by name rather than answered with a forward's token, because
-        // a batch answered in the wrong shape is a success nothing downstream
-        // can tell from a right one.
-        let encode = batch.shape.variant == Variant::Encode;
-        if !encode && batch.shape.variant.media() {
-            return Err(executor::Error::Invalid(format!(
-                "this pool serves no {} batch",
-                batch.shape.variant.name()
-            )));
-        }
+    fn serve(&self, batch: Batch) -> Submission {
         let calls = batch
             .calls
             .iter()
@@ -95,12 +81,8 @@ impl Serving {
                     .copied()
                     .unwrap_or(0)
                     .max(0) as u32;
-                let tokens = if encode {
-                    // An encode produces no token: its rows are the
-                    // conditioning a later call reads, which this pool states
-                    // through the row's extent.
-                    Vec::new()
-                } else {
+                CallOutput::completed(
+                    *call,
                     vec![if self.by_extent {
                         // A function of the extent, so a continuation samples
                         // what the uninterrupted request sampled next. The
@@ -114,15 +96,10 @@ impl Serving {
                         SAMPLED + (seen % 5_000)
                     } else {
                         SAMPLED + index as u32
-                    }]
-                };
-                CallOutput::completed(
-                    *call,
-                    tokens,
+                    }],
                     RowState {
                         // Text carries no denoising trajectory: the step index
-                        // is a media row's, and this pool serves forwards and
-                        // encodes.
+                        // is a media row's, and this pool serves forwards.
                         step_index: 0,
                         cache_computed_len: seen,
                         cache_visible_len: seen,
@@ -139,7 +116,7 @@ impl Serving {
             }),
         );
         *next += 1;
-        Ok(submission)
+        submission
     }
 }
 
@@ -149,11 +126,11 @@ impl Batches for Serving {
             .lock()
             .expect("the pool's batches")
             .push(batch.clone());
-        self.serve(batch)
+        Ok(self.serve(batch))
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        self.serve(batch)
+        Ok(self.serve(batch))
     }
 
     fn inventory(&self) -> &[Inventory] {
@@ -203,28 +180,5 @@ pub(crate) fn pool(group: &str) -> Inventory {
             )]),
         },
         max_model_len: 4096,
-    }
-}
-
-/// One rank of a text pool that also serves the media encodes: its ranks state
-/// `VisionEncoding` and `LatentEncoding` beside the two forwards.
-///
-/// The capability is the rank's, not the pool's: `pool` states prefill and
-/// decode only, which is what a deployment without media states and what the
-/// media rejection case relies on. A case about an image needs this one.
-pub(crate) fn media_rank(host: &str) -> WorkerInfo {
-    let mut info = rank(host);
-    info.supported_calls
-        .push(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding));
-    info.supported_calls
-        .push(ipc::CallKind::Media(ipc::MediaCall::LatentEncoding));
-    info
-}
-
-/// The pool [`pool`] states, with ranks that also serve the media encodes.
-pub(crate) fn media_pool(group: &str) -> Inventory {
-    Inventory {
-        ranks: vec![media_rank("gpu-a")],
-        ..pool(group)
     }
 }
