@@ -84,7 +84,12 @@ impl Serving {
                 CallOutput::completed(
                     *call,
                     vec![if self.by_extent {
-                        SAMPLED + seen
+                        // A function of the extent, so a continuation samples
+                        // what the uninterrupted request sampled next, and
+                        // clamped into the window the simulated model's own
+                        // tokens occupy, so an id never leaves the vocabulary
+                        // its callers expect.
+                        SAMPLED + (seen % 5_000)
                     } else {
                         SAMPLED + index as u32
                     }],
