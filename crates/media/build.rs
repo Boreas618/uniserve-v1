@@ -10,14 +10,19 @@
 //! The runtime path is recorded in every executable this package builds, so a
 //! test binary runs without a wrapper script.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Libraries the shim calls, in link order.
 const LIBRARIES: [&str; 5] = ["avformat", "avcodec", "swscale", "swresample", "avutil"];
 
+// Which installation this is: the same rule the executables' links read
+// (`build_support/ffmpeg_prefix.rs`), included rather than copied.
+include!("build_support/ffmpeg_prefix.rs");
+
 fn main() {
     println!("cargo:rerun-if-env-changed=UNISERVE_FFMPEG_DIR");
     println!("cargo:rerun-if-changed=src/ffi/shim.c");
+    println!("cargo:rerun-if-changed=build_support/ffmpeg_prefix.rs");
 
     let prefix = ffmpeg_prefix();
     let include = prefix.join("include");
@@ -47,6 +52,10 @@ fn main() {
     for name in LIBRARIES {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
+    // These two apply to this package's own targets only; Cargo passes a dependency's search path
+    // and library names on but not its link arguments, so an executable's package states its own
+    // (the workspace root does, in `build.rs`).
+    println!("cargo:rustc-link-arg=-Wl,-rpath-link,{}", lib.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     // The runtime's own `bin/ffmpeg` is the default reference-video decoder:
     // the same installation that provides the codecs provides the external
@@ -55,19 +64,6 @@ fn main() {
         "cargo:rustc-env=UNISERVE_MEDIA_RUNTIME={}",
         prefix.display()
     );
-}
-
-/// The installation the crate is built against.
-fn ffmpeg_prefix() -> PathBuf {
-    if let Some(dir) = std::env::var_os("UNISERVE_FFMPEG_DIR") {
-        return PathBuf::from(dir);
-    }
-    let manifest = match std::env::var_os("CARGO_MANIFEST_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => panic!("Cargo sets CARGO_MANIFEST_DIR for a build script"),
-    };
-    let workspace = manifest.join("../..");
-    workspace.join("artifacts/native/prefix")
 }
 
 /// Whether `lib` holds a shared libav* library.
