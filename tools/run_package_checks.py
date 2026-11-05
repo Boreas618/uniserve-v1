@@ -9,17 +9,24 @@ runs them on a schedule: this does, in one pass, device-free and in seconds, bec
 set `TRITON_INTERPRET` themselves or accept it from here.
 
 A script is **run** only when it is a check: one with an `if __name__` block. A module a check
-imports (`scenario.py` and the like) is not run on its own, and a check that needs a *module
-directory* or a device on its command line is reported as **skipped with its reason**, which is what
-its own argument parser says.
+imports (`scenario.py` and the like) is not run on its own.
+
+**A check that refuses for a missing argument is called again with the arguments this runner can
+answer** — today that is `--op`, whose value is the operator the package is for, since it is the
+directory the check lives under. One that needs an argument nobody here can answer is **unrunnable**,
+named with the argument: that is a gap in the instrument, not a property of the kernel. The runner
+does not compile a module to feed one, because a check that loads a module launches it, so it is a
+device check, and a device check is skipped here by design rather than compiled for and then skipped.
 
 Outcomes:
 
 - **passed**: exit status 0.
-- **skipped**: the check refused before doing arithmetic — it wants a compiled module, a device, or an
-  argument this runner does not invent. The first line of its refusal is printed, so a skip that is
-  really a defect is visible rather than counted as success.
-- **failed**: anything else. Exit status 1 if any check failed.
+- **skipped**: the check refused before doing arithmetic for something this host does not have — a
+  device, a compiled module, a library. The line it printed is shown, so a skip that is really a
+  defect stays visible rather than counting as success.
+- **unrunnable**: this runner cannot call the check at all; the line names the argument it would have
+  needed. Reported, not failed, for the same reason `unreachable` is: nobody's kernel is wrong.
+- **failed**: anything else. Exit status 1 if any check failed, timed out or was contended.
 
 This is not a test and runs nothing a caller's suite would: it exercises the operators' kernels on the
 interpreter, which is where a wrong index or a missing mask is cheapest to find.
@@ -29,6 +36,7 @@ import argparse
 import concurrent.futures
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -47,6 +55,19 @@ SKIP_MARKERS = (
     "module directory is required",
     "a module directory",
 )
+
+#: Arguments a check declares required that this runner can answer from where the check lives. A
+#: required argument the runner cannot answer makes a check **unrunnable** rather than skipped: "wants
+#: a device" is a statement about the host, and "the harness does not know how to call it" is a
+#: statement about the harness — filing the second under the first is how nineteen checks read as
+#: device-dependent for weeks (`usage: conv_check.py [-h] --op {conv1d,conv3d,conv_transpose1d}`).
+DERIVABLE = {
+    # `--op` names the operator the package is for, which is where the script lives.
+    "--op": lambda operator, script: operator,
+}
+
+#: What argparse prints when it refuses for a missing argument, with the names that were required.
+REQUIRED = re.compile(r"the following arguments are required: (.+)$", re.MULTILINE)
 
 #: A check's own verdict on the arithmetic it did. A marker says a part of the check could not run
 #: here; a verdict says a part that *did* run disagreed with its reference, and that outranks the
@@ -127,14 +148,37 @@ def packages(root):
     return found
 
 
-def run_one(package, script, timeout):
-    """Run one check in its own directory with the interpreter enabled."""
+def offers(script, flag):
+    """Whether a check's own argument parser lists `flag`."""
     environment = dict(os.environ)
     environment.setdefault("TRITON_INTERPRET", "1")
     environment.pop("PYTHONPATH", None)
     try:
         completed = subprocess.run(
-            [sys.executable, script.name],
+            [sys.executable, script.name, "--help"],
+            cwd=str(script.parent),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return flag in (completed.stdout + completed.stderr)
+
+
+def run_one(package, script, timeout, operator=None, arguments=(), retried=False, cpu_only=False):
+    """Run one check in its own directory with the interpreter enabled.
+
+    A check that refuses for a missing argument is called once more with the arguments this runner
+    can answer (`DERIVABLE`); one that needs an argument nobody here can answer is `unrunnable`.
+    """
+    environment = dict(os.environ)
+    environment.setdefault("TRITON_INTERPRET", "1")
+    environment.pop("PYTHONPATH", None)
+    try:
+        completed = subprocess.run(
+            [sys.executable, script.name, *arguments],
             cwd=str(script.parent),
             env=environment,
             capture_output=True,
@@ -153,7 +197,53 @@ def run_one(package, script, timeout):
     )
     if verdict is not None:
         return ("failed", verdict, "")
+    missing = REQUIRED.search("\n".join(output))
+    if missing is not None:
+        names = [one.strip() for one in missing.group(1).split(",") if one.strip()]
+        unknown = [one for one in names if one not in DERIVABLE]
+        if unknown:
+            # A required name that is not a flag is a positional: either an input this runner does
+            # not produce (a compiled module) or a choice among the check's own cases. Both are the
+            # harness's gap and neither is answered by writing a value into the check's mouth.
+            flags = [one for one in unknown if one.startswith("-")]
+            positional = [one for one in unknown if not one.startswith("-")]
+            needs = []
+            if flags:
+                needs.append(f"the arguments {', '.join(flags)}")
+            if positional:
+                needs.append(f"its input {', '.join(positional)}")
+            return (
+                "unrunnable",
+                f"{script.name}: this runner supplies {' and '.join(needs)}, so the check is not "
+                f"called and proves nothing here",
+                2,
+            )
+        if not retried:
+            supplied = []
+            for one in names:
+                supplied.extend((one, DERIVABLE[one](operator, script)))
+            return run_one(package, script, timeout, operator, tuple(supplied), retried=True)
+        # The second call refused for an argument this runner did supply, so the refusal is not one
+        # the table can answer and the check stays uncalled rather than passed off as a skip.
+        return (
+            "unrunnable",
+            f"{script.name}: still refusing for {', '.join(names)} after they were supplied",
+            2,
+        )
     if any(marker in head or marker in tail for marker in SKIP_MARKERS):
+        # A check that offers `--cpu-only` can be held to the half of itself that does not need a
+        # device, and that half is a real assertion: `gemm_check.py` refuses without a module and
+        # then passes `--cpu-only` with four verdicts it had never been asked for here.
+        if not cpu_only and offers(script, "--cpu-only"):
+            again = run_one(
+                package, script, timeout, operator,
+                tuple(arguments) + ("--cpu-only",), retried=True, cpu_only=True,
+            )
+            if again[0] == "passed":
+                return ("passed", f"host-only half: {again[1]}", 0)
+            if again[0] == "failed":
+                return again
+            return ("skipped", f"{head or tail} (and --cpu-only: {again[1]})", "")
         return ("skipped", head or tail, "")
     if completed.returncode < 0:
         # A check killed by a signal may be a check that dies when several interpreter runs
@@ -221,6 +311,7 @@ def main():
         "timeout": [],
         "contended": [],
         "unreachable": [],
+        "unrunnable": [],
     }
     for line in diverged:
         outcomes["failed"].append((line.split(":")[0], line, 1))
@@ -245,7 +336,10 @@ def main():
         outcomes["unreachable"].append((name, reason, 1))
     with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
         futures = {
-            pool.submit(run_one, package, script, options.timeout): (package, script)
+            pool.submit(
+                run_one, package, script, options.timeout,
+                package.relative_to(options.kernels).parts[0],
+            ): (package, script)
             for package, script in jobs
         }
         for future in concurrent.futures.as_completed(futures):
@@ -264,9 +358,9 @@ def main():
         f"{len(outcomes['passed'])} passed, "
         f"{len(outcomes['skipped'])} skipped, {len(outcomes['failed'])} failed, "
         f"{len(outcomes['timeout'])} timed out, {len(outcomes['contended'])} contended, "
-        f"{len(outcomes['unreachable'])} unreachable"
+        f"{len(outcomes['unreachable'])} unreachable, {len(outcomes['unrunnable'])} unrunnable"
     )
-    for outcome in ("failed", "timeout", "contended", "unreachable", "skipped"):
+    for outcome in ("failed", "timeout", "contended", "unreachable", "unrunnable", "skipped"):
         for name, detail, code in sorted(outcomes[outcome]):
             prefix = f" [{code}]" if code not in (0, "", None) else ""
             print(f"{outcome:8s} {name}{prefix} — {detail}")
@@ -276,6 +370,8 @@ def main():
     # `unreachable` does not fail the run: it says a package exists that no caller can launch, which
     # is a question for the operator set's owner, not a check that went wrong. What it must not do is
     # disappear, so it is in the count line, in the detail lines, and out of the passed count.
+    # `unrunnable` is the same shape for the harness: a check this runner cannot call is a gap in the
+    # instrument, named with the argument it would have needed, and not a verdict about the kernel.
     return 1 if outcomes["failed"] or outcomes["timeout"] or outcomes["contended"] else 0
 
 
