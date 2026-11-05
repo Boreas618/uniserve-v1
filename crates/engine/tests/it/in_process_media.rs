@@ -207,22 +207,13 @@ fn text_is_served_before_any_rejection() {
     // A token, not a terminal event: this is completion's wait, so a failure
     // here means nothing was served, while a failure of the media case alone
     // means it waited for the wrong event.
-    let deadline = Instant::now() + ANSWER;
-    let mut served_any = false;
-    while Instant::now() < deadline && !served_any {
-        match served.try_recv() {
-            // The engine publishes generated tokens as `TextTokens` carrying
-            // the ids a step produced (`scheduler/output.rs`), and a single
-            // `TextToken` is the one-id form of the same event. A wait that
-            // matched only the second read a served request as a starved one.
-            Ok(Event::TextToken { .. }) | Ok(Event::TextTokens { .. }) => served_any = true,
-            Ok(event) if event.is_terminal() => break,
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(1)),
-        }
-    }
+    // A token, not a terminal event: this is completion's wait, so a failure
+    // here means nothing was served. The wait itself is shared, because the
+    // engine publishes generated tokens as `TextTokens` and a case that
+    // matched only `TextToken` read a served deployment as a starved one.
+    let (served_tokens, _) = support::wait_for_tokens(&mut served, 1, ANSWER);
     assert!(
-        served_any,
+        !served_tokens.is_empty(),
         "the deployment serves text before any rejection: no token arrived"
     );
 
