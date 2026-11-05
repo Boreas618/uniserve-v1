@@ -190,7 +190,30 @@ const FFN: u32 = 14336;
 /// of the model: the model's frame rule says which lengths a request can be snapped to, and no source
 /// says which of those this deployment drives. The delivery's stages and the model's bound are the
 /// list; `--frames` states another, and it may not omit one of these.
-const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+/// The stage lengths the delivery drives, in **frames**.
+///
+/// These are the stages' own lengths - what a request asks for - not the clips the sampler produces.
+/// A generation runs `17n + 5` frames (`packing::video_latent_frames`), so five of these six are not
+/// clips at all: 17, 25, 49, 121 and 1024 are counts the video *encoder* accepts (a condition is cut
+/// and padded) and the sampler does not. [`deployment_clips`] is the model's own rounding of them,
+/// and that is what the rows are keyed for.
+const DEPLOYMENT_STAGES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+
+/// The clips a delivery's stage lengths snap to, by the model's own rule.
+///
+/// `align_num_frames` rounds a request up to the next generated clip and floors it at 22, so the six
+/// stages are five clips - 22, 39, 56, 124 and 1008 - and two stages that snap to one clip state one
+/// clip's rows. Deriving the ladder this way means the row set cannot describe a timeline no request
+/// can be handed, which is what a list of stage lengths read as clips did for days.
+fn deployment_clips() -> Vec<u32> {
+    let mut clips: Vec<u32> = DEPLOYMENT_STAGES
+        .iter()
+        .map(|frames| minimax_h3::packing::align_num_frames(*frames))
+        .collect();
+    clips.sort_unstable();
+    clips.dedup();
+    clips
+}
 
 const AUDIO_ATTENTION_HEADS: u32 = 8;
 const AUDIO_LATENT_DIM: u32 = 2048;
@@ -450,14 +473,15 @@ fn main() {
     // nothing else would notice. It covers **default against stated, not stated against legal**: the
     // frame rule (`align_num_frames`) says which lengths a request snaps to, and the deployment says
     // which of those it drives.
+    let deployment_clips = deployment_clips();
     if clip_frames.is_empty() {
-        clip_frames = DEPLOYMENT_FRAMES.to_vec();
+        clip_frames = deployment_clips.clone();
     } else {
-        for frames in DEPLOYMENT_FRAMES {
+        for frames in &deployment_clips {
             if !clip_frames.contains(&frames) {
                 panic!(
                     "the run states the ladder {clip_frames:?}, which omits {frames} - a clip the \
-                     deployment drives; state a superset of {DEPLOYMENT_FRAMES:?} or no --frames"
+                     deployment drives; state a superset of {deployment_clips:?} or no --frames"
                 );
             }
         }
