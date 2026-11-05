@@ -22,7 +22,27 @@ use minimax_h3::checkpoint::{Dit, Layout, Sidecars};
 use minimax_h3::config::Config;
 use minimax_h3::schedule::{Modality, Schedule};
 
+/// What the dump takes, printed for `--help`.
+///
+/// The dump is stage 3 of the numeric diagnosis, and its three flags are all it has: the checkpoint,
+/// where the two DiTs' schedules go, and the revision the record names. Printing them is cheaper than
+/// a reader finding this file to learn that `--schedule` does not exist.
+fn usage() -> String {
+    "schedule_dump [--root <checkpoint>] [--out <dir>] [--commit <revision>]\n\n\
+     Writes `schedule-transformer.json` and `schedule-transformer_ref.json` under `--out`, each one\n\
+     the sampled schedule of one DiT: its grid kind, its sigma ladder per modality and its step\n\
+     count. Compare two trees' dumps with `tools/compare_schedule.py --dump <dir>`.\n"
+        .to_owned()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args()
+        .skip(1)
+        .any(|flag| flag == "--help" || flag == "-h")
+    {
+        print!("{}", usage());
+        return Ok(());
+    }
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut out: Option<PathBuf> = None;
     let mut commit = String::from("unstated");
