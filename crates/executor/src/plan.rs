@@ -73,6 +73,14 @@ pub enum Variant {
     /// one-dimensional convolutions. One bucket cannot hold both, and a capture is keyed by the
     /// graph a bucket runs.
     AudioDecode,
+    /// One video unit encoded on the host: the postprocessor's `[frames, rows, columns, 3]` raster
+    /// into the encoded unit the assembly appends.
+    VideoEncode,
+    /// One request's audio track encoded on the host: the decoder's interleaved PCM into the track
+    /// the assembly carries.
+    AudioEncode,
+    /// One request's encoded units and track assembled into its MP4, on the host.
+    Mux,
 }
 
 impl Variant {
@@ -87,6 +95,9 @@ impl Variant {
             Self::Denoise => "denoise",
             Self::Decode => "decode",
             Self::AudioDecode => "audio_decode",
+            Self::VideoEncode => "video_encode",
+            Self::AudioEncode => "audio_encode",
+            Self::Mux => "mux",
         }
     }
 
@@ -98,7 +109,13 @@ impl Variant {
     pub const fn media(self) -> bool {
         matches!(
             self,
-            Self::Encode | Self::Denoise | Self::Decode | Self::AudioDecode
+            Self::Encode
+                | Self::Denoise
+                | Self::Decode
+                | Self::AudioDecode
+                | Self::VideoEncode
+                | Self::AudioEncode
+                | Self::Mux
         )
     }
 
@@ -118,11 +135,12 @@ impl Variant {
             // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
             // file mapped to nothing while the model served video alone.
             ipc::MediaCall::AudioDecoding => Some(Self::AudioDecode),
-            ipc::MediaCall::MediaReading
-            | ipc::MediaCall::LatentPreparation
-            | ipc::MediaCall::VideoEncoding
-            | ipc::MediaCall::AudioEncoding
-            | ipc::MediaCall::Muxing => None,
+            // The three host calls: their work is encoding and muxing in this process, and each is
+            // a phase of its own because each is a call the mechanism submits and waits on.
+            ipc::MediaCall::VideoEncoding => Some(Self::VideoEncode),
+            ipc::MediaCall::AudioEncoding => Some(Self::AudioEncode),
+            ipc::MediaCall::Muxing => Some(Self::Mux),
+            ipc::MediaCall::MediaReading | ipc::MediaCall::LatentPreparation => None,
         }
     }
 
@@ -816,17 +834,36 @@ mod tests {
         };
         assert_eq!(tracks.select_media(&clip_decode), None);
 
+        // The artifact's three host calls are computations of their own - the executor encodes and
+        // muxes them in this process - and no device bucket serves one: they state a variant so a
+        // batch reaches the runner that does, and they select no graph.
+        for (call, variant) in [
+            (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
+            (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
+            (ipc::MediaCall::Muxing, Variant::Mux),
+        ] {
+            let host = Computation {
+                call,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::None,
+            };
+            assert_eq!(host.variant(), Some(variant));
+            assert!(variant.media());
+            assert_eq!(tracks.select_media(&host), None);
+        }
+
         // A call no variant states is served nowhere, and the mechanism reads that as the
         // capability it is.
-        let mux = Computation {
-            call: ipc::MediaCall::Muxing,
+        let unstated = Computation {
+            call: ipc::MediaCall::LatentPreparation,
             rows: 1,
             tokens: 0,
             extent: Extent::None,
         };
-        assert!(!mux.stated(), "a mux states no variant");
-        assert_eq!(plan.select_media(&mux), None);
-        assert_eq!(tracks.select_media(&mux), None);
+        assert!(!unstated.stated(), "a latent preparation states no variant");
+        assert_eq!(plan.select_media(&unstated), None);
+        assert_eq!(tracks.select_media(&unstated), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media

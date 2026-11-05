@@ -285,9 +285,20 @@ impl MediaColumns {
                 self.inputs.len()
             )));
         }
-        if computation.extent == crate::plan::Extent::None
-            && computation.variant() != Some(crate::plan::Variant::Encode)
-        {
+        // Three computations are sized by no extent at all: an encode by rows and tokens, and the
+        // artifact's two host calls by the request's own products - an audio track's samples come
+        // from the decoder's window, and a mux reads what the encodes already wrote. A device
+        // computation, by contrast, is captured for one canvas, so a batch that states none cannot
+        // say which graph serves it.
+        let host = matches!(
+            computation.variant(),
+            Some(
+                crate::plan::Variant::Encode
+                    | crate::plan::Variant::AudioEncode
+                    | crate::plan::Variant::Mux
+            )
+        );
+        if computation.extent == crate::plan::Extent::None && !host {
             return Err(Error::Invalid(format!(
                 "a {:?} batch states no extent: its kernels are captured for one canvas, and a                  batch cannot say which",
                 computation.call
@@ -609,6 +620,19 @@ pub enum Job {
         /// The generation the rebind is for.
         generation: u64,
     },
+    /// Serves one call on the host: a media call whose work is encoding, muxing or reading, and
+    /// whose answer is bytes rather than a device result (2.4's fourth kind of blocking work).
+    ///
+    /// The job carries no bucket because a host call captures no graph: the runner staged the bytes
+    /// this job reads when it submitted the batch, and performs the work on the process's media
+    /// lane, so nothing here reaches a device stream. A `CallOutput` from such a job carries the
+    /// artifact (`media_output`) and no tokens, which is what the mechanism's completion reads.
+    Host {
+        /// The runner that serves the call.
+        runner: crate::runner::RunnerId,
+        /// The call this job answers.
+        call: CallId,
+    },
 }
 
 impl Job {
@@ -644,6 +668,7 @@ impl Job {
                 "shadowing {operator} {key} in the bucket of {} tokens and {} rows of generation {generation}",
                 bucket.tokens, bucket.rows
             ),
+            Self::Host { call, .. } => format!("serving call {} on the host", call.0),
         }
     }
 
@@ -654,6 +679,7 @@ impl Job {
             Self::Capture { .. } => JobKind::Capture,
             Self::Rebind { .. } => JobKind::Rebind,
             Self::Shadow { .. } => JobKind::Shadow,
+            Self::Host { .. } => JobKind::Host,
         }
     }
 
@@ -671,7 +697,8 @@ impl Job {
             Self::Replay { runner, .. }
             | Self::Capture { runner, .. }
             | Self::Rebind { runner, .. }
-            | Self::Shadow { runner, .. } => Some(*runner),
+            | Self::Shadow { runner, .. }
+            | Self::Host { runner, .. } => Some(*runner),
         }
     }
 }
@@ -724,6 +751,11 @@ impl std::fmt::Debug for Job {
                 .field("runner", runner)
                 .field("bucket", bucket)
                 .field("generation", generation)
+                .finish(),
+            Self::Host { runner, call } => formatter
+                .debug_struct("Host")
+                .field("runner", runner)
+                .field("call", call)
                 .finish(),
         }
     }
@@ -946,6 +978,8 @@ pub enum JobKind {
     Rebind,
     /// A paired forward of one changed operator (7.3).
     Shadow,
+    /// Serving one media call on the host: encoding, muxing, or the reading of media (2.4).
+    Host,
     /// Capturing every bucket of the serving generation before it serves.
     Warmup,
     /// Preparing the next generation (7.3 step 2).
@@ -975,6 +1009,7 @@ impl JobKind {
             Self::Capture => "capture",
             Self::Rebind => "rebind",
             Self::Shadow => "shadow",
+            Self::Host => "host",
             Self::Warmup => "warmup",
             Self::Precopy => "precopy",
             Self::Switchover => "switchover",
