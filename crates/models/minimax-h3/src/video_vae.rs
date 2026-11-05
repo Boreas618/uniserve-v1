@@ -2252,6 +2252,16 @@ pub(crate) mod tests {
         assert_eq!(count("scaled_residual"), 1);
         assert_eq!(count("value_first_swiglu"), 1);
         assert_eq!(count("unpatchify_video"), 1);
+        // The stitch's third family: each seam's neighbour is copied into one contiguous block before
+        // the blend reads it, because a blend addresses its sources flat and a neighbour in a raster
+        // wider than the tile is not one contiguous block. One copy serves every seam of every canvas.
+        assert_eq!(count("copy_block"), 1);
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "copy_block" && key.contains("source_f16_out_f16")),
+            "the copy states the deployment's element type twice, as its source and its out"
+        );
 
         // The stitch compiles one blend per seam width on each of the two axes.
         let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
