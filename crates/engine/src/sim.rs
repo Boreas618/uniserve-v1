@@ -17,6 +17,7 @@
 
 use ipc::{ForwardMode, MediaCall, TransferMode};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -61,6 +62,80 @@ enum Job {
 }
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
+/// Reports a simulated deployment's worker group lost, the way a dead launch
+/// does: the group closes, and the executor answers its next poll with the
+/// loss instead of a result.
+///
+/// A real launch that cannot be replaced closes its group, and the scheduler
+/// stops when every model group is closed. Without this a simulated executor's
+/// workers never die, so no in-process case could state what happens when they
+/// all do.
+#[derive(Clone, Default)]
+pub struct SimLoss {
+    /// The group reported lost: it stays lost for the executor's lifetime, so
+    /// it reports not ready after the report has been answered.
+    group: Arc<Mutex<Option<WorkerGroupId>>>,
+    /// The report the executor's next poll answers with, taken once.
+    pending: Arc<Mutex<Option<(WorkerGroupId, String)>>>,
+    /// Wakes a scheduler parked on this executor, so the loss is answered
+    /// without waiting out its park.
+    wake: Arc<Mutex<Option<CommandWaker>>>,
+}
+
+impl SimLoss {
+    /// Reports `group` lost for `message`; the executor's next poll answers
+    /// with the loss, and `group` reports not ready and closed from then on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous report is still pending: a loss is delivered once.
+    pub fn lose(&self, group: WorkerGroupId, message: impl Into<String>) {
+        {
+            let mut lost = self
+                .group
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(lost.is_none(), "a simulated loss is reported once");
+            *lost = Some(group.clone());
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *pending = Some((group, message.into()));
+        }
+        if let Some(waker) = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            waker.wake();
+        }
+    }
+
+    /// Wakes `waker` when a loss is reported, so a scheduler parked on this
+    /// executor answers it rather than waiting out its park.
+    fn watch(&self, waker: CommandWaker) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+    }
+
+    /// Whether `group` has been reported lost.
+    fn is_lost(&self, group: &WorkerGroupId) -> bool {
+        self.group
+            .lock()
+            .map(|lost| lost.as_ref().is_some_and(|name| name == group))
+            .unwrap_or(false)
+    }
+
+    /// Takes the report the next poll answers with, if it has not been.
+    fn take(&self) -> Option<(WorkerGroupId, String)> {
+        self.pending.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
 pub struct SimExecutor {
     executor_info: ExecutorInfo,
     /// Maximum batches submitted whose results `poll` has not yet returned.
@@ -90,6 +165,8 @@ pub struct SimExecutor {
     /// The simulator's stop flag: set before the thread is joined, so that a
     /// batch waiting for a permit cannot hold the join open.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The loss a test reports through [`Self::loss`], answered by `poll`.
+    loss: SimLoss,
     /// Requests admitted by a submitted batch whose `Finish` has not been
     /// acknowledged through `poll`.
     admissions: HashSet<ipc::RequestKey>,
@@ -167,7 +244,7 @@ impl SimExecutor {
                 }
             })
             .expect("spawn sim executor thread");
-        Self {
+        let mut executor = Self {
             executor_info: {
                 let id = WorkerGroupId("sim".to_owned());
                 ExecutorInfo {
@@ -202,10 +279,15 @@ impl SimExecutor {
             ledgers: None,
             handle: Some(handle),
             stop,
+            loss: SimLoss::default(),
             admissions: HashSet::new(),
             products: HashSet::new(),
             held: None,
-        }
+        };
+        // A loss wakes the scheduler parked on this executor, so it is
+        // answered on the next poll rather than at the end of the park.
+        executor.loss.watch(executor.command_waker());
+        executor
     }
 
     /// Reports every batch this executor accepts and every result it hands
@@ -287,6 +369,15 @@ impl SimExecutor {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
         Ok(result)
+    }
+
+    /// A handle that reports one of this executor's groups lost, which the
+    /// executor answers on its next poll and reports through `is_ready`.
+    ///
+    /// The handle outlives the executor's move into a scheduler, so a test
+    /// states a loss at the moment it means it.
+    pub fn loss(&self) -> SimLoss {
+        self.loss.clone()
     }
 
     /// The failure a result's failed calls amount to, as `WorkerExecutor`
@@ -375,6 +466,7 @@ impl Executor for SimExecutor {
 
     fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.handle.is_some()
+            && !self.loss.is_lost(worker)
             && self
                 .executor_info
                 .workers
@@ -453,6 +545,21 @@ impl Executor for SimExecutor {
     /// Returns the next batch result and applies its acknowledged `Free` and
     /// `Finish` commands to the ownership sets `command_has_capacity` reads.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
+        // A lost group is reported before any result: its work is gone, and a
+        // closed group's loss is engine-fatal when no other model group
+        // serves.
+        if let Some((worker_id, message)) = self.loss.take() {
+            return Err(anyhow::Error::new(WorkerFailure {
+                worker_id,
+                endpoints: Vec::new(),
+                requests: Vec::new(),
+                refusals: Default::default(),
+                retired: Vec::new(),
+                buffers: Vec::new(),
+                execution: None,
+                message,
+            }));
+        }
         let (result, commands) = match self.held.take() {
             Some(held) => held,
             None => {
