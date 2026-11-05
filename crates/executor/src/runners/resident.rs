@@ -256,10 +256,17 @@ impl ResidentCache {
             let slot = *slot;
             let destination = table.row_address(row as u32);
             if slot < 0 {
+                // An absent row names **page zero** for every entry, not a sentinel: a vendor
+                // kernel forms a page's address before it checks the row's length, and `-1` would
+                // put that address a whole page-stride before the pool - an illegal address on a
+                // row that is not the batch's last live one. Page zero is the pool's reserved
+                // padding unit, so the address is in range and a zero-length row attends to
+                // nothing. The row's `seq_lens` entry is the batch's own and states the same zero.
+                //
                 // SAFETY: the row lies inside this provider's column, which outlives the stream
                 // work, and the count is the row's own width.
                 unsafe {
-                    platform::memset_d32(destination, u32::MAX, width as usize, stream)?;
+                    platform::memset_d32(destination, 0, width as usize, stream)?;
                 }
                 continue;
             }
@@ -288,10 +295,12 @@ impl ResidentCache {
 
 /// The slot each row of a group's table gathers from.
 ///
-/// A row the batch does not fill is `-1`: the attention kernel never reads past a row's `seq_lens`,
-/// so an absent row is never dereferenced, and the pool reserves no such slot - which is why `-1`
-/// and not `0` is the absent row. A batch wider than the table is refused, because a table one row
-/// short would silently drop a request's pages.
+/// A row the batch does not fill is `-1` **here**, and its gathered row names page zero: the slot
+/// is the cache's own numbering, where a negative slot states that no request owns the row, and the
+/// row is then filled with the padding page rather than that slot's pool row. The two are different
+/// things - who owns the row, and what the kernel may read - and only the first can be a sentinel.
+/// A batch wider than the table is refused, because a table one row short would silently drop a
+/// request's pages.
 fn row_count(group: usize, table_rows: u32, slots: &[i32]) -> Result<u32> {
     if slots.is_empty() {
         return Err(Error::Invalid(format!(
