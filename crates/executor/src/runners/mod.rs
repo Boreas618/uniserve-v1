@@ -15,6 +15,7 @@ pub mod decoder;
 pub mod denoiser;
 pub(crate) mod diag;
 pub mod encoder;
+pub(crate) mod floor;
 pub mod lifecycle;
 pub(crate) mod tables;
 
