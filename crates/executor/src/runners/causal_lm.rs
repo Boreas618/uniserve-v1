@@ -215,18 +215,14 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        // Padding **tokens** belong to a prefill: a chunk of host tokens shorter than the bucket has
-        // the rest of the bucket's token axis to fill, and the last row's range extends over it
-        // (those tokens write no cache page). A decode bucket has no padding tokens - it has padding
-        // *rows*, each evaluating one token with a commit slot below zero - so extending the last
-        // row's range there would make a one-token row own the rest of the bucket's token axis: a
-        // row attending to tokens it never carried and a pack whose end is not the batch's.
-        if !bucket.variant.is_decode()
-            && tokens < bucket_tokens
-            && let Some(last) = self.rows.query_offsets.last_mut()
-        {
-            *last = bucket_tokens as i32;
-        }
+        // A call's span is its **real** tokens and padding is inside no span: the offsets end where
+        // the batch's own tokens end, and the rest of the bucket's token axis belongs to no call.
+        // Widening the last row's span over the padding fixed one reader - a gather that wanted the
+        // last real token - and broke every other: a reader that takes a row's query length from the
+        // span was told a twenty-four-token prompt is five hundred and twelve tokens of query, and
+        // the token axis's operators were asked to work on four hundred and eighty-eight tokens no
+        // call owns. What bounds those operators is the batch's own count (`live_tokens`), which is
+        // staged beside these columns; what a span says is what the batch has.
         while self.rows.query_offsets.len() <= bucket_rows {
             let end = self
                 .rows
@@ -1612,13 +1608,64 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     counters.launches(captured.kernel_nodes());
                 }
                 if runner_dump() {
-                    // The node count is what separates a graph that does per-token work from one
-                    // that does per-batch work: a prefill an order of magnitude slower than a
-                    // decode and holding an order of magnitude more nodes is a graph shaped by its
-                    // token axis, not a slow kernel.
+                    // What a replay launches, by node kind, and how many launches the recording
+                    // saw. A forward of forty-eight layers holds hundreds of kernel nodes; a graph
+                    // that reports one node while the model has hundreds means the launches did not
+                    // land in the template - they ran during the capture - and a replay is then a
+                    // graph replaying work that is not the forward.
+                    let mut histogram: Vec<(String, u64)> = Vec::new();
+                    let mut launches = 0_u64;
+                    for (_, _, launch) in captured.nodes() {
+                        launches += 1;
+                        for walked in launch {
+                            let kind = walked
+                                .node
+                                .kind()
+                                .map(|kind| format!("{kind:?}"))
+                                .unwrap_or_else(|_| "unknown".to_owned());
+                            match histogram.iter_mut().find(|(name, _)| *name == kind) {
+                                Some((_, count)) => *count += 1,
+                                None => histogram.push((kind, 1)),
+                            }
+                        }
+                    }
+                    let kinds = histogram
+                        .iter()
+                        .map(|(name, count)| format!("{name}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    // The template's own node table, straight from the driver: what a replay
+                    // actually launches, which the recording's table can only claim.
+                    let (template_nodes, template_kinds) = match captured.template().nodes() {
+                        Ok(nodes) => {
+                            let mut counted: Vec<(String, u64)> = Vec::new();
+                            for node in &nodes {
+                                let kind = node
+                                    .kind()
+                                    .map(|kind| format!("{kind:?}"))
+                                    .unwrap_or_else(|_| "unknown".to_owned());
+                                match counted.iter_mut().find(|(name, _)| *name == kind) {
+                                    Some((_, count)) => *count += 1,
+                                    None => counted.push((kind, 1)),
+                                }
+                            }
+                            let spelled = counted
+                                .iter()
+                                .map(|(name, count)| format!("{name}:{count}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            (nodes.len(), spelled)
+                        }
+                        Err(error) => (0, format!("unreadable({error})")),
+                    };
                     tracing::info!(
                         bucket = %bucket,
                         kernels = captured.kernel_nodes(),
+                        walks = launches,
+                        recorded_kinds = %kinds,
+                        template_nodes,
+                        template_kinds = %template_kinds,
+                        kernels_held = captured.kernels().len(),
                         launch_ms = launched.elapsed().as_secs_f64() * 1e3,
                         "a replay issued its graph"
                     );
@@ -2866,10 +2913,10 @@ fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> R
 /// token - a decode - so a batch whose rows carry several tokens reads its prefill from the wrong
 /// row without this mapping.
 ///
-/// A prefilling bucket's padding tokens belong to the **last** row: `Staging::stage` extends that
-/// row's range to the bucket's token axis, because the pack the attention kernel reads ends there.
-/// So the range's end is the last token of the *bucket*, not of the batch, and the count that tells
-/// them apart is the batch's own live token count. A row that samples nothing gathers the stack's
+/// A row's range ends at its own last real token, and padding is inside no span, so the range's end
+/// is the token to read. The clamp to the batch's live token count is a belt around that rule rather
+/// than a second rule: a span that ever reached past the batch's tokens would read the bucket's
+/// padding, which is what a widened span used to do. A row that samples nothing gathers the stack's
 /// first token, whose id the sampler discards.
 fn gather_indices(
     logits_rows: &[i32],
@@ -3252,6 +3299,12 @@ mod tests {
                 "padded token {token} writes no cache page"
             );
         }
+        // The call's span is its three real tokens: padding is inside no span, so a reader that
+        // takes a row's query length from these offsets is told three and not the bucket's sixty
+        // four. Everything that must work over the bucket's token axis is bounded by the batch's
+        // live count instead (`staging.live_tokens()`), which is one bound with one meaning.
+        assert_eq!(&staging.batch_rows().query_offsets[..], &[0, 3]);
+        assert_eq!(staging.live_tokens(), 3);
         Ok(())
     }
 
