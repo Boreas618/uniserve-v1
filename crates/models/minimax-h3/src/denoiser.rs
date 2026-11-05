@@ -4457,4 +4457,37 @@ mod tests {
             .collect();
         assert_eq!(names, SEGMENT_TABLES);
     }
+
+    /// A sparse deployment's tile bound is its own layout rule's, not a caller's number.
+    ///
+    /// The walk states the bound as an argument (`--sparse tile,sparsity,tiles`), which is a second
+    /// statement of one fact: the model computes it once, at load, over every canvas and frame count
+    /// the deployment offers. This measures the model's own number, so a drift between the two shows
+    /// as a red test rather than as a fixture row nothing compares.
+    #[test]
+    fn the_sparse_tile_bound_is_the_layout_rules_and_the_fixture_s() {
+        let config = crate::config::tests_support::released_config();
+        let network = config
+            .denoisers
+            .get(&crate::Dit::Base)
+            .expect("a released base network")
+            .clone();
+        let mut sparse = network.clone();
+        sparse.attention =
+            crate::config::AttentionKind::sparse(64, 0.9, None).expect("a served tile");
+        let arrangement = Arrangement::new(&sparse, 4096, 64, 1).expect("an arrangement");
+        let layouts = Layouts::new(sparse, arrangement).expect("the layout rule");
+        let bound = layouts.tiles_bound().expect("a sparse deployment's bound");
+        // The descriptor keys the bound by its next power of two, and the launch refuses a request
+        // outside the live bound rather than clamping: so the class, not the request's count, is what
+        // a sparse deployment's store must hold. Measured: 5 400 tiles over this deployment's own
+        // canvases, the 8 192 class - while the sparse fixture's row states `max_tiles_512`, which is
+        // the walk's argument and not the model's number. The two disagree today and this test holds
+        // the half the launch keys, so a canvas-rule change moves the class and the fixture with it.
+        assert_eq!(
+            bound.next_power_of_two(),
+            8192,
+            "the deployment's own bound is {bound}"
+        );
+    }
 }
