@@ -52,6 +52,7 @@ use minimax_h3::video_vae::Tiles;
 use minimax_h3::AttentionKind;
 use minimax_h3::Partition;
 use minimax_h3::output::{Splice, VideoPostprocessor};
+use minimax_h3::partition::Ulysses;
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use nn::capability::Denoiser as _;
@@ -762,9 +763,11 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         .map_err(|error| error.to_string())?;
     let input =
         Linear::new(projection, Some(bias), WeightOrder::NxK).map_err(|error| error.to_string())?;
+    let spatial = config.spatial_compression();
+    let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
     let decoder = VideoDecoder::load(
         &config,
-        clip_canvas,
+        &[raster],
         AttentionKind::Dense,
         DType::F32,
         input,
@@ -775,7 +778,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
     let scratch = decoder
-        .scratch(&forward)
+        .scratch(&forward, &clip_canvas)
         .map_err(|error| error.to_string())?;
     let latents = arena
         .tensor(
@@ -800,7 +803,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
-    let run = decoder.decode(&forward, latents, positions, out, &scratch);
+    let run = decoder.decode(&forward, &clip_canvas, latents, positions, out, &scratch);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
 
@@ -1623,8 +1626,8 @@ fn deployment_bound(root: &Path, sparse: Option<(u32, f64, Option<f64>)>) -> Res
         }
         // The partition is the store's statement of the two capacities; the arrangement is the only
         // place they become rows, so both come from here rather than from an argument.
-        let partition =
-            Partition::serving(&config, task, 1, 1, 0, 0).map_err(|error| error.to_string())?;
+        let partition = Partition::serving(&config, task, Ulysses::single(), 1, 0, 0)
+            .map_err(|error| error.to_string())?;
         let arrangement = partition
             .arrangement(&network)
             .map_err(|error| error.to_string())?;

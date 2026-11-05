@@ -476,7 +476,10 @@ fn main() {
         let partition = minimax_h3::Partition::serving(
             &config,
             nn::VideoTask::ReferenceToVideoAudio,
-            ulysses,
+            minimax_h3::partition::Ulysses::of(
+                ulysses,
+                minimax_h3::partition::Projection::Exchange,
+            ),
             tensor_parallel,
             0,
             0,
@@ -519,7 +522,7 @@ fn main() {
     let serving = minimax_h3::Partition::serving(
         &config,
         nn::VideoTask::ReferenceToVideoAudio,
-        ulysses,
+        minimax_h3::partition::Ulysses::of(ulysses, minimax_h3::partition::Projection::Exchange),
         tensor_parallel,
         0,
         0,
@@ -929,13 +932,20 @@ fn deployment_bound(
         if let Some(kind) = &sparse {
             network.attention = *kind;
         }
-        let reached = minimax_h3::Partition::serving(config, task, 1, 1, 0, 0)
-            .and_then(|partition| partition.arrangement(&network))
-            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(network, arrangement))
-            .and_then(|rules| rules.rows_bound())
-            .unwrap_or_else(|error| {
-                panic!("the {task:?} deployment's packed bound is not statable: {error}")
-            });
+        let reached = minimax_h3::Partition::serving(
+            config,
+            task,
+            minimax_h3::partition::Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .and_then(|partition| partition.arrangement(&network))
+        .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(network, arrangement))
+        .and_then(|rules| rules.rows_bound())
+        .unwrap_or_else(|error| {
+            panic!("the {task:?} deployment's packed bound is not statable: {error}")
+        });
         bound = bound.max(reached);
     }
     bound
