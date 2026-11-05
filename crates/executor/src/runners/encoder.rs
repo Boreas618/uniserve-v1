@@ -432,11 +432,13 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
                 .device
                 .at(self.columns.hidden.device.offset_elements(first * width))
                 .reshape(ops::Shape::new(&[rows, width]));
+            let written = crate::runners::products::written_on(&self.stream)?;
             products.publish(
                 *request,
                 Product::Text,
                 self.device,
                 self.stream_id(),
+                Some(written),
                 &view,
             )?;
         }

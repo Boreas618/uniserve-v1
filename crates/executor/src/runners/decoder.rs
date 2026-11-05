@@ -485,11 +485,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         };
         let layout = self.layout(bucket)?;
         let raster = self.raster(bucket, &layout)?;
+        let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
             request,
             Product::Video,
             self.device,
             self.stream_id(),
+            Some(written),
             &raster,
         )
     }

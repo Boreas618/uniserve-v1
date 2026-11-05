@@ -364,11 +364,12 @@ fn missing_product(
     products: &dyn Products,
     request: ipc::RequestKey,
     kinds: &[Product],
-    device: platform::DeviceId,
-    stream: StreamId,
 ) -> Result<Option<Product>> {
+    // **Presence, not placement.** Whether a product exists is a fact about the store; where a
+    // reader wants it is `copy_into`'s question. Asking `borrow` here made a deployment that puts
+    // the text encoder on its own GPU refuse every step with "no call produced it".
     for kind in kinds {
-        if products.borrow(request, *kind, device, stream)?.is_none() {
+        if !products.holds(request, *kind) {
             return Ok(Some(*kind));
         }
     }
@@ -712,7 +713,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // padding below writes a column's host side, which is the memory its graph reads.
         let pending = self.pending.clone();
         let stream = self.stream.clone();
-        let (device, stream_id) = (self.device, self.stream_id());
         let layout = layout_of(bucket)?;
         let (rows, width) = conditioning_row(&self.shape, &layout);
         let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
@@ -725,24 +725,22 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 (Product::Text, &mut self.columns.text),
                 (Product::Source, &mut self.columns.source),
             ] {
-                let Some(view) = products.borrow(request, kind, device, stream_id)? else {
+                // **The copy is the store's, not this runner's.** A deployment can put the text
+                // phase on its own GPU, so the product may be on another device or another stream,
+                // and only the store holds both ends: it waits on the producer's write before this
+                // stream copies. A runner issuing its own `memcpy_async` from another device's
+                // region would be reading bytes no ordering protects.
+                let Some(available) = products.product_bytes(request, kind)? else {
                     return Err(products::absent(request, kind));
                 };
-                let (copied, zeroed) = fills(request, kind, view.byte_len()?, bytes)?;
-                let destination = column.host.address() + u64::from(index) * bytes;
-                // SAFETY: both ranges outlive this copy - the column is the runner's, allocated for
-                // the largest bucket it serves, and the span being written is one row inside it; the
-                // store's region belongs to the request, which is in flight until the executor
-                // forgets it. The copy is on the runner's own stream, so the graph that reads it is
-                // ordered after it.
-                unsafe {
-                    platform::memcpy_async(
-                        destination,
-                        view.ptr.address(),
-                        usize::try_from(copied)
-                            .map_err(|_| Error::Invalid("a row is larger than memory".into()))?,
-                        &stream,
-                    )?;
+                let (copied, zeroed) = fills(request, kind, available, bytes)?;
+                let destination = TensorView::new(
+                    ops::DevicePtr::new(column.host.address() + u64::from(index) * bytes),
+                    self.shape.dtype,
+                    Shape::new(&[copied / u64::from(element)]),
+                );
+                if !products.copy_into(request, kind, &destination, &stream)? {
+                    return Err(products::absent(request, kind));
                 }
                 // The rest of the row is the packing's zero row. A layout's prefix is the
                 // **deployment's capacity** (`DensePacking::text_rows` - "a layout holds every
@@ -824,19 +822,23 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         for row in &self.pending {
             let request = row.request;
             let latents = self.latents(bucket, row.index)?;
+            let written = products::written_on(&self.stream)?;
             products.publish(
                 request,
                 Product::VideoLatents,
                 self.device,
                 self.stream_id(),
+                Some(written),
                 &latents.video,
             )?;
             if let Some(audio) = latents.audio {
+                let written = products::written_on(&self.stream)?;
                 products.publish(
                     request,
                     Product::AudioLatents,
                     self.device,
                     self.stream_id(),
+                    Some(written),
                     &audio,
                 )?;
             }
@@ -854,13 +856,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             return Err(products::no_store(request));
         };
         let kinds = step_products(&layout_of(bucket)?);
-        match missing_product(
-            products.as_ref(),
-            request,
-            kinds,
-            self.device,
-            self.stream_id(),
-        )? {
+        match missing_product(products.as_ref(), request, kinds)? {
             Some(kind) => Err(products::absent(request, kind)),
             None => Ok(()),
         }
@@ -1511,9 +1507,29 @@ mod product_tests {
             _kind: Product,
             _device: platform::DeviceId,
             _stream: StreamId,
+            _written: Option<Arc<platform::Event>>,
             _view: &TensorView,
         ) -> Result<()> {
+            // The presence rule reads the store; who published what is `Store::held`'s own setup.
             Ok(())
+        }
+
+        fn holds(&self, _request: ipc::RequestKey, kind: Product) -> bool {
+            self.held.contains(&kind)
+        }
+
+        fn product_bytes(&self, _request: ipc::RequestKey, _kind: Product) -> Result<Option<u64>> {
+            unreachable!("the presence rule reads existence, not a length")
+        }
+
+        fn copy_into(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+            _destination: &TensorView,
+            _stream: &platform::Stream,
+        ) -> Result<bool> {
+            unreachable!("the presence rule never copies")
         }
 
         fn forget(&self, _request: ipc::RequestKey) -> usize {
@@ -1581,14 +1597,8 @@ mod product_tests {
             held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
             Some(Product::Source),
@@ -1608,14 +1618,8 @@ mod product_tests {
             held: CONDITIONED_STEP_PRODUCTS.to_vec(),
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(missing, None);
         assert_eq!(
             store.asked.lock().unwrap().len(),
@@ -1654,14 +1658,8 @@ mod product_tests {
             held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(
-            &store,
-            request(),
-            CONDITIONED_STEP_PRODUCTS,
-            platform::DeviceId(0),
-            StreamId(0),
-        )
-        .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
             Some(Product::Source),
