@@ -2175,6 +2175,29 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 for group in 0..self.kv.groups() {
                     self.kv.block_table(group, &slots, &self.stream)?;
                 }
+                // A draw that never ran and a draw that ran wrongly are the same reading afterwards,
+                // because the sampler's output lives in arena memory nothing has initialised. `-1` is
+                // outside every vocabulary and outside every sampled id, so filling the buffer with it
+                // before the launch makes "no draw" visible - and it is written under the dump only,
+                // which is a device fill on this thread's own stream and ordered before the replay.
+                if runner_dump() {
+                    let samples = self.bucket_samples.borrow().get(bucket).copied();
+                    if let Some(samples) = samples {
+                        // SAFETY: the buffer is the sampler's own `[rows]` i32 in this bucket's plan,
+                        // live for the whole epoch, and the fill is ordered before the launch that
+                        // would overwrite it.
+                        if let Err(error) = unsafe {
+                            platform::memset_d32(
+                                samples.tokens.ptr.address(),
+                                u32::MAX,
+                                bucket.rows as usize,
+                                &self.stream,
+                            )
+                        } {
+                            tracing::warn!(bucket = %bucket, %error, "the sampler's sentinel fill failed");
+                        }
+                    }
+                }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -3038,8 +3061,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let id = *id;
             id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
         }) {
+            // `-1` is the sentinel the dump fills the sampler's buffer with, so it says which of the
+            // two things happened: no draw wrote this row, or a draw wrote a value outside the
+            // vocabulary. The two are indistinguishable from an id alone, and they are different
+            // defects.
+            let why = if ids[row] == -1 {
+                "the sampler wrote nothing for this row: its buffer still holds the sentinel the dump \
+                 fills before the replay"
+            } else {
+                "a draw produced a value outside the vocabulary"
+            };
             return Err(Error::Invariant(format!(
-                "row {row} sampled token {} outside the vocabulary of {}",
+                "row {row} sampled token {} outside the vocabulary of {}: {why}",
                 ids[row], self.geometry.vocabulary
             )));
         }
