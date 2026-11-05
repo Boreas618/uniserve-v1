@@ -2076,14 +2076,21 @@ impl Denoiser {
         // type). A walk that stated them at the stack's bulk type left five launches - the refiner's
         // attention, per-head norm, gated activation and two logits gathers - without a cell, which is
         // what the recorder found.
-        let refiner_type = match groups {
-            Groups::Generated => dtype,
-            Groups::Conditioned => nn::DType::F32,
+        // **The refiner is handed features of two types and takes each as it comes** (its working
+        // buffer is `features.dtype`): the prompt's own rows arrive at the stack's type and a
+        // conditioned deployment's conditioner hands it FP32. So a conditioned deployment states the
+        // refiner at both, and a dense one at the stack's type alone - the recorder drove the forward
+        // and read exactly that, in both deployments.
+        let refiner_types: &[nn::DType] = match groups {
+            Groups::Generated => &[dtype],
+            Groups::Conditioned => &[dtype, nn::DType::F32],
         };
-        programs.extend(crate::conditioning::TokenRefiner::programs(
-            config,
-            refiner_type,
-        )?);
+        for refiner_type in refiner_types {
+            programs.extend(crate::conditioning::TokenRefiner::programs(
+                config,
+                *refiner_type,
+            )?);
+        }
 
         let video = config.video_channels;
 
