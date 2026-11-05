@@ -83,10 +83,11 @@ type Harness = fn(&Request) -> Result<Vec<(String, String)>, String>;
 /// What the recorder was asked to record — the deployment, stated so the output can say what it is.
 struct Request {
     root: PathBuf,
-    dtype: DType,
     clip: u32,
     raster: (u32, u32),
-    rows: u32,
+    /// The deployment's own bounded packed-row count (`Layouts::rows_bound`), which serving reads and
+    /// the attention is compiled for. Derived once here so the header and the harness cannot differ.
+    bound: u32,
     /// The deployment's prompt capacity: the arrangement's text rows and the request's own text
     /// length, which key the packed stream's offsets.
     tokens: u32,
@@ -117,12 +118,11 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut component = String::from("all");
-    // No default: the deployment's element type is the deployment's statement, and a recorder that
-    // guessed it would produce a row set for a type nobody serves. The walk takes no default either.
-    let mut dtype: Option<DType> = None;
     let mut clip = 256u32;
     let mut raster = (480u32, 832u32);
-    let mut rows = 32_000u32;
+    // No default: the bounded count is the deployment's own (`Layouts::rows_bound`) and serving
+    // reads it. A stated value is a claim the denoiser harness checks against it.
+    let mut rows: Option<u32> = None;
     // The deployment's prompt capacity and audio track, which the walk states as `--tokens` and
     // `--track`. They key the packed stream's offsets and the audio encoder's widths, so a
     // comparison of two deploments must pass the same pair to both enumerations.
@@ -140,14 +140,6 @@ fn run() -> Result<(), String> {
         match argument.as_str() {
             "--root" => root = PathBuf::from(value()?),
             "--component" => component = value()?,
-            "--dtype" => {
-                dtype = Some(match value()?.as_str() {
-                    "f16" => DType::F16,
-                    "bf16" => DType::BF16,
-                    "f32" => DType::F32,
-                    other => return Err(format!("unknown dtype {other}")),
-                })
-            }
             "--clip" => clip = value()?.parse().map_err(|_| "clip is a count of frames")?,
             "--raster" => {
                 let stated = value()?;
@@ -157,7 +149,7 @@ fn run() -> Result<(), String> {
                     h.parse().map_err(|_| "--raster's height is a count")?,
                 );
             }
-            "--rows" => rows = value()?.parse().map_err(|_| "--rows is a count")?,
+            "--rows" => rows = Some(value()?.parse().map_err(|_| "--rows is a count")?),
             "--tokens" => tokens = value()?.parse().map_err(|_| "--tokens is a count")?,
             "--track" => track = value()?.parse().map_err(|_| "--track is a count of samples")?,
             "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
@@ -200,7 +192,6 @@ fn run() -> Result<(), String> {
         return list_extents(&root, &component);
     }
 
-    let dtype = dtype.ok_or("--dtype is the deployment's own element type and has no default")?;
     // The caller's tensor table is an artifact of an export, not a file in the tree, so it is stated
     // when it is at hand and said to be unstated when it is not: requiring it would make a recording
     // refuse on a host that simply has not exported one.
@@ -208,12 +199,21 @@ fn run() -> Result<(), String> {
         Some(path) => read_extents(path)?,
         None => BTreeMap::new(),
     };
+    let bound = deployment_bound(&root, tokens, sparse)?;
+    if let Some(stated) = rows
+        && stated != bound
+    {
+        return Err(format!(
+            "--rows states {stated} packed rows and the deployment's own bound is {bound}: the \
+             attention is compiled for the bound it serves, and a recording of a smaller one \
+             describes a deployment the model cannot be asked to be"
+        ));
+    }
     let request = Request {
         root,
-        dtype,
+        bound,
         clip,
         raster,
-        rows,
         tokens,
         track,
         elements,
@@ -282,7 +282,7 @@ fn run() -> Result<(), String> {
         request.raster.0,
         request.raster.1,
         request.tokens,
-        request.rows,
+        request.bound,
         request.elements,
         request.types.as_deref().map_or_else(
             || format!("[{}]", minimax_h3::load::UNSTATED),
@@ -593,8 +593,9 @@ fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, S
         ulysses_degree: 1,
         ..Partition::single()
     };
-    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
-    let encoder = TextEncoder::load(&mut loader, &config, &partition, request.dtype)
+    let text_type = component_type(request, "text_encoder")?;
+    let mut loader = WeightLoader::stated(text_type, Some(&request.extents));
+    let encoder = TextEncoder::load(&mut loader, &config, &partition, text_type)
         .map_err(|error| error.to_string())?;
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
@@ -653,7 +654,7 @@ fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, S
     }
     let hidden = arena
         .tensor(
-            request.dtype,
+            text_type,
             Shape::new(&[count, u64::from(config.hidden_size)]),
         )
         .map_err(|error| error.to_string())?;
@@ -682,6 +683,8 @@ fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, S
 /// It is the one decoded component with no checkpoint of its own — its two constants are the model's — so it
 /// measures whether the walk's rows are the launch's, not whether a store has them.
 fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, String> {
+    // The post-processor runs in the VAE container's type, which is the type its rows key.
+    let vae_type = component_type(request, "vae")?;
     let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
     let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
     let mean = loader
@@ -702,7 +705,7 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
             "minimax-h3",
         )
         .map_err(|error| error.to_string())?;
-    let post = VideoPostprocessor::new(request.dtype, mean, std).map_err(|error| error.to_string())?;
+    let post = VideoPostprocessor::new(vae_type, mean, std).map_err(|error| error.to_string())?;
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
@@ -710,7 +713,7 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
     let (height, width) = request.raster;
     let clip = arena
         .tensor(
-            request.dtype,
+            vae_type,
             Shape::new(&[
                 3,
                 u64::from(splice.overlap.1),
@@ -723,7 +726,7 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
     // against and skips the seam, so the harness states the predecessor and the blend is recorded.
     let previous = arena
         .tensor(
-            request.dtype,
+            vae_type,
             Shape::new(&[
                 3,
                 u64::from(splice.overlap.1 - splice.overlap.0),
@@ -759,6 +762,7 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
 /// shapes here — the arena is null-backed and the forward records instead of launching — so a step
 /// costs no device and no checkpoint byte.
 fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let dit_type = component_type(request, "transformer")?;
     let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
     let network = config
         .denoisers
@@ -780,7 +784,10 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     // The layout rule is the same statement the network loads with: the tables a step reads are the
     // rule's, and a harness that built its own would be a second source of truth for them.
     let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
-    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
+    let mut loader = WeightLoader::stated(
+        component_type(request, "transformer")?,
+        Some(&request.extents),
+    );
     let partition = Partition {
         tensor_parallel: 1,
         tensor_rank: 0,
@@ -790,7 +797,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let denoiser = Denoiser::load(
         network,
         arrangement,
-        request.rows,
+        request.bound,
         &partition,
         &mut loader,
         None,
@@ -828,7 +835,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let hidden = u64::from(config_hidden);
     let text = arena
         .tensor(
-            request.dtype,
+            dit_type,
             Shape::new(&[u64::from(packing.text_rows), hidden]),
         )
         .map_err(|error| error.to_string())?;
@@ -891,7 +898,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let text_width = u64::from(config.text_encoder.hidden_size);
     let run = arena
         .tensor(
-            request.dtype,
+            dit_type,
             Shape::new(&[u64::from(packing.text_rows), text_width]),
         )
         .map_err(|error| error.to_string())
@@ -919,6 +926,8 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
 /// refines the prompt in place. That is where `posterior`, `frame_pad` and the encoders' launches
 /// happen, and nothing else reaches them without a device.
 fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let text_type = component_type(request, "text_encoder")?;
+    let dit_type = component_type(request, "transformer")?;
     let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
     let network = config
         .denoisers
@@ -970,7 +979,10 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arrangement = Arrangement::new(&network, request.tokens, capacity, 1)
         .map_err(|error| error.to_string())?;
     let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
-    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
+    let mut loader = WeightLoader::stated(
+        component_type(request, "audio_vae")?,
+        Some(&request.extents),
+    );
     // `ConditionEncoders` reads its weights from the VAE directories, as the decoder halves do, and
     // the stated loader answers every name from the extents table on a host with no shard.
     // The encoders compute in FP32 at every deployment, so they get their own statement. They are
@@ -1032,10 +1044,10 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     // is the denoiser's rows, at the network's - two widths, and a source at the wrong one is refused.
     let text_width = u64::from(config.text_encoder.hidden_size);
     let source = arena
-        .tensor(request.dtype, Shape::new(&[prefix, text_width]))
+        .tensor(text_type, Shape::new(&[prefix, text_width]))
         .map_err(|error| error.to_string())?;
     let text = arena
-        .tensor(request.dtype, Shape::new(&[prefix, hidden]))
+        .tensor(dit_type, Shape::new(&[prefix, hidden]))
         .map_err(|error| error.to_string())?;
     // The condition's pixels at the canvas the request names, in the encoder's own channel order,
     // and the anchoring draw at its latent raster: the runner owns both, and the conditioner
@@ -1164,6 +1176,50 @@ fn deployment_types(path: &Path) -> String {
         Ok(stated) => format!("[{}] from {}", stated.field(), path.display()),
         Err(error) => format!("unreadable ({error})"),
     }
+}
+
+/// The deployment's own bounded packed-row count, from the model's own rule.
+///
+/// Serving sizes its attention from `Layouts::rows_bound` and the walk takes it as its only source, so
+/// the recorder asks the same function rather than a flag: a harness that sized the attention from an
+/// argument would record a deployment the model cannot be asked to be.
+fn deployment_bound(
+    root: &Path,
+    tokens: u32,
+    sparse: Option<(u32, f64, Option<f64>)>,
+) -> Result<u32, String> {
+    let config = minimax_h3::Config::read(root, None).map_err(|error| error.to_string())?;
+    let mut network = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or("this checkpoint holds no base network")?
+        .clone();
+    if let Some((tile, sparsity, reference_keep)) = sparse {
+        network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
+            .map_err(|error| error.to_string())?;
+    }
+    let arrangement = Arrangement::new(&network, tokens, 64, 1).map_err(|error| error.to_string())?;
+    let rules = Layouts::new(network, arrangement).map_err(|error| error.to_string())?;
+    rules.rows_bound().map_err(|error| error.to_string())
+}
+
+/// One component's stored element type, from the caller's table where it is at hand and the
+/// checkpoint's own shard headers where they are.
+///
+/// The harnesses state their weights' shapes (this host holds no shard), so the type a weight is
+/// stated in is the component's own - the same fact the walk keys its rows from. A component of two
+/// stored types answers with its bulk, and the individual crossings the extents table states keep
+/// their own type, because the table's entry is the more particular fact.
+fn component_type(request: &Request, component: &str) -> Result<DType, String> {
+    let stated = match request.types.as_deref() {
+        Some(table) => Some(
+            minimax_h3::load::ElementTypes::read(table).map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let checkpoint = nn::Checkpoint::open(&request.root).ok();
+    minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), component)
+        .map_err(|error| error.to_string())
 }
 
 /// Every checkpoint tensor the chosen component's load asks for, in the load's order.
