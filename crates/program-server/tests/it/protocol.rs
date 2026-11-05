@@ -209,7 +209,6 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                         entry: String::new(),
                         entries: std::collections::HashMap::new(),
                         metadata: "metadata.json".into(),
-                        library: String::new(),
                     })),
                 },
                 &[OwnedFd::from(file)],
@@ -366,7 +365,6 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
                         .into_iter()
                         .collect(),
                         metadata: String::new(),
-                        library: String::new(),
                     })),
                 },
                 &[OwnedFd::from(file)],

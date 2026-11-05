@@ -311,7 +311,6 @@ impl ProgramServer {
                             entry: String::new(),
                             entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
-                            library: module.library.unwrap_or_default(),
                         })),
                     },
                     &descriptors,
@@ -715,7 +714,6 @@ impl ProgramServer {
             files: module_files,
             metadata: package.manifest.module.metadata_name(&path.descriptor),
             entries,
-            library: package.manifest.module.library_name(&path.descriptor),
         })
     }
 
