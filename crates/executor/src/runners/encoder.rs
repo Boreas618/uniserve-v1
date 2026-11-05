@@ -31,7 +31,7 @@ use crate::batch::{Batch, BatchOutput, Job, Jobs};
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_i32};
-use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
@@ -695,7 +695,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 
