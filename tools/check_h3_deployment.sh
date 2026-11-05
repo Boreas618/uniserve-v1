@@ -64,7 +64,7 @@ echo "== the sparse list against its generator"
 # rather than by falling through to a walk comparison, which measures the walk.
 if [ -f "$sparse_fixture" ]; then
     python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9,8192 \
-        --fixture "$sparse_fixture" || fail "the sparse file is not the generator's sparse rows"
+        --fixture "$sparse_fixture" || sparse_not_generated=1
 else
     echo "   skipped: $sparse_fixture is absent"
 fi
@@ -269,5 +269,12 @@ fi
 
 echo
 echo
+# A sparse file that is another tree's rows is reported at the end rather than at
+# the point it is found: the dense file's other seven answers are independent of it,
+# and a reader who never sees them reads a red as being about the deployment.
+if [ "${sparse_not_generated:-}" = 1 ]; then
+    fail "the sparse file is not the generator's sparse rows"
+fi
+
 echo "every question answers: the list is this tree's rows, every row is declared,"
 echo "every clip is one a request can name, and the walks' shapes are in the file."
