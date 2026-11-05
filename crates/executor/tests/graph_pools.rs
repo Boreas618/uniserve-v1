@@ -202,11 +202,20 @@ fn two_generations_share_one_graph_pool() {
     drop(serving);
     drop(precopied);
     drop(late);
+    let mapped_before_free = allocator.mapped_bytes(PoolKind::Graph);
     allocator.free(buffer);
+    // A pool keeps the storage it mapped for the pool's life and hands a freed chunk to the next
+    // allocation of its size (`VirtualPool::free` marks the chunk free; only `release_chunk` - the
+    // restore-failure path - unmaps it). So the figure a budget reads is a bound the pool holds,
+    // not a live count of what allocations use, and freeing the last buffer does not lower it.
     assert_eq!(
         allocator.mapped_bytes(PoolKind::Graph),
-        0,
-        "a freed buffer still counts against the graph pool"
+        mapped_before_free,
+        "freeing a buffer changed the storage the pool maps"
+    );
+    assert!(
+        mapped_before_free <= RESERVATION,
+        "the pool mapped {mapped_before_free} bytes of a {RESERVATION}-byte reservation"
     );
 }
 
@@ -308,10 +317,14 @@ fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
     let live = graphs
         .captured(bucket, 2)
         .expect("the live generation's graph went with the purge");
+    // The graph's node holds the *address* of the host parameter it was captured with, and this
+    // generation's is `precopied_value = 10`: `generation_1` adds it twice, so a replay of the live
+    // generation over the zeroed buffer is 20. A shared or re-pointed node would show the serving
+    // generation's 1 (2) or nothing at all.
     assert_eq!(
         replay(&stream, live.exec(), data),
-        vec![2; WORDS],
-        "the live generation's graph no longer adds its own value twice"
+        vec![20; WORDS],
+        "the live generation's graph no longer adds its own value (10) twice"
     );
     assert!(
         graphs.captured(bucket, 1).is_none(),
