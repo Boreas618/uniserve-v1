@@ -989,6 +989,11 @@ impl EpochPlan {
                 // A construction stating their union would serve both; the model offers none, and
                 // this does not invent one.
                 let task = served_task(&config.tasks(), &self.checkpoint)?;
+                // **The postprocessor is placed here, though `serving` names only what holds
+                // weights.** Its arithmetic is the clip splice and it names no checkpoint
+                // directory, so it is not a component a task's weights place - but the decode
+                // runner takes it as the video decoder's second entry point, and a rank that held
+                // the decoder without it would publish a timeline's first clip and say nothing.
                 let partition = minimax_h3::Partition::serving(
                     &config,
                     task,
@@ -997,6 +1002,11 @@ impl EpochPlan {
                     tensor_rank,
                     sequence_rank,
                 )?;
+                let partition = partition.placing(
+                    partition
+                        .blocks
+                        .with(minimax_h3::Component::VideoPostprocessor),
+                );
                 let dtype = match self.build.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
