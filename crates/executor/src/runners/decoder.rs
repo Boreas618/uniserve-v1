@@ -126,6 +126,10 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// so one name covers a batch, and a later decode of the same request replaces it — which is
     /// what a reader that copied in time expects.
     staged_request: Option<ipc::RequestKey>,
+    /// The pinned host scratch a trajectory of another element type lands in, allocated the first
+    /// time one is staged and reused after: the denoiser accumulates in FP32 and this decoder reads
+    /// the checkpoint's type, so the crossing is one conversion per clip, on the host.
+    crossing: Option<platform::PinnedBuffer>,
 }
 
 impl<M: Decoder + Send + Sync> DecoderRunner<M> {
@@ -184,6 +188,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             raster_elements: 0,
             products: None,
             staged_request: None,
+            crossing: None,
         })
     }
 
@@ -459,14 +464,88 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     ) -> Result<()> {
         self.stage_columns(bucket, None)?;
         let layout = self.layout(bucket)?;
-        let latents = self.latents(&layout);
-        if !store.copy_into(request, Product::VideoLatents, &latents, &self.stream)? {
+        let Some(published) = store.product(request, Product::VideoLatents)? else {
+            return Err(crate::runners::products::absent(
+                request,
+                Product::VideoLatents,
+            ));
+        };
+        if published.dtype == self.dtype {
+            let latents = self.latents(&layout);
+            if !store.copy_into(request, Product::VideoLatents, &latents, &self.stream)? {
+                return Err(crate::runners::products::absent(
+                    request,
+                    Product::VideoLatents,
+                ));
+            }
+            return Ok(());
+        }
+        // **The boundary's one conversion.** The denoiser accumulates in FP32 (`SAMPLE_DTYPE`) and
+        // this decoder reads the checkpoint's own type; the reference spans the two with
+        // `torch.autocast`, which design 9 replaced with declared per-layer precision, so exactly
+        // one conversion happens here - once per clip, on the host, not per step and not in a loop.
+        let source = self.trajectory_scratch(published)?;
+        if !store.copy_into(request, Product::VideoLatents, &source, &self.stream)? {
             return Err(crate::runners::products::absent(
                 request,
                 Product::VideoLatents,
             ));
         }
+        // The copy is ordered on this stream, so the host may read the bytes once the stream reaches
+        // it. This is the one place in the media seam that waits on the device rather than ordering
+        // more work after it, and it waits once per clip.
+        self.stream.synchronize()?;
+        let crossing = self
+            .crossing
+            .as_ref()
+            .ok_or_else(|| Error::Invariant("the trajectory scratch was just staged".into()))?;
+        // SAFETY: the buffer is this runner's own pinned storage, sized for exactly the trajectory
+        // and written by the copy above, which the synchronize has completed; nothing else holds a
+        // reference to it while the conversion reads it.
+        let bytes = unsafe { crossing.as_slice() };
+        let converted = nn::weights::convert(
+            published.dtype,
+            self.dtype,
+            bytes,
+            "the denoiser's trajectory",
+        )
+        .map_err(Error::from)?;
+        self.columns.latents.write(&converted)?;
         Ok(())
+    }
+
+    /// The pinned host scratch a trajectory of another element type lands in, sized to it once.
+    ///
+    /// The conversion is a host conversion, so the product's bytes must come back to the host first -
+    /// and a product of another type cannot be copied into this runner's column at all, which the
+    /// store refuses by both types. Reusing one buffer keeps the crossing to one allocation per
+    /// runner rather than one per clip.
+    fn trajectory_scratch(
+        &mut self,
+        published: crate::runners::products::Published,
+    ) -> Result<TensorView> {
+        let element = published
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", published.dtype)))?;
+        let bytes = usize::try_from(published.bytes)
+            .map_err(|_| Error::Invalid("a trajectory is larger than memory".into()))?;
+        if self
+            .crossing
+            .as_ref()
+            .is_none_or(|buffer| buffer.len() < bytes)
+        {
+            self.crossing = Some(platform::PinnedBuffer::new(self.device, bytes)?);
+        }
+        let buffer = self
+            .crossing
+            .as_ref()
+            .ok_or_else(|| Error::Invariant("the trajectory scratch was just allocated".into()))?;
+        Ok(TensorView::new(
+            ops::DevicePtr::new(buffer.address()),
+            published.dtype,
+            Shape::new(&[published.bytes / u64::from(element)]),
+        ))
     }
 
     /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
