@@ -304,6 +304,10 @@ fn main() {
     // list has that is absent here is typed drift. It exits before the header, so a diff of its
     // output against the file is the review artifact.
     let mut derived = false;
+    // One rank's place in each group is 0: a key names a program, and every rank of a group launches
+    // the same one, so the position is not an axis of the row set.
+    let mut ulysses: usize = 1;
+    let mut tensor_parallel: usize = 1;
     // Which attention backend the deployment runs. **One deployment runs one**, so this is what the
     // file is a deployment of, not a filter over a union: without it the sparse selection's rows are
     // absent, and a store built from the file serves the dense deployment and only that.
@@ -333,6 +337,23 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            // **The sequence and tensor degrees are key axes, not deployment decorations.** A sparse
+            // attention's program takes the heads one exchange rank attends (`Partition::denoiser_heads`,
+            // `heads / ulysses`), so a checkpoint served at Ulysses 4 launches `heads_14` where a single
+            // rank launches `heads_56`: a walk fixed at degree 1 cannot enumerate the rows of a sharded
+            // deployment, and a store for one therefore cannot be built from it.
+            "--ulysses" => {
+                ulysses = value(&mut arguments, "--ulysses")
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("--ulysses is not a degree"))
+                    .max(1);
+            }
+            "--tensor-parallel" => {
+                tensor_parallel = value(&mut arguments, "--tensor-parallel")
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("--tensor-parallel is not a degree"))
+                    .max(1);
+            }
             // The revision the rows are enumerated from. The generator cannot read it - it reads a
             // checkpoint, not a tree - so the caller states it, and a fixture that omits it is a
             // row set with no way back to the code that produced it.
@@ -353,6 +374,20 @@ fn main() {
             }
             other => panic!("unknown flag {other}"),
         }
+    }
+    // **A sparse deployment has no Ulysses degree in this port**, and the walk says so rather than
+    // emitting rows for a launch the model refuses: `AttentionSparse::new` declines a degree above one
+    // because the compression's cross-rank composition is not written, so every `vsa_*` row this file
+    // can produce is a row for a single-rank launch. A walk that emitted the same descriptors under a
+    // sharded header would describe a deployment that cannot load, and a store built from it would
+    // hold programs for a launch that never happens.
+    if sparse && ulysses > 1 {
+        panic!(
+            "a sparse deployment at a Ulysses degree of {ulysses} has no program to enumerate: the \
+             sparse attention refuses a degree above one, because the compression's cross-rank \
+             composition is not written - a store for that deployment would hold rows for a launch \
+             the model would not perform"
+        );
     }
     if rasters.is_empty() {
         rasters = minimax_h3::NAMED_CANVASES
@@ -441,8 +476,8 @@ fn main() {
         let partition = minimax_h3::Partition::serving(
             &config,
             nn::VideoTask::ReferenceToVideoAudio,
-            1,
-            1,
+            ulysses,
+            tensor_parallel,
             0,
             0,
         )
@@ -481,11 +516,15 @@ fn main() {
     // states the released defaults and gives a bound no conditioned request asks for. Two rows are
     // reachable only at the bound (the gated activation's `wide` form switches on the row count), and
     // the header states it.
-    let serving =
-        minimax_h3::Partition::serving(&config, nn::VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
-            .unwrap_or_else(|error| {
-                panic!("the deployment's serving partition is not statable: {error}")
-            });
+    let serving = minimax_h3::Partition::serving(
+        &config,
+        nn::VideoTask::ReferenceToVideoAudio,
+        ulysses,
+        tensor_parallel,
+        0,
+        0,
+    )
+    .unwrap_or_else(|error| panic!("the deployment's serving partition is not statable: {error}"));
     let bound = deployment_bound(&config, sparse_deployment);
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
@@ -613,7 +652,10 @@ fn main() {
         // The two DiTs, from the same value and the partition the deployment states. `elements` is empty
         // by construction: the solver's residual width is a request's element count, so a row for it
         // would be a program for numbers no request states until it arrives.
-        let partition = minimax_h3::Partition::single();
+        // **The degrees the deployment serves at**: `Partition::single()` states 1 and 1, and a sparse
+        // attention's `heads` is the heads one exchange rank attends, so a walk fixed at one rank
+        // cannot produce the `heads_14` row a Ulysses 4 deployment launches.
+        let partition = minimax_h3::Partition::single().sharded(ulysses, tensor_parallel);
         let Some(dies) = config.denoisers.values().next() else {
             panic!("the checkpoint states no DiT, so its arrangement is not statable")
         };

@@ -408,6 +408,19 @@ impl Partition {
         }
     }
 
+    /// The same partition at `ulysses_degree` and `tensor_parallel`, with every other field as it
+    /// stands.
+    ///
+    /// The two degrees are what a program key can depend on: a sparse attention states `heads` as the
+    /// heads one exchange rank attends (`heads / degree`), and the text encoder's degree divides its
+    /// query heads. A walk that cannot state them enumerates one deployment's rows and calls them the
+    /// model's - which is why this is a builder on a stated partition rather than a constant.
+    pub const fn sharded(mut self, ulysses_degree: usize, tensor_parallel: usize) -> Self {
+        self.ulysses_degree = ulysses_degree;
+        self.tensor_parallel = tensor_parallel;
+        self
+    }
+
     /// The same partition, placed at `rank` of the denoiser's sequence group.
     ///
     /// A builder rather than another positional `usize` on [`Self::new`] and [`Self::serving`]: those
