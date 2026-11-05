@@ -905,6 +905,33 @@ impl EpochPlan {
     /// measures a device the weights are already mapped on - what is left, not what was there
     /// before the load - and returns both, so the caller holds no model class of its own and no
     /// knowledge of the order the two must be done in.
+    /// The deployment page this epoch runs, as the launcher placed it.
+    ///
+    /// The media class's parallel shape is the deployment's, and the page states it beside the
+    /// component it splits; the same reader the launcher used answers it here, so a rank and the
+    /// engine that started it cannot disagree about the group's degrees.
+    fn deployment_groups(&self) -> Result<Vec<engine::WorkerGroupConfig>> {
+        let path = self.build.worker_groups.as_ref().with_context(|| {
+            "the media class's parallel shape is the deployment's, and this epoch states no \
+             deployment file: a tensor-parallel width alone cannot say which sequence degree this \
+             rank's group splits"
+                .to_owned()
+        })?;
+        let text = path
+            .to_str()
+            .with_context(|| format!("the deployment file {} is not UTF-8", path.display()))?;
+        let deployment = engine::Deployment::read(text)
+            .with_context(|| format!("reading the deployment file {}", path.display()))?;
+        let host = self
+            .build
+            .engine_host
+            .clone()
+            .unwrap_or_else(|| "localhost".to_owned());
+        deployment
+            .worker_groups(&host)
+            .with_context(|| format!("placing the deployment file {} on {host}", path.display()))
+    }
+
     pub(crate) fn load_and_open(
         &self,
         weights: &mut dyn nn::RetainedWeights,
@@ -942,23 +969,35 @@ impl EpochPlan {
                 let opened = nn::Checkpoint::open(&self.checkpoint)?;
                 let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
                 let config = minimax_h3::Config::read(&self.checkpoint, None)?;
-                // **The pipeline's two parallel degrees are the deployment's, and one of them has
-                // no field in the build config yet.** A causal-language deployment splits its
-                // weights and its experts; the media class splits the denoiser's sequence (Ulysses)
-                // and the text encoder's tensors. Until the deployment states the Ulysses degree,
-                // the two agree only at one rank, so a wider deployment is refused here by name
-                // rather than served with a partition nobody stated.
-                let width = usize::try_from(placement.tensor_parallel)
-                    .context("a parallel width wider than this process addresses")?;
-                if width != 1 {
-                    bail!(
-                        "this rank is one of {width} and the media class's Ulysses degree is the \
-                         deployment's to state: the build config carries the tensor-parallel width \
-                         and no sequence degree, so a partition of {width} would be assumed rather \
-                         than declared"
-                    );
-                }
-                let partition = minimax_h3::Partition::new(&config, 1, 1, 0, 0)?;
+                // **The media class's parallel shape is the deployment's, and the deployment file
+                // is where it is stated.** The build config carries the tensor-parallel width and
+                // no sequence degree, so a rank that read its tensor place alone would either
+                // refuse every wider deployment or serve four whole denoisers. The page that
+                // placed this group states both beside the component they split, and this reads it
+                // through the same reader the launcher used.
+                let groups = self.deployment_groups()?;
+                let (ulysses, tensor_parallel, tensor_rank, sequence_rank) = media_parallel(
+                    &groups,
+                    &self.group,
+                    self.rank,
+                    placement.tensor_parallel,
+                    placement.tensor_rank,
+                )?;
+                // **The partition serves the task the checkpoint states, and a checkpoint that
+                // states several is refused here.** One partition carries one task's block set
+                // (the condition encoders are placed for the conditioned tasks) and one task's
+                // condition capacity, so two tasks are two partitions and one deployment holds one.
+                // A construction stating their union would serve both; the model offers none, and
+                // this does not invent one.
+                let task = served_task(&config.tasks(), &self.checkpoint)?;
+                let partition = minimax_h3::Partition::serving(
+                    &config,
+                    task,
+                    ulysses,
+                    tensor_parallel,
+                    tensor_rank,
+                    sequence_rank,
+                )?;
                 let dtype = match self.build.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
@@ -1820,6 +1859,131 @@ pub(crate) struct Placement {
     load_options: qwen3_moe::LoadOptions,
 }
 
+/// The one task this deployment serves, from the checkpoint's own statement.
+///
+/// A partition carries one task's block set and one task's condition capacity: the condition encoders
+/// are placed for the conditioned tasks and the capacity is [`minimax_h3::partition::condition_rows`]
+/// of the task, so two tasks are two partitions and one deployment holds one. The checkpoint states
+/// which it serves (`Config::tasks`, read from the export's own record), and a checkpoint that states
+/// several is refused here naming them, rather than served with one task's arrangement for another
+/// task's request.
+fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTask> {
+    match tasks {
+        [] => bail!(
+            "the checkpoint {} states no task, so no denoiser partition can be sized for one",
+            checkpoint.display()
+        ),
+        [task] => Ok(*task),
+        several => bail!(
+            "the checkpoint states {} tasks ({}) and one partition serves one task's block set and \
+             condition capacity: a deployment serving several needs a construction that states their \
+             union",
+            several.len(),
+            several
+                .iter()
+                .map(|task| format!("{task:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// This rank's sequence split, and its place in it, as the deployment page states them.
+///
+/// **The page is the one statement of the parallel shape, and this reads it rather than a second
+/// copy.** A main process knows its own devices and its rank number, and the build config states the
+/// tensor-parallel width; the sequence degree and the head projection are the deployment file's,
+/// written beside the component they split. So the group is found by the name the launch states, its
+/// one sequence-split component is read, and the rank's position inside that component is its
+/// sequence rank.
+///
+/// It refuses what would otherwise be assumed: a group with two sequence-split components is not one
+/// partition, a projection this stack does not implement is refused rather than served at degree
+/// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
+/// is Ulysses' alone.
+fn media_parallel(
+    groups: &[engine::WorkerGroupConfig],
+    group: &str,
+    rank: u32,
+    tensor_parallel: u32,
+    tensor_rank: u32,
+) -> Result<(minimax_h3::partition::Ulysses, usize, usize, usize)> {
+    let tensor_parallel =
+        usize::try_from(tensor_parallel).context("a tensor-parallel width the process addresses")?;
+    let tensor_rank = usize::try_from(tensor_rank).context("a tensor rank the process addresses")?;
+    let rank = usize::try_from(rank).context("a rank number the process addresses")?;
+    let placed = groups
+        .iter()
+        .find(|candidate| candidate.id.0 == group)
+        .with_context(|| {
+            format!(
+                "this rank serves worker group {group:?} and the deployment places {}",
+                groups
+                    .iter()
+                    .map(|group| group.id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let mut splits = placed.components.iter().filter(|(_, component)| {
+        !matches!(
+            component.parallel_config.sequence_parallel,
+            ipc::SequenceParallel::Local
+        )
+    });
+    let (_, component) = match (splits.next(), splits.next()) {
+        // No split: the sequence is this rank's own, and the tensor degree is the whole shape.
+        (None, _) => return Ok((minimax_h3::partition::Ulysses::single(), tensor_parallel, tensor_rank, rank)),
+        (Some(one), None) => one,
+        (Some(first), Some(second)) => bail!(
+            "worker group {group:?} states a sequence split on two components ({:?} and {:?}) and \
+             one partition describes one split",
+            first.0,
+            second.0
+        ),
+    };
+    // A component that states no member list holds every rank of its replica, so a rank's position
+    // in it is the rank's own ordinal.
+    let sequence_rank = if component.ranks.is_empty() {
+        rank
+    } else {
+        component
+            .ranks
+            .iter()
+            .position(|member| *member == rank)
+            .with_context(|| {
+                format!(
+                    "this rank is {rank} and the group's sequence-split component holds ranks {:?}",
+                    component.ranks
+                )
+            })?
+    };
+    let ulysses = match &component.parallel_config.sequence_parallel {
+        ipc::SequenceParallel::Ulysses {
+            ulysses_degree,
+            projection,
+            ..
+        } => minimax_h3::partition::Ulysses::of(
+            *ulysses_degree,
+            match projection {
+                ipc::HeadProjection::Exchange => minimax_h3::partition::Projection::Exchange,
+                // The stack loads whole attention projections on every rank and sends each member
+                // its head shard, which is the exchange mode: a gathered projection would be served
+                // weights its own page says it does not hold.
+                ipc::HeadProjection::Gather => bail!(
+                    "worker group {group:?} states the `gather` head projection, and this stack \
+                     loads whole attention projections on every rank: it implements `exchange`"
+                ),
+            },
+        ),
+        other => bail!(
+            "worker group {group:?} states the sequence split {other:?}, and this class's denoiser \
+             exchanges its sequence over Ulysses ranks"
+        ),
+    };
+    Ok((ulysses, tensor_parallel, tensor_rank, sequence_rank))
+}
+
 impl Placement {
     /// This rank's part of the epoch's parallel shape.
     ///
@@ -1927,6 +2091,112 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deployment page holding one group named `model`, with the components it names.
+    fn groups(components: &str) -> Vec<engine::WorkerGroupConfig> {
+        let page = format!(
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
+        );
+        engine::Deployment::parse(&page)
+            .expect("the page parses")
+            .worker_groups("localhost")
+            .expect("the page places")
+    }
+
+    /// The rank's sequence split is the deployment's, and it is read from the page that states it.
+    ///
+    /// The defect this pins: the arm refused every rank above one because the build config carries no
+    /// sequence degree, and the alternative - a partition of `1` over four ranks - would have served
+    /// four whole denoisers. The page states the degree beside the component it splits, so the rank
+    /// that reads it serves the split it was launched in.
+    #[test]
+    fn the_sequence_split_comes_from_the_group_the_rank_serves() {
+        let placed = groups(
+            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 4, projection = \"exchange\" }\n\
+             [worker_groups.components.text_encoder]\ntensor_parallel_size = 4\n",
+        );
+        let (ulysses, tensor_parallel, tensor_rank, sequence_rank) =
+            media_parallel(&placed, "model", 2, 4, 2).expect("a four-way exchange partition");
+        assert_eq!(ulysses.degree, 4, "the page states the degree");
+        assert_eq!(
+            ulysses.projection,
+            minimax_h3::partition::Projection::Exchange,
+            "the page states the projection this stack implements"
+        );
+        assert_eq!((tensor_parallel, tensor_rank), (4, 2), "the tensor place is the rank's");
+        assert_eq!(sequence_rank, 2, "a component of every rank places the rank at its ordinal");
+    }
+
+    /// A page that states no split serves one rank's sequence, which is not a refusal.
+    #[test]
+    fn a_group_with_no_sequence_split_serves_one_rank() {
+        let placed = groups("[worker_groups.components.transformer]\n");
+        let (ulysses, _, _, sequence_rank) =
+            media_parallel(&placed, "model", 1, 1, 0).expect("one rank's sequence");
+        assert_eq!(ulysses.degree, 1);
+        assert_eq!(sequence_rank, 1);
+    }
+
+    /// The two refusals the page can earn, by name rather than served at degree one.
+    ///
+    /// A gathered projection would be served weights this stack does not load (it holds whole
+    /// attention projections on every rank and sends each member its head shard), and two
+    /// sequence-split components are two splits where a partition describes one.
+    #[test]
+    fn a_projection_or_a_second_split_the_stack_cannot_serve_is_refused_by_name() {
+        let gather = groups(
+            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 2, projection = \"gather\" }\n",
+        );
+        let error = media_parallel(&gather, "model", 0, 2, 0).expect_err("gather is unimplemented");
+        assert!(
+            format!("{error:#}").contains("exchange"),
+            "the refusal names the mode this stack implements: {error:#}"
+        );
+        let two = groups(
+            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 2 }\n\
+             [worker_groups.components.text_encoder]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 2 }\n",
+        );
+        let error = media_parallel(&two, "model", 0, 2, 0).expect_err("one partition, one split");
+        assert!(
+            format!("{error:#}").contains("transformer") && format!("{error:#}").contains("text_encoder"),
+            "the refusal names both components: {error:#}"
+        );
+    }
+
+    /// One partition serves one task, and the checkpoint's own statement decides which.
+    ///
+    /// The condition encoders are placed for the conditioned tasks and the condition capacity is that
+    /// task's, so a second task is a second partition. A checkpoint that states several is refused
+    /// naming them, rather than served with one task's arrangement for another task's request.
+    #[test]
+    fn the_served_task_is_the_one_the_checkpoint_states() {
+        let checkpoint = Path::new("/models/fasth3");
+        let one = served_task(&[nn::VideoTask::TextToVideoAudio], checkpoint)
+            .expect("a checkpoint that states one task serves it");
+        assert_eq!(one, nn::VideoTask::TextToVideoAudio);
+        let none = served_task(&[], checkpoint).expect_err("no task is no partition");
+        assert!(
+            format!("{none:#}").contains("states no task"),
+            "the refusal says the checkpoint states none: {none:#}"
+        );
+        let several = served_task(
+            &[
+                nn::VideoTask::TextToVideoAudio,
+                nn::VideoTask::FirstLastToVideoAudio,
+            ],
+            checkpoint,
+        )
+        .expect_err("two tasks are two partitions");
+        let sentence = format!("{several:#}");
+        assert!(
+            sentence.contains("TextToVideoAudio") && sentence.contains("FirstLastToVideoAudio"),
+            "the refusal names the tasks: {sentence}"
+        );
+    }
 
     /// A plan serves the phases its buckets are launched as, in the scheduler's numbering, and no
     /// phase it does not run.
