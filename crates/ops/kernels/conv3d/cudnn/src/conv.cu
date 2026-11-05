@@ -45,6 +45,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifndef UNISERVE_CONV_ENTRY
 #error "the package's build script defines UNISERVE_CONV_ENTRY: the module's launch entry"
@@ -499,9 +500,52 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       }
     }
     void* heuristic = nullptr;
-    void* configs[kMaxEngineConfigs] = {};
-    int64_t count = 0;
+    std::vector<void*> configs;
     bool listed = false;
+    // **A list longer than the array is a query cuDNN refuses, and a refused query reads exactly
+    // like an empty one.** The count is asked for separately - zero elements, no array - and the
+    // array is sized from the answer, so the exhaustive list is readable whatever its length. The
+    // cap keeps a library that reports nonsense from taking the process with it.
+    // Answers the number of configurations the list holds, `0` for a list that is empty, and `-1`
+    // for a query the library refused - three states, because "answered nothing" and "not answered"
+    // have different cures and used to be one sentence.
+    auto ask = [&library, &configs](void* heuristic) -> int64_t {
+      int64_t needed = 0;
+      const bool sized = library.backend_get(heuristic, kAttrEngineHeurResults,
+                                             kTypeBackendDescriptor, 0, &needed, nullptr) ==
+                         kSuccess;
+      int64_t room = sized && needed > 0 ? needed : kMaxEngineConfigs;
+      if (room > kMaxEngineConfigs * 64) {
+        room = kMaxEngineConfigs * 64;
+      }
+      configs.assign(static_cast<size_t>(room), nullptr);
+      int64_t count = 0;
+      const bool answered =
+          library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor, room,
+                              &count, configs.data()) == kSuccess;
+      if (!answered) {
+        // A refused query may have written some of its array: those are engine configurations the
+        // library handed over and only this function can release them.
+        for (void* config : configs) {
+          if (config != nullptr) {
+            library.backend_destroy(config);
+          }
+        }
+        configs.clear();
+        return -1;
+      }
+      if (count <= 0) {
+        // A query the library answered with nothing is the *empty list*, which is a different fact
+        // from a query it refused and is the one this mode's record has to tell apart.
+        configs.clear();
+        return 0;
+      }
+      if (count > room) {
+        count = room;
+      }
+      configs.resize(static_cast<size_t>(count));
+      return count;
+    };
     char tried[160] = {};
     const int32_t modes[3] = {kHeuristicModeA, kHeuristicModeB, kHeuristicModeFallback};
     const char* names[3] = {"shortlist", "exhaustive", "fallback"};
@@ -532,17 +576,13 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       if (!ready) {
         std::snprintf(said, sizeof(said), "%s unbuilt, ", names[at_mode]);
       } else {
-        int64_t got = 0;
-        const bool answered = library.backend_get(asked, kAttrEngineHeurResults,
-                                                  kTypeBackendDescriptor, kMaxEngineConfigs, &got,
-                                                  configs) == kSuccess;
-        if (answered && got > 0) {
+        const int64_t got = ask(asked);
+        if (got > 0) {
           listed = true;
-          count = got;
           heuristic = asked;
           break;
         }
-        std::snprintf(said, sizeof(said), answered ? "%s none, " : "%s unanswered, ",
+        std::snprintf(said, sizeof(said), got < 0 ? "%s unanswered, " : "%s none, ",
                       names[at_mode]);
       }
       if (asked != nullptr) {
@@ -632,7 +672,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     int64_t take = -1;
     bool hosted = false;
     bool named_narrows = false;
-    for (int64_t at = 0; at < count && built; ++at) {
+    for (int64_t at = 0; at < static_cast<int64_t>(configs.size()) && built; ++at) {
       void* engine = nullptr;
       if (library.backend_get(configs[at], kAttrEngineCfgEngine, kTypeBackendDescriptor, 1,
                               nullptr, &engine) != kSuccess ||
@@ -684,8 +724,8 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
                   &configs[take]) &&
               finalize(plan, "the plan");
     }
-    for (int64_t at = 0; at < count; ++at) {
-      library.backend_destroy(configs[at]);
+    for (void* config : configs) {
+      library.backend_destroy(config);
     }
     // The winning heuristic names the device-properties descriptor, so it outlives it.
     if (heuristic != nullptr) {
