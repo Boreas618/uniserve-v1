@@ -195,7 +195,11 @@ impl Plan {
 }
 
 /// The plan names' element for `dtype`: the vocabulary `crate::decoding::Buffer` holds.
-pub(crate) fn element_of(dtype: nn::DType) -> &'static str {
+///
+/// Public because a plan's element type is the caller's to state and a harness must print the one it
+/// reserved by: `video_arena` takes the decode's type, so the line that prints the plan has to spell
+/// the same type it was stated in, or a short plan reads as an allocator fault.
+pub fn element_of(dtype: nn::DType) -> &'static str {
     match dtype {
         nn::DType::BF16 => "bf16",
         nn::DType::F16 => "f16",
