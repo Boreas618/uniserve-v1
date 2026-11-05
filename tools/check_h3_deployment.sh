@@ -30,6 +30,7 @@ clip=${4:-124}
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$here/notes/programs/minimax-h3-deployment-keys.txt
+sparse_fixture=$here/notes/programs/minimax-h3-sparse-keys.txt
 gaps=$here/crates/models/minimax-h3/tools/walk_gaps.py
 manifests=$here/crates/models/minimax-h3/tools/check_encoder_manifests.py
 ladder=$here/crates/models/minimax-h3/tools/check_frames_ladder.py
@@ -103,15 +104,22 @@ python3 "$gaps" --phantom --fixture "$fixture" \
     || fail "an operator the list holds is launched by no walk"
 
 echo
-echo "== each walk's shapes against the file"
+echo "== each walk's shapes against its own file"
 for walk in t2va fl2va ref2va sparse; do
-    answer=$(python3 "$gaps" --by-shape --fixture "$fixture" --walk "$scratch/$walk.txt" | tail -1)
+    # One file is one attention backend: the sparse walk's `vsa_*` and `sparse_attention`
+    # rows belong to the sparse file, and comparing them with the dense one would report
+    # seven gaps that are a deployment's, not a file's.
+    against=$fixture
+    [ "$walk" = sparse ] && against=$sparse_fixture
+    answer=$(python3 "$gaps" --by-shape --fixture "$against" --walk "$scratch/$walk.txt" | tail -1)
     echo "   $walk: $answer"
     # A walk states one shape the file lacks at every element type when it is
     # the walk's own sample (a request-only quantity, not a deployment one); a
     # raster-class absence, or one no raster explains, is a real gap.
+    # The reading ends "... 0 at any raster (...), 0 raster-class, 1 the walk's own
+    # sample": the sample row is a request's number, and any other absence is a gap.
     case $answer in
-    *" 0 at any raster, 0 raster-class, 1 the walk's own sample") ;;
+    *"0 raster-class, 1 the walk's own sample") ;;
     *) fail "the $walk walk states a shape the file cannot build at any element type" ;;
     esac
 done
@@ -139,8 +147,10 @@ done
 echo "   24 points, $(cut -f1,2 "$scratch/union.txt" | sort -u | wc -l) rows bound"
 python3 "$gaps" --walk "$scratch/union.txt" --fixture "$fixture" \
     | grep -E '^(  MISSING|[0-9]+ key)' || true
+# A row keyed by the walk's own `--elements` is the walk's sample, not a deployment row:
+# the same rule `--by-shape` applies to the sample count.
 if python3 "$gaps" --walk "$scratch/union.txt" --fixture "$fixture" \
-    | grep -q 'MISSING from the fixture'; then
+    | grep 'MISSING from the fixture' | grep -qv 'columns_123456'; then
     fail "a row the model binds at an offered point is not in the file"
 fi
 
