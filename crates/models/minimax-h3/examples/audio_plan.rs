@@ -37,6 +37,7 @@ fn run() -> Result<(), String> {
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut extents_path: Option<PathBuf> = None;
     let mut lengths: Vec<u32> = vec![582, 1164, 3492];
+    let mut check = false;
     while let Some(flag) = arguments.next() {
         let mut value = || {
             arguments
@@ -46,6 +47,7 @@ fn run() -> Result<(), String> {
         match flag.as_str() {
             "--root" => root = PathBuf::from(value()?),
             "--extents" => extents_path = Some(PathBuf::from(value()?)),
+            "--check" => check = true,
             "--latent-frames" => {
                 lengths = value()?
                     .split(',')
@@ -102,6 +104,20 @@ fn run() -> Result<(), String> {
             ));
         }
         exact += usize::from(used == reserved);
+        if check && reserved - used > nn::forward::ALIGNMENT - 1 {
+            return Err(format!(
+                "the plan reserves {} B more than the encode takes, past the {} B an alignment step explains",
+                reserved - used,
+                nn::forward::ALIGNMENT - 1
+            ));
+        }
+        if check && reserved - used > nn::forward::ALIGNMENT - 1 {
+            return Err(format!(
+                "the plan reserves {} B more than the decode takes, past the {} B an alignment step explains - a buffer nothing reads",
+                reserved - used,
+                nn::forward::ALIGNMENT - 1
+            ));
+        }
         slack += i128::try_from(reserved - used).unwrap_or(i128::MAX);
         println!(
             "{length:>5} latent frames ({samples} samples): {} buffer(s), {reserved} B planned, {used} B taken, {}",
