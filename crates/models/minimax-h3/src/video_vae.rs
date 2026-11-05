@@ -1294,26 +1294,30 @@ impl VideoDecoder {
     /// reservation would grow the clip's footprint by the tile count. The plan states these once
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
     pub fn scratch(&self, f: &Forward) -> Result<TileScratch> {
-        let rows = self.canvas.rows();
-        let voxels = self.canvas.voxels();
-        let width = u64::from(self.width);
-        let ffn = width * u64::from(self.ffn_mult);
-        let half = u64::from(rotary(&self.config)?.0 / 2);
+        // The decoder's per-tile buffers come from the one statement of their names, shapes and
+        // element types: `crate::decoding::tile_scratch` is also what the executor sizes the arena
+        // from, so this reservation and the plan it is sized by cannot disagree. They did twice
+        // before it existed - once by the grid's tile count and once by an element type.
+        let buffers = crate::decoding::tile_scratch(&self.config, self.dtype)?;
+        let view = |index: usize| -> Result<TensorView> {
+            let (_, dtype, dims) = buffers[index];
+            Ok(f.arena().tensor(dtype, Shape::new(&dims))?)
+        };
         Ok(TileScratch {
-            stream: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            projected: f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?,
-            cosine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
-            sine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
-            normalized: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            value: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            rotated_query: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            rotated_key: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            attended: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            update: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            gate_up: f.arena().tensor(self.dtype, Shape::new(&[rows, 2 * ffn]))?,
-            gated: f.arena().tensor(self.dtype, Shape::new(&[rows, ffn]))?,
+            stream: view(0)?,
+            projected: view(1)?,
+            cosine: view(2)?,
+            sine: view(3)?,
+            normalized: view(4)?,
+            query: view(5)?,
+            key: view(6)?,
+            value: view(7)?,
+            rotated_query: view(8)?,
+            rotated_key: view(9)?,
+            attended: view(10)?,
+            update: view(11)?,
+            gate_up: view(12)?,
+            gated: view(13)?,
         })
     }
 
