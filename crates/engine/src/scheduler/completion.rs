@@ -108,9 +108,10 @@ impl CallCompletion {
     /// type (2.4).
     ///
     /// The mechanism names the call: the executor numbers a batch's calls by
-    /// their index, so the pair comes from the batch that was submitted. A
-    /// process publishes no immutable storage of its own to claim, so `media`
-    /// is empty — an in-process media call is refused before it is submitted.
+    /// their index, so the pair comes from the batch that was submitted. A host
+    /// call publishes its artifact into a POSIX shared-memory object and names
+    /// it, and that name is claimed here — the mapping is what the mechanism
+    /// delivers, and claiming it is what unlinks the name.
     ///
     /// Two things the device reports differently from a worker, both stated
     /// rather than filled in: a call has no timing of its own (the batch
@@ -153,9 +154,31 @@ impl CallCompletion {
             candidate_logprobs: output.candidate_logprobs,
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
-            media: Ok(None),
+            media: match output.media_output.as_ref() {
+                Some(published) => claim(published),
+                None => Ok(None),
+            },
         }
     }
+}
+
+/// Claims the artifact an in-process host call published.
+///
+/// The executor's media stage copies the mux's bytes into a shared-memory object and relinquishes
+/// it (`ipc::MediaSource::into_locator`), which states the object's name and its exact length; the
+/// claim is the mechanism's, and it is the call that unlinks the name and maps the bytes.
+///
+/// # Safety
+///
+/// The publisher writes nothing after it relinquishes the object and never resizes it, which is the
+/// contract `SharedMedia::open` requires. The mechanism is the only claimer of a name the executor
+/// published for one completion.
+fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
+    let ipc::ArtifactHandle::PosixShm { name } = &published.handle;
+    // SAFETY: see this function's contract - the bytes are written before the publisher
+    // relinquishes the object and no process modifies it while the mapping lives.
+    let media = unsafe { SharedMedia::open(name, published.bytes)? };
+    Ok(Some(Arc::new(media)))
 }
 
 /// One batch's completion, as the mechanism reads it.

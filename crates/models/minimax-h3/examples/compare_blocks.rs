@@ -40,6 +40,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// What the two modes take, printed for `--help` and for a caller who guessed wrong.
+///
+/// The reader has two inputs and no default for either: a layout dump written by
+/// `tools/dump_tables.py`, or two tensor trees to pair file by file. Asking the tool is the shortest
+/// way to learn that, and the alternative - an "unknown argument" with no list - is what a caller
+/// meets at the moment they are trying to use it.
+fn usage() -> String {
+    let mut text = String::new();
+    text.push_str(
+        "compare_blocks --dumps <dir> [--out <report.md>]\n\
+         compare_blocks --reference <dir> --candidate <dir> [--out <report.md>]\n\n\
+         The first compares this crate's computed layout tables against a dump of today's\n\
+         implementation (`case.json` and one `.h3t` per tensor, from `tools/dump_tables.py`).\n\
+         The second pairs two tensor trees file by file, in the order given.\n\
+         Nothing is gated on the numbers: this is a diagnosis (specs/worker.md 10).\n",
+    );
+    text
+}
+
 fn run() -> Result<String, String> {
     let mut arguments = std::env::args().skip(1);
     let mut dumps: Option<PathBuf> = None;
@@ -52,7 +71,13 @@ fn run() -> Result<String, String> {
             "--reference" => reference = arguments.next().map(PathBuf::from),
             "--candidate" => candidate = arguments.next().map(PathBuf::from),
             "--out" => out = arguments.next().map(PathBuf::from),
-            other => return Err(format!("unknown argument {other}")),
+            "--help" | "-h" => return Ok(usage()),
+            other => {
+                return Err(format!(
+                    "unknown argument {other}: accepted are --dumps, --reference with --candidate, \
+                     --out and --help"
+                ));
+            }
         }
     }
     if let Some(reference) = reference {

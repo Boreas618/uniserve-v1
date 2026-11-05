@@ -10,6 +10,7 @@ publish = false
 # Storage Server's derived state. The runners, graphs and arenas that issue
 # device work live beside these modules in the same crate.
 [dependencies]
+media = { path = "../media" }
 bytemuck.workspace = true
 platform.workspace = true
 indexmap.workspace = true
