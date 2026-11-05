@@ -2077,7 +2077,15 @@ impl Denoiser {
         // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
         // The patch reads the latents, and a trajectory is FP32 whatever the stack's type is.
         programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(nn::DType::F32));
-        programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor());
+        // The inverse of the pack reads the sample, and the sample is the trajectory's FP32 whatever the
+        // stack's type is — the forward builds it at `video.dtype`, not at the deployment's.
+        programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(
+            nn::DType::F32,
+            u64::from(video),
+            1,
+            2,
+        )?
+        .descriptor());
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
             dtype,
             NoiseKind::Normal,
