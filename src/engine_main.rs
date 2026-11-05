@@ -1665,14 +1665,6 @@ impl MainProcess {
         Ok(())
     }
 
-    /// The epoch's first generation: the store's set, with the deployment's named programs overlaid
-    /// by operator (§7.3 step 2).
-    ///
-    /// A named program chooses its operator's implementation - its backend and revision - and never
-    /// states the operator set: a deployment that pins one operator's kernel still runs every other
-    /// operator its buckets launch. So the first generation takes this host's store as its set and
-    /// the named programs overlaid on it, which is the only reading under which `kernels=1` on a
-    /// host that built twenty-seven launches a model rather than a fragment.
     /// The epoch's first generation: the store's set, with the deployment's named programs deciding
     /// the phases their own packages cover (§7.3 step 2).
     ///
