@@ -2107,18 +2107,26 @@ fn rows(deployment: DType, bound: u32) -> Vec<(String, String)> {
     // **Its tile is a function of the raster's width**, not a constant: `FramePadDescriptor::tiles`
     // takes `min(ROW_PIXELS 512, next_power_of_two(columns))` pixels per program and divides
     // `ROW_ELEMENTS 2048` by it, so a raster at least 512 pixels wide gives the 512-pixel tile with
-    // four channels per program — every realistic clip width — and a narrower one re-keys to its own
-    // pixel block. This row is the wide case; a request whose width is under 512 compiles another.
-    push(
-        "frame_pad",
-        ops::frame::FramePadDescriptor {
-            dtype: DType::F32,
-            reflect: true,
-            block_pixels: 512,
-            block_channels: 4,
-        }
-        .to_string(),
-    );
+    // four channels per program and a narrower one re-keys to its own pixel block.
+    //
+    // The four rungs below are the classes the walk states over the deployment's six canvases and its
+    // tile widths, and **a walk is the authority for them**. The 64-pixel rung is the tiled driver's
+    // own pad (`ClipEncoder`'s tile at `TILE_PIXELS`), which no `Deployment` row derives yet - the
+    // call site and the harness that would witness it are the open item. It is stated here because a
+    // class a launch takes that the file lacks stops a run with a store that reads as complete, while
+    // a class nothing takes costs a compile.
+    for (block_pixels, block_channels) in [(64, 32), (128, 16), (256, 8), (512, 4)] {
+        push(
+            "frame_pad",
+            ops::frame::FramePadDescriptor {
+                dtype: DType::F32,
+                reflect: true,
+                block_pixels,
+                block_channels,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
