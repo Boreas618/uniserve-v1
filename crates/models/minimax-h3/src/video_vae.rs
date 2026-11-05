@@ -2118,9 +2118,8 @@ pub(crate) mod tests {
             .iter()
             .map(|source| match &source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => tensor.clone(),
-                crate::audio_vae::Tensor::Normalized { .. }
-                | crate::audio_vae::Tensor::Parts(_) => {
-                    panic!("the video decoder folds no weight norm and fuses no tensor")
+                crate::audio_vae::Tensor::Normalized { .. } => {
+                    panic!("the video decoder folds no weight norm")
                 }
             })
             .collect();

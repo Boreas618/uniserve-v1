@@ -416,7 +416,6 @@ pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
     for source in sources {
         match &source.tensor {
             Tensor::Region(tensor) => keys.push(tensor.clone()),
-            Tensor::Parts(parts) => keys.extend(parts.iter().cloned()),
             Tensor::Normalized { value, gain } => {
                 keys.push(value.clone());
                 keys.push(gain.clone());
@@ -431,8 +430,6 @@ pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
 pub enum Tensor {
     /// One tensor under one key.
     Region(String),
-    /// Several checkpoint tensors that fill one parameter, in order (the fused query-key-value bias).
-    Parts(Vec<String>),
     /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
     /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
     /// below carries it (specs/worker.md 9, the BigVGAN row).
