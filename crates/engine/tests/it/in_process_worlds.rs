@@ -38,6 +38,12 @@ use crate::support::{self, Serving};
 /// fails here, only later.
 const ANSWER: Duration = Duration::from_secs(300);
 
+/// How long a park may take once the world has been asked.
+///
+/// A park waits for the world to hold nothing, which is a drained world rather
+/// than a compiling one, so this bound is the mechanism's and not the build's.
+const PARK: Duration = Duration::from_secs(30);
+
 /// How many tokens the running world generates before it parks.
 const GENERATED: usize = 3;
 
@@ -214,8 +220,36 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
 
     // The running world parks, the successor is promoted with its index, and
     // the running world closes.
-    let index =
-        answer("the running world's park", running.park(true)).expect("the running world parks");
+    // The park is waited for with a bound of its own, and a park that does not
+    // answer is reported with what the world was doing: steps taken since the
+    // command and whether it is still answering at all. A park waits for the
+    // world to hold nothing — no running, waiting, retiring request and no
+    // batch in flight — so a timeout there is a state, and the state has a name.
+    let steps_before = running
+        .counters()
+        .recv_timeout(PARK)
+        .expect("the running world answers its counters")
+        .steps;
+    let parked = match running.park(true).recv_timeout(PARK) {
+        Ok(result) => result,
+        Err(error) => {
+            let alive = running
+                .counters()
+                .recv_timeout(PARK)
+                .map(|counters| format!("{} steps, {} batches", counters.steps, counters.batches))
+                .unwrap_or_else(|why| format!("no counters ({why})"));
+            let cache = answer("the running world's cache", running.describe_cache())
+                .map(|groups| format!("{} group(s)", groups.len()))
+                .unwrap_or_else(|why| format!("no answer ({why})"));
+            panic!(
+                "the running world did not park within {PARK:?} ({error}): it had taken \
+                 {steps_before} steps before the command, and afterwards {alive} and {cache} — \
+                 a world still counting steps is parking and never meets the condition, a \
+                 world that stopped answering is stuck"
+            );
+        }
+    };
+    let index = parked.expect("the running world parks");
     successor
         .promote(index, false, false)
         .expect("the successor is promoted with the parked index");
