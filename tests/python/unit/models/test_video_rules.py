@@ -110,3 +110,17 @@ def test_a_refused_request_exits_non_zero():
     answer = json.loads(completed.stdout)["answers"][0]
     assert "answer" not in answer
     assert answer["error"]["kind"] == "value"
+
+
+def test_a_binary_without_the_command_names_itself(monkeypatch, tmp_path):
+    stale = tmp_path / "uniserve"
+    stale.write_text(
+        "#!/bin/sh\necho 'Error: unknown command rules' >&2\nexit 2\n"
+    )
+    stale.chmod(0o755)
+    monkeypatch.setenv("UNISERVE_EXECUTABLE", str(stale))
+    with pytest.raises(video_rules.RulesRuntimeError) as raised:
+        video_rules.answers([("video_tasks", {})])
+    message = str(raised.value)
+    assert str(stale) in message
+    assert "unknown command" in message
