@@ -108,6 +108,10 @@ fn stage(name: &'static str) {
 fn name_panicking_stage() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A run's output is block-buffered when the log is a file, and an abort discards whatever
+        // was never flushed - so the last line a log holds is not the last thing the run did. A
+        // panic that aborts is exactly when that matters, so the buffer goes out first.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         let held = STAGE.lock().map(|held| *held).unwrap_or("start-up");
         eprintln!("stage: {held}");
         previous(info);
