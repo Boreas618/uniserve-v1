@@ -143,7 +143,25 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     coverage=$(RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
         cargo run -q -p program-server --example key_coverage -- \
         --fixture "$fixture" --target sm_100a 2>&1 | grep -E 'not covered|every key' | head -1)
+    # A coverage check that prints nothing is a broken check, not a clean fixture: the tool once
+    # wrote both fixtures while this line was empty, and an empty line reads exactly like a pass.
+    if [ -z "$coverage" ]; then
+        echo "  $name coverage printed nothing — refusing to certify a fixture whose coverage is unknown" >&2
+        exit 1
+    fi
     printf '  %-10s coverage %s\n' "$name" "$coverage"
+    # A key the fixture names, that no package declares, and that the blocked block does not excuse,
+    # is the one state a store must not be built from. The blocked block is pasted from
+    # `--declared-blocked` above, so an excused key never reaches this test.
+    case "$coverage" in
+        *" 0 of "*) ;;
+        *)
+            if [ ! -s "$staging/missing-$name.txt" ]; then
+                echo "  $name has uncovered keys and no block to excuse them" >&2
+                exit 1
+            fi
+            ;;
+    esac
 done
 
 if [ "$status" -ne 0 ]; then
