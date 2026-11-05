@@ -6433,6 +6433,13 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
 }
 
 fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+    // An epoch switch commits its target, whose programs were committed when the daemon handed them
+    // over: the generation it names already serves with nothing on trial, so the answer is that.
+    if update.current() == generation
+        && matches!(update.phase(), executor::hot_update::Phase::Serving)
+    {
+        return ProgramStatus::Committed { generation };
+    }
     match update.commit(generation) {
         Ok(()) => ProgramStatus::Committed { generation },
         Err(error) => {
@@ -8156,6 +8163,19 @@ mod tests {
             )
             .expect("the revert lands");
         update
+    }
+
+    /// An epoch switch's commit reaches a target whose programs were committed at their handover:
+    /// the generation it names serves with nothing on trial, so it is answered as committed. A
+    /// refusal here left the switch waiting for an acknowledgement, and the previous epoch's process
+    /// running, for good.
+    #[test]
+    fn a_commit_of_the_generation_that_serves_is_committed() {
+        let mut update = update_on_probation_then_reverted();
+        match answer_commit(&mut update, 1) {
+            ProgramStatus::Committed { generation } => assert_eq!(generation, 1),
+            other => panic!("a commit of what serves answered {other:?}"),
+        }
     }
 
     /// A commit that races the revert is answered with the state that holds, and the process keeps
