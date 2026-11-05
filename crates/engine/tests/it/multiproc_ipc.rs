@@ -24,11 +24,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::remove_file;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -39,10 +36,9 @@ use engine::{
 };
 use engine::{DiffusionRequest, Event, Request};
 use ipc::{
-    Batch, BatchCommand, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call,
-    CallCoordinates, CallId, CallKind, CallStatus, DType, ErrorCode, ForwardBatch, ForwardMode,
-    GenerationParams, LatentParams, LaunchDescriptor, MediaCall, NewRequest, RequestKey,
-    ShapeBound, TensorRef, TransferMode,
+    Batch, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call, CallCoordinates,
+    CallId, CallKind, CallStatus, DType, ForwardBatch, ForwardMode, GenerationParams, NewRequest,
+    RequestKey, ShapeBound, TensorRef, TransferMode,
 };
 use ipc::{DiffusionSamplingParams, RequestId, SamplingParams, UnitId};
 
@@ -1000,17 +996,6 @@ fn text_admission(
 // Products and transfers: tensor products published by one component or
 // worker and imported by another, cache exports, and the retirement of work
 // that reads a failed or unreachable product.
-
-/// The calls of a generated image's trajectory, as the scheduler plans a
-/// 32x32 image of `IMAGE_STEPS` steps without guidance for the stub: each
-/// builder returns a batch of one call, named by its batch id, whose
-/// outputs take the generations `generation` and `generation + 1`.
-mod trajectory {
-    use ipc::BufferId;
-
-    use super::*;
-
-}
 
 /// Device products cross worker processes over CUDA VMM with their values:
 /// the source publishes two requests' transition flags (one false, one
