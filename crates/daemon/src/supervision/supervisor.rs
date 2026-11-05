@@ -31,11 +31,13 @@
 //! it; an engine whose connection closes takes its remaining processes with
 //! it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use proto::process::{Exit, Reserve, Reserved, Spawn};
@@ -60,6 +62,67 @@ struct Supervised {
     child: Child,
     /// When the process's NCCL names were last noted.
     noted: Instant,
+    /// The last lines the process wrote to its standard error, which its exit
+    /// report carries: a worker that dies before it registers explains itself
+    /// there and nowhere else the daemon can see.
+    tail: StderrTail,
+}
+
+/// The last lines a spawned process wrote to its standard error.
+///
+/// The stream is drained on its own thread for as long as the process runs, so
+/// a full pipe never blocks it, and only a bounded number of lines is kept.
+/// This is a report: nothing in the supervisor decides anything from it.
+#[derive(Default)]
+struct StderrTail(Arc<Mutex<VecDeque<String>>>);
+
+impl StderrTail {
+    /// How many of the process's last stderr lines the exit report keeps.
+    const LINES: usize = 8;
+    /// The longest line prefix kept of any one line.
+    const LINE: usize = 400;
+
+    /// Reads `reader` to its end on its own thread, keeping the last lines.
+    fn read<R: Read + Send + 'static>(mut reader: R) -> Self {
+        let tail = Self::default();
+        let kept = Arc::clone(&tail.0);
+        std::thread::spawn(move || {
+            let mut pending = String::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                        while let Some(end) = pending.find('\n') {
+                            let line = pending[..end].trim_end().to_owned();
+                            pending.drain(..end + 1);
+                            Self::push(&kept, line);
+                        }
+                    }
+                }
+            }
+            if !pending.trim().is_empty() {
+                Self::push(&kept, pending.trim_end().to_owned());
+            }
+        });
+        tail
+    }
+
+    fn push(kept: &Mutex<VecDeque<String>>, line: String) {
+        let line: String = line.chars().take(Self::LINE).collect();
+        if let Ok(mut kept) = kept.lock() {
+            kept.push_back(line);
+            while kept.len() > Self::LINES {
+                kept.pop_front();
+            }
+        }
+    }
+
+    /// The last line the process wrote, when it wrote one.
+    fn last(&self) -> Option<String> {
+        self.0.lock().ok()?.back().cloned()
+    }
 }
 
 /// A listening socket held for a group until a process inherits it.
@@ -187,8 +250,16 @@ impl Supervisor {
             }
         }
 
-        let child = Child::spawn(&mut command)
+        // A process's own words are where a launch failure explains itself: a
+        // worker that dies before it registers is otherwise only a status. The
+        // stream is read for as long as the process runs, so the pipe never
+        // fills and the process never blocks on it.
+        command.stderr(Stdio::piped());
+        let mut child = Child::spawn(&mut command)
             .map_err(|error| format!("spawning {}: {error}", spawn.executable))?;
+        let tail = child
+            .take_stderr()
+            .map_or_else(StderrTail::default, StderrTail::read);
         let pid = child.id();
         tracing::info!(group = %spawn.group, rank = spawn.rank, generation = spawn.generation, pid, "started a process");
         if let Some(mut previous) = self.children.insert(
@@ -196,6 +267,7 @@ impl Supervisor {
             Supervised {
                 child,
                 noted: Instant::now(),
+                tail,
             },
         ) {
             // A spawn repeated for one launch replaces its process.
@@ -322,17 +394,21 @@ impl Supervisor {
                 Ok(None) => continue,
                 Err(error) => (format!("exit status unreadable: {error}"), false),
             };
-            exited.push((key.clone(), status, success));
+            exited.push((key.clone(), status, success, supervised.tail.last()));
         }
         exited
             .into_iter()
-            .map(|((engine, group, rank, generation), status, success)| {
+            .map(|((engine, group, rank, generation), status, success, last_stderr)| {
                 self.children
                     .remove(&(engine, group.clone(), rank, generation));
+                // The report names the engine the process was spawned for, its
+                // rank, how it ended, and the last line it wrote itself: a
+                // launch that failed for a reason outside the engine says so
+                // here rather than arriving as an unexplained status.
                 if success {
-                    tracing::info!(%group, rank, generation, "a process exited");
+                    tracing::info!(engine, %group, rank, generation, last_stderr = ?last_stderr, "a process exited");
                 } else {
-                    tracing::warn!(%group, rank, generation, %status, "a process exited");
+                    tracing::warn!(engine, %group, rank, generation, %status, last_stderr = ?last_stderr, "a process exited");
                 }
                 (
                     engine,
@@ -466,6 +542,9 @@ impl Supervisor {
                 Supervised {
                     child,
                     noted: Instant::now(),
+                    // An adopted process's standard error was this daemon's
+                    // predecessor's pipe: its last line is not readable here.
+                    tail: StderrTail::default(),
                 },
             );
         }
@@ -636,6 +715,15 @@ impl Child {
             process: Process::Adopted { pid, pidfd },
             exited: None,
             segments: platform::shm::NcclSegments::default(),
+        }
+    }
+
+    /// The process's standard error, when this daemon spawned it and it was
+    /// spawned with a pipe.
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match &mut self.process {
+            Process::Spawned(child) => child.stderr.take(),
+            Process::Adopted { .. } => None,
         }
     }
 
@@ -814,6 +902,29 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    /// A worker that dies before it registers says why on its own standard
+    /// error; the report keeps its last line and no more than a bounded number
+    /// of them, whatever it wrote.
+    #[test]
+    fn a_process_s_last_stderr_line_reaches_its_exit_report() {
+        let written = (0..StderrTail::LINES * 3)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let tail = StderrTail::read(std::io::Cursor::new(written));
+
+        // The reader runs on its own thread, so the line appears when it has
+        // been read, not when `read` returns.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let last = loop {
+            if let Some(line) = tail.last().filter(|line| line == "line 23") {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "the process's last line is kept");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(last, "line 23");
+    }
 
     /// A stand-in rank: creates an interprocess event on device 0, which
     /// makes the driver create its shared memory named for this process, and
