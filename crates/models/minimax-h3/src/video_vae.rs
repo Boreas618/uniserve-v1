@@ -1557,12 +1557,16 @@ impl Decoder for VideoDecoder {
             owner: "VideoDecoder",
             problem,
         };
-        let (width, height) = self.canvas.pixels(&self.config);
+        // `pixels` answers `(height, width)` in that order, and this destructures it in the same
+        // order: the two were once written the other way round, which a square canvas cannot show.
+        // The pair below is compared in one order and the refusal names both rasters in one order,
+        // so a transposed clip cannot read as agreement.
+        let (height, width) = self.canvas.pixels(&self.config);
         let frames = self.canvas.frames_out(&self.config);
         if (clip.height, clip.width) != (height, width) {
             return Err(refuse(format!(
-                "this decoder's canvas decodes a {}x{height} raster and the call states a {}x{} one",
-                width, clip.height, clip.width,
+                "this decoder's canvas decodes a {width}x{height} raster and the call states a {}x{} one",
+                clip.width, clip.height,
             )));
         }
         // The raster includes the padding frames the splice drops, so the clip is compared against
@@ -1605,12 +1609,13 @@ impl Decoder for VideoDecoder {
                 ),
             });
         }
-        let plan = crate::decoding::video_arena(&self.config, &canvas, self.dtype).map_err(
-            |error| nn::Error::Shape {
-                owner: "VideoDecoder",
-                problem: format!("this decoder's plan for its canvas: {error}"),
-            },
-        )?;
+        let plan =
+            crate::decoding::video_arena(&self.config, &canvas, self.dtype).map_err(|error| {
+                nn::Error::Shape {
+                    owner: "VideoDecoder",
+                    problem: format!("this decoder's plan for its canvas: {error}"),
+                }
+            })?;
         Ok(crate::decoding::arena_reservation(&plan))
     }
 
@@ -1812,8 +1817,15 @@ pub(crate) mod tests {
             ))
             .expect("a stated bias");
         let input = Linear::new(projection, Some(bias), WeightOrder::NxK).expect("a linear");
-        VideoDecoder::load(config, canvas, AttentionKind::Dense, DType::F32, input, &mut loader)
-            .expect("the decoder")
+        VideoDecoder::load(
+            config,
+            canvas,
+            AttentionKind::Dense,
+            DType::F32,
+            input,
+            &mut loader,
+        )
+        .expect("the decoder")
     }
 
     /// The clip a canvas decodes: the raster's pixels and its native frame count.
@@ -1833,6 +1845,45 @@ pub(crate) mod tests {
     /// would capture a graph whose constants belong to a different raster. Both refusals are asserted
     /// by what they name, because a runner reads them to know which side was wrong, and a refusal that
     /// fired for another reason would leave the mismatch to the first launch.
+    /// A rectangular canvas is the case a transposition hides in: a square extent compares equal to
+    /// itself whichever order the two halves are written in, so only a rectangle can see the bug that
+    /// `pixels` answers `(height, width)` while its caller read `(width, height)`.
+    #[test]
+    fn a_rectangular_canvas_refuses_its_own_transpose() {
+        let config = video_config();
+        let ratio = config.spatial_compression();
+        let canvas = Canvas::clip(&config, 2 * ratio, 3 * ratio);
+        let decoder = stated_decoder(&config, canvas);
+
+        let clip = clip_of(&config, canvas);
+        let layout = decoder.layout_of(clip).expect("its own rectangular canvas");
+        assert_eq!(
+            (layout.video.height, layout.video.width),
+            (canvas.height, canvas.width),
+            "the layout is the canvas's own latent extents, height first"
+        );
+
+        // The transpose: the same area and the same frame count with the two extents exchanged. It is
+        // not this decoder's canvas, and the message names the two rasters distinctly rather than
+        // printing one number pair twice.
+        let transposed = nn::capability::Clip {
+            height: clip.width,
+            width: clip.height,
+            ..clip
+        };
+        let error = decoder
+            .layout_of(transposed)
+            .expect_err("the transposed raster is not this decoder's canvas");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{}x{}", clip.width, clip.height)),
+            "the refusal names the raster it decodes, width first: {message}"
+        );
+        assert!(
+            message.contains(&format!("{}x{}", clip.height, clip.width)),
+            "and the raster the call stated, in the same order: {message}"
+        );
+    }
     #[test]
     fn the_decoder_states_its_own_canvas_and_refuses_another_by_both_extents() {
         let config = video_config();
@@ -1854,9 +1905,13 @@ pub(crate) mod tests {
             width: clip.width + ratio,
             ..clip
         };
-        let error = decoder.layout_of(wider).expect_err("a raster of another width");
+        let error = decoder
+            .layout_of(wider)
+            .expect_err("a raster of another width");
         assert!(
-            error.to_string().contains(&format!("{}x{}", clip.width, clip.height)),
+            error
+                .to_string()
+                .contains(&format!("{}x{}", clip.width, clip.height)),
             "the refusal names the raster it decodes: {error}"
         );
 
@@ -1866,13 +1921,17 @@ pub(crate) mod tests {
         };
         let error = decoder.layout_of(longer).expect_err("another frame count");
         assert!(
-            error.to_string().contains(&format!("{} frame(s)", clip.frames)),
+            error
+                .to_string()
+                .contains(&format!("{} frame(s)", clip.frames)),
             "the refusal names the frame count it decodes: {error}"
         );
 
         // The arena is the canvas's own plan: a wider raster needs more bytes, and this decoder
         // refuses the other's layout by name rather than answering with a number for its own raster.
-        let bytes = decoder.arena_bytes(&layout).expect("the plan of its own canvas");
+        let bytes = decoder
+            .arena_bytes(&layout)
+            .expect("the plan of its own canvas");
         let wider_canvas = Canvas::clip(&config, 2 * ratio, 3 * ratio);
         let wider_decoder = stated_decoder(&config, wider_canvas);
         let wider_layout = wider_decoder
