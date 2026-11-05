@@ -161,13 +161,15 @@ recorder() {
         "$@" >"$staging/record-$name.txt" 2>&1; then
         printf '  %-8sFAILED\n' "$name"
         tail -5 "$staging/record-$name.txt"
-        exit 1
+        recorder_failed=1
+        return
     fi
     line=$(grep -E '^# [0-9]+ recorded' "$staging/record-$name.txt" || true)
     if [ -z "$line" ]; then
         printf '  %-8sthe recorder printed no summary, which reads exactly like a pass\n' "$name"
         tail -5 "$staging/record-$name.txt"
-        exit 1
+        recorder_failed=1
+        return
     fi
     unstated=$(printf '%s' "$line" | sed -n 's/.*\([0-9][0-9]*\) only recorded.*/\1/p')
     printf '  %-8s%s\n' "$name" "$line"
@@ -175,14 +177,23 @@ recorder() {
         echo "the model launches rows this walk does not state (${unstated:-unparsed}):" >&2
         grep '^recorded, not stated:' "$staging/record-$name.txt" >&2 || true
         echo "a fixture cut here is short of launches the model makes; fix the walk, not the fixture" >&2
-        exit 1
+        recorder_failed=1
     fi
 }
 
 # `--extents` is the recorder's own fixture of tensor shapes; it is committed beside the fixtures.
 extents=${extents:-notes/programs/h3-extents.json}
+# **Both deployments report before the tool fails.** A gate that exits at the first one states a
+# count for one deployment and reads as if it had spoken about the other: with dense short the tool
+# stopped there, so no run ever printed the sparse count, and a reader comparing the two fixtures had
+# one number where two exist.
+recorder_failed=0
 recorder dense "$walk_dense"
 recorder sparse "$walk_sparse" --sparse 64,0.9
+if [ "$recorder_failed" != "0" ]; then
+    echo "the re-cut stops: a walk above is short of launches the model makes, so no fixture is written" >&2
+    exit 1
+fi
 
 # 3. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
