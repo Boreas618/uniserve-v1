@@ -273,13 +273,24 @@ pub(crate) fn collect(
             return Ok(ranks.into_values().collect());
         }
 
+        // `alive` is the caller's view of the launch's processes: a rank that
+        // exited before registering fails here by name, with the status its
+        // daemon reported. Running it every turn is what makes this wait watch
+        // children rather than only the clock.
         alive()?;
         if Instant::now() >= deadline {
             let missing: Vec<usize> = (0..expected)
                 .filter(|rank| !ranks.contains_key(rank))
                 .collect();
+            // Reaching the deadline means `alive` answered Ok for every turn:
+            // the launch's processes are alive-but-silent, or their exit events
+            // never reached this engine. The message says which of the two this
+            // wait can see, so a silent wait is a canary for the event path
+            // rather than a mystery about registration.
             anyhow::bail!(
-                "ranks {missing:?} of worker {worker_id} did not register within {}s",
+                "ranks {missing:?} of worker {worker_id} did not register within {}s, and this \
+                 engine was told of no exit for them: either they are alive but silent, or the \
+                 launch's exit events never arrived",
                 REGISTRATION_TIMEOUT.as_secs()
             );
         }
