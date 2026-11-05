@@ -8,12 +8,19 @@
 //!
 //! ## Why this exists
 //!
-//! `VideoDecoder::programs` states thirty-five rows and a decode launches ten. The other twenty-five
-//! are not an over-statement and not a defect: the component's decode is a decoder **and a clip
-//! stitcher**, the stitcher owns one unpatchify and one compiled blend per seam width and axis, and a
-//! single tile's decode launches neither. The distinction matters because the three instruments that
-//! certify a store see only a list: a row with a plausible owner and a row nothing launches look the
-//! same to `keys_delta`, `key_coverage` and `build_store`.
+//! `VideoDecoder::programs` states more rows than one tile's decode launches, and the difference is
+//! not an over-statement: the component's decode is a decoder **and a clip stitcher**, and the stitcher
+//! owns one unpatchify, one compiled blend per seam width and axis, and the copy that makes a seam's
+//! neighbour readable - a single tile's decode launches none of them. The numbers are printed rather
+//! than stated here, because the blend table is **derived from the canvases the deployment offers**:
+//! it holds a width exactly when an offered canvas launches it, so a canvas added to the model adds
+//! its seams and this program's output changes without this sentence being edited. (A ladder of
+//! alignment steps to the tile size was once written out instead; it stated 24 widths, of which 8 ever
+//! launch.)
+//!
+//! The distinction matters because the three instruments that certify a store see only a list: a row
+//! with a plausible owner and a row nothing launches look the same to `keys_delta`, `key_coverage` and
+//! `build_store`.
 //!
 //! So this file splits the enumeration into the families it is made of, drives the decoder's own
 //! `decode` for the first, reads the stitcher's declared blends for the second, and prints anything
