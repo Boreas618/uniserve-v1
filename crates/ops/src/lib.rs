@@ -80,6 +80,9 @@ pub mod audio_activation;
 pub mod audio_resample;
 pub mod bias;
 pub mod block_copy;
+// Test-only: the package headers' mirrors checked against the layouts this crate passes.
+#[cfg(test)]
+pub mod call_layout_check;
 pub mod capture;
 pub mod commit;
 pub mod conv;

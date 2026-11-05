@@ -1546,4 +1546,56 @@ mod tests {
         let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
         assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
     }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_paged_attention_header_declares_this_call_layout() {
+        let layout = PAGED_ATTENTION_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "paged_attention",
+            "uniserve_paged_attention_call",
+            &[
+                ("out", layout.out),
+                ("query", layout.query),
+                ("key", layout.key),
+                ("value", layout.value),
+                ("key_scale", layout.key_scale),
+                ("value_scale", layout.value_scale),
+                ("workspace", layout.workspace),
+                ("page_table", layout.page_table),
+                ("seq_lens", layout.seq_lens),
+                ("cum_seq_lens_q", layout.cum_seq_lens_q),
+                ("batch", layout.batch),
+                ("tokens", layout.tokens),
+                ("max_q_len", layout.max_q_len),
+                ("max_kv_len", layout.max_kv_len),
+                ("num_pages", layout.num_pages),
+                ("page_size", layout.page_size),
+                ("q_heads", layout.q_heads),
+                ("kv_heads", layout.kv_heads),
+                ("head_dim", layout.head_dim),
+                ("q_stride_tokens", layout.q_stride_tokens),
+                ("q_stride_heads", layout.q_stride_heads),
+                ("kv_stride_page", layout.kv_stride_page),
+                ("kv_stride_tokens", layout.kv_stride_tokens),
+                ("kv_stride_heads", layout.kv_stride_heads),
+                ("o_stride_tokens", layout.o_stride_tokens),
+                ("o_stride_heads", layout.o_stride_heads),
+                ("scale", layout.scale),
+                ("window_left", layout.window_left),
+                ("causal", layout.causal),
+                ("workspace_bytes", layout.workspace_bytes),
+                ("dtype_query", layout.dtype_query),
+                ("dtype_key_value", layout.dtype_key_value),
+                ("dtype_output", layout.dtype_output),
+                ("phase", layout.phase),
+                ("error", layout.error),
+            ],
+            layout.size,
+        );
+    }
 }
