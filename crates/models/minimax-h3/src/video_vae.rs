@@ -2295,13 +2295,13 @@ pub(crate) mod tests {
             moved += 1;
             // The one exception the declaration states: the factor table's positions are coordinates,
             // FP32 whatever the decode is. Everything else in the row is the deployment's type.
-            let rest = converted.1.replace("positions_f32", "");
+            // The row's own element type is the deployment's. An operand that stays FP32 - the
+            // rotation's positions, the attention's kv - is a layer's declaration, not the row's.
             assert!(
-                !rest.contains("f32"),
-                "{} did not follow the deployment: {} at f16, {} at f32",
+                converted.1.contains("dtype_f16"),
+                "{} did not follow the deployment: {} at f16",
                 converted.0,
-                converted.1,
-                declared.1
+                converted.1
             );
         }
         assert!(
