@@ -30,12 +30,18 @@ use minimax_h3::decoding::{Buffer, arena_reservation};
 use minimax_h3::encoding::{Extent, conditioning_arena, video_encoder_run_arena};
 
 const USAGE: &str = "\
-usage: encoder_plan [--root <checkpoint>] [--frames <n>] [--height <n>] [--width <n>] [--extents <json>]
+usage: encoder_plan [--root <checkpoint>] [--frames <n>] [--height <n>] [--width <n>]
+                    [--extents <json>] [--arena <bytes>] [--check]
 
-  --root    the checkpoint's small files (default /opt/uv/models/MiniMax-H3)
-  --frames  the clip's raster frames (default 17, the decoder's clip body)
-  --height  the raster's pixel height (default 768)
-  --width   the raster's pixel width (default 768)";
+  --root     the checkpoint's small files (default /opt/uv/models/MiniMax-H3)
+  --frames   the clip's raster frames (default 17, the decoder's clip body)
+  --height   the raster's pixel height (default 768)
+  --width    the raster's pixel width (default 768)
+  --extents  a JSON table of weight extents, without which no forward can be driven
+  --arena    the bytes the tile's arena holds, instead of enough that nothing stops it
+  --check    refuse a plan the forward does not take: a request past the set, slack beyond one
+             alignment step, or a raster plan the driver does not take exactly
+  --help     this text";
 
 fn main() {
     if let Err(report) = run() {
