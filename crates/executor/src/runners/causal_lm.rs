@@ -191,10 +191,11 @@ impl Staging {
             }
         }
         // A row the batch does not fill is an **empty sequence**, not a short one: it owns no token,
-        // its block-table row is `-1`, and it therefore has no key to attend to. `seq_lens` states
-        // that as a length of zero - a length of one would tell the attention kernel that the row
-        // the table left absent has a page of keys at page `-1`, which is a read the pool never
-        // reserved. The row count itself stays the bucket's: inside a captured graph every per-row
+        // its gathered block-table row names the pool's padding page, and it therefore has no key
+        // to attend to. `seq_lens` states that as a length of zero - a length of one would tell the
+        // attention kernel that an absent row has a page of keys. The row names a page rather than
+        // a sentinel because a vendor kernel forms a page's address before it checks the length,
+        // and a `-1` there is an address before the pool's first byte. The row count itself stays the bucket's: inside a captured graph every per-row
         // operand has the bucket's extent and the batch's width is a mask over it (`logits_rows`
         // below, and the loader's `-1` slots), never the extent of an operand.
         self.rows.seq_lens.resize(bucket_rows, 0);
