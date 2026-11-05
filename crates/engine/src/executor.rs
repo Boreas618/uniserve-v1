@@ -1,16 +1,16 @@
 //! Logical execution batches, physical execution, and executor contracts.
 //!
 //! The scheduler submits logical calls through [`Executor`]. Physical
-//! executors lower those calls into worker protocol batches while retaining
+//! executors lower those calls into executor protocol batches while retaining
 //! the request and product identities needed to correlate completions. The
-//! implementations are `WorkerExecutor` (`crate::worker::executor`), which
-//! drives worker processes, and `SimExecutor` (`crate::sim`).
+//! implementations are `Dispatcher` (`crate::executors::executor`), which
+//! drives executor processes, and `SimExecutor` (`crate::sim`).
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
 //! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
 //! the placement the engine launched them with, into the single capacity view
 //! the scheduler plans against; the result types a poll
-//! returns; and [`TransferConfig`], the directed transfer edges between worker
+//! returns; and [`TransferConfig`], the directed transfer edges between executor
 //! ranks and the placement they resolve against, from which the engine derives
 //! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
 //! slot, same-host slots, and whether products cross hosts) and the consumer
@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo};
+use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, MainProcessInfo};
 
 mod batch;
 pub(crate) mod inventory;
@@ -56,7 +56,7 @@ pub struct PoolPlacement {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
-    pub workers: Vec<(WorkerGroupId, WorkerInfo)>,
+    pub workers: Vec<(ExecutorGroupId, MainProcessInfo)>,
     /// The longest sequence the model was built for: the attention
     /// descriptor's static bound on the keys one row reads, from the launch
     /// arguments every group was started with. Zero when not stated.
@@ -64,52 +64,52 @@ pub struct ExecutorInfo {
     /// For each pool, what the engine launched it with. A pool absent from
     /// the map is placed with no components and a queue depth of one.
     ///
-    /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
+    /// `Dispatcher::try_new` and `SimExecutor` fill this from their
     /// launch; `from_workers` leaves it empty.
-    pub placements: BTreeMap<WorkerGroupId, PoolPlacement>,
-    /// For each worker that decodes video, the encoder replicas whose rank
+    pub placements: BTreeMap<ExecutorGroupId, PoolPlacement>,
+    /// For each executor that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `Dispatcher::try_new` fills this from the placement;
     /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
-    /// encoding call's candidates to the set of the worker chosen to decode.
-    pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
+    /// encoding call's candidates to the set of the executor chosen to decode.
+    pub video_codecs: BTreeMap<ExecutorGroupId, BTreeSet<ExecutorGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
     /// in rank order, as the ranks reported them. Each rank has its own
     /// buffer pool, sized to the products of the components it executes and
     /// of the components that read them, so the engine places a pool's
     /// media buffers rank by rank.
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; a pool absent
+    /// `Dispatcher::try_new` fills this from its ranks; a pool absent
     /// from it, as `from_workers` and `SimExecutor` leave every pool, has
     /// its launched ranks (`PoolPlacement::ranks`, one when it has no
     /// placement), each backing its reported `buffer_pool_bytes`.
-    pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
+    pub rank_buffer_bytes: BTreeMap<ExecutorGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
     /// the host page pools it maps, and the rank's host, in rank order.
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// and `SimExecutor` leave it empty, which serves no pool through the
     /// host KV cache.
-    pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
+    pub rank_caches: BTreeMap<ExecutorGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
     /// For each pool, each rank's host latent pool as the rank reported it,
     /// and the rank's host, in rank order: the video denoising ranks report
-    /// one, every other rank none (`ipc::WorkerInfo::latent_pool`).
+    /// one, every other rank none (`ipc::MainProcessInfo::latent_pool`).
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no preempted trajectory, and a
     /// simulated executor states its own (`SimEngine::set_latent_pools`).
-    pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
+    pub rank_latents: BTreeMap<ExecutorGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
     /// For each pool, each rank's host encoder pool as the rank reported it,
     /// and the rank's host, in rank order: the ranks that execute video
     /// encoder calls report one, every other rank none
-    /// (`ipc::WorkerInfo::encoder_pool`).
+    /// (`ipc::MainProcessInfo::encoder_pool`).
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no encoder output, and a simulated
     /// executor states its own (`SimEngine::set_encoder_pools`).
-    pub rank_encoders: BTreeMap<WorkerGroupId, RankEncoderPools>,
+    pub rank_encoders: BTreeMap<ExecutorGroupId, RankEncoderPools>,
 }
 
 /// Each rank's host and its host encoder pool, as it reported it, in rank
@@ -122,7 +122,7 @@ impl ExecutorInfo {
     /// Each rank validated the report it built, so the records are taken as
     /// they are. Fails when `pools` is empty, repeats a pool id, or holds
     /// replicas of one component that expose different numerical outputs.
-    pub fn from_workers(pools: Vec<(WorkerGroupId, WorkerInfo)>) -> anyhow::Result<Self> {
+    pub fn from_workers(pools: Vec<(ExecutorGroupId, MainProcessInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
             "executor info must contain at least one pool"
@@ -150,14 +150,14 @@ impl ExecutorInfo {
     }
 
     /// Returns the configuration the engine placed component `name` with on
-    /// `worker`, or `None` when the pool was launched with no such component.
-    pub fn component_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&ComponentConfig> {
+    /// `executor`, or `None` when the pool was launched with no such component.
+    pub fn component_config(&self, worker: &ExecutorGroupId, name: &str) -> Option<&ComponentConfig> {
         self.placements.get(worker)?.components.get(name)
     }
 
-    /// The persistent buffer bytes each rank of `worker` backs, in rank
+    /// The persistent buffer bytes each rank of `executor` backs, in rank
     /// order; empty for a pool this info does not hold.
-    pub fn rank_buffer_bytes(&self, worker: &WorkerGroupId) -> Vec<u64> {
+    pub fn rank_buffer_bytes(&self, worker: &ExecutorGroupId) -> Vec<u64> {
         if let Some(bytes) = self.rank_buffer_bytes.get(worker) {
             return bytes.clone();
         }
@@ -172,21 +172,21 @@ impl ExecutorInfo {
             .unwrap_or_default()
     }
 
-    /// The ranks `worker` holds; one for a pool this info does not hold.
-    pub fn rank_count(&self, worker: &WorkerGroupId) -> usize {
+    /// The ranks `executor` holds; one for a pool this info does not hold.
+    pub fn rank_count(&self, worker: &ExecutorGroupId) -> usize {
         self.rank_buffer_bytes(worker).len().max(1)
     }
 
-    /// Resolves which component serves each media call across every worker.
+    /// Resolves which component serves each media call across every executor.
     ///
-    /// The video graph may span workers: a model worker serves decoding and a
-    /// host worker serves encoding and muxing. Each call is served by one
-    /// component, which several workers may replicate, and a deployment that
-    /// muxes serves the whole video graph between its workers.
+    /// The video graph may span executors: a model executor serves decoding and a
+    /// host executor serves encoding and muxing. Each call is served by one
+    /// component, which several executors may replicate, and a deployment that
+    /// muxes serves the whole video graph between its executors.
     pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
-        // The first worker seen serving a call is kept only to name it if
-        // another worker routes that call to a different component.
-        let mut routing: BTreeMap<MediaCall, (String, &WorkerGroupId)> = BTreeMap::new();
+        // The first executor seen serving a call is kept only to name it if
+        // another executor routes that call to a different component.
+        let mut routing: BTreeMap<MediaCall, (String, &ExecutorGroupId)> = BTreeMap::new();
         for (id, info) in &self.workers {
             for (call, component) in &info.media_components {
                 if let Some((other, owner)) = routing.get(call) {
@@ -220,16 +220,16 @@ impl ExecutorInfo {
 
     /// Returns the media units one call of `call` covers at once: the ranks
     /// of a distributed serving component times its `units_per_rank`, or one
-    /// for any other component, on the narrowest worker serving the call.
+    /// for any other component, on the narrowest executor serving the call.
     ///
     /// A latent encoding round is dealt to the latent encoder's ranks that a
     /// request's prompt does not take (`Scheduler::latent_round`), so while
     /// the prompt is encoded a round covers only the ranks the latent
-    /// encoder does not share with the text encoder of its worker. Those
+    /// encoder does not share with the text encoder of its executor. Those
     /// ranks count; a latent encoder that shares every rank encodes after
     /// the prompt, on all of them.
     ///
-    /// Returns `None` when no worker serves `call`, or the width does not
+    /// Returns `None` when no executor serves `call`, or the width does not
     /// fit in `u32`.
     pub fn media_units(&self, call: MediaCall) -> Option<u32> {
         self.workers
@@ -263,7 +263,7 @@ impl ExecutorInfo {
 
     /// Derives the runtime's immutable capacity view from concrete pools.
     /// The returned value is not part of executor identity and is never
-    /// reported as a physical worker.
+    /// reported as a physical executor.
     ///
     /// A single pool's record is returned unchanged. With several pools, the
     /// record is cloned from the first pool that serves a cache forward call (or
@@ -285,8 +285,8 @@ impl ExecutorInfo {
     /// video reports no video denoiser, when pools describe the denoiser
     /// differently, when cache pools disagree on cache layout or a routed cache pool
     /// has no cache, when summed capacities overflow `u32`, or when the merged
-    /// record fails `WorkerInfo::validate`.
-    pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
+    /// record fails `MainProcessInfo::validate`.
+    pub fn runtime_info(&self) -> anyhow::Result<MainProcessInfo> {
         anyhow::ensure!(
             !self.workers.is_empty(),
             "executor exposes no physical pools"
@@ -328,11 +328,11 @@ impl ExecutorInfo {
         let mut merged = self.workers[seed_index].1.clone();
         merged.media_components = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
-        // The denoising worker owns the denoiser: its description is the
+        // The denoising executor owns the denoiser: its description is the
         // deployment's.
         merged.video_denoiser = denoising.and_then(|info| info.video_denoiser.clone());
         // A deployment that assembles video denoises over the fixed schedule
-        // the denoising worker describes.
+        // the denoising executor describes.
         anyhow::ensure!(
             !merged.media_components.contains_key(&MediaCall::Muxing)
                 || merged.video_denoiser.is_some(),
@@ -387,7 +387,7 @@ impl ExecutorInfo {
             .unwrap_or(0);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
-            // every WorkerGroup. End-to-end concurrency is the narrowest sum
+            // every ExecutorGroup. End-to-end concurrency is the narrowest sum
             // of replica capacities among the graph's components. Each
             // component is keyed to the first call it serves; its replicas are
             // the pools that support that call and bind the component.
@@ -444,7 +444,7 @@ impl ExecutorInfo {
         merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
         merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
         // The denoising pool's image shapes are those its runtime prepared,
-        // and the widest diffusion LM step of any worker is warmed down to
+        // and the widest diffusion LM step of any executor is warmed down to
         // one row.
         merged.image_warmups = flow.map_or_else(Vec::new, |info| info.image_warmups.clone());
         merged.captured_images = flow.and_then(|info| info.captured_images.clone());
@@ -453,7 +453,7 @@ impl ExecutorInfo {
             .and_then(|info| info.captured_latents.clone());
         merged.image_unconditional_token_ids =
             flow.and_then(|info| info.image_unconditional_token_ids.clone());
-        // Each image encoder's output is the one the worker that serves its
+        // Each image encoder's output is the one the executor that serves its
         // encoding states.
         merged.image_encoders.clear();
         for (call, name) in [
@@ -512,7 +512,7 @@ impl ExecutorInfo {
 /// A conditioned task reads its media on a host component and encodes its
 /// conditions before denoising, so a deployment serving one must place the
 /// media reader and both condition encoders as well as the generation calls.
-fn check_video_tasks(info: &WorkerInfo) -> anyhow::Result<()> {
+fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     let Some(denoiser) = info.video_denoiser.as_ref() else {
         return Ok(());
     };
@@ -543,24 +543,24 @@ pub struct CallResult {
 
 /// A decoded physical result that owns media before routing or rank validation.
 #[derive(Debug)]
-pub struct WorkerResult {
+pub struct ExecutorResult {
     pub batch_id: u64,
     /// Every participating rank has retired this batch, including command-only ranks.
     pub done: bool,
     pub results: Vec<CallResult>,
     /// Tensor exports remain owned by the executor's transfer consumers.
     pub products: Vec<TensorExport>,
-    /// Worker-reported execution duration in microseconds, when reported.
+    /// Executor-reported execution duration in microseconds, when reported.
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported.
     pub forward_stats: Option<ipc::ForwardStats>,
 }
 
-impl WorkerResult {
+impl ExecutorResult {
     /// Claims all media before any fallible correlation or aggregation step.
     /// Acquisition failure belongs to the call; independent results remain usable.
     ///
-    /// The returned value always sets `done`; `WorkerGroup::try_join`, which
+    /// The returned value always sets `done`; `ExecutorGroup::try_join`, which
     /// joins rank reports, decides `done` for the joined result itself.
     pub(crate) fn receive(report: BatchOutput) -> Self {
         let results = report
@@ -596,7 +596,7 @@ impl WorkerResult {
 pub enum CommandOutcome {
     /// Every target pool acknowledged the command.
     Applied,
-    /// The targeted request was tainted by a worker failure, so the command
+    /// The targeted request was tainted by an executor failure, so the command
     /// settles without an acknowledgment. The scheduler treats it as settled,
     /// like `Applied`.
     Retired,
@@ -627,9 +627,9 @@ pub struct BatchResult {
     pub command_results: Vec<CommandResult>,
     /// Whether this join completes the batch.
     pub done: bool,
-    /// Per-worker execution durations in microseconds.
+    /// Per-executor execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
-    /// Per-worker model-forward statistics.
+    /// Per-executor model-forward statistics.
     pub forward_stats: Vec<ipc::ForwardStats>,
 }
 
@@ -641,9 +641,9 @@ pub struct BatchResult {
 /// or without them; callers that track other outcomes overwrite the receipts.
 /// A partial result carries no receipts. `report.products` is not carried
 /// into the result: exports stay with the executor, and
-/// `WorkerExecutor` records them before converting.
+/// `Dispatcher` records them before converting.
 pub(crate) fn logical_result(
-    report: WorkerResult,
+    report: ExecutorResult,
     done: bool,
     commands: &[BatchCommand],
 ) -> BatchResult {
@@ -683,8 +683,8 @@ pub(crate) fn logical_result(
 /// Callers report executor failures rather than match them: the scheduler
 /// fails the affected calls and logs the error chain. The failures it acts
 /// on travel inside as typed errors and are recovered by downcasting: a
-/// worker's loss (`WorkerFailure`), a rank's execution error
-/// (`WorkerExecError`) and inputs no worker can route (`UnroutableInputs`).
+/// executor's loss (`ExecutorFailure`), a rank's execution error
+/// (`ExecuteError`) and inputs no executor can route (`UnroutableInputs`).
 pub type ExecutorError = anyhow::Error;
 
 /// Backpressure and terminal failures returned by logical batch submission.
@@ -698,12 +698,12 @@ pub enum ExecutorSubmitError {
     Failed(#[from] anyhow::Error),
 }
 
-/// Stable identity of one explicitly configured physical worker pool.
+/// Stable identity of one explicitly configured physical executor pool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct WorkerGroupId(pub String);
+pub struct ExecutorGroupId(pub String);
 
-impl WorkerGroupId {
+impl ExecutorGroupId {
     /// Validates and constructs a stable pool identifier.
     ///
     /// An identifier is nonempty ASCII alphanumerics, `-`, and `_`. Only this
@@ -715,24 +715,24 @@ impl WorkerGroupId {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
-            anyhow::bail!("invalid worker id {value:?}");
+            anyhow::bail!("invalid executor id {value:?}");
         }
         Ok(Self(value))
     }
 }
 
-impl std::fmt::Display for WorkerGroupId {
+impl std::fmt::Display for ExecutorGroupId {
     /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-/// Transport available for product movement between worker pools.
+/// Transport available for product movement between executor pools.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferBackend {
-    /// Keeps products within one worker process.
+    /// Keeps products within one executor process.
     #[default]
     Local,
     /// Publishes products through POSIX shared storage.
@@ -790,15 +790,15 @@ impl FromStr for TransferBackend {
 /// the edge's device mechanism, a host product on its host mechanism. An edge
 /// may name only one of the two, in which case products of the other
 /// location have no way across it: `TransferConfig::bind_inputs` refuses them
-/// where they are bound, and `WorkerExecutor` fails the requests reading them.
+/// where they are bound, and `Dispatcher` fails the requests reading them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
-    pub source_worker: WorkerGroupId,
+    pub source_worker: ExecutorGroupId,
     /// One source member, or all members when omitted.
     pub source_rank: Option<u32>,
     /// Pool that consumes the transferred product.
-    pub destination_worker: WorkerGroupId,
+    pub destination_worker: ExecutorGroupId,
     /// One consumer member, or all members when omitted.
     pub destination_rank: Option<u32>,
     /// Mechanism carrying device products across this edge.
@@ -825,13 +825,13 @@ impl TransferEdge {
 pub struct TransferConfig {
     /// Explicit directed transfer edges.
     pub edges: Vec<TransferEdge>,
-    /// Rank count of each worker an edge may name.
+    /// Rank count of each executor an edge may name.
     ///
-    /// An edge that omits a rank names every rank of its worker, so counting
+    /// An edge that omits a rank names every rank of its executor, so counting
     /// a product's consumers needs the membership the placement gave each.
     #[serde(default)]
     pub worker_ranks: std::collections::BTreeMap<String, u32>,
-    /// Host of each rank of each worker an edge may name.
+    /// Host of each rank of each executor an edge may name.
     ///
     /// An export's readiness mechanism depends on where it is read: an
     /// interprocess event reaches another process on this host and no further.
@@ -874,7 +874,7 @@ impl std::fmt::Display for TransferConfig {
 
 impl TransferConfig {
     /// Records the placement's rank counts and hosts, and binds a default edge
-    /// for every ordered pair of ranks, within and across workers, that no
+    /// for every ordered pair of ranks, within and across executors, that no
     /// configured edge covers.
     ///
     /// Each rank is a separate process. Its self-edge uses local storage for
@@ -883,19 +883,19 @@ impl TransferConfig {
     /// devices export a fabric handle; host products move over shared storage
     /// on one host and over the rank channel across hosts, because a
     /// shared-memory segment is named in one host's namespace. Explicit
-    /// bindings take precedence. `WorkerExecutor::try_new` validates each
+    /// bindings take precedence. `Dispatcher::try_new` validates each
     /// edge against the initialized endpoints and backends before the
     /// executor accepts work, and refuses by name an edge that would have to
     /// cross hosts without fabric handles.
     ///
     /// # Errors
     ///
-    /// Fails when `WorkerGroupConfig::validate_all` rejects `workers`.
+    /// Fails when `ExecutorGroupConfig::validate_all` rejects `executors`.
     pub fn with_worker_defaults(
         mut self,
-        workers: &[crate::WorkerGroupConfig],
+        workers: &[crate::ExecutorGroupConfig],
     ) -> anyhow::Result<Self> {
-        crate::WorkerGroupConfig::validate_all(workers)?;
+        crate::ExecutorGroupConfig::validate_all(workers)?;
         for worker in workers {
             self.worker_ranks
                 .insert(worker.id.0.clone(), worker.ranks.len() as u32);
@@ -904,8 +904,8 @@ impl TransferConfig {
                 worker.ranks.iter().map(|rank| rank.host.clone()).collect(),
             );
         }
-        // Products flow between the components of one worker and between
-        // workers, a model worker's decoded media units to a host worker's
+        // Products flow between the components of one executor and between
+        // executors, a model executor's decoded media units to a host executor's
         // encoders, so every ordered pair of ranks gets an edge derived from
         // its coordinates unless the configuration named one.
         for worker in workers {
@@ -1004,11 +1004,11 @@ impl TransferConfig {
     /// rank of the scheduler's groups. A consumer claims the word at its own slot when it
     /// begins reading and acknowledges it once its reads are done, so the
     /// producer can tell a consumer still reading from one that has finished
-    /// or never began. Slots are dense across the groups. A worker group absent
-    /// from `worker_ranks` yields a slot past every placed worker's run.
+    /// or never began. Slots are dense across the groups. An executor group absent
+    /// from `worker_ranks` yields a slot past every placed executor's run.
     pub fn acknowledgment_slot(&self, worker: &str, rank: u32) -> u32 {
-        // Workers are keyed in a BTreeMap, so their order is the same in every
-        // process that derives a slot. Each worker owns a contiguous run of
+        // Executors are keyed in a BTreeMap, so their order is the same in every
+        // process that derives a slot. Each executor owns a contiguous run of
         // slots, and a rank takes its offset within that run.
         let mut base = 0;
         for (name, ranks) in &self.worker_ranks {
@@ -1021,7 +1021,7 @@ impl TransferConfig {
     }
 
     /// Acknowledgment slots of every rank placed on the same host as one
-    /// rank, across workers, this rank's own included.
+    /// rank, across executors, this rank's own included.
     ///
     /// A host product is published over the mechanism that reaches the
     /// consumers its producing call names: shared storage for a consumer on
@@ -1102,10 +1102,10 @@ impl TransferConfig {
     /// consumers' identities and not merely their number. The consumers are the
     /// destinations of the edges leaving this rank, fixed when the placement
     /// is; an edge that omits the destination rank names every rank of that
-    /// worker. A producing rank cannot derive them: it knows which component
+    /// executor. A producing rank cannot derive them: it knows which component
     /// it belongs to, not which component reads what it publishes, and a
     /// product is consumed in a later batch than the one that produced it.
-    /// `WorkerGroup::consumer_slots` uses this for calls outside the video
+    /// `ExecutorGroup::consumer_slots` uses this for calls outside the video
     /// graph and states the slots on each producing call.
     ///
     /// The result is sorted and excludes this rank's own slot.
@@ -1127,7 +1127,7 @@ impl TransferConfig {
                 Some(consumer) => {
                     slots.insert(self.acknowledgment_slot(destination, consumer));
                 }
-                // An edge without a rank names every rank of its worker.
+                // An edge without a rank names every rank of its executor.
                 None => {
                     let members = self.worker_ranks.get(destination).copied().unwrap_or(0);
                     for consumer in 0..members {
@@ -1148,9 +1148,9 @@ impl TransferConfig {
     /// `destination`: a location survives when the first edge matching its
     /// source and `destination` carries the mechanism it was published on, or,
     /// with no matching edge, when it is a local location on `destination`
-    /// itself. An endpoint's worker and rank are the ones `incarnations`
+    /// itself. An endpoint's executor and rank are the ones `incarnations`
     /// holds for its incarnation; a location whose source is not a live
-    /// incarnation matches no edge. `WorkerGroup` calls this for each rank's
+    /// incarnation matches no edge. `ExecutorGroup` calls this for each rank's
     /// projected batch.
     ///
     /// # Errors
@@ -1162,10 +1162,10 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
-        incarnations: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::executors::IncarnationRegistry,
         products: &mut [ipc::TensorExport],
         cache_inputs: &mut [ipc::CacheTransfer],
-        destination: &ipc::WorkerEndpoint,
+        destination: &ipc::MainProcessEndpoint,
     ) -> Result<(), UnroutableInputs> {
         let position = incarnations.position(destination);
         let mut unroutable = Vec::new();
@@ -1204,10 +1204,10 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
-        incarnations: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::executors::IncarnationRegistry,
         tensor: &mut ipc::TensorTransfer,
-        destination: &ipc::WorkerEndpoint,
-        destination_position: Option<&(WorkerGroupId, u32)>,
+        destination: &ipc::MainProcessEndpoint,
+        destination_position: Option<&(ExecutorGroupId, u32)>,
     ) -> bool {
         use ipc::TransferTransport;
 
@@ -1252,19 +1252,19 @@ impl TransferConfig {
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
     /// both joined by `+` with the device mechanism first, as in
     /// `cuda_vmm+posix_shm`. `local` serves both locations. Entries are separated by
-    /// commas, and an omitted rank covers every rank of that worker.
+    /// commas, and an omitted rank covers every rank of that executor.
     ///
     /// The result holds no placement: `with_worker_defaults` fills
     /// `worker_ranks` and `worker_hosts` and binds the edges left unnamed.
     ///
     /// # Errors
     ///
-    /// Fails on a malformed entry, an invalid worker id or rank, an unknown
+    /// Fails on a malformed entry, an invalid executor id or rank, an unknown
     /// or conflicting mechanism, or an edge that overlaps an earlier one.
     pub fn parse(s: &str) -> Result<Self, TransferConfigError> {
         let mut edges = Vec::new();
 
-        let endpoint = |text: &str| -> Result<(WorkerGroupId, Option<u32>), TransferConfigError> {
+        let endpoint = |text: &str| -> Result<(ExecutorGroupId, Option<u32>), TransferConfigError> {
             let (worker, rank) = match text.trim().split_once(':') {
                 Some((worker, rank)) => (
                     worker,
@@ -1274,8 +1274,8 @@ impl TransferConfig {
                 ),
                 None => (text.trim(), None),
             };
-            let worker = WorkerGroupId::new(worker).map_err(|error| {
-                TransferConfigError::message(format!("invalid transfer worker: {error}"))
+            let worker = ExecutorGroupId::new(worker).map_err(|error| {
+                TransferConfigError::message(format!("invalid transfer executor: {error}"))
             })?;
             Ok((worker, rank))
         };
@@ -1295,7 +1295,7 @@ impl TransferConfig {
             let (dst, destination_rank) = endpoint(dst)?;
             let (device, host) = Self::parse_mechanisms(backend.trim())?;
 
-            // Two edges between the same workers overlap when their ranks
+            // Two edges between the same executors overlap when their ranks
             // can name one pair; an omitted rank overlaps every rank.
             if edges.iter().any(|existing: &TransferEdge| {
                 existing.source_worker == src
@@ -1377,12 +1377,12 @@ impl FromStr for TransferConfig {
 ///
 /// Every published location of these products travels on a mechanism that no
 /// configured edge to the consumer carries, so the requests reading them can
-/// never run there. `WorkerExecutor` fails those requests alone: the refusal
+/// never run there. `Dispatcher` fails those requests alone: the refusal
 /// says nothing about the rest of the batch or the health of either group.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("input products have no location on a configured transfer edge to {destination}")]
 pub(crate) struct UnroutableInputs {
-    /// The consuming rank, as `worker:rank`.
+    /// The consuming rank, as `executor:rank`.
     pub(crate) destination: String,
     /// The products left without a location the consumer can read.
     pub(crate) buffers: Vec<ipc::BufferId>,
@@ -1400,18 +1400,18 @@ impl TransferConfigError {
     }
 }
 
-/// A worker-reported execution error classified for scheduler failure policy.
+/// An executor-reported execution error classified for scheduler failure policy.
 ///
 /// The typed taxonomy and execution context cross the IPC together so failure
 /// policy and diagnostics use the same call identity.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("worker execute error: {message}")]
-pub struct WorkerExecError {
+#[error("executor execute error: {message}")]
+pub struct ExecuteError {
     /// Batch whose response carried this error. Composite executors use it to
     /// join the same terminal outcome across ranks before returning the
     /// failure to the scheduler.
     pub batch_id: Option<u64>,
-    /// Whether the error invalidates the worker process or executor.
+    /// Whether the error invalidates the executor process or executor.
     pub fatal: bool,
     /// The failure's class, when the rank classified it.
     pub code: Option<ipc::ErrorCode>,
@@ -1420,13 +1420,13 @@ pub struct WorkerExecError {
     /// Execution phase in which the failure occurred, when known.
     pub phase: Option<String>,
     /// Call kind of the failed batch or numerical call, when the failure
-    /// belongs to a batch with calls (see `WorkerResponseError::route`).
+    /// belongs to a batch with calls (see `MainProcessResponseError::route`).
     pub route: Option<String>,
-    /// Calls affected by the worker failure.
+    /// Calls affected by the executor failure.
     pub calls: Vec<ipc::ErrorCallIdentity>,
 }
 
-impl WorkerExecError {
+impl ExecuteError {
     /// The classification of a batch some of whose calls computed
     /// non-finite logits (`ErrorCode::NumericalFault`), which fails a world
     /// on trial as a whole; `None` for a batch whose failed calls failed
@@ -1454,17 +1454,17 @@ impl WorkerExecError {
     }
 }
 
-/// Terminal work abandoned by one Worker, with the exact invalidated ownership.
+/// Terminal work abandoned by one Executor, with the exact invalidated ownership.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-pub struct WorkerFailure {
-    /// Worker group reporting the failure.
-    pub worker_id: WorkerGroupId,
+pub struct ExecutorFailure {
+    /// Executor group reporting the failure.
+    pub worker_id: ExecutorGroupId,
     /// Invalidated incarnations; empty when the group retains its allocations.
-    pub endpoints: Vec<ipc::WorkerEndpoint>,
+    pub endpoints: Vec<ipc::MainProcessEndpoint>,
     /// Request epochs affected by the failed work or invalidated allocations.
     pub requests: Vec<RequestKey>,
-    /// The requests among `requests` that a worker refused, each with the
+    /// The requests among `requests` that an executor refused, each with the
     /// reason its input-error completion states (`CallOutput::error_message`).
     /// The scheduler rejects these with their reason and fails the others
     /// with `message`.
@@ -1474,7 +1474,7 @@ pub struct WorkerFailure {
     /// Buffers whose published locations no longer cover their complete logical value.
     pub buffers: Vec<ipc::BufferId>,
     /// Classified execution failure, if the ranks returned one before retirement.
-    pub execution: Option<WorkerExecError>,
+    pub execution: Option<ExecuteError>,
     /// Human-readable failure description.
     pub message: String,
 }
@@ -1488,30 +1488,30 @@ pub struct WorkerFailure {
 pub trait Executor: Send {
     /// Returns the executor's concrete pool capabilities.
     fn info(&self) -> &ExecutorInfo;
-    /// Whether every worker of group `worker` is ready to accept execution.
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool;
-    /// Whether group `worker` executes nothing further: it is closed, or
+    /// Whether every executor of group `executor` is ready to accept execution.
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool;
+    /// Whether group `executor` executes nothing further: it is closed, or
     /// could not be replaced. A group whose replacement is starting is not
     /// ready but not closed either. The default suits an executor that
     /// replaces no group in the background: a group that is not ready is
     /// closed.
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         !self.is_ready(worker)
     }
-    /// Whether group `worker` has an unclaimed destination submission slot.
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
+    /// Whether group `executor` has an unclaimed destination submission slot.
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool;
     /// Whether every physical owner of a lifecycle command can accept its submission.
     fn command_has_capacity(&self, command: &BatchCommand) -> bool;
     /// Submits one logical batch without blocking for capacity.
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError>;
     /// Waits up to `timeout` for one partial or terminal batch result.
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
-    /// Closes the executor and its physical workers.
+    /// Closes the executor and its physical executors.
     fn close(&mut self) -> Result<(), ExecutorError>;
-    /// Commits the workers' world: each worker takes the predecessor
+    /// Commits the executors' world: each executor takes the predecessor
     /// world's storage it mapped read-only, and its group relaunches on a
-    /// loss and keeps its standby from then on. Returns what each worker
-    /// reported. The default suits an executor whose workers succeed no
+    /// loss and keeps its standby from then on. Returns what each executor
+    /// reported. The default suits an executor whose executors succeed no
     /// world.
     fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
         Ok(Vec::new())
@@ -1522,14 +1522,14 @@ pub trait Executor: Send {
         Ok(())
     }
     /// Ends the storage of every world of `worlds` on the nodes of the
-    /// executor's workers (`Claims::retire`). The default suits an executor
+    /// executor's executors (`Claims::retire`). The default suits an executor
     /// that retains no storage.
     fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
         let _ = worlds;
         Ok(())
     }
     /// Keeps the weights alone of every world of `worlds` on the nodes of
-    /// the executor's workers, in host storage when `to_host`
+    /// the executor's executors, in host storage when `to_host`
     /// (`Claims::keep_weights`), and returns each node's report. The default
     /// suits an executor that retains no storage, which has no node to
     /// report.
@@ -1544,14 +1544,14 @@ pub trait Executor: Send {
     }
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use on the nodes of the executor's
-    /// workers (`Claims::throttle`), and returns those nodes' hosts. The
+    /// executors (`Claims::throttle`), and returns those nodes' hosts. The
     /// default suits an executor that retains no storage and runs no
     /// transfer, which throttles no host.
     fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
         let _ = halve;
         Ok(Vec::new())
     }
-    /// The storage ledgers of the nodes of the executor's workers
+    /// The storage ledgers of the nodes of the executor's executors
     /// (`Claims::ledgers`): for each node, JSON of `{"host": ..., "ledgers":
     /// [...], "host_storage": {...}}`. The default suits an executor that
     /// retains no storage, whose ledgers are empty.
@@ -1564,36 +1564,36 @@ pub trait Executor: Send {
     fn storage_nodes(&self) -> std::collections::BTreeMap<String, String> {
         std::collections::BTreeMap::new()
     }
-    /// Runs the worker hook `name` with `payload` on every worker while
-    /// none runs a batch, and returns each worker group's identity with its
+    /// Runs the executor hook `name` with `payload` on every executor while
+    /// none runs a batch, and returns each executor group's identity with its
     /// ranks' results, in rank order. The default refuses: the executor has
-    /// no workers to run hooks on.
+    /// no executors to run hooks on.
     fn hook_groups(
         &mut self,
         name: &str,
         payload: &str,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         let _ = payload;
-        anyhow::bail!("this executor runs no worker hook ({name})")
+        anyhow::bail!("this executor runs no executor hook ({name})")
     }
-    /// Maps the host KV cache's page pools on every worker's ranks, each
+    /// Maps the host KV cache's page pools on every executor's ranks, each
     /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
-    /// while none runs a batch, and returns each worker group's identity
+    /// while none runs a batch, and returns each executor group's identity
     /// with its ranks' pools (JSON, `null` for a rank that copies no pages),
     /// in rank order. Ranks that later replace lost ones map the same pools
-    /// before they serve. The default refuses: the executor has no workers.
+    /// before they serve. The default refuses: the executor has no executors.
     fn map_host_cache(
         &mut self,
         tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         anyhow::bail!("this executor maps no host KV cache ({tokens} tokens)")
     }
-    /// Runs the worker hook `name` with `payload` on every worker while
-    /// none runs a batch, and returns each worker's result. The default
-    /// refuses: the executor has no workers to run hooks on.
+    /// Runs the executor hook `name` with `payload` on every executor while
+    /// none runs a batch, and returns each executor's result. The default
+    /// refuses: the executor has no executors to run hooks on.
     fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
         let _ = payload;
-        anyhow::bail!("this executor runs no worker hook ({name})")
+        anyhow::bail!("this executor runs no executor hook ({name})")
     }
 
     /// Commit prepared expert allocations and retain their order for recovery.
@@ -1610,11 +1610,11 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
 
-    /// A worker serving `routes`; the one that denoises describes the
+    /// An executor serving `routes`; the one that denoises describes the
     /// deployment's fixed schedule.
-    fn media_info(routes: &[(MediaCall, &str)]) -> WorkerInfo {
+    fn media_info(routes: &[(MediaCall, &str)]) -> MainProcessInfo {
         let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
-        WorkerInfo {
+        MainProcessInfo {
             media_components: routes
                 .iter()
                 .map(|(call, component)| (*call, (*component).to_owned()))
@@ -1631,7 +1631,7 @@ mod tests {
                 denoise_steps: 4,
                 description: b"{}".to_vec(),
             }),
-            ..WorkerInfo::default()
+            ..MainProcessInfo::default()
         }
     }
 
@@ -1639,7 +1639,7 @@ mod tests {
         id: &str,
         routes: &[(MediaCall, &str)],
         request_slots: u32,
-    ) -> (WorkerGroupId, WorkerInfo) {
+    ) -> (ExecutorGroupId, MainProcessInfo) {
         let mut info = media_info(routes);
         info.request_slots = request_slots;
         info.components = routes
@@ -1652,10 +1652,10 @@ mod tests {
                 outputs: Vec::new(),
             })
             .collect();
-        (WorkerGroupId(id.to_owned()), info)
+        (ExecutorGroupId(id.to_owned()), info)
     }
 
-    fn media_replica(id: &str, request_slots: u32) -> (WorkerGroupId, WorkerInfo) {
+    fn media_replica(id: &str, request_slots: u32) -> (ExecutorGroupId, MainProcessInfo) {
         media_pool(
             id,
             &[
@@ -1716,7 +1716,7 @@ mod tests {
 
     #[test]
     fn media_routing_is_the_union_over_workers() {
-        // A model worker decodes and a host worker encodes and muxes; the
+        // A model executor decodes and a host executor encodes and muxes; the
         // deployment's routing names every video call once.
         let model = media_info(&[
             (MediaCall::TextEncoding, "text_encoder"),
@@ -1732,8 +1732,8 @@ mod tests {
         ]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerGroupId("model".to_owned()), model),
-                (WorkerGroupId("host".to_owned()), host),
+                (ExecutorGroupId("model".to_owned()), model),
+                (ExecutorGroupId("host".to_owned()), host),
             ],
             ..ExecutorInfo::default()
         };
@@ -1745,8 +1745,8 @@ mod tests {
 
     /// A distributed component's round covers its ranks times its units per
     /// rank, an undistributed one's a single unit, and the narrowest replica
-    /// binds; a call no worker serves has no round units. A latent encoding
-    /// round leaves out the ranks its worker's text encoder takes.
+    /// binds; a call no executor serves has no round units. A latent encoding
+    /// round leaves out the ranks its executor's text encoder takes.
     #[test]
     fn media_units_count_the_units_one_call_covers() {
         let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
@@ -1777,7 +1777,7 @@ mod tests {
             )
         };
         let round_units =
-            |pools: Vec<((WorkerGroupId, WorkerInfo), (WorkerGroupId, PoolPlacement))>| {
+            |pools: Vec<((ExecutorGroupId, MainProcessInfo), (ExecutorGroupId, PoolPlacement))>| {
                 let (workers, placements) = pools.into_iter().unzip();
                 ExecutorInfo {
                     workers,
@@ -1809,7 +1809,7 @@ mod tests {
 
         // A latent encoding round covers the ranks the prompt's encoding
         // leaves free: those the latent encoder does not share with its
-        // worker's text encoder, or all of them when it shares every one.
+        // executor's text encoder, or all of them when it shares every one.
         let beside = |text: Vec<usize>| {
             round_units(vec![pool(
                 "a",
@@ -1865,7 +1865,7 @@ mod tests {
                 description: b"{}".to_vec(),
             });
             ExecutorInfo {
-                workers: vec![(WorkerGroupId("model".to_owned()), info)],
+                workers: vec![(ExecutorGroupId("model".to_owned()), info)],
                 ..ExecutorInfo::default()
             }
         };
@@ -1895,8 +1895,8 @@ mod tests {
         let host = media_info(&[(MediaCall::Muxing, "muxer")]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerGroupId("model".to_owned()), model.clone()),
-                (WorkerGroupId("host".to_owned()), host),
+                (ExecutorGroupId("model".to_owned()), model.clone()),
+                (ExecutorGroupId("host".to_owned()), host),
             ],
             ..ExecutorInfo::default()
         };
@@ -1909,8 +1909,8 @@ mod tests {
         let other = media_info(&[(MediaCall::VideoDecoding, "decoder")]);
         let info = ExecutorInfo {
             workers: vec![
-                (WorkerGroupId("model".to_owned()), model),
-                (WorkerGroupId("other".to_owned()), other),
+                (ExecutorGroupId("model".to_owned()), model),
+                (ExecutorGroupId("other".to_owned()), other),
             ],
             ..ExecutorInfo::default()
         };
@@ -1929,17 +1929,17 @@ mod tests {
         let mut transfer = TransferConfig {
             edges: vec![
                 TransferEdge {
-                    source_worker: WorkerGroupId("encoder".to_owned()),
+                    source_worker: ExecutorGroupId("encoder".to_owned()),
                     source_rank: Some(0),
-                    destination_worker: WorkerGroupId("decode".to_owned()),
+                    destination_worker: ExecutorGroupId("decode".to_owned()),
                     destination_rank: None,
                     device: Some(TransferBackend::CudaVmm),
                     host: Some(TransferBackend::PosixShm),
                 },
                 TransferEdge {
-                    source_worker: WorkerGroupId("encoder".to_owned()),
+                    source_worker: ExecutorGroupId("encoder".to_owned()),
                     source_rank: Some(0),
-                    destination_worker: WorkerGroupId("encoder".to_owned()),
+                    destination_worker: ExecutorGroupId("encoder".to_owned()),
                     destination_rank: Some(0),
                     device: Some(TransferBackend::Local),
                     host: Some(TransferBackend::Local),
@@ -1998,17 +1998,17 @@ mod tests {
     fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
         use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
         };
 
         // A device product that did not fit its producer's pool is published
         // in the producer's own address space and as shared-memory bytes; an
         // edge that carries only CUDA VMM takes neither to the decoder.
         let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
-        let endpoint = |worker: &str| Endpoint {
+        let endpoint = |group: &str| Endpoint {
             host: "host".to_owned(),
-            address_space: format!("{worker}-process"),
-            incarnation: format!("{worker}-incarnation"),
+            address_space: format!("{group}-process"),
+            incarnation: format!("{group}-incarnation"),
         };
         let producer = endpoint("denoiser");
         let locator = |transport| Locator {
@@ -2052,10 +2052,10 @@ mod tests {
             },
         }];
 
-        let incarnations = crate::worker::IncarnationRegistry::default();
+        let incarnations = crate::executors::IncarnationRegistry::default();
         let decoder = endpoint("decoder");
-        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), [&producer]);
-        incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
+        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), [&producer]);
+        incarnations.assign(&ExecutorGroupId("decoder".to_owned()), [&decoder]);
 
         let refusal = transfer
             .bind_inputs(&incarnations, &mut products, &mut [], &decoder)
@@ -2064,7 +2064,7 @@ mod tests {
         assert_eq!(refusal.destination, "decoder:0");
     }
 
-    /// A publication binds to the edge of the worker and rank its source
+    /// A publication binds to the edge of the executor and rank its source
     /// incarnation serves; once a group replaces its ranks, the replaced
     /// incarnation's publication binds to nothing and the replacement takes
     /// the same edge.
@@ -2072,7 +2072,7 @@ mod tests {
     fn a_replaced_worker_incarnation_no_longer_binds_to_its_edge() {
         use ipc::{
             CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, WorkerEndpoint as Endpoint,
+            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
         };
 
         // Rank 1 of the denoiser sends to the decoder over shared storage,
@@ -2085,9 +2085,9 @@ mod tests {
         };
         let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
         let decoder = endpoint("decoder-0");
-        let incarnations = crate::worker::IncarnationRegistry::default();
-        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), &denoiser);
-        incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
+        let incarnations = crate::executors::IncarnationRegistry::default();
+        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), &denoiser);
+        incarnations.assign(&ExecutorGroupId("decoder".to_owned()), [&decoder]);
 
         let product = TensorRef {
             request_key: RequestKey::new(1, ipc::RequestId(7), 1),
@@ -2139,7 +2139,7 @@ mod tests {
         // The denoiser replaces both of its ranks. The old rank 1 incarnation
         // is retired, and its replacement takes the same edge.
         let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
-        incarnations.assign(&WorkerGroupId("denoiser".to_owned()), &replacement);
+        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), &replacement);
 
         let mut retired = vec![published_by(&denoiser[1])];
         assert!(
@@ -2160,9 +2160,9 @@ mod tests {
         assert_eq!(
             t.edges[0],
             TransferEdge {
-                source_worker: WorkerGroupId("encoder".to_owned()),
+                source_worker: ExecutorGroupId("encoder".to_owned()),
                 source_rank: None,
-                destination_worker: WorkerGroupId("prefill".to_owned()),
+                destination_worker: ExecutorGroupId("prefill".to_owned()),
                 destination_rank: None,
                 device: Some(TransferBackend::CudaVmm),
                 host: None,
@@ -2203,7 +2203,7 @@ mod tests {
                 "b".to_owned(),
             ],
         );
-        // Model rank 3 is on host b with CPU worker 1 and model rank 2.
+        // Model rank 3 is on host b with CPU executor 1 and model rank 2.
         let slots = transfer.host_slots("model", 3);
         let expected = [
             transfer.acknowledgment_slot("host", 1),

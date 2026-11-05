@@ -1,11 +1,11 @@
 //! The deployment's claims at the Storage Servers of its nodes.
 //!
-//! Before any worker starts, the engine has the daemon of every node of the
+//! Before any executor starts, the engine has the daemon of every node of the
 //! deployment claim the deployment at that node's Storage Server
 //! (`ProcessClient::claim`), naming the scopes the engine's world keeps
-//! there (none on a node that runs none of its workers). The daemon holds
+//! there (none on a node that runs none of its executors). The daemon holds
 //! the claim for as long as it runs, so the claim outlives the engine. Each
-//! worker starts with its node's socket and claim token ([`StorageLaunch`]),
+//! executor starts with its node's socket and claim token ([`StorageLaunch`]),
 //! by which the server tells it belongs to the deployment's current claim,
 //! and the other nodes' servers, from which it may receive another world's
 //! weights. The engine ends another world's storage on every node by
@@ -21,14 +21,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use ipc::StorageLaunch;
 
-use crate::worker::WorkerProcessArgs;
-use crate::worker::processes::Processes;
+use crate::executors::ExecutorProcessArgs;
+use crate::executors::processes::Processes;
 
 /// The deployment's claims, shared by every group of the deployment.
 pub(crate) type StorageClaims = Arc<Claims>;
 
 pub(crate) struct Claims {
-    /// The storage launch of each node's workers, by host.
+    /// The storage launch of each node's executors, by host.
     launches: BTreeMap<String, StorageLaunch>,
     /// Where other nodes reach each node's server, by host: empty for a
     /// server no other node reaches.
@@ -52,7 +52,7 @@ impl Claims {
     /// Fails when a server cannot be started or reached, or refuses the
     /// claim because another head of the deployment is connected.
     pub(crate) fn claim(
-        arguments: &[WorkerProcessArgs],
+        arguments: &[ExecutorProcessArgs],
         processes: &Processes,
     ) -> anyhow::Result<StorageClaims> {
         let Some(first) = arguments.first() else {
@@ -67,8 +67,8 @@ impl Claims {
             }));
         };
         let deployment = &first.deployment;
-        let hosts = crate::worker::processes::lock(processes)?.hosts();
-        // The leader's node runs the engine, whose workers reach their
+        let hosts = crate::executors::processes::lock(processes)?.hosts();
+        // The leader's node runs the engine, whose executors reach their
         // server through its socket.
         let engine_host = hosts.first().cloned();
         let mut scopes: BTreeMap<String, Vec<(String, u32)>> =
@@ -97,7 +97,7 @@ impl Claims {
         let mut claimed = BTreeMap::new();
         for (host, scopes) in scopes {
             claimed.insert(host.clone(), scopes.clone());
-            let launch = crate::worker::processes::lock(processes)?
+            let launch = crate::executors::processes::lock(processes)?
                 .claim(
                     &host,
                     deployment,
@@ -105,14 +105,14 @@ impl Claims {
                     scopes,
                     // A world started again at a rollback retires the world on
                     // trial first, whose storage it needs.
-                    crate::worker::processes::Retirement {
+                    crate::executors::processes::Retirement {
                         worlds: first.retire.clone(),
                     },
                     server_arguments.clone(),
                 )
                 .with_context(|| format!("claiming deployment {deployment} on host {host}"))?;
             endpoints.insert(host.clone(), launch.tcp.clone().unwrap_or_default());
-            // The engine decides whether its workers use the host KV cache,
+            // The engine decides whether its executors use the host KV cache,
             // and reaches its own node's server through its socket.
             let tcp = launch
                 .tcp
@@ -147,7 +147,7 @@ impl Claims {
     /// Publishes this committed world's immutable pages on every claimed node.
     pub(crate) fn publish(&self) -> anyhow::Result<()> {
         for host in self.scopes.keys() {
-            crate::worker::processes::lock(&self.processes)?.publish_worlds(
+            crate::executors::processes::lock(&self.processes)?.publish_worlds(
                 host,
                 &self.deployment,
                 &[self.world],
@@ -170,13 +170,13 @@ impl Claims {
             return Ok(());
         }
         for (host, scopes) in &self.scopes {
-            crate::worker::processes::lock(&self.processes)?
+            crate::executors::processes::lock(&self.processes)?
                 .claim(
                     host,
                     &self.deployment,
                     self.world,
                     scopes.clone(),
-                    crate::worker::processes::Retirement {
+                    crate::executors::processes::Retirement {
                         worlds: worlds.to_vec(),
                     },
                     self.server_arguments.clone(),
@@ -222,7 +222,7 @@ impl Claims {
         }
         let mut reports = Vec::with_capacity(self.scopes.len());
         for host in self.scopes.keys() {
-            let kept = crate::worker::processes::lock(&self.processes)?.keep_weights(
+            let kept = crate::executors::processes::lock(&self.processes)?.keep_weights(
                 host,
                 &self.deployment,
                 worlds,
@@ -267,7 +267,7 @@ impl Claims {
         // The copies of a world change run on the Transfer Servers of the
         // nodes its successor runs on, which may have joined after this
         // engine started.
-        let mut processes = crate::worker::processes::lock(&self.processes)?;
+        let mut processes = crate::executors::processes::lock(&self.processes)?;
         let hosts = processes.current_hosts()?;
         for host in &hosts {
             processes.throttle(host, &self.deployment, halve)?;
@@ -278,7 +278,7 @@ impl Claims {
     /// The storage ledgers of every node of the deployment: for each host, the
     /// JSON of its Storage Server's ledgers of the deployment and what it
     /// admits of new host storage, read by the node's daemon over its claim
-    /// (no worker is asked, so serving goes on).
+    /// (no executor is asked, so serving goes on).
     ///
     /// # Errors
     ///
@@ -287,13 +287,13 @@ impl Claims {
         let mut ledgers = Vec::with_capacity(self.scopes.len());
         for host in self.scopes.keys() {
             let ledger =
-                crate::worker::processes::lock(&self.processes)?.ledger(host, &self.deployment)?;
+                crate::executors::processes::lock(&self.processes)?.ledger(host, &self.deployment)?;
             ledgers.push((host.clone(), ledger));
         }
         Ok(ledgers)
     }
 
-    /// The storage launch of the workers on `host`, which names the
+    /// The storage launch of the executors on `host`, which names the
     /// servers of the other nodes that other nodes reach.
     pub(crate) fn launch(&self, host: &str) -> anyhow::Result<StorageLaunch> {
         let launch = self

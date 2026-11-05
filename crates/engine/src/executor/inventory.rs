@@ -14,11 +14,11 @@
 use std::collections::BTreeMap;
 
 use anyhow::ensure;
-use ipc::WorkerInfo;
+use ipc::MainProcessInfo;
 
-use crate::WorkerGroupId;
+use crate::ExecutorGroupId;
 use crate::executor::{ExecutorInfo, PoolPlacement, RankEncoderPools};
-use crate::worker::executor::codecs::video_unit_codecs;
+use crate::executors::dispatch::codecs::video_unit_codecs;
 
 impl ExecutorInfo {
     /// The capability information of the pools `pools` describes, as the mechanism reads it.
@@ -42,7 +42,7 @@ impl ExecutorInfo {
             );
             let info = pool_info(&pool.ranks)
                 .map_err(|error| error.context(format!("pool {}", named(&pool.group))))?;
-            reports.push((WorkerGroupId(pool.group.clone()), info));
+            reports.push((ExecutorGroupId(pool.group.clone()), info));
         }
         // Pool identities are unique and replicas of one component agree, which
         // is the same check every launch passes (`from_workers`).
@@ -78,7 +78,7 @@ impl ExecutorInfo {
         // The capacities come from the launch, not from the ranks' reports: a
         // rank reports what it holds, not how many it was launched for.
         for pool in pools {
-            let id = WorkerGroupId(pool.group.clone());
+            let id = ExecutorGroupId(pool.group.clone());
             ensure!(
                 pool.placement.ranks.max(1) == pool.ranks.len(),
                 "pool {} was launched for {} ranks and reports {}",
@@ -140,7 +140,7 @@ impl ExecutorInfo {
             .iter()
             .map(|pool| {
                 (
-                    WorkerGroupId(pool.group.clone()),
+                    ExecutorGroupId(pool.group.clone()),
                     pool.ranks
                         .iter()
                         .map(|rank| rank.endpoint.host.clone())
@@ -161,7 +161,7 @@ impl ExecutorInfo {
 /// and transfer tickets a pool holds are its narrowest rank's, the image facts are those the ranks
 /// holding them agree on, and the prefix cache's layers and heads are their union. The fields a rank
 /// reports for itself alone — its host latent and encoder pool — are left for the rank-by-rank maps.
-pub(crate) fn pool_info(ranks: &[WorkerInfo]) -> anyhow::Result<WorkerInfo> {
+pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcessInfo> {
     ensure!(!ranks.is_empty(), "a pool has at least one rank");
 
     // Rank 0's report becomes the pool's.
@@ -330,7 +330,7 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ipc::{ComponentConfig, MediaCall, WorkerEndpoint};
+    use ipc::{ComponentConfig, MediaCall, MainProcessEndpoint};
     use std::collections::BTreeSet;
 
     /// A rank's report, with the fields a mechanism reads distinguishable per
@@ -339,16 +339,16 @@ mod tests {
         host: &str,
         buffer_pool_bytes: u64,
         prefix_cache: Option<ipc::PrefixCacheInfo>,
-    ) -> WorkerInfo {
-        WorkerInfo {
-            endpoint: WorkerEndpoint {
+    ) -> MainProcessInfo {
+        MainProcessInfo {
+            endpoint: MainProcessEndpoint {
                 host: host.to_owned(),
                 address_space: format!("{host}-space"),
                 incarnation: format!("{host}-rank"),
             },
             buffer_pool_bytes,
             prefix_cache,
-            ..WorkerInfo::default()
+            ..MainProcessInfo::default()
         }
     }
 
@@ -372,7 +372,7 @@ mod tests {
 
     fn pool(
         group: &str,
-        ranks: Vec<WorkerInfo>,
+        ranks: Vec<MainProcessInfo>,
         placed_ranks: usize,
         components: BTreeMap<String, ComponentConfig>,
         max_model_len: u32,
@@ -425,7 +425,7 @@ mod tests {
         let info = ExecutorInfo::from_inventory(&[text]).expect("one pool's facts describe it");
 
         assert_eq!(info.workers.len(), 1);
-        let id = WorkerGroupId("text".to_owned());
+        let id = ExecutorGroupId("text".to_owned());
         assert_eq!(info.workers[0].0, id);
         assert_eq!(
             info.rank_buffer_bytes(&id),
@@ -514,7 +514,7 @@ mod tests {
     fn a_decoder_pairs_only_with_encoders_that_stay_on_its_host() {
         let info = ExecutorInfo::from_inventory(&[media_pool("gpu-a")])
             .expect("a media pool's own encoder is admissible");
-        let id = WorkerGroupId("media".to_owned());
+        let id = ExecutorGroupId("media".to_owned());
         assert_eq!(
             info.video_codecs.get(&id),
             Some(&BTreeSet::from([id.clone()])),

@@ -302,7 +302,7 @@ impl BatchReport {
             done: true,
             timing: output.timing,
             // Device-side forward statistics are a worker's readout, not a
-            // rank's own (`crate::worker`); a process reports none here.
+            // rank's own (`crate::executors`); a process reports none here.
             forward_stats: Vec::new(),
         })
     }

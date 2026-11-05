@@ -3,8 +3,8 @@
 //! The engine listens on one Unix socket path and one TCP port for the whole
 //! deployment. A rank connects to the engine when it starts, through the Unix
 //! socket on the engine's node and through TCP from any other node, and its
-//! first frame is its `Registration`: worker group, rank, launch generation
-//! and build version. [`WorkerRegistry::begin_launch`] numbers each launch of
+//! first frame is its `Registration`: executor group, rank, launch generation
+//! and build version. [`ExecutorRegistry::begin_launch`] numbers each launch of
 //! a group, and [`collect`] gathers the registrations of the
 //! group's current launch and hands each rank's connection to that launch,
 //! which answers with the rank's launch descriptor. The connection then
@@ -38,13 +38,13 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// some of them have not registered.
 const ACCEPT_INTERVAL: Duration = Duration::from_millis(20);
 
-/// The deployment's registry, shared by its worker groups.
-pub(crate) type Registry = Arc<Mutex<WorkerRegistry>>;
+/// The deployment's registry, shared by its executor groups.
+pub(crate) type Registry = Arc<Mutex<ExecutorRegistry>>;
 
 /// Locks the registry, reporting a poisoned lock as an error.
 pub(crate) fn lock(
-    registry: &Mutex<WorkerRegistry>,
-) -> anyhow::Result<std::sync::MutexGuard<'_, WorkerRegistry>> {
+    registry: &Mutex<ExecutorRegistry>,
+) -> anyhow::Result<std::sync::MutexGuard<'_, ExecutorRegistry>> {
     registry
         .lock()
         .map_err(|_| anyhow::anyhow!("the rank registry is poisoned"))
@@ -59,11 +59,11 @@ struct RegisteredWorker {
 }
 
 /// The address ranks connect to, and those that have registered there.
-pub(crate) struct WorkerRegistry {
+pub(crate) struct ExecutorRegistry {
     listener: Listener,
     /// Holds the Unix socket's path; dropping it removes the directory.
     _directory: tempfile::TempDir,
-    /// The generation of each worker group's current launch, which every
+    /// The generation of each executor group's current launch, which every
     /// rank of that launch states when it registers.
     generations: HashMap<String, u64>,
     /// Accepted connections whose registration has not arrived.
@@ -73,7 +73,7 @@ pub(crate) struct WorkerRegistry {
     ranks: Vec<RegisteredWorker>,
 }
 
-impl WorkerRegistry {
+impl ExecutorRegistry {
     /// Binds the Unix socket path and the TCP port ranks connect to.
     ///
     /// `routable` says whether some rank runs on another host: the TCP port
@@ -158,11 +158,11 @@ impl WorkerRegistry {
             let rank = registered.rank as usize;
             anyhow::ensure!(
                 rank < expected,
-                "rank {rank} registered for worker {worker_id}, which has {expected} ranks"
+                "rank {rank} registered for executor {worker_id}, which has {expected} ranks"
             );
             anyhow::ensure!(
                 ranks.insert(rank, registered.channel).is_none(),
-                "rank {rank} of worker {worker_id} registered twice"
+                "rank {rank} of executor {worker_id} registered twice"
             );
         }
         Ok(())
@@ -250,11 +250,11 @@ impl WorkerRegistry {
 /// Fails on an error from `alive`, when the deadline passes with ranks
 /// unregistered (named in the error), when a registration states another
 /// build than the engine's, and when one names a rank outside `0..expected`
-/// or one that already registered. Connections of other worker groups are
+/// or one that already registered. Connections of other executor groups are
 /// kept for their own launches, and a rank of an earlier launch of this
 /// group is refused without failing this one.
 pub(crate) fn collect(
-    registry: &Mutex<WorkerRegistry>,
+    registry: &Mutex<ExecutorRegistry>,
     worker_id: &str,
     expected: usize,
     mut alive: impl FnMut() -> anyhow::Result<()>,
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn a_launch_collects_its_own_workers_over_both_addresses_in_rank_order() {
-        let shared = WorkerRegistry::bind(false).unwrap();
+        let shared = ExecutorRegistry::bind(false).unwrap();
         let registry = || lock(&shared).unwrap();
         let unix = registry().address(None).unwrap();
         let tcp = registry()
@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(ranks.len(), 2);
         for (rank, channel) in ranks.iter_mut().enumerate() {
             channel
-                .send(&ipc::WorkerRequest::Info {
+                .send(&ipc::MainProcessRequest::Info {
                     message_id: Some(rank as u64),
                 })
                 .unwrap();
@@ -356,7 +356,7 @@ mod tests {
         for (rank, peer) in [&mut first, &mut second].into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(5);
             let request = loop {
-                if let Some(request) = peer.try_recv::<ipc::WorkerRequest>().unwrap() {
+                if let Some(request) = peer.try_recv::<ipc::MainProcessRequest>().unwrap() {
                     break request;
                 }
                 assert!(Instant::now() < deadline);
@@ -374,7 +374,7 @@ mod tests {
     /// and neither counts as a rank of the relaunch.
     #[test]
     fn a_worker_of_an_earlier_launch_is_refused_and_the_relaunch_completes() {
-        let shared = WorkerRegistry::bind(false).unwrap();
+        let shared = ExecutorRegistry::bind(false).unwrap();
         let registry = || lock(&shared).unwrap();
         let address = registry().address(None).unwrap();
 
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_worker_of_another_build_fails_the_wait_by_name() {
-        let shared = WorkerRegistry::bind(true).unwrap();
+        let shared = ExecutorRegistry::bind(true).unwrap();
         let registry = || lock(&shared).unwrap();
 
         // Another build of the same package version.
@@ -427,7 +427,7 @@ mod tests {
             .expect("a rank of another build fails the launch")
             .to_string();
         assert!(
-            error.contains("rank 0 of worker text")
+            error.contains("rank 0 of executor text")
                 && error.contains(&other)
                 && error.contains(VERSION),
             "{error}"
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn a_worker_outside_the_group_and_a_worker_registered_twice_fail_the_launch() {
-        let shared = WorkerRegistry::bind(false).unwrap();
+        let shared = ExecutorRegistry::bind(false).unwrap();
         let registry = || lock(&shared).unwrap();
         let address = registry().address(None).unwrap();
 
@@ -462,13 +462,13 @@ mod tests {
     /// is not a registration, do not keep a launch from completing.
     #[test]
     fn a_launch_completes_beside_connections_that_never_register() {
-        let shared = WorkerRegistry::bind(false).unwrap();
+        let shared = ExecutorRegistry::bind(false).unwrap();
         let registry = || lock(&shared).unwrap();
         let address = registry().address(None).unwrap();
 
         let _silent = Channel::connect(&address).unwrap();
         let mut stray = Channel::connect(&address).unwrap();
-        stray.send(&ipc::WorkerRequest::info()).unwrap();
+        stray.send(&ipc::MainProcessRequest::info()).unwrap();
 
         let generation = registry().begin_launch("text");
         let _rank = register(&address, "text", 0, generation, VERSION);
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn a_worker_that_dies_before_registering_fails_the_launch() {
-        let shared = WorkerRegistry::bind(false).unwrap();
+        let shared = ExecutorRegistry::bind(false).unwrap();
         let registry = || lock(&shared).unwrap();
 
         registry().begin_launch("text");
