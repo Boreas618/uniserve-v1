@@ -1552,6 +1552,12 @@ mod tests {
             carried[0].1.kernels, 1,
             "the very operator the epoch's record names, not an empty set"
         );
+        assert_eq!(
+            carried[0].1.revisions,
+            vec![("rms_norm".to_owned(), 1)],
+            "the revision the epoch installed, not the zero a program carries before a \
+             Program Server selects one: a name at revision zero is one the store never built"
+        );
         assert_eq!(carried[0].1.policy, "fcfs");
 
         // A daemon that executes no epoch has nothing to hand over, and says so
