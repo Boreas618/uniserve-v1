@@ -640,9 +640,22 @@ pub struct Step {
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
-    /// `[frames, channels, height, width]` decoded frames.
+    /// `[channels, frames, height, width]` decoded frames, channels on the leading axis.
+    ///
+    /// The decoder writes this through the view it is handed, so the axis order is a
+    /// contract between the executor's allocation and every decoder's write: a reader
+    /// who takes it for `[frames, channels, height, width]` addresses a correct buffer
+    /// at the wrong stride and nothing refuses it. `VideoDecoder::decode` states the
+    /// same order in its own refusal, and the two are one statement.
+    ///
+    /// A file's frames-major order is the writer's conversion, not the decoder's.
     pub video: Option<TensorView>,
-    /// `[samples]` decoded audio.
+    /// `[channels, samples]` decoded audio, channels on the leading axis.
+    ///
+    /// The deployment's soundtrack is stereo, so a `[samples]` view is one channel of a
+    /// two-channel decode and nothing refuses it. The same rule as `video`: the decoder
+    /// writes through this view, so the axis order belongs to the executor's allocation
+    /// and the decoder's write, and `output.rs` states it channel-major in its own words.
     pub audio: Option<TensorView>,
 }
 
