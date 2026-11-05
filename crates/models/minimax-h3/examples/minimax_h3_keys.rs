@@ -366,18 +366,26 @@ fn main() {
     // length is refused by name at its first row program - which is the honest behaviour, and is
     // visible here rather than in a ladder nobody can bound.
     let audio = &config.audio_vae;
-    let samples: Vec<u32> = clip_frames
+    // A decode starts from a track's **latent frames** and the encoder's residual units are sized in
+    // **samples**: the two operators take the same clip in different units, and passing one where the
+    // other is meant was a whole ladder of wrong widths (the tallest 1.4e9 instead of 1,365,600).
+    let latents: Vec<u32> = clip_frames
         .iter()
-        .map(|frames| {
-            let latent = minimax_h3::packing::audio_latent_frames(*frames);
-            match u32::try_from(minimax_h3::audio_vae::track_samples(audio, latent)) {
+        .map(|frames| minimax_h3::packing::audio_latent_frames(*frames))
+        .collect();
+    let samples: Vec<u32> = latents
+        .iter()
+        .map(
+            |latent| match u32::try_from(minimax_h3::audio_vae::track_samples(audio, *latent)) {
                 Ok(samples) => samples,
-                Err(_) => panic!("a track of {frames} frames is longer than a u32 sample count"),
-            }
-        })
+                Err(_) => {
+                    panic!("a track of {latent} latent frames is longer than a u32 sample count")
+                }
+            },
+        )
         .collect();
     if !clip_frames.is_empty() {
-        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &samples) {
+        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &latents) {
             Ok(rows) => lines.extend(rows),
             Err(error) => panic!("the audio decoder states no programs: {error}"),
         }
