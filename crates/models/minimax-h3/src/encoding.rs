@@ -2821,9 +2821,12 @@ mod tests {
         let first = conditioning_arena(&config, frames, vertical).expect("the vertical condition");
         let second = conditioning_arena(&config, frames, wide).expect("the wide condition");
         let names: Vec<&str> = first.iter().map(|buffer| buffer.name.as_str()).collect();
+        // One tile per run, not one per tile: the pass tiles the condition itself, so the plan is one
+        // plan whatever grid the frame turns out to have. `posterior` is the sampler's buffer, between
+        // the sample it draws from and the clean latent the tile reads.
         assert_eq!(
             names,
-            ["tile", "stitch", "moments", "sample", "clean", "anchored"]
+            ["tile", "stitch", "moments", "sample", "posterior", "clean", "anchored"]
         );
         assert_eq!(
             second
@@ -2871,7 +2874,9 @@ mod tests {
             width: 48,
         };
         let plan = conditioning_arena(&config, 1, still).expect("a still's plan");
-        assert_eq!(plan.len(), 6);
+        // The six buffers the pass fills in order — tile, stitch, moments, sample, clean, anchored —
+        // and the posterior sampler's own, which carries the latent it draws before the tile converts it.
+        assert_eq!(plan.len(), 7);
         let stack = Stack::of(&config).expect("the stack");
         let canvas = crate::video_vae::Canvas::clip(&config, still.height, still.width);
         let grid = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");
