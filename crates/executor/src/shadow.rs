@@ -439,6 +439,46 @@ pub fn scratch_slot_mapping(
     Ok(mapping)
 }
 
+/// The scratch slot column a paired forward is given, over the **bucket's** token extent.
+///
+/// A captured graph addresses the whole column, so the mapping must state a value for every token
+/// of the bucket and not only for the batch's own: a token the batch does not hold names no page
+/// (`-1`), because a value left over from an earlier batch would send the paired forward's writes
+/// into a page a served request reads — the one thing the scratch numbering exists to prevent
+/// (7.3). `query_offsets` is the staged column, whose last entry is the batch's live count; the
+/// positions and slots are sliced to that count so the three describe one batch.
+pub fn scratch_column(
+    positions: &[i32],
+    query_offsets: &[i32],
+    slots: &[i32],
+    live: usize,
+    tokens: usize,
+    pages: u32,
+    page_size: u32,
+) -> Result<Vec<i32>> {
+    if live > positions.len() || live > slots.len() || tokens < live {
+        return Err(Error::Invariant(format!(
+            "a batch of {live} live token(s) in a bucket of {tokens} names {} position(s) and {} \
+             slot(s)",
+            positions.len(),
+            slots.len()
+        )));
+    }
+    let mut mapping = if live == 0 {
+        vec![-1_i32; tokens]
+    } else {
+        scratch_slot_mapping(
+            &positions[..live],
+            query_offsets,
+            &slots[..live],
+            pages,
+            page_size,
+        )?
+    };
+    mapping.resize(tokens, -1);
+    Ok(mapping)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +544,29 @@ mod tests {
         let error = scratch_slot_mapping(&[9], &[0, 1], &[7], 1, 4)
             .expect_err("position 9 needs page 2 of a one-page set");
         assert!(error.to_string().contains("page 2"), "{error}");
+    }
+
+    /// A bucket wider than the batch names no page for the tokens the batch does not hold: the
+    /// column a captured graph addresses is the bucket's, and a leftover slot there would write
+    /// into a page a served request reads (7.3).
+    #[test]
+    fn a_partial_buckets_scratch_tail_names_no_page() {
+        let mapping = scratch_column(&[0, 0, 1], &[0, 3], &[10, 11, 12], 3, 8, 2, 4)
+            .expect("three tokens of an eight-token bucket");
+        assert_eq!(mapping.len(), 8);
+        assert_eq!(&mapping[..3], &[0, 1, 2], "the batch's own tokens keep their pages");
+        assert!(
+            mapping[3..].iter().all(|slot| *slot < 0),
+            "the bucket's tail names no page: {mapping:?}"
+        );
+
+        // A batch that holds nothing writes nothing, whatever the bucket's width.
+        let empty = scratch_column(&[], &[0], &[], 0, 4, 2, 4).expect("an empty batch");
+        assert_eq!(empty, vec![-1; 4]);
+
+        let error = scratch_column(&[0], &[0, 1], &[7], 1, 2, 1, 4)
+            .expect_err("a batch of one live token cannot name a bucket of none");
+        assert!(error.to_string().contains("bucket of"), "{error}");
     }
 
     /// A NaN has no distance to anything, so the comparison treats two NaNs as agreeing and a NaN

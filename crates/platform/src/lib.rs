@@ -83,6 +83,20 @@ pub use graph::{
 pub use launch::{
     Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig, ParamInfo,
 };
+/// A 64-bit FNV-1a digest of `bytes`.
+///
+/// It costs nothing, needs no table and is stable across processes and across the two halves of a
+/// comparison - a served run's dump and a slice's run digest the same bytes to the same number, which
+/// is what makes one quotable beside the other.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
