@@ -19,10 +19,13 @@
 //!
 //! ## Checkpoint prefix
 //!
-//! Released checkpoints store the stack under `model.layers.<i>…`; some serialize it without the
-//! `model.` prefix. The loader resolves a name once with that fallback
-//! (`uniserve/models/qwen3/weights.py`, `checkpoint_mappings`), so this table always gives the
-//! canonical `model.`-prefixed name.
+//! Released checkpoints store the stack under `model.layers.<i>…`, and every name in this table is
+//! that canonical form. [`WeightLoader`] matches a checkpoint tensor's name **exactly** - the load
+//! path has no `model.`-prefix fallback - so a checkpoint serialized without the prefix is refused
+//! by the name it lacks rather than silently bound to a different tensor. The audit
+//! (`examples/audit_checkpoint.rs`) strips the prefix itself, only to report how many names the
+//! prefix accounts for, and `declared_not_consumed` does the same to recognise the two calibrated
+//! cache scales under either form; neither is the load.
 
 use crate::Config;
 

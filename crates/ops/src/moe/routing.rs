@@ -9,7 +9,7 @@
 //! One warp routes one token: it takes the row's maximum, sums `expf(score − max)` over the warp by
 //! xor butterflies, keeps the `top` largest probabilities in descending order with equal ones in
 //! ascending expert order, and divides them by their sum clamped below by `FLT_EPSILON` when
-//! [`Descriptor::renormalize`] holds; an optional per-expert scale multiplies the result in FP32.
+//! `Descriptor::renormalize` holds; an optional per-expert scale multiplies the result in FP32.
 //! The arithmetic and its order are those of the existing CUDA kernel
 //! (`uniserve_kernels/src/uniserve_kernels/csrc/topk_softmax.cu:52-197`), which in turn reproduces
 //! PyTorch's warp softmax and row-sum composition.
