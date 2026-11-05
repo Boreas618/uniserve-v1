@@ -2082,10 +2082,25 @@ impl Replica {
                 }
             }
             spec.predecessor = None;
-            *locked(&replica.served) = Some(spec);
+            let before = locked(&replica.served).replace(spec);
+            // The previous client stays until the switch settles: it is what keeps the previous
+            // epoch's process, which the switch drains next and serves again on a revert.
+            let previous = replica.hold.client();
             replica.hold.serve(Arc::clone(&client));
             tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
             info!(engine, epoch, "the switch's target serves this replica");
+            while !updates.settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let committed = updates
+                .epochs()
+                .serving()
+                .is_some_and(|(serving, _)| serving == epoch);
+            if !committed && let Some(previous) = previous {
+                *locked(&replica.served) = before;
+                replica.hold.serve(previous);
+                warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+            }
         });
     }
 
