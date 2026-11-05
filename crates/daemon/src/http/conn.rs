@@ -494,6 +494,7 @@ impl Connection {
         body: &mut RequestBody,
     ) -> anyhow::Result<Outcome> {
         let head_only = body.head_request;
+        let frames_before = self.frames;
         let mut handed = response
             .extensions()
             .get::<HandedBody>()
@@ -560,6 +561,7 @@ impl Connection {
             self.write_head(&parts, chunked, content_length, closing)
                 .await?;
         }
+        let handed_is_some = handed.is_some();
         if !head_only && !status_without_body(parts.status) {
             let complete = match handed {
                 Some(handed) => match self
@@ -580,6 +582,22 @@ impl Connection {
             if chunked {
                 self.write(b"0\r\n\r\n", None).await?;
             }
+        }
+        // A success with no body byte is never a success the client asked for:
+        // a client reading it has an empty document where an answer belongs.
+        // The heads that could still be replaced are already answered by the
+        // failure above; this names the one that could not be, so the run that
+        // reads an empty body says which response produced it (design §7.4).
+        if self.frames == frames_before
+            && parts.status.is_success()
+            && !status_without_body(parts.status)
+            && !head_only
+        {
+            warn!(
+                status = parts.status.as_u16(),
+                handed = handed_is_some,
+                "a response answered success and wrote no byte of body"
+            );
         }
         if closing {
             return Ok(Outcome::Close);
