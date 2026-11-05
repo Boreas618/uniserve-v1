@@ -1898,12 +1898,12 @@ impl SimEngine {
                     // executor does.
                     let mut media = synthetic_png_b64(width, height)?.into_bytes();
                     if call.image_output.is_some() {
-                        let seed = request
-                            .image()
-                            .and_then(|image| image.seed)
-                            .unwrap_or(call.request_key.request_id.0);
-                        let values =
-                            synthetic_feedback_values(seed, request.image_index, height, width);
+                        let values = synthetic_feedback_values(
+                            call.request_key.request_id,
+                            request.image_index,
+                            height,
+                            width,
+                        );
                         ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
                     }
                     record.media_output = Some(publish_media("uniserve-image-", &media)?);
@@ -2237,12 +2237,14 @@ impl SimEngine {
 /// The values of the decoded image product of request `request_id`'s image
 /// `image_index`: BF16 bytes `[3, height, width]` the simulator derives from
 /// the two, so an image restarted from noise decodes to the same values.
-/// The values a generated image's feedback product carries, derived from the
-/// seed the request draws its latent with: one seed yields one image, and the
-/// same seed in another request yields the same one.
-fn synthetic_feedback_values(seed: u64, image_index: u32, height: u32, width: u32) -> Vec<u8> {
+fn synthetic_feedback_values(
+    request_id: RequestId,
+    image_index: u32,
+    height: u32,
+    width: u32,
+) -> Vec<u8> {
     let bytes = ipc::ImagePixels::value_bytes(height, width) as usize;
-    let mut state = (seed << 32) ^ u64::from(image_index) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut state = (request_id.0 << 32) ^ u64::from(image_index) ^ 0x9e37_79b9_7f4a_7c15;
     (0..bytes)
         .map(|_| {
             state = state
@@ -2336,11 +2338,12 @@ fn context_writes(
                 } else {
                     DEFAULT_IMAGE_HW
                 };
-                let seed = request
-                    .image()
-                    .and_then(|image| image.seed)
-                    .unwrap_or(call.request_key.request_id.0);
-                let values = synthetic_feedback_values(seed, request.image_index, height, width);
+                let values = synthetic_feedback_values(
+                    call.request_key.request_id,
+                    request.image_index,
+                    height,
+                    width,
+                );
                 request
                     .provenance
                     .insert(output.clone(), (digest(&values), None));
