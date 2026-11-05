@@ -8,6 +8,14 @@
 //!
 //! Its model-declared tables are the one thing it holds that a language model does not: `state`,
 //! allocated when the runner loads and viewed at every capture (`runners::tables`).
+//!
+//! **It keeps no cache and therefore no state group.** The state group of §8 is what a recurrent
+//! model must checkpoint at a boundary it declares, and an encoder computes its hidden states from
+//! the rows it was handed and carries nothing across batches: so this runner takes no snapshot,
+//! constructs no `Snapshot`, and has no boundary to name. A model that does keep state - a recurrent
+//! or hybrid one - states the boundary itself and its runner snapshots there; this is the statement
+//! that this class is not that one, written down so a runner that never checkpoints is not mistaken
+//! for one that silently forgot to.
 
 use std::sync::{Arc, Mutex};
 
