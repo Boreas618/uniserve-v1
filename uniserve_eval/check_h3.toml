@@ -52,6 +52,12 @@
 #   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3
 #   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3 \
 #     --reuse-deployment
+#
+# and then, on the delivered service, the same six points reversed:
+#
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3-reversed
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3-reversed \
+#     --reuse-deployment
 root = ".."
 artifact_root = "artifacts/minimax_h3/check/results"
 
@@ -309,5 +315,214 @@ videos_per_second = "higher"
 checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
 task = "ref2va"
 
+# The six cells in two orders. `check-h3` is the order today's implementation is measured in: the
+# reference cell first, because that implementation shares one Storage Server key between the two base
+# servers on one checkpoint and a weight its loader computes has no file, so whichever of them runs
+# second inherits the first's pages. That ordering is how the baseline is measured, not a property the
+# delivered service is allowed to need.
+#
+# `check-h3-reversed` is the same six points with the reference cell last, and it is the candidate's
+# obligation: the delivered service must pass every cell in any order, on retained weights. A run of
+# `check-h3` alone says the baseline still measures what it measured; a run of `check-h3-reversed` that
+# passes says the ordering requirement is gone.
+[benchmarks.check-base-ref2va-reversed]
+server = "base-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-ref2va-reversed.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/base-ref2va"
+
+[benchmarks.check-base-ref2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-base-ref2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-ref2va-reversed.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "ref2va"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-t2va"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-t2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "t2va"
+
+[benchmarks.check-base-t2va-reversed]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-t2va-reversed.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check-reversed/base-t2va"
+
+[benchmarks.check-base-t2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-base-t2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-t2va-reversed.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "t2va"
+
+# ------------------------------------------------------------------- fl2va cells
+# W3's seed-0 row: the official first keyframe and prompt on an automatic
+# canvas, 8 seconds.
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-fl2va"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-fl2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "fl2va"
+
+[benchmarks.check-base-fl2va-reversed]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-fl2va-reversed.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/base-fl2va"
+
+[benchmarks.check-base-fl2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-base-fl2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-fl2va-reversed.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "fl2va"
+
+# ------------------------------------------------------------------- ref2va cells
+# W4's seed-0 row: a reference image and the official reference voice on an
+# automatic canvas, 5 seconds.
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed]
+server = "fasth3-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check-reversed/fasth3-omniref-ref2va"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-omniref-ref2va-reversed.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+task = "ref2va"
+
+# The six cells in two orders. `check-h3` is the order today's implementation is measured in: the
+# reference cell first, because that implementation shares one Storage Server key between the two base
+# servers on one checkpoint and a weight its loader computes has no file, so whichever of them runs
+# second inherits the first's pages. That ordering is how the baseline is measured, not a property the
+# delivered service is allowed to need.
+#
+# `check-h3-reversed` is the same six points with the reference cell last, and it is the candidate's
+# obligation: the delivered service must pass every cell in any order, on retained weights. A run of
+# `check-h3` alone says the baseline still measures what it measured; a run of `check-h3-reversed` that
+# passes says the ordering requirement is gone.
 [suites.check-h3]
 points = ["check-base-ref2va", "check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va"]
+
+[suites.check-h3-reversed]
+points = ["check-fasth3-dmd-t2va-reversed", "check-fasth3-dmd-fl2va-reversed", "check-fasth3-omniref-ref2va-reversed", "check-base-t2va-reversed", "check-base-fl2va-reversed", "check-base-ref2va-reversed"]
