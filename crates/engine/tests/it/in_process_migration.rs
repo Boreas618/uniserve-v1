@@ -7,6 +7,12 @@
 //! submitted with the tokens it generated finishes with the reference's
 //! sequence. Here the loss is the simulated executor's own, so the same two
 //! statements hold without a process to kill.
+//!
+//! The continuation is submitted by the case, as the launched case also
+//! submits it: the engine's half is that the lost request leaves as migratable
+//! carrying what it generated, and resuming it is the caller's act. A case
+//! that asserted the engine re-submits the request would be claiming a
+//! behaviour neither path has.
 
 use std::thread;
 use std::time::{Duration, Instant};
