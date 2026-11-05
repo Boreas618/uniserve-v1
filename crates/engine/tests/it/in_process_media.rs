@@ -148,6 +148,19 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
         .expect("the text deployment serves");
     install(&engine, &pool);
 
+    // Text is served **before** any rejection, so the rejection cannot be what
+    // leaves the deployment able to serve: the state this case ends in is not
+    // a state it was already in.
+    let mut before = engine
+        .submit(text_request(0, 8))
+        .expect("the first text request is accepted");
+    let (served_before, ended_before) = support::wait_for_tokens(&mut before, 1, ANSWER);
+    assert!(
+        !served_before.is_empty(),
+        "the deployment serves text before any rejection: no token arrived, and the request \
+         ended as {ended_before:?}"
+    );
+
     let mut rejections = Vec::new();
     for index in 0..2 {
         let mut events = engine
@@ -184,68 +197,4 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
 
     engine.shutdown();
     assert!(!engine.is_dead(), "media rejection killed the engine");
-}
-
-/// The same deployment serves text **before** any rejection: the probe that
-/// separates a rejection state which outlives the request from a construct
-/// that never serves text at all.
-///
-/// If this case passes while `unsupported_media_is_rejected_without_stopping_the_engine`
-/// fails, the engine serves and the rejection is what blocks the later
-/// request. If both fail, the construct starves and rejections are innocent.
-///
-/// **This is a probe with a disposal instruction, not a permanent case.** When
-/// it answers: if text is served, fold it into
-/// `unsupported_media_is_rejected_without_stopping_the_engine` and delete it —
-/// the behaviour it states is that case's. If text is refused, it stays: an
-/// admission that closes behind a rejection is a behaviour worth naming.
-#[test]
-fn text_is_served_before_any_rejection() {
-    let pool = Arc::new(Serving::new(vec![support::pool("model")]));
-    // The differential against the failing media case: this one leaves
-    // `max_batch` at the configuration's own value, as the green
-    // `in_process_completion` case does. A probe that serves here and not
-    // there names the batching bound as the divergence.
-    let config = support::config(&pool, "in-process-media-first");
-    let engine = SchedulerHandle::over_batches(config, pool.clone() as Arc<dyn Batches>)
-        .expect("the text deployment serves");
-    install(&engine, &pool);
-
-    let mut served = engine
-        .submit(text_request(1, 8))
-        .expect("the text request is accepted");
-    // A token, not a terminal event: this is completion's wait, so a failure
-    // here means nothing was served, while a failure of the media case alone
-    // means it waited for the wrong event.
-    // A token, not a terminal event: this is completion's wait, so a failure
-    // here means nothing was served. The wait itself is shared, because the
-    // engine publishes generated tokens as `TextTokens` and a case that
-    // matched only `TextToken` read a served deployment as a starved one.
-    let (served_tokens, ended) = support::wait_for_tokens(&mut served, 1, ANSWER);
-    assert!(
-        !served_tokens.is_empty(),
-        "the deployment serves text before any rejection: no token arrived, and the request \
-         ended as {ended:?} — a terminal event here names the refusal the text request itself met"
-    );
-
-    // A second text request separates a state the first request poisoned from
-    // an admission that closed: if this one is refused too, nothing is being
-    // admitted any more; if it serves, the first request's path is what fails.
-    let mut second = engine
-        .submit(text_request(2, 8))
-        .expect("the second text request is accepted");
-    let deadline = Instant::now() + ANSWER;
-    let mut terminal = None;
-    while Instant::now() < deadline && terminal.is_none() {
-        match second.try_recv() {
-            Ok(event) if event.is_terminal() => terminal = Some(event),
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    assert!(
-        matches!(terminal, Some(Event::Finished { .. })),
-        "a second text request is served: admission is open and the first request did not poison the engine: {terminal:?}"
-    );
-    engine.shutdown();
 }
