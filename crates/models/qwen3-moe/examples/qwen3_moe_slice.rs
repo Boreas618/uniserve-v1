@@ -3795,7 +3795,14 @@ fn print_kv_digests(
             }
             digests.push_str(&format!(" {name}={:016x}", platform::fnv1a(&raw)));
         }
-        println!("kv layer{layer}:{digests}");
+        // The address each plane starts at: two layers whose planes share one address are one plane,
+        // and a digest that agrees across layers then says nothing about the arithmetic. Printing it
+        // is what tells "the same number" from "the same bytes".
+        println!(
+            "kv layer{layer}:{digests} at k=0x{:x} v=0x{:x}",
+            plane.key.ptr.address(),
+            plane.value.ptr.address()
+        );
     }
     stream.synchronize()?;
     Ok(())
