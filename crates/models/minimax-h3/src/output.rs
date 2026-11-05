@@ -370,6 +370,15 @@ pub(crate) fn fade_weight(frame: u32, count: u32) -> f32 {
 }
 
 impl nn::capability::Decoder for VideoPostprocessor {
+    /// The type the raster it blends is stated in, which is the decoder's own.
+    ///
+    /// It is `new`'s argument rather than a constant: the block holds no weights beyond two `[3]`
+    /// de-normalization constants, and what it blends is a raster the video decoder wrote in that
+    /// decoder's element type.
+    fn element_type(&self) -> nn::DType {
+        self.dtype
+    }
+
     /// No tables: the splice's parameters are its arguments, not state.
     ///
     /// The preprocessor holds two `[3]` constants the load reads once, and every other number a splice
