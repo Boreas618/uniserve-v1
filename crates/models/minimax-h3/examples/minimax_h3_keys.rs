@@ -351,28 +351,25 @@ fn main() {
                     .next()
                     .and_then(|rate| rate.trim().parse::<f64>().ok())
                     .unwrap_or_else(|| panic!("--sparse's sparsity is a fraction: {stated}"));
-                // **The third field has two meanings and this flag has one spelling.** The
-                // recorder takes `tile,sparsity[,reference_keep]`; the re-cut tool's value is
-                // `tile,sparsity,max_tiles`. A fraction is a keep rate (the attention's own
-                // parameter); a whole number is the tile bound the deployment states, which the
-                // layout derives and which no attention kind takes. Reading one as the other
-                // refused `64,0.9,8192` with `keep rate must lie in (0, 1], got 8192`.
+                // **One string, one grammar.** The recorder takes `tile,sparsity[,reference_keep]`
+                // and refuses a third field that is not a fraction; a walk that read a whole
+                // number there as a tile count accepted a string the recorder rejects, so the two
+                // halves of one deployment disagreed about which strings are legal. The accepting
+                // side refuses now: a keep rate is a fraction in (0, 1], and the tile bound is the
+                // deployment's own - the layout derives it, so no argument states it.
                 let keep = match fields.next() {
                     None => None,
-                    Some(field) => {
-                        let field = field.trim();
-                        match field.parse::<f64>() {
-                            Ok(rate) if rate > 0.0 && rate <= 1.0 => Some(rate),
-                            Ok(tiles) if tiles >= 2.0 && tiles.fract() == 0.0 => {
-                                // The tile bound: the deployment's own, derived by the layout.
-                                let _ = tiles;
-                                None
-                            }
-                            _ => panic!(
-                                "--sparse's third field is a keep rate in (0, 1] or a tile \
-                                 count: {stated}"
-                            ),
+                    Some(rate) => {
+                        let rate = rate.trim().parse::<f64>().unwrap_or_else(|_| {
+                            panic!("--sparse's reference keep rate is a fraction: {stated}")
+                        });
+                        if !(rate > 0.0 && rate <= 1.0) {
+                            panic!(
+                                "--sparse's reference keep rate must lie in (0, 1], got {rate} - \
+                                 the tile bound is the deployment's own and is not an argument"
+                            );
                         }
+                        Some(rate)
                     }
                 };
                 sparse = true;
