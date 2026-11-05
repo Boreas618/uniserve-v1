@@ -2,7 +2,7 @@
 //!
 //! During a program-layer update, the new kernel of an operator runs beside the old one on the same
 //! inputs: the old kernel writes the real outputs, the new one writes twins of them, and the two are
-//! compared within the operator's [`Tolerance`](crate::Tolerance) (specs/worker.md 7.3). Because the
+//! compared within the operator's [`Tolerance`] (specs/worker.md 7.3). Because the
 //! new kernel's result is never fed on, the difference of one operator does not accumulate through
 //! the rest of the forward.
 //!
