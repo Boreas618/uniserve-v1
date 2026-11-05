@@ -260,14 +260,21 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's
-    // - and the instance a switchover adopts is the trial's candidate. So the
-    // serving instance's life is one instantiation, one evaluation, and one
-    // `observe` and `dispatch` per step it has taken since: stated as a relation
-    // between the counts, a step this world takes on its own does not change it.
+    // - and a trial leaves the program as it found it, so the candidate a
+    // switchover adopts is a second instance of the same module. The trial's
+    // calls are the epoch's policy's and count (§7.3), from the instance that
+    // made them, while the serving instance starts its own life: two
+    // instantiations, two `limits`, and one `observe` and `dispatch` per step
+    // the serving instance has taken. Stated as a relation between the counts, a
+    // step this world takes on its own does not change it.
     install(&handle, &serving);
     let installed = reached(&handle, 0);
     let usage = installed.usage.expect("the policy has served");
-    assert_eq!(usage.decisions.calls(Call::Init), 1, "one instantiation");
+    assert_eq!(
+        usage.decisions.calls(Call::Init),
+        2,
+        "the trial's instance and the serving one"
+    );
     assert_eq!(
         usage.decisions.calls(Call::Observe),
         installed.step,
@@ -280,8 +287,8 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     );
     assert_eq!(
         usage.decisions.calls(Call::Limits),
-        1,
-        "the limits are declared once in an instance's life"
+        2,
+        "the limits are declared once in each instance's life"
     );
 
     // Requests make the world step: the real program admits them, the pool

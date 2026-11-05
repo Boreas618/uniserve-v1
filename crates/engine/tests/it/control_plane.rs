@@ -2238,6 +2238,78 @@ fn logprobs_flow_to_events() {
     );
 }
 
+/// The first token's reported distribution: the engine reports the model's
+/// most likely candidates with the model's log probabilities, and a nucleus
+/// cutoff changes which of them may be *sampled*, not which are *reported*.
+///
+/// The launched case states this with the stub model, whose successor holds
+/// nearly all mass; here the sample distribution is the simulator's, and the
+/// property under test is the same: the reported candidates and their
+/// log probabilities do not depend on the nucleus.
+#[test]
+fn logprobs_report_the_model_distribution_under_a_cutoff() {
+    let candidates = |top_p: f32| {
+        let sampling = SamplingParams {
+            n_logprobs: 5,
+            top_p,
+            ..Default::default()
+        };
+        first_token_logprobs(sampling)
+    };
+    let cut = candidates(0.5);
+    let whole = candidates(1.0);
+    assert_eq!(cut.len(), 5, "five candidates are reported: {cut:?}");
+    assert!(
+        cut.iter().all(|(_, logprob)| logprob.is_finite()),
+        "every reported log probability is finite: {cut:?}"
+    );
+    assert_eq!(
+        cut, whole,
+        "a nucleus cutoff changes what may be sampled, not what is reported"
+    );
+}
+
+/// One request's first token's reported candidates, in the order reported.
+fn first_token_logprobs(sampling: SamplingParams) -> Vec<(u32, f32)> {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(8);
+    let executor = Box::new(SimExecutor::new(sim));
+    let sched = support::scheduler(executor, special_tokens(), 32).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let req = generation_request(
+        RequestId(1),
+        text_input(vec![1, 2, 3]),
+        sampling,
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        4,
+    );
+    let mut erx = handle.submit(req).unwrap();
+    let mut reported = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reported.is_none() && Instant::now() < deadline {
+        match erx.try_recv() {
+            Ok(Event::TokenLogprobs { candidates, .. }) => {
+                reported = Some(
+                    candidates
+                        .into_iter()
+                        .map(|candidate| (candidate.token_id, candidate.logprob))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Ok(Event::Finished { .. }) => break,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+    reported.expect("the request reports its first token's candidates")
+}
+
 #[test]
 fn allowed_tokens_restricts_output() {
     let sp = SamplingParams {
@@ -4019,4 +4091,53 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
 
     handle.shutdown();
     let _ = jh.join();
+}
+
+/// An engine whose only worker group is lost, with nothing to replace it,
+/// stops admitting work: its scheduler thread ends, and a submission after
+/// that is refused rather than queued for workers that will never exist.
+///
+/// The launched-path case this states kills a rank process and makes its
+/// relaunch fail at the OS boundary. The loss here is the same event told to
+/// the simulator, and the assertion is the engine's, not the process's.
+#[test]
+fn losing_every_worker_stops_request_admission() {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().supported_calls = vec![
+        CallKind::Forward(ForwardMode::Prefill),
+        CallKind::Forward(ForwardMode::Decode),
+    ];
+    let mut executor = SimExecutor::new(sim);
+    let loss = executor.loss();
+    let scheduler = support::scheduler(Box::new(executor), special_tokens(), 32)
+        .expect("the scheduler is built over the simulated executor");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let commands = CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    // The deployment's only group is lost, and nothing can replace it.
+    loss.lose(
+        WorkerGroupId("sim".to_owned()),
+        "the simulated launch could not be replaced",
+    );
+
+    let died = scheduler_thread.join().expect("the scheduler thread ends");
+    assert!(
+        died,
+        "an engine without execution workers kept accepting work"
+    );
+    // A stopped engine refuses submissions instead of queueing them.
+    assert!(
+        commands
+            .submit(generation_request(
+                RequestId(2),
+                text_input(vec![7; 8]),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                4,
+            ))
+            .is_err(),
+        "a stopped engine accepted another submission"
+    );
 }
