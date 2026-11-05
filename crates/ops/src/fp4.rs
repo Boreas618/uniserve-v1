@@ -421,14 +421,21 @@ impl Op for Nvfp4Gemm {
         args.weight
             .require_shape(Self::NAME, Shape::new(&[n, u64::from(descriptor.k / 2)]))?;
         args.weight.require_row(Self::NAME, DType::U8, k)?;
+        // An E4M3 block scale, not a byte of packed values: the scale table is its own element
+        // type and the packed weight is the only U8 operand of this product.
         args.input_scales
-            .require_row(Self::NAME, DType::U8, args.input_scales.shape.last())?;
+            .require_row(Self::NAME, DType::F8E4M3, args.input_scales.shape.last())?;
         args.input_scales.require_shape(
             Self::NAME,
             descriptor.layout.shape(m, u64::from(descriptor.k)),
         )?;
-        args.weight_scales
-            .require_row(Self::NAME, DType::U8, args.weight_scales.shape.last())?;
+        // An E4M3 block scale, not a byte of packed values: the scale table is its own element
+        // type and the packed weight is the only U8 operand of this product.
+        args.weight_scales.require_row(
+            Self::NAME,
+            DType::F8E4M3,
+            args.weight_scales.shape.last(),
+        )?;
         args.weight_scales.require_shape(
             Self::NAME,
             ScaleLayout::Swizzled128X4.shape(n, u64::from(descriptor.k)),
