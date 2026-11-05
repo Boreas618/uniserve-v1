@@ -267,7 +267,6 @@ pub fn video_arena(
     // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
     // because a tile at the canvas's edge can be narrower than the tile size.
     let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
     // **The transformer's fourteen buffers are one tile's, not the grid's sum.** The decoder's canvas is
     // one tile (`VideoDecoder`) and `TileScratch` is reserved once per clip and reused by every tile, so
     // sizing them by the sum reserved the grid's worth of buffers for a decode that holds one tile's -
