@@ -1537,6 +1537,44 @@ impl<'a, 'b> Binder<'a, 'b> {
 #[cfg(test)]
 pub(crate) mod tests {
 
+    /// The audio decoder's names are the checkpoint's, tensor for tensor.
+    ///
+    /// A mapping that invents one name and drops another still asks the same count, so a count is not
+    /// the check - the set is. This is the decoder half of the same export the encoder's fixture
+    /// records: 912 `decoder.*` tensors and the 2 of `dec_in_proj.*`. It is what caught the input
+    /// projection being asked as a weight-normalized pair, one name each way, and the same class the
+    /// normalized-pair test above cannot see: that test reads the crate's own list.
+    #[test]
+    fn the_audio_decoders_names_are_the_checkpoints() {
+        let config = audio_config();
+        let mut ours = AudioDecoder::keys(&config).expect("the decoder's keys");
+        ours.sort_unstable();
+        let fixture: Vec<&str> = include_str!("../tests/data/audio-decoder-names.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture.len(), 914, "the recorded export's decoder half");
+        let missing: Vec<&str> = fixture
+            .iter()
+            .copied()
+            .filter(|name| !ours.iter().any(|ours| ours == name))
+            .collect();
+        let extra: Vec<&str> = ours
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !fixture.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the checkpoint has decoder names this crate does not ask for: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "this crate asks for decoder names the checkpoint does not have: {extra:?}"
+        );
+    }
+
     #[test]
     fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
         let config = audio_config();
