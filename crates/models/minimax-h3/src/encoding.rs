@@ -1361,8 +1361,13 @@ impl VideoEncoder {
                             true,
                             padded,
                         ));
-                        // The block's residual add covers the whole level: `frames · extent · channels`.
-                        let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                        // The block's residual add, keyed on the **row width** and not on the element
+                        // count: the launch reshapes the level to `[frames · pixels, channels]` and
+                        // takes the descriptor's columns from the last dimension
+                        // (`nn/src/layers/residual.rs`'s `forward`, `target.shape.last()`). Stating
+                        // the element count here named 36 keys no launch asks for, at widths up to
+                        // 2.2e9, and a package cannot serve a key nothing launches.
+                        let columns = u64::from(*out);
                         if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
                             programs.launch::<ScaledAddOp>(&descriptor);
                         }
@@ -3390,13 +3395,18 @@ mod tests {
 
     #[test]
     fn the_audio_encoder_table_names_every_parameter() {
-        let table = audio_sources(&crate::audio_vae::tests::audio_config())
-            .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
-        // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
-        // the projection block with the mean convolution: twenty-one parameters, the fused
-        // query-key-value weight, and the three bias windows the checkpoint keeps as three tensors.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 21 + 1 + 3);
+        let config = crate::audio_vae::tests::audio_config();
+        let table = audio_sources(&config).expect("the encoder's parameters");
+        // Stated as the structure it is, because a literal is what went stale: the input pair; each
+        // stage's twenty-one, which is eighteen for the three residual units - two convolutions, two
+        // biases and two Snakes apiece - two for the widening convolution and one for the stage's
+        // Snake; the output Snake and its pair; and the projection block's twenty-one parameters with
+        // the three bias windows the checkpoint keeps as three tensors in place of one fused bias.
+        //
+        // The stage count comes from the configuration, so a checkpoint with a stage fewer keeps this
+        // assertion true instead of turning it red.
+        let stages = config.encoder_rates.len();
+        assert_eq!(table.len(), 2 + stages * 21 + 3 + 21 + 3);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
