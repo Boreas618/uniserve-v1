@@ -4754,6 +4754,7 @@ dependencies = [
  "libc",
  "libloading",
  "mimalloc",
+ "minimax-h3",
  "nn",
  "ops",
  "platform",
