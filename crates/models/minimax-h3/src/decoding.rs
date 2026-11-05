@@ -548,8 +548,25 @@ impl ClipDecoder {
         let first_column = u64::from(tile.latent_columns.0) * ratio;
         let plain = self.placement(decoded, tile, first_row, first_column, 0, 0)?;
         let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
-        self.unpatchify.forward(f, tokens, plain)?;
-        self.unpatchify.forward(f, tokens, view)?;
+        // The operator's declared input is the token **grid** - `frames x height x width` rows - while a
+        // tile's buffer carries the grid plus the decoder's register and tail rows, which the decode
+        // writes and this operator never reads. So the launch states the rows it reads: `ops`' own
+        // check wants that shape exactly (`Unpatchify::check`), and the layer admits spare rows only
+        // because a view past the grid is legal to hand it - not because it should be handed one.
+        let voxels = tile.canvas.voxels();
+        if tokens.shape.rank() != 2 || tokens.shape.dim(0) < voxels {
+            return Err(Error::config(format!(
+                "a tile's tokens are {:?}, short of the {voxels} rows its grid reads",
+                tokens.shape.dims()
+            )));
+        }
+        let grid = TensorView::new(
+            tokens.offset_elements(0),
+            tokens.dtype,
+            Shape::new(&[voxels, tokens.shape.dim(1)]),
+        );
+        self.unpatchify.forward(f, grid, plain)?;
+        self.unpatchify.forward(f, grid, view)?;
         // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
         // current tile's first `extent`. The predecessor's last positions are the seam itself, which
         // still holds the predecessor's pixels in the raster, so the neighbour's view starts one
