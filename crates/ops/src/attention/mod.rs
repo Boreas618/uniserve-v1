@@ -911,9 +911,6 @@ fn words(phase: Phase) -> Vec<PagedWord> {
         PagedWord::PageTable,
         PagedWord::SeqLens,
     ];
-    if phase == Phase::Prefill {
-        words.push(PagedWord::CumSeqLensQ);
-    }
     words.extend([
         PagedWord::QueryRow,
         PagedWord::QueryHead,
@@ -934,6 +931,11 @@ fn words(phase: Phase) -> Vec<PagedWord> {
         PagedWord::Scale,
     ]);
     if phase == Phase::Prefill {
+        // The packed-batch row index sits **after** the scale, which is where the programs place it
+        // (`triton/src/build.py`'s prefill signature: the strides, the three extents, the scale, then
+        // this pointer, the row bound and the pack flag). Word 8 decides the rest: a launch whose
+        // ninth word is a pointer where the program's is a stride is refused by name before it runs.
+        words.push(PagedWord::CumSeqLensQ);
         words.push(PagedWord::MaxQueryRow);
         words.push(PagedWord::Packed);
     }
@@ -978,7 +980,10 @@ impl PagedAttention {
                     .to_owned(),
             ));
         };
-        if args.window_left != 0 {
+        // `-1` is the encoding for "no window", which is what a program compiled without one
+        // needs; a window is set when the value is not negative. A check against zero refuses the
+        // no-window call, which is every causal deployment's.
+        if args.window_left >= 0 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
