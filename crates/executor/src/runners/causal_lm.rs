@@ -1700,7 +1700,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.columns.scratch_slots.extent(0..u64::from(bucket.tokens)),
         )?;
         let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
-        let forward = Forward::new(&stream, next, &arena).with_shadow(shadow);
+        // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
+        // the served one, so the comparison sees one count (7.3).
+        let forward = Forward::new(&stream, next, &arena)
+            .with_shadow(shadow)
+            .with_live_tokens(self.columns.live_tokens.device);
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -2027,7 +2031,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 false => ops::PhaseKind::Prefill,
             },
             page_size: self.geometry.page_size,
-            live_tokens: self.columns.live_tokens.device,
             num_tokens: bucket.tokens,
             max_kv_len: self.geometry.max_kv_len,
             draft_lens: None,
@@ -2095,7 +2098,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.pool()?.reserved(),
         );
         let batch = self.token_batch(bucket)?;
-        let forward = Forward::new(&stream, generation, &arena);
+        let forward = Forward::new(&stream, generation, &arena)
+            .with_live_tokens(self.columns.live_tokens.device);
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),

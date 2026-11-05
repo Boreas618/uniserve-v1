@@ -858,7 +858,6 @@ fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, S
         logits_rows: ints(vec![tokens as i32 - 1])?,
         phase: PhaseKind::Prefill,
         page_size: 64,
-        live_tokens: ints(vec![tokens as i32])?,
         num_tokens: tokens,
         max_kv_len: tokens,
         draft_lens: None,
