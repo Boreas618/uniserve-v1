@@ -3,12 +3,25 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example minimax_h3_keys
+//! cargo run -p minimax-h3 --example minimax_h3_keys [-- --root <checkpoint>] [--rasters HxW,...]
 //! ```
 //!
 //! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
 //! every component this build loads states, over both element types - so no package has to guess a
 //! variant.
+//!
+//! ## The two flags, and why the canvases are one
+//!
+//! `--root` names the checkpoint the video encoder's rows are derived from (default
+//! `/opt/uv/models/MiniMax-H3`); its `vae/config.json` is the geometry, and the header prints the
+//! fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
+//! to `NAMED_CANVASES` - **the six the model offers**, because a store built for one canvas stops at
+//! `no kernel` on any other.
+//!
+//! A deployment that serves a canvas the model does not name builds **its own store** rather than
+//! adding a row to this one: a row is a cell every store built from this list must compile, so a
+//! canvas outside the offered set belongs to a list generated with `--rasters` naming it. The two
+//! lists are then two stores, and neither claims the other's canvases.
 //!
 //! It is not the fixture. `notes/programs/minimax-h3-keys.txt` is **one deployment's** rows, copied
 //! from that deployment's walk (`examples/programs.rs` then `examples/h3_fixture.rs`), and it is a
