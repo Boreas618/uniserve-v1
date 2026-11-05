@@ -18,6 +18,7 @@
 //! [`PROTOCOL_MINOR`] does not know. [`Connection`] carries the messages,
 //! one frame each, over a Unix socket on one node or TCP between nodes.
 
+pub mod catalog;
 mod connection;
 mod media;
 pub mod profile;
