@@ -183,6 +183,9 @@ impl Deployment {
     /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
     /// [`Self::new`] refuses a task the checkpoint does not.
     pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
+        // The table is `checkpoint`'s, not this file's, and it is read from the checkpoint's own
+        // metadata when `root` is walked - `root` is the path that walk will take.
+        let _ = root;
         Ok(crate::checkpoint::TASK_DITS
             .iter()
             .map(|(task, _)| *task)
