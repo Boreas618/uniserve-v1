@@ -3843,5 +3843,4 @@ mod tests {
         assert!(AudioEncoder::check_track(Shape::new(&[2, 3, 44_100])).is_err());
         assert!(AudioEncoder::check_track(Shape::new(&[2, 44_100])).is_err());
     }
-
 }
