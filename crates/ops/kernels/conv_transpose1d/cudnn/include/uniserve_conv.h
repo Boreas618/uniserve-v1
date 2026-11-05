@@ -34,6 +34,10 @@ struct uniserve_conv_call {
   // only an engine that does not narrow its inputs; a convolution whose inputs are
   // not FP32 may not set it, and is refused if it does.
   int32_t tf32;
+  // 0 for channels-first (NCDHW, the default), 1 for channels-last (NDHWC). The shapes in this
+  // call are logical [n, c, d, h, w] either way: only the strides the entry derives change, and a
+  // package with no channels-last path refuses 1 by name rather than reading it as 0.
+  int32_t channels_last;
   char error[512];
 };
 

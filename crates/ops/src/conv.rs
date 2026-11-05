@@ -84,6 +84,12 @@ pub struct Descriptor {
     pub bias: bool,
     /// Whether the library may use TF32 for FP32 inputs.
     pub tf32: bool,
+    /// Whether the tensors are channels-last (NDHWC) rather than channels-first (NCDHW).
+    ///
+    /// The shapes in the call stay logical (`[n, c, d, h, w]`); the order is the strides the entry
+    /// derives and the plan it selects, not a different compiled module - so, like the geometry and
+    /// `tf32`, it travels in the call and is not part of the key.
+    pub channels_last: bool,
     /// The spatial rank: 3 for `conv3d`, 1 for the one-dimensional pair.
     pub rank: u32,
     /// Whether the operation is a transposed convolution.
@@ -131,6 +137,8 @@ pub struct Call {
     pub transposed: i32,
     /// 1 when the library may use TF32.
     pub tf32: i32,
+    /// 1 when the tensors are channels-last (NDHWC), 0 for channels-first (NCDHW).
+    pub channels_last: i32,
     pub error: [u8; 512],
 }
 
@@ -300,6 +308,7 @@ impl Conv {
             groups: geometry.groups as i32,
             transposed: i32::from(descriptor.transposed),
             tf32: i32::from(descriptor.tf32),
+            channels_last: i32::from(descriptor.channels_last),
             error: [0; 512],
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is

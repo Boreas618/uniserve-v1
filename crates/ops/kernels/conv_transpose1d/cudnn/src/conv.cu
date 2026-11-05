@@ -645,6 +645,11 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
   // convolution may both grant and withhold the permission, and the engine selection
   // below is what makes the withholding real: with `tf32` clear, only an engine that
   // does not narrow its inputs is used.
+  if (call->channels_last != 0) {
+    return refuse(error,
+                  "this package has no channels-last path: it reads channels-first tensors only");
+  }
+
   if (call->tf32 != 0 && !kFp32Inputs) {
     return refuse(error,
                   "a convolution's tf32 value describes FP32 inputs only: this module's input "

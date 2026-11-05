@@ -363,9 +363,27 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   std::memcpy(x_dims, call.input_shape, sizeof(x_dims));
   std::memcpy(w_dims, call.weight_shape, sizeof(w_dims));
   std::memcpy(y_dims, call.out_shape, sizeof(y_dims));
+  /// NDHWC strides of dimensions ordered `[n, c, d, h, w]`: the channel axis runs fastest, then the
+  /// spatial axes from the innermost out, then the batch. cuDNN reads the format from the strides.
+  auto channels_last_strides = [](const int64_t* dims, int64_t* strides) {
+    const int32_t fastest_first[kSpatial + 2] = {1, 4, 3, 2, 0};  // c, w, h, d, n
+    int64_t running = 1;
+    for (int32_t step = 0; step <= kSpatial + 1; ++step) {
+      const int32_t axis = fastest_first[step];
+      strides[axis] = running;
+      running *= dims[axis];
+    }
+  };
+
+  const bool channels_last = call.channels_last != 0;
   row_major(x_dims, x_strides);
   row_major(y_dims, y_strides);
   row_major(w_dims, w_strides);
+  if (channels_last) {
+    channels_last_strides(x_dims, x_strides);
+    channels_last_strides(y_dims, y_strides);
+    channels_last_strides(w_dims, w_strides);
+  }
   if (transposed) {
     // The layer's weight is `[c, k, …]` in memory and `[k, c, …]` to the
     // backward-data pass: the same bytes with the two channel axes exchanged.
@@ -625,8 +643,11 @@ std::string plan_key(const uniserve_conv_call& call, int32_t device) {
   key += std::to_string(UNISERVE_CONV_OUTPUT_DTYPE);
   key += '_';
   key += std::to_string(UNISERVE_CONV_ENGINE);
-  // The engine the plan holds depends on the call's TF32 permission.
+  // The engine the plan holds depends on the call's TF32 permission...
   key += call.tf32 != 0 ? "_tf32" : "_exact";
+  // ...and on the iteration order, because the two orders' tensor descriptors are different
+  // plans over one engine: a plan cached for one would give the other the wrong strides.
+  key += call.channels_last != 0 ? "_ndhwc" : "_ncdhw";
   key += "_device_";
   key += std::to_string(device);
   return key;
@@ -645,6 +666,12 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
   // convolution may both grant and withhold the permission, and the engine selection
   // below is what makes the withholding real: with `tf32` clear, only an engine that
   // does not narrow its inputs is used.
+  if (call->channels_last != 0 && call->transposed != 0) {
+    return refuse(error,
+                  "a transposed convolution has no channels-last path in this package: the layer's "
+                  "channel axes are its filter's two leading axes, and no deployment asks for it");
+  }
+
   if (call->tf32 != 0 && !kFp32Inputs) {
     return refuse(error,
                   "a convolution's tf32 value describes FP32 inputs only: this module's input "
