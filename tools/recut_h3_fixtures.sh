@@ -218,6 +218,7 @@ recorder() {
         grep '^recorded, not stated:' "$staging/record-$name.txt" >&2 || true
         echo "a fixture cut here is short of launches the model makes; fix the walk, not the fixture" >&2
         recorder_failed=1
+        withheld="$name"
     fi
 }
 
@@ -227,37 +228,63 @@ extents=${extents:-notes/programs/h3-extents.json}
 # count for one deployment and reads as if it had spoken about the other: with dense short the tool
 # stopped there, so no run ever printed the sparse count, and a reader comparing the two fixtures had
 # one number where two exist.
+# A short walk withholds **its own** deployment and nothing else. The two fixtures are two
+# deployments' row sets at one commit; a row the sparse deployment launches and the sparse walk lacks
+# is no reason to withhold the dense file, which is certified separately below. The run's exit code
+# still reports the shortfall, and a reader gets both counts whatever happens.
 recorder_failed=0
+withheld=
 recorder dense "$walk_dense"
 recorder sparse "$walk_sparse" --sparse 64,0.9
+withheld_dense=0
+withheld_sparse=0
+case "$withheld" in
+    dense) withheld_dense=1 ;;
+    sparse) withheld_sparse=1 ;;
+esac
 if [ "$recorder_failed" != "0" ]; then
-    echo "the re-cut stops: a walk above is short of launches the model makes, so no fixture is written" >&2
-    exit 1
+    if [ "$withheld_dense" = "1" ] && [ "$withheld_sparse" = "1" ]; then
+        echo "the re-cut stops: both walks are short of launches the model makes" >&2
+        exit 1
+    fi
+    echo "the re-cut withholds $withheld only: its walk is short of launches the model makes" >&2
 fi
 
 # 3. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
 #    file that exempts what nothing fails on.
 echo 'declared blocked:'
-RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p program-server --example key_coverage -- \
-    --fixture "$walk_dense" --target sm_100a --declared-blocked \
-    2>/dev/null | grep '^# blocked:' >"$staging/blocked-dense.txt" || true
-RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p program-server --example key_coverage -- \
-    --fixture "$walk_sparse" --target sm_100a --declared-blocked \
-    2>/dev/null | grep '^# blocked:' >"$staging/blocked-sparse.txt" || true
+: >"$staging/blocked-dense.txt"
+: >"$staging/blocked-sparse.txt"
+if [ "$withheld_dense" = "0" ]; then
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p program-server --example key_coverage -- \
+        --fixture "$walk_dense" --target sm_100a --declared-blocked \
+        2>/dev/null | grep '^# blocked:' >"$staging/blocked-dense.txt" || true
+fi
+if [ "$withheld_sparse" = "0" ]; then
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p program-server --example key_coverage -- \
+        --fixture "$walk_sparse" --target sm_100a --declared-blocked \
+        2>/dev/null | grep '^# blocked:' >"$staging/blocked-sparse.txt" || true
+fi
 printf '  dense %s, sparse %s\n' \
     "$(wc -l <"$staging/blocked-dense.txt")" "$(wc -l <"$staging/blocked-sparse.txt")"
 
 # 4. The fixtures: the header, the block and the rows, from the walk's own print.
 echo 'fixtures:'
-RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p minimax-h3 --example h3_fixture -- \
-    --walk "$walk_dense" --commit "$commit" --blocked "$staging/blocked-dense.txt" >"$fixture_dense"
-RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-    cargo run -q -p minimax-h3 --example h3_fixture -- \
-    --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
+: >"$fixture_dense"
+: >"$fixture_sparse"
+if [ "$withheld_dense" = "0" ]; then
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example h3_fixture -- \
+        --walk "$walk_dense" --commit "$commit" --blocked "$staging/blocked-dense.txt" >"$fixture_dense"
+fi
+if [ "$withheld_sparse" = "0" ]; then
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example h3_fixture -- \
+        --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
+fi
 
 # 5. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
@@ -268,6 +295,13 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     rest=${pair#*:}
     fixture=${rest%%:*}
     walk=${rest#*:}
+
+    # A withheld deployment has no fixture to certify, and its shortfall is already stated above.
+    if [ "$(eval "echo \$withheld_$name")" = "1" ]; then
+        printf '  %-10s withheld — the walk is short\n' "$name"
+        status=1
+        continue
+    fi
 
     if RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
         cargo run -q -p ops --example keys_delta -- \
@@ -302,13 +336,36 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     esac
 done
 
+# 5. Move into place. Each fixture moved here is certified: `dense` and `sparse` are two deployments'
+#    row sets at one commit, and one may be certified while the other is withheld, so each is moved on
+#    its own evidence. What must not happen is a file moved on a certification that failed, and that
+#    cannot: the loop above skips a withheld deployment and sets the status for it.
+attempted=
+if [ "$withheld_dense" = "0" ]; then
+    attempted="$attempted dense"
+fi
+if [ "$withheld_sparse" = "0" ]; then
+    attempted="$attempted sparse"
+fi
 if [ "$status" -ne 0 ]; then
-    echo 'a fixture failed certification; notes/programs/ was not touched'
+    if [ -z "$attempted" ]; then
+        echo 'a fixture failed certification; notes/programs/ was not touched'
+        exit 1
+    fi
+    echo 'a fixture failed certification; the certified ones below still move' >&2
+fi
+for name in $attempted; do
+    case "$name" in
+        dense)
+            cp "$fixture_dense" notes/programs/minimax-h3-keys.txt
+            echo 'written: notes/programs/minimax-h3-keys.txt'
+            ;;
+        sparse)
+            cp "$fixture_sparse" notes/programs/minimax-h3-sparse-keys.txt
+            echo 'written: notes/programs/minimax-h3-sparse-keys.txt'
+            ;;
+    esac
+done
+if [ "$status" -ne 0 ]; then
     exit 1
 fi
-
-# 5. Move both into place. Only now, and both together, so the two fixtures in the tree are always from
-#    one walk at one commit.
-cp "$fixture_dense" notes/programs/minimax-h3-keys.txt
-cp "$fixture_sparse" notes/programs/minimax-h3-sparse-keys.txt
-echo 'written: notes/programs/minimax-h3-keys.txt, notes/programs/minimax-h3-sparse-keys.txt'
