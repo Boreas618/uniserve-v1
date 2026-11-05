@@ -61,6 +61,19 @@ PACKERS = {
 }
 
 
+def _native_package(package: pathlib.Path) -> bool:
+    """Whether a package states a native module, which builds no Triton cell."""
+    manifest = package / "package.toml"
+    if not manifest.exists():
+        return False
+    declared = tomllib.loads(manifest.read_text())
+    # A package states its toolchain, and the one Triton cell a sweep can read is the one whose
+    # toolchain is Triton's: `nvcc` and the CuTe DSL build native modules, whose parameters live in
+    # an entry's C declaration.
+    kind = (declared.get("toolchain") or {}).get("kind")
+    return kind is not None and kind != "triton"
+
+
 def load_spec(build: pathlib.Path):
     """The package's `spec` function, imported under a name of its own.
 
@@ -71,6 +84,15 @@ def load_spec(build: pathlib.Path):
     source = build.parent
     sys.path.insert(0, str(source))
     try:
+        # `build.py` imports `_compile` and its kernel module by bare name, so `sys.modules` would
+        # hand every package after the first the first package's copy. The copies differ between
+        # operators - one carries `parse_key` and no `descriptor_fields`, another the reverse - so a
+        # shared one refuses keys its own operator declares. Everything imported from a package's
+        # source is dropped, which is what a fresh process per package would do.
+        for cached, module in list(sys.modules.items()):
+            origin = getattr(module, "__file__", None)
+            if origin and str(KERNELS) in origin:
+                del sys.modules[cached]
         name = f"h3_package_{build.parent.parent.parent.name}_{build.parent.parent.name}"
         found = importlib.util.spec_from_file_location(name, build)
         module = importlib.util.module_from_spec(found)
@@ -310,7 +332,28 @@ def sweep(
             continue
         row = line.split("\t")
         op, descriptor = row[0], row[1]
-        backend = row[2] if len(row) > 2 else "triton"
+        backend = row[2] if len(row) > 2 else None
+        if backend is None:
+            # A fixture row may name only the operator and its descriptor: 152 rows over 46
+            # operators would repeat a backend on every line, and the operator's directory states
+            # it once. Triton's is the default a cell can be read from; a native operator has no
+            # cell at all, which the gap below then says in those words.
+            stated = sorted(
+                p.name for p in (KERNELS / op).iterdir() if p.is_dir()
+            )
+            triton = [
+                name
+                for name in stated
+                if not _native_package(KERNELS / op / name)
+            ]
+            backend = (
+                triton[0]
+                if len(triton) == 1
+                else (stated[0] if len(stated) == 1 else "triton")
+            )
+            finding = f"{op} (backends: {', '.join(stated)})"
+        else:
+            finding = f"{op}/{backend}"
         package = KERNELS / op / backend
         build = package / "src/build.py"
         cell = store / op / backend
@@ -321,11 +364,25 @@ def sweep(
             # than a missing one, and it is reported as such.
             if sorted(cell.glob(f"*/{target}/{descriptor}/launch.json")):
                 gaps.append(
-                    f"{op}/{backend} {descriptor}: a native cell, whose parameters are its "
+                    f"{finding} {descriptor}: a native cell, whose parameters are its "
+                    f"entry's C declaration rather than a recorded signature"
+                )
+            elif _native_package(package):
+                # A native package is not a Triton cell, so no build produces a `metadata.json` for
+                # it: its parameters are its entry's C declaration and `launch.json` names that
+                # entry. Nothing here can compare that, and saying "not built" would under-describe
+                # a gap that is a different statement rather than a missing one.
+                gaps.append(
+                    f"{finding} {descriptor}: a native package, whose parameters are its "
                     f"entry's C declaration rather than a recorded signature"
                 )
             else:
-                gaps.append(f"{op} {descriptor}: no built cell under {store}")
+                # A row that names no backend is attributed only when the store holds its cell:
+                # the store is the build's own record, so which backend a row belongs to is the
+                # store's answer and not this reader's guess.
+                gaps.append(
+                    f"{finding} {descriptor}: no built cell under {store}"
+                )
             continue
         cells += 1
         if not build.exists():
