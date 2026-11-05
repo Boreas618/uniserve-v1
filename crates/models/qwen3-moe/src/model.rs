@@ -345,13 +345,18 @@ impl Plan {
                 None => {
                     // One routed layer's whole step: the routing prefix, the permuted pair, and the
                     // encoded planes when the checkpoint stores them encoded. Sized from the same
-                    // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree. The
-                    // activation encoding's block scales are the CUTLASS product's plain layout.
+                    // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree.
+                    //
+                    // The activation encoding's block scales are the 128x4 swizzled form, which is
+                    // what every E2M1 artifact serves on the activation side
+                    // (`gather_gemm_nvfp4`'s `build.py` states it): the encoder is launched per
+                    // descriptor, so a plain layout here asks the store for a program no deployment
+                    // builds, which is a missing kernel rather than a wrong number.
                     if config.num_experts > 0 {
                         nn::layers::step_bytes(
                             tokens,
                             geometry,
-                            ops::fp4::ScaleLayout::Linear,
+                            ops::fp4::ScaleLayout::Swizzled128X4,
                             dtype,
                             options.experts_encoded,
                         )?
