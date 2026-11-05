@@ -1886,6 +1886,30 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return Ok(());
         }
         let began = std::time::Instant::now();
+        // The pose, stated before the walk that can fault on it: a warm launch that dies names the
+        // numbers it was given, and the table it read, rather than leaving them to be inferred from
+        // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged.
+        self.stage_warm(bucket)?;
+        let (lengths, offsets) = warm_span(bucket);
+        tracing::info!(
+            bucket = %bucket,
+            rows = bucket.rows,
+            tokens = bucket.tokens,
+            calls = warm_calls(bucket).len(),
+            seq_lens = ?lengths,
+            query_offsets = ?offsets,
+            // The third statement of the same partition: the count the kernels bound by. It must
+            // equal the last of `query_offsets` and the tokens the calls own, and a capture where
+            // those three disagree is an operand no descriptor can match.
+            live_tokens = self.staging.live_tokens(),
+            page_size = self.geometry.page_size,
+            max_kv_len = self.geometry.max_kv_len,
+            "a bucket's warm pose"
+        );
+        if runner_dump() {
+            tracing::info!(bucket = %bucket, pose = %self.dump_kernel_arguments(bucket),
+                "a bucket's warm pose, as the columns and the page table hold it");
+        }
         self.walk(bucket, kernels)?;
         // The warm launches are real device work on the pool's stream; a capture begun over them is
         // legal and does not contain them, but nothing may plan a mapping while they are in flight.
@@ -2266,6 +2290,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
             && !bucket.variant.is_decode()
         {
             self.greedy_first_tokens(logits, rows, sampling)?;
+        }
+        // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
+        // a kernel that answers the width instead of the last index is a defect and not a token,
+        // and a token one past the vocabulary reaches the tokenizer as an out-of-range id. The
+        // check is here, once, on the readback of every batch: it costs one comparison and it
+        // turns a batch of nonsense tokens into a refusal at the first step that produced one.
+        if let Some(row) = ids.iter().position(|id| {
+            let id = *id;
+            id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
+        }) {
+            return Err(Error::Invariant(format!(
+                "row {row} sampled token {} outside the vocabulary of {}",
+                ids[row], self.geometry.vocabulary
+            )));
         }
         let states = states_of(
             self.staging.slots(rows),
@@ -4106,13 +4144,15 @@ fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
 fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
     let rows = usize::try_from(bucket.rows).unwrap_or(0);
     let tokens = bucket.tokens as i32;
-    let mut lengths = vec![1_i32; rows];
+    // Every warm row's slot is `-1`, and `resident.rs:258-273` states the rule that goes with it: an
+    // absent row is filled with page zero - the pool's reserved padding unit - **and its `seq_lens`
+    // entry states the same zero**, because a row that names page zero and claims a key makes the
+    // kernel read the padding unit as if a request had written it. That is a launch with no request
+    // behind it, and at more than one row it is an address the pool does not own.
+    let lengths = vec![0_i32; rows];
     let offsets = if bucket.variant.is_decode() {
         (0..=rows as i32).collect()
     } else {
-        if let Some(first) = lengths.first_mut() {
-            *first = tokens;
-        }
         let mut offsets = vec![tokens; rows + 1];
         if let Some(first) = offsets.first_mut() {
             *first = 0;
@@ -4219,7 +4259,11 @@ mod tests {
             vec![0, 1, 2, 3, 4],
             "a decode row is one query token, so the partition is the identity"
         );
-        assert_eq!(seq_lens, vec![1, 1, 1, 1], "one key per row in the warm pose");
+        assert_eq!(
+            seq_lens,
+            vec![0, 0, 0, 0],
+            "a warm row's slot is absent, and an absent row claims no key"
+        );
     }
 
     #[test]
@@ -4247,7 +4291,11 @@ mod tests {
         let bucket = Bucket::prefill(2, 512, Variant::PrefillOutput);
         let (seq_lens, query_offsets) = warm_span(bucket);
         assert_eq!(query_offsets, vec![0, 512, 512]);
-        assert_eq!(seq_lens, vec![512, 1]);
+        assert_eq!(
+            seq_lens,
+            vec![0, 0],
+            "a warm row's slot is absent, and an absent row claims no key"
+        );
     }
 
     /// A page readback is bounded by the plane it reads before any copy is issued: the driver's

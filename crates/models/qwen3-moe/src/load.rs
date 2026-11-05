@@ -40,24 +40,15 @@ use crate::model::{
 use crate::representation::{self, Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
-/// The block-scale layout the first product's kernels read the **expert weights** in.
+/// The block-scale layout the expert products read the **weights** in: the 128x4 swizzled form.
 ///
-/// The gate/up product fuses the gated activation, and every E2M1 kernel of that form in the
-/// artifact was built with the weight side **plain**: one factor per sixteen elements, in the order
-/// the matrix stores them (`gather_gemm_nvfp4/trtllm/src/entry.cpp` states it as the form its
-/// variants serve, and `build.py`'s selection finds no such kernel with a swizzled weight side).
-/// So the shard's own table is published unchanged here.
-pub const GATHER_WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
-
-/// The block-scale layout the second product's kernels read the **expert weights** in.
+/// Both families carry their weight operand this way — `mSfLayoutA` is `SfLayout(3)` in every one of
+/// the artifact's E2M1 kernels, and `BatchedGemmOptions.h` states the rule it follows: "mSfLayoutA
+/// has to be R128cX when not batch M or not routed". The plane the two families disagree about is
+/// the **tokens** operand, which is `nn::Moe`'s statement, not the loader's.
 ///
-/// The down product is linear — no fused activation — and the artifact's linear family takes the
-/// weight side in the 128x4 swizzled form (`build.py`'s selection finds no linear kernel with a
-/// plain weight side at any tile), so the loader builds that table once at load.
-///
-/// The two products genuinely differ, and the artifact is the authority for both: a product's
-/// weight plane is in the form its own kernels index, never in a form chosen for the pair.
-pub const ROUTE_WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+/// The shard stores the plain form, so the loader builds this table once at load.
+pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
 ///
@@ -833,7 +824,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                GATHER_WEIGHT_SCALE_LAYOUT,
+                WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -847,7 +838,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                ROUTE_WEIGHT_SCALE_LAYOUT,
+                WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -1292,37 +1283,42 @@ mod tests {
         config()
     }
 
-    /// The block-scale layout each product's kernels were built for, held against the packages.
+    /// The block-scale layouts each product's kernels were built for, held against the packages.
     ///
-    /// A product's weight plane is read by kernels that were **compiled** with a weight-side layout,
-    /// and nothing checks the two against each other at runtime: the layout is not an option the
-    /// runner's lookup compares (`GemmOptions` carries no `SfLayout`), so a package built for the
-    /// plain form handed a swizzled table reads every expert factor at the wrong offset and answers
+    /// A product's planes are read by kernels that were **compiled** with a layout for each operand,
+    /// and nothing checks the two against each other at runtime: the layouts are not options the
+    /// runner's lookup compares (`GemmOptions` carries no `SfLayout`), so a package built for one
+    /// form handed a plane in another reads every block factor at the wrong offset and answers
     /// plausible numbers. This is the one place the two statements meet.
     ///
-    /// The activation side is `Moe::ACTIVATION_SCALE_LAYOUT` for both products; the weight side is
-    /// each product's own, because the artifact's gated family and its linear family were built with
-    /// opposite weight layouts.
+    /// `mSfLayoutA` is the **weights** and `mSfLayoutB` the **tokens** — `BatchedGemmOptions.h`
+    /// states both ("mSfLayoutA has to be R128cX", "Tokens need use SF linear layout when being
+    /// routed") — and the two families disagree about the second only.
     #[test]
     fn a_products_package_states_the_scale_layouts_nn_publishes() {
         let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/kernels");
         let cases = [
-            ("gather_gemm_nvfp4", GATHER_WEIGHT_SCALE_LAYOUT),
-            ("route_gemm_nvfp4", ROUTE_WEIGHT_SCALE_LAYOUT),
+            (
+                "gather_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::GATED_TOKEN_SCALE_LAYOUT,
+            ),
+            (
+                "route_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::ACTIVATION_SCALE_LAYOUT,
+            ),
         ];
-        for (operator, weights) in cases {
+        let name = |layout: ScaleLayout| match layout {
+            ScaleLayout::Linear => "\"linear\"",
+            ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
+        };
+        for (operator, weights, tokens) in cases {
             let package = kernels.join(operator).join("trtllm/package.toml");
             let stated = std::fs::read_to_string(&package)
                 .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
-            // The layouts' names as the manifest states them; the artifact's own enumeration numbers
-            // them (`SfLayoutDecl.h`: Linear 0, R8c4 1, R8c16 2, R128c4 3), and a name that named a
-            // different number would be a second statement of that enumeration.
-            let name = |layout: ScaleLayout| match layout {
-                ScaleLayout::Linear => "\"linear\"",
-                ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
-            };
-            let (activation, weights) = (name(Moe::ACTIVATION_SCALE_LAYOUT), name(weights));
-            for (option, expected) in [("mSfLayoutA", activation), ("mSfLayoutB", weights)] {
+            for (option, expected) in [("mSfLayoutA", name(weights)), ("mSfLayoutB", name(tokens))]
+            {
                 let line = format!("{option} = {expected}");
                 assert!(
                     stated.contains(&line),
