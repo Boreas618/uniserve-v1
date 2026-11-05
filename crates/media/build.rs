@@ -10,14 +10,17 @@
 //! The runtime path is recorded in every executable this package builds, so a
 //! test binary runs without a wrapper script.
 
-use std::path::{Path, PathBuf};
-
 /// Libraries the shim calls, in link order.
 const LIBRARIES: [&str; 5] = ["avformat", "avcodec", "swscale", "swresample", "avutil"];
+
+// Which installation this is: the same rule the executables' links read
+// (`build_support/ffmpeg_prefix.rs`), included rather than copied.
+include!("build_support/ffmpeg_prefix.rs");
 
 fn main() {
     println!("cargo:rerun-if-env-changed=UNISERVE_FFMPEG_DIR");
     println!("cargo:rerun-if-changed=src/ffi/shim.c");
+    println!("cargo:rerun-if-changed=build_support/ffmpeg_prefix.rs");
 
     let prefix = ffmpeg_prefix();
     let include = prefix.join("include");
@@ -29,7 +32,7 @@ fn main() {
             prefix.display()
         );
     }
-    if !has_library(&lib) {
+    if !has_ffmpeg(&prefix) {
         panic!(
             "FFmpeg shared libraries are missing from {}; the media crate loads no static \
              FFmpeg (crates/media/README.md describes how the runtime is provisioned)",
@@ -47,15 +50,10 @@ fn main() {
     for name in LIBRARIES {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
-    // An FFmpeg that loads x264 as a shared library names it in its own
-    // DT_NEEDED, and the linker does not carry a loaded library's dependencies
-    // into the link: every `x264_*` symbol then reads as undefined at the final
-    // link. Naming it here, and only where the installation ships it, keeps a
-    // build working against either kind of runtime — one that loads x264 and
-    // one that has it linked in.
-    if has_shared(&lib, "x264") {
-        println!("cargo:rustc-link-lib=dylib=x264");
-    }
+    // These two apply to this package's own targets only; Cargo passes a dependency's search path
+    // and library names on but not its link arguments, so an executable's package states its own
+    // (the workspace root does, in `build.rs`).
+    println!("cargo:rustc-link-arg=-Wl,-rpath-link,{}", lib.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     // The runtime's own `bin/ffmpeg` is the default reference-video decoder:
     // the same installation that provides the codecs provides the external
@@ -64,41 +62,4 @@ fn main() {
         "cargo:rustc-env=UNISERVE_MEDIA_RUNTIME={}",
         prefix.display()
     );
-}
-
-/// The installation the crate is built against.
-fn ffmpeg_prefix() -> PathBuf {
-    if let Some(dir) = std::env::var_os("UNISERVE_FFMPEG_DIR") {
-        return PathBuf::from(dir);
-    }
-    let manifest = match std::env::var_os("CARGO_MANIFEST_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => panic!("Cargo sets CARGO_MANIFEST_DIR for a build script"),
-    };
-    let workspace = manifest.join("../..");
-    workspace.join("artifacts/native/prefix")
-}
-
-/// Whether `lib` holds a shared libav* library.
-fn has_library(lib: &Path) -> bool {
-    LIBRARIES.iter().any(|name| has_shared(lib, name))
-}
-
-/// Whether `lib` holds `lib<name>` as a shared library, under either the plain
-/// name or a versioned one (`libx264.so.165`).
-fn has_shared(lib: &Path, name: &str) -> bool {
-    ["so", "dylib"].iter().any(|extension| {
-        let file = format!("lib{name}.{extension}");
-        lib.join(&file).is_file()
-            || std::fs::read_dir(lib).is_ok_and(|mut entries| {
-                entries.any(|entry| {
-                    entry.is_ok_and(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with(&format!("{file}."))
-                    })
-                })
-            })
-    })
 }
