@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import ctypes
 import shutil
 import subprocess
 import sys
@@ -157,6 +158,21 @@ def build(package, key, target, out_dir, python):
         return "no module.cubin was written"
     if form == "native" and not any(out_dir.glob("*.so")):
         return "no shared object was written"
+    if form == "native":
+        # A shared object that references symbols no library provides still appears in the store:
+        # the file exists, the manifest names its entry, and "built N of N" reads as a complete
+        # store. The failure then arrives at the first launch as "cannot load native library",
+        # which names neither a symbol nor a package - and a run that stops there looks like a
+        # model defect. `RTLD_NOW` resolves the whole object at load, so an undefined reference
+        # is a build failure with the symbol in it.
+        for library in sorted(out_dir.glob("*.so")):
+            failure = loads(library)
+            if failure:
+                return failure
+        # The link inputs are not part of the module: an object file beside the library is build
+        # scratch, and a store is what a host loads rather than what a compiler read.
+        for scratch in out_dir.glob("*.o"):
+            scratch.unlink()
     # A native module's C entry is declared by its manifest and is not in the shared object; publish
     # it beside the library so the store directory is enough to load the module from.
     entries = manifest["module"].get("entries")
@@ -164,6 +180,21 @@ def build(package, key, target, out_dir, python):
         (out_dir / "launch.json").write_text(
             json.dumps({"name": entries.get("launch"), "entries": entries}, indent=1) + "\n"
         )
+    return None
+
+
+def loads(library: Path):
+    """Whether the loader resolves every symbol `library` references, or the reason it does not.
+
+    `RTLD_NOW` is the whole point: `ctypes`' default mode is `RTLD_LOCAL` alone, which defers
+    binding, so an unresolvable reference
+    survive until a call reached it, which is a run-time failure in a different place than the
+    defect.
+    """
+    try:
+        ctypes.CDLL(str(library), mode=os.RTLD_NOW | os.RTLD_LOCAL)
+    except OSError as error:
+        return f"{library.name} does not load, so a host could not use it: {error}"
     return None
 
 
