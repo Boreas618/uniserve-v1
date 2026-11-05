@@ -25,6 +25,13 @@
 //! `out[i] = map[ids[i]]` for every flattened `(token, route)` entry: the expert-parallel rank's
 //! logical ids become indices into the physical expert weights. It moves integers, so two
 //! implementations agree bit for bit.
+//!
+//! Every entry of `ids` must be a logical expert id in `[0, experts)`: the program indexes `map`
+//! with it directly and reads nothing that would say otherwise, so an id outside that range reads
+//! memory beside the map and hands the route whichever expert id that memory holds. The invariant
+//! belongs to the routing that wrote the ids — `topk_softmax` writes `top` ids of a row it reasoned
+//! about — and the consumer bounds its own side: `moe_sort` drops a physical id outside its local
+//! range (`local_expert_of`), so a wrong id costs a stray read and not a corrupted permutation.
 
 use std::fmt;
 
