@@ -739,6 +739,14 @@ fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTen
     // then answers `Ok((n, metadata))` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts at
     // `N_LEN + n`. Adding `n` alone shifts every tensor eight bytes early — the right shape over
     // the wrong bytes, which is why the read-back test asserts content rather than length.
+    //
+    // **The subtraction below cannot underflow, and this is the dependency rather than an
+    // assumption.** The same crate refuses a header whose `8 + n` runs past the buffer
+    // (`buffer.get(N_LEN..stop)` returning `None` is `InvalidHeaderLength`) and requires
+    // `payload_end + 8 + n == buffer_len` exactly (`MetadataIncompleteBuffer`) — both in
+    // `safetensors-0.8.0/src/tensor.rs`. A version that relaxed either would let this line read past
+    // the file, which is why the version is named here: a bump that changes those two checks is the
+    // one that must visit this function.
     const HEADER_PREFIX: u64 = 8;
     let header = HEADER_PREFIX + header as u64;
     let payload = bytes.len() as u64 - header;
