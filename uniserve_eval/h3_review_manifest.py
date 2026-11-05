@@ -12,11 +12,12 @@ file beside the MP4s. Run it after a run finishes; it never touches a server.
 
     python -m uniserve_eval.h3_review_manifest \
         --config uniserve_eval/check_h3.toml \
-        --results /workspace/uniserve-worker-artifacts/h3-check-baseline-3
+        --candidate-results artifacts/minimax_h3/check/results
 
-The manifest states both columns for every cell. A baseline run fills the
-baseline column; a candidate run fills the candidate column when it is given
-`--candidate-results`, and the reviewer sees the two MP4s side by side.
+Each column is filled by the root it is given: `--results` for the earlier
+run, `--candidate-results` for the run under review, and a root that is not
+there is an error rather than an empty column. With both, the reviewer reads
+the two MP4s side by side; with one, the page states that cell's run alone.
 """
 
 from __future__ import annotations
@@ -96,7 +97,19 @@ def mp4_name(mp4s: list[Path], missing: str = "missing") -> str:
     return f"`{mp4s[0].name}`" if mp4s else missing
 
 
-def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
+def manifest(
+    config: Path, baseline: Path | None, candidate: Path | None
+) -> str:
+    """The review page for whichever runs exist.
+
+    The design confirms H3 by watching the candidate's six videos, so a
+    candidate alone is a reviewable run; the baseline column is a convenience
+    when its bundles are still on the host. At least one side must be given.
+    """
+    if baseline is None and candidate is None:
+        raise ValueError(
+            "a review page needs a run: --results or --candidate-results"
+        )
     profile = tomllib.loads(config.read_text())
     points = profile["suites"]["check-h3"]["points"]
     servers = profile["servers"]
@@ -111,14 +124,15 @@ def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
         "the prompt asks or whether it is as good as today's output. Both",
         "questions are answered per cell, by the two MP4s named there.",
         "",
-        f"Baseline run: `{baseline}`",
+        f"Baseline run: `{baseline}`"
+        if baseline is not None
+        else "Baseline run: not on this host — the baseline column is empty.",
     ]
-    if candidate is not None:
-        lines.append(f"Candidate run: `{candidate}`")
-    else:
-        lines.append(
-            "Candidate run: not measured — the candidate column is empty."
-        )
+    lines.append(
+        f"Candidate run: `{candidate}`"
+        if candidate is not None
+        else "Candidate run: not measured — the candidate column is empty."
+    )
     lines += [
         "",
         "| cell | task | checkpoint | seed |",
@@ -144,7 +158,7 @@ def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
         row = measured_row(config.parent.parent / cell["dataset_path"])
         task = cell.get("video", {}).get("task", "")
         seed = row.get("seed", "")
-        base_mp4s = cell_mp4s(baseline / name)
+        base_mp4s = cell_mp4s(baseline / name) if baseline is not None else []
         cand_mp4s = cell_mp4s(candidate / name) if candidate is not None else []
         rows.append((name, task, checkpoint, row, base_mp4s, cand_mp4s))
         lines.append(f"| `{name}` | {task} | `{checkpoint}` | {seed} |")
@@ -152,6 +166,9 @@ def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
     lines.append("")
     for name, task, checkpoint, row, base_mp4s, cand_mp4s in rows:
         inputs = condition_media(row)
+        base_text = mp4_name(
+            base_mp4s, "not on this host" if baseline is None else "missing"
+        )
         lines += [
             f"## `{name}`",
             "",
@@ -160,7 +177,7 @@ def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
             f"- **Seed**: {row.get('seed', '')}",
             f"- **Request**: `{row.get('id', '')}`",
             f"- **Input files**: {', '.join(inputs) if inputs else 'none'}",
-            f"- **Baseline MP4**: {mp4_name(base_mp4s)}",
+            f"- **Baseline MP4**: {base_text}",
             f"- **Candidate MP4**: {mp4_name(cand_mp4s, 'not measured')}",
             "",
             "Prompt:",
@@ -180,7 +197,10 @@ def main() -> None:
         "--config", type=Path, required=True, help="the check set profile"
     )
     parser.add_argument(
-        "--results", type=Path, required=True, help="the baseline run directory"
+        "--results",
+        type=Path,
+        default=None,
+        help="the earlier run's directory, when its bundles exist",
     )
     parser.add_argument(
         "--candidate-results",
@@ -195,8 +215,11 @@ def main() -> None:
         help="the manifest path; defaults to <results>/review-manifest.md",
     )
     args = parser.parse_args()
+    if args.results is None and args.candidate_results is None:
+        parser.error("give --results, --candidate-results, or both")
 
-    output = args.output or args.results / "review-manifest.md"
+    root = args.results or args.candidate_results
+    output = args.output or root / "review-manifest.md"
     output.write_text(
         manifest(args.config, args.results, args.candidate_results)
     )

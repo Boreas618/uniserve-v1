@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from uniserve_eval.h3_review_manifest import condition_media, manifest
 
 
@@ -155,3 +157,29 @@ def test_a_candidate_mp4_is_named_beside_the_baseline_it_is_compared_with(
 def test_a_row_with_no_conditions_names_no_inputs() -> None:
     assert condition_media({"prompt": "x", "conditions": []}) == []
     assert condition_media({"prompt": "x"}) == []
+
+
+def test_a_candidate_alone_is_a_reviewable_run(tmp_path: Path) -> None:
+    """The design's confirmation is the candidate's six videos.
+
+    The earlier run's bundles need not survive on the host; a page that
+    required them would make the review impossible exactly when it matters.
+    """
+    config = profile(tmp_path)
+    candidate = tmp_path / "candidate"
+    write_cell(candidate, "check-t2va", "t2va.mp4")
+
+    text = manifest(config, None, candidate)
+
+    assert "Baseline run: not on this host" in text
+    assert "**Baseline MP4**: not on this host" in text
+    assert "**Candidate MP4**: `t2va.mp4`" in text
+    assert "Candidate run: `" in text
+
+
+def test_a_page_without_a_run_is_refused(tmp_path: Path) -> None:
+    """A page for no run would read as a review that found nothing."""
+    config = profile(tmp_path)
+
+    with pytest.raises(ValueError, match="needs a run"):
+        manifest(config, None, None)
