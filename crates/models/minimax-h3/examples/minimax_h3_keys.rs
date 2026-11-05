@@ -312,7 +312,7 @@ fn main() {
     // stated the dense one - which the recorder refuses.
     let mut commit: Option<String> = None;
     let mut sparse = false;
-    let mut sparse_deployment: Option<(u32, f64, Option<f64>)> = None;
+    let mut sparse_deployment: Option<minimax_h3::config::AttentionKind> = None;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -338,42 +338,18 @@ fn main() {
             // row set with no way back to the code that produced it.
             "--commit" => commit = Some(value(&mut arguments, "--commit")),
             "--sparse" => {
-                // The value the walk takes (`tile_rows,sparsity[,reference_keep]`) **is** the sparse
-                // deployment: its tile is what the network's attention is when the layout is built,
-                // and a walk that knew only "sparse" could not state the bound that tile derives.
+                // **One rule reads a sparse deployment from one string** (`AttentionKind::sparse_of`),
+                // and it is the same rule the recorder takes: the tile bound a compression reduces
+                // over is the deployment's own, derived from its layouts at load, so no flag states
+                // it and a third field that is not a keep rate is refused by the same sentence in
+                // whichever tool is handed it. A walk with its own parser accepted strings the
+                // recorder refused, and the accepting side is the one that wins silently.
                 let stated = value(&mut arguments, "--sparse");
-                let mut fields = stated.split(',');
-                let tile = fields
-                    .next()
-                    .and_then(|tile| tile.trim().parse::<u32>().ok())
-                    .unwrap_or_else(|| panic!("--sparse's tile is a row count: {stated}"));
-                let sparsity = fields
-                    .next()
-                    .and_then(|rate| rate.trim().parse::<f64>().ok())
-                    .unwrap_or_else(|| panic!("--sparse's sparsity is a fraction: {stated}"));
-                // **One string, one grammar.** The recorder takes `tile,sparsity[,reference_keep]`
-                // and refuses a third field that is not a fraction; a walk that read a whole
-                // number there as a tile count accepted a string the recorder rejects, so the two
-                // halves of one deployment disagreed about which strings are legal. The accepting
-                // side refuses now: a keep rate is a fraction in (0, 1], and the tile bound is the
-                // deployment's own - the layout derives it, so no argument states it.
-                let keep = match fields.next() {
-                    None => None,
-                    Some(rate) => {
-                        let rate = rate.trim().parse::<f64>().unwrap_or_else(|_| {
-                            panic!("--sparse's reference keep rate is a fraction: {stated}")
-                        });
-                        if !(rate > 0.0 && rate <= 1.0) {
-                            panic!(
-                                "--sparse's reference keep rate must lie in (0, 1], got {rate} - \
-                                 the tile bound is the deployment's own and is not an argument"
-                            );
-                        }
-                        Some(rate)
-                    }
-                };
                 sparse = true;
-                sparse_deployment = Some((tile, sparsity, keep));
+                sparse_deployment = Some(
+                    minimax_h3::config::AttentionKind::sparse_of(&stated)
+                        .unwrap_or_else(|error| panic!("{error}")),
+                );
             }
             other => panic!("unknown flag {other}"),
         }
@@ -881,7 +857,7 @@ fn header(
 /// row set was cut at the dense one because `--sparse` never reached here.
 fn deployment_bound(
     config: &minimax_h3::config::Config,
-    sparse: Option<(u32, f64, Option<f64>)>,
+    sparse: Option<minimax_h3::config::AttentionKind>,
 ) -> u32 {
     let mut bound = 0u32;
     for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
@@ -889,9 +865,8 @@ fn deployment_bound(
             panic!("this checkpoint holds no {} network", dit.directory());
         };
         let mut network = dies.clone();
-        if let Some((tile, sparsity, keep)) = sparse {
-            network.attention = minimax_h3::config::AttentionKind::sparse(tile, sparsity, keep)
-                .unwrap_or_else(|error| panic!("the sparse deployment is not statable: {error}"));
+        if let Some(kind) = &sparse {
+            network.attention = kind.clone();
         }
         let reached = minimax_h3::Partition::serving(config, task, 1, 1, 0, 0)
             .and_then(|partition| partition.arrangement(&network))
