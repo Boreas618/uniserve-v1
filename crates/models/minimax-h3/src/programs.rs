@@ -233,23 +233,27 @@ impl Deployment {
         Ok(programs.finish())
     }
 
-    /// The rows the two audio VAEs and the video VAE state: the components whose whole argument is
-    /// the deployment's own canvases, rungs and element types.
+    /// The rows the two audio VAEs and the video VAE state, at the request extents a walk states.
     ///
-    /// A component that also takes a request extent (the prompt's length, the trajectory's elements,
-    /// the packed row bound) is stated by [`Deployment::rows`], which is the one function downstream
-    /// reads.
-    pub fn vae_rows(&self) -> Result<Vec<(String, String)>> {
+    /// The rasters and the clip ladder are arguments because they are the delivery's: a walk states
+    /// which clips it drives, and [`Deployment::own_vae_rows`] is the same statement at this
+    /// checkpoint's own canvases and the caller's rungs. A component that also takes the prompt's
+    /// length or the trajectory's elements is stated by [`Deployment::text_rows`] and
+    /// [`Deployment::denoiser_rows`].
+    pub fn vae_rows(
+        &self,
+        rasters: &[(u32, u32)],
+        latents: &[u32],
+        samples: &[u32],
+    ) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        let latents = self.latents();
-        let samples = self.samples();
         programs.extend(crate::audio_vae::AudioDecoder::programs(
             &self.config.audio_vae,
-            &latents,
+            latents,
         )?);
         programs.extend(crate::encoding::AudioEncoder::programs(
             &self.config.audio_vae,
-            &samples,
+            samples,
         )?);
         programs.extend(crate::video_vae::VideoDecoder::programs(
             &self.config.video_vae,
@@ -257,12 +261,17 @@ impl Deployment {
         )?);
         programs.extend(crate::output::VideoPostprocessor::programs(
             self.types.video,
-            &self.canvases,
+            rasters,
         ));
         programs.extend(crate::encoding::VideoEncoder::programs(
             &self.config.video_vae,
-            &self.canvases,
+            rasters,
         )?);
         Ok(programs.finish())
+    }
+
+    /// The same rows at this checkpoint's own canvases and the rungs the delivery states.
+    pub fn own_vae_rows(&self) -> Result<Vec<(String, String)>> {
+        self.vae_rows(&self.canvases, &self.latents(), &self.samples())
     }
 }
