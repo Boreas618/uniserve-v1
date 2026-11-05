@@ -877,6 +877,15 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
 }
 
 impl BigVgan {
+    /// The sample clock the checkpoint was trained at, in hertz.
+    ///
+    /// It is the audio vae config's own number (`audio_vae/config.json`'s `sampling_rate`), not a
+    /// constant this crate types: the muxer builds the artifact's timeline from it, so a checkpoint
+    /// trained at another rate would state that rate rather than be resampled silently.
+    pub fn sampling_rate(&self) -> u32 {
+        self.config.sampling_rate
+    }
+
     /// Every checkpoint tensor the audio decoder reads, by name.
     ///
     /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
