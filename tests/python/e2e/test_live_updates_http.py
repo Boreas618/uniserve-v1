@@ -2511,6 +2511,10 @@ def _lose_the_serving_engine(
     recovery_s = resumed[0] - started
 
     streaming.join(timeout=1800)
+    # The measurement is taken before the tokens are judged: a run whose served
+    # path is broken still states how long the recovery took, which is the one
+    # number this case exists to record.
+    evidence_time = round(recovery_s, 3)
     assert done.is_set(), "the count did not end after the recovery"
     assert not errors, f"the count failed: {errors[0]!r}"
     numbers = _numbers(read)
@@ -2546,7 +2550,7 @@ def _lose_the_serving_engine(
         "case": case,
         "standby": standby,
         "engine_lost": killed,
-        "recovery_s": round(recovery_s, 3),
+        "recovery_s": evidence_time,
         "promoted": promoted,
         "relaunched": relaunched,
         "numbers_across_the_loss": len(numbers),
