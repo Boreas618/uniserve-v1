@@ -234,8 +234,9 @@ pub fn compare_buffers(
     let mut widest: Option<(usize, f32, f32, f32)> = None;
     for index in 0..numel as usize {
         let (reference, candidate) = read(index * width)?;
-        // A NaN in one buffer and a number in the other is a difference; two NaNs agree.
-        let agree = if reference.is_nan() && candidate.is_nan() {
+        // A NaN in one buffer and a number in the other is a difference; two NaNs agree, and so do
+        // two infinities of one sign, whose difference is a NaN no bound can hold.
+        let agree = if (reference.is_nan() && candidate.is_nan()) || reference == candidate {
             true
         } else {
             tolerance.allows_within(peak, reference, candidate)

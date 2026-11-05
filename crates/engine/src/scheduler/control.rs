@@ -715,6 +715,11 @@ impl Scheduler {
     /// Applies the stage asked for, when the scheduler is at a boundary: no
     /// batch and no submission is in flight, so the policy that decided them is
     /// no longer needed by anything (§7.3 steps 3 to 6).
+    /// Whether a policy stage waits for this boundary: one that names a later step is not due yet.
+    pub(super) fn policy_stage_due(&self) -> bool {
+        matches!(&self.policy_stage, Some((_, _, at)) if at.is_none_or(|at| self.step >= at))
+    }
+
     pub(super) fn apply_policy_stage(&mut self) {
         let ready = self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty();

@@ -405,6 +405,12 @@ impl Scheduler {
             if !self.a_rank_queue_admits() {
                 break;
             }
+            // A stage applies at a boundary with nothing in flight, and a scheduler under traffic
+            // always has a batch in flight while it keeps forming them. So one that is due stops
+            // this loop: what is in flight drains, the stage applies, and forming resumes (7.3).
+            if self.policy_stage_due() {
+                break;
+            }
             let batches = self.schedule_batches();
             if batches.is_empty() {
                 break;
