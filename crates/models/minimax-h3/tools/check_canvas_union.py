@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
 
     whole = set(rows)
     singles: set[str] = set()
+    per_canvas: list[set[str]] = []
     for height, width in canvases:
         raster, produced = generate("--rasters", f"{height}x{width}")
         if not produced:
@@ -105,10 +106,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"--rasters {height}x{width} was asked for and the header"
                 f" states {rasters(raster)}: the flag does not reach the rows"
             )
+        per_canvas.append(set(produced))
         singles.update(produced)
+
+    # A union check whose parts are all identical proves nothing: it passes on any list, including
+    # one whose canvas-class rows are wrong or missing. So the raster must be shown to select
+    # something, or the pass is vacuous and says so instead of passing.
+    if not selects(per_canvas):
+        raise SystemExit(
+            f"{len(canvases)} canvases produced one row set: no row depends on the raster, so"
+            " this comparison cannot fail and proves nothing - the canvas-class rows are"
+            " absent, not equal"
+        )
 
     print(f"{len(canvases)} canvases, {len(whole)} rows in the union run")
     return report(whole, singles)
+
+
+def selects(per_canvas: list[set[str]]) -> bool:
+    """Whether the raster changes any row: false makes the union check vacuous."""
+    return any(part != per_canvas[0] for part in per_canvas[1:])
 
 
 def report(whole: set[str], singles: set[str]) -> int:
@@ -145,7 +162,10 @@ def self_test() -> int:
     # The header's parse: two canvases, in the order the generator prints them.
     stated = "# derived: rasters (height, width) [(672, 1536), (768, 1344)]."
     assert rasters(stated) == [(672, 1536), (768, 1344)], rasters(stated)
-    print("ok   the union comparison, both mismatch directions, the header's parse")
+    # A raster that selects nothing makes every comparison above pass by construction.
+    assert selects([{"a\t1"}, {"a\t1"}]) is False
+    assert selects([{"a\t1"}, {"a\t1", "b\t2"}]) is True
+    print("ok   the union comparison, both mismatch directions, the parse, and the raster's effect")
     return 0
 
 
