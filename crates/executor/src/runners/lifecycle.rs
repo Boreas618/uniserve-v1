@@ -490,8 +490,18 @@ pub(crate) fn walk_capture(
         ops::capture::set_sink(Some(&mut recording));
         let walked = walk();
         ops::capture::set_sink(None);
-        let nodes = recording.nodes;
-        if let Some(failure) = recording.failure {
+        // The recorder holds a clone of the capture while the walk runs, and this thread holds the
+        // other: taking the table and the failure out by field would leave the clone alive to the
+        // end of the function, so `try_unwrap` below would refuse the only handle that can end the
+        // capture. Destructuring drops the recorder with it, which is what makes the capture ours
+        // again.
+        let Recording {
+            nodes,
+            failure,
+            capture: recorder,
+        } = recording;
+        drop(recorder);
+        if let Some(failure) = failure {
             return Err(failure.into());
         }
         walked?;
@@ -580,5 +590,29 @@ impl Recording {
     /// The node table, the recorder consumed.
     pub fn into_nodes(self) -> Nodes {
         self.nodes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capture taken through `walk_capture` comes back as a template. The recorder holds a clone
+    /// of the capture for as long as it lives, so a partly moved `Recording` would keep the capture
+    /// shared past the walk and `Rc::try_unwrap` would answer `the capture is still shared by its
+    /// recorder` - which is a bucket no generation can replay, reached after a whole forward.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_capture_through_the_walk_returns_its_template() {
+        let stream = platform::Stream::new(platform::DeviceId(0)).expect("a stream");
+        let walked = walk_capture(&stream, || Ok(())).expect("a walk that launches nothing");
+        assert!(
+            walked.nodes.is_empty(),
+            "a walk that launches nothing reported {} node(s)",
+            walked.nodes.len()
+        );
+        // The template itself: a capture that had another handle could not have been ended, so its
+        // existence is the assertion the test is for.
+        let _template = walked.template;
     }
 }
