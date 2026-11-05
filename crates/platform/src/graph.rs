@@ -703,8 +703,17 @@ impl Capture {
                 fresh.insert(*node as usize);
             }
         }
-        let mut queue: std::collections::VecDeque<Handle> =
-            frontier.iter().map(|(node, _)| *node).collect();
+        // The walk starts at the *previous* frontier as well as this one. An operation may add more
+        // than one node - a native module that launches two kernels, a reduction beside its main
+        // pass - and only the last of them is the frontier: the earlier ones are reached by walking
+        // downstream from where the operation began, and `seen` keeps a node from being collected
+        // twice.
+        let mut queue: std::collections::VecDeque<Handle> = self
+            .frontier
+            .iter()
+            .copied()
+            .chain(frontier.iter().map(|(node, _)| *node))
+            .collect();
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
