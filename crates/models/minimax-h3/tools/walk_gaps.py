@@ -238,7 +238,16 @@ def by_shape(args):
     }
 
     missing = sorted(set(shapes) - held)
-    canvas = [shape for shape in missing if shape[0] in CANVAS_CLASS]
+    # The rasters each walk states, so a shape absent from walks of two *different* canvases is
+    # not called canvas-class: the canvas cannot explain an absence that survives a change of
+    # canvas, and labelling it that way hides a row a store has to hold at every raster.
+    stated = {path: statements(path)[0] for path in args.walk}
+    canvas = [
+        shape
+        for shape in missing
+        if shape[0] in CANVAS_CLASS
+        and len({tuple(stated[path]) for path in shapes[shape]}) < 2
+    ]
     for operator, key in missing:
         where = sorted(shapes[(operator, key)])
         launched_at = sorted(
@@ -261,8 +270,15 @@ def by_shape(args):
                 for field, number in carried
             )
             mark = f"  SAMPLE-DEPENDENT ({asked})"
-        elif operator in CANVAS_CLASS:
+        elif operator in CANVAS_CLASS and len(
+            {tuple(stated[path]) for path in where}
+        ) < 2:
             mark = "  RASTER-DEPENDENT"
+        elif operator in CANVAS_CLASS:
+            mark = (
+                "  MISSING at every raster walked (the canvas cannot explain it:"
+                " absent at two or more)"
+            )
         else:
             # The element types the walk launched it at, in the verdict line: the comparison
             # normalises the type away, so the one field a row is *written* with is the one the
