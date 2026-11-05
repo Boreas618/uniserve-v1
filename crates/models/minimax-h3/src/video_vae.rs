@@ -1389,7 +1389,7 @@ fn frequencies(
 }
 
 impl VideoDecoder {
-    /// The tables one layout's decode reads, in [`table_bytes_into`]' order.
+    /// The tables one layout's decode reads, in the order the table walk writes them.
     pub fn tables(&self, latent_height: u32, latent_width: u32) -> Result<Vec<StateTable>> {
         table_specs(&self.config, latent_height, latent_width)
     }
@@ -1508,7 +1508,7 @@ impl VideoDecoder {
     ///
     /// `latents` is `[voxels, latent_channels]` — one row per latent voxel, in the raster order the
     /// caller's clip rows select — `positions` is `[3, rows]` F32, axis-major, the per-layout table
-    /// [`table_specs`] declares, and `out` is `[rows, out_channels · 4 · 16 · 16]`: one token's
+    /// the table walk declares, and `out` is `[rows, out_channels · 4 · 16 · 16]`: one token's
     /// 3×4×16×16 pixel block,
     /// which the caller scatters into the clip's raster. The rows are the voxels, then the register
     /// rows, then the trailing zero row.

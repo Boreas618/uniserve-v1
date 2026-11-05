@@ -387,7 +387,7 @@ pub fn tiled_rows(grid: (u32, u32, u32), shape: (u32, u32, u32), tiles: u32) -> 
 
 /// The packed row of each latent voxel a clip's decoder reads, in clip-then-raster order.
 ///
-/// The video VAE decodes one 25-frame clip at a time from [`CLIP_DECODE_LATENTS`] latent frames:
+/// The video VAE decodes one 25-frame clip at a time from `CLIP_DECODE_LATENTS` latent frames:
 /// clip `k` reads latent frames `[5k, 5k + 7)`, five that advance the timeline and two the next
 /// clip reads again, so a video's clips partition its latent frames and the last clip's input ends
 /// exactly at the last latent frame. Under dense attention the raster and packed orders agree; a
