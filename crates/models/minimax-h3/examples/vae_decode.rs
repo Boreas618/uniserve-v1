@@ -2403,9 +2403,12 @@ const CONTAINER_I16: u8 = 6;
 ///
 /// The trajectory a denoiser writes is the sample's own type, which is FP32, while this stage holds the
 /// VAE in the checkpoint's half precision: the pipeline therefore has one narrowing between the draw and
-/// the decode, and the reference makes the same one (`latents.to(dtype)` before its decoder). It is
-/// stated on the run's own line, never silent, and only the two float widths this pipeline uses convert -
-/// a file of any other type is refused by name rather than reinterpreted.
+/// the decode. **The reference makes no such call** - it runs its decoder body under
+/// `torch.autocast(dtype=the decoder's projection width)`, which narrows each operator's operands, and
+/// names the conversion nowhere. Our design replaces autocast with per-layer declared precision, so the
+/// narrowing is a step of ours: it is stated on the run's own line, never silent, and only the two float
+/// widths this pipeline uses convert - a file of any other type is refused by name rather than
+/// reinterpreted.
 fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     let from = match held {
         CONTAINER_F32 => 4_usize,
