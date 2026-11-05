@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::config::AttentionKind;
+use minimax_h3::config::offered_canvases;
 use minimax_h3::decoding::{ClipDecoder, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder, folded_input};
 use nn::{
@@ -1070,6 +1071,24 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
         .map_err(|_| Failure::message(format!("{}: too many rows", pixels_path.display())))?;
     let columns = u32::try_from(columns)
         .map_err(|_| Failure::message(format!("{}: too many columns", pixels_path.display())))?;
+    // **The canvas is the deployment's, and it is refused by name.** A row keyed for a raster no
+    // request can name is a cell no launch reads, so the six the deployment offers are the only
+    // extents this stage encodes - the same rule the walks apply to their `--rasters`.
+    let offered = offered_canvases();
+    if !offered
+        .iter()
+        .any(|canvas| canvas.height == rows && canvas.width == columns)
+    {
+        let names: Vec<String> = offered
+            .iter()
+            .map(|canvas| format!("{} ({}x{})", canvas.name(), canvas.width, canvas.height))
+            .collect();
+        return Err(Failure::message(format!(
+            "{}: {rows}x{columns} is not one of the deployment's offered canvases {}",
+            pixels_path.display(),
+            names.join(", ")
+        )));
+    }
     if !rows.is_multiple_of(ratio) || !columns.is_multiple_of(ratio) {
         return Err(Failure::message(format!(
             "{}: {rows} x {columns} pixels is not a multiple of the encoder's {ratio}-pixel spatial \
