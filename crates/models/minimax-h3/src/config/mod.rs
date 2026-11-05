@@ -180,9 +180,11 @@ impl Config {
                     // The export names its backend; the sparse parameters exist exactly when it does.
                     match contract.attention {
                         None => AttentionKind::Dense,
-                        Some(sparse) => {
-                            AttentionKind::sparse(sparse.tile, sparse.sparsity, sparse.reference_keep)?
-                        }
+                        Some(sparse) => AttentionKind::sparse(
+                            sparse.tile,
+                            sparse.sparsity,
+                            sparse.reference_keep,
+                        )?,
                     },
                 ),
             };

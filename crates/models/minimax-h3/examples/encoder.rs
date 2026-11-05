@@ -713,9 +713,13 @@ fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Genera
             installed += 1;
         }
     }
+    // The path is on the line as well as the counts: a stage that stops on a missing program is
+    // answered by *which* store it opened, and a store name in the runner's command is not the
+    // directory a harness resolved.
     println!(
-        "store: {installed} committed modules of {} operators",
-        operators.len()
+        "store: {installed} committed modules of {} operators from {}",
+        operators.len(),
+        root.display()
     );
     Ok(ops::Generation::new(1, entries))
 }
@@ -1084,11 +1088,15 @@ fn stage_encode(args: &Args) -> Result<()> {
         // while it was being written. The line names all three and the file's time, because a reader
         // who sees only "cannot be paired" will look for a defect in the pool instead.
         Some((names, sizes)) if names.len() != sizes.len() => println!(
-            "regions: {} published, {} measured, and the file holds no keys to pair them by - it was\n         \
-             written by an older build of `--stage weights`, by a run with another `--out`, or while it\n         \
-             was being written; run both stages from this binary into this directory\n         \
-             ({}, {})",
+            "regions: {} published, and the file cannot pair them by key - it holds {} keys and {} \
+             sizes, because it was written by an older build of `--stage weights`, by a run with \
+             another `--out`, or while it was being written; run both stages from this binary into \
+             this directory (a file older than the binary) ({}, {})",
             weights.published.len(),
+            // Both counts answer different questions: `0 keys` is a file from another build, and
+            // `N keys` below `M sizes` is one key published twice - two regions and one identity,
+            // which is the measurement's own arithmetic rather than a stale file.
+            names.len(),
             sizes.len(),
             measured.display(),
             written_time(&measured),
@@ -1293,6 +1301,16 @@ fn stage_encode(args: &Args) -> Result<()> {
         code_of(dtype),
         &payload,
     )?;
+    // The same numbers in the container the guild's comparison reads. `.h3t` keeps the checkpoint's
+    // own type; `.npy` is FP32 because that is what `numpy.save` writes, and widening BF16 or F16 to
+    // it is exact - so the twin is a second container for one computation, not a second computation.
+    let widened = minimax_h3::diagnosis::f32_bytes_of(dtype, &payload).map_err(Failure::message)?;
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("prompt_hidden.npy"),
+        &[rows, hidden],
+        &widened,
+    )
+    .map_err(Failure::message)?;
     let ids_json = ids
         .iter()
         .map(u32::to_string)

@@ -2955,6 +2955,9 @@ mod tests {
     /// the other available through the same public service.
     #[tokio::test]
     async fn concurrent_requests_spread_over_engine_cores() {
+        // Every wait in this test is bounded and named: an unbounded wait here
+        // reads as a suite that hung, with no line saying which of the seven
+        // answers the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
             let core = sim_core(EngineConfig::sim("sim-model"), SimEngine::new());
@@ -2972,39 +2975,77 @@ mod tests {
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
         let mut serving = Vec::new();
-        for _ in 0..2 {
-            let (stream, core) = engine.submit(text_request()).await.expect("submit request");
+        for index in 0..2 {
+            let (stream, core) = within(
+                10,
+                &format!("the {} request's admission", index + 1),
+                engine.submit(text_request()),
+            )
+            .await
+            .expect("submit request");
             streams.push(stream);
             serving.push(core);
         }
         assert_ne!(serving[0], serving[1]);
-        for stream in &mut streams {
-            while let Some(event) = stream.next().await {
-                if let Event::Finished { reason, .. } = event {
-                    assert_eq!(reason, proto::request::FinishReason::Eos);
-                    break;
+        for (index, stream) in streams.iter_mut().enumerate() {
+            within(10, &format!("the {} request's batch", index + 1), async {
+                while let Some(event) = stream.next().await {
+                    if let Event::Finished { reason, .. } = event {
+                        assert_eq!(reason, proto::request::FinishReason::Eos);
+                        break;
+                    }
                 }
-            }
+            })
+            .await;
         }
         let lost = Arc::clone(&clients[0]);
-        tokio::task::spawn_blocking(move || {
-            lost.shutdown();
-            lost.await_exit(Duration::from_secs(5)).unwrap();
-        })
+        within(
+            15,
+            "the lost replica's teardown",
+            tokio::task::spawn_blocking(move || {
+                lost.shutdown();
+                lost.await_exit(Duration::from_secs(5)).unwrap();
+            }),
+        )
         .await
         .unwrap();
         assert!(engine.is_healthy());
-        let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
+        let (mut stream, replica) = within(
+            10,
+            "the request after the lost replica",
+            engine.submit(text_request()),
+        )
+        .await
+        .unwrap();
         assert_eq!(replica, 1);
         let mut finished = false;
-        while let Some(event) = stream.next().await {
-            if let Event::Finished { reason, .. } = event {
-                assert_eq!(reason, proto::request::FinishReason::Eos);
-                finished = true;
+        within(10, "the surviving replica's batch", async {
+            while let Some(event) = stream.next().await {
+                if let Event::Finished { reason, .. } = event {
+                    assert_eq!(reason, proto::request::FinishReason::Eos);
+                    finished = true;
+                }
             }
-        }
+        })
+        .await;
         assert!(finished);
-        engine.shutdown().await.expect("shutdown replica");
+        within(10, "the replica's shutdown", engine.shutdown())
+            .await
+            .expect("shutdown replica");
+    }
+
+    /// Awaits `future`, failing by name when it does not answer within
+    /// `seconds`: a test whose unbounded wait hangs says which answer it never
+    /// got instead of outliving the suite's bound in silence.
+    async fn within<T>(
+        seconds: u64,
+        what: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(Duration::from_secs(seconds), future).await {
+            Ok(value) => value,
+            Err(_) => panic!("{what} did not answer within {seconds} s"),
+        }
     }
 
     /// Simulated executor whose teardown lasts until another task releases

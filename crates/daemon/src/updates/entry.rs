@@ -1062,7 +1062,7 @@ mod tests {
     /// gone is unavailable.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_status_reports_the_executing_engine_and_the_gpus_the_deployment_books() {
-        use storage::protocol::Priority::{Background, Warming};
+        use storage::protocol::Priority::Background;
 
         let mut executor = engine::SimExecutor::new(engine::SimEngine::new());
         let nodes = executor.report_ledgers();

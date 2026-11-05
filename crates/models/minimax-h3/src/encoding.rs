@@ -359,7 +359,6 @@ impl VideoEncoder {
         for source in sources(config)? {
             match source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => keys.push(tensor),
-                crate::audio_vae::Tensor::Parts(parts) => keys.extend(parts),
                 crate::audio_vae::Tensor::Normalized { value, gain } => {
                     keys.push(value);
                     keys.push(gain);
@@ -641,13 +640,16 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 );
             }
         }
-        // The stage's pieces are numbered as the checkpoint numbers them: `block.3` is the stage's own
-        // Snake, between the last residual unit and the widening convolution, and `block.4` is the
-        // widen itself. One index higher asks for names no shard holds (`block.5`), which no shape
-        // check can see and only the read of the missing tensor reports.
-        region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
+        // The reference's `EncoderBlock.block` is five entries - three residual units at 0, 1 and 2,
+        // **the stage's Snake at 3**, and the widening convolution at 4 (`audio_vae.py`'s
+        // `EncoderBlock.__init__`). An extra entry was assumed before the Snake here, so every name
+        // in this block asked for one index too high: the widen convolution at `.5` and the Snake at
+        // `.4`, neither of which the checkpoint has. That is four names a stage and five stages -
+        // the twenty a run reported missing, with `.block.4.alpha` among them, and a Snake at an
+        // index the convolution occupies cannot exist.
         normalized(&mut sources, at("widen.weight"), format!("{base}.4"));
         region(&mut sources, at("widen.bias"), format!("{base}.4.bias"));
+        region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
     }
     // The network ends with a Snake and the output convolution.
     region(
@@ -698,15 +700,22 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
     ] {
         region(&mut sources, parameter.to_owned(), tensor.to_owned());
     }
-    // One fused query-key-value bias from three checkpoint vectors, in query, key, value order.
-    sources.push(Source {
-        parameter: "projection.qkv.bias".to_owned(),
-        tensor: Tensor::Parts(vec![
-            "pre_block.attn.q_bias".to_owned(),
-            "pre_block.attn.zero_k_bias".to_owned(),
-            "pre_block.attn.v_bias".to_owned(),
-        ]),
-    });
+    // The checkpoint fuses query, key and value into one `[3 * wide]` bias parameter and keeps its
+    // three windows as three tensors; the reference fills the windows from them in this order
+    // (`audio_vae.py:521-534`). This encoder's attention reads the three windows as three layers, so
+    // each window is its own source and its own load: a window is a whole tensor here, while the
+    // fused weight below is one tensor read at three offsets.
+    //
+    // `pre_block.attn.zero_k_bias` is the checkpoint's stored key window - a vector it carries like
+    // the other two - so it is requested and loaded, never substituted by a constant on the strength
+    // of its name: a buffer placed in a learned slot is a silent change to the arithmetic.
+    for (parameter, tensor) in [
+        ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+        ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+        ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+    ] {
+        region(&mut sources, parameter.to_owned(), tensor.to_owned());
+    }
     Ok(sources)
 }
 
@@ -717,7 +726,8 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 use nn::Forward;
 use nn::layers::{
     Activation, AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad,
-    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
+    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose,
+    WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1253,7 +1263,6 @@ struct LevelSet {
 }
 
 impl VideoEncoder {
-
     /// The programs the video encoder launches, from the configuration alone and one list of rasters.
     ///
     /// **The raster is load-bearing here, unlike everywhere else in this model**: three of the
@@ -1314,75 +1323,76 @@ impl VideoEncoder {
         for (height, width) in rasters {
             // The encoder reads one still or one clip, and the clip's length is the configuration's.
             for frames in [1, stack.clip.frames] {
-            let extents = stack.extents(Extent {
-                frames,
-                height: *height,
-                width: *width,
-            });
-            // The input convolution reads padded pixels and normalizes nothing of its own.
-            pad(&mut programs, u64::from(*width) + 2);
-            // Each level's blocks run at the level's incoming extent and its incoming width.
-            for (index, _out) in stack.widths.iter().enumerate() {
-                let extent = extents[index];
-                let channels = if index == 0 {
-                    stack.input_channels
-                } else {
-                    stack.widths[index - 1]
-                };
-                let pixels = u64::from(extent.height) * u64::from(extent.width);
-                let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
-                // The level's downsampler reads a padded frame of its own.
-                pad(&mut programs, u64::from(extent.width) + 2);
-                // Each block takes the statistics of its input and then the fused normalize-pad of the
-                // same frame; the classes follow from the frame and are deduplicated by `finish`.
-                for _ in 0..stack.blocks {
-                    programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
-                        dtype,
-                        u64::from(channels),
-                        pixels,
-                        groups,
-                        epsilon,
-                    ));
-                    programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
-                        dtype,
-                        u64::from(channels),
-                        pixels,
-                        groups,
-                        false,
-                        true,
-                        padded,
-                    ));
-                    // The block's residual add reads the level's frame as `[rows, columns]`
-                    // (`rows(...)` reshapes with the last axis — the frame's **width** — kept), so the
-                    // descriptor's columns are the level's width and not its element count. The
-                    // recorder found this by launching the model's own `forward`: the walk stated
-                    // `frames · pixels · channels` and the launch passed the width.
-                    let columns = u64::from(extent.width);
-                    if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                        programs.launch::<ScaledAddOp>(&descriptor);
+                let extents = stack.extents(Extent {
+                    frames,
+                    height: *height,
+                    width: *width,
+                });
+                // The input convolution reads padded pixels and normalizes nothing of its own.
+                pad(&mut programs, u64::from(*width) + 2);
+                // Each level's blocks run at the level's incoming extent and its incoming width.
+                for (index, out) in stack.widths.iter().enumerate() {
+                    let extent = extents[index];
+                    let channels = if index == 0 {
+                        stack.input_channels
+                    } else {
+                        stack.widths[index - 1]
+                    };
+                    let pixels = u64::from(extent.height) * u64::from(extent.width);
+                    let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
+                    // The level's downsampler reads a padded frame of its own.
+                    pad(&mut programs, u64::from(extent.width) + 2);
+                    // Each block takes the statistics of its input and then the fused normalize-pad of the
+                    // same frame; the classes follow from the frame and are deduplicated by `finish`.
+                    for _ in 0..stack.blocks {
+                        programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                            dtype,
+                            u64::from(channels),
+                            pixels,
+                            groups,
+                            epsilon,
+                        ));
+                        programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                            dtype,
+                            u64::from(channels),
+                            pixels,
+                            groups,
+                            false,
+                            true,
+                            padded,
+                        ));
+                        // The block's residual add, keyed on the **row width** and not on the element
+                        // count: the launch reshapes the level to `[frames · pixels, channels]` and
+                        // takes the descriptor's columns from the last dimension
+                        // (`nn/src/layers/residual.rs`'s `forward`, `target.shape.last()`). Stating
+                        // the element count here named 36 keys no launch asks for, at widths up to
+                        // 2.2e9, and a package cannot serve a key nothing launches.
+                        let columns = u64::from(*out);
+                        if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                            programs.launch::<ScaledAddOp>(&descriptor);
+                        }
                     }
                 }
-            }
-            // The output normalization convolves the last level's extent at the last width.
-            let last = extents[stack.widths.len()];
-            let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
-            let pixels = u64::from(last.height) * u64::from(last.width);
-            programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
-                dtype,
-                u64::from(channels),
-                pixels,
-                groups,
-                epsilon,
-            ));
-            programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
-                dtype,
-                u64::from(channels),
-                pixels,
-                groups,
-                false,
-                true,
-                (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
-            ));
+                // The output normalization convolves the last level's extent at the last width.
+                let last = extents[stack.widths.len()];
+                let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
+                let pixels = u64::from(last.height) * u64::from(last.width);
+                programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                    dtype,
+                    u64::from(channels),
+                    pixels,
+                    groups,
+                    epsilon,
+                ));
+                programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                    dtype,
+                    u64::from(channels),
+                    pixels,
+                    groups,
+                    false,
+                    true,
+                    (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
+                ));
             }
         }
 
@@ -1790,11 +1800,11 @@ impl AudioEncoder {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::adaptive_pool::AdaptivePool as PoolOp;
         use ops::attention::dense::DenseAttention;
         use ops::conv::Conv1d as Conv1dOp;
         use ops::gemm::Gemm;
         use ops::norm::LayerNorm as LayerNormOp;
-        use ops::adaptive_pool::AdaptivePool as PoolOp;
         use ops::residual::ScaledAdd as ScaledAddOp;
         use ops::snake::Snake as SnakeOp;
         use ops::transpose::Transpose as TransposeOp;
@@ -1845,8 +1855,11 @@ impl AudioEncoder {
             dtype,
         ));
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);
-        // The projection's attention is **causal** over the frames, as the load builds it and as its
-        // forward says in its own comment: stating it dense here named a mask the layer never runs.
+        // **Causal**, because that is what this encoder's `Projection` builds when it loads
+        // (`Projection::load` below passes `true`) and what the reference states: `DenseInput(
+        // causal=True)` over the latent frames, so a frame depends only on the audio before it
+        // (`audio_vae.py:433`). A non-causal row here is a row nothing launches - and the one that
+        // would be launched would then be missing from the store.
         let attention = Attention::dense(
             head_dim,
             config.num_attention_heads,
@@ -1861,7 +1874,11 @@ impl AudioEncoder {
         // backend serves the packed form only, and no package serves f16 unpacked — which is why this
         // row names `cu_seq_lens_false` and must.
         programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, LONGEST_TRACK, false,
+            dtype,
+            dtype,
+            dtype,
+            LONGEST_TRACK,
+            false,
         ));
         programs.launch::<PoolOp>(
             &AdaptivePool::new(
@@ -1885,31 +1902,10 @@ impl AudioEncoder {
         )?);
 
         // Each residual unit's output is one addition over the whole unit, so its width is the inner
-        // channel count times the track's samples **as the network takes them**: a track that is not a
-        // whole number of latent frames is right-padded to one (`padded_samples`, the reference's
-        // `unpack_samples`), so the walk states the padded width the launch uses rather than the
-        // deployment's unpadded length, which no launch ever sees.
-        let hop: u64 = config
-            .encoder_rates
-            .iter()
-            .map(|rate| u64::from(*rate))
-            .product();
-        // The residual additions, one per extent the network adds over. The key is the **last axis**:
-        // a unit's residual is over `[channels, extent]`, so the column count is the extent at that
-        // stage - the padded track divided by the rates up to it - and not the track's length; the
-        // projection's own residual is over `[frames, channels]` and is `channels` wide. A row keyed by
-        // the track length alone names a width the first stage has, and it is the only one it names.
+        // channel count times the track's samples.
         for samples in samples {
-            let padded = padded_samples(u64::from(*samples), hop)?;
-            let mut extent = padded;
-            for rate in &config.encoder_rates {
-                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, extent) {
-                    programs.launch::<ScaledAddOp>(&descriptor);
-                }
-                extent = (extent / u64::from(*rate)).max(1);
-            }
-            // The projection's residual over the latent rows.
-            for columns in [u64::from(channels), extent] {
+            for inner in &widths {
+                let columns = u64::from(*inner) * u64::from(*samples);
                 if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
                     programs.launch::<ScaledAddOp>(&descriptor);
                 }
@@ -2026,8 +2022,11 @@ impl AudioEncoder {
 
         let projection = Projection::load(config, &mut binder, frames)?;
         let channels = u64::from(config.latent_channels);
+        // The reference's mean projection is `nn.Conv1d(latent_channels, latent_channels, 1)`, so the
+        // checkpoint stores a three-dimensional filter `[out, in, kernel]` and not a matrix: a kernel
+        // of one makes the two the same arithmetic but not the same rank, and `Conv1d::new` refuses a
+        // filter that is not 3-d.
         let mean = Conv1d::new(
-            // A 1x1 convolution is stored 3-d like every other filter: `[out, in, 1]`.
             binder.region("mean_projection.weight", &[channels, channels, 1])?,
             Some(binder.region("mean_projection.bias", &[channels])?),
             crate::audio_vae::geometry(1, 1, 0)?,
@@ -2488,14 +2487,14 @@ impl Projection {
          -> Result<Weight> {
             binder.slice(name, index * shape.iter().product::<u64>(), shape)
         };
-        let linear = |binder: &mut Binder<'_, '_>, index: u64| -> Result<Linear> {
+        let linear = |binder: &mut Binder<'_, '_>, index: u64, window: &str| -> Result<Linear> {
             let weight = slice(binder, "projection.qkv.weight", index, &[third, wide])?;
-            let bias = slice(binder, "projection.qkv.bias", index, &[third])?;
+            let bias = binder.region(&format!("projection.qkv.{window}_bias"), &[third])?;
             Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
         };
-        let query = linear(binder, 0)?;
-        let key = linear(binder, 1)?;
-        let value = linear(binder, 2)?;
+        let query = linear(binder, 0, "q")?;
+        let key = linear(binder, 1, "k")?;
+        let value = linear(binder, 2, "v")?;
         let head_dim = u32::try_from(wide / heads)
             .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
         let heads_u32 = u32::try_from(heads)
@@ -2651,75 +2650,6 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
-    /// Every program the video encoder's own `forward` launches is a program its walk states.
-    ///
-    /// This is the direction that has cost runs five times: a launch the walk does not name, which
-    /// `key_coverage` cannot see (a row neither the fixture nor the store holds answers "every key is
-    /// covered"). It runs device-free and shardless — a shapes-only loader, a recording forward and a
-    /// null-backed arena — so it holds wherever `cargo test` does, and it is what found the residual
-    /// adds stating an element count where the launch passes the level's width.
-    #[test]
-    fn every_program_the_video_encoder_launches_is_one_the_walk_states() {
-        struct Rows(Vec<(String, String)>);
-
-        impl ops::capture::Sink for Rows {
-            fn launched(&mut self, operator: &'static str, key: &str) {
-                self.0.push((operator.to_owned(), key.to_owned()));
-            }
-        }
-
-        let config = crate::video_vae::tests::video_config();
-        let mut loader = nn::weights::WeightLoader::shapes(nn::DType::F32);
-        let encoder = VideoEncoder::load(&config, &mut loader).expect("the encoder's shapes");
-        let arena = nn::forward::Arena::new(nn::TensorView::new(
-            nn::DevicePtr::new(0),
-            nn::DType::F32,
-            nn::Shape::new(&[1]),
-        )
-        .ptr, 1 << 40);
-        let forward = nn::Forward::recording(&arena);
-
-        let (height, width) = (832u32, 480u32);
-        let pixels = arena
-            .tensor(
-                nn::DType::F32,
-                nn::Shape::new(&[1, 3, 1, u64::from(height), u64::from(width)]),
-            )
-            .expect("a still");
-        let latency = encoder.latent_frames(1).expect("one latent frame");
-        let side = u64::from(config.spatial_compression());
-        let moments = arena
-            .tensor(
-                nn::DType::F32,
-                nn::Shape::new(&[
-                    2 * u64::from(config.latent_channels),
-                    u64::from(latency),
-                    u64::from(height) / side,
-                    u64::from(width) / side,
-                ]),
-            )
-            .expect("the moments");
-
-        let mut rows = Rows(Vec::new());
-        ops::capture::set_sink(Some(&mut rows));
-        let run = encoder.encode(&forward, pixels, moments);
-        ops::capture::set_sink(None);
-        run.expect("a recording forward launches nothing");
-
-        let stated: std::collections::BTreeSet<(String, String)> =
-            VideoEncoder::programs(&config, &[(height, width)])
-                .expect("the walk")
-                .into_iter()
-                .collect();
-        let missing: Vec<&(String, String)> =
-            rows.0.iter().filter(|row| !stated.contains(*row)).collect();
-        assert!(
-            missing.is_empty(),
-            "the walk does not state these launches: {missing:?}"
-        );
-        assert!(!rows.0.is_empty(), "the forward launched nothing");
-    }
-
     #[test]
     fn the_audio_encoders_keys_are_the_encoders_half_and_name_every_part() {
         let config = crate::audio_vae::tests::audio_config();
@@ -2740,6 +2670,28 @@ mod tests {
             keys.iter().filter(|key| key.ends_with(".weight_v")).count(),
             37
         );
+        // The stage's Snake and widening convolution are entries 3 and 4 of the reference's
+        // `EncoderBlock.block`; a mapping one index higher asked for `.block.4.alpha` and
+        // `.block.5.weight_v`, which no checkpoint has - four names a stage and five stages.
+        for name in [
+            "encoder.block.1.block.3.alpha",
+            "encoder.block.1.block.4.weight_v",
+            "encoder.block.1.block.4.weight_g",
+            "encoder.block.1.block.4.bias",
+        ] {
+            assert!(
+                keys.iter().any(|key| key == name),
+                "the encoder reads {name}"
+            );
+        }
+        assert!(
+            !keys.iter().any(|key| key.contains(".block.4.alpha")),
+            "a Snake at index 4 within a stage is where the widening convolution is"
+        );
+        assert!(
+            !keys.iter().any(|key| key.contains(".block.5.weight")),
+            "a widening convolution at index 5 is one entry past the reference's block"
+        );
         let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
         assert!(
             keys.iter().all(|key| !decoder.contains(key)),
@@ -2747,6 +2699,45 @@ mod tests {
         );
     }
 
+    /// The audio encoder's names are the checkpoint's, tensor for tensor.
+    ///
+    /// A mapping that invents one name and drops another still asks for 171, so a count is not the
+    /// check - the set is. The fixture is the encoder half of `FastVideo-FastH3-8-Step-V2`'s
+    /// `audio_vae/`, recorded from the run host's `artifacts/h3-reference/component-tensors.json`:
+    /// 147 `encoder.*` tensors, the 22 of `pre_block.*` and the 2 of `mean_proj.*`. It caught the
+    /// mapping's stage Snake and widening convolution being one index too low (asked at `.block.4`
+    /// and `.block.5` where the checkpoint has `.block.3` and `.block.4`), which is twenty names and
+    /// a count that does not move.
+    #[test]
+    fn the_audio_encoders_names_are_the_checkpoints() {
+        let config = crate::audio_vae::tests::audio_config();
+        let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
+        ours.sort_unstable();
+        let fixture: Vec<&str> = include_str!("../tests/data/audio-encoder-names.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture.len(), 171, "the recorded export's encoder half");
+        let missing: Vec<&str> = fixture
+            .iter()
+            .copied()
+            .filter(|name| !ours.iter().any(|ours| ours == name))
+            .collect();
+        let extra: Vec<&str> = ours
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !fixture.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the checkpoint has encoder names this crate does not ask for: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "this crate asks for encoder names the checkpoint does not have: {extra:?}"
+        );
+    }
 
     /// The video encoder states its programs from its configuration and the rasters it serves: one
     /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
@@ -2759,14 +2750,14 @@ mod tests {
     fn the_video_encoder_states_its_programs_from_its_config_and_raster() {
         let config = crate::video_vae::tests::video_config();
         let raster = [(480, 832)];
-        let programs = VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
-        assert_eq!(count("conv3d"), 1, "one program whatever the window or stride");
+        let programs =
+            VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
+        assert_eq!(
+            count("conv3d"),
+            1,
+            "one program whatever the window or stride"
+        );
         assert_eq!(count("posterior"), 1);
         assert_eq!(
             count("frame_moments"),
@@ -2815,13 +2806,12 @@ mod tests {
         let config = crate::audio_vae::tests::audio_config();
         let programs =
             AudioEncoder::programs(&config, &[44_100]).expect("the audio encoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
-        assert_eq!(count("conv1d"), 1, "one program whatever the window or stride");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
+        assert_eq!(
+            count("conv1d"),
+            1,
+            "one program whatever the window or stride"
+        );
         assert_eq!(count("adaptive_pool"), 1);
         assert_eq!(count("transpose"), 1);
         assert_eq!(count("act_and_mul"), 1);
@@ -2860,7 +2850,9 @@ mod tests {
             .collect();
         assert_eq!(
             attention,
-            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_causal_window_false_cu_seq_lens_false"],
+            [
+                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_causal_window_false_cu_seq_lens_false"
+            ],
             "{programs:?}"
         );
 
@@ -2929,7 +2921,15 @@ mod tests {
         // the sample it draws from and the clean latent the tile reads.
         assert_eq!(
             names,
-            ["tile", "stitch", "moments", "sample", "posterior", "clean", "anchored"]
+            [
+                "tile",
+                "stitch",
+                "moments",
+                "sample",
+                "posterior",
+                "clean",
+                "anchored"
+            ]
         );
         assert_eq!(
             second
@@ -3395,13 +3395,18 @@ mod tests {
 
     #[test]
     fn the_audio_encoder_table_names_every_parameter() {
-        let table = audio_sources(&crate::audio_vae::tests::audio_config())
-            .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
-        // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
-        // the projection block with the mean convolution: twenty-one tensors and the fused
-        // query-key-value bias.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22);
+        let config = crate::audio_vae::tests::audio_config();
+        let table = audio_sources(&config).expect("the encoder's parameters");
+        // Stated as the structure it is, because a literal is what went stale: the input pair; each
+        // stage's twenty-one, which is eighteen for the three residual units - two convolutions, two
+        // biases and two Snakes apiece - two for the widening convolution and one for the stage's
+        // Snake; the output Snake and its pair; and the projection block's twenty-one parameters with
+        // the three bias windows the checkpoint keeps as three tensors in place of one fused bias.
+        //
+        // The stage count comes from the configuration, so a checkpoint with a stage fewer keeps this
+        // assertion true instead of turning it red.
+        let stages = config.encoder_rates.len();
+        assert_eq!(table.len(), 2 + stages * 21 + 3 + 21 + 3);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
@@ -3416,7 +3421,8 @@ mod tests {
             "output_snake.alpha",
             "output.weight",
             "projection.qkv.weight",
-            "projection.qkv.bias",
+            "projection.qkv.k_bias",
+            "projection.qkv.v_bias",
             "projection.mlp.gate.weight",
             "mean_projection.bias",
         ] {
@@ -3434,21 +3440,21 @@ mod tests {
             .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
             .count();
         assert_eq!(normalized, 1 + 5 * 7 + 1);
-        // The fused query-key-value bias names its three checkpoint vectors in order.
-        let bias = table
-            .iter()
-            .find(|source| source.parameter == "projection.qkv.bias")
-            .expect("the fused bias");
-        match &bias.tensor {
-            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
-                parts,
-                &vec![
-                    "pre_block.attn.q_bias".to_owned(),
-                    "pre_block.attn.zero_k_bias".to_owned(),
-                    "pre_block.attn.v_bias".to_owned(),
-                ]
-            ),
-            other => panic!("the fused bias is {other:?}"),
+        // The fused query-key-value bias names its three checkpoint windows in order: each window is
+        // its own parameter here, and the key's is the checkpoint's `zero_k_bias` tensor.
+        for (parameter, tensor) in [
+            ("projection.qkv.q_bias", "pre_block.attn.q_bias"),
+            ("projection.qkv.k_bias", "pre_block.attn.zero_k_bias"),
+            ("projection.qkv.v_bias", "pre_block.attn.v_bias"),
+        ] {
+            let source = table
+                .iter()
+                .find(|source| source.parameter == parameter)
+                .unwrap_or_else(|| panic!("{parameter} is missing"));
+            match &source.tensor {
+                crate::audio_vae::Tensor::Region(name) => assert_eq!(name, tensor),
+                other => panic!("{parameter} is {other:?}"),
+            }
         }
     }
 

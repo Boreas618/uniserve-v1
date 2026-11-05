@@ -159,7 +159,7 @@ def attention_package(dtype: str) -> str:
     return "dense_attention/f32" if dtype == "f32" else "dense_attention/fa4"
 
 
-def text_calls(text: dict, dtype: str) -> list[Call]:
+def text_calls(text: dict, dtype: str, ulysses: int = 1) -> list[Call]:
     """Every descriptor call the text encoder's load and forward make."""
     hidden = text["hidden_size"]
     heads = text["num_attention_heads"]
@@ -173,9 +173,16 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
     # The widths count frequencies and the operator counts rotated elements, so each is doubled
     # (`text_encoder.rs::sections_of`); the cut is interleaved, which is the checkpoint's own.
     rotated_sections = "-".join(str(width * 2) for width in sections)
-    for degree in (1, 2):
-        if heads % degree or kv_heads % degree:
-            continue
+    # One key per degree the *deployment* binds: a degree-1 deployment never launches the split
+    # variants, and a fixture generated from a walk at degree 1 legitimately holds none of them -
+    # so deriving both would report a gap that no run can reach, which is a false red on the
+    # strongest instrument this half has.
+    degree = ulysses
+    if heads % degree or kv_heads % degree:
+        raise ValueError(
+            f"{heads} query and {kv_heads} key heads do not split over {degree} rank(s)"
+        )
+    if True:
         why = f"over {degree} tensor-parallel rank(s)"
         calls.append(
             (
@@ -627,8 +634,116 @@ def report(name: str, calls: list[Call], kernels: pathlib.Path) -> int:
     return missing
 
 
+def parse_key(key: str, fields: set[str]) -> dict[str, str] | None:
+    """One key as field -> value, or None when a segment matches no field of the operator.
+
+    The key is a flat `field_value_field_value...` string, and the field names are the ones the
+    operator's manifests declare, so the split is a left-to-right match against those names rather
+    than a split on `_`: `head_dim`, `cu_seq_lens`, `block_pixels` and `update_bias` carry
+    underscores, while every value is one token - a number, a bit pattern, a boolean, or a dashed
+    list such as `16-16-16`. A field name that is a prefix of another (`kv` against `kv_heads`) is
+    why the next field is found by searching for `_name_` and not for the name alone.
+    """
+    order = sorted(fields, key=len, reverse=True)
+    parsed: dict[str, str] = {}
+    position = 0
+    while position < len(key):
+        for field in order:
+            if not key.startswith(f"{field}_", position):
+                continue
+            start = position + len(field) + 1
+            boundary = len(key)
+            for candidate in order:
+                found = key.find(f"_{candidate}_", start)
+                if found >= 0:
+                    boundary = min(boundary, found)
+            parsed[field] = key[start:boundary]
+            # `boundary` is the separator's own index, so the next field starts one past it.
+            position = boundary if boundary == len(key) else boundary + 1
+            break
+        else:
+            return None
+    return parsed
+
+
+def keys_mode(path: pathlib.Path, kernels: pathlib.Path) -> int:
+    """Every row of a key file against the package cells that declare it.
+
+    A row is served when **one** manifest block declares every field the key carries: the blocks of
+    one package are alternatives, not a union, so a key taking field A from one block and field B
+    from another is a key no package compiles. This is the third question beside "does a walk launch
+    it" and "does the file hold it": a row can be in both and still have no cell.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        operator, _, key = line.partition("\t")
+        if not key:
+            print(f"  NOT A ROW: {line}", file=sys.stderr)
+            return -1
+        rows.append((operator, key))
+
+    blocks: dict[str, list[dict[str, set[str]]]] = {}
+    for operator in {operator for operator, _ in rows}:
+        manifests = sorted((kernels / operator).glob("*/package.toml"))
+        if not manifests:
+            print(f"  NO PACKAGE {operator}", file=sys.stderr)
+            return -1
+        blocks[operator] = [
+            block for manifest in manifests for block in descriptor_blocks(manifest)
+        ]
+
+    unserved = 0
+    for operator, key in rows:
+        fields = {field for block in blocks[operator] for field in block}
+        parsed = parse_key(key, fields)
+        if parsed is None:
+            print(f"  UNPARSED {operator}: {key}")
+            unserved += 1
+            continue
+        served = any(
+            all(field in block and value in block[field] for field, value in parsed.items())
+            for block in blocks[operator]
+        )
+        if served:
+            continue
+        unserved += 1
+        # The first field that no block declares is the actionable part: without it the key asks
+        # for a dimension the operator does not have, and the value list is the set that exists.
+        for block in blocks[operator]:
+            for field, value in parsed.items():
+                if field in block and value not in block[field]:
+                    near = ", ".join(sorted(block[field]))
+                    print(f"  NO CELL {operator}.{field} = {value}; the declared set is {near}")
+                    break
+            else:
+                continue
+            break
+        else:
+            absent = [field for field in parsed if not any(field in b for b in blocks[operator])]
+            print(f"  NO FIELD {operator}: {', '.join(absent) or 'the blocks disagree field by field'}")
+
+    # A row whose cell no manifest declares is not a row to delete: it is a requirement the package has
+    # not met yet, and the count is stated that way so nobody reads the gap as a defect in the list.
+    print(
+        f"{len(rows) - unserved} of {len(rows)} rows are declared by one package block; "
+        f"{unserved} wait on cells no manifest declares yet"
+    )
+    return 1 if unserved else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--rows",
+        type=pathlib.Path,
+        help=(
+            "a key file to check row by row against the package cells, instead of deriving this "
+            "half's calls from the configs: the third question beside the walk and the file"
+        ),
+    )
     parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
     parser.add_argument(
         "--dtype",
@@ -639,7 +754,17 @@ def main() -> int:
             "with the assumption printed"
         ),
     )
-    parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument("--kernels", type=pathlib.Path, default=pathlib.Path("crates/ops/kernels"))
+    parser.add_argument(
+        "--ulysses",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help=(
+            "the Ulysses degree the deployment runs: the text stack's attention and its fused "
+            "qk-norm rotation split over the degrees, so only the deployment's own keys are bound"
+        ),
+    )
     parser.add_argument(
         "--against",
         type=pathlib.Path,
@@ -671,16 +796,18 @@ def main() -> int:
     dtype = element_type(arguments.dtype, root / "text_encoder")
     text_config = json.loads(text_path.read_text())
     sections = [
-        ("text encoder", text_calls(text_config["text_config"], dtype)),
+        ("text encoder", text_calls(text_config["text_config"], dtype, arguments.ulysses)),
         ("vision tower", tower_calls(text_config["vision_config"], dtype)),
-        ("video VAE encoder", vae_calls(json.loads(vae_path.read_text()))),
+        # No video-encoder section: this tool derives the *text* stack's and the *tower*'s calls,
+        # which are the two components this half owns. The video encoder normalizes with
+        # `frame_moments` + `frame_norm_pad` rather than `layer_norm`, and its rows are generated by
+        # `VideoEncoder::programs` - the same function the store's list is built from - so restating
+        # them here produced four `layer_norm` calls the encoder never launches. A false miss is worse
+        # than a covered silence: it sends a reader to add rows for an operator nothing binds.
     ]
 
-    if arguments.keys:
-        emitted = sum(keys(calls) for _, calls in sections)
-        print()
-        print(f"{emitted} keys emitted")
-        return 0
+    if arguments.rows:
+        return keys_mode(arguments.rows, arguments.kernels)
 
     total = 0
     checked = 0

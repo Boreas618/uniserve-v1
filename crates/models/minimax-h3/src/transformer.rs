@@ -577,18 +577,17 @@ impl Transformer {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
+        use nn::layers::{Attention, Rotary};
         use ops::activation::ActAndMul as ActAndMulOp;
-        use ops::attention::dense::DenseAttention;
+        use ops::activation::Silu as SiluOp;
         use ops::attention::SparseAttention;
+        use ops::attention::dense::DenseAttention;
         use ops::gemm::Gemm;
         use ops::modulation::GatedResidual as GatedResidualOp;
         use ops::modulation::ModulatedRmsNorm as ModulatedOp;
-        use ops::activation::Silu as SiluOp;
         use ops::norm::RmsNorm as RmsNormOp;
-        use nn::layers::{Attention, Rotary};
         use ops::rope::Rotation;
         use ops::rope::{QkNormRope, RotaryFactors};
-
 
         let hidden = config.hidden_size;
         let head = config.head_dim;
@@ -604,33 +603,30 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
-            // The fine attention's key extent is the packed rows the program serves, which is what the
-            // model's own forward passes (`attention_sparse.rs:127`) and is whole tiles by
-            // construction: the stream holds the video, text, conditioning and audio tiles, so a bound
-            // counted in video tiles alone is short by the rest.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(rows),
+                u64::from(tiles),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
             // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
-            // The factor table's row is one channel per rotated **pair**, `rotated / 2` - the shape the
-            // descriptor states for the cosine and sine tables. A row of `rotated` is twice the table
-            // the kernel reads, and the stride is compiled in.
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated / 2)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
             );
-            programs.launch::<ops::segments::VsaZeroPadding>(&tiles_layer.zero_padding_descriptor(dtype));
+            programs.launch::<ops::segments::VsaZeroPadding>(
+                &tiles_layer.zero_padding_descriptor(dtype),
+            );
             programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
-            programs.launch::<ops::segments::VsaCompressPooled>(&tiles_layer.compress_descriptor(dtype));
+            programs.launch::<ops::segments::VsaCompressPooled>(
+                &tiles_layer.compress_descriptor(dtype),
+            );
             programs.launch::<ops::segments::VsaAddGatedTiles>(
                 &tiles_layer.add_gated_tiles_descriptor(dtype),
             );
             programs.launch::<ops::segments::VsaSelectTiles>(
-                &tiles_layer.select_descriptor()?,
+                &tiles_layer.select_descriptor(u64::from(tiles))?,
             );
             programs.launch::<SparseAttention>(&fine.descriptor_of(dtype));
         }
@@ -649,53 +645,35 @@ impl Transformer {
 
         // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
         // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
-        // types and the epilogue, not the width — and the activation's element type is **FP32**, because
-        // the AdaLN pair is pinned there at every deployment (`modulation.rs` refuses any other type).
-        // Stating the deployment's `dtype` here asked for a program the launch cannot make: the store
-        // held `silu f16/bf16 at 5376` while the model launches `silu f32 at 5376`, and the run stopped
-        // on the key it could not find.
-        programs.launch::<SiluOp>(&Silu::descriptor_of(
-            nn::DType::F32,
-            config.time_hidden_dim,
-        ));
+        // types and the epilogue, not the width.
+        programs.launch::<SiluOp>(&Silu::descriptor_of(dtype, config.time_hidden_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
-        // **The cache is FP32 whatever the stack's type is**: the timestep embedding, its activation
-        // (the `silu f32` row) and every projection matrix feeding it are the checkpoint's twelve FP32
-        // tensors, so a gather keyed by the deployment's type names a module the launch never asks for
-        // - which is how two of them read as unlaunched to the recorder while this walk stated them.
-        // The cache's own tables. The hidden-width table is **not** one of them: the model gathers
-        // that one at the stack's type (stated below), so a third entry here states a program the
-        // launch never asks for - the recorder made `logits_gather bf16 5376` and never `f32 5376`.
-        for columns in [18 * u64::from(hidden), 2 * u64::from(hidden)] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                nn::DType::F32,
-                columns,
-            )?);
-        }
-        // One table at the hidden width is the stack's own rather than the cache's - the recorded
-        // launch reads it at the deployment's type - so both are stated: the same gather at two
-        // element types is two programs, and a store holding one dies on the other.
-        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-            dtype,
-            u64::from(hidden),
-        )?);
-        // The step's own entry per group is an index row, not a table row.
-        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-            nn::DType::I32,
-            u64::from(groups.count()),
-        )?);
-
-        // The video stack's modulation carries two vectors and no gate, at the attention's width and
-        // at the six of the feed-forward's; the audio's carries six of each and a gate. The walk stated
-        // one form of each width's group and the recorder measured the three the stack launches.
-        for (gate, stride, update, retain) in [
-            (0, 2 * u64::from(hidden), false, false),
-            (0, interaction, false, false),
-            (interaction, interaction, true, true),
+        //
+        // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
+        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
+        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
+        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
+        // i32 for all three named two keys no launch binds.
+        for (dtype, columns) in [
+            (nn::DType::I32, u64::from(groups.count())),
+            (dtype, 18 * u64::from(hidden)),
+            (dtype, 2 * u64::from(hidden)),
         ] {
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
+        }
+
+        // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
+        // feed-forward's (both, retaining the normalized row for the projection).
+        //
+        // The gate stride is `0` for the first because `forward` builds that norm with `None` for its
+        // gate - there is no gate projection on the attention's normalization, which is what the
+        // reference's `modulation` omits. Stating the cache row's stride there named a key no launch
+        // binds while the key the launch binds had no row: one wrong number on each side of the same
+        // defect, and a store built from the statement would have missed the row a run needs.
+        for (update, retain, gate) in [(false, false, 0), (true, true, interaction)] {
             programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
                 dtype,
                 dtype,
@@ -703,8 +681,8 @@ impl Transformer {
                 hidden,
                 config.norm_eps,
                 gate,
-                stride,
-                stride,
+                interaction,
+                interaction,
                 update,
                 retain,
             ));
@@ -717,9 +695,18 @@ impl Transformer {
         )?);
 
         // The rotation and the attention, both over this rank's heads.
-        // The reference's rotation splits each axis in half (`uniserve/nn/functional/_rope.py:157`), so
-        // the sections are stated as they are; the table the step reads is I32, which is the layout's
-        // own declaration. Both were the walk's guess and the recorder measured against the launch.
+        //
+        // **The factors are built contiguous and the rotation applies them interleaved**, and the two
+        // are separate keys for that reason: one spectrum over the three axes is written as three
+        // blocks (`188b8b1d5`), while the per-head rotation pairs the halves of a block. Stating the
+        // factors as `interleaved` named a key no launcher binds - the deployment list's contiguous row
+        // was the launch's, and this statement was the one that disagreed.
+        //
+        // The positions are the **integer** table: `position_ids` is declared `i32` beside the tables
+        // it is indexed with (`denoiser.rs`), a coordinate being an index rather than a measured value,
+        // so a statement typing them F32 named a key no launch binds - and the failure that produced
+        // says so in its own words (`generation 1 has no kernel for rotary_factors descriptor
+        // dtype_f32_positions_f32_columns_48`). The row the file holds is `positions_i32`.
         let sections = nn::layers::Sections::new(&rotated_axes(config)).map_err(Error::from)?;
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
             rotated,
@@ -752,33 +739,31 @@ impl Transformer {
                 1.0 / (head as f32).sqrt(),
             )
             .map_err(Error::from)?;
-            programs.launch::<DenseAttention>(&attention.dense_descriptor(
-                dtype, dtype, dtype, rows, true,
-            ));
+            programs.launch::<DenseAttention>(
+                &attention.dense_descriptor(dtype, dtype, dtype, rows, true),
+            );
         }
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
-        // The gated activation reads the two halves of **one** packed projection: `projection_halves`
-        // keeps the packed row stride, so each half's stride between rows is twice its width, and the
-        // launch passes that stride (`GatedActivation::forward` takes it from the views). A key stating
-        // the half's width names a program the launch never makes.
-        let half = u64::from(config.intermediate_size);
-        // **`wide` is the element count, and a deployment whose bound crosses `u32::MAX` needs both
-        // programs.** The key's `wide` field is `elements >= u32::MAX` (`nn::layers::activation`), so a
-        // launch keys it from the *request's* rows while this walk states the deployment's bound: at
-        // the bound the stack keys `wide_true`, and every request smaller than 299 593 rows keys
-        // `wide_false`. A store holding only one of them serves one of the two and dies on the other,
-        // which is exactly how the recorder caught this - one row differing in that field alone.
-        for elements in [u64::from(rows) * half, half] {
-            programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
-                dtype,
-                half,
-                nn::layers::Activation::Silu,
-                elements,
-                true,
-            )?);
-        }
+        //
+        // **Both row strides are twice the width, because the two halves come from one packed
+        // projection.** `forward` reads them through `projection_halves`, which keeps the packed
+        // tensor's strides: a `[rows, 2 * intermediate]` buffer gives each half a row stride of
+        // `2 * intermediate`, and that is the number the kernel's descriptor carries - so this
+        // statement, the launch, and the deployment list's row are one value, not three. Stating the
+        // width here instead would have been a second, wrong answer to a question the launch already
+        // answers, and the walk that records the launch is what a store is built from.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(config.intermediate_size),
+            nn::layers::Activation::Silu,
+            packed_stride,
+            packed_stride,
+            u64::from(rows) * u64::from(config.intermediate_size),
+            true,
+        )?);
 
         Ok(programs.finish())
     }
@@ -1300,79 +1285,101 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
-            // A bound above `u32::MAX / intermediate_size` (299 593 rows), so the gated activation's
-            // two `wide` classes are distinct: below it the same program is keyed twice and deduped.
-            400_000,
+            32_000,
             Groups::of(true),
             &Partition::single(),
             0,
         )
         .expect("the stack's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("rms_norm"), 1);
-        // Two tables of the FP32 modulation cache (18·hidden and 2·hidden), the step's group index at
-        // I32, and the stack's own table at the hidden width in the deployment's type: the
-        // hidden-width table is **not** a cache table, which is one row the walk used to invent.
-        assert_eq!(count("logits_gather"), 4);
-        // Three forms: the video stack's two (no gate, at the attention's and the feed-forward's
-        // modulation widths) and the audio's one (gated, retaining the normalized row).
-        assert_eq!(count("modulated_rms_norm"), 3);
+        assert_eq!(count("logits_gather"), 3);
+        assert_eq!(count("modulated_rms_norm"), 2);
         assert_eq!(count("gated_residual"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("dense_attention"), 1);
         assert_eq!(count("rotary_factors"), 1);
-        // One gated activation in two `wide` classes: the key's `wide` is the element count, so a
-        // deployment whose bound crosses `u32::MAX` keys both from the same launch site.
-        assert_eq!(count("act_and_mul"), 2);
-        // The gated activation reads the two halves of **one packed projection**: the halves keep the
-        // packed row stride, so the key states twice the width, and `GatedActivation::forward` takes
-        // exactly that from the views. A key stating the half's width names a program no launch makes.
-        let activated: Vec<&str> = programs
-            .iter()
-            .filter(|(name, _)| name == "act_and_mul")
-            .map(|(_, key)| key.as_str())
-            .collect();
-        // Two classes, and the first proves the packed-view rule: the halves keep the packed row
-        // stride, so each half's stride between rows is twice its width. The second is the same
-        // program at the element count of one row, which is the class every request below
-        // `u32::MAX / width` rows keys (299 593 here).
-        assert_eq!(
-            activated,
-            vec![
-                concat!(
-                    "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
-                    "_value_stride_28672_wide_false_pdl_false_stepwise_true"
-                ),
-                concat!(
-                    "dtype_bf16_width_14336_block_1024_activation_silu_gate_stride_28672",
-                    "_value_stride_28672_wide_true_pdl_false_stepwise_true"
-                ),
-            ],
-            "the block's activation is the packed-view program at the stepwise recipe, in both \
-             `wide` classes because the deployment's bound crosses u32::MAX / width"
+        assert_eq!(count("act_and_mul"), 1);
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "act_and_mul" && key.contains("stepwise_true")),
+            "the block's activation is the stepwise recipe: {programs:?}"
         );
 
-        // The AdaLN activation is FP32 `(`modulation.rs` refuses a timestep pair in any other type),
-        // so its key states FP32 at the modulation's hidden width and **not** the deployment's dtype:
-        // a row keyed from the deployment names a program the launch cannot make, and a store built
-        // from it lacks the cell the model asks for. The width is the hidden one, not the timestep
-        // pair's output width — the activation sits between the two projections.
-        let silu: Vec<&str> = programs
+        // **The stated keys are the keys a launch binds**, and each of the four below is a defect this
+        // test would have caught: a `programs` statement that drifted from the `forward` beside it, so
+        // that a store built from the statement either held a program nothing launches or missed the
+        // one that runs.
+        //
+        // The activation reads the two halves of one packed `[rows, 2 * 14336]` projection, so both row
+        // strides are twice the width - `projection_halves` keeps the packed tensor's strides, and the
+        // launch passes `gate.strides[0]`.
+        assert!(
+            programs.iter().any(|(name, key)| name == "act_and_mul"
+                && key.contains("gate_stride_28672_value_stride_28672")),
+            "the block's activation reads a packed projection at twice the width: {programs:?}"
+        );
+        // The attention's normalization has **no gate** - `forward` builds it with `None` - so its
+        // gate stride is `0` while the feed-forward's reads the modulation cache. Stating the cache's
+        // stride for both named a key no launch binds.
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm" && key.contains("gate_stride_0_")),
+            "the attention's normalization carries no gate: {programs:?}"
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm"
+                    && key.contains("gate_stride_32256_")),
+            "the feed-forward's normalization is gated: {programs:?}"
+        );
+        // Of the three row gathers, only the per-token **group tag** is i32; the two modulation tables
+        // are gathered at the stack's own type, so a statement that typed them i32 named two keys no
+        // launch binds - and the element type is the one field a row is written with.
+        let gathers = programs
             .iter()
-            .filter(|(name, _)| name == "silu")
-            .map(|(_, key)| key.as_str())
-            .collect();
+            .filter(|(name, _)| name == "logits_gather")
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            silu,
-            vec!["dtype_f32_columns_5376_block_1024_pdl_false"],
-            "the AdaLN activation is one f32 program at 5376 columns"
+            gathers
+                .iter()
+                .filter(|key| key.contains("dtype_i32"))
+                .count(),
+            1,
+            "only the group tag is i32: {gathers:?}"
+        );
+        assert!(
+            gathers
+                .iter()
+                .any(|key| key.contains("dtype_bf16_columns_96768"))
+                && gathers
+                    .iter()
+                    .any(|key| key.contains("dtype_bf16_columns_10752")),
+            "the modulation tables are gathered at the stack's type: {gathers:?}"
+        );
+
+        // The rotation's factor table: **contiguous** sections over the three axes (one spectrum
+        // written in blocks) and **integer** positions, because `position_ids` is an `i32` table - a
+        // coordinate is an index, not a measured value. Stating either the other way named a key no
+        // launch binds, and the store had the launch's row both times.
+        let factors = programs
+            .iter()
+            .find(|(name, _)| name == "rotary_factors")
+            .map(|(_, key)| key.clone())
+            .expect("the stack states one factor table");
+        assert!(
+            factors.contains("positions_i32"),
+            "the factor table reads the integer position table: {factors}"
+        );
+        assert!(
+            factors.contains("sections_32-32-32") && !factors.contains("interleaved_true"),
+            "the factor table is contiguous over three equal axes: {factors}"
         );
 
         // A conditioned deployment's modulation cache has four groups where a text-only one has two,

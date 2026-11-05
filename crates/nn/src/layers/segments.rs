@@ -214,15 +214,12 @@ impl VsaTiles {
         }
     }
 
-    /// The descriptor one `vsa_select_tiles` launch takes.
-    ///
-    /// The key's `block` is the **deployment's** tile bound and not the request's live tile count: a
-    /// key carrying the request would put a store cell against every deployment shape, and the bound
-    /// is what the compiled program serves. The launch refuses a `scores` whose key extent exceeds the
-    /// bound by name rather than reading past it.
-    pub fn select_descriptor(&self) -> Result<segments::SelectTilesDescriptor> {
+    /// The descriptor one `vsa_select_tiles` launch takes, for `tiles` key tiles.
+    pub fn select_descriptor(&self, tiles: u64) -> Result<segments::SelectTilesDescriptor> {
         Ok(segments::SelectTilesDescriptor {
-            block: self.max_tiles.max(1).next_power_of_two(),
+            block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
+                Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
+            })?,
         })
     }
 
@@ -278,7 +275,15 @@ impl VsaTiles {
         epsilon: Float,
     ) -> segments::PrepareTilesDescriptor {
         let [heads, width, rotated, tile_rows, block_rows] = geometry;
-        let [query_row, query_head, key_row, key_head, value_row, value_head, factor] = strides;
+        let [
+            query_row,
+            query_head,
+            key_row,
+            key_head,
+            value_row,
+            value_head,
+            factor,
+        ] = strides;
         segments::PrepareTilesDescriptor {
             dtype,
             heads,
@@ -682,16 +687,11 @@ impl VsaTiles {
             ));
         }
         let tiles = scores.shape.dim(2);
-        if tiles > u64::from(self.max_tiles) {
-            return Err(Error::shape(
-                "VsaTiles",
-                format!(
-                    "{tiles} key tiles exceed the deployment's bound of {}",
-                    self.max_tiles
-                ),
-            ));
-        }
-        let descriptor = self.select_descriptor()?;
+        let descriptor = segments::SelectTilesDescriptor {
+            block: u32::try_from(tiles.max(1).next_power_of_two()).map_err(|_| {
+                Error::shape("VsaTiles", format!("{tiles} key tiles in one query tile"))
+            })?,
+        };
         let args = segments::SelectTilesArgs {
             scores,
             segments,
@@ -709,21 +709,14 @@ impl VsaTiles {
 mod tests {
     use super::*;
 
-    /// The selection's block is the **deployment's** tile bound's class, not the request's count: a
-    /// key carrying the request would put a store cell against every deployment shape, and the bound
-    /// is the width the compiled program serves.
+    /// The selection's block is the key-tile count rounded up to a power of two: the program's own
+    /// table width, so a walk that reads the accessor sees the same key the launch would.
     #[test]
-    fn the_select_block_is_the_deployments_bound_rounded_up() {
+    fn the_select_block_is_the_tile_count_rounded_up() {
         let layer = VsaTiles::with_default_tile(4, 128, 1e-6).unwrap();
-        let bound = layer.max_tiles;
-        assert_eq!(
-            layer.select_descriptor().unwrap().block,
-            bound.max(1).next_power_of_two()
-        );
-        // A request inside the bound is served by that one program, whatever its own count.
-        let mut bounded = VsaTiles::with_default_tile(4, 128, 1e-6).unwrap();
-        bounded = bounded.with_tile_bound(5).unwrap();
-        assert_eq!(bounded.select_descriptor().unwrap().block, 8);
+        assert_eq!(layer.select_descriptor(1).unwrap().block, 1);
+        assert_eq!(layer.select_descriptor(5).unwrap().block, 8);
+        assert_eq!(layer.select_descriptor(64).unwrap().block, 64);
         // The member table is the layer's own statement of the gate's slots.
         let compose = layer.compose_descriptor(DType::BF16, &[2, 5]);
         assert_eq!(compose.members, 2);

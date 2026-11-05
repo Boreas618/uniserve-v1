@@ -181,35 +181,40 @@ impl RefinerBlock {
         self.query.forward(f, rows.normed, rows.query)?;
         self.key.forward(f, rows.normed, rows.key)?;
         self.value.forward(f, rows.normed, rows.value)?;
-        // The query and key norms are per head: the checkpoint's weight is `head_dim` wide, and the
-        // reference reshapes the projection to `[batch, tokens, heads, head_dim]` before applying
-        // them (`conditioning.py:94-99`). A row's heads are contiguous, so flattening the head axis
-        // gives the same tensor - `[rows * heads, head_dim]` - and both the input and the output of
-        // the norm take that view. The head count is the model's rather than this rank's: the
-        // exchange has not happened yet, so every head of the row is here.
-        let head = u64::from(self.head_dim);
-        let per_head = |view: TensorView| {
-            view.reshape(Shape::new(&[
-                u64::from(local_rows) * u64::from(self.heads),
-                head,
-            ]))
-        };
-        self.query_norm
-            .forward(f, per_head(rows.query), per_head(rows.query_normed))?;
-        self.key_norm
-            .forward(f, per_head(rows.key), per_head(rows.key_normed))?;
+        // The query and key norms are **per head**: a projection writes `[rows, heads · head]` and
+        // the normalization is over one head's channels, so it reads the same buffer as
+        // `[rows · heads, head]`. Handing it the flat projection is a width the norm refuses
+        // (`RmsNorm::forward` checks the row's extent) - and it refused the whole refiner, which is
+        // why no forward of it had ever completed.
+        let head = self.head_dim;
+        let heads = self.local_heads;
+        self.query_norm.forward(
+            f,
+            rows.query.reshape(per_head(rows.query, head)),
+            rows.query_normed.reshape(per_head(rows.query, head)),
+        )?;
+        self.key_norm.forward(
+            f,
+            rows.key.reshape(per_head(rows.key, head)),
+            rows.key_normed.reshape(per_head(rows.key, head)),
+        )?;
 
         let (query, key, value) = self.exchange(f, &rows)?;
+        // The attention's operands are rank 3 - one axis of tokens, then the heads, then a head's
+        // channels (`ops/src/attention/dense.rs`) - while every buffer here is `[rows, inner]`. The
+        // reshape is by `heads`, which reads the token axis from the view's own element count: the
+        // exchanged path's rows are the whole sequence's and the local path's are this rank's.
         self.attention.attend_dense(
             f,
-            query,
-            key,
-            value,
+            query.reshape(with_heads(query, heads, head)),
+            key.reshape(with_heads(key, heads, head)),
+            value.reshape(with_heads(value, heads, head)),
             Some(visible.cu_seq_lens_q),
             Some(visible.cu_seq_lens_k),
             // One document per request over packed rows: every query sees the whole key set.
             visible.key_rows,
-            rows.attended,
+            rows.attended
+                .reshape(with_heads(rows.attended, heads, head)),
         )?;
         let attended = self.gather(f, rows.attended, &rows)?;
         self.output.forward(f, attended, rows.update)?;
@@ -271,16 +276,7 @@ impl TokenRefiner {
     /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
     /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
     /// gated activation, and the residual each block folds its two updates through.
-    ///
-    /// **Two element types, because the refiner has two.** Its working buffer is as wide as the
-    /// prompt features it is handed, so the block norms and the per-head ones key that type; its
-    /// final norm writes the stack's rows, and that write is keyed by the type it writes.
-    pub fn programs(
-        config: &TransformerConfig,
-        features: nn::DType,
-        working: nn::DType,
-        output: nn::DType,
-    ) -> Result<Vec<(String, String)>> {
+    pub fn programs(config: &TransformerConfig, dtype: nn::DType) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::activation::ActAndMul as ActAndMulOp;
         use ops::attention::dense::DenseAttention;
@@ -298,29 +294,23 @@ impl TokenRefiner {
         // pair. None carries a bias.
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
-            working,
+            dtype,
             WeightOrder::NxK,
             false,
-            working,
-            working,
+            dtype,
+            dtype,
         ));
 
         // Two normalization widths: the hidden state's and one head's, which the query and the key
         // normalize over.
-        // The hidden-state norm reads the incoming features, so its element type is theirs - the
-        // refiner's working buffer is the prompt's, and a block computes in its own type beside it
-        // (`Rows::reserve` allocates the block's buffers at `block.dtype` while `forward` hands the
-        // block the features' buffer). The per-head norms read the block's own projections.
-        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, features));
-        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(head, working));
+        for columns in [hidden, head] {
+            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, dtype));
+        }
 
-        // The identity residual each block folds both of its updates through. Its scale is one
-        // value (`identity()`, `[1]` F32), so the launch's descriptor is one column wide and the
-        // operator broadcasts it across the row: declaring the row's width here states a key the
-        // block never launches.
+        // The identity residual each block folds both of its updates through.
         programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            working,
-            IDENTITY_COLUMNS,
+            dtype,
+            u64::from(hidden),
             false,
         )?);
 
@@ -336,21 +326,17 @@ impl TokenRefiner {
         )
         .map_err(Error::from)?;
         programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(working, working, working, hidden, true),
+            &attention.dense_descriptor(dtype, dtype, dtype, hidden, true),
         );
-        // The halves of one packed projection: the stride they carry is twice their width.
-        programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
-            working,
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
             u64::from(config.intermediate_size),
             Activation::Silu,
+            u64::from(config.intermediate_size),
+            u64::from(config.intermediate_size),
             u64::from(inner),
             true,
         )?);
-
-        // The refinement's last write, at the output's type: `forward` ends with
-        // `self.norm.forward(f, working, out)`, so FP32 working rows are narrowed into the
-        // stack's own. A single type here stated `rms_norm f32 5376`, which no launch makes.
-        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, output));
 
         Ok(programs.finish())
     }
@@ -526,6 +512,22 @@ impl Rows {
     }
 }
 
+/// One flat `[rows, heads · head]` buffer as the shape a per-head norm reads: `[rows · heads, head]`.
+fn per_head(view: TensorView, head_dim: u32) -> Shape {
+    let head = u64::from(head_dim).max(1);
+    Shape::new(&[view.shape.numel() / head, head])
+}
+
+/// One flat `[rows, heads · head]` buffer as the shape the attention takes: `[tokens, heads, head]`.
+fn with_heads(view: TensorView, heads: u32, head_dim: u32) -> Shape {
+    let width = u64::from(heads) * u64::from(head_dim);
+    Shape::new(&[
+        view.shape.numel() / width.max(1),
+        u64::from(heads),
+        u64::from(head_dim),
+    ])
+}
+
 /// The attention scale of one head: `1 / sqrt(head_dim)`.
 fn scaling(head_dim: u32) -> f32 {
     1.0 / (head_dim as f32).sqrt()
@@ -539,20 +541,13 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
     }
 }
 
-/// The width of the identity residual's scale: one value, broadcast across the row.
-///
-/// The residual's descriptor is its scale's element count, so this is both the buffer the block
-/// loads and the `columns` its launch is keyed by; the two are written from one constant because a
-/// declared width that disagrees with the loaded buffer states a key nothing launches.
-const IDENTITY_COLUMNS: u64 = 1;
-
 /// The identity residual: every channel's update added unchanged.
 fn identity(loader: &mut WeightLoader<'_>) -> Result<ScaledResidual> {
     let one = 1.0f32.to_le_bytes();
     let scale = loader.constant(
         "refiner.identity_scale",
         nn::DType::F32,
-        Shape::new(&[IDENTITY_COLUMNS]),
+        Shape::new(&[1]),
         &one,
         "minimax-h3",
     )?;
@@ -586,4 +581,41 @@ fn projection(
 /// A normalization's learned gain.
 fn norm(loader: &mut WeightLoader<'_>, name: &str, columns: u64, eps: f32) -> Result<RmsNorm> {
     Ok(RmsNorm::new(vector(loader, name, columns)?, eps)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ops::tensor::{DevicePtr, Shape};
+
+    /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
+    fn view(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), ops::DType::BF16, Shape::new(shape))
+    }
+
+    /// The refiner's two flat buffers are read by two readers that want two different ranks.
+    ///
+    /// A per-head normalization is over one head's channels, so it reads a `[rows, heads · head]`
+    /// projection as `[rows · heads, head]`; the attention takes `[tokens, heads, head]`. Handing
+    /// either of them the flat projection is what stopped the refiner's forward from ever
+    /// completing - and a shape a reader refuses is not a shape a test can leave to a comment.
+    #[test]
+    fn the_refiners_flat_buffers_are_read_as_a_head_axis_or_as_one_norm_row() {
+        let (rows, heads, head) = (5u64, 56u64, 128u64);
+        let flat = view(&[rows, heads * head]);
+        let normed = per_head(flat, head as u32);
+        assert_eq!(normed.dims(), &[rows * heads, head]);
+        let attended = with_heads(flat, heads as u32, head as u32);
+        assert_eq!(attended.dims(), &[rows, heads, head]);
+        // Both views hold the buffer's own elements: a reshape, not a copy or a second allocation.
+        assert_eq!(normed.numel(), flat.shape.numel());
+        assert_eq!(attended.numel(), flat.shape.numel());
+        // And the head count the norm's rows carry is the projection's, not a deployment constant:
+        // under Ulysses the exchanged buffer is the whole sequence's rows of this rank's heads.
+        let exchanged = view(&[rows * 3, (heads / 2) * head]);
+        assert_eq!(
+            per_head(exchanged, head as u32).dims(),
+            &[rows * 3 * heads / 2, head]
+        );
+    }
 }

@@ -41,7 +41,7 @@ use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
-use minimax_h3::partition::{Component, Partition};
+use minimax_h3::partition::{Component, Components, Partition};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
 use nn::{
     Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
@@ -86,8 +86,23 @@ struct Args {
     /// The request's seed, which addresses the condition's draw.
     seed: u64,
     device: u32,
+    /// The element type the deployment loads at. `auto` is the design's default: the checkpoint's own
+    /// representation, nothing converted at load, and each request's pin decides.
+    dtype: Option<DType>,
     /// The program store `--stage encode` reads its modules from.
     store: Option<PathBuf>,
+    /// Which blocks this process places: the deployment's, or only the conditioner's.
+    place: Place,
+    /// Where the block-by-block diagnosis writes `<block>/<name>.npy` (`specs/worker.md` 10).
+    ///
+    /// These files are the **candidate's half** of a comparison whose reference half is
+    /// `tools/dump_*.py`; each is a tensor this stage already produced, written in the container the
+    /// python dumpers write, so a pair is a shape, a maximum difference and the index of the worst
+    /// element - never a summary word.
+    diag: Option<PathBuf>,
+    /// The commit this run computes at, recorded in the diagnosis page: a `.npy` with no commit
+    /// beside it is a number nobody can date.
+    commit: Option<String>,
 }
 
 fn run() -> Result<(), String> {
@@ -117,7 +132,11 @@ impl Args {
             image: 256,
             seed: 0,
             device: 0,
+            dtype: None,
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
+            place: Place::Deployment,
+            diag: None,
+            commit: std::env::var("H3_COMMIT").ok(),
         };
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
@@ -131,6 +150,21 @@ impl Args {
                 "--out" => args.out = PathBuf::from(value()?),
                 "--stage" => args.stage = value()?,
                 "--store" => args.store = Some(PathBuf::from(value()?)),
+                "--place" => {
+                    args.place = match value()?.as_str() {
+                        "deployment" => Place::Deployment,
+                        "conditioner" => Place::Conditioner,
+                        other => {
+                            return Err(format!(
+                                "`{other}` is not a placement; write deployment (every block this \
+                                 stage serves) or conditioner (the blocks a conditioned encode \
+                                 reads)"
+                            ));
+                        }
+                    };
+                }
+                "--diag" => args.diag = Some(PathBuf::from(value()?)),
+                "--commit" => args.commit = Some(value()?),
                 "--task" => {
                     args.task = match value()?.as_str() {
                         "fl2va" => VideoTask::FirstLastToVideoAudio,
@@ -192,6 +226,19 @@ impl Args {
                         .parse()
                         .map_err(|_| "`--device` takes an index".to_owned())?;
                 }
+                "--dtype" => {
+                    args.dtype = match value()?.as_str() {
+                        "auto" => None,
+                        "bf16" => Some(DType::BF16),
+                        "f16" => Some(DType::F16),
+                        "f32" => Some(DType::F32),
+                        other => {
+                            return Err(format!(
+                                "`{other}` is not an element type; write auto, bf16, f16 or f32"
+                            ));
+                        }
+                    };
+                }
                 other => return Err(format!("`{other}` is not a flag of this harness")),
             }
         }
@@ -215,9 +262,28 @@ fn task_name(task: VideoTask) -> &'static str {
 /// what a stage is for. Its output is the runner's prefix buffer, which is what a deployment passes
 /// between the two stages and what this harness states as a synthetic pattern (stage 4 owns the text
 /// encoder). Placing it here would reserve it and read nothing.
-fn stage_partition(config: &Config, task: VideoTask) -> Result<Partition, String> {
+fn stage_partition(config: &Config, task: VideoTask, place: Place) -> Result<Partition, String> {
     let serving = Partition::serving(config, task, 1, 1, 0, 0).map_err(show)?;
-    Ok(serving.placing(serving.blocks.without(Component::TextEncoder)))
+    let placed = serving.blocks.without(Component::TextEncoder);
+    Ok(serving.placing(match place {
+        Place::Deployment => placed,
+        // The blocks a **conditioned encode** reads and nothing else: the DiT, which carries both
+        // condition encoders, and the `latent_encoder` entry that names their directories. The two
+        // decoders are placed by a served deployment because it is one process; a diagnosis of the
+        // conditioner does not read them, and on a student checkpoint (`FastVideo-FastH3-8-Step-V2`
+        // holds no `audio_vae` weights) placing them would refuse the load for want of a block the
+        // encode never launches.
+        Place::Conditioner => Components::of([Component::Transformer, Component::LatentEncoder]),
+    }))
+}
+
+/// Which blocks this process places.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The deployment's own, minus the text encoder: what a served stage holds.
+    Deployment,
+    /// The conditioner's inputs only, for a diagnosis of the conditioned path.
+    Conditioner,
 }
 
 /// Every tensor name the checkpoint's index lists for one component directory.
@@ -272,7 +338,7 @@ fn weights(args: &Args) -> Result<(), String> {
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
 
-    let partition = stage_partition(&config, args.task)?;
+    let partition = stage_partition(&config, args.task, args.place)?;
     println!(
         "{} places {} blocks (the text encoder is the stage before this one): {}",
         task_name(args.task),
@@ -356,7 +422,7 @@ fn plan(args: &Args) -> Result<(), String> {
     let sidecars =
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
-    let partition = stage_partition(&config, args.task)?;
+    let partition = stage_partition(&config, args.task, args.place)?;
     let dit = config
         .denoisers
         .get(&Dit::Base)
@@ -365,6 +431,9 @@ fn plan(args: &Args) -> Result<(), String> {
     let arrangement = partition.arrangement(&dit).map_err(show)?;
     let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
 
+    // The deployment's type for the terms the refiner reads and writes; the condition views are FP32
+    // and are counted at 4 bytes below whatever this is.
+    let dtype = args.dtype.unwrap_or(DType::BF16);
     let condition = ConditionShape {
         role: ConditionRole::FirstFrame,
         frames: 1,
@@ -440,15 +509,32 @@ fn plan(args: &Args) -> Result<(), String> {
             println!("  {:<24} {:>12} elements", buffer.name, buffer.elements);
         }
     }
-    // The draws are FP32 and the text buffers the deployment's type, which the device stage reads
-    // from the checkpoint; on this host the case's own type is the export's, so both are four bytes
-    // unless a caller says otherwise.
+    // Every term states the element type it is counted at, because the two kinds differ here: the
+    // **source** the refiner reads and writes is the deployment's own (`dtype`, BF16 on this export
+    // and F16 on the preset), while **every condition view is FP32** - the text encoder's features,
+    // the piece's pixels and its anchoring draw, which `precision.py` pins FP32 at every preset. One
+    // term counted at 4 bytes for both kinds is a plan whose reader cannot tell which it overstated.
+    let width = dtype.bytes().unwrap_or(4);
+    // One line, two kinds: the terms the refiner reads and writes are the deployment's type, every
+    // condition view is FP32. Stating the two kinds once beats repeating the type on each term, and
+    // it is the line a reader needs when a figure looks half of what a block allocates.
+    let typed = match args.dtype {
+        Some(stated) => {
+            format!("the source at {stated} (stated by --dtype), the condition views at f32")
+        }
+        // `--stage plan` opens no checkpoint, so on a host with indexes and no shards `auto` cannot
+        // ask the export; it states the design's default rather than pass a guess off as the export's.
+        None => format!(
+            "the source at {dtype} (--dtype auto: this stage loads nothing, so it is the design's \
+             default), the condition views at f32"
+        ),
+    };
     let prefix_mib =
-        ((packing.zero_row() as u64 + 1) * u64::from(dit.transformer.hidden_size) * 4) >> 20;
-    let text_mib = (u64::from(one.text_rows)
-        * (u64::from(dit.transformer.hidden_size) + u64::from(config.text_encoder.hidden_size))
-        * 4)
-        >> 20;
+        ((packing.zero_row() as u64 + 1) * u64::from(dit.transformer.hidden_size) * width) >> 20;
+    let source_mib =
+        (u64::from(one.text_rows) * u64::from(dit.transformer.hidden_size) * width) >> 20;
+    let text_mib =
+        (u64::from(one.text_rows) * u64::from(config.text_encoder.hidden_size) * 4) >> 20;
     let pixel_mib = (u64::from(pixels.frames)
         * u64::from(pixels.height)
         * u64::from(pixels.width)
@@ -461,9 +547,10 @@ fn plan(args: &Args) -> Result<(), String> {
         * u64::from(dit.transformer.video_channels)
         * 4)
         >> 20;
+    println!("plan types: {typed}");
     println!(
-        "plan buffers: prefix {prefix_mib} MiB, text+source {text_mib} MiB, pixels {pixel_mib} MiB, \
-         draw {draw_mib} MiB"
+        "plan buffers: prefix {prefix_mib} MiB, source {source_mib} MiB, text features {text_mib} \
+         MiB, pixels {pixel_mib} MiB, draw {draw_mib} MiB"
     );
     println!(
         "plan arena total (the two plans alone): {} MiB",
@@ -512,7 +599,7 @@ fn encode(args: &Args) -> Result<(), String> {
     //    build, attaches the condition encoders to the denoiser block, and converts nothing.
     let checkpoint = Checkpoint::open(&args.root).map_err(show)?;
     let config = Config::read(&args.root, None).map_err(show)?;
-    let partition = stage_partition(&config, args.task)?;
+    let partition = stage_partition(&config, args.task, args.place)?;
     let dit = config
         .denoisers
         .get(&Dit::Base)
@@ -553,7 +640,7 @@ fn encode(args: &Args) -> Result<(), String> {
     // the timestep pair FP32, the AdaLN projections and the stack BF16 - so every weight is
     // published as stored and each request's pin decides. Nothing converts at load, so asking the
     // component for a single type here would refuse the export the model is designed to load.
-    let deployment: Option<DType> = None;
+    let deployment: Option<DType> = args.dtype;
     let mut published = 0_u64;
     let mut tensors = 0_u64;
     for component in partition.blocks.iter() {
@@ -627,8 +714,12 @@ fn encode(args: &Args) -> Result<(), String> {
     // condition rows, then one zero row. `zero_row` is the model's statement of where the last
     // begins, so nothing here re-derives it.
     let rows = u64::from(packing.zero_row()) + 1;
+    let mode = match deployment {
+        Some(stated) => format!("stated by --dtype {stated}"),
+        None => "auto, the checkpoint's own".to_owned(),
+    };
     println!(
-        "loaded: {dtype} is the stack's element type (auto, the checkpoint's own), hidden {hidden}, \
+        "loaded: {dtype} is the stack's element type ({mode}), hidden {hidden}, \
          text {} rows of capacity, \
          conditions {} rows of capacity, prefix {rows} rows",
         layout.text_rows, layout.condition_rows
@@ -808,8 +899,10 @@ fn encode(args: &Args) -> Result<(), String> {
     let text_bytes = pseudo_bytes(text_elements, dtype);
     upload_bytes(&stream, text, &text_bytes)?;
     upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
-    // The pixels are the encoder's input: `[frames, height, width, channels]`, normalised. A
-    // deterministic ramp stands in for an image and the case says so.
+    // The pixels are the encoder's input in the encoder's own order, `[channels, frames, height,
+    // width]`, normalised: the order `pixels.h3t` is written in below and the one the reference
+    // probe reads, so no transpose can sit between this ramp and the convolution. A deterministic
+    // ramp stands in for an image, and the case says so.
     let mut pixels_host = Vec::with_capacity(pixel_elements as usize * 4);
     for plane in 0..channels {
         for element in 0..(pixel_elements / channels) {
@@ -972,6 +1065,86 @@ fn encode(args: &Args) -> Result<(), String> {
         ],
         &pixels_host,
     )?;
+    // The block-by-block diagnosis (`specs/worker.md` 10): the **candidate's half** of a comparison
+    // whose reference half is `tools/dump_*.py`. Each file is a tensor this stage already produced,
+    // in the container the python dumpers write, under the block name the protocol's table gives - a
+    // shape, a maximum difference and the index of the worst element pair; never a pass or a fail.
+    if let Some(diag) = &args.diag {
+        let block = diag.join("latent_encoder");
+        // The page below writes a `case.json` into the same block directory, so naming the
+        // diagnosis' tree as the stage's own page would leave one of the two files silently
+        // overwritten - and the one that survived would carry the other's provenance.
+        if block == directory {
+            return Err(format!(
+                "`--diag {}` is this stage's own page directory ({}): the diagnosis and the page \
+                 write the same case.json there, so pass a separate tree",
+                diag.display(),
+                directory.display()
+            ));
+        }
+        std::fs::create_dir_all(&block).map_err(|error| format!("{}: {error}", block.display()))?;
+        minimax_h3::diagnosis::write_npy(
+            &block.join("pixels.npy"),
+            &[
+                channels,
+                u64::from(pixels.frames),
+                u64::from(pixels.height),
+                u64::from(pixels.width),
+            ],
+            &pixels_host,
+        )?;
+        minimax_h3::diagnosis::write_npy(
+            &block.join("condition_noise.npy"),
+            &[
+                u64::from(dit.transformer.video_channels),
+                u64::from(latent.frames),
+                u64::from(latent.height),
+                u64::from(latent.width),
+            ],
+            &draw,
+        )?;
+        let rows_bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        minimax_h3::diagnosis::write_npy(
+            &block.join("condition_rows.npy"),
+            &[rows, hidden],
+            &rows_bytes,
+        )?;
+        // A `.npy` carries no provenance, so the page beside it does: which commit computed these
+        // numbers and which checkpoint they were read from, or a reader cannot date one of them.
+        let page = format!(
+            "{{\n  \"block\": \"latent_encoder\",\n  \"candidate\": \"minimax-h3\",\n  \
+             \"commit\": \"{}\",\n  \"checkpoint\": \"{}\",\n  \"dtype\": \"{dtype}\",\n  \
+             \"task\": \"{}\",\n  \"files\": [\"pixels.npy\", \"condition_noise.npy\", \
+             \"condition_rows.npy\"],\n  \"shapes\": {{\"pixels\": [{}, {}, {}, {}], \
+             \"condition_noise\": [{}, {}, {}, {}], \"condition_rows\": [{}, {}]}},\n  \
+             \"reference\": \"tools/dump_encoder.py and tools/dump_vae_blocks.py, --out <dir>\",\n  \
+             \"note\": \"a conditioned request's draw is made inside the reference's runner, so the \
+             reference half of condition_noise.npy is not producible on the host\"\n}}\n",
+            args.commit.as_deref().unwrap_or("unstated"),
+            args.root.display(),
+            task_name(args.task),
+            channels,
+            u64::from(pixels.frames),
+            u64::from(pixels.height),
+            u64::from(pixels.width),
+            u64::from(dit.transformer.video_channels),
+            u64::from(latent.frames),
+            u64::from(latent.height),
+            u64::from(latent.width),
+            rows,
+            hidden
+        );
+        std::fs::write(block.join("case.json"), page)
+            .map_err(|error| format!("diag case.json: {error}"))?;
+        println!(
+            "diagnosis: {} written at commit {}",
+            block.display(),
+            args.commit.as_deref().unwrap_or("unstated")
+        );
+    }
     let case = format!(
         "{{\n  \"stage\": \"encode\",\n  \"task\": \"{}\",\n  \"canvas\": [{}, {}],\n  \
          \"frames\": {},\n  \"image\": {},\n  \"prompt_tokens\": {},\n  \"seed\": {},\n  \
