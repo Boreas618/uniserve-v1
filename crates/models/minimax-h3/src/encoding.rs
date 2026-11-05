@@ -966,6 +966,15 @@ impl Sample {
 }
 
 /// Read one convolution of the checkpoint: `from` input channels, `to` output, `kernel` taps.
+///
+/// **`channels_last` is the operand's storage, not a preference.** The kernel derives every
+/// operand's strides from the flag, so a convolution declared channels-last over a channels-first
+/// buffer is wrong numbers rather than a refusal (`nn::Conv3d::forward` refuses it). The reference's
+/// stride-1 padded convolutions read channels-last because PyTorch's `memory_format` runs them so;
+/// this encoder keeps every activation channels-first, because the tree has no permutation between
+/// the two orders and the reference states that the order selects the same algorithm and leaves the
+/// encoding unchanged. So the flag is `false` here, and it becomes `true` for the block
+/// convolutions and `conv_in` the day a permute exists to back it.
 fn convolution(
     loader: &mut WeightLoader,
     name: &str,
@@ -996,6 +1005,7 @@ fn convolution(
         // reads as neither, and a review of this crate took it for absent while it was here.
         /* tf32 */
         true,
+        /* channels_last */
         channels_last,
     )?)
 }
@@ -1031,7 +1041,7 @@ impl VideoEncoder {
             let bias = read(loader, &format!("{norm_name}.bias"), &[u64::from(channels)])?;
             Ok(Normalized {
                 norm: FrameNormPad::new(u64::from(groups), Some(weight), Some(bias), reflect)?,
-                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3], true)?,
+                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3], false)?,
                 channels,
                 groups,
                 epsilon,
@@ -1045,7 +1055,7 @@ impl VideoEncoder {
             stack.widths[0],
             3,
             [1; 3],
-            true,
+            false,
         )?;
         let mut width = stack.widths[0];
         let mut levels = Vec::with_capacity(stack.widths.len());
@@ -1352,20 +1362,19 @@ impl VideoEncoder {
 
         // Every convolution of the network — the input, each block's two, each level's downsampler, the
         // output and the two of the posterior head — takes the same key: element types and a bias. The
-        // **order** does not key the module, so one descriptor does not cover both: a channels-last
-        // convolution and a channels-first one launch the same module with different strides, and the
-        // walk states the two descriptors because the network launches both.
-        for channels_last in [true, false] {
-            programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
-                dtype,
-                dtype,
-                true,
-                dtype,
-                crate::audio_vae::geometry(3, 1, 1)?,
-                true,
-                channels_last,
-            ));
-        }
+        // **order** does not key the module either: a channels-last convolution and a channels-first
+        // one launch the same module with different strides. This encoder states one descriptor
+        // because it launches one order, and a channels-last convolution here would cost no row.
+        programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            crate::audio_vae::geometry(3, 1, 1)?,
+            true,
+            /* channels_last */
+            false,
+        ));
         // The head's sample: the moments and the noise, one operator.
         programs.launch::<PosteriorOp>(&Posterior::new().descriptor());
 
