@@ -13,7 +13,8 @@
 //! [`super::max_permuted_rows`] so they are invariant across a captured graph's replays.
 //!
 //! A route whose expert lies outside this rank's `[local_offset, local_offset + local_experts)`
-//! window is left out: its expanded entry receives `-1` in [`Args::expanded_to_permuted`], and the
+//! window is left out: the sort writes `-1` into its entry of [`Args::expanded_to_permuted`] as it
+//! counts, so a caller never pre-fills that map and no launch can leave an entry stale, and the
 //! expert-parallel exchange carries the route to the rank that owns it.
 
 use std::ffi::c_void;
@@ -66,7 +67,8 @@ pub struct SortArgs {
     pub tile_to_expert: TensorView,
     /// `[max_tiles]` i32: live rows of each tile.
     pub tile_to_limit: TensorView,
-    /// `[tokens, top]` i32: permuted row of each expanded route, `-1` when not on this rank.
+    /// `[tokens, top]` i32: permuted row of each expanded route, and `-1` for a route this rank does
+    /// not hold, which the sort writes. The buffer needs no initial value.
     pub expanded_to_permuted: TensorView,
     /// `[max_permuted_rows]` i32: expanded route of each permuted row.
     pub permuted_to_expanded: TensorView,
