@@ -1120,13 +1120,18 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         ..probe
     };
     let (layout, packing) = rules.layout(&asked).map_err(|error| error.to_string())?;
-    // The deployment's packed-row bound is the layout's own total for this request - the video
-    // and audio rows and the prefix - because a conditioned request carries the condition rows in
-    // the same packed sequence: a bound of the generated rows alone refuses at the first launch.
+    // **The bound is the deployment's packed row count, not this request's.** Passing the request's
+    // own total loaded the attention for exactly that one layout, so the first launch of a request
+    // with one more condition row refused by name - and raising the constant would have been the
+    // same defect with a luckier number. `request.bound` is `Layouts::rows_bound`, which serving
+    // reads and which the walk takes as its only source, so the harness cannot state a deployment
+    // the model cannot be asked to be. The launch still states this request's own packed rows, and
+    // they are inside the bound by construction.
+    let _ = packing.padded_tokens;
     let mut denoiser = Denoiser::load(
         network,
         arrangement,
-        packing.padded_tokens,
+        request.bound,
         &partition,
         &mut loader,
         None,
@@ -1160,6 +1165,24 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     let text = arena
         .tensor(dit_type, Shape::new(&[prefix, hidden]))
         .map_err(|error| error.to_string())?;
+    // **The refiner reads the prompt, not the prefix.** Its attention is loaded for the deployment's
+    // text capacity (`Arrangement::text_rows`, which is also the bound its own `refiner_cu_seq_lens_k`
+    // table states), and the reference's `TokenRefiner.forward` takes `[documents, rows, text_dim]` -
+    // the prompt alone. Handing it the whole prefix buffer gave its key projection every condition
+    // row and the anchor row, so its keys outran the bound it was loaded for by
+    // `condition_rows + 1` and the first conditioned launch refused by name. The conditioner writes
+    // below the prompt in the same buffer, so both views name the same allocation and no copy moves.
+    let prompt = |view: TensorView| {
+        let columns = view.shape.dim(1);
+        TensorView::with_strides(
+            view.offset_elements(0),
+            view.dtype,
+            Shape::new(&[u64::from(arrangement.text_rows), columns]),
+            nn::Strides::new(&[columns, 1]),
+        )
+    };
+    let source = prompt(source);
+    let text = prompt(text);
     // The condition's pixels at the canvas the request names, in the encoder's own channel order,
     // and the anchoring draw at its latent raster: the runner owns both, and the conditioner
     // patchifies the draw rather than reading rows from it.
