@@ -1498,8 +1498,26 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
+    ///
+    /// **One entry may be sliced any number of times**, which is why this does not go through
+    /// [`Self::entry`]: that guard refuses a parameter bound twice, and a fused matrix is bound once
+    /// and read in three windows. What the guard protects is a parameter read twice *whole* - two
+    /// layers sharing one checkpoint tensor - and [`Self::region`] and [`Self::normalized`] still
+    /// refuse it.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
+        let index = self
+            .table
+            .iter()
+            .position(|source| source.parameter == parameter)
+            .ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "{}: {}",
+                    parameter.to_owned(),
+                    "the checkpoint's audio decoder has no such parameter".to_owned()
+                ))
+            })?;
+        self.used[index] = true;
+        match self.table[index].tensor.clone() {
             Tensor::Region(tensor) => {
                 let weight =
                     self.loader
