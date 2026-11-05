@@ -171,6 +171,17 @@ impl Buffer {
         }
     }
 
+    /// The bytes the buffer occupies in an arena: its size rounded up to the arena's alignment.
+    ///
+    /// `plan::Arena::reserve` aligns every give-out to [`nn::forward::ALIGNMENT`], so a reservation
+    /// summed from raw sizes is short by up to `ALIGNMENT - 1` bytes **per buffer** - multiplied by
+    /// the number of buffers, which for the video decoder's sixteen is up to 4 KiB. The first run to
+    /// meet it was short by 64 bytes, exactly the padding of the two rotary tables (`1797 x 24 x 4`
+    /// is not a multiple of 256).
+    pub fn reservation(&self) -> u64 {
+        self.bytes().next_multiple_of(nn::forward::ALIGNMENT)
+    }
+
     /// The bytes the buffer occupies.
     pub fn bytes(&self) -> u64 {
         // A plan with an unknown element name is caught by [`Self::width`]; this answers for the four
@@ -229,6 +240,17 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
+/// The bytes a runner must reserve for `plan`: every buffer at the arena's alignment.
+///
+/// **A plan summed raw is short.** The arena aligns each give-out to [`nn::forward::ALIGNMENT`] and a
+/// plan's entries are not all multiples of it, so the reservation a runner makes has to be the
+/// aligned sum rather than the sum of the sizes. The failure this prevents is the smallest that has
+/// ever stopped a stage: `22081536 bytes requested at offset 368378880 of a 390460352-byte region`,
+/// 64 bytes past the end, because `1797 x 24 x 4` twice is 64 bytes of padding the sum left out.
+pub fn arena_reservation(plan: &[Buffer]) -> u64 {
+    plan.iter().map(Buffer::reservation).sum()
+}
+
 pub fn video_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
@@ -899,6 +921,39 @@ mod tests {
     /// them but the rotary tables, which the block allocates at F32 whatever it decodes at. A plan
     /// that spelled one type for both reserved half of what an FP32 decode asks the arena for, and the
     /// shortfall surfaced inside the clip as "cannot give out" rather than as a plan that was short.
+    /// A reservation summed raw is short by every buffer's padding - and the buffers that pad are
+    /// the ones whose element count is not a multiple of the alignment, which for this decoder is the
+    /// two rotary tables. The first device run to meet it was 64 bytes short of a 372 MiB arena.
+    #[test]
+    fn a_plan_is_reserved_at_the_arenas_alignment_not_at_its_raw_sum() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 16, 16);
+        let plan = video_arena(&config, &canvas, nn::DType::F32).expect("the plan");
+        let raw: u64 = plan.iter().map(Buffer::bytes).sum();
+        let reserved = arena_reservation(&plan);
+        let padded: u64 = plan
+            .iter()
+            .filter(|buffer| buffer.bytes() % nn::forward::ALIGNMENT != 0)
+            .count() as u64;
+        assert_eq!(
+            reserved,
+            plan.iter()
+                .map(|buffer| buffer.bytes().next_multiple_of(nn::forward::ALIGNMENT))
+                .sum::<u64>(),
+            "the reservation is each buffer at the arena's alignment"
+        );
+        assert!(reserved >= raw, "an aligned sum is never smaller");
+        assert_eq!(
+            (reserved - raw) % 256,
+            0,
+            "every byte of the difference is padding, {padded} buffer(s) of it"
+        );
+        assert!(
+            reserved > raw,
+            "this canvas pads: the rotary tables' element counts are not multiples of the alignment"
+        );
+    }
+
     #[test]
     fn the_video_arena_is_stated_in_the_decodes_own_element_type() {
         let config = crate::video_vae::tests::video_config();

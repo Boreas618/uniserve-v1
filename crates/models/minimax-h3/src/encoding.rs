@@ -641,10 +641,16 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 );
             }
         }
-        normalized(&mut sources, at("widen.weight"), format!("{base}.5"));
-        region(&mut sources, at("widen.bias"), format!("{base}.5.bias"));
-        // The stage's own Snake sits between the last unit and the widening convolution.
-        region(&mut sources, at("snake.alpha"), format!("{base}.4.alpha"));
+        // The reference's `EncoderBlock.block` is five entries - three residual units at 0, 1 and 2,
+        // **the stage's Snake at 3**, and the widening convolution at 4 (`audio_vae.py`'s
+        // `EncoderBlock.__init__`). An extra entry was assumed before the Snake here, so every name
+        // in this block asked for one index too high: the widen convolution at `.5` and the Snake at
+        // `.4`, neither of which the checkpoint has. That is four names a stage and five stages -
+        // the twenty a run reported missing, with `.block.4.alpha` among them, and a Snake at an
+        // index the convolution occupies cannot exist.
+        normalized(&mut sources, at("widen.weight"), format!("{base}.4"));
+        region(&mut sources, at("widen.bias"), format!("{base}.4.bias"));
+        region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
     }
     // The network ends with a Snake and the output convolution.
     region(
@@ -2643,6 +2649,28 @@ mod tests {
         assert_eq!(
             keys.iter().filter(|key| key.ends_with(".weight_v")).count(),
             37
+        );
+        // The stage's Snake and widening convolution are entries 3 and 4 of the reference's
+        // `EncoderBlock.block`; a mapping one index higher asked for `.block.4.alpha` and
+        // `.block.5.weight_v`, which no checkpoint has - four names a stage and five stages.
+        for name in [
+            "encoder.block.1.block.3.alpha",
+            "encoder.block.1.block.4.weight_v",
+            "encoder.block.1.block.4.weight_g",
+            "encoder.block.1.block.4.bias",
+        ] {
+            assert!(
+                keys.iter().any(|key| key == name),
+                "the encoder reads {name}"
+            );
+        }
+        assert!(
+            !keys.iter().any(|key| key.contains(".block.4.alpha")),
+            "a Snake at index 4 within a stage is where the widening convolution is"
+        );
+        assert!(
+            !keys.iter().any(|key| key.contains(".block.5.weight")),
+            "a widening convolution at index 5 is one entry past the reference's block"
         );
         let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
         assert!(
