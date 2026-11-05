@@ -60,9 +60,6 @@ use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use minimax_h3::Partition;
 
-/// The prompt capacity the denoiser's rows are stated at: the deployment's own text limit, and the
-/// one number in the deployment line that is not a function of the clip or the raster.
-const PROMPT_TOKENS: u32 = 4096;
 use nn::layers::{Linear, WeightOrder};
 use nn::weights::WeightRequest;
 use nn::forward::Arena;
@@ -90,6 +87,15 @@ struct Request {
     clip: u32,
     raster: (u32, u32),
     rows: u32,
+    /// The deployment's prompt capacity: the arrangement's text rows and the request's own text
+    /// length, which key the packed stream's offsets.
+    tokens: u32,
+    /// The deployment's audio track length in samples, which keys the encoder's rows.
+    track: u32,
+    /// The trajectory's element count as the deployment states it. No row is keyed by it - the
+    /// solver's residual is one column - so it is carried into the deployment line only, where a
+    /// reader comparing two deployments sees what each claimed.
+    elements: u64,
     extents: BTreeMap<String, (DType, Shape)>,
     /// The sparse deployment's served tile and keep rate, absent for a dense one.
     sparse: Option<(u32, f64, Option<f64>)>,
@@ -109,10 +115,18 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut component = String::from("all");
-    let mut dtype = DType::F16;
+    // No default: the deployment's element type is the deployment's statement, and a recorder that
+    // guessed it would produce a row set for a type nobody serves. The walk takes no default either.
+    let mut dtype: Option<DType> = None;
     let mut clip = 256u32;
     let mut raster = (480u32, 832u32);
     let mut rows = 32_000u32;
+    // The deployment's prompt capacity and audio track, which the walk states as `--tokens` and
+    // `--track`. They key the packed stream's offsets and the audio encoder's widths, so a
+    // comparison of two deploments must pass the same pair to both enumerations.
+    let mut tokens = 4096u32;
+    let mut track = 44_100u32;
+    let mut elements = 0u64;
     let mut against: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
     let mut sparse: Option<(u32, f64, Option<f64>)> = None;
@@ -124,12 +138,12 @@ fn run() -> Result<(), String> {
             "--root" => root = PathBuf::from(value()?),
             "--component" => component = value()?,
             "--dtype" => {
-                dtype = match value()?.as_str() {
+                dtype = Some(match value()?.as_str() {
                     "f16" => DType::F16,
                     "bf16" => DType::BF16,
                     "f32" => DType::F32,
                     other => return Err(format!("unknown dtype {other}")),
-                }
+                })
             }
             "--clip" => clip = value()?.parse().map_err(|_| "clip is a count of frames")?,
             "--raster" => {
@@ -141,6 +155,9 @@ fn run() -> Result<(), String> {
                 );
             }
             "--rows" => rows = value()?.parse().map_err(|_| "--rows is a count")?,
+            "--tokens" => tokens = value()?.parse().map_err(|_| "--tokens is a count")?,
+            "--track" => track = value()?.parse().map_err(|_| "--track is a count of samples")?,
+            "--elements" => elements = value()?.parse().map_err(|_| "--elements is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
             "--extents" => extents = Some(PathBuf::from(value()?)),
             // `tile,sparsity[,reference_keep]`: the bound the compression reduces over is the
@@ -177,6 +194,7 @@ fn run() -> Result<(), String> {
         return list_extents(&root, &component);
     }
 
+    let dtype = dtype.ok_or("--dtype is the deployment's own element type and has no default")?;
     let table = match extents.as_deref() {
         Some(path) => read_extents(path)?,
         None => BTreeMap::new(),
@@ -187,6 +205,9 @@ fn run() -> Result<(), String> {
         clip,
         raster,
         rows,
+        tokens,
+        track,
+        elements,
         extents: table,
         sparse,
     };
@@ -242,13 +263,14 @@ fn run() -> Result<(), String> {
     // device and no shard, which is what makes the walk the second enumeration rather than the first.
     println!(
         "# MiniMax-H3 programs for these clip lengths: [{}], raster sizes: [({}, {})], prompt lengths: [{}], \
-         packed rows: [{}], sparse attention: {sparse:?}, tensor-parallel degree 1, ulysses degree 1 \
-         - recorded from the model's own forward at {}",
+         packed rows: [{}], trajectory elements: [{}], sparse attention: {sparse:?}, \
+         tensor-parallel degree 1, ulysses degree 1 - recorded from the model's own forward at {}",
         request.clip,
         request.raster.0,
         request.raster.1,
-        PROMPT_TOKENS,
+        request.tokens,
         request.rows,
+        request.elements,
         request.root.display(),
         sparse = request.sparse
     );
@@ -334,8 +356,12 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
 
-    let hop = encoder.hop();
-    let length = hop * 64;
+    // The deployment's own track length, so the widths this harness records are the ones the walk
+    // states for the same deployment rather than one window of 64 hops.
+    // The deployment states its track's length; the network takes it right-padded to a whole number of
+    // latent frames, which is the caller's own rule (`padded_samples`) and not a rounding here.
+    let length = minimax_h3::encoding::padded_samples(u64::from(request.track), encoder.hop())
+        .map_err(|error| error.to_string())?;
     let samples = arena
         .tensor(DType::F32, Shape::new(&[1, 1, length]))
         .map_err(|error| error.to_string())?;
@@ -370,7 +396,8 @@ fn audio_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
 
-    let frames = 64u32;
+    // The clips the deployment serves are the decoder's buckets, as the walk states them.
+    let frames = request.clip;
     let latent_channels = u64::from(config.latent_channels);
     let latents = arena
         .tensor(
@@ -731,7 +758,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let config_hidden = network.transformer.hidden_size;
     // The two prefix capacities are the request's own: a prompt of the walk's length and one unit of
     // condition rows, which a `t2va` request leaves empty. The bound is the deployment's.
-    let arrangement = Arrangement::new(&network, 4096, 64, 1)
+    let arrangement = Arrangement::new(&network, request.tokens, 64, 1)
         .map_err(|error| error.to_string())?;
     // The layout rule is the same statement the network loads with: the tables a step reads are the
     // rule's, and a harness that built its own would be a second source of truth for them.
@@ -763,7 +790,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
         first_frames: 0,
         last_frames: 0,
         references: 0,
-        text_tokens: PROMPT_TOKENS,
+        text_tokens: request.tokens,
         conditions: &[],
         vision_spans: &[],
     };
@@ -833,6 +860,12 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     // The request's own noise draw runs first: one Philox stream per request, the conditions' draws
     // then the video's then the audio's. A harness that hands the network pre-made latents never
     // launches it, which is why the row was stated and unlaunched until now.
+    // The AdaLN cache is filled once after load - the timestep pair, its activation and the
+    // projections - and a harness that only calls `denoise` reads a cache nothing wrote, so its
+    // launches (the time embedder's `silu` among them) are stated and unrecorded.
+    denoiser
+        .prepare_constants(&forward, &[])
+        .map_err(|error| error.to_string())?;
     denoiser
         .draw_noise(&forward, nn::capability::Seed(0), layout, latents)
         .map_err(|error| error.to_string())?;
