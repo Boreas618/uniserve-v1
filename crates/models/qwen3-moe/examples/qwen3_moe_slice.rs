@@ -56,6 +56,11 @@
 //! loader published by the element type each weight arrived in, beside what the checkpoint's index
 //! declares, and refuses a checkpoint whose packed tensors arrived as none.
 //!
+//! `--preflight` prints every key the run would ask the store for, in the deployment list's own
+//! `operator<TAB>key` form, and stops: it is host arithmetic over that list and the checkpoint's
+//! declaration, so a list that is short a program reads as coverage rather than as the first
+//! operator to launch.
+//!
 //! What is deliberately *not* here: capture, buckets, request slots, multi-request batching and the
 //! serve path. This is a numerics harness. Its results are for comparing against a reference, and
 //! its failures are for naming the operator and the key that produced them.
@@ -175,6 +180,13 @@ struct Args {
     kv_pages: KvPages,
     /// What a difference from the reference means for this run.
     divergence: Divergence,
+    /// Print every key this run would ask the store for, and stop.
+    ///
+    /// Host arithmetic over the deployment's list and the checkpoint's declaration: which programs a
+    /// run of this shape launches, and which class each packed product is compiled for, are facts
+    /// about files. Discovering a gap in the list should not cost a driver, and a gap reported that
+    /// way reads as coverage rather than as the first operator to launch.
+    preflight: bool,
 }
 
 /// What a run does at the first id that differs from the reference.
@@ -271,6 +283,7 @@ impl Args {
         let mut expect = None;
         let mut kv_pages = KvPages::Bf16;
         let mut divergence = Divergence::Stop;
+        let mut preflight = false;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -325,6 +338,7 @@ impl Args {
                     })?);
                 }
                 "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+                "--preflight" => preflight = true,
                 "--divergence" => {
                     let name = value("--divergence")?;
                     divergence = match name.as_str() {
@@ -391,7 +405,8 @@ impl Args {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --generate, --greedy, --expect, --divergence, --kv-pages, --dump or \
+                         --generate, --greedy, --expect, --divergence, --kv-pages, --dump, \
+                         --preflight or \
                          --reference"
                     )));
                 }
@@ -464,12 +479,16 @@ impl Args {
             expect,
             kv_pages,
             divergence,
+            preflight,
         })
     }
 }
 
 fn run() -> Result<()> {
     let args = Args::parse()?;
+    if args.preflight {
+        return preflight(&args);
+    }
     check_dump_dir(&args)?;
     match args.stage {
         Stage::Weights => stage_weights(&args),
@@ -870,16 +889,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
         )
     })?;
-    let tokens: Vec<i32> = args
-        .tokens
-        .split(',')
-        .filter(|part| !part.trim().is_empty())
-        .map(|part| {
-            part.trim().parse().map_err(|_| {
-                Failure::message(format!("--tokens takes comma-separated ids, not `{part}`"))
-            })
-        })
-        .collect::<Result<_>>()?;
+    let tokens = prompt_ids(&args.tokens)?;
     if tokens.is_empty() {
         return Err(Failure::message(
             "stage `decode` needs the prompt's token ids: --tokens 1,2,3 (the reference records \
@@ -2797,6 +2807,54 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 }
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
+/// The prompt's token ids, as `--tokens` states them.
+fn prompt_ids(text: &str) -> Result<Vec<i32>> {
+    text.split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim().parse().map_err(|_| {
+                Failure::message(format!("--tokens takes comma-separated ids, not `{part}`"))
+            })
+        })
+        .collect()
+}
+
+/// Every key this run would ask the store for, printed in the deployment list's own format.
+///
+/// `--preflight` answers one question without a device: **which** of the deployment list's programs
+/// a run of this shape installs. A stage's packed products are compiled per row class, so the answer
+/// is a class fact and not a count, and it is printed in the list's own form so it can be compared
+/// with a built store.
+///
+/// It does not answer the other half - whether the list holds what the model compiles at all -
+/// because it filters the list and cannot see past it. That is `examples/keys_check.rs`'s question,
+/// which walks the model's own enumeration (`qwen3_moe::keys::keys`) against the same file.
+fn preflight(args: &Args) -> Result<()> {
+    let declared = Representation::read(&args.checkpoint)?;
+    let count = u64::try_from(prompt_ids(&args.tokens)?.len()).unwrap_or(0);
+    let encoded = Encoded {
+        declared: declared.is_encoded(),
+        tokens: Some(count),
+        generated: args.generate.map(|_| 1),
+    };
+    let mut printed: BTreeSet<(String, String)> = BTreeSet::new();
+    for (stage, sampling, encoded) in [
+        // The embedding stage launches its own operators and no packed product, which is what
+        // `Encoded::default()` states; the decode stage launches the prompt's prefill and one row
+        // per continuation, so both packed row classes are required.
+        (Stage::Embedding, false, Encoded::default()),
+        (Stage::Decode, args.generate.is_some(), encoded),
+    ] {
+        for (operator, key) in needed_keys(Path::new("."), stage, sampling, args.kv_pages, encoded)?
+        {
+            if printed.insert((operator.clone(), key.clone())) {
+                println!("{operator}\t{key}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn needed_keys(
     store_root: &Path,
     stage: Stage,
