@@ -40,11 +40,11 @@
 //! because an empty region is a step that runs on zeros.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ipc::RequestKey;
 use ops::TensorView;
-use platform::DeviceId;
+use platform::{DeviceId, Event};
 
 use crate::Result;
 use crate::arena::StreamId;
@@ -105,10 +105,16 @@ impl Product {
 pub trait Products: Send + Sync {
     /// Publishes `request`'s `kind` product from `view`.
     ///
-    /// `view` is storage on `device`, and the bytes are copied out on `stream` — the producing
-    /// runner's own stream, at the end of the call that computed them. The contract is that the copy
-    /// is issued before this returns and that a later `borrow` on any device reads the bytes it
-    /// covered.
+    /// `view` is storage on `device` and `stream` is the producing runner's own stream, named by the
+    /// id a runner computes from it. `written` is that stream's write as an event
+    /// ([`written_on`]) — **a producer that expects a reader on another stream or device must state
+    /// it**, because that reader's copy is ordered by waiting on it; a producer publishing for its
+    /// own stream alone may pass `None`, and a crossing read of such a product is refused by name
+    /// rather than issued unordered.
+    ///
+    /// The ids and not the stream itself is what keeps this call free of a device: the store's rules
+    /// — which placements may borrow, which must copy, what a mismatch says — are then testable
+    /// where no GPU exists.
     ///
     /// A product already published by this request is replaced: a trajectory is published step by
     /// step, and the reader wants the latest.
@@ -118,14 +124,17 @@ pub trait Products: Send + Sync {
         kind: Product,
         device: DeviceId,
         stream: StreamId,
+        written: Option<Arc<Event>>,
         view: &TensorView,
     ) -> Result<()>;
 
-    /// Borrows `request`'s `kind` product for a call on `device`.
+    /// Borrows `request`'s `kind` product as a view a call on `stream` may read **directly**.
     ///
-    /// When the product lives on another device of this process, the copy is issued on `stream` and
-    /// ordered after the producer's write, so the returned view is readable by work this runner
-    /// issues on that stream afterwards.
+    /// This is the zero-copy answer, and it is only given where the producer's write is already
+    /// ordered before the reader's work - the same device and the same stream. Any other placement
+    /// is refused by name, and [`Products::copy_into`] is the call for it: a caller that wants the
+    /// bytes somewhere else asks for a copy it can order, rather than a view whose ordering it
+    /// cannot see.
     ///
     /// `None` is the answer for a product no call of `request` produced: the caller refuses by name
     /// rather than reading a region nobody wrote.
@@ -136,6 +145,44 @@ pub trait Products: Send + Sync {
         device: DeviceId,
         stream: StreamId,
     ) -> Result<Option<TensorView>>;
+
+    /// Whether `request` has a `kind` product, **whatever device and stream it lives on**.
+    ///
+    /// Presence is a fact about the store; placement is a fact about where a reader wants it. A
+    /// runner's step check asks the first and only the copy answers the second, so a product on
+    /// another device is *held* - a deployment that puts the text encoder on its own GPU would
+    /// otherwise refuse every denoising step with "nothing produced it".
+    fn holds(&self, request: RequestKey, kind: Product) -> bool;
+
+    /// The bytes `request`'s `kind` product holds, or `None` when no call produced it.
+    ///
+    /// A reader that must place the bytes rather than read them where they lie needs the length
+    /// before it copies - the conditioning row sizes its copy from the product and pads the rest -
+    /// and it must come from the store rather than from a view the reader has already crossed to.
+    fn product_bytes(&self, request: RequestKey, kind: Product) -> Result<Option<u64>>;
+
+    /// Copies `request`'s `kind` product into `destination`, ordered on `stream`.
+    ///
+    /// **This is the call that crosses a device or a stream**, and it answers whether there was
+    /// anything to copy: `false` is a product no call of `request` produced, which a caller refuses
+    /// by name (`absent`).
+    ///
+    /// The ordering is the store's because the store is the only holder of both ends: `publish`
+    /// records the producer's write as an event on the producer's stream, and this call makes
+    /// `stream` wait on that event before issuing the copy on it. Same stream and same device is a
+    /// plain copy; a second stream on the same device and a second device are both the ordered copy,
+    /// because in both the reader's work is not otherwise ordered after the writer's.
+    ///
+    /// `destination` is the reader's buffer, and it must be exactly the product's size: a partial
+    /// copy is a reader whose buffer disagrees with the product's shape, which is a refusal with
+    /// both byte counts rather than a copy of the shorter one.
+    fn copy_into(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        destination: &TensorView,
+        stream: &platform::Stream,
+    ) -> Result<bool>;
 
     /// Drops every product of `request`, answering how many there were.
     ///
@@ -159,6 +206,16 @@ pub fn no_store(request: RequestKey) -> crate::Error {
     ))
 }
 
+/// The write a producer is about to publish, as an event a crossing reader waits on.
+///
+/// One function for the three runners, so the event's flags and the fact that it is recorded **on
+/// the producing stream** before the publish cannot differ between them.
+pub fn written_on(stream: &platform::Stream) -> Result<Arc<Event>> {
+    let written = Arc::new(Event::new(platform::EventFlags::default()));
+    written.record(stream)?;
+    Ok(written)
+}
+
 /// The absence of one kind, as a caller reports it.
 pub fn absent(request: RequestKey, kind: Product) -> crate::Error {
     crate::Error::Invalid(format!(
@@ -175,14 +232,17 @@ pub fn absent(request: RequestKey, kind: Product) -> crate::Error {
 /// is - its device and the stream that wrote it - which is the half a reader must consult before it
 /// reads: a view is only readable by work issued after the write that filled it.
 ///
-/// # The two crossings it refuses, and why refusing is the safe answer
+/// # The two crossings, and how they are ordered
 ///
-/// A product written on one stream and read on another needs an ordering the store cannot establish
-/// by itself - an event recorded at the write and awaited at the read - and a product written on one
-/// device and read on another needs that ordering **and** a copy. Both belong to the executor, which
-/// owns the event pool and the pools a copy allocates from, so this store refuses by name and says
-/// which of the two crossings it met. The refusal is what keeps a reader from aliasing a region
-/// whose write it did not wait for: a read that silently proceeded would be correct in the common
+/// A product written on one stream and read on another needs an ordering, and one written on one
+/// device and read on another needs that ordering **and** a copy. The store is the only holder of
+/// both ends, so it records the write as an event on the producer's stream at
+/// [`Products::publish`] and makes the reader's stream wait on that event before it issues the copy
+/// ([`Products::copy_into`]). **A deployment whose text phase owns its own GPU crosses a device on
+/// every denoising step**, so this is a required path rather than a convenience.
+///
+/// [`Products::borrow`] stays the zero-copy answer and is only given where the writer's stream *is*
+/// the reader's: a view handed across an ordering the caller cannot see is correct in the common
 /// case and wrong under load, which is the worst pair of outcomes to debug.
 ///
 /// # Lifetime
@@ -195,11 +255,41 @@ pub struct Held {
 }
 
 /// One product's region and the write that filled it.
-#[derive(Clone, Copy, Debug)]
+///
+/// `written` is that write, recorded on the producing stream by the producer ([`written_on`]): a
+/// reader on any other stream or device waits on it before copying the bytes, which is what makes a
+/// copy legal without the reader knowing anything about the producer. It is `None` for a product its
+/// producer published for its own stream alone, and a crossing read of that is refused rather than
+/// issued unordered.
+#[derive(Clone)]
 struct Placed {
     view: TensorView,
     device: DeviceId,
     stream: StreamId,
+    written: Option<Arc<Event>>,
+}
+
+/// Where a copy of `placed` into `stream` starts: immediately, or after the writer's event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// The writer's stream is the reader's, so its write is already ordered before the copy.
+    Ordered,
+    /// Another stream or another device: the reader waits on the writer's event first.
+    AfterTheWriter,
+}
+
+/// Which route a read of a product takes from the placement it was written on to the reader's.
+///
+/// One function for the decision, over ids rather than a stream, so the table is testable where no
+/// device exists - and so the two facts cannot be read one at a time by different code: **a second
+/// device always crosses, and a second stream on the same device crosses too.** Only both equal is
+/// the plain copy.
+fn route(written: (DeviceId, StreamId), read: (DeviceId, StreamId)) -> Route {
+    if written == read {
+        Route::Ordered
+    } else {
+        Route::AfterTheWriter
+    }
 }
 
 impl Default for Held {
@@ -234,6 +324,7 @@ impl Products for Held {
         kind: Product,
         device: DeviceId,
         stream: StreamId,
+        written: Option<Arc<Event>>,
         view: &TensorView,
     ) -> Result<()> {
         // A trajectory is published again at every step and the last write is the one a reader
@@ -244,6 +335,7 @@ impl Products for Held {
                 view: *view,
                 device,
                 stream,
+                written,
             },
         );
         Ok(())
@@ -256,15 +348,15 @@ impl Products for Held {
         device: DeviceId,
         stream: StreamId,
     ) -> Result<Option<TensorView>> {
-        let placed = crate::lock(&self.entries).get(&(request, kind)).copied();
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         let Some(placed) = placed else {
             return Ok(None);
         };
         if placed.device != device {
             return Err(crate::Error::Invalid(format!(
                 "request {} reads its {} region on device {} and it was written on device {}: a \
-                 product that moves between devices needs a copy ordered after its producer, which \
-                 the executor issues and this store does not",
+                 borrowed view carries no ordering, so a reader on another device asks for a copy \
+                 (`copy_into`) and this store orders it after the producer's write",
                 request.request_id.0,
                 kind.name(),
                 device.0,
@@ -273,8 +365,9 @@ impl Products for Held {
         }
         if placed.stream != stream {
             return Err(crate::Error::Invalid(format!(
-                "request {} reads its {} region on stream {} and it was written on stream {}: the \
-                 reader must wait for the writer's event, or read on the writer's stream",
+                "request {} reads its {} region on stream {} and it was written on stream {}: a \
+                 borrowed view carries no ordering, so a reader on another stream asks for a copy \
+                 (`copy_into`) and this store orders it after the producer's write",
                 request.request_id.0,
                 kind.name(),
                 stream.0,
@@ -282,6 +375,74 @@ impl Products for Held {
             )));
         }
         Ok(Some(placed.view))
+    }
+
+    fn holds(&self, request: RequestKey, kind: Product) -> bool {
+        crate::lock(&self.entries).contains_key(&(request, kind))
+    }
+
+    fn product_bytes(&self, request: RequestKey, kind: Product) -> Result<Option<u64>> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        match placed {
+            Some(placed) => Ok(Some(placed.view.byte_len()?)),
+            None => Ok(None),
+        }
+    }
+
+    fn copy_into(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        destination: &TensorView,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(false);
+        };
+        let product = placed.view.byte_len()?;
+        let wanted = destination.byte_len()?;
+        if product != wanted {
+            return Err(crate::Error::Invalid(format!(
+                "request {} copies {product} byte(s) of {} into a buffer of {wanted}: a partial \
+                 copy is a reader whose buffer disagrees with the product's shape",
+                request.request_id.0,
+                kind.name()
+            )));
+        }
+        let read = (stream.device(), StreamId(stream.raw()));
+        if route((placed.device, placed.stream), read) == Route::AfterTheWriter {
+            // The crossing needs the producer's write as an event. A product published without one
+            // was published for the writer's own stream alone, so reading it here would be a copy
+            // the producer never ordered: refused by name, never issued unordered.
+            let Some(written) = placed.written.as_ref() else {
+                return Err(crate::Error::Invalid(format!(
+                    "request {} copies {} to device {} stream {} and it was written on device {} \
+                     stream {} with no record of its write: a producer that expects a crossing \
+                     reader states the event (`written_on`) when it publishes",
+                    request.request_id.0,
+                    kind.name(),
+                    stream.device().0,
+                    stream.raw(),
+                    placed.device.0,
+                    placed.stream.0
+                )));
+            };
+            stream.wait_event(written)?;
+        }
+        // SAFETY: both ranges outlive the copy - the product's region belongs to the request, which
+        // is in flight while it is read, and `destination` belongs to the caller - and the copy is
+        // ordered on `stream` after the writer's event where they differ.
+        unsafe {
+            platform::memcpy_async(
+                destination.ptr.address(),
+                placed.view.ptr.address(),
+                usize::try_from(product)
+                    .map_err(|_| crate::Error::Invalid("a product is larger than memory".into()))?,
+                stream,
+            )?;
+        }
+        Ok(true)
     }
 
     fn forget(&self, request: RequestKey) -> usize {
@@ -298,6 +459,29 @@ mod tests {
 
     use ops::{DType, DevicePtr, Shape};
     use platform::DeviceId;
+
+    /// The crossing table: only the writer's own stream on the writer's own device is the plain copy.
+    ///
+    /// The two rows that matter are the ones a single-device pipeline never meets and a real
+    /// deployment does: a second **device** (the text phase on its own GPU) and a second **stream** on
+    /// one device (two runners). Both cross, so both wait on the producer's write before copying. A
+    /// rule that compared only one of the two would pass on a single-GPU deployment and read
+    /// unordered bytes on the one that ships.
+    #[test]
+    fn only_the_writers_own_placement_copies_without_waiting() {
+        let written = (DeviceId(0), StreamId(7));
+        assert_eq!(route(written, (DeviceId(0), StreamId(7))), Route::Ordered);
+        assert_eq!(
+            route(written, (DeviceId(0), StreamId(8))),
+            Route::AfterTheWriter,
+            "a second stream on one device is a crossing"
+        );
+        assert_eq!(
+            route(written, (DeviceId(1), StreamId(7))),
+            Route::AfterTheWriter,
+            "a second device is a crossing even when the stream ids agree"
+        );
+    }
 
     /// Every kind's name is its own, so a refusal says which product is missing.
     ///
@@ -350,6 +534,7 @@ mod tests {
                 Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(4096, 2),
             )
             .expect("a store accepts a view");
@@ -372,6 +557,7 @@ mod tests {
                 Product::Text,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(8192, 3),
             )
             .expect("a store accepts a view");
@@ -395,6 +581,7 @@ mod tests {
                 Product::Images,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(16384, 4),
             )
             .expect("a store accepts a view");
@@ -432,6 +619,7 @@ mod tests {
                 Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(4096, 2),
             )
             .expect("first step");
@@ -441,6 +629,7 @@ mod tests {
                 Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(4096, 2),
             )
             .expect("second step");
@@ -463,7 +652,14 @@ mod tests {
         let store = Held::new();
         for kind in [Product::Text, Product::VideoLatents] {
             store
-                .publish(request(1), kind, DeviceId(0), StreamId(1), &view(4096, 2))
+                .publish(
+                    request(1),
+                    kind,
+                    DeviceId(0),
+                    StreamId(1),
+                    None,
+                    &view(4096, 2),
+                )
                 .expect("published");
         }
         store
@@ -472,6 +668,7 @@ mod tests {
                 Product::Text,
                 DeviceId(0),
                 StreamId(1),
+                None,
                 &view(8192, 3),
             )
             .expect("published");
