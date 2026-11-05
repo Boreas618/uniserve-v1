@@ -213,11 +213,13 @@ def _paged_attention_prefill_kernel(
     # route computed from them indexes a table nothing can serve (an illegal address inside the
     # MoE gather, one kernel later). The inert value is written instead.
     if position >= length:
-        # ...and only a token the bucket has room for. A packed bucket's padded rows start where
-        # the live tokens end, so `first + position` runs past the bucket's token axis for every
-        # padded row but the first; the store is clipped rather than masked, because a store past
-        # the axis lands in the next tensor of the arena and is silent. `tl.num_programs(0)` is the
-        # launch's token count, the same number `tokens` carries on the host.
+        # ...and only a token the bucket has room for. Every padded row of a packed batch starts
+        # where the live tokens end, so `first + position` runs past the buffer's token axis for all
+        # but the first - and a store there lands in whatever the arena holds next, silently, which
+        # would trade one illegal address for a corrupted tensor. `tl.num_programs(0)` is the
+        # launch's token count: the host passes the same number as `tokens`, and at prefill
+        # `max_q_len` is that number too ("the packed token count, which bounds every row"), so one
+        # bound holds the row and the buffer at once.
         if token < tl.num_programs(0):
             padded = (
                 tl.zeros((HEAD_DIM,), tl.bfloat16)
