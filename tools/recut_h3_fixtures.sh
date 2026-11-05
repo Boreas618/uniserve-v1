@@ -43,7 +43,11 @@ fi
 # The clip length is a count of **generated frames**, and a generated frame count is `17n + 5`: the
 # legal clips are 22, 39, 56, ... A round number like 256 is not one of them, so a walk cut at 256
 # states rows for a clip no request can ask for.
-samples=22
+# `SAMPLES` and `TRACK` are the deployment's clip lengths and their audio tracks, and they come from
+# outside because the deployment states them: `124,192,243,362` are the delivery's durations snapped to
+# the `17n + 5` rung. A clip set written here is a second statement of the deployment, which is the
+# defect this file has already been fixed for twice (a raster and a bound).
+samples=${SAMPLES:-22}
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -62,7 +66,7 @@ elements=123456
 # other. The walk still takes `--track` as a free number; deriving it from `--samples` there is owed,
 # exactly as `rows_bound()` is owed, and until then this is the pair both enumerations accept — the
 # recorder refuses any other by name.
-track=29600
+track=${TRACK:-29600}
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
