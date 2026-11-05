@@ -260,33 +260,6 @@ impl DenoiseColumns {
     }
 }
 
-/// One request's model-side inputs: what the model prepared on the device for its next step.
-///
-/// This is the half of a step the mechanism cannot state. The latent trajectory is a device product
-/// of the previous step and the encoded conditioning rows are the text encoder's output, so both
-/// reach a step from the model's own residency rather than from a batch's columns; the mechanism
-/// states the request's parameters and this type carries the values.
-///
-/// A set is host bytes in the layout's element type, row-major, and it is **copied** into the
-/// batch's staged columns, so a residency layer may own the underlying device buffers without this
-/// runner reaching into them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Prepared {
-    /// The video latents, `[channels, frames, height, width]`, row-major in the layout's element
-    /// type.
-    pub video: Vec<u8>,
-    /// The audio latents when the task has a soundtrack, empty otherwise.
-    pub audio: Vec<u8>,
-    /// The encoded conditioning rows, `[text_rows + condition_rows, width]`.
-    pub text: Vec<u8>,
-    /// The text encoder's own features, the same shape as `text`: what a model's conditioner folds
-    /// into those rows before the first evaluation ([`nn::Denoiser::prepare_conditioning`]).
-    ///
-    /// It is a separate buffer and not a second name for `text` because the fold is in place over
-    /// `text` while reading these, so one buffer would have the conditioner overwrite its own input.
-    pub source: Vec<u8>,
-}
-
 /// The products one denoising step reads, in the order a refusal names them.
 ///
 /// **This is the list the runner reads from the store, and nothing else.** A step here reads the
@@ -361,6 +334,12 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     diag: Diag,
     /// The step of the schedule the staged batch is, which names the diagnosis dumps.
     staged_step: Option<u32>,
+    /// The rows of the batch being served, as `(request, row)`: what a replay seeds from the store
+    /// and what it publishes its trajectory back to.
+    ///
+    /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
+    /// a second `submit` before a replay would be a second batch, which the executor does not do.
+    pending: Vec<(ipc::RequestKey, u32)>,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -420,6 +399,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             products: None,
             diag: Diag::from_env(),
             staged_step: None,
+            pending: Vec::new(),
         })
     }
 
@@ -599,74 +579,94 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         })
     }
 
-    /// Stages one request's row of a batch into the host side of the columns.
-    fn stage_request(&mut self, bucket: Bucket, index: u32, request: &Prepared) -> Result<()> {
+    /// Copies each pending row's conditioning from the store into its row of the columns.
+    ///
+    /// **Device to device, on the runner's stream, after `upload()`**: the store holds views of
+    /// regions other calls wrote, so a host round-trip would move a request's conditioning rows out
+    /// of the device and back on every step. Issued on one stream, the copy is ordered after
+    /// `upload()`'s writes and after whatever the producer issued, so the row the graph reads is the
+    /// row the store holds.
+    ///
+    /// A view shorter than the row it must fill is refused by name: a short copy would leave the
+    /// tail of the row holding the previous request's values, which is worse than a refusal because
+    /// the graph runs either way.
+    fn seed(&self, bucket: Bucket) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            return Ok(());
+        };
         let layout = layout_of(bucket)?;
-        let expected = latent_bytes(&layout.video, self.shape.dtype)?;
-        if request.video.len() as u64 != expected {
-            return Err(Error::Invalid(format!(
-                "a step of bucket {bucket} carries {} byte(s) of video latents and the layout \
-                 states {expected}",
-                request.video.len()
-            )));
-        }
-        let offset = u64::from(index) * expected;
-        Staged::place(
-            &mut self.columns.staged.video,
-            offset,
-            &request.video,
-            "video latents",
-        )?;
-        if let Some(audio) = layout.audio {
-            let bytes = latent_bytes(&audio, self.shape.dtype)?;
-            if request.audio.len() as u64 != bytes {
-                return Err(Error::Invalid(format!(
-                    "a step of bucket {bucket} carries {} byte(s) of audio latents and the layout \
-                     states {bytes}",
-                    request.audio.len()
-                )));
-            }
-            let offset = u64::from(index) * bytes;
-            Staged::place(
-                &mut self.columns.staged.audio,
-                offset,
-                &request.audio,
-                "audio latents",
-            )?;
-        }
         let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
         let width = u64::from(self.shape.width.max(1));
-        let element = self.shape.dtype.bytes().ok_or_else(|| {
+        let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
-        })?;
+        })?);
         let bytes = rows * width * element;
-        if request.text.len() as u64 != bytes {
-            return Err(Error::Invalid(format!(
-                "a step of bucket {bucket} carries {} byte(s) of conditioning rows and the layout \
-                 states {bytes}",
-                request.text.len()
-            )));
+        for (request, index) in &self.pending {
+            for (kind, column) in [
+                (Product::Text, &self.columns.text),
+                (Product::Source, &self.columns.source),
+            ] {
+                let Some(view) = products.borrow(*request, kind, self.device, self.stream_id())?
+                else {
+                    return Err(products::absent(*request, kind));
+                };
+                let available = view.byte_len()?;
+                if available < bytes {
+                    return Err(Error::Invalid(format!(
+                        "request {} presents {} byte(s) of {} where a row of bucket {bucket} needs \
+                         {bytes}: the store's region is shorter than the row it must fill",
+                        request.request_id.0,
+                        available,
+                        kind.name()
+                    )));
+                }
+                // SAFETY: both ranges are device memory that outlives this copy - the column is the
+                // runner's, allocated for the largest bucket it serves, and the span being written
+                // is one row inside it; the store's region belongs to the request, which is in
+                // flight until the executor forgets it. The copy is on the runner's own stream, so
+                // the graph that reads it is ordered after it.
+                unsafe {
+                    platform::memcpy_async(
+                        column.host.address() + u64::from(*index) * bytes,
+                        view.ptr.address(),
+                        usize::try_from(bytes)
+                            .map_err(|_| Error::Invalid("a row is larger than memory".into()))?,
+                        &self.stream,
+                    )?;
+                }
+            }
         }
-        let offset = u64::from(index) * bytes;
-        Staged::place(
-            &mut self.columns.staged.text,
-            offset,
-            &request.text,
-            "conditioning rows",
-        )?;
-        if request.source.len() as u64 != bytes {
-            return Err(Error::Invalid(format!(
-                "a step of bucket {bucket} carries {} byte(s) of encoder features and the layout \
-                 states {bytes}, which is the conditioning rows' own extent",
-                request.source.len()
-            )));
+        Ok(())
+    }
+
+    /// Publishes each pending row's trajectory as this runner's columns hold it.
+    ///
+    /// **No copy**: the captured graph updates the latents in place, so the column *is* the
+    /// trajectory and what the store records is a view of it. That is the handoff to a decode, and
+    /// it is why the store's `VideoLatents` is a name for memory rather than a second buffer.
+    fn publish(&self, bucket: Bucket) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            return Ok(());
+        };
+        for (request, index) in &self.pending {
+            let latents = self.latents(bucket, *index)?;
+            products.publish(
+                *request,
+                Product::VideoLatents,
+                self.device,
+                self.stream_id(),
+                &latents.video,
+            )?;
+            if let Some(audio) = latents.audio {
+                products.publish(
+                    *request,
+                    Product::AudioLatents,
+                    self.device,
+                    self.stream_id(),
+                    &audio,
+                )?;
+            }
         }
-        Staged::place(
-            &mut self.columns.staged.source,
-            offset,
-            &request.source,
-            "encoder features",
-        )?;
         Ok(())
     }
 
@@ -683,20 +683,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             Some(kind) => Err(products::absent(request, kind)),
             None => Ok(()),
         }
-    }
-
-    /// The model's prepared inputs for `request`, when this runner holds them.
-    ///
-    /// No residency layer for a media request's products exists yet, so this answers `None` and the
-    /// step is refused by name where it would be served. The signature is the contract such a layer
-    /// fills: given the request a row names, the trajectory and the encoded conditioning rows the
-    /// model prepared for it.
-    ///
-    /// The key is the request's, not the row's: an in-process batch numbers its calls by position,
-    /// so a request's row may differ between two steps of its own trajectory and states nothing
-    /// about which state belongs to whom.
-    fn prepared(&self, _request: ipc::RequestKey) -> Option<Prepared> {
-        None
     }
 
     /// Writes the coefficient index the step reads, before a walk or a replay, and records it for
@@ -902,6 +888,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             )));
         }
         let steps = self.schedule(bucket)?;
+        // A batch is one step of its requests, and the replay that follows serves exactly this one:
+        // a row left from an earlier batch would be seeded and published again.
+        self.pending.clear();
         let mut step = None;
         for (index, _row) in media.inputs.iter().enumerate() {
             // The mechanism states the request's parameters: which step this is, and the seed and
@@ -913,18 +902,21 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
             // and never derived here.
             self.require_products(stated_request.request)?;
-            let prepared = self.prepared(stated_request.request).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "a denoise step of bucket {bucket} names request {} at row {index}, whose \
-                     latents and encoded conditioning rows no capability prepared: the mechanism \
-                     states a request's parameters and the model's own preparation of it is held by \
-                     no runner yet (step {} of {})",
-                    stated_request.request.request_id.0,
-                    stated_request.step,
-                    stated_request.steps
-                ))
-            })?;
-            self.stage_request(bucket, index, &prepared)?;
+            // A request's first step has no trajectory yet: it must be drawn and folded from the
+            // request's own conditioning by `Denoiser::draw_noise` and `prepare_latents`, and both
+            // take a `Forward`, whose arena a replay may not begin over the reservation its captured
+            // graph already addresses. Until that is ruled, step zero is refused here rather than
+            // served on whatever the warm capture left in the column.
+            if stated_request.step == 0 {
+                return Err(Error::Invalid(format!(
+                    "a denoise step of bucket {bucket} names request {} at row {index}, its first \
+                     step: the trajectory's first values come from the model's own draw and fold, \
+                     which a replay cannot issue (a forward needs an arena, and a captured graph \
+                     already addresses the reservation's)",
+                    stated_request.request.request_id.0
+                )));
+            }
+            self.pending.push((stated_request.request, index));
             // Every row of one batch is the same step of the same schedule: a batch is one step
             // (`Variant::Denoise`), so a row that names another step describes another batch.
             let stated = steps
@@ -1030,6 +1022,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             } => {
                 let stream = self.stream.clone();
                 self.upload()?;
+                // The conditioning is the store's, and it overwrites the rows the upload just wrote:
+                // that order is why one upload covers every column.
+                self.seed(*bucket)?;
                 let (served, captured) = self
                     .lifecycle
                     .graphs
@@ -1054,6 +1049,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 }
                 let launched = std::time::Instant::now();
                 captured.launch(&stream)?;
+                // The graph advanced the trajectory in place; what a decode reads next is this
+                // column, and the store records that view rather than a copy of it.
+                self.publish(*bucket)?;
+                self.pending.clear();
                 if let Some(step) = step {
                     // The step updates the latents in place, so the exit state of this evaluation is
                     // the entry state of the next one, which is the name both trees dump.
