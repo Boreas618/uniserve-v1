@@ -215,6 +215,9 @@ struct Args {
     /// A cut inside `--layer`, named by the reference tensor that answers it: `normalized`,
     /// `attended` or `mlp_out`.
     substage: Option<Substage>,
+    /// Walk every cut of `--layer` in one run and read each as a finite count: the instrument for
+    /// "which operator first writes a value that is not a number".
+    cuts: bool,
     /// The reference stage a `--stage block` run starts from: its `hidden_NN` is the run's input
     /// instead of the embedding, which measures one layer's arithmetic and no prefix's.
     from: Option<usize>,
@@ -338,6 +341,7 @@ impl Args {
         let mut dump = None;
         let mut reference = None;
         let mut substage = None;
+        let mut cuts = false;
         let mut from = None;
         let mut routing = false;
         let mut scores = false;
@@ -440,6 +444,9 @@ impl Args {
                         }
                     };
                 }
+                "--cuts" => {
+                    cuts = true;
+                }
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -534,6 +541,7 @@ impl Args {
             dump,
             reference,
             substage,
+            cuts,
             from,
             routing,
             scores,
@@ -1258,6 +1266,50 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // fails at `plan.bytes` past the first. The mark is taken once and released after each
         // measurement has been read back to the host.
         let mark = arena.mark();
+        // Every cut of the chosen layer in one run, each read as a finite count. This is the
+        // instrument for "which operator first writes a value that is not a number": one launch per
+        // cut, no reference, and the arena released between them exactly as the layer walk does.
+        if args.cuts {
+            let rows = tokens_usize(&batch);
+            let width = usize::try_from(plan.hidden).unwrap_or(0);
+            for cut in [
+                Substage::Normalized,
+                Substage::Attended,
+                Substage::GateIn,
+                Substage::MlpOut,
+            ] {
+                let name = cut.name();
+                let out = measure(Some(cut))?;
+                stream.synchronize()?;
+                let values = download_bf16(&stream, out, rows, width)?;
+                arena.release(mark);
+                let mut nonfinite = 0_usize;
+                let mut low = f64::INFINITY;
+                let mut high = f64::NEG_INFINITY;
+                for value in &values {
+                    if value.is_finite() {
+                        let value = f64::from(*value);
+                        low = low.min(value);
+                        high = high.max(value);
+                    } else {
+                        nonfinite += 1;
+                    }
+                }
+                println!(
+                    "  layer {layer} {name}: {} of {} not finite ({low:.4} .. {high:.4})",
+                    nonfinite,
+                    values.len()
+                );
+                if nonfinite > 0 {
+                    return Err(Failure::message(format!(
+                        "layer {layer}'s {name} is the first cut whose values are not all finite: \
+                         {nonfinite} of {} are NaN or infinite",
+                        values.len()
+                    )));
+                }
+            }
+            return Ok(());
+        }
         // The digest is the block measurement's own evidence that two identical runs agree, and
         // it costs two extra passes of the layer. A cut, the router's selection or the gate's
         // scores ask a different question of the same layer, so their runs pay for one forward.
@@ -3743,7 +3795,14 @@ fn print_kv_digests(
             }
             digests.push_str(&format!(" {name}={:016x}", platform::fnv1a(&raw)));
         }
-        println!("kv layer{layer}:{digests}");
+        // The address each plane starts at: two layers whose planes share one address are one plane,
+        // and a digest that agrees across layers then says nothing about the arithmetic. Printing it
+        // is what tells "the same number" from "the same bytes".
+        println!(
+            "kv layer{layer}:{digests} at k=0x{:x} v=0x{:x}",
+            plane.key.ptr.address(),
+            plane.value.ptr.address()
+        );
     }
     stream.synchronize()?;
     Ok(())

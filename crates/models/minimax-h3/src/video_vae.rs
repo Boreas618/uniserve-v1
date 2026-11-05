@@ -2126,8 +2126,13 @@ pub(crate) mod tests {
         )
         .expect_err("the decoder reads its own element type");
         assert!(
+            // The tree spells element types the way `DType` prints them, which is lowercase
+            // (`f16`, `f32`): the assertion compares against that spelling rather than a
+            // capitalized one the message never has, which fails for a reason that is not the
+            // refusal's subject.
             matches!(&error, nn::Error::Shape { problem, .. }
-                if problem.contains("F16") && problem.contains("F32")),
+                if problem.contains(&format!("{:?}", DType::F16))
+                    && problem.contains(&format!("{:?}", DType::F32))),
             "the refusal names both types: {error}"
         );
     }

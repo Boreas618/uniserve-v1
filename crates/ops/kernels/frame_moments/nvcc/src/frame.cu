@@ -39,11 +39,14 @@ constexpr int kMomentLoads = 8;
 // Mean and reciprocal standard deviation of row i = frame * groups + group: the
 // group's `channels_per_group * pixels` values of one frame, visited in the order of
 // the frame-folded [frames, channels, pixels] tensor PyTorch normalizes. A frame's
-// pixels of one channel are contiguous.
+// pixels of one channel are `stride_pixel` apart: 1 in channel-first storage, the
+// channel count in channels-last storage. Both layouts visit the group's values in the
+// same folded order, so the reduction is the same reduction bit for bit.
 __global__ void frame_moments_kernel(const float* values, int64_t stride_batch,
-                                     int64_t stride_channel, int64_t stride_frame, int64_t frames,
-                                     int64_t pixels, int64_t channels_per_group, int64_t groups,
-                                     float eps, float* mean, float* rstd) {
+                                     int64_t stride_channel, int64_t stride_frame,
+                                     int64_t stride_pixel, int64_t frames, int64_t pixels,
+                                     int64_t channels_per_group, int64_t groups, float eps,
+                                     float* mean, float* rstd) {
   using WelfordType = welford_data<float, int64_t>;
   using WelfordOp = welford_ops<float, float, int64_t, variance_and_mean>;
 
@@ -72,7 +75,7 @@ __global__ void frame_moments_kernel(const float* values, int64_t stride_batch,
 #pragma unroll
     for (int u = 0; u < kMomentLoads; ++u) {
       if (j0 + u * step < N) {
-        loaded[u] = static_cast<float>(row[channel * stride_channel + pixel]);
+        loaded[u] = static_cast<float>(row[channel * stride_channel + pixel * stride_pixel]);
       }
       channel += channel_step;
       pixel += pixel_step;
@@ -129,7 +132,10 @@ extern "C" int32_t uniserve_frame_moments(const uniserve_frame_moments_call* cal
   // group, which only a frame-major layout satisfies: H3's video tensors are [B, C, T, H, W], where
   // `values_frame` is one frame of one channel (H·W) and `values_channel` is a whole frame of the
   // sequence (T·H·W).
-  if (call->values_frame < call->pixels) {
+  if (call->values_pixel <= 0) {
+    return refuse(call, "frame_moments needs a positive step between a frame's pixels");
+  }
+  if (call->values_frame < call->pixels * call->values_pixel) {
     return refuse(call, "frame_moments needs a frame to span at least one row of pixels");
   }
   const int64_t channels_per_group = call->channels_per_group;
@@ -149,8 +155,8 @@ extern "C" int32_t uniserve_frame_moments(const uniserve_frame_moments_call* cal
     frame_moments_kernel<<<static_cast<unsigned int>(blocks), static_cast<unsigned int>(threads),
                            0, reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const float*>(call->values), call->values_batch, call->values_channel,
-        call->values_frame, call->frames, pixels, channels_per_group, call->groups, call->epsilon,
-        mean, rstd);
+        call->values_frame, call->values_pixel, call->frames, pixels, channels_per_group,
+        call->groups, call->epsilon, mean, rstd);
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
       return refuse(call, cudaGetErrorString(status));
