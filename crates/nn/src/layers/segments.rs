@@ -262,6 +262,63 @@ impl VsaTiles {
         Ok(())
     }
 
+    /// The descriptor one `vsa_prepare_tiles` launch takes, from the geometry and the strides.
+    ///
+    /// The strides are **compiled in** (`crates/ops/kernels/vsa_prepare_tiles/triton/src/build.py`
+    /// hands them to the build as constants), so they are in the key, and a walk states them from the
+    /// layout the model's own buffers have rather than from a caller's choice.
+    pub fn prepare_descriptor(
+        dtype: DType,
+        geometry: [u32; 5],
+        norm: bool,
+        strides: [u64; 7],
+        epsilon: Float,
+    ) -> segments::PrepareTilesDescriptor {
+        let [heads, width, rotated, tile_rows, block_rows] = geometry;
+        let [query_row, query_head, key_row, key_head, value_row, value_head, factor] = strides;
+        segments::PrepareTilesDescriptor {
+            dtype,
+            heads,
+            width,
+            rotated,
+            tile_rows,
+            block_rows,
+            epsilon,
+            norm,
+            query_row_stride: query_row,
+            query_head_stride: query_head,
+            key_row_stride: key_row,
+            key_head_stride: key_head,
+            value_row_stride: value_row,
+            value_head_stride: value_head,
+            factor_stride: factor,
+        }
+    }
+
+    /// The descriptor the launch takes for a `[rows, heads, width]` row-major view and a factor table
+    /// whose rows are `factor_row` long — the layout the model's arena buffers have.
+    pub fn contiguous_prepare_descriptor(
+        &self,
+        dtype: DType,
+        factor_row: u64,
+    ) -> segments::PrepareTilesDescriptor {
+        let row = u64::from(self.heads) * u64::from(self.width);
+        let head = u64::from(self.width);
+        Self::prepare_descriptor(
+            dtype,
+            [
+                self.heads,
+                self.width,
+                self.rotated,
+                self.tile_rows,
+                self.block_rows,
+            ],
+            self.norm,
+            [row, head, row, head, row, head, factor_row],
+            Float::from(self.eps),
+        )
+    }
+
     /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
     ///
     /// `query`, `key` and `value` are `[tiles · tile_rows, heads, width]` and are modified in place;
@@ -285,23 +342,27 @@ impl VsaTiles {
         pooled_value: TensorView,
     ) -> Result<()> {
         self.check_prepare(query_weight.is_some(), key_weight.is_some(), cosine, sine)?;
-        let descriptor = segments::PrepareTilesDescriptor {
-            dtype: query.dtype,
-            heads: self.heads,
-            width: self.width,
-            rotated: self.rotated,
-            tile_rows: self.tile_rows,
-            block_rows: self.block_rows,
-            epsilon: Float::from(self.eps),
-            norm: self.norm,
-            query_row_stride: query.strides.get(0),
-            query_head_stride: query.strides.get(1),
-            key_row_stride: key.strides.get(0),
-            key_head_stride: key.strides.get(1),
-            value_row_stride: value.strides.get(0),
-            value_head_stride: value.strides.get(1),
-            factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
-        };
+        let descriptor = Self::prepare_descriptor(
+            query.dtype,
+            [
+                self.heads,
+                self.width,
+                self.rotated,
+                self.tile_rows,
+                self.block_rows,
+            ],
+            self.norm,
+            [
+                query.strides.get(0),
+                query.strides.get(1),
+                key.strides.get(0),
+                key.strides.get(1),
+                value.strides.get(0),
+                value.strides.get(1),
+                cosine.map(|table| table.strides.get(0)).unwrap_or(0),
+            ],
+            Float::from(self.eps),
+        );
         let args = segments::PrepareTilesArgs {
             query,
             key,

@@ -1914,6 +1914,7 @@ impl Denoiser {
     /// solver and the conditioner issue. `elements` is the element count of the largest trajectory a
     /// modality steps: the solver's residual is one operator over the whole sample, so its width is a
     /// deployment statement and not a constant.
+    #[allow(clippy::too_many_arguments)]
     pub fn programs(
         config: &crate::config::TransformerConfig,
         attention: crate::config::AttentionKind,
@@ -1922,6 +1923,7 @@ impl Denoiser {
         groups: Groups,
         partition: &Partition,
         elements: &[u64],
+        tiles: u32,
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
@@ -1933,7 +1935,7 @@ impl Denoiser {
 
         let mut programs = Programs::default();
         programs.extend(Transformer::programs(
-            config, attention, dtype, rows, groups, partition,
+            config, attention, dtype, rows, groups, partition, tiles,
         )?);
         programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
 
@@ -3011,6 +3013,7 @@ mod tests {
             Groups::of(true),
             &crate::partition::Partition::single(),
             &[1_000_000],
+            0,
         )
         .expect("the denoiser's programs");
         let has = |operator: &str| programs.iter().any(|(name, _)| name == operator);

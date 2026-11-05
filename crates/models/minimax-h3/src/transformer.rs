@@ -548,9 +548,10 @@ impl Transformer {
     /// The programs this DiT stack launches, from its configuration and the deployment's partition.
     ///
     /// Stated without weights, because a deployment compiles its store before it opens the
-    /// checkpoint. `kind` decides the attention's programs and nothing else; `rows` is the largest
-    /// packed row count the deployment's layouts hold, which is the attention's key bound and the
-    /// activation's launch value. **No collective is a program**: the Ulysses exchange issues a
+    /// checkpoint. `kind` decides the attention's programs; `rows` is the largest packed row count the
+    /// deployment's layouts hold, which is the dense attention's key bound; and `tiles` is the
+    /// deployment's tile bound — the sparse attention's reduction length — which the layouts state
+    /// and a sparse deployment carries. **No collective is a program**: the Ulysses exchange issues a
     /// communication, so a partition's degree changes the shapes the attention reads and adds no row.
     pub fn programs(
         config: &TransformerConfig,
@@ -559,11 +560,13 @@ impl Transformer {
         rows: u32,
         groups: Groups,
         partition: &Partition,
+        tiles: u32,
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
         use ops::activation::ActAndMul as ActAndMulOp;
         use ops::attention::dense::DenseAttention;
+        use ops::attention::SparseAttention;
         use ops::gemm::Gemm;
         use ops::modulation::GatedResidual as GatedResidualOp;
         use ops::modulation::ModulatedRmsNorm as ModulatedOp;
@@ -573,13 +576,6 @@ impl Transformer {
         use ops::rope::Rotation;
         use ops::rope::{QkNormRope, RotaryFactors};
 
-        if matches!(kind, AttentionKind::Sparse { .. }) {
-            return Err(Error::Unsupported(
-                "a sparse DiT partition's programs: the video-sparse selection and its attention \
-                 program are not stated yet"
-                    .to_owned(),
-            ));
-        }
 
         let hidden = config.hidden_size;
         let head = config.head_dim;
@@ -587,6 +583,37 @@ impl Transformer {
         let rotated: u32 = ROTATED_AXES.iter().sum();
         let interaction = 6 * u64::from(hidden);
         let mut programs = Programs::default();
+
+        // A sparse deployment's attention adds the video-sparse selection's six programs and the fine
+        // attention over the tiles it selects. Its projections are the shared `gemm` row and its
+        // rotation the shared rope rows, so only the selection and the tile attention are new.
+        if let AttentionKind::Sparse { tile, .. } = kind {
+            let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
+                .with_rotation(rotated)?
+                .with_tile_bound(tiles)?;
+            let fine = nn::layers::SegmentAttention::new(
+                u64::from(tile),
+                u64::from(heads),
+                u64::from(head),
+                u64::from(tiles),
+                dtype,
+            )?;
+            // The prepare launch compiles its strides in, and the buffers are the model's own:
+            // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            programs.launch::<ops::segments::VsaPrepareTiles>(
+                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+            );
+            programs.launch::<ops::segments::VsaZeroPadding>(&tiles_layer.zero_padding_descriptor(dtype));
+            programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
+            programs.launch::<ops::segments::VsaCompressPooled>(&tiles_layer.compress_descriptor(dtype));
+            programs.launch::<ops::segments::VsaAddGatedTiles>(
+                &tiles_layer.add_gated_tiles_descriptor(dtype),
+            );
+            programs.launch::<ops::segments::VsaSelectTiles>(
+                &tiles_layer.select_descriptor(u64::from(tiles))?,
+            );
+            programs.launch::<SparseAttention>(&fine.descriptor_of(dtype));
+        }
 
         // Every projection of the stack: the video and audio entrances, the four of each block's
         // attention, its feed-forward pair, and the head per modality. None carries a bias.
@@ -667,19 +694,23 @@ impl Transformer {
             // The checkpoint stores `norm_q` and `norm_k` per head.
             true,
         ));
-        let attention = Attention::dense(
-            head,
-            heads,
-            heads,
-            rows,
-            false,
-            None,
-            1.0 / (head as f32).sqrt(),
-        )
-        .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, rows, true,
-        ));
+        // A sparse stack attends through the selection over tiles, stated above; a dense one through
+        // the single attention over every packed row. The two are different backends, not a subset.
+        if matches!(kind, AttentionKind::Dense) {
+            let attention = Attention::dense(
+                head,
+                heads,
+                heads,
+                rows,
+                false,
+                None,
+                1.0 / (head as f32).sqrt(),
+            )
+            .map_err(Error::from)?;
+            programs.launch::<DenseAttention>(&attention.dense_descriptor(
+                dtype, dtype, dtype, rows, true,
+            ));
+        }
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
@@ -1172,6 +1203,7 @@ mod tests {
             32_000,
             Groups::of(true),
             &Partition::single(),
+            0,
         )
         .expect("the stack's programs");
         let count = |operator: &str| {
@@ -1206,6 +1238,7 @@ mod tests {
             32_000,
             Groups::of(false),
             &Partition::single(),
+            0,
         )
         .expect("a text-only deployment's programs");
         let entries = |set: &[(String, String)]| {
@@ -1216,22 +1249,52 @@ mod tests {
         };
         assert_ne!(entries(&programs), entries(&generated));
 
-        // A sparse partition's programs are not stated: the selection and its attention are missing,
-        // and the walk says so rather than returning the dense set under a sparse name.
+        // A sparse partition states the selection's six programs and the fine attention over the
+        // tiles it selects, in place of the dense attention's one: the dense rows are the ones the
+        // sparse path does not launch, and the difference is the backend rather than a subset.
+        let sparse = Transformer::programs(
+            &transformer,
+            AttentionKind::Sparse {
+                tile: 64,
+                sparsity: 0.5,
+                reference_keep: Some(0.1),
+            },
+            nn::DType::BF16,
+            32_000,
+            Groups::of(true),
+            &Partition::single(),
+            512,
+        )
+        .expect("a sparse deployment's programs");
+        let sparse_has = |operator: &str| sparse.iter().any(|(name, _)| name == operator);
+        for operator in [
+            "vsa_prepare_tiles",
+            "vsa_zero_padding",
+            "vsa_scores",
+            "vsa_select_tiles",
+            "vsa_compress_pooled",
+            "vsa_add_gated_tiles",
+            "sparse_attention",
+        ] {
+            assert!(sparse_has(operator), "{operator} is not stated: {sparse:?}");
+        }
+        // The dense attention's rows are the dense deployment's; the sparse stack projects and rotates
+        // through the same rows, so those stay.
         assert!(
-            Transformer::programs(
-                &transformer,
-                AttentionKind::Sparse {
-                    tile: 32,
-                    sparsity: 0.5,
-                    reference_keep: Some(0.1),
-                },
-                nn::DType::BF16,
-                32_000,
-                Groups::of(true),
-                &Partition::single(),
-            )
-            .is_err()
+            !sparse_has("dense_attention"),
+            "a sparse stack launches no dense attention"
+        );
+        assert!(sparse_has("gemm") && sparse_has("modulated_rms_norm"));
+        // A sparse deployment's tile bound is in the compression's descriptor, and the launch refuses a
+        // request outside it rather than clamping.
+        let compress = sparse
+            .iter()
+            .find(|(name, _)| name == "vsa_compress_pooled")
+            .map(|(_, key)| key.clone())
+            .expect("the compression's row");
+        assert!(
+            compress.contains("max_tiles_512"),
+            "the bound the deployment states is the one the row names: {compress}"
         );
     }
     use super::*;
