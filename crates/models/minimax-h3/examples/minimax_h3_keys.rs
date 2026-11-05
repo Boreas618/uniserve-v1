@@ -1683,6 +1683,27 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
+    // **The refiner's feed-forward**: the same width and the same activation as the DiT's block MLP
+    // and a different program, because `conditioning.rs` runs its gate and up projections into two
+    // *separate* contiguous buffers - both row strides are the intermediate width, while the DiT
+    // reads the halves of one packed projection at twice it. A walk of this tree launches both, so
+    // both are rows; one row at the packed stride would leave the refiner's every conditioned
+    // request without a program.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: deployment,
+            width: 14336,
+            block: ELEMENTWISE_BLOCK,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 14336,
+            value_stride: 14336,
+            wide: false,
+            pdl: PDL,
+            stepwise: true,
+        }
+        .to_string(),
+    );
     // The two packed forms: the DiT's block MLP and the conditioning projection both contract to
     // `ffn_dim 14336` in BF16 from a packed `[rows, 2 · width]` row, and the video VAE decoder's to
     // its own `mlp` width 8192 in FP16 (`decoders.md`'s arena: `mlp [rows, 8192]`). The row stride is
