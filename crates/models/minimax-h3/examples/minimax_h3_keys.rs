@@ -372,12 +372,13 @@ fn main() {
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                // The component's own type is BF16, but `denoiser_rows` keys every row from this one
-                // value, and **model-lead01 measures the AdaLN cache as F32 whatever the stack is** -
-                // so the stack's rows are stated at both until each row takes the type of the tensor
-                // that produces it. F32 is the safe direction: an over-stated row costs a compile, a
-                // missing one stops a run with a store that looks complete.
-                transformer: DType::F32,
+                // The checkpoint's own type for the component, which is also what every launch reads:
+                // the stack's buffers are allocated at the hidden states' type, the modulation cache
+                // with them (`denoiser.rs:2992`, `arena.tensor(hidden.dtype, ..)`), and each refiner
+                // block carries the type of its `to_q` weight (`conditioning.rs:122`,
+                // `dtype: query_dtype`). A second type here states rows for launches that ask BF16 -
+                // cells nothing selects, in a file that reads as covering both.
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
@@ -552,15 +553,16 @@ fn main() {
     // above are being replaced by one component at a time. Emitting it beside them is a no-op today
     // (a row is a set member) and is what makes the replacement checkable: the set must not move.
     // The partition the deployment states, and the packed bound the rows are cut at. Both are stated
-    let Some(dies) = config.denoisers.values().next() else {
-        panic!("the checkpoint states no DiT, so its arrangement is not statable")
-    };
+    assert!(
+        config.denoisers.values().next().is_some(),
+        "the checkpoint states no DiT, so its arrangement is not statable"
+    );
     for vae in VAES {
         let deployment = minimax_h3::programs::Deployment::new(
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::F32,
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
