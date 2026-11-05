@@ -21,16 +21,27 @@
 //!
 //! ## What it drives
 //!
+//! ## The arena the plan states
+//!
+//! The last thing this program checks is the figure a runner sizes storage from: `video_arena` states
+//! a clip's buffers, and a whole clip is decoded in an arena of **exactly** those bytes, at every
+//! canvas and in both element types. A decode that does not fit fails there rather than on a device
+//! partway through the stitch, and a decode that fits with room to spare means the plan reserves a
+//! buffer nothing takes - so the check requires the clip to consume the plan entirely, and the one
+//! number it prints per canvas (`takes all N bytes of its 17 buffer plan`) is the reservation a
+//! runner may allocate.
+//!
 //! The decoder is built from weight extents alone (`WeightLoader::stated` reads no byte) and
 //! `Forward::recording` reports each launch to a capture sink, so a canvas's tile decodes with no
-//! device and no checkpoint shard. The canvas is the tile the decoder is loaded with, exactly as
-//! `load` hands it: one tile, not the clip, because the scratch is sized for a tile's rows.
+//! device and no checkpoint shard. For the row accounting the canvas is the tile the decoder is
+//! loaded with, exactly as `load` hands it: one tile, because the rows a tile launches are the rows
+//! the decoder's own enumeration is about. The clip's whole decode is driven only for its arena.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use minimax_h3::AttentionKind;
-use minimax_h3::decoding::ClipDecoder;
+use minimax_h3::decoding::{ClipDecoder, arena_reservation, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder};
 use nn::forward::Arena;
 use nn::layers::{Linear, WeightOrder};
@@ -112,7 +123,7 @@ fn run() -> Result<(), String> {
     let mut union: Vec<(String, String)> = Vec::new();
     // One arena per canvas: the arena never rewinds, and the decoder's reservations are the pair this
     // lane has had to reason about twice.
-    for (height, width) in canvases {
+    for &(height, width) in &canvases {
         let arena = Arena::new(DevicePtr::new(0), 1u64 << 42);
         let f = nn::Forward::recording(&arena);
         let mut loader = WeightLoader::stated(DType::F32, Some(&extents));
@@ -259,10 +270,20 @@ fn run() -> Result<(), String> {
         println!("    LAUNCHED NOT STATED\t{}\t{}", row.0, row.1);
     }
 
-    if unstated.is_empty() && unattributed.is_empty() && missing.is_empty() {
+    let rows_agree = if unstated.is_empty() && unattributed.is_empty() && missing.is_empty() {
         println!(
             "# every stated row is launched by the decoder or declared by the stitcher, and no launch is unstated."
         );
+        true
+    } else {
+        false
+    };
+
+    // The plan is the figure a runner sizes storage from, so it is checked by driving the decode it
+    // describes rather than by reading it.
+    fit_arenas(&config, &extents, &canvases, model_width)?;
+
+    if rows_agree {
         Ok(())
     } else {
         Err(format!(
@@ -270,6 +291,132 @@ fn run() -> Result<(), String> {
             unstated.len(),
             unattributed.len(),
             missing.len()
+        ))
+    }
+}
+
+/// Drive a whole clip's decode in an arena of **exactly** the bytes `video_arena` states for it.
+///
+/// The plan is the figure a runner reserves, and until this check nothing drove the path it describes:
+/// the tile decode above and the probes all hand their forward an arena far larger than any clip needs,
+/// so a plan one buffer short would pass every check in the lane and fail on the first clip on a device
+/// - as `Arena { needed, available }` partway through the stitch, naming no buffer.
+///
+/// Two directions, one measurement. A decode that does not fit fails here; a decode that fits with room
+/// to spare means the plan states a buffer nothing reserves, which is device memory a runner would
+/// reserve for no reason. The plan is exact when the clip takes every byte of it, at every canvas and
+/// both element types, so the allowance is zero rather than one buffer.
+fn fit_arenas(
+    config: &minimax_h3::VideoVaeConfig,
+    extents: &BTreeMap<String, (DType, Shape)>,
+    canvases: &[(u32, u32)],
+    model_width: u32,
+) -> Result<(), String> {
+    let ratio = config.spatial_compression();
+    let mut failures: Vec<String> = Vec::new();
+    // The decoder's own element types: the checkpoint stores the video VAE in F16, and an unconverted
+    // deployment keeps its FP32 weights, so both plans a device can ask for are measured.
+    for dtype in [DType::F32, DType::F16] {
+        for &(height, width) in canvases {
+            let clip_canvas = Canvas::clip(config, height / ratio, width / ratio);
+            let tiles = Tiles::of(config, &clip_canvas)
+                .map_err(|error| error.to_string())?
+                .tiles(config, &clip_canvas)
+                .to_vec();
+            let grid = tiles.first().copied().ok_or("a clip with no tiles")?.canvas;
+            let mut loader = WeightLoader::stated(dtype, Some(extents));
+            let projection = loader
+                .load(&WeightRequest::region(
+                    "virtual.proj_in.weight",
+                    0,
+                    Shape::new(&[u64::from(model_width), u64::from(config.latent_channels)]),
+                ))
+                .map_err(|error| error.to_string())?;
+            let bias = loader
+                .load(&WeightRequest::region(
+                    "virtual.proj_in.bias",
+                    0,
+                    Shape::new(&[u64::from(model_width)]),
+                ))
+                .map_err(|error| error.to_string())?;
+            let input = Linear::new(projection, Some(bias), WeightOrder::NxK)
+                .map_err(|error| error.to_string())?;
+            let decoder = VideoDecoder::load(
+                config,
+                grid,
+                AttentionKind::Dense,
+                dtype,
+                input,
+                &mut loader,
+            )
+            .map_err(|error| error.to_string())?;
+            let plan =
+                video_arena(config, &clip_canvas, dtype).map_err(|error| error.to_string())?;
+            let need = arena_reservation(&plan);
+
+            // The runner's own buffers - the clip's latent rows, the position table and the raster the
+            // stitch writes - are not part of a clip's plan, so they live in their own arena.
+            let caller = Arena::new(DevicePtr::new(0), 1u64 << 42);
+            let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
+            let latents = caller
+                .tensor(
+                    dtype,
+                    Shape::new(&[voxels, u64::from(config.latent_channels)]),
+                )
+                .map_err(|error| error.to_string())?;
+            let positions = caller
+                .tensor(DType::F32, Shape::new(&[3, Canvas::rows(&tiles[0].canvas)]))
+                .map_err(|error| error.to_string())?;
+            let out = caller
+                .tensor(
+                    dtype,
+                    Shape::new(&[
+                        u64::from(minimax_h3::output::Rgb::CHANNELS),
+                        u64::from(clip_canvas.frames_out(config)),
+                        u64::from(height),
+                        u64::from(width),
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
+
+            // Exactly the plan: not one buffer more.
+            let clip_arena = Arena::new(DevicePtr::new(0), need);
+            let f = nn::Forward::recording(&clip_arena);
+            let stitch = ClipDecoder::new(config, dtype).map_err(|error| error.to_string())?;
+            let mut recorded = Recorded::default();
+            capture::set_sink(Some(&mut recorded));
+            let run = stitch.decode_clip(&f, &decoder, &tiles, latents, positions, out);
+            capture::set_sink(None);
+            let used = clip_arena.used();
+            match run {
+                Err(error) => failures.push(format!(
+                    "{dtype:?} {height}x{width}: a clip does not fit the {} bytes its plan states: {error}",
+                    need
+                )),
+                Ok(()) if used != need => failures.push(format!(
+                    "{dtype:?} {height}x{width}: the clip takes {used} of the {} bytes its {} stated buffers reserve, so {} byte(s) are reserved for nothing",
+                    need,
+                    plan.len(),
+                    need - used
+                )),
+                Ok(()) => println!(
+                    "{dtype:?} {height}x{width}: a {}-tile clip takes all {need} bytes of its {} buffer plan",
+                    tiles.len(),
+                    plan.len()
+                ),
+            }
+        }
+    }
+    if failures.is_empty() {
+        println!("# every canvas's clip fits its plan exactly, in both element types.");
+        Ok(())
+    } else {
+        for failure in &failures {
+            println!("    PLAN DOES NOT MATCH THE DECODE\t{failure}");
+        }
+        Err(format!(
+            "{} canvas(es) whose decode does not match the arena its plan states",
+            failures.len()
         ))
     }
 }
