@@ -248,11 +248,17 @@ fn main() {
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
     // track length, so this is a deployment statement like `--rasters` and not a property of a model.
-    let mut clip_frames: Vec<u32> = Vec::new();
+    //
+    // The default is the lengths the delivery's stages drive and the model's own bound. The rows are
+    // transient by construction - when the residual add's extent stops being part of its key they
+    // collapse to one per add - so the ladder ships complete now and gets smaller later, and a
+    // request naming a length outside it is refused by name at its first audio row program.
+    let mut clip_frames: Vec<u32> = vec![5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
             "--frames" => {
+                clip_frames.clear();
                 for frames in value(&mut arguments, "--frames").split(',') {
                     clip_frames.push(parse(frames.trim(), frames, "a clip length"));
                 }
@@ -358,13 +364,9 @@ fn main() {
     // (`audio_latent_frames`, `track_samples`) rather than a constant here, because 44.1 kHz was
     // written into a measurement once tonight and produced rows for a rate this checkpoint does not
     // use.
-    // **Empty by default, and that is a statement rather than an omission.** Their rows carry
-    // `columns = inner × samples`, so a track length is a whole row set: six lengths measured on this
-    // checkpoint ask for sixty cells no package declares, and a seventh would ask for ten more. Until
-    // the add's extent stops being part of its key (a bound cell, or model's 64-bit extent), the
-    // deployment states the lengths it serves with `--frames`, and a decode of audio at any other
-    // length is refused by name at its first row program - which is the honest behaviour, and is
-    // visible here rather than in a ladder nobody can bound.
+    // The audio operators state one row set per track length, because their residual adds carry the
+    // track's extent in the key: the ladder above is the deployment's clip lengths, converted here
+    // through the crate's own arithmetic so no sample count is written down twice.
     let audio = &config.audio_vae;
     // A decode starts from a track's **latent frames** and the encoder's residual units are sized in
     // **samples**: the two operators take the same clip in different units, and passing one where the
