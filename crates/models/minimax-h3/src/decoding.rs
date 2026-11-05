@@ -695,6 +695,32 @@ impl ClipDecoder {
                 out.shape.dims()
             )));
         }
+        // **Every tile's scatter must land inside the raster, and this is the only place both values
+        // exist.** A `ClipDecoder` holds the row *width* (`patch`) and nothing that states how many
+        // rows a frame has, so `write_tile` cannot check a capacity; `nn::layers::Rows`' `check` sees
+        // views but a block's offset is runtime data. Here the grid's latent extents and the caller's
+        // raster are both in hand, so a decoder built for one canvas and driven over another is
+        // refused by name rather than scattering past the buffer - a clip canvas over a tile's raster
+        // is nine times the tile in the square of the ratio between their sides.
+        //
+        // The test is per tile and one-sided on purpose: a tile that lands inside the raster is not
+        // evidence that the raster is the grid's own, and asserting equality would refuse a caller
+        // that legitimately clips. A tile that lands outside it is unambiguous.
+        let ratio = u64::from(self.ratio);
+        for tile in tiles {
+            let row_end = u64::from(tile.latent_rows.1) * ratio;
+            let column_end = u64::from(tile.latent_columns.1) * ratio;
+            if row_end > out.shape.dim(2) || column_end > out.shape.dim(3) {
+                return Err(Error::config(format!(
+                    "tile ({}, {}) scatters to row {row_end} and column {column_end} of a raster \
+                     {:?}: the decoder was built for one canvas and driven over another, and the \
+                     overflow is the square of the ratio between their sides",
+                    tile.row,
+                    tile.column,
+                    out.shape.dims()
+                )));
+            }
+        }
         // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
         // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
         // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
