@@ -379,6 +379,15 @@ impl Scheduler {
     ) {
         let answer_moved = answer.clone();
         let step = self.step;
+        // The scheduler's own entry for §7.3 step 2, on the serving thread at a boundary: a log that
+        // has the control thread's marker and not this line is a command that never left the queue,
+        // and one that has this line and no resolve is a wait inside the preparation itself.
+        tracing::info!(
+            backend = %program.backend,
+            revision = program.revision,
+            step,
+            "the scheduler took this precopy at a boundary and is preparing it"
+        );
         let state = views::trial_state(self, step, self.recorder.recorded());
         let live = views::live(self, step, self.recorder.recorded());
         let ceilings = ceilings_of(BatchCapacity::of(&self.info));
