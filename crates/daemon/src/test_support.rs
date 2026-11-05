@@ -196,7 +196,16 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || engine::serve_requests(engine, cores, Some(policy)))
+        .spawn(move || {
+            if let Err(error) = engine::serve_requests(engine, cores, Some(policy)) {
+                // A simulated engine that ends is the whole of a test's failure and
+                // otherwise leaves no line: the client reports only that its process
+                // ended, and the reason - a frame the engine refused, a scheduler that
+                // did not answer - is lost with the thread. Standard error, so a test
+                // run with `--nocapture` carries it beside the assertion.
+                eprintln!("the simulated engine ended: {error:#}");
+            }
+        })
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
