@@ -19,7 +19,7 @@ queue_depth = 6
 mem_fraction_static = 0.73
 
 [worker_groups.components.transformer]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.components.video_decoder]
 
