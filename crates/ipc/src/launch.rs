@@ -123,8 +123,6 @@ pub struct LaunchDescriptor {
     pub role: String,
     /// Concurrent microbatches of a disaggregated attention rank.
     pub expert_microbatches: u32,
-    /// Torch process-group backend override.
-    pub distributed_backend: Option<String>,
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's.
     pub mesh: Option<String>,

@@ -678,8 +678,6 @@ pub struct WorkerOptions {
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's.
     pub mesh: Option<String>,
-    /// Torch process-group backend for the ranks' collectives.
-    pub distributed_backend: Option<String>,
     /// Keep a standby beside every worker group: it maps the group's
     /// retained weights and cache, captures its graphs and parks, and
     /// replaces the group when it fails instead of a relaunch. A group whose
@@ -711,7 +709,6 @@ impl Default for WorkerOptions {
             executable: default_executable(),
             watchdog_timeout: Duration::from_secs(300),
             mesh: None,
-            distributed_backend: None,
             standby: false,
             standby_storage: StandbyStorage::Auto,
         }
@@ -1442,7 +1439,6 @@ impl ServeConfig {
                 watchdog_timeout_ms: u64::try_from(worker.watchdog_timeout.as_millis())
                     .unwrap_or(u64::MAX),
                 mesh: worker.mesh.clone().unwrap_or_default(),
-                distributed_backend: worker.distributed_backend.clone().unwrap_or_default(),
                 standby: worker.standby,
                 attention_backend: self.attention_backend.clone(),
                 dtype: word(&self.dtype),

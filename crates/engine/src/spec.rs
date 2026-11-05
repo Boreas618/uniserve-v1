@@ -233,7 +233,6 @@ impl EngineConfig {
                 .transpose()?,
             mem_fraction_static: placement.mem_fraction_static,
             worker_mesh: stated(&workers.mesh),
-            distributed_backend: stated(&workers.distributed_backend),
             max_model_len: facts.max_model_len,
             canvas_sampling: facts
                 .canvas_sampling
