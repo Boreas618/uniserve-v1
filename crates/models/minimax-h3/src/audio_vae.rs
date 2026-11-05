@@ -1065,10 +1065,15 @@ impl AudioDecoder {
     /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
     ///
     /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
-    /// the descriptor, so they are stated once per stage width and per sample count the deployment
-    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
-    /// clip of another length replays the compiled program.
-    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+    /// the descriptor, so they are stated once per latent track length the deployment serves
+    /// (`tracks`, in **latent frames**). The per-channel ones do not: a convolution's key is its
+    /// geometry, and a clip of another length replays the compiled program.
+    ///
+    /// A track is stated in latent frames because that is the quantity a decode starts from
+    /// (`forward` takes the latent's frame count and multiplies it by each stage's rate); a sample
+    /// count is that number times the decoder's 800-fold upsampling, so passing one here would state
+    /// every stage's width 800 times too wide.
+    pub fn programs(config: &AudioVaeConfig, tracks: &[u32]) -> Result<Vec<(String, String)>> {
         use ops::audio_activation::AudioActivation as AudioActivationOp;
         use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
         use ops::pcm::PcmInterleave as PcmInterleaveOp;
@@ -1158,8 +1163,8 @@ impl AudioDecoder {
         // the stage's buffers are `[PCM_CHANNELS, channels, length]` and the add reshapes them to
         // `[PCM_CHANNELS · channels, length]` (`rows`), so the descriptor's `columns` is the length
         // the stage's upsampling leaves. Stating `channels × bucket` named keys no launch asks for.
-        for bucket in buckets {
-            let mut length = u64::from(*bucket);
+        for track in tracks {
+            let mut length = u64::from(*track);
             for stage in &stages {
                 length *= u64::from(stage.rate);
                 programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, length)?);
