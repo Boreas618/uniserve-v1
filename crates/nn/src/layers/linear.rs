@@ -441,7 +441,8 @@ impl Nvfp4Linear {
     /// activation row. A plan that does not reserve them is an arena the launch writes past, so the
     /// model's plan asks this rather than estimating.
     pub fn scratch_bytes(&self, rows: u64) -> u64 {
-        let align = |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
+        let align =
+            |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
         let values = align(rows * u64::from(self.k) / 2);
         let scales = {
             let shape = self.layout.shape(rows, u64::from(self.k));

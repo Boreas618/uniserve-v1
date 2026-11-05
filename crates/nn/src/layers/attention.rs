@@ -885,7 +885,10 @@ mod tests {
         };
 
         assert!(page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::F32))).is_ok());
-        assert!(page_scale(plane(DType::F8E4M3), None).is_err(), "no scale at all");
+        assert!(
+            page_scale(plane(DType::F8E4M3), None).is_err(),
+            "no scale at all"
+        );
         assert!(
             page_scale(plane(DType::F8E4M3), Some(scale(1, DType::F32))).is_err(),
             "one scalar where a page table belongs"

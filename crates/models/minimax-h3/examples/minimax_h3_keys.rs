@@ -121,6 +121,9 @@ const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
 /// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
 const VAE_WIDTH: u32 = 32 * 64;
 
+/// The video VAE's spatial compression: 256 output pixels per 16 latent columns.
+const VAE_SPATIAL_COMPRESSION: u32 = 16;
+
 /// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
 /// `[rows, 8192]`).
 const VAE_MLP: u32 = 8192;
@@ -646,15 +649,120 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The seam between two decoded tiles, five voxels of overlap along the height.
+    // The seam between two decoded tiles - **every width the model can hand the operator**, on both
+    // axes, because both are compiled loop bounds rather than launch values.
+    //
+    // `decoding.rs`'s `ClipDecoder::new` builds one blend per overlap its tile grid can produce:
+    // `extent` starts at `video_vae::MINIMUM_OVERLAP` (64 output pixels) and grows by the alignment
+    // (`spatial_compression`, 16) while it is under `TILE_PIXELS` (256), for axes 2 (height) and 3
+    // (width). That is twelve widths on two axes per element type, and a seam only appears where a
+    // canvas is larger than one tile - which is why a row set written from the one-tile case held a
+    // single `extent 5`, a width this code has not built since the blend moved from latent voxels to
+    // output pixels. A 768 x 1344 clip decodes as 3 x 6 tiles and would have stopped on the first seam.
+    for vae in VAES {
+        let mut extent = minimax_h3::video_vae::MINIMUM_OVERLAP;
+        while extent < minimax_h3::video_vae::TILE_PIXELS {
+            for axis in [2_u32, 3] {
+                push(
+                    "cross_fade",
+                    ops::cross_fade::Descriptor {
+                        dtype: vae,
+                        extent,
+                        axis,
+                        block: ops::cross_fade::BLOCK,
+                        pdl: PDL,
+                    }
+                    .to_string(),
+                );
+            }
+            // The step is the config's spatial compression (16): a seam widens by one alignment unit.
+            extent += VAE_SPATIAL_COMPRESSION;
+        }
+    }
+    // The **video encoder's** seam blends, derived from the code rather than written down: the tile grid
+    // of every canvas the model serves (`NAMED_CANVASES`) and the latent-space widths its seams produce.
+    //
+    // The encoder works on the latent grid, so its blend width is a decoder-space overlap divided by the
+    // spatial compression (`Grid::blends` over `Seams::split`'s overlaps, `encoding.rs`). Asking the grid
+    // itself for those widths is the point: the numbers depend on the raster, a canvas the config gains
+    // later would add one, and a transcription would go stale silently - a blend's extent divides its
+    // weights, so a wrong width fades a seam by the wrong ramp and no shape check sees it.
+    //
+    // One extent-1 layer is built unconditionally for the placement of a tile that has no neighbour
+    // (`tiled_encode.rs`), so it belongs in the set with the derived ones.
+    {
+        let mut widths: Vec<u32> = vec![1];
+        for canvas in minimax_h3::NAMED_CANVASES {
+            // A named canvas is a legal raster, so its grid exists; a refusal here is a defect in the
+            // canvas list rather than in this list, and it must not be silently skipped.
+            let Ok(grid) = minimax_h3::encoding::Grid::of(canvas.height, canvas.width) else {
+                panic!(
+                    "the named canvas {}x{} has no tile grid",
+                    canvas.height, canvas.width
+                );
+            };
+            for overlap in minimax_h3::encoding::Grid::blends(&grid.rows)
+                .into_iter()
+                .chain(minimax_h3::encoding::Grid::blends(&grid.columns))
+            {
+                // `Grid::blends` answers the latent-space widths itself (it divides the pixel overlaps
+                // by the spatial compression); a zero is an axis with no seam.
+                if overlap != 0 {
+                    widths.push(overlap);
+                }
+            }
+        }
+        widths.sort_unstable();
+        widths.dedup();
+        for extent in widths {
+            for axis in [2_u32, 3] {
+                push(
+                    "cross_fade",
+                    ops::cross_fade::Descriptor {
+                        dtype: DType::F32,
+                        extent,
+                        axis,
+                        block: ops::cross_fade::BLOCK,
+                        pdl: PDL,
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
+    // The video decoder's per-head normalization fused with its rotation - **no learned gain**, which
+    // is what `affine_false` states and what makes this a different program from the DiT's row.
+    //
+    // Every number here is the export's, and none is a convention of this crate: `vae/config.json`
+    // gives the decoder 32 heads of 64 elements (`decoder_num_attention_heads`,
+    // `decoder_attention_head_dim`) with `decoder_rope_dim_ratio 0.75`, so **48 of the 64 columns
+    // rotate**, split-half; and `decoder_norm_eps 1e-5` is the RMS floor. `VideoDecoder::load` builds
+    // its `Rotary` with the identity gain because the checkpoint stores no normalization weight for
+    // that attention (`vae/` has no `decoder.*.attn.norm.*`), and `ops::rope` states a gainless
+    // normalization as the `_affine_false` key.
+    //
+    // Two rows, because the VAE's element type is the export's: F16 for a checkpoint that stores it
+    // half, F32 for one that stores it whole. Without them the store holds no cell for the first
+    // operator a decode launches past its input projection, and stage 2 would stop on this row as if
+    // it were a new defect - which is the class this list has now had three times in one night.
     for vae in VAES {
         push(
-            "cross_fade",
-            ops::cross_fade::Descriptor {
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
                 dtype: vae,
-                extent: 5,
-                axis: 2,
-                block: ops::cross_fade::BLOCK,
+                output: vae,
+                head_dim: 64,
+                q_heads: 32,
+                k_heads: 32,
+                rotation: SPLIT_HALF,
+                // `f32` on purpose: the config's epsilon reaches the descriptor as a 32-bit float,
+                // and a 64-bit literal would name a different key.
+                epsilon: ops::Float::from(1.0e-5_f32),
+                rotated: 48,
+                rows: QK_NORM_TOKENS,
+                // `head_dim.next_power_of_two().min(1024)` - the row tile `nn`'s `Rotary` builds.
+                block: 64,
+                affine: false,
                 pdl: PDL,
             }
             .to_string(),
@@ -828,6 +936,65 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
+    // The audio encoder's projection block, the refiner's own operators: a **causal** dense attention
+    // and a **tanh-GELU** gated unit, and neither shape existed anywhere in this list.
+    //
+    // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
+    // `num_attention_heads 8` heads of 256, with as many key heads as query heads; `Projection::load`
+    // passes `causal = true` and one sequence with no offsets, so the key carries the `mask_causal`
+    // and `cu_seq_lens_false` forms. The gated unit is `GatedActivation::new(GeluTanh)` over the
+    // latent channels, whose gate and value are **two separate** `[frames, 2 · 32]` buffers rather
+    // than one packed one - so the row stride is the width, and this row is the `gelu_tanh`
+    // activation the DiT's `silu` rows cannot stand in for.
+    push(
+        "dense_attention",
+        ops::attention::DenseDescriptor {
+            query: DType::F32,
+            key_value: DType::F32,
+            output: DType::F32,
+            head_dim: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+            q_heads: AUDIO_ATTENTION_HEADS,
+            kv_heads: AUDIO_ATTENTION_HEADS,
+            mask: ops::attention::Mask::Causal,
+            windowed: false,
+            // A launch bound outside the key: the refiner attends one clip's frames as one sequence.
+            max_kv_len: 4096,
+            cu_seq_lens: false,
+        }
+        .to_string(),
+    );
+    let audio_hidden = 2 * AUDIO_LATENT_CHANNELS;
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: DType::F32,
+            width: audio_hidden,
+            block: ELEMENTWISE_BLOCK,
+            activation: ops::activation::Activation::GeluTanh,
+            gate_stride: u64::from(audio_hidden),
+            value_stride: u64::from(audio_hidden),
+            wide: false,
+            pdl: PDL,
+            // `GatedActivation::new` is the default (non-stepwise) form; the DiT's MLP declares the
+            // stepwise one because the reference rounds each row's output as it goes.
+            stepwise: false,
+        }
+        .to_string(),
+    );
+    // The projection's MLP normalizes over the latent channels (`projection.mlp.norm`,
+    // `LayerNorm` at 32 with its bias), a width no other row of this list has.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: DType::F32,
+            columns: AUDIO_LATENT_CHANNELS,
+            tile: row_tile(AUDIO_LATENT_CHANNELS),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
     // The video path's last step: the VAE's raster is `float16`
     // (`uniserve/models/minimax_h3/output.py`'s own state buffer), three channels, packed bytes.
     for vae in VAES {
@@ -950,18 +1117,27 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `hidden_size 1152`, `num_heads 16` — so `head_dim 72` — 27 blocks, `num_position_embeddings
     // 2304` (a 48 × 48 learned table), `patch_size 16`, `temporal_patch_size 2`, and both weight and
     // bias on every LayerNorm (the checkpoint's `model.visual.*.norm{1,2}.bias` entries). Its MLP
-    // activation is `gelu_pytorch_tanh` over `intermediate_size 4304`.
-    push(
-        "gelu",
-        ops::gelu::Descriptor {
-            dtype: deployment,
-            columns: 4304,
-            block: ELEMENTWISE_BLOCK,
-            approximate: ops::gelu::Approximation::Tanh,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // **Two activations, not one.** A block's MLP takes `gelu_pytorch_tanh` over
+    // `intermediate_size` 4304; a patch merger takes a plain `nn.GELU()`, the exact `erf` form, over
+    // the merged row `hidden_size · spatial_merge_size²` = 1152 · 4 = 4608 (`vision.rs` builds
+    // `Gelu::tanh()` and `Gelu::exact()` for those two sites, and its own header says so). The rows
+    // differ in `columns` *and* in `approximate`, so one row cannot cover both.
+    for (columns, approximate) in [
+        (4304_u32, ops::gelu::Approximation::Tanh),
+        (4608_u32, ops::gelu::Approximation::Exact),
+    ] {
+        push(
+            "gelu",
+            ops::gelu::Descriptor {
+                dtype: deployment,
+                columns,
+                block: ELEMENTWISE_BLOCK,
+                approximate,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The vision tower's products, all BF16 against FP32 accumulation with no epilogue.
     //
@@ -1011,17 +1187,159 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The tower's residual stream is `[patches, 1152]` with a plain scale and no bias update.
-    push(
-        "scaled_residual",
-        ops::residual::ScaledResidualDescriptor {
-            dtype: deployment,
-            columns: 1152,
-            block: ELEMENTWISE_BLOCK,
-            update_bias: false,
+    // Two residual streams, two widths, and neither covers the other: the tower's is
+    // `[patches, 1152]` and the text encoder's is `[tokens, 5120]` - the language stack's hidden,
+    // which `text_encoder.rs:1140` writes each retained layer's down projection into before the next
+    // layer's norm. Both are a plain scale with no bias update, and the block is the residual
+    // operator's own (`RESIDUAL_BLOCK`, 1024) rather than the elementwise one that happens to equal
+    // it.
+    for columns in [1152_u32, 5120] {
+        push(
+            "scaled_residual",
+            ops::residual::ScaledResidualDescriptor {
+                dtype: deployment,
+                columns,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: false,
+            }
+            .to_string(),
+        );
+    }
+
+    // ---- The video VAE decoder's own stack, from `vae/config.json` and `video_vae.rs`'s composition.
+    //
+    // The decoder is 36 blocks of one width - `decoder_num_attention_heads 32 ·
+    // decoder_attention_head_dim 64 = 2048` - with a feed-forward four times as wide
+    // (`decoder_ffn_mult 4` -> 8192), and every shape below is one no other component of this model
+    // asks for. That is exactly why none of them was here: a row set written from the shapes that
+    // have run drifts from the shapes that have not, and stage 2 has never decoded.
+    //
+    // Each family is pushed once per element type the export may store the VAE in: F16 for a
+    // checkpoint that keeps it half (the default, `dtype = "auto"`, which converts nothing), F32 for
+    // one that keeps it whole.
+    for vae in VAES {
+        // `norm1`/`norm2` - `RmsNorm::new(weight, decoder_norm_eps)` over the width.
+        push(
+            "rms_norm",
+            ops::norm::RmsNormDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                tile: row_tile(VAE_WIDTH),
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+        // `decoder.norm_out` - the one LayerNorm of the stack, and it has its bias.
+        push(
+            "layer_norm",
+            ops::norm::LayerNormDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                tile: row_tile(VAE_WIDTH),
+                bias: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+        // Both residual adds carry a projection's bias (`ScaledResidual::new(scale, Some(bias))`): the
+        // attention's `to_out` bias and the feed-forward's `ff.net.2` bias belong to the residuals, as
+        // the reference groups them, so `update_bias` is true - a different program from the DiT's.
+        push(
+            "scaled_residual",
+            ScaledResidualDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: true,
+            }
+            .to_string(),
+        );
+        // The packed gate projection's bias is the activation's (`PackedSwiGlu::new(Some(bias))`), and
+        // its two halves sit beside each other, so the row stride is twice the width. The DiT's row is
+        // `bias_false`; this one is not interchangeable with it.
+        push(
+            "value_first_swiglu",
+            ops::activation::ValueFirstSwigluDescriptor {
+                dtype: vae,
+                width: VAE_MLP,
+                block: ELEMENTWISE_BLOCK,
+                input_stride: 2 * u64::from(VAE_MLP),
+                bias: true,
+                absmax: false,
+            }
+            .to_string(),
+        );
+        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window, and
+        // **no offsets** - `attend_dense(..., None, None, rows, ...)` attends one clip as one
+        // sequence, and the key names that form only by its `cu_seq_lens_false` suffix.
+        //
+        // **A named gap, not a missing row: only the FP32 backend serves the offset-free form.**
+        // `dense_attention/fa4` is the F16/BF16 backend and its package states why it serves the packed
+        // form alone - FlashAttention-4's interface takes the sequence offsets, so a key without them
+        // is not a launch it can make. So an export that stores its VAE half has the decoder's
+        // attention unresolved until either this call passes one sequence's offsets (`[0, rows]`, the
+        // packed form every other consumer uses) or the FP32 backend's SGEMM program gains an F16
+        // form. Neither is this list's to choose; writing the row here would be a cell no program can
+        // run, which is the one thing this list does not do.
+        if vae == DType::F32 {
+            push(
+                "dense_attention",
+                ops::attention::DenseDescriptor {
+                    query: vae,
+                    key_value: vae,
+                    output: vae,
+                    head_dim: 64,
+                    q_heads: 32,
+                    kv_heads: 32,
+                    mask: ops::attention::Mask::Dense,
+                    windowed: false,
+                    // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
+                    // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
+                    max_kv_len: 2048,
+                    cu_seq_lens: false,
+                }
+                .to_string(),
+            );
         }
-        .to_string(),
-    );
+        // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
+        // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: vae,
+                    weight: vae,
+                    accumulate: DType::F32,
+                    output: vae,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k: VAE_WIDTH,
+                }
+                .to_string(),
+            );
+        }
+    }
+
+    // ---- The video VAE encoder's residual adds.
+    //
+    // Every block of the encoder adds its convolution pair's output back into its input
+    // (`ScaledAdd.forward(f, rows(out), rows(residual), 1.0, 1.0)`) at that stage's own channel count -
+    // `block_out_channels [128, 256, 256, 512, 512, 1024]`, so four distinct widths, and the encoder is
+    // FP32 throughout. `scaled_add` is the operator that widens and narrows in the diffusion path, and
+    // no row of it existed at any of these four widths: the encoder's residual adds are the only
+    // consumer of that family at a VAE channel count.
+    for columns in [128_u32, 256, 512, 1024] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: DType::F32,
+                source: DType::F32,
+                columns,
+                block: ops::residual::RESIDUAL_BLOCK,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
     //
@@ -1098,6 +1416,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // Ulysses-2 shard are two calls of the same block rather than two code paths. Every key here is
     // bound by a `t2va` request's first stage, which is why they belong in the list even though no
     // DiT stage binds them.
+    //
+    // **The mask is `causal`, and the tower's is `dense`: one stage reads both.** The base text
+    // encoder hands the language stack `VarlenInput(lengths, lengths, (True,) * len(counts))`
+    // (`uniserve/models/encoder.py:482`) - a prompt is a causal sequence - while the vision tower
+    // hands its rows `(False,)` (`uniserve/models/qwen3_vl/vision.py:281`), because a patch sees the
+    // whole image. This table said `dense` for the text stack until a device asked for
+    // `mask_causal` by name on the first block of stage 4, which is the only instrument that could
+    // have told us: both keys have the same shape, the same heads and the same dtypes.
     for heads in [64_u32, 32] {
         push(
             "dense_attention",
@@ -1108,7 +1434,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 head_dim: 128,
                 q_heads: heads,
                 kv_heads: heads / 8,
-                mask: ops::attention::Mask::Dense,
+                mask: ops::attention::Mask::Causal,
                 windowed: false,
                 // A prompt's token count is a launch value, not part of the key: the bound below is
                 // the text capacity's own, and the reference masks query rows past the prompt.
