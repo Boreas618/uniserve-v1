@@ -34,6 +34,11 @@ not evidence:
 - a case whose `role.json` states a different `theta` -> ``refused the case states theta 10000.0 and
   the checkpoint's config gives 5000000.0; the pair is two different requests``, exit 2.
 
+And the same two holds for the other two modes: `--dit` reports swapped axis blocks as ``the columns
+take different coordinates`` and a spectrum value times 1.01 as ``5.623e-04 at element 5``; `--vision`
+reports a column coordinate raised by 1 as ``positions (16, 2): 1 apart at element 7`` and a cosine
+times 1.001 as ``1.000e-03 at element 7``.
+
 **A text-only prompt cannot exercise the interleaving**, because every axis carries the token's own
 position and the three coordinates are equal - a wrong axis assignment then produces identical
 factors. The case that does exercise it states an image grid (`--image-grid`), which is the only
@@ -288,21 +293,22 @@ def compare(name: str, mine, theirs, shape, *, integer: bool = False) -> float:
     return worst[0]
 
 
-def compare_dit(case: Path, checkpoint: Path) -> int:
-    """Compare the DiT's rotary spectrum and axis order with the reference's.
+def compare_spectrum(case: Path, checkpoint: Path, *, stated_as: str, label: str) -> int:
+    """Compare one component's rotary spectrum and axis order with the reference's.
 
-    The DiT's factors are a device operator, so what the host can compare is what feeds it: the
-    `[3 * rope_freq_dim]` table (`attention::table`) and the axis each of its columns takes
-    (`ops::rope::section_axes`). Both are wrong in ways no shape can see - 48 distinct frequencies
-    where the reference repeats 16, or the axes in another order - and the DiT's rotary has had
-    exactly that class of defect.
+    The factors of both components are device operators, so what the host can compare is what feeds
+    them: the table (one spectrum per axis) and the axis each of its columns takes. Both are wrong in
+    ways no shape can see - distinct frequencies where the reference repeats one spectrum, or the axes
+    in another order - and the DiT's rotary has had exactly that class of defect.
+
+    `stated_as` is the file the probe wrote; `label` names the component in the report.
     """
     if install_kernel_stub():
         print(
             "note    the reference's compiled kernel module is absent here; only its host inverse"
             " frequency table is read, which needs no kernel"
         )
-    stated = json.loads((case / "dit_rope.json").read_text())
+    stated = json.loads((case / stated_as).read_text())
     pairs = int(stated["pairs"])
     axes = int(stated["axes"])
     theta = float(stated["theta"])
@@ -326,7 +332,7 @@ def compare_dit(case: Path, checkpoint: Path) -> int:
     # spectrum repeats once per axis.
     repeated = spectrum * axes
     implied = "".join(str(index // pairs) for index in range(axes * pairs))
-    print(f"case    {pairs} frequencies, {axes} axes over {len(table)} columns, theta {theta}")
+    print(f"case    {label}: {pairs} frequencies, {axes} axes over {len(table)} columns, theta {theta}")
     worst = compare("spectrum", table, repeated, (axes * pairs,))
     if stated["spectrum_axes"] != implied:
         print(
@@ -335,6 +341,73 @@ def compare_dit(case: Path, checkpoint: Path) -> int:
         )
         return 1
     print(f"axes    {implied}: the axes occupy contiguous blocks of {pairs} columns, as ours do")
+    if worst <= TOLERANCE:
+        print("verdict equal")
+        return 0
+    print("verdict differ")
+    return 1
+
+
+def compare_vision(case: Path, checkpoint: Path) -> int:
+    """Compare the vision tower's 2-D rotary factors with the reference's.
+
+    The reference builds one `RotaryEmbedding(head_dim / 2)` without sections
+    (`qwen3_vl/vision.py:168`) and calls it with `[patches, 2]` merged-grid coordinates (`:253`),
+    flattening `[patches, 2, head_dim / 4]` to `[patches, head_dim / 2]` - so each axis uses the
+    whole 18-frequency spectrum and the axes are contiguous halves. The crate computes the same
+    tables on the host (`positions::VisionRotary::factors`), which is why this can be compared at
+    all.
+    """
+    if install_kernel_stub():
+        print(
+            "note    the reference's compiled kernel module is absent here; only its host factor"
+            " arithmetic is used, which needs no kernel"
+        )
+    stated = json.loads((case / "vision_rope.json").read_text())
+    head_dim = int(stated["head_dim"])
+    theta = float(stated["theta"])
+    height, width, merge = int(stated["height"]), int(stated["width"]), int(stated["merge"])
+    patches = int(stated["patches"])
+    shape, coordinates = read_container(case / "coordinates.h3t")
+    _, cosine = read_container(case / "cosine.h3t")
+    _, sine = read_container(case / "sine.h3t")
+    if shape != (patches, 2):
+        raise Differ(f"the case's coordinates are {shape} for {patches} patches")
+
+    python = Path(".").resolve()
+    if str(python) not in sys.path:
+        sys.path.insert(0, str(python))
+    torch = importlib.import_module("torch")
+    position_module = load_module(
+        "reference_vision_position", python / "uniserve/nn/vision/position.py"
+    )
+    rope_module = load_module("reference_rope", python / "uniserve/nn/rope.py")
+    rows, columns = position_module.merged_grid_coordinates(height, width, merge)
+    theirs = torch.stack((rows.reshape(-1), columns.reshape(-1)), dim=-1).to(torch.float32)
+    rotary = rope_module.RotaryEmbedding(
+        head_dim // 2,
+        theta=theta,
+        sections=None,
+        scaling=None,
+        max_position_embeddings=32768,
+    )
+    with torch.inference_mode():
+        their_cosine, their_sine = rotary(
+            theirs, dtype=torch.float32, sequence_length=0
+        )
+    theirs_coordinates = [[int(a), int(b)] for a, b in theirs.tolist()]
+    ours_coordinates = [
+        [coordinates[2 * index], coordinates[2 * index + 1]] for index in range(patches)
+    ]
+    flat_theirs = [value for pair in theirs_coordinates for value in pair]
+    print(f"case    {patches} patches of a {height}x{width} grid merged by {merge}, head {head_dim}")
+    worst = compare("positions", [v for pair in ours_coordinates for v in pair], flat_theirs, shape, integer=True)
+    factors = (patches, head_dim // 2)
+    worst = max(
+        worst,
+        compare("cosine", cosine, their_cosine.flatten().tolist(), factors),
+    )
+    worst = max(worst, compare("sine", sine, their_sine.flatten().tolist(), factors))
     if worst <= TOLERANCE:
         print("verdict equal")
         return 0
@@ -351,11 +424,35 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="compare the DiT's spectrum and axis order instead of a prompt's factors",
     )
+    parser.add_argument(
+        "--vae",
+        type=Path,
+        help="compare the video decoder's spectrum and axis order",
+    )
+    parser.add_argument(
+        "--vision",
+        type=Path,
+        help="compare the vision tower's 2-D rotary factors",
+    )
     arguments = parser.parse_args(argv)
     if arguments.dit is not None:
-        return compare_dit(arguments.dit, arguments.checkpoint)
+        return compare_spectrum(
+            arguments.dit,
+            arguments.checkpoint,
+            stated_as="dit_rope.json",
+            label="the DiT's",
+        )
+    if arguments.vae is not None:
+        return compare_spectrum(
+            arguments.vae,
+            arguments.checkpoint,
+            stated_as="vae_rope.json",
+            label="the video decoder's",
+        )
+    if arguments.vision is not None:
+        return compare_vision(arguments.vision, arguments.checkpoint)
     if arguments.case is None:
-        parser.error("one of --case or --dit is required")
+        parser.error("one of --case, --dit, --vae or --vision is required")
 
     role = json.loads((arguments.case / "role.json").read_text())
     shape, coordinates = read_container(arguments.case / "positions.h3t")
