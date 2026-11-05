@@ -367,7 +367,7 @@ mod tests {
             frames: 9,
             height: 8,
             width: 10,
-            ..latents.clone()
+            ..latents
         };
         assert_eq!(decoded.raster().dims(), &[3, 36, 128, 160]);
         assert_eq!(decoded.raster_row(), 160);
