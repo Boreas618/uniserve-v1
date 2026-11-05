@@ -692,8 +692,28 @@ impl Capture {
         for (_, data) in &frontier {
             EdgeKind::of(data)?;
         }
-        let mut queue: std::collections::VecDeque<Handle> =
-            frontier.iter().map(|(node, _)| *node).collect();
+        // The frontier names the nodes the *next* operation will depend on, so after an operation
+        // has been issued they are the nodes that operation added - the very nodes this walk is
+        // asked for. Collecting only the frontier's dependents finds nothing for a launch, because
+        // the node the launch just added has no dependents yet: the first walk of a capture found
+        // its node only because that node was also a root, and every launch after it was invisible.
+        for (node, _) in &frontier {
+            if self.seen.insert(*node as usize) {
+                found.push(*node);
+                fresh.insert(*node as usize);
+            }
+        }
+        // The walk starts at the *previous* frontier as well as this one. An operation may add more
+        // than one node - a native module that launches two kernels, a reduction beside its main
+        // pass - and only the last of them is the frontier: the earlier ones are reached by walking
+        // downstream from where the operation began, and `seen` keeps a node from being collected
+        // twice.
+        let mut queue: std::collections::VecDeque<Handle> = self
+            .frontier
+            .iter()
+            .copied()
+            .chain(frontier.iter().map(|(node, _)| *node))
+            .collect();
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
