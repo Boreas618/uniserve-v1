@@ -566,10 +566,12 @@ impl Transformer {
     /// deployment's tile bound — the sparse attention's reduction length — which the layouts state
     /// and a sparse deployment carries. **No collective is a program**: the Ulysses exchange issues a
     /// communication, so a partition's degree changes the shapes the attention reads and adds no row.
+    #[allow(clippy::too_many_arguments)]
     pub fn programs(
         config: &TransformerConfig,
         kind: AttentionKind,
         dtype: nn::DType,
+        boundary: nn::DType,
         rows: u32,
         groups: Groups,
         partition: &Partition,
@@ -654,12 +656,31 @@ impl Transformer {
             dtype,
             dtype,
         ));
+        // **And the four boundary projections, which the checkpoint stores at another type.** They
+        // read the stack's activation with a weight of the boundary type and carry a bias, so a row
+        // keyed from the stack alone states a product the runtime never makes: the omission stopped
+        // a run (`the refused gemm is input f32, weight bf16`). A component stored in one type has
+        // `boundary == dtype` and states nothing here.
+        if boundary != dtype {
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                WeightOrder::NxK,
+                true,
+                dtype,
+                dtype,
+            ));
+        }
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
 
         // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
         // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
         // types and the epilogue, not the width.
-        programs.launch::<SiluOp>(&Silu::descriptor_of(dtype, config.time_hidden_dim));
+        // **At the boundary's type, not the stack's**: the activation reads the timestep embedder's
+        // output, and both of that pair's tensors are stored at the boundary type. A statement that
+        // named the stack's type was a row the forward never launches and, in the other direction,
+        // the row the forward does launch was missing.
+        programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_hidden_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
@@ -1298,6 +1319,7 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &Partition::single(),
@@ -1401,6 +1423,7 @@ mod tests {
             &transformer,
             AttentionKind::Dense,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(false),
             &Partition::single(),
@@ -1426,6 +1449,7 @@ mod tests {
                 reference_keep: Some(0.1),
             },
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &Partition::single(),
