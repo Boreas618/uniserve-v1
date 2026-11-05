@@ -323,7 +323,7 @@ def families(args):
 
 OPS = pathlib.Path("crates/ops/src")
 NAME = re.compile(r'const NAME: &\'static str = "([a-z0-9_]+)"')
-COUNT = re.compile(r"^# (\d+) data rows")
+COUNT = re.compile(r"^# (\d+) data rows(?:, (\d+) operators)?")
 
 
 def wellformed(args):
@@ -335,12 +335,15 @@ def wellformed(args):
     operator name `crates/ops` does not define (an install failure far from here).
     """
     text = pathlib.Path(args.fixture).read_text().splitlines()
-    rows, stated = [], None
+    rows, stated, stated_ops = [], None, None
     for line in text:
         if line.startswith("#"):
             found = COUNT.match(line)
             if found:
                 stated = int(found.group(1))
+                # The same line usually names the operators; when it does, it is a
+                # second statement about the file and drifts on its own.
+                stated_ops = int(found.group(2)) if found.group(2) else None
             continue
         if "\t" in line:
             operator, key = line.split("\t", 1)
@@ -354,6 +357,19 @@ def wellformed(args):
     elif stated != len(rows):
         print(
             f"the header states {stated} data rows and the file holds {len(rows)}"
+        )
+        failures += 1
+    operators = {operator for operator, _ in rows}
+    if stated_ops is None:
+        print(
+            "the header states no operator count: the line naming the rows should"
+            " name how many operators they come from"
+        )
+        failures += 1
+    elif stated_ops != len(operators):
+        print(
+            f"the header states {stated_ops} operators and the file holds"
+            f" {len(operators)}"
         )
         failures += 1
     repeats = sorted({row for row in rows if rows.count(row) > 1})
@@ -374,8 +390,9 @@ def wellformed(args):
     if failures:
         return 1
     print(
-        f"the list states what it holds: {len(rows)} rows, no repeat, and every"
-        f" operator among the {len(defined)} `crates/ops` defines"
+        f"the list states what it holds: {len(rows)} rows over"
+        f" {len(operators)} operators, no repeat, and every operator among the"
+        f" {len(defined)} `crates/ops` defines"
     )
     return 0
 
@@ -675,7 +692,7 @@ def self_test() -> int:
         root = pathlib.Path(directory)
         good = root / "good.txt"
         good.write_text(
-            "# 2 data rows\n"
+            "# 2 data rows, 2 operators\n"
             "rms_norm\tdtype_bf16_columns_5376_block_1024\n"
             "gemm\tdtype_bf16_rows_64_columns_64\n"
         )
@@ -687,6 +704,13 @@ def self_test() -> int:
             "gemm\tdtype_bf16_rows_64_columns_64\n"
         )
         assert wellformed(_Args(str(stale))) == 1
+        ops_wrong = root / "ops_wrong.txt"
+        ops_wrong.write_text(
+            "# 2 data rows, 3 operators\n"
+            "rms_norm\tdtype_bf16_columns_5376_block_1024\n"
+            "gemm\tdtype_bf16_rows_64_columns_64\n"
+        )
+        assert wellformed(_Args(str(ops_wrong))) == 1
         repeated = root / "repeated.txt"
         repeated.write_text(
             "# 3 data rows\nrms_norm\tone\nrms_norm\tone\ngemm\tother\n"
