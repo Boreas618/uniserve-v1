@@ -1081,9 +1081,12 @@ impl DecoderLayer {
             return Ok(normalized);
         }
 
-        self.attention.forward(
-            f, batch, cache, layer, buffers, normalized, cosine, sine, update,
+        let projected = self.attention.forward(
+            f, batch, cache, layer, buffers, normalized, cosine, sine, update, stop,
         )?;
+        if stop == Some(Substage::Projected) {
+            return Ok(projected);
+        }
         if stop == Some(Substage::Attended) {
             return Ok(update);
         }
@@ -1120,10 +1123,14 @@ impl AttentionLayer {
         cosine: TensorView,
         sine: TensorView,
         out: TensorView,
-    ) -> Result<()> {
+        stop: Option<Substage>,
+    ) -> Result<TensorView> {
         self.q_proj.forward(f, normalized, buffers.query)?;
         self.k_proj.forward(f, normalized, buffers.key)?;
         self.v_proj.forward(f, normalized, buffers.value)?;
+        if stop == Some(Substage::Projected) {
+            return Ok(buffers.value);
+        }
 
         let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
         let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
@@ -1169,7 +1176,7 @@ impl AttentionLayer {
                 .all_reduce_sum(out, f.stream()?)
                 .map_err(Error::from)?;
         }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -1283,6 +1290,14 @@ pub struct Run {
 pub enum Substage {
     /// The residual add and the input normalization.
     Normalized,
+    /// The attention block's three projections, before the cache write and the attention.
+    ///
+    /// This is the cut a cache whose values are wrong is bisected at: the projections' answer is the
+    /// only tensor between the normalized input and the cache write, so a value that is finite here
+    /// and wrong in the page is the write's, and one already wrong here is the product's. The view
+    /// is the value projection's buffer, which is the last of the three launches and the one a
+    /// zeroed cache is usually blamed on.
+    Projected,
     /// The attention block's projection out, before the residual add.
     Attended,
     /// The post-attention normalization: the gate's operand (`post_attention_layernorm`).
@@ -1296,12 +1311,19 @@ impl Substage {
     ///
     /// The spellings are the contract with a command line that names a stage: the model refuses
     /// anything else, so a mistyped stage cannot silently run a different cut.
-    pub const NAMES: [&'static str; 4] = ["normalized", "attended", "gate_in", "mlp_out"];
+    pub const NAMES: [&'static str; 5] = [
+        "normalized",
+        "projected",
+        "attended",
+        "gate_in",
+        "mlp_out",
+    ];
 
     /// The stage `name` asks for, or `None` when it names no cut.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "normalized" => Some(Self::Normalized),
+            "projected" => Some(Self::Projected),
             "attended" => Some(Self::Attended),
             "gate_in" => Some(Self::GateIn),
             "mlp_out" => Some(Self::MlpOut),
@@ -1313,6 +1335,7 @@ impl Substage {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Normalized => "normalized",
+            Self::Projected => "projected",
             Self::Attended => "attended",
             Self::GateIn => "gate_in",
             Self::MlpOut => "mlp_out",
