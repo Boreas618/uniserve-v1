@@ -911,10 +911,11 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 channels,
                 kernel: ACTIVATION_KERNEL,
                 ratio: ACTIVATION_RATIO,
-                // The decoder's widest stage, which is the model's own number
-                // (`AudioDecoder`'s channel schedule), not a layer constant: `nn`'s
-                // `AudioActivation` takes the block as a construction argument.
-                block: 1024,
+                // The model's own program width, read from it rather than restated: the launcher
+                // passes `audio_vae::ACTIVATION_BLOCK` to `AudioActivation::new`, so a copy of the
+                // number here is a second answer to a question the launch already answers - and this
+                // row said 1024 for seven launches the device makes at 256.
+                block: minimax_h3::audio_vae::ACTIVATION_BLOCK,
                 pdl: PDL,
             }
             .to_string(),
