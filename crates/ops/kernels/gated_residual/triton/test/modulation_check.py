@@ -396,7 +396,10 @@ def check_gated(case, generator, dtype, width, rows, gate, indices):
         gate,
         indices,
         case["gate_stride"],
-        elements,
+        # The kernel takes the ROW count and multiplies it by the width it was compiled for; the
+        # element count here masked every lane live past the activation and past `indices`, which
+        # the interpreter answered by reading out of bounds.
+        rows,
         WIDTH=width,
         BLOCK=GATED_BLOCK,
     )
@@ -474,15 +477,22 @@ HAND = {
 }
 
 
-def check_hand(operator):
-    """Run the hand-computed case of one form and compare every element with its literal."""
+def check_hand(form):
+    """Run the hand-computed case of one form and compare every element with its literal.
+
+    `form` is `modulated` or `gated` — the same two words `HAND` is keyed by and the same derivation
+    the descriptor's key uses. It selects **both** the literal table and the kernel, which is the
+    point: branching on the operator's name here instead would run one form's kernel against the
+    other form's literals whenever the caller passed a form, and the mismatch would read as an
+    arithmetic defect in a kernel that is correct.
+    """
     width = HAND["width"]
     rows = len(HAND["value"])
     gate = torch.tensor(HAND["gate"], dtype=torch.float32)
     indices = torch.tensor(HAND["indices"], dtype=torch.int64)
-    expect = torch.tensor(HAND[operator], dtype=torch.float64)
+    expect = torch.tensor(HAND[form], dtype=torch.float64)
 
-    if operator == "gated_residual":
+    if form == "gated":
         import gated_residual as kernels
 
         elements = rows * width
@@ -496,7 +506,7 @@ def check_hand(operator):
             gate,
             indices,
             width,
-            elements,
+            rows,
             WIDTH=width,
             BLOCK=GATED_BLOCK,
         )
