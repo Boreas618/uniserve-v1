@@ -1290,4 +1290,52 @@ mod tests {
             );
         }
     }
+
+    /// Every seam the deployment's offered canvases produce is in the blend table.
+    ///
+    /// The table is a ladder of widths (from `MINIMUM_OVERLAP` up in alignment steps on both axes)
+    /// and a deployment launches only what its grids realize. **The ladder may be wider than the
+    /// deployment and must never be narrower**: a width this test cannot find is a seam a canvas
+    /// needs and the decoder has no module for, which stops a clip decode at the first seam of that
+    /// width rather than at a load. That is the error a ladder gets narrowed by - one class removed
+    /// because one request did not reach it - and it is invisible to every other check in the crate.
+    #[test]
+    fn every_seam_the_offered_canvases_produce_is_in_the_blend_table() {
+        let config = crate::video_vae::tests::video_config();
+        let decoder = ClipDecoder::new(&config, DType::F32).expect("a clip decoder");
+        let ratio = config.spatial_compression();
+        let mut realized = Vec::new();
+        for offered in crate::config::offered_canvases() {
+            let canvas = Canvas::clip(
+                &config,
+                offered.height / ratio,
+                offered.width / ratio,
+            );
+            let tiles = Tiles::of(&config, &canvas)
+                .expect("the grid")
+                .tiles(&config, &canvas);
+            for tile in tiles {
+                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
+                    if extent > 0 && !realized.contains(&(extent, axis)) {
+                        realized.push((extent, axis));
+                    }
+                }
+            }
+        }
+        assert!(
+            !realized.is_empty(),
+            "the deployment's canvases are multi-row and multi-column, so they produce seams"
+        );
+        for (extent, axis) in &realized {
+            assert!(
+                decoder
+                    .blends()
+                    .iter()
+                    .any(|(width, side, _)| width == extent && side == axis),
+                "the deployment launches a {extent}-pixel seam along axis {axis} and the table is \
+                 {} widths on two axes: a narrowed ladder stops the clip decode here",
+                decoder.blends().len()
+            );
+        }
+    }
 }
