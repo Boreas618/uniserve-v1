@@ -63,7 +63,7 @@ echo "== the sparse list against its generator"
 # with `--sparse`, and a file cut from a walk at another clip fails here by name
 # rather than by falling through to a walk comparison, which measures the walk.
 if [ -f "$sparse_fixture" ]; then
-    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9,8192 \
+    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9,0.9 \
         --fixture "$sparse_fixture" || sparse_not_generated=1
 else
     echo "   skipped: $sparse_fixture is absent"
