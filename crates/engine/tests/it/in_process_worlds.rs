@@ -222,9 +222,15 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     // the running world closes.
     // The park is waited for with a bound of its own, and a park that does not
     // answer is reported with what the world was doing: steps taken since the
-    // command and whether it is still answering at all. A park waits for the
-    // world to hold nothing — no running, waiting, retiring request and no
-    // batch in flight — so a timeout there is a state, and the state has a name.
+    // command and whether it is still answering at all.
+    //
+    // `poll_park` answers only when seven sets are empty: running requests,
+    // running media, retiring requests, waiting requests, waiting media,
+    // batches in flight and pending submissions (`scheduler/world.rs:232`). A
+    // request's `Finish` leaves inside a batch, so a close that never rides one
+    // keeps the park from answering: a world still counting steps is that
+    // case, and a world answering nothing has a stopped control thread. Two
+    // owners, which is why the timeout names which one it met.
     let steps_before = running
         .counters()
         .recv_timeout(PARK)
