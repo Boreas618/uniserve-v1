@@ -1363,7 +1363,10 @@ def _restart_while_streaming(
             f"stream errors: {[repr(one) for one in errors]})"
         ) from error
     restarted = _admin(base_url, "restart")
-    assert restarted.status_code == 200, restarted.text
+    # A refusal here is the successor's own answer, and the reason it gives names
+    # the step that stopped; the daemons' log says what happened to the processes
+    # the handover was carrying, which the answer cannot.
+    assert restarted.status_code == 200, f"{restarted.text}{_log_trouble(log)}"
     successor = restarted.json()["result"]["pid"]
     successors.append(successor)
     assert successor != old_daemon
@@ -1594,7 +1597,10 @@ def _restart_with_a_json_body(
         "the one-body request was never served",
     )
     restarted = _admin(base_url, "restart")
-    assert restarted.status_code == 200, restarted.text
+    # A refusal here is the successor's own answer, and the reason it gives names
+    # the step that stopped; the daemons' log says what happened to the processes
+    # the handover was carrying, which the answer cannot.
+    assert restarted.status_code == 200, f"{restarted.text}{_log_trouble(log)}"
     successor = restarted.json()["result"]["pid"]
     successors.append(successor)
     request.join(timeout=1800)

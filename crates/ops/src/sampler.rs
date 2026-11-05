@@ -882,6 +882,15 @@ pub struct OrderArgs {
     pub ordered_values: TensorView,
     /// `[rows, width]` the ids in ascending token order.
     pub ordered_ids: TensorView,
+    /// `[rows, vocabulary]` i32 scratch, one count per token id and then that id's rank.
+    ///
+    /// The program counts rather than compares, because a row's candidates may be the whole
+    /// vocabulary: an ordering that compares every candidate with every other is quadratic in the
+    /// vocabulary, and 151936 candidates in one program is sixteen seconds. This buffer is the id
+    /// space's, and the program owns it for the duration of the launch.
+    pub counts: TensorView,
+    /// The id space `counts` covers: the model's vocabulary.
+    pub vocabulary: u64,
 }
 
 /// Put each row's candidates in ascending token order.
@@ -946,17 +955,60 @@ impl Op for CandidateOrder {
             }
         }
 
+        if args.vocabulary < width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a row of {width} candidates names ids in a vocabulary of {}: the id space \
+                     cannot be narrower than the candidates it holds",
+                    args.vocabulary
+                ),
+            ));
+        }
+        args.counts
+            .require_shape(Self::NAME, Shape::new(&[rows, args.vocabulary]))?;
+        if args.counts.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the counts are i32 over [{rows}, {}], the view says {}",
+                    args.vocabulary, args.counts.dtype
+                ),
+            ));
+        }
+        if args.counts.strides != crate::tensor::Strides::row_major(args.counts.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the counts are written row-major; found {}",
+                    args.counts.strides
+                ),
+            ));
+        }
+
         let mut arguments = Arguments::new();
+        // The scratch is the program's own: neither twin rule applies to it, and a shadow run gets
+        // its own buffer only if the caller gives it one.
         arguments
             .view(args.values)
             .view(args.ids)
             .view(args.ordered_values)
             .view(args.ordered_ids)
+            .view(args.counts)
             .u64(rows)
             .u32(u32::try_from(width).map_err(|_| {
                 Error::argument(
                     Self::NAME,
                     format!("{width} candidates do not fit a kernel parameter"),
+                )
+            })?)
+            .u32(u32::try_from(args.vocabulary).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "a vocabulary of {} does not fit a kernel parameter",
+                        args.vocabulary
+                    ),
                 )
             })?);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
