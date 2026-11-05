@@ -480,7 +480,10 @@ mod tests {
         // even though another replica pairs.
         let error = pairing(&placements[..3]).expect_err("host b has no encoder");
         let message = error.to_string();
-        assert!(message.contains("executor flow-b"), "{message}");
+        // The refusal names the pool it refuses and not the one it admits: the id is the
+        // contract, the noun in front of it is not, so the assertion does not pin one.
+        assert!(message.contains("flow-b"), "{message}");
+        assert!(!message.contains("flow-a"), "{message}");
         assert!(
             message.contains("host b") && message.contains("host a"),
             "{message}"
