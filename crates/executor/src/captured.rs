@@ -114,6 +114,24 @@ impl Captured {
                 }
             }
         }
+        // A capture is the one place in this system where a silent partial result looks exactly like
+        // success: it returns in milliseconds, with no error, and its graph replays a fraction of the
+        // forward. So the template is read back from the driver and compared with what the walk
+        // reported, and a graph that holds fewer nodes than the walk launched refuses **by name**.
+        //
+        // The comparison is one-sided on purpose. An operator may emit more than one node - the
+        // paged attention's second reduction does - and the mechanism adds a memcpy per uploaded
+        // column and an empty node per ordering edge, so the template holds at least what the walk
+        // launched and equality is not the invariant. Holding fewer is: it means nodes the walk
+        // reported are not in the graph a replay launches.
+        let launched = nodes.iter().map(|(_, _, launch)| launch.len() as u64).sum::<u64>();
+        let template_nodes = template.nodes()?.len() as u64;
+        if template_nodes < launched {
+            return Err(Error::Invariant(format!(
+                "the capture recorded {launched} launch(es) and its graph holds {template_nodes} \
+                 node(s): the work a replay launches is not the work the walk declared"
+            )));
+        }
         Ok(Self {
             exec,
             template,

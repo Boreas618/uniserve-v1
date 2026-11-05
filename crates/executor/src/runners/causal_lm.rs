@@ -1658,8 +1658,25 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         }
                         Err(error) => (0, format!("unreadable({error})")),
                     };
+                    // Per operator, how many nodes the walk attributed to it: two buckets of one
+                    // model should name the same operators with the same counts, and a bucket
+                    // missing a few per layer names the operator that vanished.
+                    let mut per_op: Vec<(&'static str, u64)> = Vec::new();
+                    for (op, _, launch) in captured.nodes() {
+                        match per_op.iter_mut().find(|(name, _)| name == op) {
+                            Some((_, count)) => *count += launch.len() as u64,
+                            None => per_op.push((op, launch.len() as u64)),
+                        }
+                    }
+                    per_op.retain(|(_, count)| *count > 0);
+                    let ops = per_op
+                        .iter()
+                        .map(|(name, count)| format!("{name}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     tracing::info!(
                         bucket = %bucket,
+                        ops = %ops,
                         kernels = captured.kernel_nodes(),
                         walks = launches,
                         recorded_kinds = %kinds,
