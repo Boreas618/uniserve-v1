@@ -88,6 +88,13 @@ pub struct DeferredCall {
 unsafe impl Send for DeferredCall {}
 
 impl DeferredCall {
+    /// A call of `function` with `args`, deferred to the issuer's order.
+    ///
+    /// Built by tests only since the unit resets address the pool's fields
+    /// directly: the one production path that deferred a numerical library call
+    /// through this constructor is gone, and `Issue::call` still performs the
+    /// calls other code holds.
+    #[cfg(test)]
     pub(crate) fn new(function: Function, args: Vec<Any>) -> Self {
         Self { function, args }
     }
