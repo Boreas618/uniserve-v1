@@ -111,6 +111,10 @@ impl Scheduler {
             // submitted. Its `Finish` and `Free` have nothing left to reach.
             if batch.requests.is_empty() && self.executor.serves_in_process() {
                 self.acknowledge_commands(&batch.commands);
+                // Nothing went to an executor, so no result will ever end this batch: it leaves
+                // the in-flight window here, or every boundary that waits for an empty window (a
+                // policy stage, a park, a drain) waits for it forever.
+                self.inflight.pending_batches.remove(&batch.id);
                 progressed = true;
                 continue;
             }
