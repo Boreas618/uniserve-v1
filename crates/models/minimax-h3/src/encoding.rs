@@ -23,7 +23,9 @@
 //! SGEMM 加 softmax kernel program」 — FP32 attention for `ref2va`'s audio encoder and the VSA
 //! compression branch, as a cuBLASLt SGEMM plus a softmax kernel program. It is the declaration §9
 //! asks the model to make instead of leaning on `torch.autocast`, and it is the opposite of the
-//! video VAE decoder's rule (one FP16 element type for parameters and residual). The layer is
+//! video VAE decoder's rule (one element type for both parameters and residual, whatever the
+//! deployment's preset - F32 under `dtype = "auto"`, because the checkpoint stores the VAE in F32 and
+//! auto converts nothing; FP16 is a *converted* deployment's element, and every size halves with it). The layer is
 //! [`nn::layers::Attention::fp32`]; no call site may construct the dense backend for these blocks.
 //!
 //! ## The encoder's input
