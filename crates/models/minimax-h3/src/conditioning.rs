@@ -277,6 +277,7 @@ impl TokenRefiner {
     /// final norm writes the stack's rows, and that write is keyed by the type it writes.
     pub fn programs(
         config: &TransformerConfig,
+        features: nn::DType,
         working: nn::DType,
         output: nn::DType,
     ) -> Result<Vec<(String, String)>> {
@@ -306,9 +307,12 @@ impl TokenRefiner {
 
         // Two normalization widths: the hidden state's and one head's, which the query and the key
         // normalize over.
-        for columns in [hidden, head] {
-            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, working));
-        }
+        // The hidden-state norm reads the incoming features, so its element type is theirs - the
+        // refiner's working buffer is the prompt's, and a block computes in its own type beside it
+        // (`Rows::reserve` allocates the block's buffers at `block.dtype` while `forward` hands the
+        // block the features' buffer). The per-head norms read the block's own projections.
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, features));
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(head, working));
 
         // The identity residual each block folds both of its updates through. Its scale is one
         // value (`identity()`, `[1]` F32), so the launch's descriptor is one column wide and the
