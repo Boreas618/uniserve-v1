@@ -70,6 +70,16 @@ pub enum Product {
     VideoLatents,
     /// The audio latent trajectory, in the same sense.
     AudioLatents,
+    /// `[channels, frames, rows, columns]` the decoded clip: a decode writes it and the transport
+    /// that turns it into an artifact reads it.
+    ///
+    /// It is a product for the same reason the latents are: the region is a runner's own column, and
+    /// a value another call must read has nowhere to be unless it is named. The name is
+    /// `(request, kind)` like every other, so the transport reads one clip by the identity the
+    /// request was admitted under rather than by a position in a batch.
+    Video,
+    /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
+    Track,
 }
 
 impl Product {
@@ -82,6 +92,8 @@ impl Product {
             Self::Audio => "audio",
             Self::VideoLatents => "video latents",
             Self::AudioLatents => "audio latents",
+            Self::Video => "video",
+            Self::Track => "track",
         }
     }
 }
@@ -206,7 +218,7 @@ impl Held {
 
     /// How many products the store holds, for a reader checking that a request ended cleanly.
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("the product store").len()
+        crate::lock(&self.entries).len()
     }
 
     /// Whether the store holds nothing.
@@ -226,7 +238,7 @@ impl Products for Held {
     ) -> Result<()> {
         // A trajectory is published again at every step and the last write is the one a reader
         // wants, so publishing replaces rather than refusing a second write.
-        self.entries.lock().expect("the product store").insert(
+        crate::lock(&self.entries).insert(
             (request, kind),
             Placed {
                 view: *view,
@@ -244,12 +256,7 @@ impl Products for Held {
         device: DeviceId,
         stream: StreamId,
     ) -> Result<Option<TensorView>> {
-        let placed = self
-            .entries
-            .lock()
-            .expect("the product store")
-            .get(&(request, kind))
-            .copied();
+        let placed = crate::lock(&self.entries).get(&(request, kind)).copied();
         let Some(placed) = placed else {
             return Ok(None);
         };
@@ -278,7 +285,7 @@ impl Products for Held {
     }
 
     fn forget(&self, request: RequestKey) -> usize {
-        let mut entries = self.entries.lock().expect("the product store");
+        let mut entries = crate::lock(&self.entries);
         let before = entries.len();
         entries.retain(|(key, _), _| *key != request);
         before - entries.len()

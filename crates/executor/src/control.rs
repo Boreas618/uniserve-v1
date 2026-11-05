@@ -32,6 +32,12 @@ use crate::{Error, Result};
 /// refused: a peer sends it as the connection's first frame.
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an attaching daemon has to welcome an engine that connects to it
+/// (`Attach`, §7.5.1 step 2). It is the daemon's own connect bound, so a
+/// handover that hangs is reported on the daemon's side rather than waiting
+/// here forever.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Where the main process reaches the processes on its other ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoints {
@@ -47,8 +53,11 @@ pub struct Endpoints {
 /// What the control thread's wait found, for the driver to act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ready {
-    /// A frame from the daemon is buffered.
+    /// A frame from the daemon that launched this process is buffered.
     Daemon,
+    /// A frame from an attached daemon is buffered: the hot restart successor
+    /// whose request socket this engine connected to (`Attach`, §7.5.1 step 2).
+    Attached(usize),
     /// A peer main process connected: [`Control::accept`] takes it.
     PeerConnecting,
     /// A peer has a frame buffered; read it with [`Control::peer_mut`].
@@ -65,6 +74,12 @@ pub enum Ready {
 /// wake other threads use to end a wait.
 pub struct Control {
     daemon: Connection,
+    /// The daemons this engine attached to besides the one that launched it,
+    /// by the index the request records use: a hot restart's successor, which
+    /// takes the responses in flight over while the process goes on serving
+    /// (§7.5.1 step 2). An entry stays in place once its daemon detaches, so
+    /// that no other front's index moves.
+    attached: Vec<Option<Connection>>,
     engine: u64,
     listener: Option<Listener>,
     peers: BTreeMap<u32, Channel>,
@@ -91,6 +106,7 @@ impl Control {
             .map_err(|error| Error::transport_source("creating the control wake", error))?;
         Ok(Self {
             daemon,
+            attached: Vec::new(),
             engine,
             listener,
             peers: BTreeMap::new(),
@@ -119,6 +135,19 @@ impl Control {
             events: libc::POLLIN,
             revents: 0,
         });
+        let attached_start = descriptors.len();
+        // The front each attached descriptor belongs to: a detached entry keeps
+        // its index and has no descriptor, so the two are read together.
+        let mut attached_fronts = Vec::new();
+        for (index, front) in self.attached.iter().enumerate() {
+            let Some(front) = front else { continue };
+            attached_fronts.push(index);
+            descriptors.push(libc::pollfd {
+                fd: front.descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         let listener_start = descriptors.len();
         if let Some(listener) = &self.listener {
             descriptors.extend(listener.poll_fds());
@@ -164,6 +193,16 @@ impl Control {
         if descriptors[0].revents != 0 {
             events.push(Ready::Daemon);
         }
+        // An attached front reports its index, which is its place among the
+        // fronts the process has ever had, not among the live ones.
+        for (descriptor, front) in descriptors[attached_start..listener_start]
+            .iter()
+            .zip(&attached_fronts)
+        {
+            if descriptor.revents != 0 {
+                events.push(Ready::Attached(*front));
+            }
+        }
         if descriptors[listener_start..listener_end]
             .iter()
             .any(|descriptor| descriptor.revents != 0)
@@ -195,15 +234,16 @@ impl Control {
         let Some(listener) = &self.listener else {
             return Ok(None);
         };
-        let mut channel = match listener.try_accept().map_err(|error| {
-            Error::transport_source("accepting a peer main process", error)
-        })? {
+        let mut channel = match listener
+            .try_accept()
+            .map_err(|error| Error::transport_source("accepting a peer main process", error))?
+        {
             Some(channel) => channel,
             None => return Ok(None),
         };
-        channel.wait(REGISTRATION_TIMEOUT).map_err(|error| {
-            Error::transport_source("waiting for a peer's registration", error)
-        })?;
+        channel
+            .wait(REGISTRATION_TIMEOUT)
+            .map_err(|error| Error::transport_source("waiting for a peer's registration", error))?;
         let registration: PeerRegistration = channel
             .try_recv()
             .map_err(|error| Error::transport_source("reading a peer's registration", error))?
@@ -215,9 +255,9 @@ impl Control {
             )));
         }
         let rank = registration.rank;
-        channel.send(&PeerAccepted { rank }).map_err(|error| {
-            Error::transport_source("answering a peer's registration", error)
-        })?;
+        channel
+            .send(&PeerAccepted { rank })
+            .map_err(|error| Error::transport_source("answering a peer's registration", error))?;
         self.peers.insert(rank, channel);
         Ok(Some(rank))
     }
@@ -225,6 +265,107 @@ impl Control {
     /// The daemon's request interface.
     pub fn daemon_mut(&mut self) -> &mut Connection {
         &mut self.daemon
+    }
+
+    /// The connection of the front `front`, when it is live: index 0 is the
+    /// daemon that launched this process.
+    pub fn front_mut(&mut self, front: usize) -> Option<&mut Connection> {
+        match front {
+            0 => Some(&mut self.daemon),
+            index => self.attached.get_mut(index - 1)?.as_mut(),
+        }
+    }
+
+    /// Connects to another daemon's request socket and serves it as a further
+    /// front (`Attach`, §7.5.1 step 2).
+    ///
+    /// The engine states itself first - its hello, the daemon's welcome, then
+    /// what it serves - because the successor counts this engine as serving on
+    /// the `State` that follows. Returns the front's index, which the request
+    /// records keep: a response taken over by that daemon names it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection cannot be made, when the daemon refuses the
+    /// engine, or when it does not welcome it in time. The process keeps
+    /// serving the fronts it has; a refused attach is a failed handover, not a
+    /// failure of this engine.
+    pub fn attach(
+        &mut self,
+        address: &str,
+        state: i32,
+        info: Option<proto::request::wire::EngineInfo>,
+    ) -> Result<usize> {
+        let mut reader = Connection::connect(address).map_err(|error| {
+            Error::transport_source(
+                "connecting to the attaching daemon's request interface",
+                error,
+            )
+        })?;
+        reader
+            .send(&proto::request::wire::Hello {
+                major: proto::PROTOCOL_MAJOR,
+                minor: proto::PROTOCOL_MINOR,
+                build: proto::BUILD.to_owned(),
+                engine: self.engine,
+                // A request link of a process of the deployment: the successor
+                // files it as that engine's request interface, which serves
+                // requests and takes no command.
+                interface: proto::process::Interface::Requests as i32,
+            })
+            .map_err(|error| {
+                Error::transport_source("stating this engine to the attaching daemon", error)
+            })?;
+        let welcome: proto::request::wire::Welcome = reader
+            .recv(ATTACH_TIMEOUT)
+            .map_err(|error| {
+                Error::transport_source("awaiting the attaching daemon's welcome", error)
+            })?
+            .ok_or_else(|| {
+                Error::transport("the attaching daemon closed before it welcomed this engine")
+            })?;
+        if !welcome.refusal.is_empty() {
+            return Err(Error::transport(format!(
+                "the attaching daemon refused this engine: {}",
+                welcome.refusal
+            )));
+        }
+        // What this process is, stated on the new front: the successor counts
+        // the engine as serving on this message and on nothing else.
+        reader
+            .send(&proto::request::wire::FromEngine {
+                kind: Some(proto::request::wire::from_engine::Kind::State(
+                    proto::request::wire::State {
+                        state,
+                        info,
+                        error: String::new(),
+                    },
+                )),
+            })
+            .map_err(|error| {
+                Error::transport_source(
+                    "stating what this engine serves to the attaching daemon",
+                    error,
+                )
+            })?;
+        self.attached.push(Some(reader));
+        Ok(self.attached.len())
+    }
+
+    /// How many attached fronts this process has ever had, live or not: the
+    /// indices stay in place so no request's record moves when one detaches.
+    pub fn attached_fronts(&self) -> usize {
+        self.attached.len()
+    }
+
+    /// Forgets the front `index - 1`'s connection once its daemon detached.
+    pub fn detach(&mut self, front: usize) {
+        if let Some(entry) = self.attached.get_mut(front - 1) {
+            if let Some(connection) = entry.as_mut() {
+                connection.close();
+            }
+            *entry = None;
+        }
     }
 
     /// One peer's channel, when it is connected.
@@ -277,6 +418,7 @@ mod tests {
         std::mem::forget(theirs);
         Control {
             daemon: Connection::from_unix(ours).expect("a connection over the pair"),
+            attached: Vec::new(),
             engine,
             listener: Some(Listener::bind(&[address]).expect("a peer listener")),
             peers: BTreeMap::new(),
@@ -355,6 +497,149 @@ mod tests {
         let ready = control.wait(Some(started + Duration::from_millis(50)))?;
         assert_eq!(ready, vec![Ready::Idle]);
         assert!(started.elapsed() >= Duration::from_millis(50));
+        Ok(())
+    }
+
+    /// A daemon that accepts one attach: it reads the engine's hello and the
+    /// state that follows, answers `Welcome`, and then sends `frame` so the
+    /// engine's wait reports the new front.
+    ///
+    /// Returns the thread, which answers with what the daemon read.
+    fn attaching_daemon(
+        listener: proto::Listener,
+        refusal: String,
+        frame: Option<proto::request::wire::ToEngine>,
+    ) -> std::thread::JoinHandle<(proto::request::wire::Hello, proto::request::wire::State)> {
+        std::thread::spawn(move || {
+            let mut connection = loop {
+                match listener.try_accept() {
+                    Ok(Some(connection)) => break connection,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => panic!("accepting the engine: {error}"),
+                }
+            };
+            let hello: proto::request::wire::Hello = connection
+                .recv(Duration::from_secs(10))
+                .expect("reading the hello")
+                .expect("the engine said hello");
+            connection
+                .send(&proto::request::wire::Welcome {
+                    major: proto::PROTOCOL_MAJOR,
+                    minor: proto::PROTOCOL_MINOR,
+                    build: proto::BUILD.to_owned(),
+                    refusal,
+                    spec: None,
+                })
+                .expect("answering the hello");
+            let reported: Option<proto::request::wire::FromEngine> = connection
+                .recv(Duration::from_secs(10))
+                .expect("reading the state");
+            let state: proto::request::wire::State = reported
+                .and_then(|message| match message.kind {
+                    Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
+                    _ => None,
+                })
+                .expect("the engine stated what it serves");
+            if let Some(frame) = frame {
+                connection.send(&frame).expect("sending a frame");
+            }
+            // The connection stays open until the test's own end, so the front
+            // is live for the whole assertion.
+            std::thread::sleep(Duration::from_secs(2));
+            (hello, state)
+        })
+    }
+
+    /// The engine gives a hot restart's successor a front of its own: it
+    /// connects to the address the daemon names, says what it is, and serves
+    /// the frames that arrive on that connection (§7.5.1 step 2).
+    ///
+    /// Before the handler existed the process refused the command and kept one
+    /// front, so the successor never became a daemon the engine could hand a
+    /// response to.
+    #[test]
+    fn an_engine_attaches_to_a_second_daemons_request_socket() -> Result<()> {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let peers = format!("unix:{}", directory.path().join("peers.sock").display());
+        let successor = format!("unix:{}", directory.path().join("requests.sock").display());
+        let listener = proto::Listener::bind(&successor).expect("the successor's request socket");
+        let daemon = attaching_daemon(
+            listener,
+            String::new(),
+            Some(proto::request::wire::ToEngine {
+                kind: Some(proto::request::wire::to_engine::Kind::Engine(
+                    proto::request::wire::EngineCommand {
+                        kind: Some(proto::request::wire::engine_command::Kind::Shutdown(
+                            proto::request::wire::Shutdown {},
+                        )),
+                    },
+                )),
+            }),
+        );
+        let mut control = control(&peers, 7);
+
+        let front = control.attach(
+            &successor,
+            proto::request::wire::EngineState::Ready as i32,
+            None,
+        )?;
+        assert_eq!(
+            front, 1,
+            "the attaching daemon is the process's second front"
+        );
+        assert_eq!(control.attached_fronts(), 1);
+
+        // The frame the successor sent is readable through that front, and the
+        // wait reports it by its index rather than as the launching daemon's.
+        let ready = control.wait(Some(Instant::now() + Duration::from_secs(10)))?;
+        assert!(
+            ready.contains(&Ready::Attached(0)),
+            "the attached front was not reported: {ready:?}"
+        );
+        let message: proto::request::wire::ToEngine = control
+            .front_mut(front)
+            .expect("the attached front is live")
+            .try_recv()
+            .map_err(|error| Error::transport_source("reading the attached front", error))?
+            .expect("the successor's frame arrived");
+
+        let (hello, state) = daemon.join().expect("the daemon thread");
+        assert_eq!(hello.engine, 7, "the engine stated its own number");
+        assert_eq!(
+            hello.interface,
+            proto::process::Interface::Requests as i32,
+            "the attach is the engine's request link"
+        );
+        assert_eq!(
+            state.state,
+            proto::request::wire::EngineState::Ready as i32,
+            "the state that makes the successor count this engine as serving"
+        );
+        assert!(message.kind.is_some());
+        Ok(())
+    }
+
+    /// A daemon that refuses the attach changes nothing: the engine keeps the
+    /// fronts it has and its process does not end. A refused attach is a failed
+    /// handover, and the daemon that asked is still serving its requests.
+    #[test]
+    fn a_refused_attach_leaves_the_engine_with_the_front_it_had() -> Result<()> {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let peers = format!("unix:{}", directory.path().join("peers.sock").display());
+        let successor = format!("unix:{}", directory.path().join("requests.sock").display());
+        let listener = proto::Listener::bind(&successor).expect("the successor's request socket");
+        let daemon = attaching_daemon(listener, "another build".to_owned(), None);
+        let mut control = control(&peers, 7);
+
+        let refused = control.attach(
+            &successor,
+            proto::request::wire::EngineState::Ready as i32,
+            None,
+        );
+        assert!(refused.is_err(), "a refused attach must not be a front");
+        assert_eq!(control.attached_fronts(), 0);
+        assert!(control.front_mut(1).is_none(), "no second front exists");
+        daemon.join().expect("the daemon thread");
         Ok(())
     }
 }

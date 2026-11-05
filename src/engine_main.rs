@@ -90,7 +90,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 
 use crate::engine_plan::{EpochPlan, PrefillCatalogue};
@@ -103,9 +103,10 @@ use executor::control::{Control, Endpoints, Ready};
 use executor::device::{Executor, Probe};
 use executor::host::{HostAction, HostTask, Lane};
 use executor::hot_update::{Action, HotUpdate};
+use executor::memory::Memory;
 use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
-use executor::memory::Memory;
+use executor::runners::products::Held;
 use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
@@ -539,6 +540,34 @@ pub(crate) fn run(
 /// each executor thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
+/// One admitted request and the connection its events belong to.
+///
+/// A request belongs to the daemon front that submitted it until a `Takeover`
+/// moves it to another (§7.5.1 step 4). The events the front's consumer has
+/// not reported as consumed are kept, because a takeover from a position names
+/// what has to be replayed: the predecessor freezes its response at the pause,
+/// so its consumer stops advancing while this process goes on producing, and
+/// the successor's body resumes from the position it last rendered.
+struct Served {
+    /// The daemon's identity for the request.
+    request: u64,
+    /// The scheduler rank a command for the request is routed to.
+    rank: usize,
+    /// What the request produced.
+    events: engine::EventRx,
+    /// The daemon front it belongs to: 0 is the daemon that launched this
+    /// process, and each attached daemon adds one.
+    front: usize,
+    /// Events written to a front so far, which is the position a takeover
+    /// names and the consumer reports.
+    sent: u64,
+    /// The events not yet reported as consumed, by their position, at most
+    /// `EVENT_WINDOW` of them: an older event than that is beyond what any
+    /// consumer can be behind by, since the same bound gates the credit this
+    /// process waits on.
+    kept: std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+}
+
 pub(crate) struct MainProcess {
     control: Control,
     /// This node's schedulers, one per DP rank. The handle is the interface: each scheduler's thread
@@ -588,6 +617,10 @@ pub(crate) struct MainProcess {
     /// given no command looks exactly like one that is working, from the daemon's side and from
     /// its own.
     announced_at: Option<Instant>,
+    /// The state this process last stated on the request interface (§7.3 step 1). An attaching
+    /// daemon is told the same state on the connection it gives (§7.5.1 step 2): a successor that
+    /// is not told what this engine is never counts it as serving.
+    reported_state: i32,
     commands_seen: u64,
     /// The two waits of the epoch's start that no event ends: the daemon's first command, and this
     /// node's warmup.
@@ -641,9 +674,9 @@ pub(crate) struct MainProcess {
     /// The admitted requests' event streams, by the daemon's request identity: the scheduler
     /// answers a submission with the stream of what the request produced, and this process is what
     /// carries those events back to the daemon (§2.3). A stream leaves when its request ends.
-    /// Each admitted request's scheduler rank beside its stream: a command for the request has to
-    /// reach the scheduler that serves it, and the command names the request, not the rank.
-    streams: Vec<(u64, usize, engine::EventRx)>,
+    /// Each admitted request with the stream it produces, the scheduler rank a command for it
+    /// reaches, and the daemon front it belongs to (§7.5.1 step 4).
+    streams: Vec<Served>,
     /// Whether this process admits and executes: a drain parks every scheduler, and only the
     /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2). A process that
     /// has not reached its first switchover admits nothing whatever the daemon has said: the epoch's
@@ -741,11 +774,8 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process = ProcessInterface::connect(
-            &launch.processes,
-            &launch.deployment,
-            launch.engine,
-        )?;
+        let mut process =
+            ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -810,18 +840,22 @@ impl MainProcess {
         // The shadow region alone: the twins allocate it, and the reservation beside it holds the
         // state group's snapshot too (7.3, 4.5).
         let shadow = graph.shadow;
+        // The product store is the process's, not a device's: a runner on one device publishes a
+        // region a runner on another reads through the same store, so all of this process's
+        // executors share one (b01, `M8764`).
+        let products: Arc<dyn executor::runners::products::Products> = Arc::new(Held::new());
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
-            let executor =
-                Executor::spawn(
-                    *device,
-                    runners,
-                    plan.events(),
-                    Arc::clone(&pools),
-                    scratch,
-                    shadow,
-                )?;
+            let executor = Executor::spawn(
+                *device,
+                runners,
+                plan.events(),
+                Arc::clone(&pools),
+                Arc::clone(&products),
+                scratch,
+                shadow,
+            )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
@@ -865,6 +899,7 @@ impl MainProcess {
             warming: Vec::new(),
             switchovers: 0,
             announced_at: None,
+            reported_state: proto::request::wire::EngineState::Starting as i32,
             commands_seen: 0,
             command_wait: Wait::default(),
             warmup_wait: Wait::default(),
@@ -1075,7 +1110,10 @@ impl MainProcess {
             }
             for event in self.control.wait(deadline)? {
                 match event {
-                    Ready::Daemon => {
+                    // Every front reads the same way: a frame from an attached daemon is served
+                    // exactly as one from the daemon that launched this process, and the front it
+                    // came from travels with it.
+                    Ready::Daemon | Ready::Attached(_) => {
                         if let Some(failure) = self.daemon_messages()? {
                             return Ok(Some(failure));
                         }
@@ -1278,14 +1316,33 @@ impl MainProcess {
     /// Serves the daemon's buffered messages: request submissions and commands
     /// go to the schedulers, program-layer commands to [`Self::program`].
     fn daemon_messages(&mut self) -> Result<Option<UpdateFailure>> {
-        loop {
-            let Some(message) = self.control.daemon_mut().try_recv()? else {
-                return Ok(None);
-            };
-            if let Some(failure) = self.daemon_message(message)? {
-                return Ok(Some(failure));
+        // Every front is read in turn, the launching daemon's first: a submission names the front
+        // it came from, and so does every command for a request already admitted.
+        let fronts = 1 + self.control.attached_fronts();
+        for front in 0..fronts {
+            loop {
+                // A frame from a closed front ends that front and nothing else: its requests stay
+                // parked for the takeover that claims them (§7.5.1 step 4).
+                let Some(connection) = self.control.front_mut(front) else {
+                    break;
+                };
+                let message = match connection.try_recv() {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, front, "reading a daemon front failed");
+                        if front > 0 {
+                            self.control.detach(front);
+                        }
+                        break;
+                    }
+                };
+                if let Some(failure) = self.daemon_message(front, message)? {
+                    return Ok(Some(failure));
+                }
             }
         }
+        Ok(None)
     }
 
     /// Serves the daemon's request interface: submissions and per-request
@@ -1293,6 +1350,7 @@ impl MainProcess {
     /// program-layer commands run the driver of §7.3.
     fn daemon_message(
         &mut self,
+        front: usize,
         message: proto::request::wire::ToEngine,
     ) -> Result<Option<UpdateFailure>> {
         let Some(kind) = message.kind else {
@@ -1308,6 +1366,7 @@ impl MainProcess {
                     // and the request is the frontend's to resubmit when the epoch serves again.
                     if !self.serving || self.paused {
                         self.reject(
+                            front,
                             id,
                             proto::request::RejectionKind::Overloaded,
                             if self.paused {
@@ -1328,6 +1387,7 @@ impl MainProcess {
                             // it ends with the refusal's event and every other request of the
                             // submission is still admitted.
                             self.reject(
+                                front,
                                 id,
                                 proto::request::RejectionKind::Invalid,
                                 error.to_string(),
@@ -1341,13 +1401,23 @@ impl MainProcess {
                     };
                     match scheduler.submit(request) {
                         Ok(stream) => {
-                            self.streams.push((id, rank, stream));
-                            self.send_event(proto::request::wire::from_engine::Kind::Accepted(
-                                proto::request::wire::Accepted {
-                                    request: id,
-                                    scheduler: rank as u32,
-                                },
-                            ));
+                            self.streams.push(Served {
+                                request: id,
+                                rank,
+                                events: stream,
+                                front,
+                                sent: 0,
+                                kept: std::collections::VecDeque::new(),
+                            });
+                            self.send_event(
+                                front,
+                                proto::request::wire::from_engine::Kind::Accepted(
+                                    proto::request::wire::Accepted {
+                                        request: id,
+                                        scheduler: rank as u32,
+                                    },
+                                ),
+                            );
                         }
                         Err(error) => {
                             let kind = match error {
@@ -1355,17 +1425,19 @@ impl MainProcess {
                                     proto::request::RejectionKind::Overloaded
                                 }
                             };
-                            self.reject(id, kind, error.to_string());
+                            self.reject(front, id, kind, error.to_string());
                         }
                     }
                 }
                 Ok(None)
             }
             proto::request::wire::to_engine::Kind::Command(command) => {
-                self.request_command(command)?;
+                self.request_command(front, command)?;
                 Ok(None)
             }
-            proto::request::wire::to_engine::Kind::Engine(command) => self.engine_command(command),
+            proto::request::wire::to_engine::Kind::Engine(command) => {
+                self.engine_command(front, command)
+            }
         }
     }
 
@@ -1898,10 +1970,7 @@ impl MainProcess {
                 continue;
             };
             return Ok(Some((
-                program_server::program::ProgramSlot {
-                    op,
-                    phase: None,
-                },
+                program_server::program::ProgramSlot { op, phase: None },
                 Program {
                     backend: backend.clone(),
                     revision: *revision,
@@ -2123,8 +2192,8 @@ impl MainProcess {
             right
                 .0
                 .cmp(&left.0)
-                .then_with(|| right.1 .1.cmp(&left.1 .1))
-                .then_with(|| left.1 .0.as_str().cmp(right.1 .0.as_str()))
+                .then_with(|| right.1.1.cmp(&left.1.1))
+                .then_with(|| left.1.0.as_str().cmp(right.1.0.as_str()))
         });
         let Some((covers, next)) = remaining.into_iter().next() else {
             // Every candidate is spent: the refusal names the operator, what it could not serve and
@@ -2239,7 +2308,10 @@ impl MainProcess {
         // opened - so that `Switched` states the one thing it means: this process can serve.
         if self.warming.is_empty() {
             if let Some((generation, reply)) = self.pending_switch.take() {
-                tracing::info!(generation, "answering the switchover now that admission is open");
+                tracing::info!(
+                    generation,
+                    "answering the switchover now that admission is open"
+                );
                 self.answer(reply, ProgramStatus::Switched { generation });
             }
         }
@@ -2397,7 +2469,7 @@ impl MainProcess {
                 let (resolved, candidates) = match self.first_generation(&named) {
                     Ok(resolved) => resolved,
                     Err(failure) => {
-                        return self.abandon_precopy(generation, failure, precopy.reply)
+                        return self.abandon_precopy(generation, failure, precopy.reply);
                     }
                 };
                 tracing::info!(
@@ -2413,7 +2485,7 @@ impl MainProcess {
                 let (tasks, unavailable) = match self.admit_installs(&resolved, &BTreeMap::new()) {
                     Ok(admitted) => admitted,
                     Err(failure) => {
-                        return self.abandon_precopy(generation, failure, precopy.reply)
+                        return self.abandon_precopy(generation, failure, precopy.reply);
                     }
                 };
                 precopy.programs = resolved;
@@ -2510,10 +2582,8 @@ impl MainProcess {
                     // that never answers is not a device that never answered, and the previous
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
-                    let policy = matches!(
-                        poll_answers(&precopy.policies),
-                        Some(StageFailure::Pending)
-                    );
+                    let policy =
+                        matches!(poll_answers(&precopy.policies), Some(StageFailure::Pending));
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -2756,15 +2826,16 @@ impl MainProcess {
             // later precopy took its place while the builds ran. The revert path discards what was
             // built and answers by name; the process goes on serving what it served.
             tracing::warn!(generation, %error, "a precopy finished for an update that moved on");
-            return self.revert(
-                generation,
-                UpdateFailure::Precopy {
-                    reason: format!(
-                        "the precopy finished for a generation that is not in flight: {error}"
-                    ),
-                },
-            )
-            .map(|_| ());
+            return self
+                .revert(
+                    generation,
+                    UpdateFailure::Precopy {
+                        reason: format!(
+                            "the precopy finished for a generation that is not in flight: {error}"
+                        ),
+                    },
+                )
+                .map(|_| ());
         }
         let mut uncompared = self.uncompared();
         if precopy.changed.is_empty() {
@@ -3517,21 +3588,67 @@ impl MainProcess {
     /// The request's scheduler is the rank the submission was routed to; the
     /// daemon addresses commands to the main process, and the mechanism keeps
     /// the rank of every request it accepted.
-    fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
+    fn request_command(
+        &mut self,
+        front: usize,
+        command: proto::request::wire::Command,
+    ) -> Result<()> {
         // Two of a request's commands are the connection's bookkeeping rather than a scheduler's,
-        // and this process is the connection: it forwards every event as the scheduler produces it,
-        // so there is no window of its own to release, and a takeover moves the stream between
-        // daemon connections, of which this process has exactly one — the socket the successor
-        // inherits (§7.5.1 step 4). Accepting them by name keeps the scheduler's refusal, which is
-        // right for a scheduler, from ending the epoch on the first long request: the daemon
-        // reports a consumer's position every `EVENT_WINDOW / 2` events, so a stream of a few dozen
-        // frames ended the process before this.
-        match command.kind {
-            Some(proto::request::wire::command::Kind::Consumed(_))
-            | Some(proto::request::wire::command::Kind::Takeover(_)) => {
-                tracing::debug!(
+        // and this process is the connection: it writes every event to the front the request
+        // belongs to and keeps what a takeover has to replay. Handling them here keeps the
+        // scheduler's refusal, which is right for a scheduler, from ending the epoch on the first
+        // long request: the daemon reports a consumer's position every `EVENT_WINDOW / 2` events.
+        match command.kind.as_ref() {
+            Some(proto::request::wire::command::Kind::Consumed(consumed)) => {
+                let Some(served) = self
+                    .streams
+                    .iter_mut()
+                    .find(|served| served.request == command.request)
+                else {
+                    tracing::debug!(
+                        request = command.request,
+                        "a consumer's position names a request this epoch no longer serves"
+                    );
+                    return Ok(());
+                };
+                // Everything the consumer has read can no longer be replayed, which is what bounds
+                // the journal.
+                served.kept.retain(|(position, _)| *position > consumed.events);
+                return Ok(());
+            }
+            Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
+                let Some(served) = self
+                    .streams
+                    .iter_mut()
+                    .find(|served| served.request == command.request)
+                else {
+                    tracing::debug!(
+                        request = command.request,
+                        "a takeover names a request this epoch no longer serves"
+                    );
+                    return Ok(());
+                };
+                // The request is this daemon's from the position its consumer states: what the
+                // predecessor produced past it is replayed, because its own consumer stopped
+                // reading at the pause.
+                let replay = replay_after(&served.kept, takeover.events);
+                served.front = front;
+                for event in replay {
+                    tracing::debug!(
+                        request = command.request,
+                        front,
+                        "replaying an event a taken-over request produced during the pause"
+                    );
+                    self.send_event(
+                        front,
+                        proto::request::wire::from_engine::Kind::Event(event),
+                    );
+                }
+                tracing::info!(
                     request = command.request,
-                    "a request's connection bookkeeping belongs to this process, not a scheduler"
+                    front,
+                    from = takeover.events,
+                    "a request was taken over by another daemon front"
                 );
                 return Ok(());
             }
@@ -3541,10 +3658,11 @@ impl MainProcess {
         // stream the submission answered with. A request that is not in flight here has already
         // ended: a cancel or a stop for it is a no-op, not a fault, and ending an epoch because a
         // client disconnected a moment too late would be the daemon's most common message.
-        let Some((_, rank, _)) = self
+        let Some(rank) = self
             .streams
             .iter()
-            .find(|(id, _, _)| *id == command.request)
+            .find(|served| served.request == command.request)
+            .map(|served| served.rank)
         else {
             tracing::debug!(
                 request = command.request,
@@ -3552,7 +3670,7 @@ impl MainProcess {
             );
             return Ok(());
         };
-        let Some(scheduler) = self.schedulers.get(*rank) else {
+        let Some(scheduler) = self.schedulers.get(rank) else {
             tracing::debug!(
                 request = command.request,
                 rank,
@@ -3571,6 +3689,7 @@ impl MainProcess {
     /// and the program-layer commands a single-rank node receives directly.
     fn engine_command(
         &mut self,
+        front: usize,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
         // §2.3: the epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the program layer's
@@ -3585,6 +3704,27 @@ impl MainProcess {
         let refused = match command.kind {
             Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
                 self.stopping = true;
+                return Ok(None);
+            }
+            // §7.5.1 step 2: a hot restart's successor gives this engine a second daemon front, so
+            // the responses in flight can move to it while the process goes on serving. A refusal
+            // is a failed handover and not this process's end: the daemon that asked is still
+            // serving the requests it took.
+            Some(proto::request::wire::engine_command::Kind::Attach(attach)) => {
+                let state = self.reported_state;
+                let info = self.announced_info();
+                match self.control.attach(&attach.requests, state, info) {
+                    Ok(front) => tracing::info!(
+                        daemon = %attach.requests,
+                        front,
+                        "a daemon attached to this engine"
+                    ),
+                    Err(error) => tracing::warn!(
+                        daemon = %attach.requests,
+                        %error,
+                        "attaching a daemon failed; this engine keeps the fronts it has"
+                    ),
+                }
                 return Ok(None);
             }
             Some(proto::request::wire::engine_command::Kind::Hook(hook)) => Some(
@@ -3705,7 +3845,7 @@ impl MainProcess {
             None => None,
         };
         if let Some(kind) = refused {
-            self.send_event(kind);
+            self.send_event(front, kind);
         }
         Ok(None)
     }
@@ -3804,19 +3944,28 @@ impl MainProcess {
     }
 
     /// Sends one message of the request interface to the daemon (§2.3).
-    fn send_event(&mut self, kind: proto::request::wire::from_engine::Kind) {
-        if let Err(error) = self
-            .control
-            .daemon_mut()
-            .send(&proto::request::wire::FromEngine { kind: Some(kind) })
-        {
-            tracing::warn!(%error, "sending an event of an admitted request failed");
+    fn send_event(&mut self, front: usize, kind: proto::request::wire::from_engine::Kind) {
+        let Some(connection) = self.control.front_mut(front) else {
+            // The front this request belongs to detached. Its new owner names itself with a
+            // `Takeover`, and until then nobody is reading: the request's events are kept for the
+            // takeover to replay.
+            tracing::debug!(front, "a request's front is gone; its events are kept for a takeover");
+            return;
+        };
+        if let Err(error) = connection.send(&proto::request::wire::FromEngine { kind: Some(kind) }) {
+            tracing::warn!(%error, front, "sending an event of an admitted request failed");
         }
     }
 
     /// Ends one request with its refusal: a submission this process will not admit is answered with
     /// the event that says so, because the daemon has no other way to learn it (§2.3).
-    fn reject(&mut self, request: u64, kind: proto::request::RejectionKind, message: String) {
+    fn reject(
+        &mut self,
+        front: usize,
+        request: u64,
+        kind: proto::request::RejectionKind,
+        message: String,
+    ) {
         let event = proto::request::wire::Event {
             request,
             kind: Some(proto::request::wire::event::Kind::Rejected(
@@ -3826,7 +3975,7 @@ impl MainProcess {
                 },
             )),
         };
-        self.send_event(proto::request::wire::from_engine::Kind::Event(event));
+        self.send_event(front, proto::request::wire::from_engine::Kind::Event(event));
     }
 
     /// Carries every admitted request's events to the daemon, and forgets a request whose stream
@@ -3839,9 +3988,10 @@ impl MainProcess {
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
         let mut running = Vec::with_capacity(streams.len());
-        for (id, rank, mut stream) in streams {
+        for mut served in streams {
+            let id = served.request;
             loop {
-                match stream.try_recv() {
+                match served.events.try_recv() {
                     Ok(event) => {
                         let terminal = matches!(
                             event,
@@ -3866,14 +4016,24 @@ impl MainProcess {
                                  carry: the daemon will wait for bytes that never come"
                             );
                         }
-                        self.send_event(proto::request::wire::from_engine::Kind::Event(wire));
+                        // The position this event is written at, and the copy a takeover from an
+                        // earlier position replays.
+                        served.sent += 1;
+                        served.kept.push_back((served.sent, wire.clone()));
+                        while served.kept.len() > proto::request::EVENT_WINDOW as usize {
+                            served.kept.pop_front();
+                        }
+                        self.send_event(
+                            served.front,
+                            proto::request::wire::from_engine::Kind::Event(wire),
+                        );
                         if terminal {
                             break;
                         }
                     }
                     // A request that produced nothing yet keeps its stream.
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        running.push((id, rank, stream));
+                        running.push(served);
                         break;
                     }
                     // The scheduler that served the request is gone, which ends it.
@@ -3896,6 +4056,7 @@ impl MainProcess {
     /// the generation, so a process that waited to be ready until it had a policy would wait for the
     /// command that waits for it - the deadlock the caller's stuck run shows.
     fn announce(&mut self, state: proto::request::wire::EngineState) -> Result<()> {
+        self.reported_state = state as i32;
         let info = match state {
             proto::request::wire::EngineState::Ready
             | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
@@ -3914,6 +4075,16 @@ impl MainProcess {
             self.announced_at.get_or_insert_with(Instant::now);
         }
         announce(&mut self.control, state, info)
+    }
+
+    /// What an attaching daemon is told this process is: the info it announced, for a state that
+    /// carries one, and nothing otherwise.
+    fn announced_info(&mut self) -> Option<proto::request::wire::EngineInfo> {
+        match proto::request::wire::EngineState::try_from(self.reported_state).ok()? {
+            proto::request::wire::EngineState::Ready
+            | proto::request::wire::EngineState::Standby => self.engine_info().ok(),
+            _ => None,
+        }
     }
 
     /// What the daemon records of this process: the limits every request is checked against, the
@@ -4012,16 +4183,19 @@ impl MainProcess {
         // §2.3: a shutdown finishes every request in flight as aborted, and the daemon learns that
         // from the request's own event - a connection that closes under it says only that the
         // process ended, not which request was lost with it.
-        for (request, _, _) in std::mem::take(&mut self.streams) {
+        for served in std::mem::take(&mut self.streams) {
             let event = proto::request::wire::Event {
-                request,
+                request: served.request,
                 kind: Some(proto::request::wire::event::Kind::Error(
                     proto::request::wire::Failed {
                         message: "the epoch was shut down with this request in flight".to_owned(),
                     },
                 )),
             };
-            self.send_event(proto::request::wire::from_engine::Kind::Event(event));
+            self.send_event(
+                served.front,
+                proto::request::wire::from_engine::Kind::Event(event),
+            );
         }
         // The schedulers go first: their `Batches` holds a clone of every executor, and a device
         // thread cannot be joined while a scheduler could still submit to it.
@@ -4334,14 +4508,28 @@ fn answer(
 
 /// What the engine answers a command of the worker era's surface: the operation named a worker
 /// world of its own, and this epoch executes batches itself (§2.4).
-const WORKER_ERA: &str =
-    "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
+const WORKER_ERA: &str = "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
      executors are the process's own";
+
+/// The events a takeover from `from` replays: everything this process produced past the position
+/// the successor's consumer states.
+///
+/// The predecessor freezes its response at the pause, so its consumer stops advancing while this
+/// process goes on producing, and the successor resumes from what it last rendered. Without the
+/// replay those events are rendered nowhere and the response loses the tokens the pause covered.
+fn replay_after(
+    kept: &std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    from: u64,
+) -> Vec<proto::request::wire::Event> {
+    kept.iter()
+        .filter(|(position, _)| *position > from)
+        .map(|(_, event)| event.clone())
+        .collect()
+}
 
 /// What the engine answers a command whose owner is the epoch layer: the same operation exists,
 /// and it is asked for through the process connection, where the driver applies it (§2.5, §7.4).
-const EPOCH_LIFECYCLE: &str =
-    "this command is the epoch layer's, applied through the process connection rather than the \
+const EPOCH_LIFECYCLE: &str = "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
 
 /// States a main process's state on the request interface (§7.3 step 1).
@@ -4366,8 +4554,7 @@ fn announce(
 
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
-const LEDGERS: &str =
-    "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
 
 /// The §7.3 stage a program-layer command belongs to, for the log line each one leaves.
@@ -5734,14 +5921,8 @@ fn device_work(
     let policies: String = if policies.is_empty() {
         "no policy build was asked for".to_owned()
     } else {
-        let answered = policies
-            .iter()
-            .filter(|answer| !answer.is_empty())
-            .count();
-        format!(
-            "{answered} of {} policy build(s) answered",
-            policies.len()
-        )
+        let answered = policies.iter().filter(|answer| !answer.is_empty()).count();
+        format!("{answered} of {} policy build(s) answered", policies.len())
     };
     format!("{devices}; {policies}")
 }
@@ -5872,7 +6053,11 @@ fn declared_program(
             .then_with(|| left.backend.cmp(&right.backend))
     });
     let package = declared.first()?;
-    Some((package.op.clone(), package.backend.clone(), package.revision))
+    Some((
+        package.op.clone(),
+        package.backend.clone(),
+        package.revision,
+    ))
 }
 
 fn select_programs(
@@ -6171,7 +6356,9 @@ fn resolve_slots(
             };
             let declared: Vec<String> = packages
                 .iter()
-                .filter(|package| package.op == op && !built_here(&package.backend, package.revision))
+                .filter(|package| {
+                    package.op == op && !built_here(&package.backend, package.revision)
+                })
                 .map(|package| format!("{} revision {}", package.backend, package.revision))
                 .collect();
             let mut answer = format!(
@@ -6436,6 +6623,32 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A takeover replays what the predecessor produced past the position the successor's consumer
+    /// states, and nothing else (§7.5.1 step 4).
+    ///
+    /// The pause freezes the predecessor's response, so its consumer stops advancing while this
+    /// process goes on producing; without the replay those events are rendered nowhere and the
+    /// response loses the tokens the pause covered.
+    #[test]
+    fn a_takeover_replays_only_the_events_past_the_position_it_names() {
+        let event = |request: u64, message: &str| proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Error(
+                proto::request::wire::Failed {
+                    message: message.to_owned(),
+                },
+            )),
+        };
+        let kept: std::collections::VecDeque<_> = (1..=4).map(|at| (at, event(9, "e"))).collect();
+
+        assert_eq!(replay_after(&kept, 0).len(), 4, "a takeover from the start");
+        assert_eq!(replay_after(&kept, 2).len(), 2, "only the events past the position");
+        assert!(
+            replay_after(&kept, 4).is_empty(),
+            "a consumer at the last event has nothing left to replay"
+        );
+    }
+
     /// An epoch's first precopy has no serving generation, so no operator has an old kernel to pair
     /// a shadowed step against: the changed set is empty and the precopy finishes without asking
     /// for a step an idle epoch never runs.
@@ -6989,10 +7202,12 @@ mod tests {
         );
 
         assert_eq!(group.0.len(), 2, "one package asked twice for one operator");
-        assert!(group
-            .0
-            .iter()
-            .all(|request| request.selector == Selector::Fixed(prefill.clone())));
+        assert!(
+            group
+                .0
+                .iter()
+                .all(|request| request.selector == Selector::Fixed(prefill.clone()))
+        );
         let attention = group
             .1
             .iter()
@@ -7009,8 +7224,8 @@ mod tests {
         );
     }
 
-    use program_server::protocol::{ListedModule, ListedPackage};
     use program_server::ModuleForm;
+    use program_server::protocol::{ListedModule, ListedPackage};
 
     /// A listed package with one built module for `target`.
     fn package(op: &str, backend: &str, revision: u32, target: &str) -> ListedPackage {
@@ -7367,7 +7582,6 @@ mod tests {
         );
     }
 
-
     /// An operator no model forward reaches - the runner launches `slot_commit` itself - is a
     /// package the store holds and has never built, so `select_programs` cannot see it. The walk
     /// names the operator, and the declaration is what lets this host build the key it needs: the
@@ -7381,7 +7595,11 @@ mod tests {
             revision,
             modules: Vec::new(),
         };
-        let packages = vec![package("triton", 1), package("triton", 3), package("cuda", 3)];
+        let packages = vec![
+            package("triton", 1),
+            package("triton", 3),
+            package("cuda", 3),
+        ];
         assert_eq!(
             declared_program(&packages, "slot_commit"),
             Some(("slot_commit".to_owned(), "cuda".to_owned(), 3)),
@@ -7393,7 +7611,6 @@ mod tests {
             "an operator the store holds no package of was answered"
         );
     }
-
 
     /// The state a daemon's late messages meet: an update that went to probation and was reverted by
     /// the rollback threshold, so every command still in flight names a generation no longer there.
@@ -7455,7 +7672,12 @@ mod tests {
         assert!(update.commit(2).is_err());
         assert!(
             update
-                .revert(2, UpdateFailure::Threshold { reason: "again".into() })
+                .revert(
+                    2,
+                    UpdateFailure::Threshold {
+                        reason: "again".into()
+                    }
+                )
                 .is_err(),
             "a revert of a generation that is not on probation applied"
         );
@@ -7470,7 +7692,6 @@ mod tests {
         );
     }
 
-
     /// A switchover answers `Switched` only when it can serve: a warmup still running means the
     /// buckets a batch would be planned into do not exist yet, so the answer waits for admission.
     /// The run this is written from answered first and the daemon opened a frontend onto a process
@@ -7478,8 +7699,12 @@ mod tests {
     #[test]
     fn a_switchover_answers_after_its_warmup_not_before() {
         match switchover_answer(0, 3) {
-            SwitchoverAnswer::Now(ProgramStatus::Switched { generation }) => assert_eq!(generation, 3),
-            SwitchoverAnswer::Now(other) => panic!("a switchover with nothing to warm answered {other:?}"),
+            SwitchoverAnswer::Now(ProgramStatus::Switched { generation }) => {
+                assert_eq!(generation, 3)
+            }
+            SwitchoverAnswer::Now(other) => {
+                panic!("a switchover with nothing to warm answered {other:?}")
+            }
             SwitchoverAnswer::AfterTheWarmup => {
                 panic!("a switchover with nothing to warm deferred its answer forever")
             }
@@ -7489,5 +7714,4 @@ mod tests {
             "a switchover answered before the warmup it queued had run"
         );
     }
-
 }

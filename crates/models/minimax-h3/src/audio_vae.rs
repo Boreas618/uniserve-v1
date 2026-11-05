@@ -824,7 +824,12 @@ const ACTIVATION_RATIO: u32 = 2;
 /// for seven rows the device launches at 256.
 pub const ACTIVATION_BLOCK: u32 = 256;
 /// The two channels the reference decodes and interleaves.
-const PCM_CHANNELS: u32 = 2;
+/// The rows of the PCM window a decode writes: one per stereo channel, interleaved.
+///
+/// Public because a caller sizes `DecodedMedia.audio` before a graph exists - the window is
+/// `[track_samples(config, frames), PCM_CHANNELS]` - and a row count restated outside this crate would
+/// be a second statement of the wire format.
+pub const PCM_CHANNELS: u32 = 2;
 
 /// Every parameter name the audio decoder's load binds, in the order it binds them.
 ///
