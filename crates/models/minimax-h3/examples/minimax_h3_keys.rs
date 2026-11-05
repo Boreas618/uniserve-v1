@@ -246,9 +246,17 @@ fn main() {
     let mut arguments = std::env::args().skip(1);
     let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut rasters: Vec<(u32, u32)> = Vec::new();
+    // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
+    // track length, so this is a deployment statement like `--rasters` and not a property of a model.
+    let mut clip_frames: Vec<u32> = Vec::new();
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
+            "--frames" => {
+                for frames in value(&mut arguments, "--frames").split(',') {
+                    clip_frames.push(parse(frames.trim(), frames, "a clip length"));
+                }
+            }
             "--rasters" => {
                 for raster in value(&mut arguments, "--rasters").split(',') {
                     let Some((height, width)) = raster.trim().split_once('x') else {
@@ -339,6 +347,44 @@ fn main() {
         lines.extend(minimax_h3::output::VideoPostprocessor::programs(
             dtype, &rasters,
         ));
+    }
+
+    // ---- The audio decoder's and encoder's rows: derived from the clip lengths, for the reason the
+    // video decoder's are derived, and with one more.
+    //
+    // Their per-row programs carry `columns = inner × samples` in the **key**, so a track length is its
+    // own row set: a written set would be one length's and every other length would stop at a missing
+    // program. The conversion from video frames to sample counts is the crate's own arithmetic
+    // (`audio_latent_frames`, `track_samples`) rather than a constant here, because 44.1 kHz was
+    // written into a measurement once tonight and produced rows for a rate this checkpoint does not
+    // use.
+    // **Empty by default, and that is a statement rather than an omission.** Their rows carry
+    // `columns = inner × samples`, so a track length is a whole row set: six lengths measured on this
+    // checkpoint ask for sixty cells no package declares, and a seventh would ask for ten more. Until
+    // the add's extent stops being part of its key (a bound cell, or model's 64-bit extent), the
+    // deployment states the lengths it serves with `--frames`, and a decode of audio at any other
+    // length is refused by name at its first row program - which is the honest behaviour, and is
+    // visible here rather than in a ladder nobody can bound.
+    let audio = &config.audio_vae;
+    let samples: Vec<u32> = clip_frames
+        .iter()
+        .map(|frames| {
+            let latent = minimax_h3::packing::audio_latent_frames(*frames);
+            match u32::try_from(minimax_h3::audio_vae::track_samples(audio, latent)) {
+                Ok(samples) => samples,
+                Err(_) => panic!("a track of {frames} frames is longer than a u32 sample count"),
+            }
+        })
+        .collect();
+    if !clip_frames.is_empty() {
+        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &samples) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the audio decoder states no programs: {error}"),
+        }
+        match minimax_h3::encoding::AudioEncoder::programs(audio, &samples) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the audio encoder states no programs: {error}"),
+        }
     }
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
