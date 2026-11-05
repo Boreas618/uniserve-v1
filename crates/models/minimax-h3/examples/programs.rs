@@ -210,8 +210,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (`Layouts::rows_bound`), so a stated value is checked against it below rather than believed.
     packed.sort_unstable();
     packed.dedup();
+    // **The track of a clip is the clip's own** (`packing::audio_samples`), so the walk derives the
+    // tracks from `--samples` rather than taking a second statement that can disagree with the clips
+    // it is walking. A stated `--track` is checked against the implied pairs below: one that no stated
+    // clip can produce is a pair the audio encoder would be walked at and the audio decoder not.
     if track.is_empty() {
-        return Err("--track is the deployment's and has no default".into());
+        track = samples
+            .iter()
+            .map(|frames| minimax_h3::packing::audio_samples(*frames))
+            .collect();
     }
     track.sort_unstable();
     track.dedup();

@@ -1732,9 +1732,15 @@ impl MainProcess {
     fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
         // §7.3's steps are answered here. A run that stops between two of them needs to know which
         // one was answered last, and the daemon's own log of its commands is not this side's.
+        // The reason travels with the status, and a run that reads only this log needs it too.
+        let failure = match &status {
+            ProgramStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
+            _ => String::new(),
+        };
         tracing::info!(
             status = status_name(&status),
             to_peer = reply.is_some(),
+            failure,
             "answering the epoch's program layer"
         );
         if let Some(rank) = reply {
@@ -2646,7 +2652,7 @@ impl MainProcess {
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
                     let policy =
-                        matches!(poll_answers(&precopy.policies), Some(StageFailure::Pending));
+                        matches!(poll_answers(&mut precopy.policies), Some(StageFailure::Pending));
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -2667,7 +2673,7 @@ impl MainProcess {
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
-                match poll_answers(&precopy.policies) {
+                match poll_answers(&mut precopy.policies) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Executors(submissions);
                         self.precopy = Some(precopy);
@@ -2831,7 +2837,7 @@ impl MainProcess {
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            PrecopyStage::Shadow(answers) => {
+            PrecopyStage::Shadow(mut answers) => {
                 // A shadow step runs inside a batch the scheduler forms from its resident requests.
                 // An engine with none forms no batch, so the step never runs and nothing is
                 // compared - and a comparison nobody made is how a wrong kernel reaches a
@@ -2848,7 +2854,7 @@ impl MainProcess {
                 }
                 // The shadow pass runs on the scheduler's own thread, one step of the batches it
                 // formed, so the serve pass polls it rather than waiting (§2.4).
-                match poll_answers(&answers) {
+                match poll_answers(&mut answers) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Shadow(answers);
                         self.precopy = Some(precopy);
@@ -4593,13 +4599,11 @@ impl MainProcess {
             );
         }
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.switchover_policy(),
                 self.watchdog.stall_bound(),
                 "the policy switchover",
-            ) {
-                tracing::error!(%error, "switching the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4615,13 +4619,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.revert_policy(),
                 self.watchdog.stall_bound(),
                 "the policy revert",
-            ) {
-                tracing::error!(%error, "reverting the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4746,11 +4748,15 @@ fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
 /// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
 /// may not wait on a stage whose length the daemon's load decides (§2.4).
 fn poll_answers(
-    answers: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+    answers: &mut Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
 ) -> Option<StageFailure> {
-    for receiver in answers {
+    // An answer is taken once and its sender is gone after it, so a receiver that answered leaves
+    // the list: polling it again would read a scheduler that finished as one that was lost.
+    while let Some(receiver) = answers.first() {
         match receiver.try_recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                answers.remove(0);
+            }
             Ok(Err(reason)) => return Some(StageFailure::Failed(reason)),
             Err(crossbeam_channel::TryRecvError::Empty) => return Some(StageFailure::Pending),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -4761,6 +4767,23 @@ fn poll_answers(
         }
     }
     None
+}
+
+/// Logs one scheduler's answer to a policy step when it comes, off the control thread.
+///
+/// A scheduler answers at its next batch boundary, and it reaches that boundary only while the
+/// control thread drains what it sends: a control thread that waited here held the scheduler it
+/// waited for, and a switchover under traffic stood still for the whole stall bound (§2.4).
+fn report_policy_answer(
+    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
+    bound: Duration,
+    what: &'static str,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = answer(receiver, bound, what) {
+            tracing::error!(%error, "a scheduling policy step failed");
+        }
+    });
 }
 
 /// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
