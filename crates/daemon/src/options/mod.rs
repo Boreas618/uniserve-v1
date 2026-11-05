@@ -1137,16 +1137,6 @@ impl ServeConfig {
     /// `video_config.max_seconds` lies outside the durations the video API
     /// admits.
     pub fn validate(&self, stated: &Stated) -> anyhow::Result<()> {
-        // The precision policy's retired option name. It is parsed into a field
-        // of its own rather than left unknown so that a deployment which has not
-        // been updated learns the name to state, instead of a table that nothing
-        // reads: an unknown option would be refused as "unknown field", which
-        // names the mistake but not the way out.
-        anyhow::ensure!(
-            self.retired_quantization_config.is_none(),
-            "`quantization_config` is retired: state the precision policy as `quantization` \
-             (`--set quantization.mode=...`, or `[quantization]` in --config)"
-        );
         anyhow::ensure!(
             self.node_rank < self.nnodes.get(),
             "`node_rank` {} lies outside the {} nodes `nnodes` states",
