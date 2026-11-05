@@ -770,6 +770,12 @@ impl VisionTower {
         use ops::rope::{RopeApply, Rotation};
 
         let hidden = config.hidden_size;
+        // The pixels one patch of the tower's raster carries: its channels over the temporal and both
+        // spatial extents.
+        let patch_pixels = u64::from(config.in_channels)
+            * u64::from(config.temporal_patch_size)
+            * u64::from(config.patch_size)
+            * u64::from(config.patch_size);
         let head_dim = BlockRows::head_dim(config)?;
         let heads = config.num_heads;
         let merged = BlockRows::merged_width(config);
@@ -783,6 +789,16 @@ impl VisionTower {
             WeightOrder::NxK,
             true,
             dtype,
+            dtype,
+        ));
+        // The patch embedding reads the request's pixels, which are FP32 whatever the tower's type is:
+        // its operand pair is the one projection of the tower whose input is not the tower's own type.
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            u32::try_from(patch_pixels).map_err(|_| Error::config("a patch wider than u32".to_owned()))?,
+            dtype,
+            WeightOrder::NxK,
+            true,
+            nn::DType::F32,
             dtype,
         ));
 
@@ -1253,7 +1269,9 @@ mod tests {
                 .filter(|(name, _)| name == operator)
                 .count()
         };
-        assert_eq!(count("gemm"), 1);
+        // Two: the tower's own projections share one row, and the patch embedding is the second —
+        // its operands are the request's FP32 pixels against the tower's weights.
+        assert_eq!(count("gemm"), 2);
         assert_eq!(count("layer_norm"), 2);
         assert_eq!(count("position_interpolate"), 1);
         assert_eq!(count("scaled_residual"), 1);

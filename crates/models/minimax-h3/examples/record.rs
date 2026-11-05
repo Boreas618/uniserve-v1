@@ -47,7 +47,8 @@ use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
 use nn::capability::{
-    Encoder, EncoderInputs, EncoderOutputs, TokenBatch, VideoRequest, VideoTask,
+    Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape, TokenBatch, VideoRequest,
+    VideoTask,
 };
 use nn::{PhaseKind, TensorView};
 use minimax_h3::AttentionKind;
@@ -161,6 +162,7 @@ fn run() -> Result<(), String> {
             ("denoiser", denoiser as Harness),
             ("video-postprocessor", video_postprocessor as Harness),
             ("text-encoder", text_encoder as Harness),
+            ("vision-tower", vision_tower as Harness),
         ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
@@ -168,6 +170,7 @@ fn run() -> Result<(), String> {
         "denoiser" => vec![("denoiser", denoiser as Harness)],
         "video-postprocessor" => vec![("video-postprocessor", video_postprocessor as Harness)],
         "text-encoder" => vec![("text-encoder", text_encoder as Harness)],
+        "vision-tower" => vec![("vision-tower", vision_tower as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -439,6 +442,15 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 /// The tower is a separate component only when a request carries one, so the harness states the text-only
 /// path — the same one a prompt without media takes — and the tower is the row set still owed.
 fn text_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    encoder_prefill(request, false)
+}
+
+/// The text encoder over a prompt that carries one image: the vision tower's own path.
+fn vision_tower(request: &Request) -> Result<Vec<(String, String)>, String> {
+    encoder_prefill(request, true)
+}
+
+fn encoder_prefill(request: &Request, with_image: bool) -> Result<Vec<(String, String)>, String> {
     let config = text_config(&request.root)?;
     let partition = Partition {
         tensor_parallel: 1,
@@ -477,7 +489,24 @@ fn text_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         max_kv_len: tokens,
         draft_lens: None,
     };
-    let layout = Encoder::layout(&encoder, &batch, &[]);
+    // One image at the deployment's patch size when the harness asks for the tower: the tower's rows
+    // are the token count's, and the grid only says how many patches the prompt carries.
+    let shapes = if with_image {
+        vec![ImageShape { grid: [1, 28, 28] }]
+    } else {
+        Vec::new()
+    };
+    let pixels = if with_image {
+        Some(
+            arena
+                .tensor(DType::F32, Shape::new(&[784, 1536]))
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let images: Vec<ImageInput> = pixels.iter().map(|pixels| ImageInput { pixels: *pixels }).collect();
+    let layout = Encoder::layout(&encoder, &batch, &shapes);
     let specs = Encoder::state_tables(&encoder, &layout);
     let mut tables = Vec::with_capacity(specs.len());
     for spec in &specs {
@@ -501,7 +530,7 @@ fn text_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         EncoderInputs {
             ids,
             batch,
-            images: &[],
+            images: &images,
             layout: &layout,
             state: &tables,
             diagnostics: &[],
