@@ -13,8 +13,15 @@
 //! [`super::max_permuted_rows`] so they are invariant across a captured graph's replays.
 //!
 //! A route whose expert lies outside this rank's `[local_offset, local_offset + local_experts)`
-//! window is left out: its expanded entry receives `-1` in [`Args::expanded_to_permuted`], and the
+//! window is left out: the sort writes `-1` into its entry of [`Args::expanded_to_permuted`] as it
+//! counts, so a caller never pre-fills that map and no launch can leave an entry stale, and the
 //! expert-parallel exchange carries the route to the rank that owns it.
+//!
+//! Two paddings are one word and they are two subjects. A **token** row the batch does not fill is a
+//! row of the batch's extent that has no route; a **permuted** row past an expert's last live one is
+//! padding inside a tile group, which [`Args::total_padded_tokens`] counts. Neither count answers the
+//! other's question, and a page that reads one as the other is the shape of defect this crate keeps
+//! removing.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -66,17 +73,48 @@ pub struct SortArgs {
     pub tile_to_expert: TensorView,
     /// `[max_tiles]` i32: live rows of each tile.
     pub tile_to_limit: TensorView,
-    /// `[tokens, top]` i32: permuted row of each expanded route, `-1` when not on this rank.
+    /// `[tokens, top]` i32: permuted row of each expanded route, and `-1` for a route this rank does
+    /// not hold, which the sort writes. The buffer needs no initial value.
+    ///
+    /// `-1` means one thing here and only one: **this rank does not hold the route**. A *token* row a
+    /// bucket holds but the batch does not fill is a different subject - a row that is not live has no
+    /// route for any rank to own - and it is not written at all today, because nothing in a launch
+    /// knows how many of a bucket's rows the batch fills.
     pub expanded_to_permuted: TensorView,
     /// `[max_permuted_rows]` i32: expanded route of each permuted row.
     pub permuted_to_expanded: TensorView,
-    /// `[1]` i32: padded rows the GEMMs must cover.
+    /// `[1]` i32: padded **permuted** rows the GEMMs must cover.
+    ///
+    /// This is the tail of an expert's last tile, and it is not the same subject as a token row a batch
+    /// does not fill: one is a permuted row inside a tile group, the other is a row of the batch's own
+    /// extent. A reader who needs the second cannot read it from this count.
     pub total_padded_tokens: TensorView,
     /// `[1]` i32: tiles that hold live rows.
     pub num_non_exiting_tiles: TensorView,
+    /// `[1]` i32: the token rows **of this batch** that are live, device-resident.
+    ///
+    /// The subject is the batch's own rows, not the rows a buffer holds: `tokens` may be a bucket
+    /// wider than the batch, and on an expert-parallel path it is a count of delivered route rows
+    /// from many batches at once. Only the single-rank path, where `tokens` is the batch's row
+    /// count, has padding to mark.
+    ///
+    /// A captured bucket is wider than the batch that fills it, and a row past the batch's extent has
+    /// no route: the program writes [`PADDED`] into `expanded_to_permuted` for every route of such a
+    /// row, which the combine skips because it refuses any negative index. The value lives on the
+    /// device rather than in [`Call`]'s host scalars because it changes per replay of one captured
+    /// graph, and a host value is read once at launch. `None` states no count, which every row live
+    /// means here: a deployment that has not been given one behaves exactly as it did before the
+    /// operand existed, and the kernel reads a null pointer as "all rows are live".
+    pub live_tokens: Option<TensorView>,
     /// First logical expert this rank holds.
     pub local_offset: u32,
 }
+
+/// The map's value for a route of a token row the batch does not fill.
+///
+/// Distinct from `-1`, which means the route is held by another rank. The combine refuses any
+/// negative index, so both are skipped by one predicate.
+pub const PADDED: i32 = -2;
 
 /// The call structure the package's entry receives.
 ///
@@ -99,11 +137,12 @@ pub struct Call {
     pub tile_tokens: i64,
     pub scales_dtype: i64,
     pub error: [u8; 512],
+    pub live_tokens: *const i32,
 }
 
 /// The size and field offsets the package's header must mirror, in bytes.
 pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 632,
+    size: 640,
     ids: 0,
     scales: 8,
     tile_to_expert: 16,
@@ -120,6 +159,7 @@ pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
     tile_tokens: 104,
     scales_dtype: 112,
     error: 120,
+    live_tokens: 632,
 };
 
 /// The layout of [`Call`], for the header's mirror and its test.
@@ -142,6 +182,7 @@ pub struct CallLayout {
     pub tile_tokens: usize,
     pub scales_dtype: usize,
     pub error: usize,
+    pub live_tokens: usize,
 }
 
 const _: () = assert!(
@@ -155,6 +196,10 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(Call, tokens) == SORT_CALL_LAYOUT.tokens,
     "the moe_sort call structure's extents moved without its header"
+);
+const _: () = assert!(
+    std::mem::offset_of!(Call, live_tokens) == SORT_CALL_LAYOUT.live_tokens,
+    "the moe_sort call structure's live count moved without its header"
 );
 const _: () = assert!(
     std::mem::offset_of!(Call, error) == SORT_CALL_LAYOUT.error,
@@ -229,6 +274,10 @@ impl Op for MoeSort {
             .require_shape(Self::NAME, Shape::new(&[1]))?;
         args.num_non_exiting_tiles
             .require_shape(Self::NAME, Shape::new(&[1]))?;
+        if let Some(live_tokens) = args.live_tokens {
+            live_tokens.require_shape(Self::NAME, Shape::new(&[1]))?;
+            live_tokens.require_row(Self::NAME, DType::I32, 1)?;
+        }
         for view in [
             &args.expanded_to_permuted,
             &args.permuted_to_expanded,
@@ -269,6 +318,9 @@ impl Op for MoeSort {
             tile_tokens: to_i64(Self::NAME, tile)?,
             scales_dtype: dtype_code(descriptor.scales),
             error: [0; 512],
+            live_tokens: args.live_tokens.map_or(std::ptr::null(), |view| {
+                address(view.ptr) as usize as *const i32
+            }),
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
         // pinned by the assertions above and by the test below.
@@ -363,6 +415,39 @@ mod tests {
         assert_eq!(
             super::super::max_permuted_rows(1024, 8, 128, 128),
             191 * 128
+        );
+    }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_package_header_declares_this_call_layout() {
+        let layout = SORT_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "moe_sort",
+            "uniserve_moe_sort_call",
+            &[
+                ("ids", layout.ids),
+                ("scales", layout.scales),
+                ("tile_to_expert", layout.tile_to_expert),
+                ("tile_to_limit", layout.tile_to_limit),
+                ("expanded_to_permuted", layout.expanded_to_permuted),
+                ("permuted_to_expanded", layout.permuted_to_expanded),
+                ("total_padded_tokens", layout.total_padded_tokens),
+                ("num_non_exiting_tiles", layout.num_non_exiting_tiles),
+                ("tokens", layout.tokens),
+                ("top", layout.top),
+                ("experts", layout.experts),
+                ("local_experts", layout.local_experts),
+                ("local_offset", layout.local_offset),
+                ("tile_tokens", layout.tile_tokens),
+                ("scales_dtype", layout.scales_dtype),
+                ("error", layout.error),
+            ],
+            layout.size,
         );
     }
 }

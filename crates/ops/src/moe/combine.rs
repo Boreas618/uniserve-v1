@@ -336,4 +336,34 @@ mod tests {
         assert!(tolerance.allows(1.0, 1.0));
         assert!(!tolerance.allows(0.0, 1.0));
     }
+
+    /// Every package header that serves this operator states the layout this crate passes.
+    ///
+    /// The mirror is written by hand on both sides, so a field that moves on one side fails on the
+    /// other: the module's entry reads these offsets, and a mismatch is a wrong number rather than a
+    /// refusal.
+    #[test]
+    fn the_unpermute_header_declares_this_call_layout() {
+        let layout = UNPERMUTE_CALL_LAYOUT;
+        crate::call_layout_check::check(
+            "moe_unpermute",
+            "uniserve_unpermute_call",
+            &[
+                ("routes", layout.routes),
+                ("out", layout.out),
+                ("expanded_to_permuted", layout.expanded_to_permuted),
+                ("scales", layout.scales),
+                ("tokens", layout.tokens),
+                ("top", layout.top),
+                ("hidden", layout.hidden),
+                ("routes_rows", layout.routes_rows),
+                ("input_dtype", layout.input_dtype),
+                ("scales_dtype", layout.scales_dtype),
+                ("output_dtype", layout.output_dtype),
+                ("layout", layout.layout),
+                ("error", layout.error),
+            ],
+            layout.size,
+        );
+    }
 }
