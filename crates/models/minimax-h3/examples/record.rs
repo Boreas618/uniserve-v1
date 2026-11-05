@@ -403,6 +403,24 @@ fn run() -> Result<(), String> {
         };
         for (name, harness) in &harnesses {
             match harness(&per) {
+                Ok(rows) if rows.is_empty() => {
+                    // An empty record is not a pass: `0 only recorded` over a harness that drove
+                    // nothing reads exactly like a deployment that launches nothing. A harness
+                    // that needs an argument it was not given refuses by name above; one that
+                    // returns no rows at all is refusing silently, and this is where it is named.
+                    let why = format!(
+                        "recorded no launch: nothing was driven for this harness, and an empty \
+                         record cannot be read as a deployment that launches nothing{}",
+                        if many {
+                            format!(" (at {width}x{height})")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    println!("# refused: {name}: {why}");
+                    eprintln!("# refused: {name}: {why}");
+                    refusals.push((name.to_string(), why));
+                }
                 Ok(rows) => {
                     eprintln!("# {name} at {width}x{height}: {} rows", rows.len());
                     all.extend(rows);
