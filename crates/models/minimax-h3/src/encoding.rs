@@ -175,6 +175,16 @@ impl Clip {
 }
 
 impl Stack {
+    /// Whether stage `index` ends in a downsampler, which is whether it halves space or strides time.
+    ///
+    /// The load builds the convolution from this answer and [`VideoEncoder::programs`] states the pad
+    /// its call reads from the same one: a stage with both factors one has no convolution, so it has
+    /// no padded frame either, and an enumeration that padded every stage would state a class no
+    /// launch asks for.
+    pub fn downsamples(&self, index: usize) -> bool {
+        self.temporal_strides[index] * self.spatial_strides[index] > 1
+    }
+
     /// The stack the config states.
     pub fn of(config: &VideoVaeConfig) -> Result<Self> {
         let stages = config.block_out_channels.len();
@@ -1066,16 +1076,19 @@ impl VideoEncoder {
                     shortcut,
                 });
             }
-            let temporal = stack.temporal_strides[index];
-            let spatial = stack.spatial_strides[index];
-            let downsample = if temporal * spatial > 1 {
+            let stride = [
+                stack.temporal_strides[index],
+                stack.spatial_strides[index],
+                stack.spatial_strides[index],
+            ];
+            let downsample = if stack.downsamples(index) {
                 Some(convolution(
                     loader,
                     &format!("{stage}.downsamplers.0.conv"),
                     *out,
                     *out,
                     3,
-                    [temporal, spatial, spatial],
+                    stride,
                 )?)
             } else {
                 None
@@ -1348,8 +1361,11 @@ impl VideoEncoder {
                     };
                     let pixels = u64::from(extent.height) * u64::from(extent.width);
                     let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
-                    // The level's downsampler reads a padded frame of its own.
-                    pad(&mut programs, u64::from(extent.width) + 2);
+                    // The level's downsampler reads a padded frame of its own - the stages that end in
+                    // one, which is every stage but the last of this checkpoint's ladder.
+                    if stack.downsamples(index) {
+                        pad(&mut programs, u64::from(extent.width) + 2);
+                    }
                     // Each block takes the statistics of its input and then the fused normalize-pad of the
                     // same frame; the classes follow from the frame and are deduplicated by `finish`.
                     for _ in 0..stack.blocks {
@@ -1369,19 +1385,12 @@ impl VideoEncoder {
                             true,
                             padded,
                         ));
-                        // The block's residual add is keyed on the level's **width in pixels**, and
-                        // the recorder is the witness: `block` adds `rows(out)` to `rows(residual)`,
-                        // `rows` takes `dim(4)` of a `[1, channels, frames, height, width]` buffer as
-                        // its columns, and that is the width. So the raster is load-bearing for this
-                        // row - 672x1536 launches at 1536, 768, 384, 192 and 96, and 768x1024 at 1024,
-                        // 512, 256, 128 and 64 - and a statement keyed on the channel count names a
-                        // key no launch asks for while leaving every key it does ask for unstated.
-                        let columns = u64::from(extent.width);
-                        // Stated or refused, never silently omitted: a width the descriptor cannot
-                        // hold cannot be launched either, so swallowing the refusal would turn a
-                        // configuration this VAE cannot run into a program list that looks complete.
-                        let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
-                        programs.launch::<ScaledAddOp>(&descriptor);
+                        // The block's residual add: `block` adds `rows(out)` to `rows(residual)`,
+                        // and `rows` takes `dim(4)` of a `[1, channels, frames, height, width]`
+                        // buffer as its columns. **That width is the operand's**, so it is passed at
+                        // launch and never keyed - a keyed one states a row set per raster, which is
+                        // a request's shape rather than a compiled class.
+                        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
                     }
                 }
                 // The output normalization convolves the last level's extent at the last width.
@@ -1944,7 +1953,7 @@ impl AudioEncoder {
         // The projection's **two** residual adds run over the latent channels, not over the track:
         // `shortcut` is `[frames, channels]` whatever the track's length is, so its last dimension is
         // the channel count and the two adds of one projection share one row.
-        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, u64::from(channels))?);
+        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
 
         // **One row per stage, from the list the launch walks.** A track of `samples` reaches the
         // residual add at five extents, not one: the input at its own length and then once per stage
@@ -1960,11 +1969,11 @@ impl AudioEncoder {
         for samples in samples {
             // The pad is the caller's before the first convolution, so the rows are the pad's lengths.
             let padded = padded_samples(u64::from(*samples), hop)?;
-            for extent in AudioEncoder::stage_extents(config, padded)? {
-                // As above: the refusal is the statement's, not a reason to leave the row out.
-                let descriptor = ScaledAdd.descriptor(dtype, dtype, extent)?;
-                programs.launch::<ScaledAddOp>(&descriptor);
-            }
+            // Each stage's residual add is one program at every stage and every track: its width is
+            // the operand's. `stage_extents` is still asked, because a stage the encoder cannot size
+            // is a configuration this VAE cannot run and the refusal belongs to the statement.
+            AudioEncoder::stage_extents(config, padded)?;
+            programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
         }
 
         Ok(programs.finish())
@@ -2808,7 +2817,7 @@ mod tests {
             !keys.iter().any(|key| key.contains(".block.5.weight")),
             "a widening convolution at index 5 is one entry past the reference's block"
         );
-        let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
+        let decoder = crate::audio_vae::BigVgan::keys(&config).expect("the decoder's keys");
         assert!(
             keys.iter().all(|key| !decoder.contains(key)),
             "the two audio halves read disjoint tensors"
@@ -2957,6 +2966,63 @@ mod tests {
             distinct.len(),
             "one residual row per distinct level width: {:?}",
             residuals(&programs)
+        );
+    }
+
+    /// A stage that neither strides time nor halves space has no downsampler, so it reads no padded
+    /// frame: the encoder's enumeration states one pad per frame it pads and no more.
+    ///
+    /// The pads are the input's and each downsampling stage's own columns, so the stated classes must
+    /// be exactly those - a class for the deepest stage, which no convolution reads, is a program no
+    /// launch asks for, and it is invisible to every check that compares one enumeration with another.
+    #[test]
+    fn the_video_encoder_states_a_pad_for_each_frame_it_pads() {
+        use ops::frame::FramePadDescriptor;
+
+        let config = crate::video_vae::tests::video_config();
+        let stack = Stack::of(&config).expect("the checkpoint's stack");
+        let (height, width) = (768u32, 768);
+        let programs = VideoEncoder::programs(&config, &[(height, width)])
+            .expect("the video encoder's programs");
+        let stated: Vec<String> = programs
+            .iter()
+            .filter(|(name, _)| name == "frame_pad")
+            .map(|(_, key)| key.clone())
+            .collect();
+
+        // The padded frames the network reads: the input's own columns, and each stage's that ends in
+        // a downsampler.
+        let extents = stack.extents(Extent {
+            frames: 1,
+            height,
+            width,
+        });
+        let mut columns = vec![width + 2];
+        for (index, extent) in extents.iter().enumerate().take(stack.widths.len()) {
+            if stack.downsamples(index) {
+                columns.push(extent.width + 2);
+            }
+        }
+        let reflect = matches!(
+            config.spatial_padding_mode,
+            crate::config::SpatialPadding::Reflect
+        );
+        let mut expected: Vec<String> = columns
+            .iter()
+            .map(|columns| {
+                let (pixels, channels) =
+                    FramePadDescriptor::tiles_of(true, true, u64::from(*columns));
+                FramePad::descriptor_of(DType::F32, reflect, pixels, channels).to_string()
+            })
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut stated = stated;
+        stated.sort_unstable();
+
+        assert_eq!(
+            stated, expected,
+            "the pads stated are the frames padded, and no stage without a downsampler has one"
         );
     }
 

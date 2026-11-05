@@ -649,9 +649,14 @@ pub struct ScaledAddDescriptor {
     pub target: DType,
     /// Element type of the source, which is only read.
     pub source: DType,
-    /// Elements per row.
-    pub columns: u32,
     /// The elements one program walks.
+    ///
+    /// **The width is the operand's, not the descriptor's.** `columns` used to be a field here and in
+    /// the key, and it is what makes a row set describe one clip: a blend's width is a request's
+    /// duration, so keying it states rows for the clips a walk happened to name and leaves every other
+    /// length with no kernel. The width changes no compiled code - the kernel takes the extent as an
+    /// `i64` argument and derives the row width from the operand's own shape - so it belongs with the
+    /// launch, and `check` reads it from the target view.
     pub block: u32,
 }
 
@@ -746,19 +751,16 @@ impl Op for ScaledAdd {
 
 /// Validate a call and answer its flattened element count.
 fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
-    if descriptor.columns == 0 || descriptor.block == 0 {
+    if descriptor.block == 0 {
         return Err(Error::argument(
             ScaledAdd::NAME,
-            "a row or a block of zero elements adds nothing".to_owned(),
+            "a block of zero elements adds nothing".to_owned(),
         ));
     }
-    let columns = u64::from(descriptor.columns);
+    // The width is the operand's, read from the view: a descriptor field would be a second statement
+    // of it, and a keyed one states a row set per request duration.
     args.target.require_rank(ScaledAdd::NAME, 2)?;
-    args.target
-        .require_row(ScaledAdd::NAME, descriptor.target, columns)?;
     args.source.require_rank(ScaledAdd::NAME, 2)?;
-    args.source
-        .require_row(ScaledAdd::NAME, descriptor.source, columns)?;
     if args.source.shape != args.target.shape {
         return Err(Error::argument(
             ScaledAdd::NAME,
@@ -792,7 +794,6 @@ mod scaled_add_tests {
         ScaledAddDescriptor {
             target,
             source,
-            columns: 64,
             block: SCALED_ADD_BLOCK,
         }
     }
@@ -827,7 +828,6 @@ mod scaled_add_tests {
         let descriptor = ScaledAddDescriptor {
             target: DType::BF16,
             source: DType::F32,
-            columns: WIDEST_ENCODER_ROW as u32,
             block: SCALED_ADD_BLOCK,
         };
 

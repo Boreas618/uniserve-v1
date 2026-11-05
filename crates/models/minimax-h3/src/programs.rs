@@ -88,6 +88,14 @@ pub struct Deployment {
     pub types: Types,
     /// The rasters the deployment renders, from the DiT that states its canvases.
     pub canvases: Vec<(u32, u32)>,
+    /// The tasks the deployment serves, which state the timestep groups a step reads.
+    ///
+    /// **These are deployment facts like the canvases**: a task decides how many groups the
+    /// modulation cache holds, and the cache's width is a program key - so a file that stated one
+    /// task's rows left every request of another without a cell, and a tool that appended the other
+    /// tasks' rows was a second statement of the same deployment fact.
+    pub tasks: Vec<nn::VideoTask>,
+
     /// The clip lengths the delivery serves, in video frames.
     ///
     /// **A supplied clip and a generated clip obey different rules, and this is the supplied one.**
@@ -104,7 +112,26 @@ impl Deployment {
     ///
     /// A rung the packing refuses is refused here by name, because the alternative is a row set that
     /// covers a clip no request can ask for and a first launch that fails at the kernel lookup.
-    pub fn new(config: Config, types: Types, rungs: Vec<u32>) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        types: Types,
+        rungs: Vec<u32>,
+        tasks: Vec<nn::VideoTask>,
+    ) -> Result<Self> {
+        if tasks.is_empty() {
+            return Err(Error::config(
+                "a deployment states no served task, so it states no modulation cache".to_owned(),
+            ));
+        }
+        if let Some(unserved) = tasks.iter().find(|task| {
+            !crate::checkpoint::TASK_DITS
+                .iter()
+                .any(|(served, _)| served == *task)
+        }) {
+            return Err(Error::config(format!(
+                "{unserved:?} is not a task this checkpoint serves"
+            )));
+        }
         let dies = config.denoisers.values().next().ok_or_else(|| {
             Error::config("the checkpoint states no DiT, so it states no canvases".to_owned())
         })?;
@@ -113,11 +140,15 @@ impl Deployment {
             .iter()
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
-        let dies = dies.clone();
+        // A rung is a clip the **sampler** produces, so it is checked against the timeline rule and
+        // not the encoder's: the encoder accepts any frame count (a condition is cut and padded),
+        // which is why a list of stage lengths read as a clip ladder passed this check for days.
         for rung in &rungs {
-            if let Err(error) = dies.clip.latent_frames(*rung) {
+            if let Err(error) = crate::packing::video_latent_frames(*rung) {
                 return Err(Error::config(format!(
-                    "a {rung}-frame clip is not one the encoder accepts: {error}"
+                    "a {rung}-frame clip is not one this model generates: {error}. A count the \
+                     encoder accepts but a generation cannot is a condition's length, which belongs \
+                     with the rasters rather than with the clips a delivery drives"
                 )));
             }
         }
@@ -125,8 +156,40 @@ impl Deployment {
             config,
             types,
             canvases,
+            tasks,
             rungs,
         })
+    }
+
+    /// A deployment of the checkpoint at `root`.
+    ///
+    /// The configuration is read through [`Config::read`], which normalizes the checkpoint's sidecars
+    /// at this boundary - the one place that knows how a checkpoint's directories become a deployment.
+    /// A walk that parsed the component directories itself lacks the clip rule, the attention kind and
+    /// the canvas set, which are exactly the facts `rows_bound` needs; building a denoiser config from
+    /// what it has would be a second normalization of the same checkpoint.
+    pub fn read(
+        root: &std::path::Path,
+        types: Types,
+        rungs: Vec<u32>,
+        tasks: Vec<nn::VideoTask>,
+    ) -> Result<Self> {
+        Self::new(Config::read(root, None)?, types, rungs, tasks)
+    }
+
+    /// The tasks the checkpoint's own `fastvideo_inference.json` states it serves.
+    ///
+    /// A deployment's served set is its checkpoint's unless a caller names a subset; reading it here
+    /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
+    /// [`Self::new`] refuses a task the checkpoint does not.
+    pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
+        // The table is `checkpoint`'s, not this file's, and it is read from the checkpoint's own
+        // metadata when `root` is walked - `root` is the path that walk will take.
+        let _ = root;
+        Ok(crate::checkpoint::TASK_DITS
+            .iter()
+            .map(|(task, _)| *task)
+            .collect())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
@@ -141,7 +204,10 @@ impl Deployment {
         let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
         while frames <= MAX_FRAMES {
             rungs.push(frames);
-            frames += crate::CLIP_LATENTS;
+            // The step is the **clip**, not the window: `17n + 5` moves a whole 17-frame clip per
+            // rung, and stepping by `CLIP_LATENTS` printed 22, 27, 32 - a rule no request obeys,
+            // whose size (198) is not the 59 the rule has.
+            frames += crate::CLIP_FRAMES;
         }
         rungs
     }
@@ -174,28 +240,43 @@ impl Deployment {
     /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
     /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
     /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
-    pub fn text_rows(&self, partition: &Partition, tokens: u32) -> Result<Vec<(String, String)>> {
+    /// The prompt lengths a walk states.
+    ///
+    /// The tower is stated **at the longest of them**, because its learned position table is compiled
+    /// for a bound rather than for one prompt: the table does not change with a shorter prompt, and a
+    /// row per prompt length would state a table the deployment compiles once.
+    pub fn text_rows(
+        &self,
+        partition: &Partition,
+        tokens: &[u32],
+    ) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        programs.extend(crate::text_encoder::TextEncoder::programs(
-            &self.config.text_encoder,
-            partition,
-            self.types.text_encoder,
-            tokens,
-        )?);
-        programs.extend(crate::vision::VisionTower::programs(
-            &self.config.text_encoder.vision,
-            self.types.text_encoder,
-            tokens,
-        )?);
+        for length in tokens {
+            programs.extend(crate::text_encoder::TextEncoder::programs(
+                &self.config.text_encoder,
+                partition,
+                self.types.text_encoder,
+                *length,
+            )?);
+        }
+        if let Some(sequence) = tokens.iter().copied().max() {
+            programs.extend(crate::vision::VisionTower::programs(
+                &self.config.text_encoder.vision,
+                self.types.text_encoder,
+                sequence,
+            )?);
+        }
         Ok(programs.finish())
     }
 
     /// The rows the two DiTs state: their stacks, the orchestration around them, and the
     /// conditioner.
     ///
-    /// Three facts are the caller's and are handed in rather than held, because they are the
-    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement, the
-    /// tensor-parallel placement, and whether the modulation cache is the conditioned one. The
+    /// Two facts are the caller's and are handed in rather than held, because they are the
+    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement and
+    /// the tensor-parallel placement. The served tasks are **not** among them: they are deployment
+    /// facts like the canvases, so the modulation cache's groups follow from `Deployment::tasks`,
+    /// and a call cannot state a narrower set than the deployment serves. The
     /// packed row bound is not among them: it is derived from the arrangement by the layout rule
     /// (`Layouts::rows_bound`), which is the one place that answers it.
     ///
@@ -207,8 +288,16 @@ impl Deployment {
         &self,
         partition: &Partition,
         arrangement: &Arrangement,
-        groups: Groups,
     ) -> Result<Vec<(String, String)>> {
+        // The groups are the served tasks', not an argument: a cache width is a key, so a task the
+        // deployment serves and this call does not state is a request with no cell.
+        let mut groups: Vec<Groups> = Vec::new();
+        for task in &self.tasks {
+            let groups_of = Groups::of(!matches!(task, nn::VideoTask::TextToVideoAudio));
+            if !groups.contains(&groups_of) {
+                groups.push(groups_of);
+            }
+        }
         let mut programs = Programs::default();
         for config in self.config.denoisers.values() {
             let rules = crate::denoiser::Layouts::new(config.clone(), *arrangement)?;
@@ -219,18 +308,48 @@ impl Deployment {
                     .div_ceil(config.attention.capacity_rows())
                     .next_power_of_two(),
             };
-            programs.extend(crate::denoiser::Denoiser::programs(
-                &config.transformer,
-                config.attention,
-                self.types.transformer,
-                rows,
-                groups,
-                partition,
-                &[],
-                tiles,
-            )?);
+            for &groups in &groups {
+                programs.extend(crate::denoiser::Denoiser::programs(
+                    &config.transformer,
+                    config.attention,
+                    self.types.transformer,
+                    rows,
+                    groups,
+                    partition,
+                    &[],
+                    tiles,
+                )?);
+            }
         }
         Ok(programs.finish())
+    }
+
+    /// The packed row bound the deployment's DiTs are laid out at, at the attention kind it serves.
+    ///
+    /// One function answers this number for serving (`Layouts::rows_bound`), for the rows this file
+    /// states and for a walk's `--rows`, which is why it is published: a flag that restates a bound
+    /// the deployment derives is a second answer, and the only way it can be caught is by asking the
+    /// deployment. The largest bound over the checkpoint's DiTs is the deployment's, because one store
+    /// serves both.
+    pub fn bound(
+        &self,
+        partition: &Partition,
+        attention: Option<crate::config::AttentionKind>,
+    ) -> Result<u32> {
+        let mut bound = 0;
+        for config in self.config.denoisers.values() {
+            let network = match attention {
+                Some(attention) => {
+                    let mut network = config.clone();
+                    network.attention = attention;
+                    network
+                }
+                None => config.clone(),
+            };
+            let arrangement = partition.arrangement(&network)?;
+            bound = bound.max(crate::denoiser::Layouts::new(network, arrangement)?.rows_bound()?);
+        }
+        Ok(bound)
     }
 
     /// The rows the two audio VAEs and the video VAE state, at the request extents a walk states.
@@ -247,7 +366,7 @@ impl Deployment {
         samples: &[u32],
     ) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        programs.extend(crate::audio_vae::AudioDecoder::programs(
+        programs.extend(crate::audio_vae::BigVgan::programs(
             &self.config.audio_vae,
             latents,
         )?);

@@ -12,7 +12,7 @@
 //! SnakeBeta parameters are per channel, so the weights are four published views the layer holds.
 
 use ops::audio_activation::{self, AudioActivation as AudioActivationOp};
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -186,10 +186,11 @@ impl AudioActivation {
         })?;
         let descriptor = self.descriptor();
         let channels = u64::from(self.channels);
-        // The block is per channel: the filters are one bank of `channels` taps and the chain carries
-        // the sample axis in the last dimension. A decoder's signal is `[batch, channels, samples]`
-        // - the form its one-dimensional convolutions take - and nothing in this block mixes the
-        // batch, so a batched call is one launch per row of the same program, not a wider one.
+        // **`[channels, samples]` or a leading batch of them.** The block is elementwise per channel, so
+        // a batch is the same channel set read again - the audio decoder carries a stereo pair through
+        // buffers of `[PCM_CHANNELS, channels, length]` and hands the whole view here. One launch per
+        // batch row, over the same descriptor: the program is per channel and per sample count, so a
+        // batch cannot change the key and must not change the arithmetic.
         let batch = match input.shape.rank() {
             2 => 1,
             3 => input.shape.dim(0),
@@ -197,25 +198,21 @@ impl AudioActivation {
                 return Err(Error::shape(
                     "AudioActivation",
                     format!(
-                        "{:?} is not [{channels} channels, samples] or a batch of them",
+                        "{:?} is neither [{channels} channels, samples] nor \
+                         [batch, {channels} channels, samples]",
                         input.shape.dims()
                     ),
                 ));
             }
         };
-        let width = input.shape.rank();
-        let rows = width - 2;
-        if input.shape.dim(rows) != channels {
+        let channel_axis = input.shape.rank() - 2;
+        if input.shape.dim(channel_axis) != channels {
             return Err(Error::shape(
                 "AudioActivation",
-                format!(
-                    "{:?} is not [{channels} channels, samples]{}",
-                    input.shape.dims(),
-                    if width == 3 { " per batch row" } else { "" }
-                ),
+                format!("{:?} does not have {channels} channels", input.shape.dims()),
             ));
         }
-        let length = input.shape.dim(width - 1);
+        let length = input.shape.dim(input.shape.rank() - 1);
         if length == 0 {
             return Err(Error::shape(
                 "AudioActivation",
@@ -225,17 +222,19 @@ impl AudioActivation {
         let expected = descriptor
             .output(length)
             .map_err(|error| Error::shape("AudioActivation", format!("{error}")))?;
-        // The output carries the same leading dimensions as the input: one row per batch row.
-        let wanted: Vec<u64> = if width == 3 {
-            vec![batch, channels, expected]
-        } else {
-            vec![channels, expected]
-        };
-        if out.shape.dims() != wanted.as_slice() {
+        // The output's tail is the same for both ranks, and its batch, when it has one, is the input's.
+        let written_tail = [channels, expected];
+        let tail = &out.shape.dims()[out.shape.rank().saturating_sub(2)..];
+        if out.shape.rank() != input.shape.rank()
+            || out.shape.rank() < 2
+            || tail != written_tail
+            || (batch > 1 && out.shape.dim(0) != batch)
+        {
             return Err(Error::shape(
                 "AudioActivation",
                 format!(
-                    "{:?} is not {wanted:?}, the length {length} after the ratio {}",
+                    "{:?} is not {batch} × [{channels} channels, {expected} samples], the length \
+                     {length} after the ratio {}",
                     out.shape.dims(),
                     self.ratio
                 ),
@@ -250,23 +249,40 @@ impl AudioActivation {
                 ),
             ));
         }
-        let samples = length;
         let length = u32::try_from(length).map_err(|_| {
             Error::shape(
                 "AudioActivation",
                 format!("{length} samples are wider than a kernel parameter"),
             )
         })?;
-        for index in 0..batch {
+        let element = self.dtype.bytes().ok_or_else(|| {
+            Error::shape(
+                "AudioActivation",
+                format!("{} has no whole-byte element size", self.dtype),
+            )
+        })?;
+        let input_row = channels * u64::from(length) * element;
+        let out_row = channels * expected * element;
+        for row in 0..batch {
+            let values = TensorView::new(
+                input.ptr.offset(row * input_row),
+                self.dtype,
+                Shape::new(&[channels, u64::from(length)]),
+            );
+            let written = TensorView::new(
+                out.ptr.offset(row * out_row),
+                self.dtype,
+                Shape::new(&[channels, expected]),
+            );
             f.operate::<AudioActivationOp>(
                 &descriptor,
                 audio_activation::Args {
-                    values: row_of(input, index, channels, samples)?,
+                    values,
                     alpha: weights.alpha.view(),
                     beta: weights.beta.view(),
                     filter_up: weights.filter_up.view(),
                     filter_down: weights.filter_down.view(),
-                    out: row_of(out, index, channels, expected)?,
+                    out: written,
                     length,
                 },
             )?;
@@ -275,60 +291,9 @@ impl AudioActivation {
     }
 }
 
-/// One batch row of a `[batch, channels, samples]` signal, as the `[channels, samples]` view one
-/// launch takes. A rank-2 signal is its own only row.
-fn row_of(view: TensorView, index: u64, channels: u64, samples: u64) -> Result<TensorView> {
-    let stride = channels * samples;
-    if view.shape.rank() == 2 {
-        return Ok(view);
-    }
-    if index >= view.shape.dim(0) {
-        return Err(Error::shape(
-            "AudioActivation",
-            format!("batch row {index} of {}", view.shape.dim(0)),
-        ));
-    }
-    Ok(TensorView::with_strides(
-        view.offset_elements(index * stride),
-        view.dtype,
-        Shape::new(&[channels, samples]),
-        Strides::new(&[samples, 1]),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A batched signal is one launch per row of the same program: the row views must name the
-    /// channels and samples the block's geometry is built for, and a rank-2 signal is its own row.
-    #[test]
-    fn a_batch_row_is_one_channel_major_slice_and_a_flat_signal_is_its_own() {
-        let flat = TensorView::with_strides(
-            ops::DevicePtr::new(4096),
-            DType::F32,
-            Shape::new(&[2, 8]),
-            Strides::new(&[8, 1]),
-        );
-        let same = row_of(flat, 1, 2, 8).unwrap();
-        assert_eq!(same.shape.dims(), [2, 8]);
-        assert_eq!(same.offset_elements(0), flat.offset_elements(0));
-
-        let batched = TensorView::with_strides(
-            ops::DevicePtr::new(4096),
-            DType::F32,
-            Shape::new(&[3, 2, 8]),
-            Strides::new(&[16, 8, 1]),
-        );
-        let second = row_of(batched, 1, 2, 8).unwrap();
-        assert_eq!(second.shape.dims(), [2, 8]);
-        // The row's first element is the batched signal's element 16: two channels of eight samples.
-        assert_eq!(
-            second.offset_elements(0),
-            batched.offset_elements(16)
-        );
-        assert!(row_of(batched, 3, 2, 8).is_err());
-    }
 
     #[test]
     fn the_taps_are_even_and_no_shorter_than_the_ratio() {

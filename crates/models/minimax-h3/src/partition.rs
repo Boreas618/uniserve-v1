@@ -23,6 +23,77 @@ pub const RELEASED_TEXT_ROWS: u32 = 128;
 /// The condition rows it holds: three 64-row units, nine images, three videos and two keyframes.
 pub const RELEASED_CONDITION_ROWS: u32 = 192;
 
+/// The condition rows a deployment must reserve to serve `task` at the largest canvas it offers.
+///
+/// `RELEASED_CONDITION_ROWS` is the checkpoint's own table - nine images, three videos and two
+/// keyframes of 64-row units - and it is a statement about the **reference's** raster, not about this
+/// model's: an H3 keyframe is a whole generated frame, so its rows are the canvas's patch rows, and
+/// two of them at 1344x768 are 2016 against the table's 192. A deployment sized by the table stops
+/// every conditioned request at the packing's capacity check (`the model packed N condition rows and
+/// the layout reserves 192`).
+///
+/// So the reservation is derived from what the deployment can be asked for: the largest canvas it
+/// offers, the keyframes the task anchors, and a reference clip's soundtrack. Returning the rows the
+/// task needs is what lets a caller with one fixed case size a stage to that case rather than to the
+/// deployment's worst.
+pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
+    let dit = TASK_DITS
+        .iter()
+        .find_map(|(served, dit)| (*served == task).then_some(*dit))
+        .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {task:?}")))?;
+    let denoiser = config
+        .denoisers
+        .get(&dit)
+        .ok_or_else(|| Error::config(format!("the checkpoint holds no {} DiT", dit.directory())))?;
+    // The frame's rows at the largest canvas the deployment offers: a keyframe is fitted to the
+    // generated canvas, so this is its size whatever the request asks for.
+    let frame_rows = denoiser
+        .offered_canvases()
+        .iter()
+        .map(|canvas| crate::packing::latent_raster(canvas).map(|raster| raster.patch_rows()))
+        .collect::<Result<Vec<u32>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let rows = match task {
+        VideoTask::TextToVideoAudio => 0,
+        VideoTask::FirstLastToVideoAudio => 2 * frame_rows,
+        VideoTask::ReferenceToVideoAudio => {
+            // A reference **with a soundtrack is a clip** (`an H3 image reference carries no audio`),
+            // so it is `CLIP_FRAMES` pixel frames and the packing's own rule reduces them to latent
+            // frames - not one frame with a track beside it. One latent frame fewer is a capacity
+            // that refuses the request it was derived for.
+            let clip = crate::encoding::Clip::of(&config.video_vae)?;
+            let latents = clip.latent_frames(crate::CLIP_FRAMES)?;
+            // The track is one clip long, and the packing counts it in latent steps of stereo rows.
+            let samples = crate::CLIP_FRAMES * crate::AUDIO_SAMPLE_RATE / crate::FPS;
+            latents * frame_rows + crate::AUDIO_CHANNELS * samples.div_ceil(crate::AUDIO_HOP)
+        }
+    };
+    capacity(config, dit, rows)
+}
+
+/// The smallest whole number of the deployment's capacity units that holds `rows` condition rows.
+///
+/// An arrangement's capacity is stated in units (`attention.capacity_rows()`, 64 for the dense
+/// paths), so a caller that sizes a stage from the rows its case asks for has to round up: 2016 rows
+/// of two keyframes at 1344x768 is 31.5 units, and a capacity is not a fraction of a unit.
+pub fn capacity(config: &Config, dit: crate::checkpoint::Dit, rows: u32) -> Result<u32> {
+    let denoiser = config
+        .denoisers
+        .get(&dit)
+        .ok_or_else(|| Error::config(format!("the checkpoint holds no {} DiT", dit.directory())))?;
+    let unit = denoiser.attention.capacity_rows();
+    if rows == 0 {
+        // A task with no conditions still reserves one unit: the packing's text region and the zero
+        // row are placed against a capacity, and zero is refused by the arrangement.
+        return Ok(unit);
+    }
+    rows.div_ceil(unit)
+        .checked_mul(unit)
+        .ok_or_else(|| Error::config(format!("a capacity of {rows} rows overflows")))
+}
+
 /// One block a deployment places, by the name its deployment file gives it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Component {
@@ -316,7 +387,15 @@ pub struct Partition {
 }
 
 impl Partition {
-    /// An unsharded deployment: one rank holds every block, sized for the released checkpoint.
+    /// An unsharded deployment: one rank holds every block, sized at the released checkpoint's own
+    /// conditioning table.
+    ///
+    /// **This capacity is not a deployment's.** `RELEASED_CONDITION_ROWS` describes the reference's
+    /// rasters; an H3 keyframe is a whole generated frame, so a partition built here keys its packed
+    /// row bound - and with it the dense attention's `max_kv_len`, which is part of a program's key -
+    /// at a bound no store holds. Anything that states a program takes [`Self::serving`], which
+    /// derives the capacity from the task; this exists for a caller that needs ranks and blocks and
+    /// no capacity at all.
     pub fn single() -> Self {
         Self {
             ulysses_degree: 1,
@@ -398,7 +477,8 @@ impl Partition {
             tensor_rank,
             sequence_rank,
         )?
-        .placing(blocks);
+        .placing(blocks)
+        .sized(RELEASED_TEXT_ROWS, condition_rows(config, task)?);
         partition.validate(config)?;
         Ok(partition)
     }
@@ -439,6 +519,9 @@ impl Partition {
     /// `tensor_rank` and `sequence_rank` are two different groups' positions, and both are stated: a
     /// deployment that sharded the denoiser's sequence and named only the text encoder's rank would
     /// have every rank draw the same noise.
+    ///
+    /// The capacity is the released table's, as in [`Self::single`]: a caller that states programs
+    /// wants [`Self::serving`], which derives it from the task.
     pub fn new(
         config: &Config,
         ulysses_degree: usize,
@@ -582,6 +665,70 @@ mod tests {
     /// The released checkpoint's dimensions.
     fn config() -> Config {
         crate::config::tests_support::released_config()
+    }
+
+    #[test]
+    fn a_deployments_row_bound_follows_its_condition_capacity() {
+        // `Layouts::rows_bound` is the number every class-crossing row is keyed at, and the condition
+        // capacity is part of the packed row count. So the three tasks' bounds must differ by exactly
+        // their capacities and nothing else: a bound that stopped following the capacity is a store
+        // keyed for a layout the deployment never serves, and it agrees with a walk that reads the
+        // same stale number - which is why this is asserted at the layout rule rather than at a flag.
+        let config = config();
+        let denoiser = config
+            .denoisers
+            .get(&crate::checkpoint::Dit::Base)
+            .expect("a base DiT");
+        let bound = |task| -> u32 {
+            let partition = Partition::serving(&config, task, 1, 1, 0, 0).expect("a partition");
+            let arrangement = partition.arrangement(denoiser).expect("an arrangement");
+            crate::denoiser::Layouts::new(denoiser.clone(), arrangement)
+                .expect("a layout rule")
+                .rows_bound()
+                .expect("a bound")
+        };
+        let unconditioned = bound(VideoTask::TextToVideoAudio);
+        let keyframes = bound(VideoTask::FirstLastToVideoAudio);
+        let reference = bound(VideoTask::ReferenceToVideoAudio);
+        let capacity = |task| condition_rows(&config, task).expect("a capacity");
+        assert_eq!(
+            keyframes - unconditioned,
+            capacity(VideoTask::FirstLastToVideoAudio) - capacity(VideoTask::TextToVideoAudio),
+            "the keyframe deployment's bound moves by its capacity and by nothing else"
+        );
+        assert_eq!(
+            reference - keyframes,
+            capacity(VideoTask::ReferenceToVideoAudio) - capacity(VideoTask::FirstLastToVideoAudio),
+            "a reference clip's bound moves by the extra rows its clip reserves"
+        );
+    }
+
+    #[test]
+    fn a_conditioned_deployment_reserves_its_own_keyframes_not_the_checkpoints_table() {
+        // The released table's 192 rows describe the reference's 64-row units. An H3 keyframe is a
+        // whole generated frame: 1008 patch rows at 1344x768, so two of them are 2016 and the
+        // capacity rounds up to the arrangement's 64-row unit. A deployment that reserved the table
+        // stops every conditioned request at the packing's capacity check.
+        let config = config();
+        assert_eq!(
+            condition_rows(&config, VideoTask::FirstLastToVideoAudio).expect("a capacity"),
+            2048
+        );
+        // A reference **with a soundtrack is a clip**: `CLIP_FRAMES` pixel frames, which the
+        // packing reduces to two latent frames at 1008 patch rows each, plus the soundtrack of one
+        // clip (29 latent steps of two channels) - 2 x 1008 + 58 = 2074, in whole units.
+        assert_eq!(
+            condition_rows(&config, VideoTask::ReferenceToVideoAudio).expect("a capacity"),
+            2112
+        );
+        // An unconditioned task still reserves one unit, because an arrangement refuses zero.
+        assert_eq!(
+            condition_rows(&config, VideoTask::TextToVideoAudio).expect("a capacity"),
+            64
+        );
+        let serving = Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0, 0)
+            .expect("a serving partition");
+        assert_eq!(serving.condition_rows, 2048);
     }
 
     #[test]

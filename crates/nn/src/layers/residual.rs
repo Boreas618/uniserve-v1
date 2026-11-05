@@ -421,23 +421,12 @@ impl ScaledAdd {
     ///
     /// The two operands' element types are the caller's — a BF16 trajectory stepped by an FP32
     /// velocity is the intended pairing — and the width is the operands', so both are arguments.
-    pub fn descriptor(
-        &self,
-        target: DType,
-        source: DType,
-        columns: u64,
-    ) -> Result<residual::ScaledAddDescriptor> {
-        Ok(residual::ScaledAddDescriptor {
+    pub fn descriptor(&self, target: DType, source: DType) -> residual::ScaledAddDescriptor {
+        residual::ScaledAddDescriptor {
             target,
             source,
-            columns: u32::try_from(columns).map_err(|_| {
-                Error::shape(
-                    "ScaledAdd",
-                    "more columns than a descriptor holds".to_owned(),
-                )
-            })?,
             block: BLOCK,
-        })
+        }
     }
 
     /// `target ← β · target + α · source` over `[rows, columns]`, writing `target` in place.
@@ -455,7 +444,7 @@ impl ScaledAdd {
                 format!("{:?} with {:?}", target.shape.dims(), source.shape.dims()),
             ));
         }
-        let descriptor = self.descriptor(target.dtype, source.dtype, target.shape.last())?;
+        let descriptor = self.descriptor(target.dtype, source.dtype);
         f.operate::<residual::ScaledAdd>(
             &descriptor,
             residual::ScaledAddArgs {
@@ -465,27 +454,5 @@ impl ScaledAdd {
                 beta,
             },
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The solver's step is typed by its two operands and its width is the operands', so a width a
-    /// descriptor cannot hold is refused by the accessor rather than truncated by the launch.
-    #[test]
-    fn a_step_wider_than_a_descriptor_holds_is_refused() {
-        assert_eq!(
-            ScaledAdd
-                .descriptor(DType::BF16, DType::F32, 2048)
-                .unwrap()
-                .columns,
-            2048
-        );
-        let refusal = ScaledAdd
-            .descriptor(DType::BF16, DType::F32, u64::from(u32::MAX) + 1)
-            .expect_err("a width past u32 has no descriptor");
-        assert!(format!("{refusal}").contains("more columns"), "{refusal}");
     }
 }
