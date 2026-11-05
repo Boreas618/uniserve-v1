@@ -604,11 +604,15 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
+            // `SegmentAttention`'s key bound is in **rows** and must be whole tiles; `tiles` is a count
+            // of tiles. Passing the count made the fine attention's bound eight tiles where the
+            // selection may choose `tiles` of them, which a 512-tile walk argument hid because 512 is
+            // a multiple of 64: the refusal is by rows, so the shortfall was silent.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles),
+                u64::from(tiles) * u64::from(tile),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:

@@ -27,7 +27,7 @@ use minimax_h3::config::{
 use minimax_h3::partition::Partition;
 use minimax_h3::output::VideoPostprocessor;
 use minimax_h3::text_encoder::TextEncoder;
-use minimax_h3::denoiser::Denoiser;
+use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
 use minimax_h3::modulation::Groups;
 use minimax_h3::video_vae::VideoDecoder;
 use minimax_h3::vision::VisionTower;
@@ -304,10 +304,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (packed.iter().copied().max().unwrap_or(0).div_ceil(sparse_contract.tile))
                     .next_power_of_two(),
             ),
-            (Some((tile, sparsity, tiles, reference_keep)), None) => (
-                AttentionKind::sparse(tile, sparsity, reference_keep)?,
-                tiles,
-            ),
+            (Some((tile, sparsity, stated_tiles, reference_keep)), None) => {
+                let attention = AttentionKind::sparse(tile, sparsity, reference_keep)?;
+                // The tile bound is the deployment's own rule and not a caller's number: it caps every
+                // canvas and frame count the deployment offers, and the launch keys its next power of
+                // two. A stated bound that is another class is refused by name rather than walked,
+                // because a fixture row naming the wrong class is a module no launch asks for.
+                let mut network = minimax_h3::Config::read(&root, None)?.denoisers;
+                let mut base = network
+                    .remove(&minimax_h3::Dit::Base)
+                    .ok_or("this checkpoint holds no base network")?;
+                base.attention = attention;
+                let tokens_max = tokens.iter().copied().max().unwrap_or(0);
+                let arrangement = Arrangement::new(&base, tokens_max, 64, 1)?;
+                let computed = Layouts::new(base, arrangement)?.tiles_bound()?;
+                if computed.next_power_of_two() != stated_tiles.next_power_of_two() {
+                    return Err(format!(
+                        "--sparse states {stated_tiles} tiles and the deployment's own bound is \
+                         {computed}: the launch keys the bound's next power of two \
+                         ({}, not {}), and a row naming another class is a module no launch asks for",
+                        computed.next_power_of_two(),
+                        stated_tiles.next_power_of_two()
+                    )
+                    .into());
+                }
+                (attention, computed)
+            }
             (None, None) => (AttentionKind::Dense, 0),
         };
         rows.extend(Denoiser::programs(
