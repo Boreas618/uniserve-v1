@@ -594,6 +594,8 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "the successor received the service",
             "the handed-over control connection closed",
             "the successor owns it, so it is not relaunched here",
+            "the engine read an engine command",
+            "a serve pass took longer than five seconds",
             "the daemon hands its service",
             "attaching a daemon failed",
             "asked the engine to dial",
