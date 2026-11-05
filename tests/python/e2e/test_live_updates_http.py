@@ -1424,8 +1424,17 @@ def _restart_while_streaming(
 
     # New requests are served while the old daemon finishes its streams.
     for _ in range(3):
-        reply = _chat(base_url, name, "Say hello.")
-        assert reply["choices"][0]["message"]["content"]
+        try:
+            reply = _chat(base_url, name, "Say hello.")
+        except Exception as error:  # noqa: BLE001 - the successor's answer, whole, with the log
+            raise AssertionError(
+                f"a new request after the restart failed: {error!r}"
+                f"{_log_trouble(log)}"
+            ) from error
+        assert reply["choices"][0]["message"]["content"], (
+            f"a new request after the restart answered an empty completion: "
+            f"{reply}{_log_trouble(log)}"
+        )
     for thread in streaming:
         thread.join(timeout=1800)
     assert all(done.is_set() for done in dones), "a stream did not end"
