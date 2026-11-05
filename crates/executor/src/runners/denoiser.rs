@@ -270,17 +270,18 @@ pub struct Prepared {
 
 /// The products one denoising step reads, in the order a refusal names them.
 ///
-/// The model states each kind's size through its `Layout`, so this list is the model's own list of
-/// what a step consumes and not a choice this runner makes. The request's raw condition media is not
-/// among them: it is an input to the conditioning rather than a row of it, and it is per condition
+/// **This is the list the runner places into `Conditioning`, and nothing else.** A step here reads
+/// the encoded conditioning rows (`text`, and `source`, the encoder's own features that
+/// `Denoiser::prepare_conditioning` folds into `text` before the first evaluation) and the
+/// trajectory it advances (`latents`). `images` and `audio` are `Conditioning` fields another model
+/// fills; this runner passes `None` for both, so requiring them would refuse every step of a model
+/// that does not use them - which is what a list written from the capability's fields rather than
+/// from this file's own assembly would do.
+///
+/// The request's raw condition media is not here either: it is an input to the conditioning rather
+/// than a row of it, it is per condition, and the scheduler names it
 /// (`crate::runners::products`).
-const STEP_PRODUCTS: &[Product] = &[
-    Product::Text,
-    Product::Source,
-    Product::Images,
-    Product::Audio,
-    Product::Latents,
-];
+const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source, Product::Latents];
 
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
@@ -1272,13 +1273,13 @@ mod product_tests {
             .expect("a store answers");
         assert_eq!(
             missing,
-            Some(Product::Images),
-            "the reference media is the first kind this store lacks"
+            Some(Product::Latents),
+            "the trajectory is the first kind this store lacks"
         );
         assert!(
-            products::absent(request(), Product::Images)
+            products::absent(request(), Product::Latents)
                 .to_string()
-                .contains("images"),
+                .contains("latents"),
             "the refusal names the kind"
         );
     }
