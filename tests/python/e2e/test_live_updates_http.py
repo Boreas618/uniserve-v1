@@ -565,6 +565,33 @@ def _log_lines(log: Path) -> list[str]:
     return [colors.sub("", line) for line in log.read_text().splitlines()]
 
 
+def _log_trouble(log: Path, limit: int = 40) -> str:
+    """The last `limit` warnings and errors of a server's log, marked.
+
+    A tail of the last lines is the wrong excerpt for a failure whose cause is
+    minutes earlier: a relaunch logs a capture per bucket per device, so two
+    hundred tail lines can hold nothing but captures and stop short of the
+    engine's death. The warnings and errors are what name a cause, and there
+    are few of them whatever the moment.
+    """  # noqa: D205
+    try:
+        trouble = [
+            line
+            for line in _log_lines(log)
+            if " WARN" in line or " ERROR" in line
+        ]
+    except OSError as error:
+        return f"\n(server log unreadable at {log}: {error})"
+    if not trouble:
+        return f"\n--- no warning or error in {log} ---"
+    shown = trouble[-limit:]
+    return (
+        f"\n--- {len(shown)} warnings and errors of {log} ---\n"
+        + "\n".join(shown)
+        + "\n--- end of excerpts ---"
+    )
+
+
 def _chat(
     base_url: str,
     model: str,
@@ -1325,7 +1352,8 @@ def _restart_while_streaming(
         # account of what it did with them, not a number of seconds.
         raise AssertionError(
             f"{error} (counts so far: {[len(read) for read in reads]}; "
-            f"stream errors: {[repr(one) for one in errors]}){log_tail(log, 200)}"
+            f"stream errors: {[repr(one) for one in errors]})"
+            f"{_log_trouble(log)}{log_tail(log, 200)}"
         ) from error
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
