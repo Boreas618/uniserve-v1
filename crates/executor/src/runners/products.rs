@@ -70,6 +70,16 @@ pub enum Product {
     VideoLatents,
     /// The audio latent trajectory, in the same sense.
     AudioLatents,
+    /// `[channels, frames, rows, columns]` the decoded clip: a decode writes it and the transport
+    /// that turns it into an artifact reads it.
+    ///
+    /// It is a product for the same reason the latents are: the region is a runner's own column, and
+    /// a value another call must read has nowhere to be unless it is named. The name is
+    /// `(request, kind)` like every other, so the transport reads one clip by the identity the
+    /// request was admitted under rather than by a position in a batch.
+    Video,
+    /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
+    Track,
 }
 
 impl Product {
@@ -82,6 +92,8 @@ impl Product {
             Self::Audio => "audio",
             Self::VideoLatents => "video latents",
             Self::AudioLatents => "audio latents",
+            Self::Video => "video",
+            Self::Track => "track",
         }
     }
 }
