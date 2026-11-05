@@ -288,6 +288,40 @@ def families(args):
     print(f"{total} key(s) launched, {collapsed} with the field(s) removed")
 
 
+def phantom(args):
+    """Operators the list holds and no walk in the set launches, with their row counts.
+
+    This is not "no launcher exists" - a walk reaches only what its flags reach. It is the list of
+    operators where the two instruments have nothing to say to each other, which is where a row set
+    written from the checkpoint's module names drifts from what the model builds: `snake_beta` is
+    seven such rows, and the walk's own activation row is the fused `audio_activation`.
+    """
+    walked = set()
+    for path in args.walk:
+        walked.update(operator for operator, _ in read_lines(path))
+    fixture = read_lines(args.fixture)
+    counts = {}
+    for operator, _ in fixture:
+        counts[operator] = counts.get(operator, 0) + 1
+    silent = sorted(op for op in counts if op not in walked)
+    for operator in silent:
+        print(
+            f"  no walk launches: {operator}  ({counts[operator]} row(s) in the list)"
+        )
+    if not silent:
+        print(
+            "every operator the list holds is launched by some walk in this set"
+        )
+        return 0
+    print(
+        f"\n{len(silent)} operator(s), {sum(counts[op] for op in silent)} row(s),"
+        " the list holds and these walks never launch. A walk reaches what its flags"
+        " reach, so this names a disagreement between the two instruments - not a"
+        " launcher's absence, which only the model's own source can say."
+    )
+    return 1
+
+
 def by_shape(args):
     """Every shape the walks produced, against the shapes the file holds at any element type."""
     shapes = {}
@@ -473,7 +507,10 @@ def self_test() -> int:
 
     # `--families` removes a field and the value after it, and nothing else.
     assert without("a_columns_128_block_1024", {"columns"}) == "a_block_1024"
-    assert without("a_columns_128_lines_4_block_1024", {"columns"}) == "a_lines_4_block_1024"
+    assert (
+        without("a_columns_128_lines_4_block_1024", {"columns"})
+        == "a_lines_4_block_1024"
+    )
     assert without("a_block_1024", {"columns"}) == "a_block_1024"
 
     print(
@@ -485,6 +522,11 @@ def self_test() -> int:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--phantom",
+        action="store_true",
+        help="operators the list holds that no walk in the set launches",
+    )
     parser.add_argument(
         "--families",
         action="store_true",
@@ -535,6 +577,8 @@ def main(argv=None):
         return by_shape(args)
     if args.families:
         return families(args)
+    if args.phantom:
+        return phantom(args)
     walk = read_lines(args.walk[0])
     fixture = read_lines(args.fixture)
 
