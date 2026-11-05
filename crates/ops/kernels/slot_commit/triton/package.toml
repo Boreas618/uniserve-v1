@@ -27,8 +27,13 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `index_i64_verified_i32_penalties_i32_stride_32_future_stride_8_vocab_151936_block_64`.
+# `index_i32_verified_i32_penalties_i32_stride_8_future_stride_1_vocab_151936_block_8`.
 [kernel.descriptors]
-dimensions = { index = ["i64"], verified = ["i32"], penalties = ["i32"], stride = ["32", "256"], future_stride = ["8", "16"], vocab = ["151936", "248320"], block = ["32", "64", "256"] }
+# The descriptor a launch passes: the table and the sampled ids are i32 end to end
+# (`nn::Sampler` emits i32), one next-input token per slot, and the block is the
+# smallest power of two covering a bucket's rows. `stride` is the *table capacity*
+# - the largest bucket's rows for every bucket - so a deployment with a wider
+# decode bucket declares its own value here.
+dimensions = { index = ["i32"], verified = ["i32"], penalties = ["i32"], stride = ["8"], future_stride = ["1"], vocab = ["151936", "248320"], block = ["1", "2", "4", "8"] }
 
 [parameters]
