@@ -578,7 +578,6 @@ impl EpochPlan {
                 executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
             })
             .collect();
-
         let config = minimax_h3::Config::read(&self.checkpoint, None)?;
         let hidden = config.text_encoder.hidden_size;
         let text = pipeline.text_encoder().context(
@@ -625,6 +624,29 @@ impl EpochPlan {
         let denoise_set = Buckets::new(warm.iter().map(|candidate| {
             executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view()))
         }));
+        // One audio decode bucket per distinct track those layouts carry. A `t2va` clip is a picture
+        // **and** a soundtrack, so a deployment that captured clips alone would produce video with
+        // no track; the track's extent is the layout the denoiser already states, and two canvases
+        // of one duration collapse onto one track. A deployment that prepares no audio at all states
+        // none, and then no audio runner is bound rather than one that could serve nothing.
+        let audio_buckets: Vec<executor::plan::Bucket> = {
+            let mut seen: Vec<(u32, u32)> = Vec::new();
+            let mut buckets = Vec::new();
+            for bucket in denoise_set.iter() {
+                let executor::plan::Extent::Latents(layout) = bucket.extent else {
+                    continue;
+                };
+                let Some(audio) = layout.audio else {
+                    continue;
+                };
+                if seen.contains(&(audio.frames, audio.channels)) {
+                    continue;
+                }
+                seen.push((audio.frames, audio.channels));
+                buckets.push(executor::plan::Bucket::audio(1, layout));
+            }
+            buckets
+        };
         let denoise = media_denoiser::DenoiserRunner::new(
             Binding {
                 id: RunnerId(1),
@@ -652,11 +674,31 @@ impl EpochPlan {
             decode_set,
             Arc::clone(generation),
         )?;
-        Ok(vec![
+        let mut runners = vec![
             NamedRunner::new(RunnerId(0), Box::new(encoder)),
             NamedRunner::new(RunnerId(1), Box::new(denoise)),
             NamedRunner::new(RunnerId(2), Box::new(decode)),
-        ])
+        ];
+        if !audio_buckets.is_empty() {
+            let audio_decoder = pipeline.audio_decoder().context(
+                "the checkpoint holds no audio decoder, so no track could be decoded and every \
+                 response would be a clip with no sound",
+            )?;
+            let audio_set = Buckets::new(audio_buckets);
+            let audio = executor::runners::AudioDecoderRunner::new(
+                Binding {
+                    id: RunnerId(3),
+                    phases: served_phases(&audio_set),
+                    device,
+                    stream: stream("audio decoder")?,
+                },
+                Arc::clone(audio_decoder),
+                audio_set,
+                Arc::clone(generation),
+            )?;
+            runners.push(NamedRunner::new(RunnerId(3), Box::new(audio)));
+        }
+        Ok(runners)
     }
 
     /// What a media rank advertises of itself: the facts its scheduler is configured from.
@@ -900,47 +942,94 @@ impl EpochPlan {
         served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
     ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
-        let Served::Text(model) = served else {
-            bail!(
-                "this rank's class is {:?} and its resident memory is planned for a causal \
-                 language model only",
-                served.class()
-            );
-        };
         let device = *self
             .devices
             .first()
             .context("this rank serves no device to open its resident memory on")?;
-        // The KV geometry is the model's own: its layer count, the heads each layer stores and the
-        // width of a head. Every figure comes from `config()`, so a checkpoint whose shape this
-        // build cannot state is refused by name below rather than planned with a literal.
-        let config = model.config();
-        let cache = executor::capacity::CacheGeometry {
-            layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
-            kv_heads: narrow(config.num_key_value_heads, "num_key_value_heads")?,
-            head_dim: narrow(config.head_dim, "head_dim")?,
-        };
-        // What a batch may be, from the epoch's own graph plan: a rank that serves captured graphs
-        // only is never handed a batch larger than its largest bucket - `Graphs` refuses it before
-        // a kernel runs - so the catalog is the rank's admission bound and not an estimate.
-        let (rows, tokens) = self.buckets.bounds();
         let host = host_name()?;
-        let facts = executor::capacity::RankFacts {
-            device: executor::config::Device::Cuda(device),
-            host: &host,
-            world: self.world,
-            world_size: self.world_size,
-            queue_depth: self.queue_depth,
-            // The model's page is the preset: the plan returns it or fails, and a plan that lowered
-            // it would leave every runner addressing pages the pool does not hold.
-            block_size: Some(model.page_tokens()),
-            max_batch_calls: rows as usize,
-            max_batch_tokens: tokens as usize,
-            max_request_pool_size: self.build.max_running_requests.get(),
-            max_model_len: self.max_kv_len(served)? as usize,
-            mem_fraction_static: self.build.mem_fraction_static,
-            cache,
-            kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+        // What one batch may be, in the class's own terms: a causal-language rank admits up to the
+        // largest bucket its catalog captured (`Graphs` refuses anything larger before a kernel
+        // runs, so the catalog is its bound and not an estimate), and a media rank admits the
+        // deployment's requests at the widest prompt capacity it captures.
+        let (rows, tokens) =
+            match served {
+                Served::Text(_) => self.buckets.bounds(),
+                Served::Media(_) => {
+                    let longest = self.build.max_model_len.map(|length| length.get()).context(
+                    "a deployment of the media class states no `max_model_len`, and its prompt \
+                     capacities are checked against it",
+                )?;
+                    (
+                        u32::try_from(self.build.max_running_requests.get())
+                            .context("more request slots than the protocol addresses")?,
+                        prompt_capacity(&self.build.video, longest)?,
+                    )
+                }
+            };
+        // Everything the engine states about the rank, and what the rank reports of itself. The two
+        // differ in one field between the classes: a rank that keeps a paged cache states its
+        // geometry and a rank that keeps none states its absence, and each planner refuses the
+        // other's value by name.
+        let (facts, report) = match served {
+            Served::Text(model) => {
+                // The KV geometry is the model's own: its layer count, the heads each layer stores
+                // and the width of a head. Every figure comes from `config()`, so a checkpoint whose
+                // shape this build cannot state is refused by name rather than planned with a
+                // literal.
+                let config = model.config();
+                let cache = executor::capacity::CacheGeometry {
+                    layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
+                    kv_heads: narrow(config.num_key_value_heads, "num_key_value_heads")?,
+                    head_dim: narrow(config.head_dim, "head_dim")?,
+                };
+                let facts = executor::capacity::RankFacts {
+                    device: executor::config::Device::Cuda(device),
+                    host: &host,
+                    world: self.world,
+                    world_size: self.world_size,
+                    queue_depth: self.queue_depth,
+                    // The model's page is the preset: the plan returns it or fails, and a plan that
+                    // lowered it would leave every runner addressing pages the pool does not hold.
+                    block_size: Some(model.page_tokens()),
+                    max_batch_calls: rows as usize,
+                    max_batch_tokens: tokens as usize,
+                    max_request_pool_size: self.build.max_running_requests.get(),
+                    max_model_len: self.max_kv_len(served)? as usize,
+                    mem_fraction_static: self.build.mem_fraction_static,
+                    cache: Some(cache),
+                    kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+                };
+                (facts, rank_report(device, &host)?)
+            }
+            Served::Media(_) => {
+                let facts = executor::capacity::RankFacts {
+                    device: executor::config::Device::Cuda(device),
+                    host: &host,
+                    world: self.world,
+                    world_size: self.world_size,
+                    queue_depth: self.queue_depth,
+                    // No page and no cache: the media class addresses no paged request, so the
+                    // three figures a cache is described by are absent. `kv_dtype` is the
+                    // deployment's own setting, kept here because the struct states one and the
+                    // media plan fits no cache to apply it to.
+                    block_size: None,
+                    max_batch_calls: rows as usize,
+                    max_batch_tokens: tokens as usize,
+                    max_request_pool_size: self.build.max_running_requests.get(),
+                    max_model_len: self.max_kv_len(served)? as usize,
+                    mem_fraction_static: self.build.mem_fraction_static,
+                    cache: None,
+                    // The media plan fits no cache, so this figure is never read: it states the
+                    // element type the rank's states are held in, which is the deployment's own
+                    // model type rather than a cache setting the deployment did not make.
+                    kv_dtype: match self.build.dtype {
+                        proto::request::ModelDtype::Float16 => ipc::PrefixCacheDtype::Float16,
+                        proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
+                        proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
+                    },
+                };
+                (facts, media_rank_report(device, &host)?)
+            }
         };
         // One rank's host group: this rank alone, which is what a world of one rank is. A
         // deployment of several ranks forms its group over the peers' rendezvous at start, and
@@ -954,8 +1043,10 @@ impl EpochPlan {
             );
         }
         let group = executor::parallel::host::HostGroup::single(self.rank as usize);
-        let report = rank_report(device, &host)?;
-        let planned = executor::capacity::plan_rank(&facts, report, &group)?;
+        let planned = match served {
+            Served::Text(_) => executor::capacity::plan_rank(&facts, report, &group)?,
+            Served::Media(_) => executor::capacity::plan_media(&facts, report, &group)?,
+        };
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
@@ -1055,6 +1146,58 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
             name: ipc::DEFAULT_COMPONENT.to_owned(),
             outputs: Vec::new(),
         }],
+    })
+}
+
+/// What a media rank advertises of itself: the calls its blocks serve, and which component serves
+/// each.
+///
+/// **A media rank serves media calls, not forwards**, so the two calls a causal-language report
+/// states (prefill and decode) are not among them: a scheduler routes a request's encode, its
+/// denoising steps and its decode by call, and each is served by one block of the pipeline.
+///
+/// **No device product is exported**, for the same reason the text class exports none: what this
+/// class hands on - the encoded conditioning rows, the latent trajectory, the decoded clip - stays
+/// in the process, through the product store, and a report that claimed otherwise would have the
+/// capacity plan reserve storage for transfers no rank makes.
+pub(crate) fn media_rank_report(
+    device: DeviceId,
+    host: &str,
+) -> Result<executor::capacity::Report> {
+    use ipc::MediaCall;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    // The component names are the deployment's own, which the pipeline's blocks answer to: a
+    // scheduler routes a call by component name, and a rank that advertised names of its own would
+    // hold nothing any pool asks for.
+    let mut media_components = std::collections::BTreeMap::new();
+    media_components.insert(MediaCall::TextEncoding, "text_encoder".to_owned());
+    media_components.insert(MediaCall::Denoising, "transformer".to_owned());
+    media_components.insert(MediaCall::VideoDecoding, "video_decoder".to_owned());
+    let supported_calls: Vec<ipc::CallKind> = media_components
+        .keys()
+        .copied()
+        .map(ipc::CallKind::Media)
+        .collect();
+    let components: Vec<ipc::ComponentInfo> = media_components
+        .values()
+        .map(|name| ipc::ComponentInfo {
+            name: name.clone(),
+            outputs: Vec::new(),
+        })
+        .collect();
+    Ok(executor::capacity::Report {
+        endpoint: ipc::WorkerEndpoint {
+            host: host.to_owned(),
+            address_space: std::process::id().to_string(),
+            incarnation: format!("{at}"),
+        },
+        device_exports: false,
+        fabric_handles: platform::HandleType::probe(device)? == platform::HandleType::Fabric,
+        supported_calls,
+        media_components,
+        components,
     })
 }
 
@@ -1542,7 +1685,11 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
             Variant::Encode => engine::PhaseKind::TextEncoding,
             Variant::Denoise => engine::PhaseKind::Denoise,
-            Variant::Decode => engine::PhaseKind::ImageDecode,
+            // The scheduler plans a clip's decode as `VideoDecode` and a track's as `AudioDecode`
+            // (`call_phase`), so a device that advertised `ImageDecode` for either served no phase
+            // the scheduler ever planned - the same defect this function's doc records.
+            Variant::Decode => engine::PhaseKind::VideoDecode,
+            Variant::AudioDecode => engine::PhaseKind::AudioDecode,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
