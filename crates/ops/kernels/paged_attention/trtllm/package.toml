@@ -5,9 +5,16 @@
 # descriptor's configurations can select published beside the module under
 # `cubins/`. The entry is the operator's `attention::paged::Call`.
 #
-# Whole-query prefill is not declared: that is `fa4`'s package (FlashAttention's
-# Blackwell pass), and a key must name one program. This package serves the decode
-# cells, where trtllm-gen's paged kernel is the one the design names.
+# Both phases are declared, and the design names trtllm-gen for both: the paged
+# decode kernel (`FmhaKernelType::Generation`) and the context kernel
+# (`FmhaKernelType::Context`), which `src/entry.cpp` selects on `call->phase` and
+# `src/build.py` selects from the artifact's table by the `Context` suffix. Until
+# this line the module declared decode alone, so the context path was written,
+# compiled and never selected by any descriptor.
+#
+# A key must still name one program: the entry dispatches on the phase the
+# descriptor's key carries, so a prefill key and a decode key are two cells of
+# one module rather than two modules for one key.
 #
 # The manifest records where the kernels come from: `[toolchain] packages` names
 # the FlashInfer distribution that carries the launch code, and
@@ -46,7 +53,7 @@ architectures = ["sm_100a", "sm_100f"]
 # operator's call carries one FP32 scale per page, so the module could not read
 # the scales the kernel asks for.
 [kernel.descriptors]
-dimensions = { phase = ["decode"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
 
 [parameters]
 # The trtllm-gen artifact: the pin its manifest is hashed by.
