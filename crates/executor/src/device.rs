@@ -631,32 +631,36 @@ impl Device {
                 );
                 continue;
             }
-            // The work in flight is this device thread's knowledge alone, and it is gone the moment
-            // the command ends: a fault that names its batch number and nothing else costs a hunt,
-            // so the activity travels inside the failure itself (and in its own log line).
-            let activity = self
-                .activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let result = self
-                .serve(&entry)
-                .map_err(|error| match &activity {
-                    Some(activity) => Error::in_flight(activity.clone(), error),
-                    None => error,
-                });
-            if let Err(error) = &result {
-                tracing::warn!(
-                    %error,
-                    activity = activity.as_deref().unwrap_or("no work in flight"),
-                    device = self.device.0,
-                    "a device command failed"
-                );
-            }
+            let result = self.serve(&entry);
             if matches!(result, Ok(Step::Requeued)) {
                 // The entry put the rest of its command at the tail; its submission waits for the
                 // last step, so nothing completes here.
                 continue;
+            }
+            // What was in hand, read **after** the command: `perform` is what writes it, and it is
+            // taken when a command completes, so a string read before the command is the one the
+            // previous command left - empty. Reading it before the command therefore wrapped no
+            // fault at all, and every device failure in a run named only its batch number.
+            let detail = self
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            // The work in flight is this thread's knowledge alone and is gone once the command ends:
+            // it travels inside the failure, so every report of it - the device's line, the
+            // submission's outcome, the main process's reason - names the bucket, the rows, the
+            // generation and the operator without reaching back for state that is gone.
+            let result = result.map_err(|error| match &detail {
+                Some(detail) => Error::in_flight(detail.clone(), error),
+                None => error,
+            });
+            if let Err(error) = &result {
+                tracing::warn!(
+                    %error,
+                    in_flight = detail.as_deref().unwrap_or("no work in flight"),
+                    device = self.device.0,
+                    "a device command failed"
+                );
             }
             let result = match result {
                 Ok(Step::Done(output)) => Ok(output),
@@ -675,11 +679,6 @@ impl Device {
                     self.sticky = Some(sticky);
                 }
             }
-            let detail = self
-                .activity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
             queue.complete(entry, result, detail);
         }
         events.set_submitter(None);
