@@ -35,6 +35,7 @@ import io
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -590,7 +591,7 @@ def native_parameters(
     return ("ok", "")
 
 
-def native(verbose: bool) -> tuple[list[str], list[str]]:
+def native(verbose: bool) -> tuple[list[str], list[str], int]:
     """Every native package's call structure, compared with the Rust structure it mirrors.
 
     The comparison is positional, by name and by storage type, which is what a layout disagreement
@@ -701,7 +702,7 @@ def native(verbose: bool) -> tuple[list[str], list[str]]:
         f"{compared} call structure(s) compared, {len(problems)} disagreement(s), "
         f"{len(gaps)} not compared"
     )
-    return problems, gaps
+    return problems, gaps, compared
 
 
 def sweep(
@@ -864,7 +865,7 @@ def sweep(
             f"{cells} cell(s) compared in order against the packages that wrote them",
             file=sys.stderr,
         )
-    return problems, gaps
+    return problems, gaps, cells
 
 
 def main() -> int:
@@ -895,10 +896,40 @@ def main() -> int:
         action="store_true",
         help="compare each native package's call structure with the Rust one it mirrors",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one record of what was compared, for a caller to keep under artifacts/",
+    )
     arguments = parser.parse_args()
 
+    def record(mode: str, compared: int, problems: list[str], gaps: list[str]) -> None:
+        """One machine-readable statement of a run: what mode, what it reached, what it found."""
+        print(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "tip": subprocess.run(
+                        ["git", "rev-parse", "--short", "HEAD"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    ).stdout.strip(),
+                    "compared": compared,
+                    "problems": problems,
+                    "gaps": gaps,
+                },
+                indent=2,
+            )
+        )
+
+
+
     if arguments.native:
-        problems, gaps = native(arguments.verbose)
+        problems, gaps, compared = native(arguments.verbose)
+        if arguments.json:
+            record("native", compared, problems, gaps)
+            return 1 if (arguments.check and problems) else 0
         for problem in problems:
             print(f"  problem: {problem}")
         for gap in gaps:
@@ -911,11 +942,19 @@ def main() -> int:
                 "--fixture needs --store: the cells are what the comparison reads"
             )
             return 2
-        problems, gaps = sweep(
+        problems, gaps, compared = sweep(
             pathlib.Path(arguments.fixture),
             pathlib.Path(arguments.store),
             arguments.target,
         )
+        if arguments.json:
+            record(
+                f"cells {arguments.fixture} against {arguments.store}",
+                compared,
+                problems,
+                gaps,
+            )
+            return 1 if (arguments.check and problems) else 0
         print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
         for problem in problems:
             print(f"  problem: {problem}")
