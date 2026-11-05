@@ -36,12 +36,12 @@ pub(in crate::scheduler) struct Demand {
     /// a media request on a worker for every media component, so a request's
     /// first call is checked against its component too. `None` when no
     /// component serves the call or the request holds no placement for it.
-    component: Option<(crate::WorkerGroupId, String)>,
+    component: Option<(crate::ExecutorGroupId, String)>,
     units: u32,
     /// Host task pools this call occupies, each named by its worker and rank
     /// with the number of tasks the call places on it: one per media unit
     /// the rank encodes, one for any other host call.
-    cpu_workers: Vec<(crate::WorkerGroupId, usize, u32)>,
+    cpu_workers: Vec<(crate::ExecutorGroupId, usize, u32)>,
 }
 
 /// What the media calls in flight occupy of their components and of the
@@ -53,12 +53,12 @@ pub(in crate::scheduler) struct Demand {
 #[derive(Default)]
 pub(in crate::scheduler) struct Occupancy {
     /// The request holding each exclusively held component.
-    exclusive: HashMap<(crate::WorkerGroupId, String), RequestId>,
+    exclusive: HashMap<(crate::ExecutorGroupId, String), RequestId>,
     /// Media units in flight on each unit-measured component.
-    units: HashMap<(crate::WorkerGroupId, String), u32>,
+    units: HashMap<(crate::ExecutorGroupId, String), u32>,
     /// Each rank owns one host task pool, so occupancy is counted per rank
     /// of each worker.
-    host: HashMap<(crate::WorkerGroupId, usize), u32>,
+    host: HashMap<(crate::ExecutorGroupId, usize), u32>,
 }
 
 impl Occupancy {
@@ -438,7 +438,7 @@ impl Scheduler {
         request: RequestKey,
         work: CallKind,
         component: &'a str,
-    ) -> Option<(&'a crate::WorkerGroupId, &'a crate::ComponentConfig)> {
+    ) -> Option<(&'a crate::ExecutorGroupId, &'a crate::ComponentConfig)> {
         let owner = self
             .placement
             .affinity
@@ -574,7 +574,7 @@ impl Scheduler {
     ///
     /// Returns `None` for an exclusively held component, and when `worker`
     /// was launched without a component named `component`.
-    fn component_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
+    fn component_units(&self, worker: &crate::ExecutorGroupId, component: &str) -> Option<u32> {
         let config = self.executor.info().component_config(worker, component)?;
         config
             .distribution
@@ -644,7 +644,7 @@ impl Scheduler {
         request: RequestKey,
         component: Option<&str>,
         units: u32,
-    ) -> Vec<(crate::WorkerGroupId, usize, u32)> {
+    ) -> Vec<(crate::ExecutorGroupId, usize, u32)> {
         let Some(component) = component else {
             return Vec::new();
         };
@@ -686,7 +686,7 @@ impl Scheduler {
 
     /// Returns how many tasks the host task pool of each rank of one worker
     /// admits at once.
-    fn host_task_capacity(&self, worker: &crate::WorkerGroupId) -> u32 {
+    fn host_task_capacity(&self, worker: &crate::ExecutorGroupId) -> u32 {
         self.executor
             .info()
             .workers

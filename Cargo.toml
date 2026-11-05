@@ -196,10 +196,6 @@ uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 winnow = "1.0.2"
 
-# The worker's only interface to Python; must match the apache-tvm-ffi
-# release pinned in pyproject.toml.
-tvm-ffi = "=0.1.14-post1"
-
 [workspace.lints.clippy]
 clone_on_ref_ptr = "warn"
 large_futures = "warn"

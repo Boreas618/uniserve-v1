@@ -232,7 +232,7 @@ pub fn release(locations: &[Location]) -> Result<()> {
 mod tests {
     use std::collections::HashSet;
 
-    use ipc::{TransferTransport, WorkerEndpoint};
+    use ipc::{TransferTransport, MainProcessEndpoint};
 
     use super::*;
     use crate::memory::allocation::Backing;
@@ -249,7 +249,7 @@ mod tests {
             capacity,
             EventPool::new(),
             &TransportOptions {
-                source: WorkerEndpoint {
+                source: MainProcessEndpoint {
                     host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
@@ -274,7 +274,7 @@ mod tests {
             Arc::clone(&capacity),
             EventPool::new(),
             &TransportOptions {
-                source: WorkerEndpoint {
+                source: MainProcessEndpoint {
                     host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),
@@ -341,7 +341,7 @@ mod tests {
             capacity,
             EventPool::new(),
             &TransportOptions {
-                source: WorkerEndpoint {
+                source: MainProcessEndpoint {
                     host: "host".into(),
                     address_space: "space".into(),
                     incarnation: "incarnation".into(),

@@ -180,7 +180,7 @@ pub struct BatchCapacity {
 
 impl BatchCapacity {
     /// The capacity the loaded workers were started for.
-    pub fn of(info: &ipc::WorkerInfo) -> Self {
+    pub fn of(info: &ipc::MainProcessInfo) -> Self {
         Self {
             max_batch: info.max_batch_calls,
             max_num_batched_tokens: info.max_batch_tokens,

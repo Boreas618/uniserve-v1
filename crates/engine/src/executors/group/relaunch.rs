@@ -1,24 +1,24 @@
-//! Relaunch: the worker groups replaced together after a failure.
+//! Relaunch: the executor groups replaced together after a failure.
 //!
-//! A relaunch covers one worker group, or every worker group that shares
-//! an expert world: their workers hold that world's communicators and
+//! A relaunch covers one executor group, or every executor group that shares
+//! an expert world: their executors hold that world's communicators and
 //! exchange tokens at every expert layer, so no group can replace its
-//! workers alone. A group that keeps a parked standby promotes it instead
+//! executors alone. A group that keeps a parked standby promotes it instead
 //! (`standby`); every other replacement is a relaunch of the domain here.
 //!
 //! A failure in any group of a domain starts a replacement round: every
-//! group is woken, terminates its workers and arrives with its launch
+//! group is woken, terminates its executors and arrives with its launch
 //! arguments. Arriving never waits, because several groups may be driven by
 //! one scheduler thread. The last group to arrive starts the relaunch on a
 //! thread of its own, which relaunches every group of the domain (an expert
 //! world at a new rendezvous), waits until all of them are ready and posts
-//! each group its workers; each group installs them on its next poll. The
+//! each group its executors; each group installs them on its next poll. The
 //! relaunch takes as long as the ranks need to start, build their models and
 //! capture their graphs, and the scheduler threads keep serving their other
 //! groups meanwhile. When their group arrives, schedulers end their
 //! in-flight token requests on it as migratable, which the daemon submits
-//! again and which wait for the relaunched workers, and fail the others;
-//! they admit work for the group again once it installed its workers. Weights and exclusive storage come back from the
+//! again and which wait for the relaunched executors, and fail the others;
+//! they admit work for the group again once it installed its executors. Weights and exclusive storage come back from the
 //! Storage Server.
 //!
 //! A group that closes during a round cancels its relaunch
@@ -45,11 +45,11 @@ use std::thread::JoinHandle;
 use crate::CommandWaker;
 
 use super::spawn::launch_all;
-use crate::worker::WorkerProcess;
-use crate::worker::WorkerProcessArgs;
-use crate::worker::claims::StorageClaims;
-use crate::worker::processes::Processes;
-use crate::worker::registry::Registry;
+use crate::executors::ExecutorProcess;
+use crate::executors::ExecutorProcessArgs;
+use crate::executors::claims::StorageClaims;
+use crate::executors::processes::Processes;
+use crate::executors::registry::Registry;
 
 /// The groups replaced together, and their replacement rounds.
 pub(super) struct Relaunch {
@@ -71,7 +71,7 @@ struct Standby {
     /// The standby launch each group offered since the last standby world
     /// started; `None` for a group that has not offered. A standby world
     /// starts once every group offered and none runs.
-    offered: Vec<Option<WorkerProcessArgs>>,
+    offered: Vec<Option<ExecutorProcessArgs>>,
     world: StandbyWorld,
 }
 
@@ -81,20 +81,20 @@ enum StandbyWorld {
     /// The standby world starts on a thread of its own.
     Starting(Running),
     /// Every rank of the standby world reported its startup and parked;
-    /// its workers by group.
-    Parked(Vec<Vec<WorkerProcess>>),
+    /// its executors by group.
+    Parked(Vec<Vec<ExecutorProcess>>),
 }
 
 /// The replacement round in progress.
 struct Round {
     /// The failure that started the round; `None` between rounds.
     cause: Option<String>,
-    /// The launch arguments of each group that has terminated its workers
+    /// The launch arguments of each group that has terminated its executors
     /// and arrived; `None` for a group that has not.
-    arrived: Vec<Option<WorkerProcessArgs>>,
-    /// Each group's relaunched workers, or why the relaunch failed, until the
+    arrived: Vec<Option<ExecutorProcessArgs>>,
+    /// Each group's relaunched executors, or why the relaunch failed, until the
     /// group takes them.
-    replacements: Vec<Option<Result<Vec<WorkerProcess>, String>>>,
+    replacements: Vec<Option<Result<Vec<ExecutorProcess>, String>>>,
     /// The relaunch running, from the last arrival until it posts.
     relaunch: Option<Running>,
     /// Set once a group of the domain closes: no relaunch starts or posts
@@ -150,7 +150,7 @@ impl Relaunch {
     /// next standby world. The last offer starts the standby world on a
     /// thread of its own, or, while one runs, once it ends; every offer
     /// returns at once.
-    pub(super) fn offer_standby(self: &Arc<Self>, index: usize, arguments: WorkerProcessArgs) {
+    pub(super) fn offer_standby(self: &Arc<Self>, index: usize, arguments: ExecutorProcessArgs) {
         let mut standby = self.standby();
         if let Some(slot) = standby.offered.get_mut(index) {
             *slot = Some(arguments);
@@ -173,7 +173,7 @@ impl Relaunch {
                 {
                     drop(standby);
                     for mut workers in groups {
-                        workers.iter_mut().for_each(WorkerProcess::terminate);
+                        workers.iter_mut().for_each(ExecutorProcess::terminate);
                     }
                 }
             }
@@ -190,7 +190,7 @@ impl Relaunch {
         {
             return;
         }
-        let arguments: Vec<WorkerProcessArgs> = standby
+        let arguments: Vec<ExecutorProcessArgs> = standby
             .offered
             .iter_mut()
             .filter_map(Option::take)
@@ -219,7 +219,7 @@ impl Relaunch {
     /// starts then.
     fn start_standby_world(
         self: Arc<Self>,
-        mut arguments: Vec<WorkerProcessArgs>,
+        mut arguments: Vec<ExecutorProcessArgs>,
         cancel: Arc<AtomicBool>,
     ) {
         let launched = launch_all(
@@ -244,7 +244,7 @@ impl Relaunch {
             }
             Ok(groups) => {
                 for mut workers in groups {
-                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                    workers.iter_mut().for_each(ExecutorProcess::terminate);
                 }
             }
             Err(error) => tracing::warn!("the standby world could not start: {error:#}"),
@@ -279,13 +279,13 @@ impl Relaunch {
 
     /// Start a replacement round for `cause`, unless one is in progress, and
     /// wake every group.
-    pub(super) fn fail(&self, worker: &str, cause: &anyhow::Error) {
+    pub(super) fn fail(&self, group: &str, cause: &anyhow::Error) {
         let started = {
             let mut round = self.round();
             if round.cause.is_some() {
                 false
             } else {
-                round.cause = Some(format!("worker {worker}: {cause:#}"));
+                round.cause = Some(format!("executor group {group}: {cause:#}"));
                 true
             }
         };
@@ -309,11 +309,11 @@ impl Relaunch {
         self.round().cause.is_some()
     }
 
-    /// Group `index` terminated its workers and arrives with the arguments
+    /// Group `index` terminated its executors and arrives with the arguments
     /// it is relaunched from. The last group to arrive starts the relaunch,
     /// or the promotion of the domain's parked standby world, on a thread
     /// of its own; every arrival returns at once.
-    pub(super) fn arrive(self: &Arc<Self>, index: usize, arguments: WorkerProcessArgs) {
+    pub(super) fn arrive(self: &Arc<Self>, index: usize, arguments: ExecutorProcessArgs) {
         // The standby's lock is taken before the round's, as everywhere
         // both are held: the last arrival takes a parked standby world.
         let mut standby = self.standby();
@@ -328,7 +328,7 @@ impl Relaunch {
             return;
         }
 
-        let arguments: Vec<WorkerProcessArgs> = round.arrived.iter().flatten().cloned().collect();
+        let arguments: Vec<ExecutorProcessArgs> = round.arrived.iter().flatten().cloned().collect();
         let groups = arguments.len();
         let parked = match std::mem::replace(&mut standby.world, StandbyWorld::Absent) {
             StandbyWorld::Parked(world) => Some(world),
@@ -345,7 +345,7 @@ impl Relaunch {
         if parked.is_some() {
             tracing::warn!(groups, "promoting the failure domain's standby world");
         } else {
-            tracing::warn!(groups, "relaunching the failure domain's worker groups");
+            tracing::warn!(groups, "relaunching the failure domain's executor groups");
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let domain = Arc::clone(self);
@@ -373,8 +373,8 @@ impl Relaunch {
     /// relaunches the domain instead.
     fn promote(
         &self,
-        mut world: Vec<Vec<WorkerProcess>>,
-        arguments: Vec<WorkerProcessArgs>,
+        mut world: Vec<Vec<ExecutorProcess>>,
+        arguments: Vec<ExecutorProcessArgs>,
         cancel: Arc<AtomicBool>,
     ) {
         let timeout = arguments
@@ -382,8 +382,8 @@ impl Relaunch {
             .map(|args| args.watchdog_timeout)
             .max()
             .unwrap_or_default();
-        let mut ranks: Vec<WorkerProcess> = world.iter_mut().flat_map(std::mem::take).collect();
-        let promoted = crate::worker::process::promote_all(&mut ranks, timeout);
+        let mut ranks: Vec<ExecutorProcess> = world.iter_mut().flat_map(std::mem::take).collect();
+        let promoted = crate::executors::process::promote_all(&mut ranks, timeout);
         // The ranks return to their groups, in group order.
         let mut ranks = ranks.into_iter();
         for (workers, args) in world.iter_mut().zip(&arguments) {
@@ -396,7 +396,7 @@ impl Relaunch {
                 if round.closing {
                     drop(round);
                     for mut workers in world {
-                        workers.iter_mut().for_each(WorkerProcess::terminate);
+                        workers.iter_mut().for_each(ExecutorProcess::terminate);
                     }
                     return;
                 }
@@ -408,17 +408,17 @@ impl Relaunch {
             Err(error) => {
                 tracing::warn!("the standby world could not be promoted; relaunching: {error:#}");
                 for mut workers in world {
-                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                    workers.iter_mut().for_each(ExecutorProcess::terminate);
                 }
                 self.relaunch(arguments, cancel);
             }
         }
     }
 
-    /// The relaunch thread: relaunch every group and post its workers, then
+    /// The relaunch thread: relaunch every group and post its executors, then
     /// wake every group. A relaunch the domain's closing cancelled posts
     /// nothing and terminates the ranks it started.
-    fn relaunch(&self, mut arguments: Vec<WorkerProcessArgs>, cancel: Arc<AtomicBool>) {
+    fn relaunch(&self, mut arguments: Vec<ExecutorProcessArgs>, cancel: Arc<AtomicBool>) {
         let relaunched = launch_all(
             &mut arguments,
             &self.registry,
@@ -430,9 +430,9 @@ impl Relaunch {
         if round.closing {
             drop(round);
             for mut workers in relaunched.into_iter().flatten() {
-                workers.iter_mut().for_each(WorkerProcess::terminate);
+                workers.iter_mut().for_each(ExecutorProcess::terminate);
             }
-            if let Ok(mut processes) = crate::worker::processes::lock(&self.processes) {
+            if let Ok(mut processes) = crate::executors::processes::lock(&self.processes) {
                 for args in &arguments {
                     let _ = processes.stop(&args.worker_id);
                 }
@@ -445,9 +445,9 @@ impl Relaunch {
         self.wake_all();
     }
 
-    /// Posts each group its relaunched workers, or every group the
+    /// Posts each group its relaunched executors, or every group the
     /// relaunch's failure, and ends the round.
-    fn post(round: &mut Round, relaunched: Result<Vec<Vec<WorkerProcess>>, String>) {
+    fn post(round: &mut Round, relaunched: Result<Vec<Vec<ExecutorProcess>>, String>) {
         match relaunched {
             Ok(groups) => {
                 for (slot, workers) in round.replacements.iter_mut().zip(groups) {
@@ -464,12 +464,12 @@ impl Relaunch {
         round.arrived.iter_mut().for_each(|arrived| *arrived = None);
     }
 
-    /// Group `index`'s relaunched workers, once the round's relaunch
+    /// Group `index`'s relaunched executors, once the round's relaunch
     /// finished.
     pub(super) fn take_replacement(
         &self,
         index: usize,
-    ) -> Option<Result<Vec<WorkerProcess>, String>> {
+    ) -> Option<Result<Vec<ExecutorProcess>, String>> {
         self.round()
             .replacements
             .get_mut(index)
@@ -503,7 +503,7 @@ impl Relaunch {
             }
             StandbyWorld::Parked(world) => {
                 for mut workers in world {
-                    workers.iter_mut().for_each(WorkerProcess::terminate);
+                    workers.iter_mut().for_each(ExecutorProcess::terminate);
                 }
             }
             StandbyWorld::Absent => {}
@@ -515,7 +515,7 @@ impl Relaunch {
             .filter_map(Option::take)
             .collect();
         for mut workers in posted.into_iter().flatten() {
-            workers.iter_mut().for_each(WorkerProcess::terminate);
+            workers.iter_mut().for_each(ExecutorProcess::terminate);
         }
     }
 }

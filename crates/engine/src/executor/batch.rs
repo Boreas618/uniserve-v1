@@ -1,26 +1,26 @@
-//! Logical submissions and their worker-local protocol projection.
+//! Logical submissions and their executor-local protocol projection.
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
 //! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to an
-//! `Executor`. `WorkerExecutor` splits it into one `ExecutionBatch` per target
-//! worker and lowers each with `ExecutionBatch::into_protocol`, which gathers
+//! `Executor`. `Dispatcher` splits it into one `ExecutionBatch` per target
+//! executor and lowers each with `ExecutionBatch::into_protocol`, which gathers
 //! the per-call placement fields into the flat, call-indexed arrays of the
 //! wire `Batch` and the persistent spans of each rank's own buffer pool.
 
-use super::WorkerGroupId;
+use super::ExecutorGroupId;
 use ipc::{
     Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
 };
 use std::collections::BTreeMap;
 
-/// A persistent span in the buffer pool one rank of a worker backs.
+/// A persistent span in the buffer pool one rank of an executor backs.
 ///
-/// Each rank of a worker group has its own pool, so a buffer a worker holds
+/// Each rank of an executor group has its own pool, so a buffer an executor holds
 /// has one span on every rank that backs it, each at that rank's offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankBuffer {
-    /// Rank within the worker group whose pool the span addresses.
+    /// Rank within the executor group whose pool the span addresses.
     pub rank: u32,
     /// The span, in that rank's pool.
     pub allocation: BufferAllocation,
@@ -28,7 +28,7 @@ pub struct RankBuffer {
 
 impl RankBuffer {
     /// Places each of `allocations` at the same offset on every one of a
-    /// worker's `ranks`, for spans taken from a pool whose layout every rank
+    /// executor's `ranks`, for spans taken from a pool whose layout every rank
     /// shares.
     pub fn on_every_rank(allocations: &[BufferAllocation], ranks: u32) -> Vec<Self> {
         allocations
@@ -46,14 +46,14 @@ impl RankBuffer {
 /// Physical placement selected by the scheduler for a call.
 ///
 /// The call itself is the shared IPC `Call`. These fields describe
-/// its worker and allocations, which are gathered into physical batch arrays.
+/// its executor and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestPlacement {
-    /// Worker routing stays outside the call sent across IPC.
-    pub worker: WorkerGroupId,
-    /// Worker-local request row when a replicated route owns its own address
+    /// Executor routing stays outside the call sent across IPC.
+    pub worker: ExecutorGroupId,
+    /// Executor-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
-    /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
+    /// `Dispatcher` applies the override to the `Start` it sends the executor.
     pub request_pool_idx: Option<u32>,
     /// Cache tables and newly acquired units used by this call.
     pub block_tables: Vec<BlockTable>,
@@ -65,27 +65,27 @@ pub struct RequestPlacement {
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
     /// Persistent spans for the call's buffer inputs and outputs, on each
-    /// rank of the worker that backs them. Request retirement retains every
+    /// rank of the executor that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
     /// Pages of the host KV cache the call's new units are filled with
-    /// before its forward, on every rank of its worker group.
+    /// before its forward, on every rank of its executor group.
     pub page_loads: Vec<ipc::PageCopy>,
-    /// For a video request's call, the worker routed to each component that
+    /// For a video request's call, the executor routed to each component that
     /// reads its products, keyed by component name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
     /// Admission fixes a video request's route, so a product is published
     /// only toward the replicas that read it. `None` for calls outside a
     /// video graph, whose readers follow from their call kind
     /// (`generation_consuming_calls`) or their transfer edges.
-    pub readers: Option<BTreeMap<String, WorkerGroupId>>,
+    pub readers: Option<BTreeMap<String, ExecutorGroupId>>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
 ///
-/// `WorkerExecutor` also uses this type for the part of a logical batch routed
-/// to one worker; that part keeps the logical `id`, so completions from every
-/// worker correlate to the same batch.
+/// `Dispatcher` also uses this type for the part of a logical batch routed
+/// to one executor; that part keeps the logical `id`, so completions from every
+/// executor correlate to the same batch.
 #[derive(Debug, Clone)]
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
@@ -98,8 +98,8 @@ pub struct ExecutionBatch {
     pub input_transfers: Vec<TensorExport>,
     /// External cache exports consumed by explicit cache installation.
     ///
-    /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
-    /// the worker-local batches it builds.
+    /// `ExecutionBatch::new` leaves this empty; `Dispatcher` fills it on
+    /// the executor-local batches it builds.
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
@@ -142,14 +142,14 @@ impl PartialEq for ExecutionBatch {
     }
 }
 
-/// Published pages one worker group writes to the host KV cache, for
+/// Published pages one executor group writes to the host KV cache, for
 /// every rank of the group (`PageCopy::rank`), and preempted video
 /// trajectories it writes to its host latent pools (`LatentPageCopy::rank`).
 /// The group runs every call of a batch that carries them; a batch without
 /// calls carries only them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageOffloads {
-    pub worker: WorkerGroupId,
+    pub worker: ExecutorGroupId,
     pub pages: Vec<ipc::PageCopy>,
     pub latents: Vec<ipc::LatentOffload>,
 }
@@ -188,7 +188,7 @@ impl ExecutionBatch {
     /// Drops the calls and `Start` commands of every request key in
     /// `requests`, then the input transfers and cache inputs no remaining call
     /// reads. The requests' `Finish` and `Free` commands stay, since they still
-    /// retire physical state and reader obligations on the workers. Returns the
+    /// retire physical state and reader obligations on the executors. Returns the
     /// removed calls with the placements describing their resources. The batch
     /// may be left with neither calls nor commands; callers decide whether to
     /// discard it.
@@ -233,7 +233,7 @@ impl ExecutionBatch {
     /// `Batch::validate`, which `into_protocol` runs.
     pub fn validate(&self) -> anyhow::Result<()> {
         // A batch of page offloads alone writes the engine's last published
-        // pages to the host KV cache before it closes its workers.
+        // pages to the host KV cache before it closes its executors.
         anyhow::ensure!(
             !self.requests.is_empty() || !self.commands.is_empty() || self.page_offloads.is_some(),
             "logical batch must carry at least one call, command or page write"
@@ -247,9 +247,9 @@ impl ExecutionBatch {
                 "call identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
-            // `WorkerGroupId`'s public field admits any string; only its
+            // `ExecutorGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
-            WorkerGroupId::new(placement.worker.0.clone())?;
+            ExecutorGroupId::new(placement.worker.0.clone())?;
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),
@@ -304,9 +304,9 @@ impl ExecutionBatch {
     /// decode ranges in call order, and rebases each placement's forward
     /// rows onto the call's position in `calls`. The wire batch carries no
     /// buffer spans, because they address each rank's own pool: they are
-    /// returned beside it, in call order, for the worker group to project
-    /// onto its ranks. `collective_seq` is the worker's next collective
-    /// sequence, which `WorkerExecutor` commits only after the worker
+    /// returned beside it, in call order, for the executor group to project
+    /// onto its ranks. `collective_seq` is the executor's next collective
+    /// sequence, which `Dispatcher` commits only after the executor
     /// accepts the batch. Fails when adding the call's position to a forward
     /// row's call index overflows `u32` or `Batch::validate_unplaced`
     /// rejects the result.
@@ -321,13 +321,13 @@ impl ExecutionBatch {
             input_transfers: input_products,
             cache_inputs,
             page_offloads,
-            // The worker-process wire batch carries no columns: they are the
+            // The executor-process wire batch carries no columns: they are the
             // in-process executor's layout, not the wire protocol's.
             columns: _,
             // A media computation's buffers are the in-process executor's, and
             // the wire batch has nowhere to carry them: refusing here is the
             // difference between a media call that stops by name and one a
-            // worker serves with no inputs at all.
+            // executor serves with no inputs at all.
             media,
         } = self;
         anyhow::ensure!(

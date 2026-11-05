@@ -1,13 +1,13 @@
-//! The encoders that may read each video worker's decoded media units
+//! The encoders that may read each video executor's decoded media units
 //! ([`video_unit_codecs`]): a decoded unit is a host product named in one
 //! host's namespace, so a decoder pairs with an encoder replica only when, at
 //! every position of a round, the ranks that decode and encode the unit share a
-//! host. Requests are routed only to admissible pairings, and a decoding worker
+//! host. Requests are routed only to admissible pairings, and a decoding executor
 //! without one is refused at startup.
 
-use crate::executor::WorkerGroupId;
+use crate::executor::ExecutorGroupId;
 
-/// Returns, for each worker that decodes video, the encoder replicas that
+/// Returns, for each executor that decodes video, the encoder replicas that
 /// keep every media unit it decodes on the host that decoded it.
 ///
 /// A decoded media unit is a host product that its encoder reads in place
@@ -17,7 +17,7 @@ use crate::executor::WorkerGroupId;
 /// `p / per_decoder` and encoded by the encoder's rank `p / per_encoder`. A
 /// pairing is admissible when the encoder covers a whole round and those two
 /// ranks share a host at every position. Requests are routed only to
-/// admissible pairings, and a decoding worker without one is refused at
+/// admissible pairings, and a decoding executor without one is refused at
 /// startup, naming the unit and the hosts it would cross.
 ///
 /// Returns an empty map when the routing lacks a video decoding or a video
@@ -25,12 +25,12 @@ use crate::executor::WorkerGroupId;
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     placements: &[(
-        WorkerGroupId,
+        ExecutorGroupId,
         Vec<String>,
         std::collections::BTreeMap<String, crate::ComponentConfig>,
     )],
 ) -> anyhow::Result<
-    std::collections::BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>,
+    std::collections::BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>,
 > {
     let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
@@ -105,13 +105,13 @@ pub(crate) fn video_unit_codecs(
 #[cfg(test)]
 mod tests {
     use super::video_unit_codecs;
-    use crate::WorkerRank;
-    use crate::executor::{ComponentConfig, WorkerGroupId};
+    use crate::ExecutorRank;
+    use crate::executor::{ComponentConfig, ExecutorGroupId};
     use ipc::MediaCall;
     use std::collections::BTreeMap;
 
-    fn rank(host: &str, device: &str) -> WorkerRank {
-        WorkerRank {
+    fn rank(host: &str, device: &str) -> ExecutorRank {
+        ExecutorRank {
             host: host.to_owned(),
             device: device.to_owned(),
         }
@@ -137,12 +137,12 @@ mod tests {
     #[test]
     fn a_decoded_unit_names_the_cpu_workers_that_read_it() {
         // The decoder's product is read by the video codec on the host
-        // worker: the encoder rank dealt this decoder rank's position is
-        // named, none of the decoder's own ranks, and the host worker's
-        // slots follow the model worker's run. A consumer that is not
+        // executor: the encoder rank dealt this decoder rank's position is
+        // named, none of the decoder's own ranks, and the host executor's
+        // slots follow the model executor's run. A consumer that is not
         // distributed reads the whole product on every rank.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
@@ -167,7 +167,7 @@ mod tests {
             2,
             model_components.get("video_decoder"),
         );
-        // Position 2 of the round, two units per CPU worker: CPU worker 1.
+        // Position 2 of the round, two units per CPU executor: CPU executor 1.
         assert_eq!(slots, [transfer.acknowledgment_slot("host", 1)]);
 
         let routing = BTreeMap::from([
@@ -207,13 +207,13 @@ mod tests {
 
     #[test]
     fn a_shared_producer_names_only_the_replica_its_request_was_routed_to() {
-        // A text encoder on its own worker feeds latent preparation on two
+        // A text encoder on its own executor feeds latent preparation on two
         // denoiser replicas. A request routed to flow-1 is read there alone,
         // so its product names flow-1's reading rank and not flow-0's. A
         // component with no route yet (a call placed only when it runs) is
         // read by whichever replica serves it, so each one is named.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let text = BTreeMap::from([(
             "text_encoder".to_owned(),
@@ -235,7 +235,7 @@ mod tests {
         for worker in ["text", "flow-0", "flow-1"] {
             transfer.worker_ranks.insert(worker.to_owned(), 1);
         }
-        let slots = |routed: &BTreeMap<String, WorkerGroupId>| {
+        let slots = |routed: &BTreeMap<String, ExecutorGroupId>| {
             media_consumer_slots(
                 &[MediaCall::LatentPreparation],
                 &routing,
@@ -250,7 +250,7 @@ mod tests {
             )
         };
 
-        let routed = BTreeMap::from([("denoiser".to_owned(), WorkerGroupId("flow-1".to_owned()))]);
+        let routed = BTreeMap::from([("denoiser".to_owned(), ExecutorGroupId("flow-1".to_owned()))]);
         assert_eq!(slots(&routed), [transfer.acknowledgment_slot("flow-1", 0)]);
 
         assert_eq!(
@@ -264,12 +264,12 @@ mod tests {
 
     #[test]
     fn a_decoded_unit_names_only_the_encoder_on_its_route() {
-        // Two hosts each hold a video codec worker. A request decoded on
-        // host 0's model worker is routed to host 0's encoder, so the unit
+        // Two hosts each hold a video codec executor. A request decoded on
+        // host 0's model executor is routed to host 0's encoder, so the unit
         // names that encoder's reading rank; host 1's encoder rank at the
         // same position never reads it.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let model = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
         let encoder = || BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 1))]);
@@ -284,7 +284,7 @@ mod tests {
         }
         let routed = BTreeMap::from([(
             "video_codec".to_owned(),
-            WorkerGroupId("encoder-0".to_owned()),
+            ExecutorGroupId("encoder-0".to_owned()),
         )]);
 
         let slots = media_consumer_slots(
@@ -307,11 +307,11 @@ mod tests {
     /// function itself reads only the ranks' hosts.
     fn pairing(
         placements: &[(
-            &WorkerGroupId,
-            &[WorkerRank],
+            &ExecutorGroupId,
+            &[ExecutorRank],
             &BTreeMap<String, ComponentConfig>,
         )],
-    ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
+    ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>> {
         let placed = placements
             .iter()
             .map(|(id, ranks, components)| {
@@ -327,8 +327,8 @@ mod tests {
 
     #[test]
     fn units_encoded_on_their_own_host_are_admitted() {
-        let model = WorkerGroupId("model".to_owned());
-        let host = WorkerGroupId("host".to_owned());
+        let model = ExecutorGroupId("model".to_owned());
+        let host = ExecutorGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -358,8 +358,8 @@ mod tests {
         // Two units per decoding rank: positions 0 to 3 come from host a's
         // decoders and go to host a's encoders, positions 4 to 7 likewise on
         // host b.
-        let model = WorkerGroupId("model".to_owned());
-        let host = WorkerGroupId("host".to_owned());
+        let model = ExecutorGroupId("model".to_owned());
+        let host = ExecutorGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -399,7 +399,7 @@ mod tests {
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
         // Every video deployment file shipped in `configs/minimax_h3/` must
         // pass the placement checks the engine applies at startup, including
-        // the pairing of every decoding worker with an encoder on its host.
+        // the pairing of every decoding executor with an encoder on its host.
         check_shipped_deployments("minimax_h3");
     }
 
@@ -441,21 +441,21 @@ mod tests {
         // the replica's own host.
         let flows = [
             (
-                WorkerGroupId("flow-a".to_owned()),
+                ExecutorGroupId("flow-a".to_owned()),
                 vec![rank("a", "cuda:0")],
             ),
             (
-                WorkerGroupId("flow-b".to_owned()),
+                ExecutorGroupId("flow-b".to_owned()),
                 vec![rank("b", "cuda:0")],
             ),
         ];
         let encoders = [
             (
-                WorkerGroupId("encoder-a".to_owned()),
+                ExecutorGroupId("encoder-a".to_owned()),
                 vec![rank("a", "cpu")],
             ),
             (
-                WorkerGroupId("encoder-b".to_owned()),
+                ExecutorGroupId("encoder-b".to_owned()),
                 vec![rank("b", "cpu")],
             ),
         ];
@@ -480,7 +480,7 @@ mod tests {
         // even though another replica pairs.
         let error = pairing(&placements[..3]).expect_err("host b has no encoder");
         let message = error.to_string();
-        assert!(message.contains("worker flow-b"), "{message}");
+        assert!(message.contains("executor flow-b"), "{message}");
         assert!(
             message.contains("host b") && message.contains("host a"),
             "{message}"

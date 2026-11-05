@@ -60,7 +60,7 @@ const READ_INTERVAL: Duration = Duration::from_millis(200);
 
 /// One frame for the daemon, with the media whose descriptor travels beside
 /// it. Cloned when a successor takes over a request and the frames the
-/// response has not taken are sent to it again (`specs/worker.md` §7.5.1
+/// response has not taken are sent to it again (`specs/executor.md` §7.5.1
 /// step 4).
 #[derive(Clone)]
 struct Frame {
@@ -92,7 +92,7 @@ struct InFlight {
     consumed: tokio::sync::watch::Sender<u64>,
     /// The connection a successor asked to take this request's event stream
     /// over from a position, which the forwarding task acts on
-    /// (`specs/worker.md` §7.5.1 step 4).
+    /// (`specs/executor.md` §7.5.1 step 4).
     takeover: tokio::sync::watch::Sender<Option<Takeover>>,
 }
 
@@ -240,7 +240,7 @@ impl Routing {
     }
 
     /// The ceilings a policy is instantiated under, from the batch the loaded
-    /// workers were built for (§4.4); `None` on a main process that holds no
+    /// executors were built for (§4.4); `None` on a main process that holds no
     /// scheduler and therefore instantiates no policy.
     fn ceilings(&self) -> Option<scheduling::guest::limits::Limits> {
         self.slots
@@ -453,7 +453,7 @@ impl Routing {
     /// the ranks step together, so it is the largest count any rank reached —
     /// while `batches` counts every batch every rank finalized, which is larger
     /// because a step submits one batch per (phase, component). `tokens` sums
-    /// the tokens the workers' forwards carried, `queue` is each rank's waiting
+    /// the tokens the executors' forwards carried, `queue` is each rank's waiting
     /// depth, and `policy_fuel` and `policy_calls` are the instances' own
     /// figures, summed by [`policy_usage`] (§12). The device's counters and the
     /// allocators' figures are not this thread's: they come with the executor's
@@ -527,7 +527,7 @@ impl Routing {
     /// Moves `request`'s event stream to the connection at `front`, which
     /// takes it over from the position `consumed`: from now on this request
     /// belongs to that connection, so closing another one does not abandon
-    /// it (`specs/worker.md` §7.5.1 step 4).
+    /// it (`specs/executor.md` §7.5.1 step 4).
     fn take_over(&self, request: RequestId, front: usize, consumed: u64) {
         if let Some(in_flight) = crate::lock(&self.requests).get_mut(&request) {
             in_flight.front = front;
@@ -561,7 +561,7 @@ impl Routing {
             .slots
             .iter()
             .find_map(|slot| slot.handle.failure())
-            .unwrap_or_else(|| "a scheduler stopped on a worker failure".to_owned());
+            .unwrap_or_else(|| "a scheduler stopped on an executor failure".to_owned());
         Some(if trial {
             format!("a scheduler of the world on trial stopped: {first}")
         } else {
@@ -1285,11 +1285,11 @@ fn submit_all(
     }
 }
 
-/// Runs the worker hook on every scheduler's workers, all schedulers at once
+/// Runs the executor hook on every scheduler's executors, all schedulers at once
 /// (`engine::HookBarrier`), on a thread of its own so that the daemons'
 /// other commands go on, and answers the daemon `front` with `Hooked`.
 fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
-    tracing::info!(hook = hook.name, "running a worker hook");
+    tracing::info!(hook = hook.name, "running an executor hook");
     let together = crate::HookBarrier::new(routing.slots.len());
     let answers: Vec<_> = routing
         .slots
@@ -1567,7 +1567,7 @@ fn answer_hooked_after(
 ) {
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
-        .name("worker-hook".to_owned())
+        .name("executor-hook".to_owned())
         .spawn(move || {
             let mut results = first;
             let mut error = String::new();
@@ -1590,7 +1590,7 @@ fn answer_hooked_after(
             );
         });
     if let Err(error) = spawned {
-        tracing::error!(%error, "the worker hook thread did not start");
+        tracing::error!(%error, "the executor hook thread did not start");
     }
 }
 
@@ -1737,7 +1737,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
 
 /// Parks every scheduler at once, on a thread of its own, and answers the
 /// daemon `front` with `Parked` and every scheduler's prefix cache index,
-/// each by the worker group whose cache it indexes; every daemon reads the
+/// each by the executor group whose cache it indexes; every daemon reads the
 /// engine's new state.
 fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
     if routing
@@ -1750,7 +1750,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
     tracing::info!("the engine parks");
     // A scheduler that stopped on a fatal failure answers no park: it handed
     // its requests back, or ended them, as it stopped, and its thread then
-    // closes its workers, which the park does not wait for.
+    // closes its executors, which the park does not wait for.
     let answers: Vec<_> = routing
         .slots
         .iter()
@@ -1902,7 +1902,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
 
 /// Commits the engine's world: publishes its pages, retires the worlds `commit` names (the
 /// predecessor), then commits every scheduler, on a thread of its own, and
-/// answers the daemon `front` with `Hooked` and every worker's report.
+/// answers the daemon `front` with `Hooked` and every executor's report.
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
     tracing::info!(
         retire = ?commit.retire,
@@ -1963,7 +1963,7 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
     }
 }
 
-/// Reports every worker group's KV cache as it holds it now, on a thread of
+/// Reports every executor group's KV cache as it holds it now, on a thread of
 /// its own, and answers the daemon `front` with `CacheDescribed`.
 fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
     let answers: Vec<_> = routing
@@ -2035,7 +2035,7 @@ fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
     }
 }
 
-/// One worker group's KV cache on the wire.
+/// One executor group's KV cache on the wire.
 fn wire_cache(group: crate::scheduler::GroupCache) -> wire::CacheSegments {
     wire::CacheSegments {
         worker_group: group.worker_group,
@@ -2269,7 +2269,7 @@ struct Stream {
 /// [`EVENT_WINDOW`] beyond those its consumer took, and keeps the events the
 /// consumer has not taken so that a connection taking the request over from a
 /// position receives them again without the request repeating its work
-/// (`specs/worker.md` §7.5.1 step 4).
+/// (`specs/executor.md` §7.5.1 step 4).
 async fn forward(stream: Stream, routing: &Routing) {
     let Stream {
         id,
@@ -2422,7 +2422,7 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs one engine process: connects to the leader daemon's request socket
 /// at `requests` (`unix:<path>` or `host:port`) as engine `engine`, takes the spec the
-/// daemon welcomes it with, starts the deployment's workers through the
+/// daemon welcomes it with, starts the deployment's executors through the
 /// daemons' process socket at `processes` and its schedulers, reports
 /// itself ready, and serves the daemon's requests until it shuts the engine
 /// down or closes the connection.
@@ -2439,7 +2439,7 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 /// # Errors
 ///
 /// Fails when the daemon cannot be reached or refuses the engine, the spec
-/// does not resolve, the workers or schedulers do not start, or the
+/// does not resolve, the executors or schedulers do not start, or the
 /// connection fails.
 pub fn run_engine(
     requests: &str,
@@ -2574,8 +2574,8 @@ const POLICY_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Runs the daemon's commands for the epoch's policy (§7.3), on a thread of
 /// their own.
 ///
-/// The process interface's connection is shared by the worker groups, so
-/// `worker/processes.rs` files the commands and this thread runs them: a
+/// The process interface's connection is shared by the executor groups, so
+/// `executor/processes.rs` files the commands and this thread runs them: a
 /// precopy takes seconds, and nothing that serves may wait for it.
 ///
 /// `policies` reads the module of a program the daemon names — the node's
@@ -2587,7 +2587,7 @@ fn handle_process_commands(
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
     stop: &AtomicBool,
 ) {
-    let Some(commands) = crate::worker::processes::take_commands() else {
+    let Some(commands) = crate::executors::processes::take_commands() else {
         // One reader per process: a `ProcessLink` of this process already
         // hands the daemon's commands out, and two readers would split them.
         tracing::info!(
@@ -2617,7 +2617,7 @@ fn handle_process_commands(
 
 /// Reports one answer or report of the epoch's policy to the daemons (§7.3).
 fn report_policy(report: proto::process::Report) {
-    if let Err(error) = crate::worker::processes::report(report) {
+    if let Err(error) = crate::executors::processes::report(report) {
         tracing::error!(%error, "a report of the epoch's policy did not reach the daemons");
     }
 }
@@ -2649,8 +2649,8 @@ fn precopied(generation: u64) -> proto::process::Report {
         kind: Some(proto::process::report::Kind::Precopied(
             proto::process::Precopied {
                 generation,
-                // This path shadows nothing: a worker-process executor refuses a shadow batch,
-                // and its update's evidence is the workers' own.
+                // This path shadows nothing: an executor-process executor refuses a shadow batch,
+                // and its update's evidence is the executors' own.
                 uncompared: Vec::new(),
             },
         )),
@@ -3088,7 +3088,7 @@ fn apply_process_command(
     }
 }
 
-/// Every worker group's KV cache as the engine starts with it.
+/// Every executor group's KV cache as the engine starts with it.
 fn describe(schedulers: &[SchedulerHandle]) -> anyhow::Result<Vec<wire::CacheSegments>> {
     let mut segments = Vec::new();
     for scheduler in schedulers {

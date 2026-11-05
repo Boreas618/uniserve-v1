@@ -1,6 +1,6 @@
 //! Metadata extraction for PNG artifacts returned by workers.
 //!
-//! Workers deliver a generated image as a base64-encoded PNG and own its
+//! A main process delivers a generated image as a base64-encoded PNG and own its
 //! encoding. The output path (`image_done_event`) reads the artifact's size
 //! and dimensions from the encoded text without decoding the image.
 
