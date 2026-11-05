@@ -322,13 +322,9 @@ fn run() -> Result<(), String> {
         // set, then the stitcher's ring and hand-off - and the check below is that the driver takes
         // exactly it. The tool prices nothing of its own here: a formula in this file was a second
         // answer to a question `tiled_encode` already answers.
-        let raster_plan = minimax_h3::encoding::video_raster_arena(
-            &config,
-            &extents,
-            columns,
-            latent_frames,
-        )
-        .map_err(|error| error.to_string())?;
+        let raster_plan =
+            minimax_h3::encoding::video_raster_arena(&config, &extents, columns, latent_frames)
+                .map_err(|error| error.to_string())?;
         let raster_bytes = arena_reservation(&raster_plan);
         let stitch = raster_bytes - set_bytes_run;
         match driven {

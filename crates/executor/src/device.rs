@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
-use crate::plan::Bucket;
-use crate::job::{Command, JobQueue, jobs_of, phase_of};
-use crate::runner::{NamedRunner, RunnerId};
 use crate::arena::Pools;
+use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
+use crate::job::{Command, JobQueue, jobs_of, phase_of};
+use crate::plan::Bucket;
+use crate::runner::{NamedRunner, RunnerId};
 use crate::stream::events::{DRAIN_LIMIT, EventPool, JobId, drain_event};
 use crate::{Error, Result};
 
@@ -136,6 +136,11 @@ impl Executor {
     /// issues here books against the same allowance (4.1). `scratch` is the shadow pair's region,
     /// which the engine sized beside the graph pool.
     ///
+    /// `products` is the epoch's one product store, and it is passed in rather than built here:
+    /// a product is produced by one device's runner and read by another's (a prompt's states are
+    /// encoded on the device that holds the text model and read by the denoiser of the request's
+    /// canvas), so there is one store per process and every device attaches the same one.
+    ///
     /// From this call on the calling thread issues no device work for this device: everything
     /// reaches the device through [`Executor::submit`], the program-layer calls, and the storage
     /// owners' recorded jobs.
@@ -166,6 +171,7 @@ impl Executor {
         mut runners: Vec<NamedRunner>,
         events: Arc<EventPool>,
         pools: Arc<std::sync::Mutex<Pools>>,
+        products: Arc<dyn crate::runners::products::Products>,
         scratch: u64,
         shadow: u64,
     ) -> Result<Self> {
@@ -173,8 +179,7 @@ impl Executor {
         // What the device thread is performing, read by whoever reports a stall from another thread
         // (2.4): the thread that is stuck cannot say it, and a stall line naming the stage alone
         // says nothing about which job never answered.
-        let activity: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let activity: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let uncompared = Arc::new(std::sync::Mutex::new(Vec::new()));
         let storage = Arc::new(std::sync::Mutex::new(None));
         let phases: Vec<ipc::PhaseId> = runners
@@ -191,6 +196,7 @@ impl Executor {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
             named.runner.attach_uncompared(Arc::clone(&uncompared));
+            named.runner.attach_products(Arc::clone(&products));
         }
         // What the next generation captures and what it is planned in, stated before the first
         // capture rather than discovered by paying for it: the first generation of an epoch has no
@@ -368,8 +374,12 @@ impl Executor {
     pub fn revert(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
-        self.queue
-            .submit(Command::Revert(generation), &submission, JobKind::Revert, None)?;
+        self.queue.submit(
+            Command::Revert(generation),
+            &submission,
+            JobKind::Revert,
+            None,
+        )?;
         Ok(submission)
     }
 
@@ -859,7 +869,8 @@ impl Device {
         if jobs.is_empty() {
             return Ok(Step::Done(output));
         }
-        self.queue.requeue(entry, Command::Steps { generation, jobs })?;
+        self.queue
+            .requeue(entry, Command::Steps { generation, jobs })?;
         Ok(Step::Requeued)
     }
 
@@ -1011,4 +1022,3 @@ impl Device {
             .ok_or_else(|| Error::Invariant(format!("the device has no runner {}", id.0)))
     }
 }
-
