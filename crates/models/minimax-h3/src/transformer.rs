@@ -611,9 +611,15 @@ impl Transformer {
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
-            // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            // `[rows, heads, width]` contiguous, and a factor row of **rotated pairs, not rotated
+            // channels**. The arena allocates the two tables `[tokens, pairs]` with
+            // `pairs = rope_frequency_dim * 3` (`denoiser.rs`, the two `arena.tensor` calls), which
+            // is half the `rotated` this operator counts: 48 against 96. Stating the channel count
+            // here named a key no launch asks for, and the launch would have refused it - the
+            // descriptor's stride is the table's own (`nn/src/layers/segments.rs`).
+            let pairs = u64::from(rotated) / 2;
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, pairs),
             );
             programs.launch::<ops::segments::VsaZeroPadding>(
                 &tiles_layer.zero_padding_descriptor(dtype),
