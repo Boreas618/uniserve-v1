@@ -724,6 +724,14 @@ impl Scheduler {
         let ready = self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty();
         if !ready {
+            if self.policy_stage.is_some() {
+                tracing::debug!(
+                    batches = self.inflight.pending_batches.len(),
+                    submissions = self.inflight.pending_submissions.len(),
+                    step = self.step,
+                    "a policy stage waits for a boundary with nothing in flight"
+                );
+            }
             return;
         }
         // A command that names the step its expert group agreed applies at that
@@ -755,6 +763,7 @@ impl Scheduler {
         let Some((stage, answer, _at)) = self.policy_stage.take() else {
             return;
         };
+        tracing::info!(stage = stage_name(stage), step = self.step, "a policy stage applies");
         let state = views::trial_state(self, self.step, self.recorder.recorded());
         // The step the stage applied at: the boundary this scheduler reached,
         // where the policy it replaced had decided its last batch. The ranks of
@@ -781,6 +790,7 @@ impl Scheduler {
                 Err(reason)
             }
         };
+        tracing::info!(ok = applied.is_ok(), "a policy stage answered");
         if let Some(answer) = answer {
             answer.send(applied);
         }
