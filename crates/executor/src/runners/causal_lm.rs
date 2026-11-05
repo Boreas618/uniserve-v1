@@ -2097,8 +2097,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     }
                     (table.start_page, out, table.allocated_tokens)
                 });
+        // The indices the sampler will gather, computed the same way `upload` computes them, so a
+        // reading of the line does not have to derive them by hand.
+        let mut gather: Vec<i32> = Vec::new();
+        let _ = gather_indices(
+            &self.staging.batch_rows().logits_rows,
+            &self.staging.batch_rows().query_offsets,
+            tokens,
+            rows,
+            &mut gather,
+        );
+        let gather = spelled(&gather, rows);
         let line = format!(
-            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} \
+            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
              positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
              slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
             bucket.variant,
@@ -2144,9 +2155,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         let Some((_, view)) = planes
             .iter()
-            .find(|(name, _)| name == "prefix_cache.key.values")
+            .find(|(name, _)| name == "key.values")
         else {
-            return "no-key-plane".to_owned();
+            let mut names = String::new();
+            for (name, _) in &planes {
+                if !names.is_empty() {
+                    names.push(',');
+                }
+                names.push_str(name);
+            }
+            return format!("no-key-plane({names})");
         };
         let shape = view.shape().to_vec();
         let (Some(&_columns), Some(&units), Some(&plane_bytes)) =
