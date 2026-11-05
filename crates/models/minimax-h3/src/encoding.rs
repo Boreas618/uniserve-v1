@@ -3390,13 +3390,18 @@ mod tests {
 
     #[test]
     fn the_audio_encoder_table_names_every_parameter() {
-        let table = audio_sources(&crate::audio_vae::tests::audio_config())
-            .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
-        // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
-        // the projection block with the mean convolution: twenty-one parameters, the fused
-        // query-key-value weight, and the three bias windows the checkpoint keeps as three tensors.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 21 + 1 + 3);
+        let config = crate::audio_vae::tests::audio_config();
+        let table = audio_sources(&config).expect("the encoder's parameters");
+        // Stated as the structure it is, because a literal is what went stale: the input pair; each
+        // stage's twenty-one, which is eighteen for the three residual units - two convolutions, two
+        // biases and two Snakes apiece - two for the widening convolution and one for the stage's
+        // Snake; the output Snake and its pair; and the projection block's twenty-one parameters with
+        // the three bias windows the checkpoint keeps as three tensors in place of one fused bias.
+        //
+        // The stage count comes from the configuration, so a checkpoint with a stage fewer keeps this
+        // assertion true instead of turning it red.
+        let stages = config.encoder_rates.len();
+        assert_eq!(table.len(), 2 + stages * 21 + 3 + 21 + 3);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
