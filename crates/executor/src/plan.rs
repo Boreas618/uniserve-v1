@@ -66,6 +66,13 @@ pub enum Variant {
     Denoise,
     /// One clip decoded from latents into a raster.
     Decode,
+    /// One audio track decoded from latents into interleaved PCM.
+    ///
+    /// A variant of its own because the graph is: a clip's decode is a stack of three-dimensional
+    /// convolutions over a voxel grid, and a track's is the vocoder's upsampling and dilated
+    /// one-dimensional convolutions. One bucket cannot hold both, and a capture is keyed by the
+    /// graph a bucket runs.
+    AudioDecode,
 }
 
 impl Variant {
@@ -79,6 +86,7 @@ impl Variant {
             Self::Encode => "encode",
             Self::Denoise => "denoise",
             Self::Decode => "decode",
+            Self::AudioDecode => "audio_decode",
         }
     }
 
@@ -88,7 +96,10 @@ impl Variant {
     /// model has no use for, and a causal-LM runner refuses one by name rather than serving it
     /// from a graph shaped for another computation.
     pub const fn media(self) -> bool {
-        matches!(self, Self::Encode | Self::Denoise | Self::Decode)
+        matches!(
+            self,
+            Self::Encode | Self::Denoise | Self::Decode | Self::AudioDecode
+        )
     }
 
     /// The computation a media call is, and `None` for a call no variant states yet.
@@ -104,9 +115,11 @@ impl Variant {
             | ipc::MediaCall::LatentEncoding => Some(Self::Encode),
             ipc::MediaCall::Denoising => Some(Self::Denoise),
             ipc::MediaCall::ImageDecoding | ipc::MediaCall::VideoDecoding => Some(Self::Decode),
+            // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
+            // file mapped to nothing while the model served video alone.
+            ipc::MediaCall::AudioDecoding => Some(Self::AudioDecode),
             ipc::MediaCall::MediaReading
             | ipc::MediaCall::LatentPreparation
-            | ipc::MediaCall::AudioDecoding
             | ipc::MediaCall::VideoEncoding
             | ipc::MediaCall::AudioEncoding
             | ipc::MediaCall::Muxing => None,
@@ -310,6 +323,20 @@ impl Bucket {
         }
     }
 
+    /// An audio decode bucket: one track of one layout's audio, decoded to interleaved PCM.
+    ///
+    /// The layout is the extent for the reason a denoise step's is: the track's latent shape, and
+    /// the window it decodes to, are the model's own arithmetic, and there is no raster here for a
+    /// clip-shaped extent to name - a track-only decode has no clip at all.
+    pub const fn audio(rows: u32, layout: nn::capability::Layout) -> Self {
+        Self {
+            variant: Variant::AudioDecode,
+            rows,
+            tokens: 0,
+            extent: Extent::Latents(layout),
+        }
+    }
+
     /// A decode bucket: one clip of `frames` raster frames at `height` by `width`.
     pub const fn clip(frames: u32, height: u32, width: u32) -> Self {
         Self {
@@ -376,7 +403,11 @@ impl fmt::Display for Bucket {
                 layout.video.height,
                 layout.video.width,
                 layout.video.channels,
-                if layout.audio.is_some() { " with audio" } else { "" }
+                if layout.audio.is_some() {
+                    " with audio"
+                } else {
+                    ""
+                }
             ),
             Extent::Clip {
                 frames,
@@ -494,7 +525,11 @@ impl Buckets {
     /// This is the set an epoch captures; the bound it implies - the largest decode rows and the
     /// largest prefill tokens - is what the capacity plan and the scheduler admit, so the buckets
     /// come first and the batch bound follows them rather than the other way round.
-    pub fn default_causal_lm(decode: Option<&[u32]>, prefill: Option<&[u32]>, sampled: bool) -> Self {
+    pub fn default_causal_lm(
+        decode: Option<&[u32]>,
+        prefill: Option<&[u32]>,
+        sampled: bool,
+    ) -> Self {
         let decode = decode.map_or_else(decode_catalog, <[u32]>::to_vec);
         let prefill = prefill.map_or_else(prefill_catalog, <[u32]>::to_vec);
         // A zero size names no bucket; a plan that states one is not a plan to refuse, only a size
@@ -547,7 +582,10 @@ impl Buckets {
 
     /// The smallest bucket that holds `shape`, if the set has one.
     pub fn select(&self, shape: &Shape) -> Option<Bucket> {
-        self.ascending.iter().copied().find(|bucket| bucket.holds(shape))
+        self.ascending
+            .iter()
+            .copied()
+            .find(|bucket| bucket.holds(shape))
     }
 
     /// The smallest captured bucket that holds `shape`, or a refusal naming the shape.
@@ -568,19 +606,35 @@ impl Buckets {
         })
     }
 
-    /// The smallest captured bucket that serves a media computation, if the set has one.
+    /// The one bucket a media computation runs in, or `None` when this rank has none for it.
     ///
-    /// A media computation is planned by what it is, not by a `Shape`: a denoising step is served
-    /// only by a graph captured for its own latent layout and a decode only by one captured for its
-    /// own clip, so the extent is matched exactly while rows (and an encode's tokens) are room to
-    /// spare. No bucket serving the computation is the executor stating it does not serve it.
+    /// A media computation is planned by what it is, not by a `Shape`: the variant says which kind of
+    /// graph it needs, and rows and tokens are room to spare.
+    ///
+    /// **An extent a caller states narrows the search; one it cannot state does not.** A caller that
+    /// states a `Latents` layout or a `Clip` is matched to the graph captured for exactly that, so a
+    /// 25-frame step cannot run in a 13-frame graph. `Extent::None` is the caller saying it does not
+    /// know: a denoising step's extent is its latent layout and a decode's is its clip, and the engine
+    /// that forms the computation knows neither until the runner that planned the bucket has
+    /// answered, so requiring agreement would refuse every bucket the runners planned. The bucket's
+    /// own extent is still what decides what the runner does with the batch, and it is copied back
+    /// into the answer.
+    ///
+    /// No bucket serving the computation is the executor stating it does not serve it.
     pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
         let variant = computation.variant()?;
         self.ascending.iter().copied().find(|bucket| {
             bucket.variant == variant
-                && bucket.extent == computation.extent
                 && bucket.rows >= computation.rows
                 && bucket.tokens >= computation.tokens
+                // An extent a caller **states** is matched exactly; `Extent::None` is a caller that
+                // cannot state one, and the bucket's own extent is then the answer. Both halves are
+                // load-bearing: the engine forms every media computation with `None` because it does
+                // not know a denoising step's layout or a decode's clip until the runner answers, and
+                // requiring agreement there refused every bucket the runners planned. A direct caller
+                // that does state one must still be narrowed to the graph captured for it, or a
+                // 25-frame step would run in a 13-frame graph and only the numbers would notice.
+                && (computation.extent == Extent::None || bucket.extent == computation.extent)
         })
     }
 
@@ -647,7 +701,10 @@ mod tests {
             extent: Extent::Latents(layout),
         };
         assert_eq!(denoise.variant(), Some(Variant::Denoise));
-        assert_eq!(plan.select_media(&denoise), Some(Bucket::denoise(1, layout)));
+        assert_eq!(
+            plan.select_media(&denoise),
+            Some(Bucket::denoise(1, layout))
+        );
 
         // One frame more is another graph, and no capture is made in the serving path.
         let other = Computation {
@@ -664,6 +721,21 @@ mod tests {
         };
         assert_eq!(plan.select_media(&other), None);
 
+        // The engine forms every media computation with `Extent::None`: a step's layout is the
+        // model's and a clip is the request's, and the mechanism knows neither until the runner that
+        // planned the bucket answers. The bucket's own extent is the answer then, and this is the
+        // case a served frame dies without - the batch matched no bucket and the only trace was a
+        // debug line.
+        let from_engine = Computation {
+            extent: Extent::None,
+            ..denoise
+        };
+        assert_eq!(
+            plan.select_media(&from_engine),
+            Some(Bucket::denoise(1, layout)),
+            "a computation that cannot state its extent is served by the bucket that states one"
+        );
+
         let clip = Computation {
             call: ipc::MediaCall::VideoDecoding,
             rows: 1,
@@ -676,6 +748,16 @@ mod tests {
         };
         assert_eq!(clip.variant(), Some(Variant::Decode));
         assert_eq!(plan.select_media(&clip), Some(Bucket::clip(48, 768, 1344)));
+
+        // The same for a decode: the engine states `Extent::None` and the clip's bucket answers.
+        let clip_from_engine = Computation {
+            extent: Extent::None,
+            ..clip
+        };
+        assert_eq!(
+            plan.select_media(&clip_from_engine),
+            Some(Bucket::clip(48, 768, 1344))
+        );
 
         // An encode is sized by rows and tokens like a prefill, so it is the one media computation
         // whose extent says nothing.
@@ -751,7 +833,9 @@ mod tests {
         let decode = Bucket::decode(8, Variant::DecodeGreedy);
         assert_eq!(decode.extent, Extent::None);
         assert!(!Variant::DecodeGreedy.media());
-        decode.causal_lm().expect("a decode bucket is a causal-LM bucket");
+        decode
+            .causal_lm()
+            .expect("a decode bucket is a causal-LM bucket");
 
         // Two layouts of one row count are two graphs, and the message states the canvas rather
         // than a token count nobody holds.
@@ -851,7 +935,9 @@ mod tests {
         let buckets = Buckets::causal_lm(&[1, 8], &[128], false);
         // Beyond the largest captured token count of a prefill variant.
         let long = Shape::prefill(1, 129, Variant::PrefillOutput);
-        let error = buckets.require(&long).expect_err("no bucket holds 129 tokens");
+        let error = buckets
+            .require(&long)
+            .expect_err("no bucket holds 129 tokens");
         let message = error.to_string();
         assert!(message.contains(&long.to_string()), "{message}");
         assert!(message.contains("no captured bucket"), "{message}");
@@ -867,7 +953,8 @@ mod tests {
         // the bound it exceeded are both in the one line a deployment's reader has.
         let (rows, tokens) = buckets.bounds();
         assert!(
-            message.contains(&format!("{rows} rows")) && message.contains(&format!("{tokens} tokens")),
+            message.contains(&format!("{rows} rows"))
+                && message.contains(&format!("{tokens} tokens")),
             "the refusal does not state this rank's bound: {message}"
         );
     }
@@ -885,7 +972,10 @@ mod tests {
         let buckets =
             Buckets::for_batch(None, None, 256, 1_000_000, true).expect("the default catalogue");
         let (rows, tokens) = buckets.bounds();
-        assert!((rows, tokens) == (128, 16384), "the catalogue tops at {rows} rows, {tokens} tokens");
+        assert!(
+            (rows, tokens) == (128, 16384),
+            "the catalogue tops at {rows} rows, {tokens} tokens"
+        );
 
         // Every shape inside the bound is planned, at both edges and along each axis: the bound is
         // only useful if it is covered, and a catalogue with a hole inside its own bound would be
@@ -899,17 +989,26 @@ mod tests {
             if variant.is_decode() {
                 for count in 1..=rows {
                     let shape = Shape::decode(count, variant);
-                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                    assert!(
+                        buckets.select(&shape).is_some(),
+                        "{shape} is inside the bound"
+                    );
                 }
             } else {
                 for count in 1..=tokens {
                     let shape = Shape::prefill(1, count, variant);
-                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                    assert!(
+                        buckets.select(&shape).is_some(),
+                        "{shape} is inside the bound"
+                    );
                 }
                 // The widest prefill the bound admits: every row count with the largest chunk.
                 for row in 1..=rows {
                     let shape = Shape::prefill(row, tokens, variant);
-                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                    assert!(
+                        buckets.select(&shape).is_some(),
+                        "{shape} is inside the bound"
+                    );
                 }
             }
             // One past the bound is refused by name, never clamped into the largest bucket.
@@ -1012,8 +1111,8 @@ mod tests {
         // captured with each computation it admits. The count is derived from them here rather than
         // written as a figure: a chunk never holds fewer tokens than its rows, so two catalogue
         // entries can name one bucket and the set holds it once.
-        let catalog = Buckets::for_batch(None, None, u32::MAX, u32::MAX, true)
-            .expect("the catalogues");
+        let catalog =
+            Buckets::for_batch(None, None, u32::MAX, u32::MAX, true).expect("the catalogues");
         let (rows, tokens) = (decode_catalog(), prefill_catalog());
         let mut stated: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
         for &row in &rows {
@@ -1031,7 +1130,10 @@ mod tests {
             "one bucket per (variant, rows, tokens) the catalogues state"
         );
         for bucket in &stated {
-            assert!(catalog.contains(bucket), "{bucket} is in the catalog's plan");
+            assert!(
+                catalog.contains(bucket),
+                "{bucket} is in the catalog's plan"
+            );
         }
     }
 
@@ -1039,17 +1141,24 @@ mod tests {
     /// can fill, and a batch of the bound's own shape is still served.
     #[test]
     fn the_catalog_is_clamped_to_the_batch_bound() {
-        let buckets = Buckets::for_batch(None, None, 8, 64, false).expect("a plan within the catalog");
+        let buckets =
+            Buckets::for_batch(None, None, 8, 64, false).expect("a plan within the catalog");
         for bucket in buckets.iter() {
             assert!(bucket.rows <= 8, "{bucket} is wider than the batch bound");
-            assert!(bucket.tokens <= 64, "{bucket} is longer than the batch bound");
+            assert!(
+                bucket.tokens <= 64,
+                "{bucket} is longer than the batch bound"
+            );
         }
         let full = Shape {
             rows: 8,
             tokens: 64,
             variant: Variant::PrefillWrite,
         };
-        assert!(buckets.select(&full).is_some(), "the bound's own shape is served");
+        assert!(
+            buckets.select(&full).is_some(),
+            "the bound's own shape is served"
+        );
         // Every decode row up to the bound is served by its own bucket.
         for rows in 1..=8 {
             let shape = Shape {
@@ -1095,12 +1204,16 @@ mod tests {
         let rows = [4_u32];
         let greedy = Buckets::for_batch(Some(&rows), None, 8, 64, false).expect("a plan");
         let sampled = Buckets::for_batch(Some(&rows), None, 8, 64, true).expect("a plan");
-        assert!(!greedy
-            .iter()
-            .any(|bucket| bucket.variant == Variant::DecodeSampled));
-        assert!(sampled
-            .iter()
-            .any(|bucket| bucket.variant == Variant::DecodeSampled));
+        assert!(
+            !greedy
+                .iter()
+                .any(|bucket| bucket.variant == Variant::DecodeSampled)
+        );
+        assert!(
+            sampled
+                .iter()
+                .any(|bucket| bucket.variant == Variant::DecodeSampled)
+        );
         // Both sets serve the same decode shape, greedily.
         let shape = Shape {
             rows: 4,
@@ -1121,6 +1234,9 @@ mod tests {
         let catalog = Buckets::default_causal_lm(None, None, false);
         let (rows, tokens) = catalog.bounds();
         assert_eq!(rows, decode_catalog().into_iter().max().expect("a catalog"));
-        assert_eq!(tokens, prefill_catalog().into_iter().max().expect("a catalog"));
+        assert_eq!(
+            tokens,
+            prefill_catalog().into_iter().max().expect("a catalog")
+        );
     }
 }

@@ -1990,6 +1990,10 @@ pub(crate) struct Replica {
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
     standby_starting: tokio::sync::Mutex<()>,
+    /// Whether this daemon handed the engine to a successor (§7.5.1): the
+    /// successor owns its life then, and a watch that sees its client go away
+    /// must not relaunch it.
+    pub(crate) handed_over: AtomicBool,
 }
 
 impl Replica {
@@ -2025,6 +2029,7 @@ impl Replica {
             manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
             standby: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
+            handed_over: AtomicBool::new(false),
         });
         hold.serve(client);
         replica
@@ -2757,6 +2762,17 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             return;
         };
         let reason = lost(states, &replica).await;
+        // A handover moves the engine, its client and the responses in flight to the
+        // successor: this daemon's watch sees that client go away by design, and a
+        // relaunch here would start a second engine for a deployment another daemon
+        // serves.
+        if replica.handed_over.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::info!(
+                %reason,
+                "this daemon handed its engine over; the successor owns it, so it is not relaunched here"
+            );
+            return;
+        }
         let _replacing = replica.replacing.lock().await;
         let Some(lost_client) = client.upgrade() else {
             return;

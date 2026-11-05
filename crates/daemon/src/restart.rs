@@ -430,6 +430,13 @@ impl Restarter {
         // interface go away, and the successor had by then neither resumed it nor claimed the
         // deployment.
         self.handed_over.store(true, Ordering::Release);
+        // From here the successor owns these engines: this daemon's watch sees their clients
+        // go away with the handover and must not read that as a loss.
+        for replica in leader.replicas() {
+            replica
+                .handed_over
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         for replica in handoff {
             replica.client.attach(&requests);
         }

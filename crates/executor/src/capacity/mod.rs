@@ -18,7 +18,7 @@ mod plan;
 
 pub use plan::{
     CacheGeometry, CapacityRequest, MediaFacts, Plan, RankFacts, Report, TokenFacts, TokenPlan,
-    plan_rank, token_plan,
+    plan_media, plan_rank, token_plan,
 };
 
 use ipc::Call;
