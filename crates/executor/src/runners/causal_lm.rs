@@ -2745,6 +2745,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             if bytes == 0 || token_elements == 0 {
                 continue;
             }
+            // A page outside this layer's plane is stated and not read: a device copy from past an
+            // allocation leaves the driver's error stuck to the stream, and the next batch would
+            // fail on a diagnosis.
+            let pages = plane.key.shape.dim(0);
+            if page >= pages {
+                out.push_str(&format!(" layer{layer}=(page {page} of {pages})"));
+                continue;
+            }
             out.push_str(&format!(" layer{layer}="));
             for (name, view) in [("k", plane.key), ("v", plane.value)] {
                 let start = view.ptr.address()
