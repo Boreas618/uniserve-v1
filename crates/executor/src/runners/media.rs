@@ -130,7 +130,7 @@ impl HostAction for MediaWork {
     type Output = Option<Vec<u8>>;
 
     fn run(&self) -> Result<Self::Output> {
-        match self.stage {
+        let outcome = match self.stage {
             Stage::Unit {
                 frames,
                 height,
@@ -152,11 +152,21 @@ impl HostAction for MediaWork {
                 Ok(None)
             }
             Stage::Mux => Ok(Some(self.output.finish(self.request)?)),
+        };
+        if outcome.is_err() {
+            // A stage that fails ends its request short of an artifact, so the assembly this
+            // request opened is closed here: it lives in `crates/media`'s runner, one mux session
+            // per request, and nothing else reaches it - the engine aborts the request and its
+            // calls are never served again, so a session left open would hold a writer until the
+            // stage is dropped. `discard` is a no-op for a request whose assembly never opened.
+            self.output.discard(self.request);
         }
+        outcome
     }
 
     /// Nothing to release: the bytes are this action's own host buffer, and dropping the action
-    /// returns them. `stage` resolves them to the encoder's copy inside `run`.
+    /// returns them. `stage` resolves them to the encoder's copy inside `run`. An assembly the
+    /// action opened and did not finish is closed by `run`'s error path.
     fn release(&self) -> Result<()> {
         Ok(())
     }
@@ -335,7 +345,9 @@ impl Output {
         Ok(self.media.finish_mux(request_id(request))?)
     }
 
-    /// Drops `request`'s assembly, for a request that ends before it could be finished.
+    /// Drops `request`'s assembly, for a request that ends before it could be finished: a stage
+    /// that fails calls this from `MediaWork::run`, so a failed call leaves no open mux session
+    /// behind. Idempotent: `close_mux` removes a session if one exists.
     pub fn discard(&self, request: RequestKey) {
         self.opened
             .lock()
