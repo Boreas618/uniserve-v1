@@ -2624,6 +2624,75 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+    /// Every program the video encoder's own `forward` launches is a program its walk states.
+    ///
+    /// This is the direction that has cost runs five times: a launch the walk does not name, which
+    /// `key_coverage` cannot see (a row neither the fixture nor the store holds answers "every key is
+    /// covered"). It runs device-free and shardless — a shapes-only loader, a recording forward and a
+    /// null-backed arena — so it holds wherever `cargo test` does, and it is what found the residual
+    /// adds stating an element count where the launch passes the level's width.
+    #[test]
+    fn every_program_the_video_encoder_launches_is_one_the_walk_states() {
+        struct Rows(Vec<(String, String)>);
+
+        impl ops::capture::Sink for Rows {
+            fn launched(&mut self, operator: &'static str, key: &str) {
+                self.0.push((operator.to_owned(), key.to_owned()));
+            }
+        }
+
+        let config = crate::video_vae::tests::video_config();
+        let mut loader = nn::weights::WeightLoader::shapes(nn::DType::F32);
+        let encoder = VideoEncoder::load(&config, &mut loader).expect("the encoder's shapes");
+        let arena = nn::forward::Arena::new(nn::TensorView::new(
+            nn::DevicePtr::new(0),
+            nn::DType::F32,
+            nn::Shape::new(&[1]),
+        )
+        .ptr, 1 << 40);
+        let forward = nn::Forward::recording(&arena);
+
+        let (height, width) = (832u32, 480u32);
+        let pixels = arena
+            .tensor(
+                nn::DType::F32,
+                nn::Shape::new(&[1, 3, 1, u64::from(height), u64::from(width)]),
+            )
+            .expect("a still");
+        let latency = encoder.latent_frames(1).expect("one latent frame");
+        let side = u64::from(config.spatial_compression());
+        let moments = arena
+            .tensor(
+                nn::DType::F32,
+                nn::Shape::new(&[
+                    2 * u64::from(config.latent_channels),
+                    u64::from(latency),
+                    u64::from(height) / side,
+                    u64::from(width) / side,
+                ]),
+            )
+            .expect("the moments");
+
+        let mut rows = Rows(Vec::new());
+        ops::capture::set_sink(Some(&mut rows));
+        let run = encoder.encode(&forward, pixels, moments);
+        ops::capture::set_sink(None);
+        run.expect("a recording forward launches nothing");
+
+        let stated: std::collections::BTreeSet<(String, String)> =
+            VideoEncoder::programs(&config, &[(height, width)])
+                .expect("the walk")
+                .into_iter()
+                .collect();
+        let missing: Vec<&(String, String)> =
+            rows.0.iter().filter(|row| !stated.contains(*row)).collect();
+        assert!(
+            missing.is_empty(),
+            "the walk does not state these launches: {missing:?}"
+        );
+        assert!(!rows.0.is_empty(), "the forward launched nothing");
+    }
+
     #[test]
     fn the_audio_encoders_keys_are_the_encoders_half_and_name_every_part() {
         let config = crate::audio_vae::tests::audio_config();
