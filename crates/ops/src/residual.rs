@@ -761,6 +761,24 @@ fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
     // of it, and a keyed one states a row set per request duration.
     args.target.require_rank(ScaledAdd::NAME, 2)?;
     args.source.require_rank(ScaledAdd::NAME, 2)?;
+    // The two element types are the descriptor's, and the operands must be the types it names: the
+    // key states them because a call may mix them on purpose, and a kernel compiled for one pair
+    // reads another pair's bytes at the wrong width. Losing this check is what a `columns` field
+    // took with it when it left the descriptor.
+    for (operand, named, role) in [
+        (args.target, descriptor.target, "target"),
+        (args.source, descriptor.source, "source"),
+    ] {
+        if operand.dtype != named {
+            return Err(Error::argument(
+                ScaledAdd::NAME,
+                format!(
+                    "the {role} is {} and the descriptor names {named}",
+                    operand.dtype
+                ),
+            ));
+        }
+    }
     if args.source.shape != args.target.shape {
         return Err(Error::argument(
             ScaledAdd::NAME,
@@ -818,9 +836,12 @@ mod scaled_add_tests {
 
     #[test]
     fn the_key_names_both_element_types_because_a_call_may_mix_them() {
+        // The width left the key with the field: a blend's width is a request's duration, so a keyed
+        // one states rows for the clips a walk happened to name and leaves every other length with
+        // no kernel. What remains is the pair of element types and the block.
         assert_eq!(
             descriptor(DType::BF16, DType::F32).to_string(),
-            "target_bf16_source_f32_columns_64_block_1024"
+            "target_bf16_source_f32_block_1024"
         );
     }
 
