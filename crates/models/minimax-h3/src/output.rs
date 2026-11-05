@@ -513,7 +513,7 @@ impl VideoPostprocessor {
                 "a timeline is {body} * n + {tail} frames and {frames} is shorter than one clip"
             )));
         }
-        if (frames - tail) % body != 0 {
+        if !(frames - tail).is_multiple_of(body) {
             return Err(refuse(format!(
                 "a timeline is {body} * n + {tail} frames and {frames} has {} frame(s) over",
                 (frames - tail) % body
