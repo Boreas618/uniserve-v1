@@ -376,6 +376,32 @@ pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
 }
 
+/// The storage a rank reserves out of its device's grant before a cache unit is fitted: the
+/// graph range - one pool per generation a preparation may hold - and the scratch region beside
+/// it.
+///
+/// One function for one figure: a caller that reserved the graph range alone would fit units into
+/// the bytes the shadow will take, and the rank would map past the device at its first shadow after
+/// the model load. `eager_prepare` states that a preparation frees its pool rather than keeping a
+/// second one, which is the graph policy `graph_storage_bytes` already answers.
+pub fn reserved_bytes(device_total_bytes: u64, prepares: bool) -> u64 {
+    let total = device_total_bytes as i64;
+    graph_storage_bytes(total, prepares, false) + graph_scratch_bytes(total)
+}
+
+/// Bytes of the scratch region a rank reserves beside the graph range: the
+/// shadow a replaced operator is executed in, one eighth of one graph pool.
+///
+/// The scratch pool holds this and, for a model that keeps a state per unit, the
+/// snapshot `design 4.5` copies units through. Both are reserved out of the
+/// device's grant before a cache unit is fitted, because the pools that map them
+/// are reserved at spawn: a plan that spent those bytes on units would leave the
+/// rank to map past the device at its first shadow - after the model load and
+/// after every module installed.
+pub fn graph_scratch_bytes(total_device_bytes: i64) -> u64 {
+    graph_storage_budget_bytes(total_device_bytes) / 8
+}
+
 /// The graph storage a device must budget for the generations the deployment
 /// keeps resident: one pool per generation a preparation can hold.
 ///

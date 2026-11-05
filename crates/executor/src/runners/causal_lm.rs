@@ -2037,10 +2037,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.model
             .logits(forward, gathered, logits)
             .map_err(Error::from)?;
+        // The sampler reads its request state per row: `parameters` is `[rows, PARAMETER_COLUMNS]`
+        // and `slots` is `[rows]`. A bucket narrower than the largest reads its own rows from the
+        // column's head - a captured graph addresses the column's base pointer, so the view states
+        // the bucket's shape and not the column's flat extent, which is the largest bucket's.
+        let parameters = self
+            .columns
+            .parameters
+            .shaped(&[rows, u64::from(ops::sampler::PARAMETER_COLUMNS)]);
+        let slots = self.columns.slots.shaped(&[rows]);
         let state = SamplerState {
             counts: sampling.counts,
-            parameters: self.columns.parameters.device,
-            slots: self.columns.slots.device,
+            parameters,
+            slots,
             extras: None,
         };
         let samples = Samples::reserve(arena, DType::I32, rows, false)?;
@@ -2057,7 +2066,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         } else {
             sampling
                 .sampler
-                .forward(forward, logits, &state, self.columns.draws.device, &samples)
+                .forward(
+                    forward,
+                    logits,
+                    &state,
+                    self.columns.draws.shaped(&[rows]),
+                    &samples,
+                )
                 .map_err(Error::from)?;
         }
         // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
@@ -2870,6 +2885,35 @@ mod sampled_output_tests {
             .expect_err("no id was sampled for row 0");
         calls_output(&[5], &[0], &batch, &[CallId(1)], &[])
             .expect_err("one call, no trajectory position");
+    }
+
+
+    /// A sampling bucket narrower than the largest reads its own rows: the state the sampler is
+    /// handed is `[rows, PARAMETER_COLUMNS]` over the column's head, and `[rows]` for its slots and
+    /// draws, never the column's flat extent. A captured graph addresses the column's base pointer,
+    /// so the two views differ in shape alone - and a flat one states the largest bucket's width,
+    /// which the sampler refuses by the shape it expected.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_narrower_sampling_bucket_reads_its_own_rows() {
+        let columns = u64::from(ops::sampler::PARAMETER_COLUMNS);
+        let largest = 8;
+        let narrow = 2;
+        let parameters = Column::new(platform::DeviceId(0), DType::F32, largest * columns)
+            .expect("the parameters column");
+        assert_eq!(parameters.device.shape.dims(), &[largest * columns]);
+        let view = parameters.shaped(&[narrow, columns]);
+        assert_eq!(view.shape.dims(), &[narrow, columns]);
+        assert_eq!(
+            view.ptr.address(),
+            parameters.device.ptr.address(),
+            "the bucket's view names the column's own base, which is what a captured graph addresses"
+        );
+        let slots =
+            Column::new(platform::DeviceId(0), DType::I32, largest).expect("the slots column");
+        assert_eq!(slots.shaped(&[narrow]).shape.dims(), &[narrow]);
+        let draws = Column::new(platform::DeviceId(0), DType::F32, largest).expect("the draws column");
+        assert_eq!(draws.shaped(&[narrow]).shape.dims(), &[narrow]);
     }
 
 }
