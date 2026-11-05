@@ -514,7 +514,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     // 5. The arena: `video_arena` is the plan the runner reserves by, and this harness uses it rather
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
-    let plan = video_arena(&config.video_vae, &canvas)?;
+    let plan = video_arena(&config.video_vae, &canvas, nn::DType::F32)?;
     let mut planned = 0_u64;
     for buffer in &plan {
         planned += buffer.elements * buffer.width()?;
