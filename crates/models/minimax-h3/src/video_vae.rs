@@ -505,7 +505,10 @@ pub struct VideoDecoder {
     output: Linear,
     rotary: Rotary,
     place: Rows,
-    /// The index table that places each voxel row of the stream.
+    /// The index table that places each voxel row of the stream: for every latent voxel of one clip, the
+    /// packed row of the patch it lies in, under **this deployment's** packing. A sparse deployment orders
+    /// its rows by spatiotemporal tile, so the table differs from the dense one and is the model's own
+    /// constant, published at load by [`pack_voxel_rows`].
     voxel_rows: Weight,
     /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of the canvas rather than
     /// a checkpoint tensor. The dense attention's flash backend serves the packed form only — it hands
@@ -535,9 +538,9 @@ pub struct VideoDecoder {
 /// because that is what the checkpoint's `video_vae.voxel_rows` holds and all a decode ever reads; how
 /// many clips a request has is the runner's question and the splice's, not this table's.
 ///
-/// Nothing calls it at runtime: the checkpoint publishes the table, and this is the arithmetic that says
-/// what the published table must contain, checked by [`the_decoder_tables_name_one_voxel_and_one_position_per_row`].
-#[cfg(test)]
+/// The checkpoint holds no such table — its `video_vae` tensors are the weights and the state tables —
+/// so the model publishes this one as a constant of the canvas at load ([`pack_voxel_rows`]), and it is
+/// the arithmetic below rather than a stored tensor that decides what the table says.
 fn voxel_rows(
     config: &VideoVaeConfig,
     attention: AttentionKind,
@@ -571,6 +574,40 @@ fn voxel_rows(
     Ok(rows)
 }
 
+/// Publish the one voxel-row table a deployment's decode reads, encoded as the gather's `i32` indices.
+///
+/// The packed order is the deployment's: dense packing reads the raster order, a sparse deployment reads
+/// spatiotemporal tiles, so a decoder handed a sparsely packed latent cannot be read through the dense
+/// table — the entries would name another voxel's row. One table per decoder, built from the packing this
+/// decoder serves; [`voxel_rows`] is the arithmetic and this is only its encoding.
+fn pack_voxel_rows(
+    loader: &mut WeightLoader,
+    config: &VideoVaeConfig,
+    attention: AttentionKind,
+    canvas: Canvas,
+) -> Result<Weight> {
+    let rows = voxel_rows(config, attention, canvas.height, canvas.width)?;
+    if rows.len() as u64 != canvas.voxels() {
+        return Err(Error::config(format!(
+            "the decoder's voxel table names {} rows for a clip of {} voxels",
+            rows.len(),
+            canvas.voxels()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(rows.len() * 4);
+    for row in &rows {
+        let row = i32::try_from(*row)
+            .map_err(|_| Error::config("a packed row wider than an index".to_owned()))?;
+        bytes.extend_from_slice(&row.to_le_bytes());
+    }
+    Ok(loader.constant(
+        "video_vae.voxel_rows",
+        DType::I32,
+        Shape::new(&[rows.len() as u64]),
+        &bytes,
+    )?)
+}
+
 /// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
 ///
 /// The grid's tiles are uniform where the canvas is at least one tile wide, so this is the checkpoint's
@@ -589,9 +626,9 @@ fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) 
 ///
 /// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the latent
 /// raster, which every other tile's positions are a slice of because the tiles are uniform. There is one
-/// table and not two: the clip's voxel rows are the checkpoint's own `video_vae.voxel_rows`, a constant
-/// read once at load ([`voxel_rows`] states what it must contain), so a per-layout copy of them would be
-/// a second source of truth for a value that never varies with the layout.
+/// table and not two: the clip's voxel rows are published once at load by [`pack_voxel_rows`] from the
+/// deployment's own packing, so a per-layout copy of them would be a second source of truth for a value
+/// that never varies with the layout.
 pub(crate) fn table_specs(
     config: &VideoVaeConfig,
     latent_height: u32,
@@ -840,17 +877,6 @@ impl VideoDecoder {
         input: Linear,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
-        // The clip's rows are gathered by the checkpoint's own `video_vae.voxel_rows`, which names the
-        // dense packed order; a denoiser that packed sparsely would hand rows in another order and the
-        // gather would read a neighbouring voxel's channel. Sparse serving is refused before this block
-        // is reached, and it is refused here too rather than read through the wrong table.
-        if attention != AttentionKind::Dense {
-            return Err(Error::config(
-                "the video decoder's voxel rows are the checkpoint's dense packed order, so a \
-                 sparsely packed denoiser cannot hand it latents"
-                    .to_owned(),
-            ));
-        }
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
@@ -1004,7 +1030,7 @@ impl VideoDecoder {
             output,
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
-            voxel_rows: indices(loader, "video_vae.voxel_rows", 0, canvas.voxels() as u32)?,
+            voxel_rows: pack_voxel_rows(loader, config, attention, canvas)?,
             offsets: {
                 // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
                 // created once with the weights and read by every clip's attention launch.
@@ -1508,6 +1534,59 @@ pub(crate) mod tests {
             }
             self
         }
+    }
+
+    #[test]
+    fn the_voxel_table_names_packed_rows_and_follows_the_deployment_packing() {
+        let config = video_config();
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (7, 4),
+            width: 1344,
+            height: 768,
+        };
+        let raster = crate::packing::latent_raster(&canvas).expect("raster");
+        let clip = Canvas::clip(&config, raster.height, raster.width);
+        let side = crate::packing::PATCH_SIDE;
+        let sparse = AttentionKind::sparse(64, 0.8, None).expect("a sparse kind");
+
+        // The gather writes `destination[indices[voxel]] = source[voxel]`, so every entry must name a
+        // packed row of the clip. A table copied from the voxel indices runs to four times that bound
+        // and scatters the clip's tokens past the end of the stream - which is why this is asserted
+        // rather than assumed.
+        for attention in [AttentionKind::Dense, sparse] {
+            let rows =
+                voxel_rows(&config, attention, raster.height, raster.width).expect("voxel rows");
+            let packed = clip.rows();
+            assert_eq!(rows.len() as u64, clip.voxels());
+            assert!(
+                rows.iter().all(|row| u64::from(*row) < packed),
+                "a table entry names a row outside the clip's {packed} packed rows"
+            );
+            // Each video row is named once per voxel of its own patch, so the counts are the patch's
+            // area and nothing else: no row is skipped and none is named twice as often. The register
+            // and tail rows of the clip are not voxels and are named by no entry.
+            let mut counts = vec![0_u32; clip.rows() as usize];
+            for row in &rows {
+                counts[*row as usize] += 1;
+            }
+            let video = (clip.frames * raster.patch_rows()) as usize;
+            assert!(
+                counts[..video].iter().all(|count| *count == side * side),
+                "{attention:?} names the clip's video rows unevenly"
+            );
+            assert!(
+                counts[video..].iter().all(|count| *count == 0),
+                "{attention:?} names a register or tail row with a voxel"
+            );
+        }
+
+        // The deployments do not read the same table: a sparse packing orders the rows by tile, so a
+        // decoder built for one packing cannot be read through the other's.
+        let dense = voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width)
+            .expect("the dense table");
+        let tiled = voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
+        assert_ne!(dense, tiled, "{dense:?}");
     }
 
     #[test]
