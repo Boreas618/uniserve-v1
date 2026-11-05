@@ -26,7 +26,9 @@ use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::batch::{
+    Batch, BatchColumns, BatchId, BatchOutput, CallId, CallOutput, Job, Jobs, RowState,
+};
 use crate::plan::{Bucket, Buckets, Shape};
 /// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
 ///
@@ -1063,6 +1065,21 @@ pub trait KvProvider: Send + Sync {
     ) -> Result<(TensorView, Vec<nn::KvPlanes>)>;
 }
 
+/// A batch's cache installation, carried from the submitting thread to the device thread.
+///
+/// The `block_tables` are the rows the gather reads and the `units` the pages the mechanism
+/// allocated this batch; both are issued on the runner's stream by the replay, which is the one
+/// thread that may issue there (2.4).
+#[derive(Debug)]
+struct PendingInstall {
+    /// The batch the rows belong to: a replay of any other batch must not install them.
+    batch: BatchId,
+    /// The batch's slot rows, `[rows, max_pages]` in the cache's pooled table.
+    tables: Vec<ipc::BlockTable>,
+    /// The units the mechanism allocated for this batch's pages, with their copies.
+    units: Vec<ipc::CacheUnitAllocation>,
+}
+
 /// A causal language model's runner: one block's decode and prefill phases.
 pub struct CausalLmRunner<M: CausalLm> {
     /// The executor's name for this runner.
@@ -1120,6 +1137,15 @@ pub struct CausalLmRunner<M: CausalLm> {
     kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
+    /// The batch's cache rows and page copies, staged at submit and performed by the device
+    /// thread before the replay reads them (2.4).
+    ///
+    /// A table's installation is work on this runner's stream exactly as a column's upload is, and
+    /// only the device thread issues there. Installed from the submitting thread it races the
+    /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
+    /// Submit therefore states which batch the rows belong to, and a replay of another batch
+    /// refuses rather than installing the wrong request's pages.
+    pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
     /// by the device thread, which is the only thread that may issue to this runner's stream.
@@ -1236,6 +1262,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            pending_install: None,
             pending_dump: None,
             last_prefill: None,
             enqueue_ms: 0.0,
@@ -1364,16 +1391,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // rows: a warm pose has no request rows, so it is made here rather than in the capture.
         refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))
             .map_err(refused)?;
-        // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
-        // pooled table, so the row must state the request's own pages before the replay, and the
-        // table states where the row begins (`start_page`) and how far it runs.
-        self.kv.install_block_tables(&batch.block_tables, &self.stream)?;
-        // Then what the mechanism allocated for this batch's pages, on the same stream: the units
-        // must be this cache's before anything is copied into them, and the copies must be in place
-        // when the graph reads those pages. A batch that cannot be applied is refused at submit -
-        // the same place, and with the same kind of error, as any other batch this device cannot
-        // serve.
-        self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
+        // The batch's slot rows and page copies are the replay's first work, not this thread's:
+        // both are operations on this runner's stream and only the device thread issues there
+        // (2.4). A table installed from here races the previous batch's replay, and the pages this
+        // batch writes land in the row that batch is reading - which reads as a model defect and is
+        // a cache one. They travel with the job like the staged columns do.
+        self.pending_install = Some(PendingInstall {
+            batch: batch.id,
+            tables: batch.block_tables.clone(),
+            units: batch.cache_units.clone(),
+        });
         // What a batch says about where its tokens read and write their cache, when a deployment
         // asks for it: the addresses a prefill wrote and a decode reads are compared from these
         // numbers rather than guessed from a continuation's text.
@@ -1575,10 +1602,15 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     "a bucket is replayed"
                 );
                 let stream = self.stream.clone();
-                // The batch's columns are uploaded here, on the device thread, before the graph
-                // reads them: the scheduler hands over a `Batch` and the device thread stages and
-                // uploads it, so a replay that skipped the upload would serve the pose the bucket
-                // was captured with.
+                // The batch's cache rows and page copies first, on this thread: the gather reads
+                // row `slot` of the cache's pooled table, so the row must state the request's own
+                // pages before the graph reads it, and the units must be this cache's before
+                // anything is copied into them.
+                self.install_pending(*batch)?;
+                // Then the batch's columns are uploaded here, on the device thread, before the
+                // graph reads them: the scheduler hands over a `Batch` and the device thread
+                // stages and uploads it, so a replay that skipped the upload would serve the pose
+                // the bucket was captured with.
                 self.upload(*bucket)?;
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
@@ -2321,6 +2353,26 @@ impl<M: CausalLm> CausalLmRunner<M> {
             None => out.push_str(" init=no-flags"),
         }
         out
+    }
+
+    /// Installs the staged batch's cache rows and page copies on this runner's stream.
+    ///
+    /// A refusal is now the replay's, not submit's: the work itself is on the device's stream, and
+    /// a batch whose pages cannot be installed fails as that batch - the operator the cache could
+    /// not describe is named by the error either way.
+    fn install_pending(&mut self, batch: BatchId) -> Result<()> {
+        let Some(install) = self.pending_install.take() else {
+            return Ok(());
+        };
+        if install.batch != batch {
+            return Err(Error::Invariant(format!(
+                "the cache rows staged for batch {} are not batch {}'s: a replay installs only its \
+                 own batch's pages",
+                install.batch.0, batch.0
+            )));
+        }
+        self.kv.install_block_tables(&install.tables, &self.stream)?;
+        self.kv.apply_cache_units(&install.units, &self.stream)
     }
 
     /// The cache description the attention kernel is handed, read from the device (2.4, 4.5).
