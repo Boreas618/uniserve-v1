@@ -67,7 +67,11 @@ impl Rgb {
     pub const CHANNELS: u32 = 3;
 
     /// Frames one clip shares with the next.
-    pub const OVERLAP_FRAMES: u32 = 5;
+    ///
+    /// Taken from [`crate::decoding::OVERLAP_FRAMES`] rather than written again: it was the same `5`
+    /// twice in this file, once as an associated constant and once as the decoder's, and the two
+    /// could drift while every use here reads one of them.
+    pub const OVERLAP_FRAMES: u32 = OVERLAP_FRAMES;
 
     /// The raster of `frames` decoded frames at a pixel extent.
     pub fn of(frames: u32, height: u32, width: u32) -> Self {
