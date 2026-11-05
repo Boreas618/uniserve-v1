@@ -788,7 +788,7 @@ impl Leader {
     /// As [`Leader::start`], before the engine starts.
     pub(crate) async fn prepare(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Prepared> {
         let LoadedModel {
-            config: mut model_config,
+            config: model_config,
             tokenizer,
             renderer,
         } = ModelConfig::load(config)
@@ -856,7 +856,7 @@ impl Leader {
             tokenizer,
             renderer,
             spec: _,
-            max_model_len,
+            max_model_len: _,
         } = prepared;
         let model_name = config.model().to_owned();
         let info = client.info().clone();
@@ -864,16 +864,14 @@ impl Leader {
         // A video checkpoint serves what its placed denoiser declares in the
         // worker handshake, planned against the conditioner's vision
         // processor.
-        let mut model_files = None;
         let renderer = match renderer {
-            LoadedRenderer::Chat { renderer, files } => {
+            LoadedRenderer::Chat { renderer, .. } => {
                 // No other served model's processor takes options.
                 anyhow::ensure!(
                     config.mm_processor_kwargs.is_empty(),
                     "invalid mm_processor_kwargs: the processor of `{}` takes no options",
                     config.model()
                 );
-                model_files = Some(files);
                 RequestRenderer::Chat(*renderer)
             }
             LoadedRenderer::Video(vision) => {
@@ -2671,7 +2669,10 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         // successor: this daemon's watch sees that client go away by design, and a
         // relaunch here would start a second engine for a deployment another daemon
         // serves.
-        if replica.handed_over.load(std::sync::atomic::Ordering::Acquire) {
+        if replica
+            .handed_over
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             tracing::info!(
                 %reason,
                 "this daemon handed its engine over; the successor owns it, so it is not relaunched here"
