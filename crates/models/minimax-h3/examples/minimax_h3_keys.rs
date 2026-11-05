@@ -170,12 +170,12 @@ const VSA_BLOCK_ROWS: u32 = 16;
 /// for the released base network at `VSA_TILE_ROWS` (printed by `examples/deployment_sizes.rs
 /// --root <checkpoint>`). Both descriptors that read it key
 /// `next_power_of_two()` of it - `CompressPooledDescriptor`'s `max_tiles` and
-/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` states from the score matrix's own
-/// key extent) - because the package compiles the reduction to a power of two, so two bounds inside
-/// one class are one module and a key that told them apart would demand a compilation per tile count
-/// a deployment happens to request. **So this constant is 8192 while the launch passes 5400**: a
-/// reader who assumes the key field holds the number they can compute is the reader this comment is
-/// for.
+/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` takes from the layer's declared
+/// bound, the same value this constant holds) - because the package compiles the reduction to a
+/// power of two, so two bounds inside one class are one module and a key that told them apart would
+/// demand a compilation per tile count a deployment happens to request. **So this constant is 8192
+/// while the launch passes 5400**: a reader who assumes the key field holds the number they can
+/// compute is the reader this comment is for.
 const VSA_MAX_TILES: u32 = 8192;
 
 /// The transformer's feed-forward width (`ffn_dim`).
