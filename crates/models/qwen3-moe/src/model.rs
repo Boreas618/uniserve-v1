@@ -356,7 +356,7 @@ impl Plan {
                         nn::layers::step_bytes(
                             tokens,
                             geometry,
-                            ops::fp4::ScaleLayout::Swizzled128X4,
+                            Moe::ACTIVATION_SCALE_LAYOUT,
                             dtype,
                             options.experts_encoded,
                         )?

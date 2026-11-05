@@ -753,6 +753,16 @@ pub struct Moe {
 }
 
 impl Moe {
+    /// The block-scale layout of the **activation** plane, which is the products' `layout` field.
+    ///
+    /// Every E2M1 artifact this deployment builds serves the activation side in the 128x4 swizzled
+    /// form (`gather_gemm_nvfp4`'s `build.py` states it as the artifact's own rule), and the encoder
+    /// is launched per descriptor, so a plain layout here asks the store for a program no artifact
+    /// covers. The **weights'** plane is a different field of a different descriptor — a property of
+    /// each encoded stack, which the loader publishes in the form that product's kernels read — and
+    /// the two must not be swapped.
+    pub const ACTIVATION_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
     /// A block whose router is `router` and whose experts are `up_gate` and `down`.
     ///
     /// `up_gate` is `[experts, 2 · intermediate, hidden]` with the up projection first, `down` is
@@ -1582,14 +1592,10 @@ impl Moe {
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
         //    the product multiplies by, and its global scale is the stack's neutral.
         //
-        // The layout here is the **activation plane's**, and it is the 128x4 swizzled form: every
-        // E2M1 artifact this deployment builds serves the activation side that way
-        // (`gather_gemm_nvfp4`'s `build.py` states it as the artifact's own rule), and the encoder is
-        // launched per descriptor, so a plain layout here asks the store for a program no artifact
-        // covers. The weights' plane is the checkpoint's own, swizzled F8_E4M3, and reaches the
-        // products through *their* descriptors below; the two are different fields of different
-        // descriptors and must not be swapped.
-        let activation_layout = ScaleLayout::Swizzled128X4;
+        // The layout here is the **activation plane's**; the weights' plane reaches the products
+        // through the same descriptors' `layout` field only because that field *is* this one — the
+        // weights' form is a property of their encoded stack, which each product's kernels state.
+        let activation_layout = Self::ACTIVATION_SCALE_LAYOUT;
         // The step's whole working set from one table: the plan sums the same extents to size the
         // arena, so every buffer a launch writes is a buffer the plan reserved.
         let step = self.encoded_step(tokens, activation_layout, hidden.dtype)?;
@@ -1614,10 +1620,15 @@ impl Moe {
         // 5. FC1: the token-major gather product, one gated row per permuted route.
         let gated = arena.tensor(step.gated.dtype, step.gated.shape)?;
         let workspace = arena.tensor(step.scratch.dtype, step.scratch.shape)?;
-        // The scale's element type and the plane layout are the **checkpoint's**, read off the stack
-        // they belong to; the loader published them from the shard's own tensors.
-        let descriptor =
-            self.gather_nvfp4_descriptor(hidden.dtype, up_gate.scales.dtype(), up_gate.layout);
+        // The scale's element type is the **checkpoint's**, read off the stack it belongs to; the
+        // layout the product states is the activation plane's, because that is the plane it encodes
+        // and reads. The weights' own form is not in the descriptor: it is a property of `up_gate`'s
+        // stack, which the loader publishes in the form this product's kernels were built for.
+        let descriptor = self.gather_nvfp4_descriptor(
+            hidden.dtype,
+            up_gate.scales.dtype(),
+            Self::ACTIVATION_SCALE_LAYOUT,
+        );
         let args = GatherGemmNvfp4Args {
             hidden: values,
             hidden_scale: scales,
@@ -1658,8 +1669,11 @@ impl Moe {
 
         // 7. FC2: one row per permuted route, the `top` repeats still separate.
         let products = arena.tensor(step.products.dtype, step.products.shape)?;
-        let descriptor =
-            self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
+        let descriptor = self.route_nvfp4_descriptor(
+            hidden.dtype,
+            down.scales.dtype(),
+            Self::ACTIVATION_SCALE_LAYOUT,
+        );
         let args = RouteGemmNvfp4Args {
             hidden: gated_values,
             hidden_scale: gated_scales,
