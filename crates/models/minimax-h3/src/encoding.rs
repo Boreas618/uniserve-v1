@@ -2679,6 +2679,46 @@ mod tests {
         );
     }
 
+    /// The audio encoder's names are the checkpoint's, tensor for tensor.
+    ///
+    /// A mapping that invents one name and drops another still asks for 171, so a count is not the
+    /// check - the set is. The fixture is the encoder half of `FastVideo-FastH3-8-Step-V2`'s
+    /// `audio_vae/`, recorded from the run host's `artifacts/h3-reference/component-tensors.json`:
+    /// 147 `encoder.*` tensors, the 22 of `pre_block.*` and the 2 of `mean_proj.*`. It caught the
+    /// mapping's stage Snake and widening convolution being one index too low (asked at `.block.4`
+    /// and `.block.5` where the checkpoint has `.block.3` and `.block.4`), which is twenty names and
+    /// a count that does not move.
+    #[test]
+    fn the_audio_encoders_names_are_the_checkpoints() {
+        let config = crate::audio_vae::tests::audio_config();
+        let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
+        ours.sort_unstable();
+        let fixture: Vec<&str> = include_str!("../tests/data/audio-encoder-names.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture.len(), 171, "the recorded export's encoder half");
+        let missing: Vec<&str> = fixture
+            .iter()
+            .copied()
+            .filter(|name| !ours.iter().any(|ours| ours == name))
+            .collect();
+        let extra: Vec<&str> = ours
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !fixture.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the checkpoint has encoder names this crate does not ask for: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "this crate asks for encoder names the checkpoint does not have: {extra:?}"
+        );
+    }
+
     /// The video encoder states its programs from its configuration and the rasters it serves: one
     /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
     /// frame, the posterior head's sample, and one residual per block at its level's own extent.
