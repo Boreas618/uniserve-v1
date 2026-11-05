@@ -40,7 +40,12 @@ fi
 
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
-samples=256
+# The delivery's four durations, as the clips the model makes of them: `uniserve_eval/workloads/minimax_h3/`
+# asks for 5, 8, 10 and 15 seconds, which at 24 fps are 120, 192, 240 and 360 frames and, through
+# `align_num_frames`, clips of 124, 192, 243 and 362. **A duration is the delivery's; the clip is the
+# model's.** The values are stated here rather than derived because this is `sh`; the generator states
+# the same four through the two functions (`DELIVERY_SECONDS`), and a mismatch is a finding.
+samples=124,192,243,362
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -51,7 +56,9 @@ rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
 elements=123456
-track=44100
+# One track per clip, `audio_samples` of it: the walk refuses a track no stated clip implies, so this
+# line cannot drift from the one above without a refusal naming both.
+track=165600,256000,324000,482400
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
