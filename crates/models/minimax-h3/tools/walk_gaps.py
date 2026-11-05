@@ -444,6 +444,19 @@ def by_shape(args):
     sampled = {
         number: name for name, values in sample.items() for number in values
     }
+    # A width an audio operator carries is derived from the track through the crate's stage
+    # arithmetic, which this tool does not follow: the number a key lands on is not the number on
+    # the command line (`--track 477166` produces 2985 x 160 = 477600, not 477166). So an audio
+    # width is sample-dependent by construction, and the sentence says so rather than letting the
+    # per-shape mark imply the tool checked a derivation it cannot see.
+    tracks = list(sample.get("audio tracks", []))
+    if tracks:
+        print(
+            f"the walks state an audio track {tracks}: an audio width is derived from"
+            " it through the crate's stages, and this tool does not follow that"
+            " arithmetic - an audio `scaled_add`/`scaled_residual` gap is"
+            " sample-dependent by construction, not a row the file lacks"
+        )
 
     missing = sorted(set(shapes) - held)
     # The rasters each walk states, so a shape absent from walks of two *different* canvases is not
