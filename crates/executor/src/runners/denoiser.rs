@@ -614,10 +614,31 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
 
     /// Writes the coefficient index the step reads, before a walk or a replay, and records it for
     /// the diagnosis.
+    ///
+    /// Little-endian is the **device's** convention for the `[1]` `i64` table a kernel reads, not the
+    /// host's: the column is device memory a launch addresses, so the bytes are the device's byte
+    /// order and every GPU this tree runs on is little-endian. A big-endian device would need this
+    /// line changed, which is why it says whose order it is rather than leaving it to be assumed.
     fn stage_step(&mut self, step: &Step) -> Result<()> {
         self.columns.staged.step = step.index.to_le_bytes().to_vec();
         self.staged_step = Some(step.index);
         Ok(())
+    }
+
+    /// The refusal for a bucket whose task the model states no schedule for.
+    ///
+    /// It names the chain a reader needs - the bucket, the task the bucket's schedule was asked for,
+    /// and the fact that the answer had no step - because the model's own refusal names the task and
+    /// this one is reached through the bucket.
+    fn no_step(&self, bucket: Bucket) -> Error {
+        let task = self
+            .plan_of(bucket)
+            .map(|plan| format!("{:?}", plan.warm.task))
+            .unwrap_or_else(|_| "no task".to_owned());
+        Error::Invalid(format!(
+            "the schedule of bucket {bucket} states no step to capture; the bucket asked for the \
+             {task} schedule"
+        ))
     }
 
     /// Writes the latents of the staged step under the block-by-block diagnosis' own names.
@@ -668,11 +689,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
         self.columns.warm(&layout, self.shape, bucket.rows)?;
-        let step = self.schedule(bucket)?.first().copied().ok_or_else(|| {
-            Error::Invalid(format!(
-                "the schedule of bucket {bucket} states no step to capture"
-            ))
-        })?;
+        let step = self
+            .schedule(bucket)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
         self.stage_step(&step)?;
         Ok(())
     }
@@ -723,11 +744,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let state = self
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let step = self.schedule(bucket)?.first().copied().ok_or_else(|| {
-            Error::Invalid(format!(
-                "the schedule of bucket {bucket} states no step to capture"
-            ))
-        })?;
+        let step = self
+            .schedule(bucket)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
         let media: [nn::capability::MediaInput; 0] = [];
         let latents = self.latents(bucket, 0)?;
         let cond = self.conditioning(bucket, 0, &state, &media)?;
