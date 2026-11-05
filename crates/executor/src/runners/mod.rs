@@ -9,6 +9,7 @@
 //! the model that needs them (H3, §11 step 3); the trait, the graph table and the arena they build
 //! on are the same.
 
+pub mod audio;
 pub mod causal_lm;
 pub(crate) mod columns;
 pub mod decoder;
@@ -19,6 +20,7 @@ pub(crate) mod floor;
 pub mod lifecycle;
 pub(crate) mod tables;
 
+pub use audio::AudioDecoderRunner;
 pub use causal_lm::CausalLmRunner;
 pub use decoder::DecoderRunner;
 pub mod products;
