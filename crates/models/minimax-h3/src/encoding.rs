@@ -1768,6 +1768,8 @@ impl AudioEncoder {
     /// "all absent" - a refusal naming the block, not a read error from inside a layer.
     pub fn keys(config: &crate::AudioVaeConfig) -> Result<Vec<String>> {
         Ok(crate::audio_vae::tensor_keys(&audio_sources(config)?))
+    }
+
     /// The programs the audio encoder launches, from the configuration and the deployment's longest
     /// track.
     ///
