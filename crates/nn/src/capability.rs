@@ -650,12 +650,14 @@ pub struct DecodedMedia {
     ///
     /// A file's frames-major order is the writer's conversion, not the decoder's.
     pub video: Option<TensorView>,
-    /// `[channels, samples]` decoded audio, channels on the leading axis.
+    /// `[samples, 2]` interleaved stereo, one pair per sample.
     ///
-    /// The deployment's soundtrack is stereo, so a `[samples]` view is one channel of a
-    /// two-channel decode and nothing refuses it. The same rule as `video`: the decoder
-    /// writes through this view, so the axis order belongs to the executor's allocation
-    /// and the decoder's write, and `output.rs` states it channel-major in its own words.
+    /// The decoder writes this through the view it is handed, so the order is the contract
+    /// and not a display choice: `AudioVaeDecoder`'s own doc calls `out.audio` "the
+    /// request's `[samples, 2]` window", and a `[channels, samples]` reading would put
+    /// sample `i` of the left channel where sample `0` of the right belongs.
+    ///
+    /// A file's layout is the writer's conversion, as with `video`.
     pub audio: Option<TensorView>,
 }
 
