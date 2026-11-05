@@ -239,7 +239,10 @@ else
                 fi
                 printf '%s\n' "$row"
             done >"$recorded_txt.missing"
-        echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s)"
+        # The two `--conditioned` settings are two deployments behind one denominator (seven fixed
+        # harnesses and one of two), so the line states both settings rather than letting a reader
+        # take the total for one deployment's harness count.
+        echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s), both --conditioned settings"
         if [ -s "$recorded_txt.build" ]; then
             sort -u "$recorded_txt.build" | head -2 | sed 's/^/     BUILD: /'
             fail "the record example did not build at $(sort -u "$recorded_txt.build" | wc -l) point(s): the tree moved under this run, and no row of it is a statement about the model"
