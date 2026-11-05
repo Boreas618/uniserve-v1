@@ -2081,7 +2081,8 @@ impl Replica {
                 .engine()
                 .context("the relaunched engine states no number")?;
             let handing = Arc::clone(&epochs);
-            let handed = tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            let handed =
+                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
             match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
                 Ok(joined) => joined
                     .context("handing the epoch's programs to the relaunched engine")?
@@ -2296,6 +2297,51 @@ impl Replica {
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
+        // The epoch's programs first, then the promotion: a standby parks
+        // before any `Precopy` names a generation, so it holds none of the
+        // epoch's programs when it is promoted (§2.5, §7.5). A promotion that
+        // named it serving with no programs would answer 503 to every request
+        // — the same silence a relaunched process produced — so the daemon
+        // hands them over before it moves the frontend, and the engine's own
+        // refusal of a programless promotion is a guard rather than the only
+        // defence.
+        if let Some(epochs) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+            .map(|driver| Arc::clone(driver.epochs()))
+        {
+            let config = locked(&self.config).clone();
+            let host = config.host_identity.clone();
+            let Some(engine) = standby.client.engine() else {
+                warn!(
+                    generation = standby.generation,
+                    "the standby states no engine number; the engine is relaunched"
+                );
+                return None;
+            };
+            let handing = Arc::clone(&epochs);
+            let handed =
+                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            let took = match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+                Ok(joined) => match joined {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(failure)) => Err(format!("{}: {}", failure.kind, failure.reason)),
+                    Err(error) => Err(format!("the handover did not complete: {error}")),
+                },
+                Err(_) => Err(format!(
+                    "it answered nothing within {} s",
+                    SWITCH_TIMEOUT.as_secs()
+                )),
+            };
+            if let Err(reason) = took {
+                warn!(
+                    generation = standby.generation,
+                    "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
+                );
+                return None;
+            }
+        }
         match standby.client.promote(Vec::new(), false, true).await {
             Ok(()) => {
                 self.hold.serve(Arc::clone(&standby.client));
