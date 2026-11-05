@@ -1705,9 +1705,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // computes for itself.
                 let live = self.staging.live_tokens();
                 if !bucket.variant.is_decode() && u64::from(bucket.tokens) > live {
+                    // The bound alone says the launch runs work this batch does not hold; what the
+                    // work *does* is decided by the columns those rows read, and the rows past the
+                    // live span are the ones no operator wrote. A slot there is either absent
+                    // (`-1`, which the cache write skips) or left from another batch, and a row
+                    // naming a slot this batch never allocated is a write outside its pages - which
+                    // the device reports as an illegal address two commands later.
                     tracing::warn!(
                         captured_tokens = bucket.tokens,
                         live_tokens = live,
+                        beyond = %self.beyond_span(live, u64::from(bucket.tokens)),
                         "a prefill bucket's captured launch states more tokens than this batch \
                          holds: the bound was taken from the pose the bucket was captured with"
                     );
@@ -2952,6 +2959,40 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         out
+    }
+
+    /// What the slot column holds for the rows a captured bound names beyond this batch's span.
+    ///
+    /// The cache write reads one slot per row of the launch's grid. Rows past the live span are rows
+    /// this batch never staged, so their slots are whatever the column last held: `-1` (which the
+    /// write skips), a slot of an earlier batch (a write into another request's pages), or a value
+    /// nothing ever wrote (a write into pages that do not exist, which is an illegal address on the
+    /// device). The three are indistinguishable from the bound alone, and only the third faults.
+    fn beyond_span(&self, live: u64, tokens: u64) -> String {
+        let first = usize::try_from(live).unwrap_or(0);
+        let count = usize::try_from(tokens.saturating_sub(live)).unwrap_or(0).min(4096);
+        if count == 0 {
+            return "none".to_owned();
+        }
+        let address = self.columns.slot_mapping.device.ptr.address().saturating_add((first as u64) * 4);
+        let Some(raw) = self.read_device(address, count * 4) else {
+            return "unreadable".to_owned();
+        };
+        let mut negative = 0_usize;
+        let mut largest = i64::MIN;
+        let mut first_few = String::new();
+        for (index, word) in raw.chunks_exact(4).enumerate() {
+            let slot = i32::from_ne_bytes(word.try_into().unwrap_or([0; 4]));
+            if slot < 0 {
+                negative += 1;
+            } else {
+                largest = largest.max(i64::from(slot));
+            }
+            if index < 4 {
+                first_few.push_str(&format!("{slot},"));
+            }
+        }
+        format!("rows={count} negative={negative} max={largest} first=[{first_few}]")
     }
 
     /// The tensors a captured graph writes, read back from the pointers its own launches name.
