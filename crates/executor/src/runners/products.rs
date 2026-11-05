@@ -65,8 +65,11 @@ pub enum Product {
     Images,
     /// `[rows, …]` encoded reference audio.
     Audio,
-    /// The request's latent trajectory: a denoise advances it step by step and a decode reads it.
-    Latents,
+    /// `[channels, frames, rows, columns]` the video latent trajectory: a denoise advances it step
+    /// by step and a decode then reads it.
+    VideoLatents,
+    /// The audio latent trajectory, in the same sense.
+    AudioLatents,
 }
 
 impl Product {
@@ -77,7 +80,8 @@ impl Product {
             Self::Source => "source",
             Self::Images => "images",
             Self::Audio => "audio",
-            Self::Latents => "latents",
+            Self::VideoLatents => "video latents",
+            Self::AudioLatents => "audio latents",
         }
     }
 }
@@ -307,7 +311,7 @@ mod tests {
         store
             .publish(
                 request(1),
-                Product::Latents,
+                Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
                 &view(4096, 2),
@@ -315,7 +319,7 @@ mod tests {
             .expect("a store accepts a view");
 
         let read = store
-            .borrow(request(1), Product::Latents, DeviceId(0), StreamId(1))
+            .borrow(request(1), Product::VideoLatents, DeviceId(0), StreamId(1))
             .expect("one stream needs no ordering")
             .expect("the product was published");
         assert_eq!(read.numel(), 2, "the same region comes back");
@@ -389,7 +393,7 @@ mod tests {
         store
             .publish(
                 request(1),
-                Product::Latents,
+                Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
                 &view(4096, 2),
@@ -398,7 +402,7 @@ mod tests {
         store
             .publish(
                 request(1),
-                Product::Latents,
+                Product::VideoLatents,
                 DeviceId(0),
                 StreamId(1),
                 &view(4096, 2),
@@ -408,7 +412,7 @@ mod tests {
         assert_eq!(store.len(), 1, "one product, published twice");
         assert_eq!(
             store
-                .borrow(request(1), Product::Latents, DeviceId(0), StreamId(1))
+                .borrow(request(1), Product::VideoLatents, DeviceId(0), StreamId(1))
                 .expect("readable")
                 .expect("present")
                 .numel(),
@@ -421,7 +425,7 @@ mod tests {
     #[test]
     fn forget_drops_one_requests_products_and_no_other() {
         let store = Held::new();
-        for kind in [Product::Text, Product::Latents] {
+        for kind in [Product::Text, Product::VideoLatents] {
             store
                 .publish(request(1), kind, DeviceId(0), StreamId(1), &view(4096, 2))
                 .expect("published");
