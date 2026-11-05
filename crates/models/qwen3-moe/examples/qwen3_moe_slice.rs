@@ -2060,6 +2060,14 @@ mod tests {
                 "{operator} missing"
             );
         }
+        // An encoded deployment launches the shared operators too: its embedding, norms, attention
+        // and sampler are the same programs a dense deployment launches. A list that dropped them
+        // let the NVFP4 run load 288 packed weights and then stop at its first launch, naming an
+        // operator its store held.
+        assert!(
+            encoded.iter().any(|(operator, _)| operator == "embedding"),
+            "the embedding is a shared program: {encoded:?}"
+        );
         assert!(
             !encoded
                 .iter()
@@ -2776,7 +2784,14 @@ fn needed_keys(
                 .into_iter()
                 .flatten()
                 .any(|rows| descriptor.contains(&format!("_m_{rows}_")));
-        if encoded.declared != (packed_row || ENCODED_OPERATORS.contains(&operator)) {
+        // A packed operator belongs to an encoded deployment and to no other: a dense one has no
+        // use for it, and a packed product whose row count this run will not launch is not a
+        // program it asks for. Every other operator belongs to both — an NVFP4 checkpoint's
+        // embedding, norms, attention and sampler launch the same programs a dense checkpoint's do
+        // — so a filter that dropped those would load and then fail at its first launch, naming an
+        // operator its own store holds.
+        let packed_operator = operator == "nvfp4_gemm" || ENCODED_OPERATORS.contains(&operator);
+        if packed_operator && (!encoded.declared || (operator == "nvfp4_gemm" && !packed_row)) {
             continue;
         }
         if !required(stage, operator, sampling) {
