@@ -2480,6 +2480,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             [a, b, c, d, e, f, g, h] => u64::from_ne_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
             _ => return "odd-parameter".to_owned(),
         };
+        // The parameter a native package passes is not always a device address: a host entry may
+        // enqueue the launch itself and bake the scalars into the node, in which case this is the
+        // address of a host structure that no longer exists. A device copy from there would fault
+        // and the driver's error sticks to this stream, so the read happens only inside the arena
+        // the bucket owns - and "outside" is itself the answer.
+        if !self.in_arena(address, LAYOUT.size) {
+            return format!(
+                "attention {operator} {key} grid={:?} block={:?} shared={} call={address:#x} \
+                 outside-arena",
+                params.grid, params.block, params.shared_memory
+            );
+        }
         let Some(call) = self.read_device(address, LAYOUT.size) else {
             return format!("call-unreadable({address:#x})");
         };
@@ -2544,8 +2556,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ("cum_seq_lens_q", LAYOUT.cum_seq_lens_q, 8),
         ] {
             let pointer = word(offset);
+            let own = match name {
+                "seq_lens" => self.columns.seq_lens.device.ptr.address(),
+                _ => self.columns.query_offsets.device.ptr.address(),
+            };
             if pointer == 0 {
                 out.push_str(&format!(" {name}=[null]"));
+                continue;
+            }
+            if pointer != own {
+                // A vector this runner did not write: its contents are not ours to read, and a
+                // read out of range is a sticky device error.
+                out.push_str(&format!(" {name}=[foreign]"));
                 continue;
             }
             let Some(raw) = self.read_device(pointer, count * 4) else {
@@ -2603,7 +2625,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let mut digests = String::new();
             for (plane, offset) in [("k", LAYOUT.key), ("v", LAYOUT.value)] {
                 let base = at(offset);
+                let pages_in_pool = at(LAYOUT.num_pages);
                 let bytes = (page_size * page_bytes) as usize;
+                if base == 0 || pages as u64 >= pages_in_pool || bytes > (1 << 20) {
+                    digests.push_str(&format!(" {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"));
+                    continue;
+                }
                 let digest = match self.read_device(base + pages as u64 * page_bytes as u64, bytes)
                 {
                     Some(raw) => format!("{:016x}", fnv(&raw)),
@@ -2614,6 +2641,23 @@ impl<M: CausalLm> CausalLmRunner<M> {
             out.push_str(&format!(" layer{layer}={digests}"));
         }
         out
+    }
+
+    /// Whether `[address, address + bytes)` lies inside the graph pool's arena.
+    ///
+    /// The only memory this runner may read back blindly is the arena its captured graphs address;
+    /// anything else is an address a launch named and a copy from it could fault, which the driver
+    /// leaves stuck to the stream for the next batch to fail on.
+    fn in_arena(&self, address: u64, bytes: usize) -> bool {
+        let Ok(mut pool) = self.pool() else {
+            return false;
+        };
+        let Ok(base) = pool.base(self.stream_id()) else {
+            return false;
+        };
+        let reserved = pool.reserved() as u64;
+        let start = base.address();
+        address >= start && (address - start).saturating_add(bytes as u64) <= reserved
     }
 
     /// `bytes` of device memory at `address`, read on this runner's stream, or `None`.
