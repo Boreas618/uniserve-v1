@@ -2105,7 +2105,10 @@ mod shipped_packages {
             let path = root.join(package);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            let parsed: toml::Value = text.parse().unwrap_or_else(|error| {
+            // `toml::Table`'s `FromStr` is a document; `toml::Value`'s parses a
+            // single value, so a document read as one is refused at its first
+            // character.
+            let parsed: toml::Table = text.parse().unwrap_or_else(|error| {
                 // A parse error at 1:1 on a package that is valid in the tree
                 // means the run read an empty file: name the path and its size
                 // rather than leave the reader to guess which copy it was.
