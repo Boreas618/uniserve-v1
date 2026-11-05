@@ -954,6 +954,58 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
+/// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
+///
+/// The package hands `TllmGenFmhaRunnerParams` to the kernel **by value**, so the node's argument
+/// blob is that struct: every pointer it holds was resolved at capture and every scalar in it is
+/// what the replay uses, with no host-side figure of the batch anywhere in between. Offsets are
+/// `sizeof`/`offsetof` of the shipped header
+/// (`flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h`, 496 bytes), read with a
+/// three-line C++ probe compiled against that header rather than counted by hand.
+fn decode_fmha_params(bytes: &[u8]) -> String {
+    const SIZE: usize = 496;
+    if bytes.len() < SIZE {
+        return format!("blob={}B (not the {SIZE} of TllmGenFmhaRunnerParams)", bytes.len());
+    }
+    let pointer = |at: usize| -> u64 {
+        u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    let integer = |at: usize| -> i32 {
+        i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+    };
+    format!(
+        "fmha blob={} mask={} kernel={} sched={} multi_cta={} q={:#x} k={:#x} v={:#x} \
+         page_idx={:#x} seq_lens_kv={:#x} cum_q={:#x} out={:#x} batch={} max_q={} max_kv={} \
+         sum_q={} sum_kv={} pages_per_seq={} tokens_per_page={} pages_in_pool={} heads_q={} \
+         q_stride_tokens={} k_stride_kv={} pdl={} stream={:#x}",
+        bytes.len(),
+        integer(4),
+        integer(8),
+        integer(12),
+        bytes[16] != 0,
+        pointer(24),
+        pointer(32),
+        pointer(40),
+        pointer(152),
+        pointer(128),
+        pointer(136),
+        pointer(296),
+        integer(380),
+        integer(388),
+        integer(392),
+        integer(404),
+        integer(408),
+        integer(412),
+        integer(416),
+        integer(420),
+        integer(368),
+        integer(312),
+        integer(320),
+        bytes[488] != 0,
+        pointer(480)
+    )
+}
+
 /// Whether a block table view holds `bytes` readable bytes of page indices.
 ///
 /// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
@@ -2531,13 +2583,29 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 }
             }
         }
-        // The kernel's one argument is the pointer to its call struct.
+        // A native package takes its parameters in one of two shapes, and only one of them is a
+        // pointer to the operator's call: the trtllm-gen entry passes `TllmGenFmhaRunnerParams` to
+        // the kernel by value, so the node's first argument **is** that struct. Decoding it names
+        // every bound the launch was given, which is what no host-side figure of the batch states.
         let Some(bytes) = params.parameters.first() else {
-            return "no-parameters".to_owned();
+            return format!("{shape} no-parameters");
         };
+        if bytes.len() != 8 {
+            // The two plane pointers the launch carries, beside the addresses this runner's own
+            // layer 0 has: a graph reading another plane is invisible from every host-side figure,
+            // and the digest below would then describe bytes the kernel never touched.
+            let key = u64::from_ne_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
+            let value = u64::from_ne_bytes(bytes[40..48].try_into().unwrap_or([0; 8]));
+            return format!(
+                "{shape} {}{}{}",
+                decode_fmha_params(bytes),
+                self.plane_verdict(key, value),
+                self.dump_cache_digests(first_page)
+            );
+        }
         let address = match bytes.as_slice() {
             [a, b, c, d, e, f, g, h] => u64::from_ne_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
-            _ => return "odd-parameter".to_owned(),
+            _ => return format!("{shape} odd-parameter"),
         };
         // The parameter a native package passes is not always a device address: a host entry may
         // enqueue the launch itself and bake the scalars into the node, in which case this is the
@@ -2711,6 +2779,22 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // whatever the kernel was handed.
         out.push_str(&self.dump_cache_digests(first_page));
         out
+    }
+
+    /// Whether the plane pointers a launch carries are this runner's own layer 0 planes.
+    fn plane_verdict(&self, key: u64, value: u64) -> String {
+        let Ok(planes) = self.kv.planes(0) else {
+            return " planes=refused".to_owned();
+        };
+        let Some(first) = planes.first() else {
+            return " planes=empty".to_owned();
+        };
+        let mark = |at: u64, own: u64| if at == own { "own" } else { "OTHER" };
+        format!(
+            " planes=layer0:{} /{}(key,value)",
+            mark(key, first.key.ptr.address()),
+            mark(value, first.value.ptr.address())
+        )
     }
 
     /// One digest per layer of the keys and values the replay just wrote into the batch's pages.
