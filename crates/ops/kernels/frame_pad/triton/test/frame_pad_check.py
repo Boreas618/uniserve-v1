@@ -28,8 +28,10 @@ The cases, each named for the mistake it catches:
   `2·dim − 2 − i` shows;
 - **zero `front`**, where no frame is causal-padded, and **`front` equal to the whole output**, where
   every copied frame is a zero frame;
-- **a channels-last output**, whose strides are the other legal layout, and **a strided source**, whose
-  batch and channel strides the kernel must read rather than assume.
+- **a channels-last output**, whose strides are the other legal layout, **a strided source**, whose
+  batch and channel strides the kernel must read rather than assume, and **a channels-last source**,
+  whose width stride is the channel count: the pixels of one row are then not contiguous, which is the
+  read a kernel that ignored the width stride gets wrong.
 """
 
 import argparse
@@ -73,7 +75,7 @@ def reference(values, *, top, left, front, out_frames, out_height, out_width, re
 
 def check(module, what, *, dtype, reflect, block_pixels, block_channels,
           batch, channels, frames, height, width, top, left, front, channels_last=False,
-          strided_source=False, seed=29):
+          strided_source=False, channels_last_source=False, seed=29):
     """One launch, asserted element for element against the two-step pad."""
     element = DTYPES[dtype]
     torch.manual_seed(seed)
@@ -81,10 +83,19 @@ def check(module, what, *, dtype, reflect, block_pixels, block_channels,
     base = torch.randn(batch, channels, frames, height, width, dtype=torch.float32).to(element)
     if strided_source:
         # A view of a wider tensor: its batch, channel **and frame** strides are each twice the
-        # packed ones, while the width stays contiguous as the operator requires. A kernel that
-        # assumed packed strides reads another sample's pixels here and agrees everywhere else.
+        # packed ones, while the width stays contiguous. A kernel that assumed packed strides reads
+        # another sample's pixels here and agrees everywhere else.
         wide = torch.randn(batch, channels * 2, frames * 2, height, width, dtype=torch.float32)
         values = wide.to(element)[:, :channels, ::2]
+    elif channels_last_source:
+        # The source stored channels-last, viewed as the operator's logical shape: a row of pixels is
+        # `channels` elements apart, so a kernel that read the columns contiguously would pick up
+        # neighbouring channels' pixels instead.
+        packed = base.permute(0, 2, 3, 4, 1).contiguous()
+        values = packed.permute(0, 4, 1, 2, 3)
+        if values.stride(4) != channels or values.stride(1) != 1:
+            raise SystemExit(f"the channels-last source has strides {values.stride()}, not the "
+                             f"channels-last order")
     else:
         values = base
 
@@ -122,7 +133,8 @@ def check(module, what, *, dtype, reflect, block_pixels, block_channels,
              f"{batch}x{channels}x{frames} of {height}x{width} -> "
              f"{out_frames}x{out_height}x{out_width}, pads top {top} left {left} front {front}"
              f"{', channels-last output' if channels_last else ''}"
-             f"{', strided source' if strided_source else ''}")
+             f"{', strided source' if strided_source else ''}"
+             f"{', channels-last source' if channels_last_source else ''}")
     differing = (out != expected)
     count = int(differing.sum())
     if count:
@@ -182,11 +194,19 @@ def main():
         check(module, "a strided source", dtype="f32", reflect=True, block_pixels=4,
               block_channels=2, batch=2, channels=2, frames=2, height=3, width=3,
               top=2, left=1, front=1, strided_source=True),
+        # The source stored channels-last: a row of pixels is `channels` apart, so this is the read
+        # a kernel that took the columns as contiguous gets wrong while every other case agrees.
+        check(module, "a channels-last source", dtype="f32", reflect=True, block_pixels=4,
+              block_channels=2, batch=1, channels=3, frames=2, height=3, width=4,
+              top=1, left=2, front=1, channels_last_source=True),
+        check(module, "a channels-last source and output", dtype="bf16", reflect=False,
+              block_pixels=2, block_channels=2, batch=1, channels=2, frames=2, height=3, width=3,
+              top=2, left=1, front=1, channels_last=True, channels_last_source=True),
     ]:
         checked += count
         zeros += zero
 
-    print(f"ok: {checked} padded elements over nine cases, bit for bit against the two-step pad, "
+    print(f"ok: {checked} padded elements over eleven cases, bit for bit against the two-step pad, "
           f"{zeros} of them zeros")
     return 0
 
