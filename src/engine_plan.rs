@@ -957,7 +957,9 @@ impl EpochPlan {
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
                     proto::request::ModelDtype::Float32 => DType::F32,
                 };
-                let model = minimax_h3::load(&opened, partition, Some(dtype), &mut loader)?;
+                let canvas = deployment_canvas(&self.build.video)?;
+                let model =
+                    minimax_h3::load(&opened, partition, Some(dtype), canvas, &mut loader)?;
                 let served = Served::Media(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))
@@ -1646,6 +1648,68 @@ fn media_candidates(
         );
     }
     Ok(candidates)
+}
+
+/// The one raster this deployment's video decoder is built for, in pixels.
+///
+/// **A canvas is the deployment's statement, not the checkpoint's**: `video_config.resolutions` and
+/// `video_config.aspect_ratios` name it, and the checkpoint is asked which raster that pair is
+/// (`NAMED_CANVASES`). **A rank serves one raster**, because the decoder's register rows, its
+/// voxel-row table and its sequence offsets are that raster's constants rather than a request's -
+/// they are published at load, so a second canvas needs a second decoder, which this build does not
+/// yet bind. A deployment that names more than one is therefore refused here, by both rasters
+/// named, rather than at the first clip that arrives with the other one.
+fn deployment_canvas(video: &daemon::options::VideoOptions) -> Result<(u32, u32)> {
+    use minimax_h3::config::NAMED_CANVASES;
+    let mut canvases: Vec<(u32, u32)> = Vec::new();
+    for edge in &video.resolutions {
+        let short_edge: u32 = edge
+            .strip_suffix('p')
+            .and_then(|value| value.parse().ok())
+            .with_context(|| {
+                format!("the deployment's resolution class {edge:?} does not name a short edge in pixels")
+            })?;
+        for ratio in &video.aspect_ratios {
+            let (width, height) = ratio
+                .split_once(':')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                .with_context(|| format!("the deployment's aspect ratio {ratio:?} is not W:H"))?;
+            let canvas = NAMED_CANVASES
+                .iter()
+                .find(|canvas| canvas.short_edge == short_edge && canvas.aspect == (width, height))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "this deployment prepares {edge} at {ratio}, and the checkpoint serves no \
+                         such canvas: it serves {}",
+                        NAMED_CANVASES
+                            .iter()
+                            .map(|canvas| format!(
+                                "{}p {}:{}",
+                                canvas.short_edge, canvas.aspect.0, canvas.aspect.1
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            if !canvases.contains(&(canvas.width, canvas.height)) {
+                canvases.push((canvas.width, canvas.height));
+            }
+        }
+    }
+    match canvases.as_slice() {
+        [one] => Ok(*one),
+        [] => bail!("this deployment prepares no resolution class, so no raster could be decoded"),
+        many => bail!(
+            "this deployment prepares {} rasters ({}), and a video decoder is built for one: its \
+             register rows, voxel rows and sequence offsets are that raster's constants. State one \
+             resolution class and one aspect ratio",
+            many.len(),
+            many.iter()
+                .map(|(width, height)| format!("{width}x{height}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// The model class a checkpoint declares, as the checkpoint itself states it.
