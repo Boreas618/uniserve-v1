@@ -591,6 +591,16 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// tail of the row holding the previous request's values, which is worse than a refusal because
     /// the graph runs either way.
     fn seed(&self, bucket: Bucket) -> Result<()> {
+        // A replay always follows the `submit` that produced it, and that submit is what names the
+        // rows: an empty set means the batch was served already, or a job outlived its submit. The
+        // graph would then read the host columns - which are a warm capture's zeros - so this is
+        // refused rather than served, because a request whose conditioning is zeros produces a
+        // plausible clip and no error.
+        if self.pending.is_empty() {
+            return Err(Error::Invariant(format!(
+                "a replay of bucket {bucket} names no staged row: its batch was served already or                  the job outlived the submit that produced it, and the columns hold a warm                  capture's zeros rather than a request's conditioning"
+            )));
+        }
         let Some(products) = self.products.as_ref() else {
             return Ok(());
         };
