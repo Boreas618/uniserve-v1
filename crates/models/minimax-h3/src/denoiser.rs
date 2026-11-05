@@ -2643,7 +2643,13 @@ impl Denoiser {
         if !cond.media.is_empty() {
             self.encode_media(f, cond.media, cond.text, trace)?;
         }
-        self.refine_conditioning(f, source, cond.text, cond.state, trace.and_then(|t| t.refined))
+        self.refine_conditioning(
+            f,
+            source,
+            cond.text,
+            cond.state,
+            trace.and_then(|t| t.refined),
+        )
     }
 
     pub fn encode_conditions(
