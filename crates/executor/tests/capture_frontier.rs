@@ -145,15 +145,18 @@ fn a_capture_attributes_the_nodes_each_launch_added() {
         answers.push((mode, per_launch, graph_nodes));
     }
 
-    // The design needs a mode in which an operator's nodes are attributable: 4.5's rebind sets one
-    // node's parameters per launch and cannot guess which of the graph's nodes are whose.
-    let attributed_everywhere = answers
-        .iter()
-        .any(|(_, per_launch, _)| per_launch.iter().all(|&nodes| nodes > 0));
-    assert!(
-        attributed_everywhere,
-        "neither capture mode attributed a node to every launch: {answers:?} - a capture that \
-         attributes nothing cannot be rebound, and 4.5 needs another way to map an operator to the \
-         nodes it added"
-    );
+    // 4.5's rebind sets one node's parameters per launch and cannot guess which of the graph's
+    // nodes are whose, so attribution must not depend on the mode the executor happens to capture
+    // in: every mode the executor may use has to name each launch's nodes.
+    for (mode, per_launch, graph_nodes) in &answers {
+        assert_eq!(
+            *graph_nodes, 3,
+            "the capture holds {graph_nodes} nodes for three launches in {mode:?}"
+        );
+        assert!(
+            per_launch.iter().all(|&nodes| nodes > 0),
+            "{mode:?} attributed {per_launch:?} nodes to the three launches: a launch of one kernel \
+             adds one node, and a walk that names none of them cannot be rebound"
+        );
+    }
 }
