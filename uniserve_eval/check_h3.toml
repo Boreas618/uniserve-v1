@@ -99,10 +99,46 @@ command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--ser
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "dtype=bfloat16", "--set", "quantization_config.mode=quality", "--set", "video_config.max_condition_rows=40960", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "video_config.max_condition_rows=40960", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
 
 # -------------------------------------------------------------------- t2va cells
 # W1's seed-0 row: the official t2va prompt at 16:9, 5 seconds.
+
+# The base-reference cell runs FIRST. It is the one cell that cannot inherit
+# the earlier base servers' retained state on the same checkpoint: the two
+# servers share their load identity and their `--set` keys, so the Storage
+# Server's retained pages of one are the other's. Ordering it first is the
+# strongest form of fresh the check set can state without a teardown, and a
+# teardown would discard the 61 GB per GPU the later cells were measured in.
+[benchmarks.check-base-ref2va]
+server = "base-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-ref2va.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/base-ref2va"
+
+[benchmarks.check-base-ref2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-base-ref2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-ref2va.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "ref2va"
 
 [benchmarks.check-fasth3-dmd-t2va]
 server = "fasth3-dmd"
@@ -258,36 +294,6 @@ videos_per_second = "higher"
 
 [benchmarks.check-fasth3-omniref-ref2va.provenance]
 checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
-task = "ref2va"
-
-[benchmarks.check-base-ref2va]
-server = "base-reference"
-task = "video"
-model = "MiniMax-H3"
-dataset = "jsonl"
-dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
-endpoint = "/v1/videos/sync"
-
-[benchmarks.check-base-ref2va.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
-media_dir = "artifacts/minimax_h3/check/base-ref2va"
-
-[benchmarks.check-base-ref2va.load]
-num_prompts = 1
-request_rate = inf
-max_concurrency = 1
-request_timeout_s = 3600
-warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
-
-[benchmarks.check-base-ref2va.metrics]
-videos_per_second = "higher"
-"video_latency_ms.p50" = "lower"
-"video_latency_ms.p95" = "lower"
-
-[benchmarks.check-base-ref2va.provenance]
-checkpoint = "MiniMaxAI/MiniMax-H3"
 task = "ref2va"
 
 [suites.check-h3]
