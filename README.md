@@ -4,7 +4,7 @@ UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned 
 
 UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve` supplies the numerical layers, loading, resource binding and the models; each worker is a `uniserve worker` process that runs the Rust worker runtime and calls those same numerical implementations through TVM-FFI.
 
-The configured model descriptions are `qwen3`, `sensenova`, `bagel`, `minimax-h3`, and `diffusion-gemma`. A server process loads exactly one description and exposes one served-model identity.
+The configured model descriptions are `qwen3` and `minimax_h3`. A server process loads exactly one description and exposes one served-model identity.
 
 ## Requirements
 
@@ -89,15 +89,11 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
 | `DELETE /v1/videos/{id}` | Cancel or delete a job |
 | `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
-| `POST /v1/images/generations` | Single-image generation adapter for configured omni descriptions |
-| `POST /v1/systemone` | TypeSafe System One decision readout (DiffusionGemma) |
 | `/admin/*` | The admin API: configuration changes (`PUT /admin/config`), each moving the deployment to a new world on trial without failing a request, their commit and rollback, and the other operations of a serving deployment ([docs/admin.md](docs/admin.md)) |
 
-The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, chat completions for every other model, image generation for an omni model, and `/v1/systemone` for DiffusionGemma. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a configuration change of `worker_config.executable` (`PUT /admin/config` with `{"set": ["worker_config.executable=/path/to/uniserve"]}`): it answers once the new world serves on trial, with `pause_seconds`, how long requests waited for it, and `POST /admin/config/commit` ends the trial. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
+The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, and chat completions for a text model. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a configuration change of `worker_config.executable` (`PUT /admin/config` with `{"set": ["worker_config.executable=/path/to/uniserve"]}`): it answers once the new world serves on trial, with `pause_seconds`, how long requests waited for it, and `POST /admin/config/commit` ends the trial. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
 
-DiffusionGemma readout settings are fixed when the server starts. `readout_config.canvas = "full"` uses the checkpoint's full canvas; `compact` rounds each answer scaffold up to a multiple of 16. A numeric value, such as `--set readout_config.canvas=64`, fixes every canvas to that length and splits larger question sets across complete canvases. Numeric lengths must be positive multiples of 16 no greater than the checkpoint's canvas length. `readout_config.candidates = "variants"` sums the supported token spellings of each answer; `primary` reads only the space-prefixed spelling (` A`, ` B`, ` yes`, ` no`, and so on). Defaults are `full` and `variants`. Canvas length and candidate selection change the returned distribution and must match between systems in a numerical or performance comparison.
 
-See the [DiffusionGemma serving guide](docs/diffusion_gemma/serving.md) for checkpoint setup, four-GPU serving, decision and chat examples, precision choices, and measurement contracts.
 
 A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/minimax_h3/minimax_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
@@ -132,7 +128,6 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `logging_config` | Request and statistics logs |
 | `chat_config`, `image_fetch_config` | Chat models: chat template, reasoning parser and image URL fetching |
 | `video_config`, `media_config`, `video_job_config` | MiniMax-H3: canvases, durations, prompt capacities, condition media and asynchronous jobs |
-| `readout_config`, `diffusion_generation_config` | DiffusionGemma readouts and block-diffusion sampling |
 
 A model-family table is refused at startup when the served checkpoint belongs to another family. `GET /admin/config` returns the resolved tree in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
 
@@ -155,13 +150,7 @@ The [evaluation guide](docs/minimax_h3/evaluation.md) lists every suite and the 
 
 ## Text and expert parallelism
 
-For data-parallel serving, run one scheduler per GPU; a model that tensor parallelism cannot split, such as DiffusionGemma, serves four GPUs this way:
-
-```bash
-uniserve serve /models/diffusiongemma-26B-A4B-it \
-  --served-model-name diffusiongemma \
-  --data-parallel-size 4
-```
+For data-parallel serving, run one scheduler per GPU.
 
 Adding `--set moe_config.expert_parallel=true` keeps the four schedulers' attention data-parallel and shards each expert layer across them, so every GPU holds a quarter of the experts and the schedulers exchange tokens at each expert layer. Every expert layer then runs in steps the schedulers take together: a scheduler without work joins each step another one starts, and all of them pad a step to the largest one's captured graph. With an NVFP4 checkpoint, `moe_config.exchange = "megamoe"` fuses each expert layer's exchange and expert computation into one kernel.
 
@@ -221,7 +210,7 @@ The [architecture guide](docs/architecture.md) describes how the daemons, the en
 
 ```text
 crates/proto/                 The interfaces across builds: the request interface and the process interface (Protobuf)
-crates/models/rules/          Model-family request semantics: the family registry, the SenseNova, Bagel and DiffusionGemma checkpoint facts and prompt rules, and the MiniMax-H3 video rules
+crates/models/rules/          Model-family request semantics: the family registry, the checkpoint facts and prompt rules of the Qwen3 and MiniMax-H3 families
 crates/storage/               The Storage Server's protocol and client
 crates/storage-server/        The Storage Server, its Mooncake connector and its Transfer Server
 crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
