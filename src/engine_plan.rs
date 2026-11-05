@@ -1187,8 +1187,13 @@ impl EpochPlan {
         // The plan's own account of this rank is what the scheduler is told about its pool: the
         // capacities it fitted, the cache it holds and where it is. It is the same `MainProcessInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
-        // rank rather than a second one derived here.
-        Ok((memory, planned.plan.info.clone(), graph))
+        // rank rather than a second one derived here. A media rank adds what its denoiser serves,
+        // which the frontend plans a request against and no capacity figure implies.
+        let mut info = planned.plan.info.clone();
+        if let Served::Media(pipeline) = served {
+            info.video_denoiser = Some(denoiser_report(pipeline, &self.build.video)?);
+        }
+        Ok((memory, info, graph))
     }
 
     /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
@@ -1782,8 +1787,110 @@ fn media_candidates(
 /// costs no device storage. The one per-canvas figure is the attention block's row bound, taken as
 /// the largest.
 fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32, u32)>> {
-    use minimax_h3::config::NAMED_CANVASES;
     let mut canvases: Vec<(u32, u32)> = Vec::new();
+    for canvas in named_canvases(video)? {
+        if !canvases.contains(&(canvas.width, canvas.height)) {
+            canvases.push((canvas.width, canvas.height));
+        }
+    }
+    Ok(canvases)
+}
+
+/// What the placed denoisers serve, as the frontend plans a request against it.
+///
+/// The tasks, the schedule and the shifts are the checkpoint's. The frame rule is the clip rule, the
+/// rates are the model's output clock, and the canvases are the ones this deployment prepares.
+fn denoiser_report(
+    pipeline: &minimax_h3::load::MinimaxH3,
+    video: &daemon::options::VideoOptions,
+) -> Result<ipc::VideoDenoiserInfo> {
+    use minimax_h3::{AUDIO_SAMPLE_RATE, CLIP_FRAMES, CLIP_LATENTS, FPS};
+    use models::video::{
+        Canvas, DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas, VideoTask,
+    };
+    let denoisers: Vec<_> = [pipeline.transformer(), pipeline.transformer_ref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let Some(first) = denoisers.first() else {
+        bail!("this media rank places no denoiser, so it serves no task");
+    };
+    let served = |task: VideoTask| {
+        let named = match task {
+            VideoTask::T2va => nn::VideoTask::TextToVideoAudio,
+            VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
+            VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
+        };
+        denoisers
+            .iter()
+            .any(|denoiser| denoiser.config().tasks.contains(&named))
+    };
+    let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
+    let steps = first.schedule().num_steps()?;
+    let shifts = &first.config().schedule.shifts;
+    // The fewest frames are one whole clip and the tail, and the tail's latent frames are what the
+    // timeline holds past the clip's.
+    let min_frames = CLIP_FRAMES + CLIP_LATENTS;
+    let latent_frames = minimax_h3::packing::video_latent_frames(min_frames)?;
+    let report = DenoiserInfo {
+        tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
+        schedule_points: steps + 1,
+        video_shift: f64::from(shifts.video),
+        audio_shift: f64::from(shifts.audio),
+        frame_rate: FPS,
+        audio_sample_rate: AUDIO_SAMPLE_RATE,
+        frames: FrameClips {
+            min_frames,
+            clip_frames: CLIP_FRAMES,
+            clip_latent_frames: CLIP_LATENTS,
+            tail_latent_frames: latent_frames - CLIP_LATENTS,
+        },
+        canvases: named_canvases(video)?
+            .into_iter()
+            .map(|canvas| ServedCanvas {
+                short_edge: canvas.short_edge,
+                aspect_ratio: canvas.name(),
+                canvas: Canvas {
+                    width: canvas.width,
+                    height: canvas.height,
+                },
+            })
+            .collect(),
+        references: if tasks.contains(&VideoTask::Ref2va) {
+            // The counts the checkpoint documents for a reference request.
+            ReferenceLimits {
+                images: 9,
+                videos: 3,
+                audios: 3,
+                total: 12,
+                image_short_edge: 2048,
+            }
+        } else {
+            ReferenceLimits::default()
+        },
+    };
+    report
+        .validate()
+        .map_err(|reason| anyhow::anyhow!("the denoiser's report: {reason}"))?;
+    Ok(ipc::VideoDenoiserInfo {
+        tasks: tasks
+            .iter()
+            .map(|task| ipc::VideoTaskInfo {
+                name: task.as_str().to_owned(),
+                conditioned: *task != VideoTask::T2va,
+            })
+            .collect(),
+        denoise_steps: steps,
+        description: report.encode().context("encoding the denoiser's report")?,
+    })
+}
+
+/// The named canvases this deployment prepares, each resolution class at each aspect ratio.
+fn named_canvases(
+    video: &daemon::options::VideoOptions,
+) -> Result<Vec<&'static minimax_h3::Canvas>> {
+    use minimax_h3::config::NAMED_CANVASES;
+    let mut canvases: Vec<&'static minimax_h3::Canvas> = Vec::new();
     for edge in &video.resolutions {
         let short_edge: u32 = edge
             .strip_suffix('p')
@@ -1813,9 +1920,7 @@ fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32
                             .join(", ")
                     )
                 })?;
-            if !canvases.contains(&(canvas.width, canvas.height)) {
-                canvases.push((canvas.width, canvas.height));
-            }
+            canvases.push(canvas);
         }
     }
     if canvases.is_empty() {
