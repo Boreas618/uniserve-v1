@@ -1299,6 +1299,61 @@ mod tests {
             "the block's activation is the stepwise recipe: {programs:?}"
         );
 
+        // **The stated keys are the keys a launch binds**, and each of the four below is a defect this
+        // test would have caught: a `programs` statement that drifted from the `forward` beside it, so
+        // that a store built from the statement either held a program nothing launches or missed the
+        // one that runs.
+        //
+        // The activation reads the two halves of one packed `[rows, 2 * 14336]` projection, so both row
+        // strides are twice the width - `projection_halves` keeps the packed tensor's strides, and the
+        // launch passes `gate.strides[0]`.
+        assert!(
+            programs.iter().any(|(name, key)| name == "act_and_mul"
+                && key.contains("gate_stride_28672_value_stride_28672")),
+            "the block's activation reads a packed projection at twice the width: {programs:?}"
+        );
+        // The attention's normalization has **no gate** - `forward` builds it with `None` - so its
+        // gate stride is `0` while the feed-forward's reads the modulation cache. Stating the cache's
+        // stride for both named a key no launch binds.
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm" && key.contains("gate_stride_0_")),
+            "the attention's normalization carries no gate: {programs:?}"
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm"
+                    && key.contains("gate_stride_32256_")),
+            "the feed-forward's normalization is gated: {programs:?}"
+        );
+        // Of the three row gathers, only the per-token **group tag** is i32; the two modulation tables
+        // are gathered at the stack's own type, so a statement that typed them i32 named two keys no
+        // launch binds - and the element type is the one field a row is written with.
+        let gathers = programs
+            .iter()
+            .filter(|(name, _)| name == "logits_gather")
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gathers
+                .iter()
+                .filter(|key| key.contains("dtype_i32"))
+                .count(),
+            1,
+            "only the group tag is i32: {gathers:?}"
+        );
+        assert!(
+            gathers
+                .iter()
+                .any(|key| key.contains("dtype_bf16_columns_96768"))
+                && gathers
+                    .iter()
+                    .any(|key| key.contains("dtype_bf16_columns_10752")),
+            "the modulation tables are gathered at the stack's type: {gathers:?}"
+        );
+
         // A conditioned deployment's modulation cache has four groups where a text-only one has two,
         // so the entries gather is a different program rather than the same one reused.
         let generated = Transformer::programs(
