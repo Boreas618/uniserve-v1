@@ -196,11 +196,20 @@ impl LayerNorm {
     /// The bias is in it, so a layer with and one without are two modules: the epilogue loads a
     /// second vector or it does not.
     pub fn descriptor(&self, input: ops::DType) -> LayerNormDescriptor {
+        Self::descriptor_of(input, self.columns, self.bias.is_some())
+    }
+
+    /// The descriptor a layer normalization over `columns` channels launches, stated without its
+    /// weights.
+    ///
+    /// The bias's presence is a descriptor field (the epilogue loads a second vector or it does not),
+    /// so a walk reads it from the checkpoint's mapping rather than from a loaded layer.
+    pub fn descriptor_of(input: ops::DType, columns: u32, bias: bool) -> LayerNormDescriptor {
         LayerNormDescriptor {
             dtype: input,
-            columns: self.columns,
-            tile: row_tile(self.columns),
-            bias: self.bias.is_some(),
+            columns,
+            tile: row_tile(columns),
+            bias,
             pdl: PDL,
         }
     }

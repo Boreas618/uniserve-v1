@@ -59,6 +59,19 @@ impl PositionInterpolate {
     /// `table` is `[in_side², channels]`, `indices` and `weights` are `[points, 4]` (i32 and f32),
     /// and `out` is `[points, channels]`, the point count the views state. The index and weight
     /// tables are the caller's: they belong to the grid, and one pair serves every image of it.
+    /// The descriptor one resample of this tower's learned table launches: the element type, the
+    /// channels and the learned side. The source points come from the request's tables and only their
+    /// count reaches the kernel.
+    pub fn descriptor(&self) -> Descriptor {
+        Descriptor {
+            dtype: self.datatype,
+            channels: self.channels,
+            in_side: self.in_side,
+            block: BLOCK,
+            pdl: false,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -67,13 +80,7 @@ impl PositionInterpolate {
         weights: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let descriptor = Descriptor {
-            dtype: self.datatype,
-            channels: self.channels,
-            in_side: self.in_side,
-            block: BLOCK,
-            pdl: false,
-        };
+        let descriptor = self.descriptor();
         f.operate::<PositionInterpolateOp>(
             &descriptor,
             ops::position::Args {

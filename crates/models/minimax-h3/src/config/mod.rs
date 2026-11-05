@@ -175,11 +175,13 @@ impl Config {
                             shifts,
                         )?,
                     },
-                    AttentionKind::sparse(
-                        contract.attention.tile,
-                        contract.attention.sparsity,
-                        contract.attention.reference_keep,
-                    )?,
+                    // The export names its backend; the sparse parameters exist exactly when it does.
+                    match contract.attention {
+                        None => AttentionKind::Dense,
+                        Some(sparse) => {
+                            AttentionKind::sparse(sparse.tile, sparse.sparsity, sparse.reference_keep)?
+                        }
+                    },
                 ),
             };
             let clip = Clip::of(&video_vae)?;
@@ -336,7 +338,7 @@ pub(crate) mod tests_support {
     use serde_json::Value;
 
     use super::*;
-    use crate::checkpoint::{Contract, Layout, Sidecars, SparseContract};
+    use crate::checkpoint::{AttentionBackend, Contract, Layout, Sidecars, SparseContract};
 
     /// Parse a fixture's JSON.
     pub(crate) fn json(body: &str) -> Value {
@@ -507,11 +509,12 @@ pub(crate) mod tests_support {
             video_shift: 10.0,
             audio_shift: 3.0,
             schedule: ContractSchedule::Rungs(vec![999, 874, 749, 624, 500, 375, 250, 125]),
-            attention: SparseContract {
+            backend: AttentionBackend::VideoSparseH3,
+            attention: Some(SparseContract {
                 tile: 64,
                 sparsity: 0.8,
                 reference_keep: None,
-            },
+            }),
         }
     }
 
@@ -587,6 +590,32 @@ mod tests {
             AttentionKind::sparse(64, 0.8, None).expect("sparse")
         );
         assert_eq!(denoiser.canvases, Some(&DMD_CANVASES[..]));
+    }
+
+    #[test]
+    fn a_contract_that_states_dense_attention_attends_densely() {
+        // The export states its backend, and the statement decides: a student that kept its
+        // distillation's sparse knobs while naming dense attention must not be read as sparse, because
+        // the inference would be invisible until a device disagreed with it.
+        let mut contract = dmd_contract();
+        contract.backend = crate::checkpoint::AttentionBackend::Dense;
+        contract.attention = None;
+        let layout = Layout {
+            dits: vec![(
+                Dit::Base,
+                vec![
+                    VideoTask::TextToVideoAudio,
+                    VideoTask::FirstLastToVideoAudio,
+                ],
+            )],
+            contract: Some(contract),
+            packed: true,
+        };
+        let mut sidecars = sidecars(&layout);
+        sidecars.scheduler = json(r#"{"shift": 10.0}"#);
+        let config = Config::normalize(&layout, &sidecars).expect("a dense export");
+        let (_, denoiser) = config.only_denoiser().expect("one partition");
+        assert_eq!(denoiser.attention, AttentionKind::Dense);
     }
 
     #[test]

@@ -14,7 +14,7 @@ import rotary_factors as kernels
 
 #: Element types of the factor tables and of the positions.
 DTYPES = {"f32": "fp32", "bf16": "bf16", "f16": "fp16"}
-POSITIONS = {"i32": "i32", "i64": "i64"}
+POSITIONS = {"i32": "i32", "i64": "i64", "f32": "fp32"}
 
 #: The most position axes a sectioned rotation reads, as the operator allows.
 MAX_AXES = 4
