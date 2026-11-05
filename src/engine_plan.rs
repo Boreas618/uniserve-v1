@@ -578,7 +578,6 @@ impl EpochPlan {
                 executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
             })
             .collect();
-
         let config = minimax_h3::Config::read(&self.checkpoint, None)?;
         let hidden = config.text_encoder.hidden_size;
         let text = pipeline.text_encoder().context(
@@ -625,6 +624,29 @@ impl EpochPlan {
         let denoise_set = Buckets::new(warm.iter().map(|candidate| {
             executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view()))
         }));
+        // One audio decode bucket per distinct track those layouts carry. A `t2va` clip is a picture
+        // **and** a soundtrack, so a deployment that captured clips alone would produce video with
+        // no track; the track's extent is the layout the denoiser already states, and two canvases
+        // of one duration collapse onto one track. A deployment that prepares no audio at all states
+        // none, and then no audio runner is bound rather than one that could serve nothing.
+        let audio_buckets: Vec<executor::plan::Bucket> = {
+            let mut seen: Vec<(u32, u32)> = Vec::new();
+            let mut buckets = Vec::new();
+            for bucket in denoise_set.iter() {
+                let executor::plan::Extent::Latents(layout) = bucket.extent else {
+                    continue;
+                };
+                let Some(audio) = layout.audio else {
+                    continue;
+                };
+                if seen.contains(&(audio.frames, audio.channels)) {
+                    continue;
+                }
+                seen.push((audio.frames, audio.channels));
+                buckets.push(executor::plan::Bucket::audio(1, layout));
+            }
+            buckets
+        };
         let denoise = media_denoiser::DenoiserRunner::new(
             Binding {
                 id: RunnerId(1),
@@ -652,11 +674,31 @@ impl EpochPlan {
             decode_set,
             Arc::clone(generation),
         )?;
-        Ok(vec![
+        let mut runners = vec![
             NamedRunner::new(RunnerId(0), Box::new(encoder)),
             NamedRunner::new(RunnerId(1), Box::new(denoise)),
             NamedRunner::new(RunnerId(2), Box::new(decode)),
-        ])
+        ];
+        if !audio_buckets.is_empty() {
+            let audio_decoder = pipeline.audio_decoder().context(
+                "the checkpoint holds no audio decoder, so no track could be decoded and every \
+                 response would be a clip with no sound",
+            )?;
+            let audio_set = Buckets::new(audio_buckets);
+            let audio = executor::runners::AudioDecoderRunner::new(
+                Binding {
+                    id: RunnerId(3),
+                    phases: served_phases(&audio_set),
+                    device,
+                    stream: stream("audio decoder")?,
+                },
+                Arc::clone(audio_decoder),
+                audio_set,
+                Arc::clone(generation),
+            )?;
+            runners.push(NamedRunner::new(RunnerId(3), Box::new(audio)));
+        }
+        Ok(runners)
     }
 
     /// What a media rank advertises of itself: the facts its scheduler is configured from.
