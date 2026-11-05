@@ -1493,9 +1493,6 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixListener;
-    use std::sync::{Arc, Mutex};
-
     use super::*;
     use crate::engine::stand_in::{Answer, Seen, main_processes, process};
     use crate::options::ServeConfig;
