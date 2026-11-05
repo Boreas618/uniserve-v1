@@ -40,6 +40,18 @@ use crate::{Error, Result};
 pub type Nodes = Vec<(&'static str, String, Vec<platform::WalkedNode>)>;
 
 /// One captured graph executable and what it was captured from.
+///
+/// **The fields are declared in the order they must be released, because that is the order dropping
+/// a value follows.** The executable goes first: it is the thing a replay launches, and a graph whose
+/// exec has been destroyed while its nodes are still addressable is a handle nobody may use. The
+/// template follows, and the kernels last, so a kernel stays loaded while a graph that calls it is
+/// still alive - a kernel unloaded under a live graph is the failure mode the platform reports as an
+/// unknown function rather than as a lifetime error.
+///
+/// This is a load-bearing order and not a style: a field added above `exec` changes what a purge
+/// releases first, and 7.3's purge is the step that must not free a graph pool segment while an
+/// executable can still replay over it. A new field goes at the end unless its own release order
+/// says otherwise.
 pub struct Captured {
     /// The executable the stream launches.
     exec: GraphExec,
