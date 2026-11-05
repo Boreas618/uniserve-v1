@@ -1206,7 +1206,15 @@ fn encode(args: &Args) -> Result<(), String> {
                 .map_err(show)?,
         );
     }
-    let text_bytes = pseudo_bytes(text_elements, dtype);
+    // **The prompt rows only, and the rest zeroed.** The prefix is one buffer with three regions,
+    // and the verdict reads the last of them: a pattern written across all three would make the zero
+    // row non-zero and the page would report a write that never happened. A served runner starts the
+    // buffer zeroed too, so this is the request's own initial state rather than a convenience.
+    let mut text_bytes = pseudo_bytes(u64::from(layout.text_rows) * hidden, dtype);
+    text_bytes.resize(
+        usize::try_from(text_elements * dtype.bytes().unwrap_or(4)).map_err(show)?,
+        0,
+    );
     upload_bytes(&stream, text, &text_bytes)?;
     upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
 
