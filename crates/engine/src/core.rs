@@ -2104,6 +2104,42 @@ mod tests {
         assert!(refused.contains("2 ranks"), "{refused}");
     }
 
+    /// A host takes a contiguous block of the ranks, the first hosts take the
+    /// remainder, and a rank's device is its local index on its own host.
+    #[test]
+    fn a_placement_shares_ranks_across_the_named_hosts() {
+        let components = ExecutorGroupConfig::single_component("model", 1);
+
+        let one = ExecutorGroupConfig::placed(
+            &["compute-0".to_owned()],
+            "cpu",
+            2,
+            1,
+            components.clone(),
+        );
+        assert!(
+            one.ranks.iter().all(|rank| rank.host == "compute-0"),
+            "a rank was placed on a host the placement does not name: {:?}",
+            one.ranks
+        );
+
+        // Three ranks over two hosts: the first host takes the remainder, so
+        // every rank is placed and each host's block stays contiguous.
+        let two = ExecutorGroupConfig::placed(
+            &["compute-0".to_owned(), "compute-1".to_owned()],
+            "cuda",
+            3,
+            1,
+            components,
+        );
+        let hosts: Vec<_> = two.ranks.iter().map(|rank| rank.host.as_str()).collect();
+        assert_eq!(hosts, ["compute-0", "compute-0", "compute-1"]);
+        // A device name is the rank's place on its own host, so each host
+        // starts at its first device.
+        let devices: Vec<_> = two.ranks.iter().map(|rank| rank.device.as_str()).collect();
+        assert_eq!(devices, ["cuda:0", "cuda:1", "cuda:0"]);
+    }
+
     /// Entries covering the shapes a placement must validate: one component
     /// parallel over every rank, one dividing its output into units, and one
     /// placed alone.
