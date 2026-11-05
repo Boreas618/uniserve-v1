@@ -717,6 +717,67 @@ impl Epochs {
         *locked(&self.commands) = Some(commands);
     }
 
+    /// Hands the serving epoch's programs to a main process that joined it
+    /// after the epoch was installed — the process a relaunch starts — and
+    /// switches it to them (§2.5, §7.5).
+    ///
+    /// A main process starts with no programs: it resolves no kernel itself,
+    /// and its first request fails every operator it was never given. The
+    /// first start installs them through the same switch (`Leader::install_programs`);
+    /// a relaunched process has to be given the very programs its predecessor
+    /// ran, because the epoch they belong to is already serving and nothing
+    /// else sends them.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no epoch serves, when the daemon has no channel to its main
+    /// processes, and when the process refuses the programs or does not answer.
+    pub fn hand_to(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+    ) -> Result<(), Failure> {
+        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
+            kind: "no_command_channel".to_owned(),
+            reason: "the daemon has no channel to its main processes".to_owned(),
+            device: None,
+        })?;
+        let (_, record) = self.serving().ok_or_else(|| Failure {
+            kind: "no_epoch".to_owned(),
+            reason: "the daemon executes no epoch".to_owned(),
+            device: None,
+        })?;
+        let programs = FilledPrograms {
+            kernels: record.kernels.clone(),
+            policy: record.policy.clone(),
+        };
+        let deployment = Deployment {
+            config: config.clone(),
+            build_config: crate::epoch::BuildConfig::of(config),
+            programs,
+        };
+        let process = crate::engine::control::EpochProcess {
+            host: host.to_owned(),
+            engine,
+        };
+        let mut switch = crate::engine::control::ProgramSwitch::new(
+            &commands,
+            vec![process],
+            Update::new(0, deployment),
+        );
+        switch.precopy(&record.kernels, &record.policy)?;
+        switch.switchover()?;
+        switch.commit()?;
+        tracing::info!(
+            engine,
+            kernels = record.kernels.len(),
+            policy = %record.policy.backend,
+            "the joining main process took the epoch's programs"
+        );
+        Ok(())
+    }
+
     /// The program-layer update in flight, if there is one.
     pub fn program_update(&self) -> Option<ProgramUpdate> {
         locked(&self.program).clone()
@@ -1291,9 +1352,29 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     // declared limits are these bounds, not a second opinion about them. A
     // prefill chunk that the deployment states larger than its token bound is
     // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
+    // The token bound is the deployment's stated budget, and when it states
+    // none the largest shape its captured graphs bound a batch to — the figure
+    // the engine admits a batch under (`proto::catalog::largest_tier`, read by
+    // both ends). Without this fallback a deployment that captures a 512-token
+    // prefill graph and states no budget hands its policy the guest's 8192-token
+    // default, and the mechanism refuses the epoch's limits against the graph's
+    // ceiling after the weights are loaded. A stated bound above the catalog is
+    // refused at load (`ServeConfig::validate`), never clamped here.
     let token_bound = config
         .max_num_batched_tokens
-        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX));
+        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
+        .or_else(|| config.cuda_graph_config.tiers().tokens);
+    // A batch of requests is bounded by the largest captured decode graph, and
+    // the deployment's batch is the smaller of its own and that: a deployment
+    // that leaves the batch at its default means the catalog's figure, and one
+    // that states more than its graphs capture is refused at load
+    // (`ServeConfig::validate`), never clamped here.
+    let max_batch = u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX);
+    let max_batch = config
+        .cuda_graph_config
+        .tiers()
+        .rows
+        .map_or(max_batch, |rows| max_batch.min(rows));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size
@@ -1302,7 +1383,7 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         max_queued_requests: scheduler
             .max_queued_requests
             .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
-        max_batch: u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX),
+        max_batch,
         max_num_batched_tokens: token_bound,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
@@ -1436,6 +1517,52 @@ mod tests {
             generation: None,
             world: 3,
         }
+    }
+
+    /// A main process that joins the serving epoch after it was installed — the
+    /// process a relaunch starts — is handed the epoch's own programs and
+    /// switched to them. A process that starts with none waits for a
+    /// program-layer command nothing sends, and answers 503 to every request,
+    /// so the epoch layer is what gives it them (§2.5, §7.5).
+    #[test]
+    fn a_joining_main_process_takes_the_epochs_own_programs() {
+        use crate::engine::stand_in::{Answer, Seen, main_processes_recording};
+
+        let (commands, seen, carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        epochs.record(0, record());
+        epochs.supervise(commands);
+
+        epochs
+            .hand_to("node-0", 9, &config)
+            .expect("the epoch's programs reached the joining process");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (9, Seen::Precopy),
+                (9, Seen::Switchover(12)),
+                (9, Seen::Commit)
+            ],
+            "the joining process prepares, switches to and commits the epoch's programs"
+        );
+        let carried = carried.lock().unwrap();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            carried[0].1.kernels, 1,
+            "the very operator the epoch's record names, not an empty set"
+        );
+        assert_eq!(carried[0].1.policy, "fcfs");
+
+        // A daemon that executes no epoch has nothing to hand over, and says so
+        // rather than leaving the process waiting.
+        let (commands, _seen, _carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
+        let empty = Epochs::new();
+        empty.supervise(commands);
+        let failure = empty
+            .hand_to("node-0", 9, &config)
+            .expect_err("a daemon with no epoch hands nothing over");
+        assert_eq!(failure.kind, "no_epoch");
     }
 
     /// A program-layer update in flight is the epoch's probation: the record
@@ -1858,11 +1985,13 @@ mod tests {
 
     /// The policy's declared limits are the launch's own bounds: the token
     /// bound the deployment gives its workers is the policy's
-    /// `max_num_batched_tokens`, and an unstated prefill chunk is that same
-    /// bound, so the policy's limits cannot disagree with the workers'
+    /// `max_num_batched_tokens`, or the largest shape its captured graphs bound
+    /// a batch to when it states no budget; an unstated prefill chunk is that
+    /// same bound, so the policy's limits cannot disagree with the workers'
     /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
     /// its bound keeps its own value here — the mechanism refuses it
-    /// (`PolicyError::BadLimits`) rather than this code clamping it.
+    /// (`PolicyError::BadLimits`), and `ServeConfig::validate` refuses it at
+    /// load by the option's name, rather than this code clamping it.
     #[test]
     fn the_policys_limits_are_the_launchs_own_token_bound() {
         let mut config = ServeConfig::default();
@@ -1888,8 +2017,70 @@ mod tests {
             toml::Value::Integer(16384)
         );
 
-        // A deployment that states no token bound states no limit, and the
-        // mechanism's ceilings are the workers' own.
+        // A deployment that states a graph catalog and no budget gives its
+        // policy the largest shape the catalog bounds a batch to: the same
+        // figure the engine admits a batch under, so a policy that states no
+        // bound of its own never declares more than the engine built for.
+        let mut config = ServeConfig::default();
+        config.cuda_graph_config.prefill_token_sizes = Some(vec![
+            NonZeroU32::new(128).unwrap(),
+            NonZeroU32::new(512).unwrap(),
+        ]);
+        config.cuda_graph_config.decode_batch_sizes = Some(vec![
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(8).unwrap(),
+        ]);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(512),
+            "an unstated budget is the largest shape the captured graphs bound a batch to"
+        );
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(512),
+            "and an unstated chunk is that same bound"
+        );
+
+        // The batch the policy may hold follows the same catalog: the
+        // deployment's own batch, or the largest decode graph when it states
+        // none, and a catalog that grows with a new world moves the derived
+        // figure with it.
+        let mut config = ServeConfig::default();
+        config.cuda_graph_config.decode_batch_sizes = Some(vec![
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            NonZeroU32::new(4).unwrap(),
+            NonZeroU32::new(8).unwrap(),
+        ]);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(8),
+            "an unstated batch is the largest decode graph the deployment captured"
+        );
+        config
+            .cuda_graph_config
+            .decode_batch_sizes
+            .as_mut()
+            .unwrap()
+            .push(NonZeroU32::new(16).unwrap());
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(16),
+            "and it moves with the catalog a new world captures"
+        );
+        // A batch the deployment states below the catalog keeps its own value.
+        config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(4)
+        );
+
+        // A deployment that states no token bound and no catalog states no
+        // limit, and the mechanism's ceilings are the workers' own.
         let config = ServeConfig::default();
         let programs = FilledPrograms::of(&config);
         assert!(

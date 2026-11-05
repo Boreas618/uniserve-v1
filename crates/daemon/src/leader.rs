@@ -2064,6 +2064,42 @@ impl Replica {
             tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
         );
         reload_adapters(self, &client).await;
+        // The epoch's programs, before this process serves: a relaunched main
+        // process starts with none, and the epoch they belong to was installed
+        // for its predecessor, so nothing else sends them. Without this the
+        // process waits on a program-layer command that never comes and
+        // answers 503 to every request (§2.5, §7.5).
+        if let Some(epochs) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+            .map(|driver| Arc::clone(driver.epochs()))
+        {
+            let config = locked(&self.config).clone();
+            let host = config.host_identity.clone();
+            let engine = client
+                .engine()
+                .context("the relaunched engine states no number")?;
+            let handing = Arc::clone(&epochs);
+            let handed =
+                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+                Ok(joined) => joined
+                    .context("handing the epoch's programs to the relaunched engine")?
+                    .map_err(|failure| {
+                        anyhow::anyhow!(
+                            "the relaunched engine did not take the epoch's programs ({}): {}",
+                            failure.kind,
+                            failure.reason
+                        )
+                    })?,
+                Err(_) => anyhow::bail!(
+                    "the relaunched engine took the epoch's programs in neither Precopy, \
+                     Switchover nor Commit within {} s",
+                    SWITCH_TIMEOUT.as_secs()
+                ),
+            }
+        }
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
         self.start_standby();
@@ -2261,6 +2297,51 @@ impl Replica {
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
+        // The epoch's programs first, then the promotion: a standby parks
+        // before any `Precopy` names a generation, so it holds none of the
+        // epoch's programs when it is promoted (§2.5, §7.5). A promotion that
+        // named it serving with no programs would answer 503 to every request
+        // — the same silence a relaunched process produced — so the daemon
+        // hands them over before it moves the frontend, and the engine's own
+        // refusal of a programless promotion is a guard rather than the only
+        // defence.
+        if let Some(epochs) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+            .map(|driver| Arc::clone(driver.epochs()))
+        {
+            let config = locked(&self.config).clone();
+            let host = config.host_identity.clone();
+            let Some(engine) = standby.client.engine() else {
+                warn!(
+                    generation = standby.generation,
+                    "the standby states no engine number; the engine is relaunched"
+                );
+                return None;
+            };
+            let handing = Arc::clone(&epochs);
+            let handed =
+                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
+            let took = match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+                Ok(joined) => match joined {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(failure)) => Err(format!("{}: {}", failure.kind, failure.reason)),
+                    Err(error) => Err(format!("the handover did not complete: {error}")),
+                },
+                Err(_) => Err(format!(
+                    "it answered nothing within {} s",
+                    SWITCH_TIMEOUT.as_secs()
+                )),
+            };
+            if let Err(reason) = took {
+                warn!(
+                    generation = standby.generation,
+                    "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
+                );
+                return None;
+            }
+        }
         match standby.client.promote(Vec::new(), false, true).await {
             Ok(()) => {
                 self.hold.serve(Arc::clone(&standby.client));
@@ -2955,6 +3036,9 @@ mod tests {
     /// the other available through the same public service.
     #[tokio::test]
     async fn concurrent_requests_spread_over_engine_cores() {
+        // Every wait in this test is bounded and named: an unbounded wait here
+        // reads as a suite that hung, with no line saying which of the seven
+        // answers the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
             let core = sim_core(EngineConfig::sim("sim-model"), SimEngine::new());
@@ -2972,39 +3056,77 @@ mod tests {
         // first is still in flight when the second is routed.
         let mut streams = Vec::new();
         let mut serving = Vec::new();
-        for _ in 0..2 {
-            let (stream, core) = engine.submit(text_request()).await.expect("submit request");
+        for index in 0..2 {
+            let (stream, core) = within(
+                10,
+                &format!("the {} request's admission", index + 1),
+                engine.submit(text_request()),
+            )
+            .await
+            .expect("submit request");
             streams.push(stream);
             serving.push(core);
         }
         assert_ne!(serving[0], serving[1]);
-        for stream in &mut streams {
-            while let Some(event) = stream.next().await {
-                if let Event::Finished { reason, .. } = event {
-                    assert_eq!(reason, proto::request::FinishReason::Eos);
-                    break;
+        for (index, stream) in streams.iter_mut().enumerate() {
+            within(10, &format!("the {} request's batch", index + 1), async {
+                while let Some(event) = stream.next().await {
+                    if let Event::Finished { reason, .. } = event {
+                        assert_eq!(reason, proto::request::FinishReason::Eos);
+                        break;
+                    }
                 }
-            }
+            })
+            .await;
         }
         let lost = Arc::clone(&clients[0]);
-        tokio::task::spawn_blocking(move || {
-            lost.shutdown();
-            lost.await_exit(Duration::from_secs(5)).unwrap();
-        })
+        within(
+            15,
+            "the lost replica's teardown",
+            tokio::task::spawn_blocking(move || {
+                lost.shutdown();
+                lost.await_exit(Duration::from_secs(5)).unwrap();
+            }),
+        )
         .await
         .unwrap();
         assert!(engine.is_healthy());
-        let (mut stream, replica) = engine.submit(text_request()).await.unwrap();
+        let (mut stream, replica) = within(
+            10,
+            "the request after the lost replica",
+            engine.submit(text_request()),
+        )
+        .await
+        .unwrap();
         assert_eq!(replica, 1);
         let mut finished = false;
-        while let Some(event) = stream.next().await {
-            if let Event::Finished { reason, .. } = event {
-                assert_eq!(reason, proto::request::FinishReason::Eos);
-                finished = true;
+        within(10, "the surviving replica's batch", async {
+            while let Some(event) = stream.next().await {
+                if let Event::Finished { reason, .. } = event {
+                    assert_eq!(reason, proto::request::FinishReason::Eos);
+                    finished = true;
+                }
             }
-        }
+        })
+        .await;
         assert!(finished);
-        engine.shutdown().await.expect("shutdown replica");
+        within(10, "the replica's shutdown", engine.shutdown())
+            .await
+            .expect("shutdown replica");
+    }
+
+    /// Awaits `future`, failing by name when it does not answer within
+    /// `seconds`: a test whose unbounded wait hangs says which answer it never
+    /// got instead of outliving the suite's bound in silence.
+    async fn within<T>(
+        seconds: u64,
+        what: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(Duration::from_secs(seconds), future).await {
+            Ok(value) => value,
+            Err(_) => panic!("{what} did not answer within {seconds} s"),
+        }
     }
 
     /// Simulated executor whose teardown lasts until another task releases

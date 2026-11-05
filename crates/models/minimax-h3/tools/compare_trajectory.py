@@ -74,6 +74,15 @@ LAYOUT_FIELDS = (
 )
 
 
+# The grid each side evaluated and how much of it. Two sides can agree on every layout field and
+# still have run different schedules - a FastH3 student's `blocks` grid against the base `uniform`
+# one, or eight evaluations against forty-nine - and their trajectories then differ everywhere for a
+# reason that is not arithmetic. These fields are required of this side, whose producer states them,
+# and read where present on the reference's: a statement that is absent is printed as absent rather
+# than taken for agreement.
+SCHEDULE_FIELDS = ("schedule", "evaluations", "num_steps")
+
+
 def layout(directory: pathlib.Path, side: str) -> dict[str, object]:
     """The layout ``side`` states it ran, refused by name when it states none."""
     path = directory / "layout.json"
@@ -101,7 +110,32 @@ def arrangements(ref: pathlib.Path, got: pathlib.Path) -> tuple[dict, dict]:
     """Both sides' layout statements, refused when they are not the same arrangement."""
     theirs = layout(ref, "reference")
     ours = layout(got, "this side")
+    unstated = [name for name in SCHEDULE_FIELDS if name not in ours]
+    if unstated:
+        raise SystemExit(
+            f"this side's layout statement omits {', '.join(unstated)}: a trajectory whose grid"
+            " and step count are not stated cannot be shown to be the same schedule as the"
+            " other side's, so it is refused rather than tabulated"
+        )
+    # Half a statement is worse than none: a reference tree that names its grid but not how much of
+    # it ran would be read as agreeing about the step count. Both producers state all three
+    # (`dump_denoiser.py` since `7e2571c07`), so a partial one is refused as a stale or hand-edited
+    # tree rather than completed by assumption.
+    unstated_theirs = [name for name in SCHEDULE_FIELDS if name not in theirs]
+    if unstated_theirs:
+        raise SystemExit(
+            f"the reference's layout statement omits {', '.join(unstated_theirs)}: a trajectory"
+            " whose grid and step count are not stated cannot be shown to be the same schedule as"
+            " this one's, and an absent statement is not a matching one - the reference producer"
+            " (`dump_denoiser.py`) states schedule, evaluations and num_steps, so a tree without"
+            " them predates that and is regenerated rather than compared"
+        )
     differ = [name for name in LAYOUT_FIELDS if theirs[name] != ours[name]]
+    # The schedule: refused where both sides state it and they disagree, which is the pair a
+    # student's block grid and the base uniform grid make.
+    for name in SCHEDULE_FIELDS:
+        if name in theirs and theirs[name] != ours[name]:
+            differ.append(name)
     if differ:
         raise SystemExit(
             "the two sides ran different layouts, so a difference between their trajectories"
@@ -121,7 +155,8 @@ def layout_line(side: str, stated: dict[str, object]) -> str:
         f"layout  {side:<9} {stated['packed_rows']} packed rows = {stated['video_rows']} video"
         f" + {stated['audio_rows']} audio + {stated['text_rows']} text"
         f" + {stated['condition_rows']} condition ({stated['frames']} frames,"
-        f" canvas {height}x{width})"
+        f" canvas {height}x{width}, {stated['schedule']} grid"
+        f" {stated['evaluations']} of {stated['num_steps']} evaluations)"
     )
 
 
@@ -220,8 +255,20 @@ def movement(previous: np.ndarray, current: np.ndarray) -> float:
     )
 
 
-def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
-    """Pair two trees and report every evaluation, refusing what it cannot interpret."""
+ONE_SIDE = "reference not run"
+
+
+def compare(ref: pathlib.Path | None, got: pathlib.Path) -> dict[str, object]:
+    """Pair two trees and report every evaluation, refusing what it cannot interpret.
+
+    `ref` may be `None`, which is the honest form of a table whose reference has not been
+    produced yet: this side's evaluations are listed with every comparison column reading
+    `reference not run`, so the page states what exists and what does not instead of being
+    absent until both sides do. The paired reading is unchanged - a reference that is named
+    but unreadable, or that disagrees about the arrangement, is still refused by name.
+    """
+    if ref is None:
+        return _one_side(got)
     their_layout, our_layout = arrangements(ref, got)
     theirs, ours = evaluations(ref), evaluations(got)
     missing_ours = sorted(set(theirs) - set(ours))
@@ -299,6 +346,42 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
     return report
 
 
+def _one_side(got: pathlib.Path) -> dict[str, object]:
+    """This side's evaluations, with the reference's columns unmeasured and named so."""
+    # A one-sided table still has to be about a schedule: a trajectory whose grid and step count
+    # are unstated could not be paired with any reference later, so the statement is required now
+    # rather than discovered when the reference arrives.
+    our_layout, _ = arrangements(got, got)
+    ours = evaluations(got)
+    if not ours:
+        raise SystemExit(
+            f"{got} holds no trajectory: a page with neither side run is written by naming the"
+            " command that produces each, not by tabulating nothing"
+        )
+    report: dict[str, object] = {
+        "ref": ONE_SIDE,
+        "got": str(got),
+        "layout": {"ref": ONE_SIDE, "got": our_layout},
+        "modalities": {},
+    }
+    for modality in MODALITIES:
+        keys = sorted(index for name, index in ours if name == modality)
+        if not keys:
+            continue
+        report["modalities"][modality] = [
+            {
+                "evaluation": index,
+                "state": ONE_SIDE,
+                "got_written": written(ours[(modality, index)]),
+                # The sample's own element count, which is what tells a reader whether this side
+                # wrote the trajectory it claims to: the numbers beside it are unmeasured.
+                "elements": int(load(ours[(modality, index)]).size),
+            }
+            for index in keys
+        ]
+    return report
+
+
 def table(report: dict[str, object]) -> str:
     """The report as the table a caller reads."""
     # The arrangement first: a reader who sees two different row counts on the first two lines has
@@ -313,6 +396,12 @@ def table(report: dict[str, object]) -> str:
     )
     for modality, rows in report["modalities"].items():
         for row in rows:
+            if row.get("state") == ONE_SIDE:
+                lines.append(
+                    f"{modality:<9} e{row['evaluation']:<10} {ONE_SIDE:<13}"
+                    f" {ONE_SIDE:<12} {ONE_SIDE:<8} {ONE_SIDE:<6} {row['elements']}"
+                )
+                continue
             lines.append(
                 f"{modality:<9} e{row['evaluation']:<10} {row['rel_l2']:<13.6e}"
                 f" {row['max_abs']:<12.6e} {row['cosine']:<8.5f}"
@@ -361,8 +450,11 @@ def self_test() -> int:
             "audio_rows": 0,
             "packed_rows": 8,
         }
+        # `stated` is the layout alone, which is what the mismatch probes vary; `full` is what a
+        # producer writes, grid and step count included.
+        full = dict(stated, schedule="uniform", evaluations=3, num_steps=3)
         for side in (ref, got):
-            (side / "layout.json").write_text(json.dumps(stated) + "\n")
+            (side / "layout.json").write_text(json.dumps(full) + "\n")
         rng = np.random.default_rng(0)
         sample = rng.standard_normal((4, 8)).astype(np.float32)
         for index in range(3):
@@ -402,11 +494,67 @@ def self_test() -> int:
             ),
             (
                 "and its line names the segments",
-                layout_line("this side", stated)
+                layout_line("this side", full)
                 == "layout  this side 8 packed rows = 4 video + 0 audio + 4 text + 0 condition"
-                " (22 frames, canvas 256x256)",
+                " (22 frames, canvas 256x256, uniform grid 3 of 3 evaluations)",
             ),
         ]
+        # Two sides that agree on every layout field and disagree on the grid are refused: a
+        # FastH3 student's block grid against the base uniform one differs everywhere, and that is
+        # not a number about arithmetic.
+        student = dict(stated, schedule="blocks", evaluations=3, num_steps=8)
+        base = dict(stated, schedule="uniform", evaluations=3, num_steps=3)
+        (got / "layout.json").write_text(json.dumps(student) + "\n")
+        (ref / "layout.json").write_text(json.dumps(base) + "\n")
+        try:
+            arrangements(ref, got)
+            checks.append(("a grid mismatch is refused", False))
+        except SystemExit as error:
+            checks.append(
+                ("a grid mismatch is refused", "schedule" in str(error))
+            )
+        # A reference tree that predates its producer stating the grid is refused by name: an
+        # absent statement is not a matching one.
+        (ref / "layout.json").write_text(json.dumps(stated) + "\n")
+        (got / "layout.json").write_text(json.dumps(student) + "\n")
+        try:
+            arrangements(ref, got)
+            checks.append(("an unstated reference grid is refused", False))
+        except SystemExit as error:
+            checks.append(
+                (
+                    "an unstated reference grid is refused",
+                    "omits schedule" in str(error),
+                )
+            )
+        # Half a statement is refused too: a tree naming its grid but not its step count would be
+        # read as agreeing about the steps.
+        (ref / "layout.json").write_text(
+            json.dumps(dict(stated, schedule="blocks")) + "\n"
+        )
+        try:
+            arrangements(ref, got)
+            checks.append(("a partial reference statement is refused", False))
+        except SystemExit as error:
+            checks.append(
+                (
+                    "a partial reference statement is refused",
+                    "omits evaluations" in str(error),
+                )
+            )
+        # And this side must state its own grid: a trajectory that does not say what it ran is
+        # refused rather than tabulated.
+        (ref / "layout.json").write_text(json.dumps(full) + "\n")
+        (got / "layout.json").write_text(json.dumps(stated) + "\n")
+        try:
+            arrangements(ref, got)
+            checks.append(("this side's own grid is required", False))
+        except SystemExit as error:
+            checks.append(
+                ("this side's own grid is required", "schedule" in str(error))
+            )
+        for side in (ref, got):
+            (side / "layout.json").write_text(json.dumps(full) + "\n")
         # A non-finite element is refused by name rather than reported as a number.
         broken = sample.copy()
         broken[3] = np.nan
@@ -477,7 +625,7 @@ def self_test() -> int:
         # arithmetic.
         (got / "layout.json").write_text(
             json.dumps(
-                dict(stated, condition_rows=192, packed_rows=200),
+                dict(full, condition_rows=192, packed_rows=200),
             )
             + "\n"
         )
@@ -529,9 +677,10 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
-    if args.ref is None or args.got is None:
+    if args.got is None:
         parser.error(
-            "--ref and --got name the two trees, or --self-test proves the harness"
+            "--got names this model's tree; --ref names the reference's, or is omitted to write"
+            " the table with every comparison column reading `reference not run`"
         )
     report = compare(args.ref, args.got)
     print(table(report))
