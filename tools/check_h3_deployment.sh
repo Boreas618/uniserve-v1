@@ -29,7 +29,7 @@ canvas=${3:-768x768}
 clip=${4:-124}
 
 here=$(cd "$(dirname "$0")/.." && pwd)
-fixture=$here/notes/programs/minimax-h3-deployment-keys.txt
+fixture=$here/notes/programs/minimax-h3-keys.txt
 sparse_fixture=$here/notes/programs/minimax-h3-sparse-keys.txt
 gaps=$here/crates/models/minimax-h3/tools/walk_gaps.py
 manifests=$here/crates/models/minimax-h3/tools/check_encoder_manifests.py

@@ -54,7 +54,7 @@ CONSTANT = re.compile(
 # The ladder the generator states when no `--frames` is given:
 # `const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, .., MAX_FRAMES];`. A rung written
 # as a constant's name is resolved from `config/mod.rs`, never typed here.
-FIXTURE = pathlib.Path("notes/programs/minimax-h3-deployment-keys.txt")
+FIXTURE = pathlib.Path("notes/programs/minimax-h3-keys.txt")
 AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
 
 # The deployment's own ladder is `Deployment::generated`, in the crate: the
