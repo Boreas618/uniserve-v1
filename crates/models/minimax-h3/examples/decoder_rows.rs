@@ -161,9 +161,13 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         let input = Linear::new(projection, Some(bias), WeightOrder::NxK)
             .map_err(|error| error.to_string())?;
+        // The decoder serves the clip's raster: `load` states canvases in pixels, and this example
+        // knows the clip's latent extents.
+        let spatial = config.spatial_compression();
+        let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
         let decoder = VideoDecoder::load(
             &config,
-            canvas,
+            &[raster],
             AttentionKind::Dense,
             DType::F32,
             input,
@@ -171,7 +175,9 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
 
-        let scratch = decoder.scratch(&f).map_err(|error| error.to_string())?;
+        let scratch = decoder
+            .scratch(&f, &canvas)
+            .map_err(|error| error.to_string())?;
         let latents = f
             .arena()
             .tensor(
@@ -194,7 +200,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         let mut recorded = Recorded::default();
         capture::set_sink(Some(&mut recorded));
-        let run = decoder.decode(&f, latents, positions, out, &scratch);
+        let run = decoder.decode(&f, &canvas, latents, positions, out, &scratch);
         capture::set_sink(None);
         run.map_err(|error| format!("{height}x{width}: {error}"))?;
         let rows = distinct(&recorded);
@@ -353,9 +359,11 @@ fn fit_arenas(
                 .map_err(|error| error.to_string())?;
             let input = Linear::new(projection, Some(bias), WeightOrder::NxK)
                 .map_err(|error| error.to_string())?;
+            let spatial = config.spatial_compression();
+            let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
             let decoder = VideoDecoder::load(
                 config,
-                clip_canvas,
+                &[raster],
                 AttentionKind::Dense,
                 dtype,
                 input,

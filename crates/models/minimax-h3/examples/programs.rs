@@ -25,7 +25,7 @@ use minimax_h3::denoiser::Denoiser;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
-use minimax_h3::partition::Partition;
+use minimax_h3::partition::{Partition, Projection, Ulysses};
 use minimax_h3::programs::{Deployment, Types};
 use minimax_h3::tiled_encode::ClipEncoder;
 use minimax_h3::video_vae::VideoDecoder;
@@ -246,7 +246,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let config = minimax_h3::Config::read(&root, None)?;
-    let partition = Partition::serving(&config, task, ulysses.unwrap_or(1), degree, 0, 0)?;
+    let partition = Partition::serving(
+        &config,
+        task,
+        Ulysses::of(ulysses.unwrap_or(1), Projection::Exchange),
+        degree,
+        0,
+        0,
+    )?;
     // The sparse chain composes each layer's compression across the exchange's members, and that
     // exchange is not written: the model refuses it by name at load, and the walk refuses the same
     // deployment here rather than printing rows that read as served.
