@@ -129,7 +129,7 @@ pub struct Scene<'a> {
     pub blended: TensorView,
 }
 
-/// The stitcher's ring and hand-off: the buffers [`Scene::encode`] takes after the encoder's set.
+/// The stitcher's ring and hand-off: the buffers `Scene::encode` takes after the encoder's set.
 ///
 /// Two decoded rows of a two-row ring, one block per tile column, and one more block that a tile whose
 /// fade is both ways hands to its second blend - `2 * columns + 1` blocks in all, in the order

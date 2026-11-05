@@ -245,7 +245,7 @@ impl Deployment {
     ///
     /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
     /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
-    /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
+    /// the table itself (`Deployment::tower_table`) until the tower takes the grid.
     /// The prompt lengths a walk states.
     ///
     /// The tower is stated **at the longest of them**, because its learned position table is compiled

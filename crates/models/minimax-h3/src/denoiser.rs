@@ -28,7 +28,7 @@
 //! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
 //! other's: the text encoder's own features and the zero row are the encoder stage's, and then
 //! [`Denoiser::encode_conditions`] projects each condition's own rows into the condition rows, and
-//! [`Denoiser::prepare_conditioning`] refines the prompt's rows in place. The condition projection
+//! `Denoiser::prepare_conditioning` refines the prompt's rows in place. The condition projection
 //! needs the request's declared condition shapes and therefore the stage that holds the request;
 //! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
 //!
@@ -36,8 +36,8 @@
 //!
 //! Everything a request changes arrives as device tables the executor allocates: the rotary
 //! coordinates, the modulation tags, the timestep groups, the prefix index of every packed row, the
-//! AdaLN row each row reads, and the step index. [`Layouts::prepare_state`] writes their host bytes
-//! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
+//! AdaLN row each row reads, and the step index. `Layouts::prepare_state` writes their host bytes
+//! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
 use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, VideoRequest};
@@ -476,7 +476,7 @@ impl Layouts {
         Ok(packing)
     }
 
-    /// The tables one request of `layout` needs, in the order [`Layouts::prepare_state`] fills them.
+    /// The tables one request of `layout` needs, in the order `Layouts::prepare_state` fills them.
     ///
     /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
     /// share one set. Every table is one the forward reads; none is a host value the executor would
@@ -787,7 +787,7 @@ impl Layouts {
         Ok(())
     }
 
-    /// Write one request's tables, in [`Layouts::state_tables`]' order.
+    /// Write one request's tables, in `Layouts::state_tables`' order.
     ///
     /// The bytes are host bytes in each table's own element type: the executor uploads them once
     /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
@@ -2615,7 +2615,7 @@ impl Denoiser {
     ///
     /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
     /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
-    /// [`Denoiser::prepare_conditioning`] with the conditioned path's diagnostic views.
+    /// `Denoiser::prepare_conditioning` with the conditioned path's diagnostic views.
     ///
     /// **The served arm is this one with no trace**, so a page a harness writes through it is the
     /// arithmetic a request runs, launch for launch. A trace is the design's numeric diagnosis
