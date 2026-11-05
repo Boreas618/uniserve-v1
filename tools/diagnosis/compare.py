@@ -62,11 +62,25 @@ def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, object]:
         "max_abs": float(np.max(np.abs(difference)))
         if difference.size
         else 0.0,
+        "worst_index": _worst_index(difference, np.shape(got)),
         "cosine": cosine,
         "elements": float(difference.size),
         "ref_norm": norm_b,
         "exact": bool(np.array_equal(a, b)),
     }
+
+
+def _worst_index(difference: np.ndarray, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The index of the largest absolute difference, in the tensor's own shape.
+
+    A maximum says ``somewhere``; the index says where. It is the column that localises a defect to
+    one token, one channel or one row, and it belongs beside the maximum rather than in a second run:
+    a report that names a block is the point of design 10, and a block is not localised by a scalar.
+    """
+    if difference.size == 0:
+        return ()
+    flat = int(np.argmax(np.abs(difference)))
+    return tuple(int(part) for part in np.unravel_index(flat, shape))
 
 
 def _files(root: pathlib.Path) -> dict[str, pathlib.Path]:
@@ -115,12 +129,15 @@ def _table(result: dict[str, object]) -> str:
     tensors: dict[str, dict[str, float]] = result["tensors"]  # type: ignore[assignment]
     ordered = sorted(tensors.items(), key=lambda item: -item[1]["rel_l2"])
     lines = [
-        f"{'tensor':<48}{'rel_l2':>12}{'max_abs':>14}{'cosine':>12}{'exact':>7}"
+        f"{'tensor':<44}{'rel_l2':>12}{'max_abs':>14}{'worst':>16}"
+        f"{'cosine':>12}{'exact':>7}"
     ]
     for name, values in ordered:
+        index = values.get("worst_index", ())
+        worst = "(" + ", ".join(str(part) for part in index) + ")"
         lines.append(
-            f"{name:<48}{values['rel_l2']:>12.3e}"
-            f"{values['max_abs']:>14.3e}{values['cosine']:>12.6f}"
+            f"{name:<44}{values['rel_l2']:>12.3e}"
+            f"{values['max_abs']:>14.3e}{worst:>16}{values['cosine']:>12.6f}"
             f"{'yes' if values['exact'] else 'no':>7}"
         )
     if result["missing_in_got"]:
