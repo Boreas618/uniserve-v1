@@ -467,66 +467,86 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   // or the first proposal.
   void* plan = nullptr;
   if (built) {
-    void* heuristic = nullptr;
-    built = make(kDescriptorEngineHeuristic, &heuristic) &&
-            set(heuristic, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1, &graph) &&
-            set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &kHeuristicModeA) &&
-            finalize(heuristic, "the heuristic");
-    // **Two of the heuristic's five attributes were never stated.** `SM_COUNT_TARGET` is the
-    // device's multiprocessor count and `DEVICEPROP` names the device the plan is for; cuDNN
-    // treats both as optional, and an engine that needs a device property the request does not
-    // name is not proposed at all - so a shape can have an engine and still come back with three
-    // empty lists. Both are stated best-effort: a cuDNN that refuses either still asks, and the
-    // refusal records which it accepted, because a sentence about an empty list cannot say whether
-    // the request reached the library the way the caller meant.
+    // **One heuristic descriptor per mode.** An attribute cannot be reset once a descriptor is
+    // finalized, so re-asking a finalized heuristic for a second list answers nothing - and
+    // "nothing" is exactly the answer this loop exists to tell apart from "no engine". Each mode
+    // builds its own descriptor, and the refusal records what each one said: a list that could not
+    // be asked for and a list that came back empty have different cures.
     bool sm_counted = false;
     bool device_named = false;
     int32_t ordinal = 0;
     int multiprocessors = 0;
-    if (built && cudaGetDevice(&ordinal) == cudaSuccess &&
+    void* properties = nullptr;
+    if (cudaGetDevice(&ordinal) == cudaSuccess &&
         cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, ordinal) ==
             cudaSuccess &&
         multiprocessors > 0) {
-      int64_t target = multiprocessors;
-      sm_counted =
-          library.backend_set(heuristic, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
-          kSuccess;
       int64_t device_id = ordinal;
-      void* properties = nullptr;
       const bool made =
           library.backend_create(kDescriptorDeviceProp, &properties) == kSuccess &&
           library.backend_set(properties, kAttrDevicePropDeviceId, kTypeInt64, 1, &device_id) ==
               kSuccess &&
           library.backend_finalize(properties) == kSuccess;
-      device_named = made && library.backend_set(heuristic, kAttrEngineHeurDeviceProp,
-                                                 kTypeBackendDescriptor, 1, &properties) ==
-                                 kSuccess;
-      if (!device_named && properties != nullptr) {
-        library.backend_destroy(properties);
+      if (!made) {
+        if (properties != nullptr) {
+          library.backend_destroy(properties);
+        }
+        properties = nullptr;
       }
     }
+    void* heuristic = nullptr;
     void* configs[kMaxEngineConfigs] = {};
     int64_t count = 0;
     bool listed = false;
-    if (built) {
-      listed = library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor,
-                                   kMaxEngineConfigs, &count, configs) == kSuccess &&
-               count > 0;
+    char tried[160] = {};
+    const int32_t modes[3] = {kHeuristicModeA, kHeuristicModeB, kHeuristicModeFallback};
+    const char* names[3] = {"shortlist", "exhaustive", "fallback"};
+    for (int32_t at_mode = 0; built && at_mode < 3 && !listed; ++at_mode) {
+      const int32_t mode = modes[at_mode];
+      char said[48];
+      void* asked = nullptr;
+      bool ready = library.backend_create(kDescriptorEngineHeuristic, &asked) == kSuccess;
+      ready = ready &&
+              library.backend_set(asked, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1,
+                                  &graph) == kSuccess;
+      if (ready && multiprocessors > 0) {
+        int64_t target = multiprocessors;
+        sm_counted = sm_counted ||
+                     library.backend_set(asked, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
+                         kSuccess;
+      }
+      if (ready && properties != nullptr) {
+        device_named =
+            device_named ||
+            library.backend_set(asked, kAttrEngineHeurDeviceProp, kTypeBackendDescriptor, 1,
+                                &properties) == kSuccess;
+      }
+      ready = ready &&
+              library.backend_set(asked, kAttrEngineHeurMode, kTypeHeurMode, 1, &mode) ==
+                  kSuccess &&
+              library.backend_finalize(asked) == kSuccess;
+      if (!ready) {
+        std::snprintf(said, sizeof(said), "%s unbuilt, ", names[at_mode]);
+      } else {
+        int64_t got = 0;
+        const bool answered = library.backend_get(asked, kAttrEngineHeurResults,
+                                                  kTypeBackendDescriptor, kMaxEngineConfigs, &got,
+                                                  configs) == kSuccess;
+        if (answered && got > 0) {
+          listed = true;
+          count = got;
+          heuristic = asked;
+          break;
+        }
+        std::snprintf(said, sizeof(said), answered ? "%s none, " : "%s unanswered, ",
+                      names[at_mode]);
+      }
+      if (asked != nullptr) {
+        library.backend_destroy(asked);
+      }
+      std::strncat(tried, said, sizeof(tried) - std::strlen(tried) - 1);
     }
-    // **A shortlist with no entry is when the exhaustive list earns its cost.** Mode A is cuDNN's
-    // performance shortlist and mode B is every engine the library implements for the graph; a
-    // shape with no shortlist entry can still have an engine, and the video VAE's first
-    // convolution at [1, 3, 19, 258, 258] f32 is one. The shape is planned once per program load,
-    // so the price is a build's, not a call's.
-    const int32_t wider[2] = {kHeuristicModeB, kHeuristicModeFallback};
-    for (int32_t at_mode = 0; at_mode < 2 && built && !listed; ++at_mode) {
-      int32_t mode = wider[at_mode];
-      count = 0;
-      listed = set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &mode) &&
-               library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor,
-                                   kMaxEngineConfigs, &count, configs) == kSuccess &&
-               count > 0;
-    }
+    (void)names;
     if (built && !listed) {
       // **The geometry is checked here, before the library is blamed.** cuDNN answers an implied
       // output shape that disagrees with the stated one with no engines at all, not with a geometry
@@ -553,14 +573,19 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       char why[512];
       std::snprintf(
           why, sizeof(why),
-          "cuDNN proposes no engine for this convolution: %s, x [%lld %lld %lld %lld %lld] "
-          "strides [%lld %lld %lld %lld %lld] type %d, w [%lld %lld %lld %lld %lld] type %d, "
-          "y [%lld %lld %lld %lld %lld] type %d, kernel [%lld %lld %lld] stride [%lld %lld %lld] "
-          "padding [%lld %lld %lld] dilation [%lld %lld %lld], tf32 %d, channels_last %d, "
-          "geometry %s (the input, weight and geometry imply [%lld %lld %lld]), sm_count_target "
-          "%s, device_property %s - the shortlist, the exhaustive list and the fallback list all "
-          "name none",
-          transposed ? "backward-data" : "forward", static_cast<long long>(x_dims[0]),
+          // The two things that decide the cure come first, so that a message truncated by its own
+          // room still says which lists were asked and whether the geometry agrees: `asked` names
+          // each list and what it said, and `geometry` compares the stated output with the one the
+          // input, weight and geometry imply. The graph follows, because a reader with only the
+          // verdict has to guess which shape cuDNN would not take.
+          "cuDNN proposes no engine for this convolution: %s, asked %s, geometry %s (imply [%lld "
+          "%lld %lld]); x [%lld %lld %lld %lld %lld] strides [%lld %lld %lld %lld %lld] type %d, "
+          "w [%lld %lld %lld %lld %lld] type %d, y [%lld %lld %lld %lld %lld] type %d, kernel "
+          "[%lld %lld %lld] stride [%lld %lld %lld] padding [%lld %lld %lld] dilation [%lld %lld "
+          "%lld], tf32 %d, channels_last %d, sm_count_target %s, device_property %s",
+          transposed ? "backward-data" : "forward", tried, agrees ? "agrees" : "DISAGREES",
+          static_cast<long long>(implied[0]), static_cast<long long>(implied[1]),
+          static_cast<long long>(implied[2]), static_cast<long long>(x_dims[0]),
           static_cast<long long>(x_dims[1]), static_cast<long long>(x_dims[2]),
           static_cast<long long>(x_dims[3]), static_cast<long long>(x_dims[4]),
           static_cast<long long>(x_strides[0]), static_cast<long long>(x_strides[1]),
@@ -579,8 +604,6 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
           static_cast<long long>(call.padding[2]), static_cast<long long>(call.dilation[0]),
           static_cast<long long>(call.dilation[1]), static_cast<long long>(call.dilation[2]),
           static_cast<int>(call.tf32), static_cast<int>(call.channels_last),
-          agrees ? "agrees" : "DISAGREES", static_cast<long long>(implied[0]),
-          static_cast<long long>(implied[1]), static_cast<long long>(implied[2]),
           sm_counted ? "stated" : "not stated", device_named ? "stated" : "not stated");
       *status = refuse(error, why);
       built = false;
@@ -660,7 +683,12 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     for (int64_t at = 0; at < count; ++at) {
       library.backend_destroy(configs[at]);
     }
-    library.backend_destroy(heuristic);
+    if (properties != nullptr) {
+      library.backend_destroy(properties);
+    }
+    if (heuristic != nullptr) {
+      library.backend_destroy(heuristic);
+    }
   }
   library.backend_destroy(graph);
   library.backend_destroy(operation);
