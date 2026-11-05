@@ -132,6 +132,39 @@ if [ -n "$unbuildable" ]; then
 fi
 echo "   $(echo "$points" | wc -w) point(s) walked singly, each one buildable from the file"
 
+echo "== the model's own launch record against the file"
+# `--by-shape` compares shapes and the generator compares enumerations; neither sees
+# which operand is which. The recorder drives each component's `forward` and reports
+# the descriptors it launches, so a row whose operands are mirrored - `input_f32_
+# weight_bf16` in the forward and `input_bf16_weight_f32` in the file - is visible
+# here and nowhere else. One direction only: a recorded row missing from the file is
+# a run that stops at `no kernel`; a file row the recording does not reach is a
+# different point, a different component, or the conditioned path, and is not a gap.
+extents=notes/programs/h3-extents.json
+if [ ! -f "$extents" ]; then
+    echo "   skipped: $extents is absent, and without it audio-encoder, audio-decoder"
+    echo "   and conditioned refuse and their rows would read as absent"
+else
+    : >"$scratch/recorded.txt"
+    for point in $points; do
+        r_canvas=${point%%:*}
+        r_clip=${point##*:}
+        cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
+            --clip "$r_clip" --raster "$r_canvas" --tokens 4096 \
+            --track "$(python3 -c "print(round($r_clip * 40 / 24) * 800)")" \
+            --elements 123456 --types "$types" --extents "$extents" --conditioned false \
+            2>/dev/null | grep -P '\t' >>"$scratch/recorded.txt" || true
+    done
+    cut -f1,2 "$scratch/recorded.txt" | grep -v '^#' | sort -u >"$scratch/recorded.rows"
+    cut -f1,2 "$fixture" | grep -v '^#' | sort -u >"$scratch/file.rows"
+    missing=$(comm -23 "$scratch/recorded.rows" "$scratch/file.rows" | grep -v 'columns_123456')
+    echo "   $(wc -l <"$scratch/recorded.rows") row(s) recorded at $(echo "$points" | wc -w) point(s)"
+    if [ -n "$missing" ]; then
+        echo "$missing" | sed 's/^/     NOT IN THE FILE: /' | head -6
+        fail "a forward launches a descriptor the file does not state"
+    fi
+fi
+
 echo
 echo "== four walks: one per task, and a sparse one"
 run() {
@@ -210,6 +243,7 @@ if grep -q 'MISSING from the fixture.*columns_123456' "$scratch/union-reading.tx
     echo "   the one above is the walk's sample row (its own \`--elements\`), a request's number - not a row to add"
 fi
 
+echo
 echo
 echo "every question answers: the list is this tree's rows, every row is declared,"
 echo "every clip is one a request can name, and the walks' shapes are in the file."
