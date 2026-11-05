@@ -1361,8 +1361,13 @@ impl VideoEncoder {
                             true,
                             padded,
                         ));
-                        // The block's residual add covers the whole level: `frames · extent · channels`.
-                        let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                        // The block's residual add, keyed on the **row width** and not on the element
+                        // count: the launch reshapes the level to `[frames · pixels, channels]` and
+                        // takes the descriptor's columns from the last dimension
+                        // (`nn/src/layers/residual.rs`'s `forward`, `target.shape.last()`). Stating
+                        // the element count here named 36 keys no launch asks for, at widths up to
+                        // 2.2e9, and a package cannot serve a key nothing launches.
+                        let columns = u64::from(*out);
                         if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
                             programs.launch::<ScaledAddOp>(&descriptor);
                         }
