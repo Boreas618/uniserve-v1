@@ -1953,7 +1953,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // The batch's live token count, which no shape of the bucket states: a captured graph reads
         // the bucket's token count as a constant, so the MoE sort - which must write a sentinel into
         // every route row of a padded token - reads this column instead.
-        encode_i32(&mut self.encoded, &[self.staging.live_tokens as i32]);
+        encode_i32(&mut self.encoded, &[self.staging.live_tokens]);
         self.columns.live_tokens.write(&self.encoded)?;
 
         self.commit
