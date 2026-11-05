@@ -13,14 +13,34 @@
 //!   denoiser holds a host seed and no device key view, and its latent's element at a flat index
 //!   must draw from `(seed, index)` whatever the buffer's shape is.
 
-use ops::TensorView;
 use ops::noise::{self, KeySource, NoiseKind, PhiloxNoise as NoiseOp};
+use ops::{Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 
 /// The elements one noise program draws.
 const BLOCK: u32 = noise::NOISE_BLOCK;
+
+/// The two-axis shape a scalar-keyed draw is launched on: every axis but the last folded into the
+/// rows, the last kept as the width.
+///
+/// `philox_noise` reads a two-axis buffer and, under a scalar key, addresses it **flattened** - a
+/// value is a function of `(seed, flat index)`. Where the fold falls therefore changes no value, and
+/// the rank of the caller's buffer is not part of the draw: a latent arrives as a four-axis raster
+/// from one caller and as a two-axis view from another, and a layer that made the rank a
+/// precondition refused the second kind after the first kind had already drawn.
+fn flat_shape(shape: Shape) -> Shape {
+    let dims = shape.dims();
+    let Some((width, folded)) = dims.split_last() else {
+        return shape;
+    };
+    let mut rows = 1_u64;
+    for extent in folded {
+        rows = rows.saturating_mul(*extent);
+    }
+    Shape::new(&[rows, *width])
+}
 
 /// Where a draw's key comes from.
 #[derive(Clone, Copy)]
@@ -90,7 +110,7 @@ impl Noise {
     pub fn draw(
         &self,
         f: &Forward,
-        out: TensorView,
+        mut out: TensorView,
         key: Key,
         stage: u32,
         draw: u32,
@@ -110,7 +130,12 @@ impl Noise {
                 }
                 (KeySource::Rows, Some(keys), 0)
             }
-            Key::Scalar(seed) => (KeySource::Scalar, None, seed),
+            Key::Scalar(seed) => {
+                // The scalar form addresses the buffer flattened, so the view the operator reads is
+                // the two-axis one whatever rank the caller's buffer has.
+                out = out.reshape(flat_shape(out.shape));
+                (KeySource::Scalar, None, seed)
+            }
         };
         let descriptor = Self::descriptor_of(out.dtype, self.kind, source);
         let args = noise::NoiseArgs {
@@ -123,5 +148,36 @@ impl Noise {
         };
 
         f.operate::<NoiseOp>(&descriptor, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The draw is addressed by `(seed, flat index)`, so a buffer's rank is not part of it and every
+    /// rank folds to the two-axis view the operator reads. The four-axis raster is the shape a
+    /// denoiser hands, and the two-axis one is what a piece's draw arrives as - a layer that made
+    /// the rank a precondition refused the second after the first had already drawn.
+    #[test]
+    fn every_rank_folds_to_the_two_axis_view_the_draw_reads() {
+        let raster = flat_shape(Shape::new(&[24, 37, 48, 84]));
+        assert_eq!(raster.dims(), &[24 * 37 * 48, 84]);
+
+        let piece = flat_shape(Shape::new(&[2, 207]));
+        assert_eq!(piece.dims(), &[2, 207], "a two-axis buffer is unchanged");
+
+        let row = flat_shape(Shape::new(&[96768]));
+        assert_eq!(row.dims(), &[1, 96768]);
+    }
+
+    /// The fold keeps every element and the row-major order, which is what makes the address a
+    /// function of the element alone.
+    #[test]
+    fn the_fold_loses_no_element() {
+        for dims in [&[24_u64, 37, 48, 84][..], &[2, 207][..], &[4, 1, 1, 64][..]] {
+            let shape = Shape::new(dims);
+            assert_eq!(flat_shape(shape).numel(), shape.numel(), "{dims:?}");
+        }
     }
 }

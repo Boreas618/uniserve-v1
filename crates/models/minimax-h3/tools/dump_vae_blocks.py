@@ -154,12 +154,25 @@ STAGES = {
         "video_encoder",
         "run host: the reference's video encoder on the candidate's pixels, its patch rows",
     ),
+    "decode_audio": (
+        "audio_decoder",
+        "run host: the reference's audio decoder on the candidate's latents, one stereo track",
+    ),
 }
 
 # The precision the deployment declares per component, which is the default a stage runs in: the video
 # decoder is FP16 and every transformer block is BF16 (design section 1). A stage passes this as the
 # module's compute dtype, so a comparison in another dtype would measure the conversion.
-STAGE_DTYPES = {"decode_out": "torch.float16", "encode_rows": "torch.float32"}
+STAGE_DTYPES = {
+    "decode_out": "torch.float16",
+    "encode_rows": "torch.float32",
+    # The checkpoint stores the audio VAE's weights in FP16 (design section 1's `auto`: the
+    # representation the checkpoint has, nothing converted at load), and the crate computes that
+    # arithmetic in FP32 - its loader refuses a weight that is not the type it declared, and its
+    # decoder's own `element_type` is F32. So the reference loads the FP16 weights and computes in
+    # FP32, and a comparison at FP16 would measure a different arithmetic than the candidate's.
+    "decode_audio": "torch.float32",
+}
 
 # The case's `dtype` word as `--dtype` spells it. An encode stage's case states the deployment's
 # type, and the reference must load at it: a comparison at another type would measure the fold.
@@ -341,6 +354,102 @@ def read_sidecars(checkpoint: Path):
         raise SystemExit(1) from error
 
 
+def run_audio_decode(options) -> int:
+    """Decode the candidate's own audio latents with the reference, then compare the two PCM streams.
+
+    The audio half's inputs and outputs are both files rather than rasters: the candidate writes the
+    latent it decoded (`latents.h3t`, FP32 `[2, channels, frames]`) and the PCM it produced
+    (`pcm.h3t`, interleaved i16 `[samples, 2]`), so this stage reads the first and compares against
+    the second on the spot. That is deliberately not a `compare_blocks` run: PCM is a wire format and
+    the comparison that matters for it is how many samples are bit-identical, which the Rust
+    comparator's float statistics would obscure.
+    """
+    component, _ = STAGES[options.probe]
+    stack = options.stack
+    if stack is None:
+        raise SystemExit(
+            f"--probe {options.probe} reads the candidate's tree: --stack <out>/{component}"
+        )
+    if stack.name != component:
+        raise SystemExit(
+            f"--stack {stack} is not the {component} directory: a decode stage writes case.json,"
+            " latents.h3t and pcm.h3t under its own name"
+        )
+    case_path, latent_path = stack / "case.json", stack / "latents.h3t"
+    for path in (case_path, latent_path):
+        if not path.is_file():
+            raise SystemExit(f"{path} is missing; run the candidate's `--stage audio` first")
+    case = json.loads(case_path.read_text())
+    latents = read_tensor(latent_path)
+    print(f"probe   {options.probe} ({STAGES[options.probe][1]})")
+    print(f"stack   {stack}")
+    print(
+        f"case    {case.get('latent_frames')} latent frames,"
+        f" {case.get('latent_channels')} channel(s), {case.get('samples')} sample pairs,"
+        f" decode dtype {case.get('dtype')}"
+    )
+    print(f"input   {tuple(latents.shape)} {latents.dtype}")
+    if latents.ndim != 3:
+        raise SystemExit(
+            f"{latent_path} holds {tuple(latents.shape)}; the audio decoder reads"
+            " [2, channels, frames]"
+        )
+
+    sidecars = read_sidecars(options.checkpoint)
+    module = load_module(component, build(component, sidecars), options)
+    dtype = dtype_of(options, STAGE_DTYPES[options.probe])
+    print(f"dtype   {dtype} parameters on {options.device}")
+    device = torch.device(options.device)
+    with torch.no_grad():
+        pcm = module(latents.to(device=device))
+    # The reference's own `forward` quantizes to the wire format - clamp, times 32767, round - so what
+    # comes back is already i16 `[samples, 2]`, the same rule and the same shape the crate writes.
+    if pcm.ndim != 2 or pcm.shape[1] != 2 or pcm.dtype != torch.int16:
+        raise SystemExit(
+            f"the module returned {tuple(pcm.shape)} {pcm.dtype}; the audio decoder writes"
+            " i16 [samples, 2] PCM"
+        )
+    print(f"got     {tuple(pcm.shape)} {pcm.dtype} interleaved PCM")
+    (options.out / component).mkdir(parents=True, exist_ok=True)
+    dump(options.out, f"{component}/pcm", pcm)
+    (options.out / component / "case.json").write_text(case_path.read_text())
+    print(f"wrote   {options.out / (component + '/pcm.h3t')}")
+
+    candidate_pcm_path = stack / "pcm.h3t"
+    if not candidate_pcm_path.is_file():
+        print(f"compare skipped: {candidate_pcm_path} is not there, so there is nothing to pair")
+        return 0
+    candidate = read_tensor(candidate_pcm_path).to(torch.int16)
+    reference = pcm.to("cpu").to(torch.int16)
+    if tuple(candidate.shape) != tuple(reference.shape):
+        raise SystemExit(
+            f"the two PCM streams are {tuple(candidate.shape)} and {tuple(reference.shape)}; a"
+            " comparison of different lengths is a different track, not a numeric difference"
+        )
+    difference = (candidate.to(torch.int64) - reference.to(torch.int64)).abs()
+    exact = int((difference == 0).sum())
+    total = int(difference.numel())
+    print(f"pcm     {exact} of {total} samples bit-identical ({100.0 * exact / total:.3f}%)")
+    if exact == total:
+        return 0
+    worst = int(difference.max())
+    first = int(difference.argmax())
+    index = (first // candidate.shape[1], first % candidate.shape[1])
+    print(
+        f"pcm     worst |difference| {worst} at sample {index[0]} channel {index[1]}:"
+        f" candidate {int(candidate[index[0], index[1]])},"
+        f" reference {int(reference[index[0], index[1]])}"
+    )
+    # A quarter of full scale is not rounding: the two decoders disagree about something the page
+    # should name rather than leave to a reader's eye.
+    if worst > 8192:
+        print(
+            "pcm     the worst difference is more than a quarter of full scale, so this is not"
+            " quantization: read the latent first, then the blocks"
+        )
+    return 0
+
+
 def run_stage(options) -> int:
     """Run a component on the candidate's own input and write its output under the candidate's name.
 
@@ -350,6 +459,8 @@ def run_stage(options) -> int:
     """
     if options.probe == "encode_rows":
         return run_encode_rows(options)
+    if options.probe == "decode_audio":
+        return run_audio_decode(options)
     component, description = STAGES[options.probe]
     stack = options.stack
     if stack is None:
