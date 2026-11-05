@@ -46,7 +46,7 @@ use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::AttentionKind;
 use minimax_h3::config::Config;
-use minimax_h3::denoiser::{Denoiser, Layouts};
+use minimax_h3::denoiser::{Denoiser, Layouts, denoise_arena};
 use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
 use minimax_h3::packing;
 use minimax_h3::partition::Partition;
@@ -1177,7 +1177,11 @@ fn stage_block(args: &Args) -> Result<()> {
 
     // 3. The request and its packed rows. The layout is the deployment's own rule, so the row count,
     //    the padding and the coordinates are the ones a served request would have.
-    let layouts = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?;
+    // The arrangement is kept beside the layouts rather than rebuilt: the arena's plan is priced at
+    // the deployment's own row capacities and sequence degree, and a second `partition.arrangement`
+    // call would agree with this one only as long as the partition did.
+    let arrangement = partition.arrangement(&denoiser)?;
+    let layouts = Layouts::new(denoiser.clone(), arrangement)?;
     let request = VideoRequest {
         task: VideoTask::TextToVideoAudio,
         width: args.width,
@@ -1191,30 +1195,85 @@ fn stage_block(args: &Args) -> Result<()> {
         conditions: &[],
         vision_spans: &[],
     };
-    let (_, packing) = layouts.layout(&request)?;
+    let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
     // The canvas is the model's answer for the request - one rounding of the pixels, the same one
     // the layout's rows were computed from. A canvas reconstructed from the layout would be a second
     // statement of that rounding, right only where the rounding is the identity.
     let canvas = layouts.canvas(&request)?;
-    let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
-    let tokens = u64::from(packing.padded_tokens);
-    if tables.position_ids.len() as u64 != tokens || tables.groups.len() as u64 != tokens {
+    // **The tables are the deployment's kind's, not the dense packing's.** A sparse stack reads the
+    // valid rows of each tile, the segment of each tile and the keep table, and its row count is the
+    // segment packing's - a different packing of the same request. Handing a sparse stack dense
+    // tables leaves it with no views at all, which the layer refuses by name (`a sparse layer was
+    // handed no segment views`); that refusal is what this harness met while the model's own step
+    // passed them.
+    let (packed_rows, position_ids, groups, used, sparse_views) = match denoiser.attention {
+        AttentionKind::Dense => {
+            let tables =
+                packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
+            (
+                packing.padded_tokens,
+                tables.position_ids,
+                tables.groups,
+                Some(tables.used),
+                None,
+            )
+        }
+        AttentionKind::Sparse {
+            sparsity,
+            reference_keep,
+            ..
+        } => {
+            let segment = layouts.segment_of(&layout)?;
+            let conditions = packing::condition_segments(&[], &canvas, denoiser.clip)?;
+            let tables = packing::segment_tables(
+                &segment,
+                frames,
+                &canvas,
+                request.text_tokens,
+                &conditions,
+                &[],
+                packing::Sparsity {
+                    sparsity,
+                    reference_keep,
+                },
+            )?;
+            (
+                segment.extent.padded_tokens,
+                tables.position_ids,
+                tables.groups,
+                None,
+                Some((
+                    tables.variable_block_sizes,
+                    tables.tile_segments,
+                    tables.segment_keep,
+                )),
+            )
+        }
+    };
+    let tokens = u64::from(packed_rows);
+    if position_ids.len() as u64 != tokens || groups.len() as u64 != tokens {
         return Err(Failure::message(format!(
             "the row tables hold {} coordinates and {} groups for {tokens} packed rows",
-            tables.position_ids.len(),
-            tables.groups.len()
+            position_ids.len(),
+            groups.len()
         )));
     }
     println!(
-        "request: {}x{}, {} frames, {} rows packed of {} padded, {} attended",
-        args.width,
-        args.height,
-        frames,
-        packing.video_rows + packing.audio_rows,
-        tokens,
-        tables.used,
+        "request: {}x{}, {} frames, {} rows packed of {} padded",
+        args.width, args.height, frames, packed_rows, tokens,
     );
+    match (&used, &sparse_views) {
+        (Some(used), None) => println!("attention: dense, {used} attended"),
+        (None, Some((sizes, _, _))) => {
+            println!("attention: sparse, {} tile(s)", sizes.len());
+        }
+        _ => {
+            return Err(Failure::message(
+                "the tables do not match the deployment's attention kind".to_owned(),
+            ));
+        }
+    }
 
     // 4. Weights on the device, through the loader's own boundary.
     let mut weights = DeviceWeights::new(&device, 0)?;
@@ -1253,12 +1312,25 @@ fn stage_block(args: &Args) -> Result<()> {
     let dtype = stack.dtype();
 
     // 5. The arena: the stack's own temporaries are reserved inside the forward, so the region must
-    //    cover the rows it holds twice, the attention's five buffers at the whole head count and the
-    //    feed-forward's packed projection. `Denoiser::denoise_arena` is the authority on that sum and
-    //    needs a loaded denoiser to ask; this harness over-reserves by a wide factor instead of
-    //    keeping a second copy of the plan, and the forward's own reservation refuses by name if the
-    //    estimate is ever short.
-    let bytes = tokens * hidden * 2 * 24 + (256 << 20);
+    //    cover one evaluation's plan. The plan is **the model's own statement of that sum** - the
+    //    same `denoise_arena` the loaded denoiser's `Denoiser::denoise_arena` calls, priced from this
+    //    stage's config, arrangement, group count, element type and layout - so the block stage and
+    //    the denoise stage reserve the same model number, and `denoise_plan` prices it on a host with
+    //    no device (`--check` proves the plan covers every request the forward makes).
+    //
+    //    What is added to it is what only this harness holds: the row coordinates, the groups, the
+    //    prefix source and the latents it writes are its own buffers, not the model's, and the plan
+    //    does not know them. The slack covers them; the arena's own reservation refuses by name if
+    //    it is short, so a case that outgrows it says so rather than writing past the region.
+    let plan = denoise_arena(
+        &denoiser,
+        &arrangement,
+        memory.groups.count(),
+        dtype,
+        &layout,
+    )?;
+    let planned: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+    let bytes = planned + (256 << 20);
     // The directory and the case go out before the arena: the case names the run, everything it
     // states is host data, and a stop in the allocation or in the forward then still leaves the
     // statement the reference producer and the comparator are run against.
@@ -1296,12 +1368,12 @@ fn stage_block(args: &Args) -> Result<()> {
 
     let arena_bytes = bytes.max(args.arena_gib << 30);
     let allocator = weights.allocator();
-    // The two numbers a pool refusal is about, printed **before** the reservation that can fail. The
-    // estimate is this stage's own (`bytes`), not `Denoiser::denoise_arena`'s plan, and the word says
-    // so: the plan belongs to a loaded denoiser and this stage keeps no second copy of it.
+    // The two numbers a pool refusal is about, printed **before** the reservation that can fail: the
+    // model's plan for one evaluation and the region this stage reserves for it.
     println!(
-        "arena {:.2} GiB estimated of {:.2} GiB reserved",
-        bytes as f64 / f64::from(1 << 30),
+        "arena {:.2} GiB planned ({} buffers) of {:.2} GiB reserved",
+        planned as f64 / f64::from(1 << 30),
+        plan.len(),
         arena_bytes as f64 / f64::from(1 << 30)
     );
     allocator.reserve(
@@ -1331,7 +1403,7 @@ fn stage_block(args: &Args) -> Result<()> {
     cache_projections(&forward, &projections, &memory)?;
 
     // 7. The inputs: the packed rows' rotary, the row table, the step, and the tokens themselves.
-    let positions = transpose_positions(&stream, &arena, &tables.position_ids, tokens)?;
+    let positions = transpose_positions(&stream, &arena, &position_ids, tokens)?;
     // A factor table holds one column per rotated pair, not per rotated channel: `rotated_width()`
     // counts channels (three axes of `2 * rope_freq_dim`) and the rotation reads `rotated / 2`.
     let cosine = arena.tensor(
@@ -1343,7 +1415,7 @@ fn stage_block(args: &Args) -> Result<()> {
         Shape::new(&[tokens, rotated_width(&config) / 2]),
     )?;
     stack.factors(&forward, positions, cosine, sine)?;
-    let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
+    let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &groups)?;
     // The evaluation the stack runs: the schedule's first, which is also the row the modulation
     // cache's entry table is indexed at. It is printed and written into `case.json`, because the
     // reference producer runs its own stack at one step and two sides at different steps differ by
@@ -1354,8 +1426,16 @@ fn stage_block(args: &Args) -> Result<()> {
     // `tokens` rows while the reference producer masks each query to `used` keys - the two sides
     // would compute different functions on the same input, and the comparison would report the
     // harness's mask as an arithmetic difference.
-    let used = i32::try_from(tables.used)
-        .map_err(|_| Failure::message(format!("{} attended rows", tables.used)))?;
+    // A sparse stack reads no visibility at all - its layers read the tiles and the keep table -
+    // so the pair is stated only for a dense deployment, and the sparse case falls back to the
+    // packed row count rather than to a number this harness invented.
+    let used =
+        match used {
+            Some(used) => i32::try_from(used)
+                .map_err(|_| Failure::message(format!("{used} attended rows")))?,
+            None => i32::try_from(tokens)
+                .map_err(|_| Failure::message(format!("{tokens} packed rows")))?,
+        };
     let packed =
         i32::try_from(tokens).map_err(|_| Failure::message(format!("{tokens} packed rows")))?;
     let cu_seq_lens_q = upload_i32(&stream, &arena, Shape::new(&[2]), &[0, packed])?;
@@ -1372,6 +1452,25 @@ fn stage_block(args: &Args) -> Result<()> {
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
     println!("step    {evaluation} of the schedule");
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
+    // The segment views a sparse stack reads: the rows of each tile, the segment of each tile and
+    // the key tiles each segment keeps - the three tables the model declares as the block's state,
+    // taken from the segment packing above rather than rebuilt here.
+    let segment_views = match &sparse_views {
+        None => None,
+        Some((sizes, segments, keep)) => {
+            let tiles = u64::try_from(sizes.len())
+                .map_err(|_| Failure::message("more tiles than a u64 states".to_owned()))?;
+            let rows = sizes
+                .iter()
+                .map(|rows| i32::try_from(*rows).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>();
+            Some(minimax_h3::attention_sparse::Segments {
+                sizes: upload_i32(&stream, &arena, Shape::new(&[tiles]), &rows)?,
+                segments: upload_i32(&stream, &arena, Shape::new(&[tiles]), segments)?,
+                keep: upload_i32(&stream, &arena, Shape::new(&[tiles]), keep)?,
+            })
+        }
+    };
     let forward_result = stack.forward(
         &forward,
         &cache,
@@ -1380,7 +1479,7 @@ fn stage_block(args: &Args) -> Result<()> {
         rows,
         Factors { cosine, sine },
         Some(&visible),
-        None,
+        segment_views.as_ref(),
         total,
         None,
     );
@@ -1865,10 +1964,24 @@ struct DeviceWeights {
 }
 
 impl DeviceWeights {
+    /// The weights' home: a **virtual** range sized from the device's own free storage.
+    ///
+    /// `Allocator::reserve` maps and books nothing until the first allocation, so this range takes no
+    /// storage from the arena the stage reserves beside it - it only caps how much the loaded weights
+    /// may ever occupy. Sizing that cap by a figure of this harness's was the defect: a `requested`
+    /// of zero fell back to an 8 GiB floor, and the sparse deployment's weights are 8.49 GiB, so the
+    /// pool refused a load the device could hold with the message `cannot give out 522190848 more` -
+    /// a whole point of the run spent reading a device limit that was this file's. The device is
+    /// asked instead, and the halving below still covers a driver that refuses the whole range.
     fn new(device: &platform::Device, requested: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget)?;
-        let mut wanted = requested.max(8 << 30);
+        // `memory_info` answers in this device's primary context; a driver that cannot answer is no
+        // reason to refuse, so the floor stands as the fallback rather than the default.
+        let free = device.memory_info().map(|info| info.free).unwrap_or(0);
+        // Never less than it was before: the 8 GiB floor stays as the fallback for a driver that
+        // cannot answer, and the device's own free storage raises the cap above it when it can.
+        let mut wanted = requested.max(free.max(8 << 30));
         let mut reserved = None;
         while wanted >= (1 << 30) {
             if pools
@@ -1889,7 +2002,11 @@ impl DeviceWeights {
                  weights cannot be held on this device",
             )
         })?;
-        println!("resident pool: {} GiB reserved", reserved >> 30);
+        println!(
+            "resident pool: {} GiB reserved of {} GiB free on the device",
+            reserved >> 30,
+            free >> 30
+        );
         Ok(Self {
             pools,
             buffers: Vec::new(),

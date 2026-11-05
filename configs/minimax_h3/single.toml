@@ -1,0 +1,36 @@
+# FastH3 on one GPU of one host: no sequence parallelism and a single-rank text
+# encoder. This is the smallest deployment that serves a `t2va` request whole -
+# one denoiser rank, one decoder, one encoder - and it is what a first end-to-end
+# run uses, because nothing about it depends on a second device.
+
+[[worker_groups]]
+id = "model"
+ranks = ["cuda:0"]
+queue_depth = 6
+
+[worker_groups.components.transformer]
+
+[worker_groups.components.text_encoder]
+tensor_parallel_size = 1
+
+[worker_groups.components.video_decoder]
+
+[worker_groups.components.audio_decoder]
+distribution = "temporal_units"
+
+[worker_groups.components.latent_encoder]
+distribution = "temporal_units"
+
+[[worker_groups]]
+id = "media"
+ranks = ["cpu*4"]
+queue_depth = 6
+
+[worker_groups.components.video_codec]
+ranks = [0, 1]
+
+[worker_groups.components.muxer]
+ranks = [2]
+
+[worker_groups.components.media_reader]
+ranks = [3]
