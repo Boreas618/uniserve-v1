@@ -312,8 +312,8 @@ impl Buffer {
     /// belongs elsewhere, and it is met by creating and exporting such storage
     /// through [`crate::vmm::SegmentedMapping::create`], which maps its own
     /// import of the exported descriptor and drops the creating handle. Storage
-    /// retained by the Storage Server is created that way
-    /// (`crates/worker/src/storage/allocation.rs`, `retainable`); a pool block
+    /// retained by the Storage Server is created that way (the retired worker's
+    /// `retainable` allocation); a pool block
     /// handed over with this descriptor is memory mapped in two processes and
     /// NVML counts it in both.
     pub fn export(&self) -> Result<OwnedFd> {

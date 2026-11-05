@@ -4,7 +4,7 @@
 //! `Spans` of `StorageView`s, ordered by the rank's `EventPool`. `Spans` and
 //! the copy planning live here first; the transports, readable results,
 //! export tables and cache import/export follow as they move from the retired
-//! worker (`crates/worker/src/transfer`), with their operations unchanged.
+//! retired worker's transfer module, with their operations unchanged.
 
 pub(crate) mod backing;
 pub(crate) mod cache_export;

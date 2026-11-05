@@ -23,7 +23,6 @@ mod logging;
 mod program_server;
 mod serve;
 mod storage;
-mod worker;
 
 use std::env;
 use std::ffi::OsString;
@@ -130,10 +129,6 @@ fn main() -> Result<std::process::ExitCode> {
         Command::Serve(args) => serve::run(*args, &cli.log),
         Command::Frontend(args) => frontend::run(*args, &cli.log),
         Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
-        Command::Worker { arguments } => {
-            follow_lifeline(lifeline);
-            worker::run(arguments)
-        }
         Command::Storage(args) => Ok(storage::run(*args)),
         Command::External(arguments) => run_external(&arguments),
     }
