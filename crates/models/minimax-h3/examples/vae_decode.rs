@@ -1212,7 +1212,7 @@ fn stage_audio(args: &Args) -> Result<()> {
     };
     let planned = decoder.arena_bytes(&layout)?;
     let held = 4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames
-        + 2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples);
+        + 2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * samples;
     let arena_bytes = (planned + held).max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
@@ -1257,10 +1257,7 @@ fn stage_audio(args: &Args) -> Result<()> {
     // The window's own shape: `[samples, 2]`, interleaved, which is what `DecodedMedia.audio` is.
     let out = arena.tensor(
         DType::I16,
-        Shape::new(&[
-            u64::from(samples),
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-        ]),
+        Shape::new(&[samples, u64::from(minimax_h3::audio_vae::PCM_CHANNELS)]),
     )?;
 
     // 6. The decode, with the recorder installed for its duration: the walk is what says which programs
@@ -1321,15 +1318,11 @@ fn stage_audio(args: &Args) -> Result<()> {
     let pcm = download(
         &stream,
         out,
-        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples))
-            .unwrap_or(0),
+        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * samples).unwrap_or(0),
     )?;
     write_h3t(
         &directory.join("pcm.h3t"),
-        &[
-            u64::from(samples),
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-        ],
+        &[samples, u64::from(minimax_h3::audio_vae::PCM_CHANNELS)],
         CONTAINER_I16,
         &pcm,
     )?;
@@ -2410,9 +2403,12 @@ const CONTAINER_I16: u8 = 6;
 ///
 /// The trajectory a denoiser writes is the sample's own type, which is FP32, while this stage holds the
 /// VAE in the checkpoint's half precision: the pipeline therefore has one narrowing between the draw and
-/// the decode, and the reference makes the same one (`latents.to(dtype)` before its decoder). It is
-/// stated on the run's own line, never silent, and only the two float widths this pipeline uses convert -
-/// a file of any other type is refused by name rather than reinterpreted.
+/// the decode. **The reference makes no such call** - it runs its decoder body under
+/// `torch.autocast(dtype=the decoder's projection width)`, which narrows each operator's operands, and
+/// names the conversion nowhere. Our design replaces autocast with per-layer declared precision, so the
+/// narrowing is a step of ours: it is stated on the run's own line, never silent, and only the two float
+/// widths this pipeline uses convert - a file of any other type is refused by name rather than
+/// reinterpreted.
 fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     let from = match held {
         CONTAINER_F32 => 4_usize,
@@ -2443,7 +2439,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
             DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
-            DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::BF16 => out.extend_from_slice(&nn::weights::f32_to_bf16(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
                 return Err(Failure::message(format!(
@@ -2481,7 +2477,7 @@ fn pattern_latents(
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
             DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
-            DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::BF16 => bytes.extend_from_slice(&nn::weights::f32_to_bf16(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
                 return Err(Failure::message(format!(
@@ -2491,18 +2487,6 @@ fn pattern_latents(
         }
     }
     Ok(bytes)
-}
-
-/// The nearest bfloat16 bit pattern of `value`: the high half of its float32, rounded half to even.
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let upper = (bits >> 16) as u16;
-    let remainder = bits & 0xffff;
-    if remainder > 0x8000 || (remainder == 0x8000 && upper & 1 == 1) {
-        upper.wrapping_add(1)
-    } else {
-        upper
-    }
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
