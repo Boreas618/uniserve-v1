@@ -56,18 +56,6 @@ const STUB_IMAGE_START: u32 = 151_670;
 /// so those two launches never overlap. Other tests launch without taking it.
 static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// The engine's end of one rank's channel, driven by a test: it starts a stub
-/// rank, answers its registration, sends requests and takes each response by
-/// the identity its request carried.
-struct RawEngine {
-    channel: ipc::Channel,
-    /// Responses read while waiting for another one.
-    inbox: std::collections::HashMap<u64, ipc::WorkerResponse>,
-}
-
-impl RawEngine {
-}
-
 /// The five top logprobs a fresh request reports for its first token after
 /// the prompt `[7, 8]`, selected greedily under the nucleus `top_p`.
 fn first_token_logprobs(
@@ -2027,26 +2015,4 @@ fn product_transfer(
         ..Bounds::default()
     };
     call
-}
-
-/// An external shared-memory publisher the test controls.
-///
-/// The reader waits on a readiness word, written after the payload.
-struct SlowShmExport {
-    name: std::ffi::CString,
-    endpoint: String,
-    file: std::fs::File,
-    published: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl SlowShmExport {
-}
-
-impl Drop for SlowShmExport {
-    fn drop(&mut self) {
-        // SAFETY: the name remains valid and identifies this fixture's segment.
-        unsafe {
-            libc::shm_unlink(self.name.as_ptr());
-        }
-    }
 }
