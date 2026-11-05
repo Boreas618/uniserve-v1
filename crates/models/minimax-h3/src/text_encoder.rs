@@ -1050,7 +1050,7 @@ impl TextEncoder {
                 )))
             };
         };
-        group.all_reduce_sum(view, f.stream).map_err(Error::from)
+        group.all_reduce_sum(view, f.stream()?).map_err(Error::from)
     }
 
     /// Refuse a call whose batch, layout or outputs do not agree.

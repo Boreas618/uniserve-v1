@@ -61,7 +61,7 @@ pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows, gather_rows_descriptor};
-pub use linear::{Linear, Nvfp4Linear};
+pub use linear::{Linear, Nvfp4Linear, PACKED_M_CLASSES, packed_rows};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
 pub use moe::{
     Buffer, ENCODE_CHUNK, EncodedStep, Group, Launch, Moe, MoeGeometry, TILE_ROWS, dense_bytes,

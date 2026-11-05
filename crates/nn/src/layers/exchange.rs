@@ -51,7 +51,7 @@ impl UlyssesExchange {
         self.check_views(input, out)?;
         let group = self.group(f)?;
         group.with(|communicator| {
-            exchange::scatter(communicator, input, out, self.ranks, f.stream).map_err(Error::from)
+            exchange::scatter(communicator, input, out, self.ranks, f.stream()?).map_err(Error::from)
         })
     }
 
@@ -60,7 +60,7 @@ impl UlyssesExchange {
         self.check_views(out, input)?;
         let group = self.group(f)?;
         group.with(|communicator| {
-            exchange::gather(communicator, input, out, self.ranks, f.stream).map_err(Error::from)
+            exchange::gather(communicator, input, out, self.ranks, f.stream()?).map_err(Error::from)
         })
     }
 

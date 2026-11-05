@@ -33,6 +33,7 @@
 //! place that reads it.
 
 use nn::{Block, BlockName};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audio_vae::AudioDecoder;
@@ -244,6 +245,161 @@ pub fn stored_types(
     Ok(found)
 }
 
+/// One component's stored element types, counted: what a deployment's header states about it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StoredTypes {
+    /// The component's name in the checkpoint, which is the name a deployment names it by.
+    pub component: &'static str,
+    /// Each element type the component stores weights in, with how many tensors carry it, in the
+    /// order they first appear. Empty when the table states none for it.
+    pub dtypes: Vec<(String, usize)>,
+}
+
+impl StoredTypes {
+    /// The one field a deployment's header carries for this component, such as
+    /// `transformer: BF16 x626 + F32 x12`.
+    ///
+    /// A row is keyed by an element type, so a header without these cannot tell a differing row from
+    /// a differing deployment - and the types are **not derivable on a host with no shard**:
+    /// `nn::Checkpoint::open` reads a shard's header and `unopened` carries no names. So they are
+    /// stated by the caller, from the same table the extents are filled from.
+    pub fn field(&self) -> String {
+        if self.dtypes.is_empty() {
+            return format!("{}: unstated", self.component);
+        }
+        let stated = self
+            .dtypes
+            .iter()
+            .map(|(dtype, count)| format!("{dtype} x{count}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        format!("{}: {stated}", self.component)
+    }
+}
+
+/// A deployment's statement of the four components' stored element types: what its header carries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ElementTypes {
+    /// The file the statement was read from, so a header can say where its numbers came from.
+    pub source: PathBuf,
+    /// The four components, in the header's own order.
+    pub components: Vec<StoredTypes>,
+}
+
+impl ElementTypes {
+    /// Read the statement from a table of either shape: a caller's export of the checkpoint's tensor
+    /// headers (`{component: {tensor: {dtype, shape}}}`), or the committed summary of one
+    /// (`{component: {dtype: count}}`).
+    ///
+    /// Both are one file because both are one fact - a checkpoint's element types - and the two
+    /// differ only in how much of the checkpoint they carry. The summary exists because an export is
+    /// an artifact (`artifacts/` is not in the tree) while a fixture's header must still state its
+    /// deployment on a host that has no export at all.
+    pub fn read(table: &Path) -> Result<Self> {
+        const COMPONENTS: [&str; 4] = ["text_encoder", "transformer", "vae", "audio_vae"];
+        let text = std::fs::read_to_string(table)
+            .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+        let table_json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| Error::checkpoint(format!("{}: {error}", table.display())))?;
+        let mut components = Vec::with_capacity(COMPONENTS.len());
+        for component in COMPONENTS {
+            let mut dtypes: Vec<(String, usize)> = Vec::new();
+            if let Some(value) = table_json
+                .get(component)
+                .and_then(|value| value.as_object())
+            {
+                for (key, entry) in value {
+                    // A summary states the counts themselves: `{"BF16": 626}`.
+                    if let Some(count) = entry.as_u64() {
+                        dtypes.push((key.clone(), count as usize));
+                        continue;
+                    }
+                    // An export states each tensor's own header: `{"<name>": {"dtype": "BF16"}}`.
+                    let Some(dtype) = entry.get("dtype").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    match dtypes.iter_mut().find(|(name, _)| name == dtype) {
+                        Some((_, count)) => *count += 1,
+                        None => dtypes.push((dtype.to_owned(), 1)),
+                    }
+                }
+            }
+            components.push(StoredTypes { component, dtypes });
+        }
+        Ok(Self {
+            source: table.to_owned(),
+            components,
+        })
+    }
+
+    /// The header's one field for all four components, such as
+    /// `text_encoder: BF16 x1058, transformer: F32 x12 + BF16 x626, …`.
+    pub fn field(&self) -> String {
+        self.components
+            .iter()
+            .map(StoredTypes::field)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Check the statement against a checkpoint's own shard headers, refusing a disagreement by
+    /// component, type and count.
+    ///
+    /// A statement that can be checked is checked, and one that cannot is not pretended to be: a host
+    /// with no shard cannot open the checkpoint, so its caller skips this - and that is exactly the
+    /// host the committed summary serves.
+    pub fn verify(&self, checkpoint: &nn::Checkpoint) -> Result<()> {
+        for stated in &self.components {
+            let found = count_stored_types(checkpoint, stated.component)?;
+            if found == stated.dtypes {
+                continue;
+            }
+            let show = |pairs: &[(String, usize)]| {
+                pairs
+                    .iter()
+                    .map(|(dtype, count)| format!("{dtype} x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            return Err(Error::checkpoint(format!(
+                "{}: the statement holds {} for {}, and the checkpoint's shards hold {}",
+                self.source.display(),
+                show(&stated.dtypes),
+                stated.component,
+                show(&found)
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One component's stored element types as its shards state them, counted per type.
+///
+/// Integer tensors are not weights and do not count, as in [`stored_types`].
+fn count_stored_types(
+    checkpoint: &nn::Checkpoint,
+    component: &str,
+) -> Result<Vec<(String, usize)>> {
+    let source = checkpoint.component(component)?;
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for name in source.names() {
+        let Some(location) = source.tensor(name) else {
+            continue;
+        };
+        if !location.dtype.is_float() {
+            continue;
+        }
+        let dtype = location.dtype.to_string();
+        match found.iter_mut().find(|(name, _)| *name == dtype) {
+            Some((_, count)) => *count += 1,
+            None => found.push((dtype, 1)),
+        }
+    }
+    Ok(found)
+}
+
+/// Where a deployment's element types stand when no table was given: stated by nothing, said so.
+pub const UNSTATED: &str = "unstated (pass --types <component-tensors.json>)";
 /// The element type a consumer takes for a whole component, refusing one of two by name.
 pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
     let found = stored_types(checkpoint, component)?;
@@ -266,6 +422,73 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
                 .join(", ")
         ))),
     }
+}
+
+/// The element type a component's programs are keyed from.
+///
+/// A row is keyed by an element type, so an enumeration that took one type for the whole deployment
+/// would state rows for a deployment nobody serves: the four components are stored as
+/// `text_encoder` BF16, `transformer` BF16 with twelve F32 crossings, and both VAEs F32. So each
+/// component asks for its own, from **one source with a fallback**: the caller's statement where it
+/// is at hand, the checkpoint's own shard headers where they are, and a refusal naming both when
+/// neither is.
+///
+/// A component of several stored types answers with the type most of its tensors are stored in - the
+/// bulk the layers compute in. The remainder are **crossings**, and a layer that narrows or widens
+/// states its own type at the site that does it (`modulation.rs`'s projections, the four boundary
+/// projections of the transformer), so asking this function never decides a crossing.
+pub fn deployment_dtype(
+    stated: Option<&ElementTypes>,
+    checkpoint: Option<&nn::Checkpoint>,
+    component: &str,
+) -> Result<nn::DType> {
+    // One source with a fallback: the caller's statement first (it is a command-line fact), then the
+    // checkpoint's own headers (it is the thing itself). Both are checked against each other where
+    // both exist, by `ElementTypes::verify`, so this order is a convenience rather than a second
+    // source.
+    if let Some(types) = stated
+        && let Some(found) = types
+            .components
+            .iter()
+            .find(|entry| entry.component == component)
+        && let Some((dtype, _)) = found.dtypes.iter().max_by_key(|(_, count)| *count)
+    {
+        return dtype_of(dtype).ok_or_else(|| {
+            Error::checkpoint(format!(
+                "{}: `{component}` states the element type `{dtype}`, which is not a type a weight \
+                 can be stored in",
+                types.source.display()
+            ))
+        });
+    }
+    if let Some(checkpoint) = checkpoint {
+        let counts = count_stored_types(checkpoint, component)?;
+        if let Some((dtype, _)) = counts.iter().max_by_key(|(_, count)| *count) {
+            return dtype_of(dtype).ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "the checkpoint stores `{component}` as `{dtype}`, which is not a type a \
+                     weight can be stored in"
+                ))
+            });
+        }
+    }
+    Err(Error::checkpoint(format!(
+        "no element type is stated for `{component}`: pass the caller's --types table, or a --root \
+         whose checkpoint holds its shards. A row is keyed by an element type, so an enumeration \
+         with neither cannot state a deployment"
+    )))
+}
+
+/// An element type by the name a table or a shard header gives it.
+fn dtype_of(name: &str) -> Option<nn::DType> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "f16" => nn::DType::F16,
+        "bf16" => nn::DType::BF16,
+        "f32" => nn::DType::F32,
+        "f8e4m3" | "e4m3fn" => nn::DType::F8E4M3,
+        "f4e2m1" | "nvfp4" => nn::DType::F4E2M1,
+        _ => return None,
+    })
 }
 
 /// The element type of one tensor of a component.
@@ -300,6 +523,57 @@ pub fn resident_bytes(component: &nn::Checkpoint, keys: &[String], granularity: 
             bytes.max(1).next_multiple_of(block)
         })
         .sum()
+}
+
+/// A checkpoint tensor a component's load deliberately leaves alone, and why it may.
+pub struct Exclusion {
+    /// The tensor's name inside its component's directory.
+    pub name: &'static str,
+    /// Why no inference forward needs it. An empty reason is not allowed: a name on this list
+    /// without a reason is a weight nobody decided about.
+    pub reason: &'static str,
+}
+
+/// The checkpoint tensors a component's load does not ask for, each with the reason it need not.
+///
+/// **A load is not required to read every tensor a file holds** — a training head's weights sit in
+/// the checkpoint and no inference path evaluates them, so asking for them would be a requirement
+/// on the export rather than on the model. What the load owes is to **name** them: an unasked
+/// tensor that is not on this list is a weight the model silently skips, and the difference between
+/// "this head is unused" and "this group was forgotten" is exactly this table. [`unasked`] is the
+/// subtraction that keeps the two apart.
+pub fn excluded_names(component: &str) -> &'static [Exclusion] {
+    match component {
+        // The audio VAE's spectral loss head: `logs_proj` scores training audio through a mel
+        // transform, and the decoder's forward reads the latent to samples and nothing else. The
+        // two tensors are 1 088 bytes of the component's 1 087 tensors, and `--names` measured the
+        // rest as asked for.
+        "audio_vae" => &[
+            Exclusion {
+                name: "logs_proj.weight",
+                reason: "the spectral loss head: it scores training audio, and no inference forward \
+                         evaluates it",
+            },
+            Exclusion {
+                name: "logs_proj.bias",
+                reason: "the spectral loss head, its bias - the same head, the same reason",
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// Every name of `component` that is **neither asked for nor named as an exclusion**.
+///
+/// This is the finding, not the count: a name here is a tensor the checkpoint holds, the load
+/// leaves alone, and nobody has said why. An exclusion answers it; a filter that hides it does not.
+pub fn unasked<'a>(component: &str, asked: &[String], held: &'a [String]) -> Vec<&'a str> {
+    let exclusions = excluded_names(component);
+    held.iter()
+        .map(String::as_str)
+        .filter(|name| !asked.iter().any(|asked| asked == name))
+        .filter(|name| !exclusions.iter().any(|exclusion| exclusion.name == *name))
+        .collect()
 }
 
 /// Load the deployment this rank places.
@@ -671,4 +945,83 @@ fn sidecars(checkpoint: &nn::Checkpoint) -> Result<(Layout, Sidecars)> {
     let layout = Layout::detect(checkpoint.root())?;
     let sidecars = Sidecars::read_components(checkpoint, &layout)?;
     Ok((layout, sidecars))
+}
+
+#[cfg(test)]
+mod element_types_tests {
+    use super::*;
+
+    /// The committed summary and the export it was taken from are one fact in two shapes: a header
+    /// that stated a different field for the two would be a header nobody could compare.
+    #[test]
+    fn a_summary_and_an_export_state_the_same_deployment() {
+        let directory = std::env::temp_dir().join("h3-element-types-test");
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let summary = directory.join("summary.json");
+        let export = directory.join("export.json");
+        std::fs::write(
+            &summary,
+            r#"{"text_encoder": {"BF16": 2}, "transformer": {"F32": 1, "BF16": 1}, "vae": {"F32": 3}}"#,
+        )
+        .expect("the summary");
+        std::fs::write(
+            &export,
+            r#"{"text_encoder": {"block.0.weight": {"dtype": "BF16", "shape": [1]},
+                                 "block.1.weight": {"dtype": "BF16", "shape": [1]}},
+                "transformer": {"proj_in.weight": {"dtype": "F32", "shape": [1]},
+                                "block.0.weight": {"dtype": "BF16", "shape": [1]}},
+                "vae": {"decoder.0.weight": {"dtype": "F32", "shape": [1]},
+                        "decoder.1.weight": {"dtype": "F32", "shape": [1]},
+                        "decoder.2.weight": {"dtype": "F32", "shape": [1]}}}"#,
+        )
+        .expect("the export");
+
+        let stated = ElementTypes::read(&summary).expect("the summary reads");
+        let exported = ElementTypes::read(&export).expect("the export reads");
+        assert_eq!(stated.field(), exported.field());
+        assert!(stated.field().contains("text_encoder: BF16 x2"));
+        assert!(stated.field().contains("transformer: F32 x1 + BF16 x1"));
+        // A component the table says nothing about is said to be unstated rather than left out: a
+        // header that dropped the field would read as a deployment with no audio VAE.
+        assert!(stated.field().contains("audio_vae: unstated"));
+    }
+
+    #[test]
+    fn an_unasked_tensor_is_named_and_a_forgotten_one_is_reported() {
+        // The audio VAE's two excluded tensors are its spectral loss head, and every exclusion
+        // carries a reason: a name on the list without one is a weight nobody decided about.
+        let exclusions = excluded_names("audio_vae");
+        assert_eq!(
+            exclusions
+                .iter()
+                .map(|exclusion| exclusion.name)
+                .collect::<Vec<_>>(),
+            vec!["logs_proj.weight", "logs_proj.bias"]
+        );
+        assert!(exclusions.iter().all(|exclusion| !exclusion.reason.is_empty()));
+
+        // The subtraction reports what neither list covers - the finding - and stays quiet about the
+        // two cases that are decided: a tensor the load asks for, and one it names as excluded.
+        let held: Vec<String> = [
+            "decoder.conv_pre.weight_g",
+            "logs_proj.weight",
+            "logs_proj.bias",
+            "encoder.block.0.norm.weight",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        let asked: Vec<String> = ["decoder.conv_pre.weight_g"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            unasked("audio_vae", &asked, &held),
+            vec!["encoder.block.0.norm.weight"]
+        );
+
+        // A component with no exclusions reports every unasked name, which is the correct answer for
+        // a load that asks for everything its component holds.
+        assert!(excluded_names("vae").is_empty());
+    }
 }

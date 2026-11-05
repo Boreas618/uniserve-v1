@@ -88,7 +88,7 @@ def covers(package, key):
     return any(covers_one(descriptors, key) for descriptors in shapes(kernel))
 
 
-def build(package, key, target, out_dir):
+def build(package, key, target, out_dir, python):
     """Compile one descriptor into `out_dir`; returns a failure message or None."""
     manifest = package["manifest"]
     source = manifest["source"]
@@ -188,6 +188,11 @@ def main():
     if args.target not in TARGETS:
         sys.exit(f"target {args.target} is not one a package here declares ({sorted(TARGETS)})")
 
+    # Named, not assumed: a plain interpreter without the venv's Triton builds none of the PDL
+    # packages and raises `module 'triton.language.extra.cuda' has no attribute 'gdc_wait'` from
+    # inside a compile script, which reads like a kernel defect rather than a wrong toolchain.
+    print(f"# interpreter: {args.python}")
+
     packages = load_packages(Path(args.kernels))
     root = Path(args.root)
     # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
@@ -259,7 +264,24 @@ def main():
         else:
             skipped.append((op, key, "; ".join(failures)))
             continue
-    print(f"# built {len(built)} of {len(rows)} keys into {root} (revision {args.revision}, {args.target})")
+    # A store that built nothing is not a store: the count line says "0 of N", and a reader who
+    # stops at it can carry on with an empty directory. The first failure is the evidence, and a
+    # missing capability in the interpreter is the common cause.
+    if not built:
+        first = skipped[0][2] if skipped else "no candidate package"
+        sys.exit(
+            f"the store is empty: none of {len(rows)} keys built for {args.target} with "
+            f"{args.python}\n  first failure: {skipped[0][0]} {skipped[0][1]}: {first}"
+            if skipped else f"the store is empty: no package covers a key of {args.fixture}"
+        )
+    print(
+        f"# built {len(built)} of {len(rows)} keys into {root} "
+        f"(revision {args.revision}, {args.target})"
+    )
+    # The fixture is named in the summary because a build is evidence of exactly one file: two
+    # fixtures built into one log read as one count, and a row of one fixture's failures then looks
+    # like a failure of the other's deployment.
+    print(f"# fixture: {args.fixture} ({len(rows)} rows)")
 
     # How many of those cells hold the same program. A key field that reaches no compiled word
     # writes an identical module under its own name (tools/key_field_audit.py proves which), so the

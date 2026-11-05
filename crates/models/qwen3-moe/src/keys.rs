@@ -224,6 +224,7 @@ pub fn keys(
                     push(
                         <ops::fp4::Nvfp4Gemm as Op>::NAME,
                         Nvfp4Linear::descriptor_of(*rows, n, k, ScaleLayout::Swizzled128X4, false, dtype)
+                            .map_err(Error::from)?
                             .to_string(),
                     );
                 }
@@ -292,6 +293,7 @@ pub fn keys(
                         push(
                             <ops::fp4::Nvfp4Gemm as Op>::NAME,
                             Nvfp4Linear::descriptor_of(*rows, n, k, ScaleLayout::Swizzled128X4, false, dtype)
+                                .map_err(Error::from)?
                                 .to_string(),
                         );
                     }
