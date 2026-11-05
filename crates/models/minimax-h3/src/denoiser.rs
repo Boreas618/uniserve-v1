@@ -4481,13 +4481,23 @@ mod tests {
         // The descriptor keys the bound by its next power of two, and the launch refuses a request
         // outside the live bound rather than clamping: so the class, not the request's count, is what
         // a sparse deployment's store must hold. Measured: 5 400 tiles over this deployment's own
-        // canvases, the 8 192 class - while the sparse fixture's row states `max_tiles_512`, which is
-        // the walk's argument and not the model's number. The two disagree today and this test holds
-        // the half the launch keys, so a canvas-rule change moves the class and the fixture with it.
+        // canvases, the 8 192 class, and both the compress and the select rows name it.
         assert_eq!(
             bound.next_power_of_two(),
             8192,
             "the deployment's own bound is {bound}"
+        );
+        // The fine attention's key bound is rows, so the tile count is multiplied by the tile: a
+        // bound of `bound` rows is not whole tiles and a bound of `bound * 64` rows is.
+        let tile = 64u64;
+        assert!(
+            (u64::from(bound) * tile).is_multiple_of(tile),
+            "the fine attention's bound is whole tiles"
+        );
+        assert!(
+            nn::layers::SegmentAttention::new(tile, 56, 128, u64::from(bound) * tile, nn::DType::F16)
+                .is_ok(),
+            "the deployment's own bound loads as the fine attention's key extent"
         );
     }
 }
