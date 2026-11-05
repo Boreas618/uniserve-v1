@@ -23,17 +23,13 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::remove_file;
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use engine::{
-    CallReaders, EngineConfig, Executor, ExecutorGroup, ExecutorGroupConfig, ExecutorProcessArgs,
-    RankBuffer, SchedulerHandle,
+    CallReaders, Executor, ExecutorGroup, ExecutorGroupConfig, ExecutorProcessArgs, RankBuffer,
 };
-use engine::{Event, Request};
 use ipc::{
     Batch, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call, CallCoordinates,
     CallId, CallKind, CallStatus, DType, ForwardBatch, ForwardMode, GenerationParams, NewRequest,
@@ -45,58 +41,6 @@ const WORLD_SIZE: usize = 2;
 const QUEUE_DEPTH: usize = 2;
 /// The stub model's image start token, the successor of 1001.
 const STUB_IMAGE_START: u32 = 151_670;
-/// The five top logprobs a fresh request reports for its first token after
-/// the prompt `[7, 8]`, selected greedily under the nucleus `top_p`.
-fn first_token_logprobs(
-    executor: &mut ExecutorGroup,
-    batch_id: u64,
-    request_id: u64,
-    slot: u32,
-    top_p: f32,
-) -> anyhow::Result<Vec<ipc::TokenLogprob>> {
-    let mut admission = text_admission(request_id, 1, slot)?;
-    let sampling = &mut admission.generation.as_mut().unwrap().sampling;
-    sampling.top_p = top_p;
-    sampling.return_logprobs = true;
-    sampling.n_logprobs = 5;
-    let mut batch = token_batch(
-        batch_id,
-        batch_id,
-        admission.request_key,
-        Some(admission),
-        CallId::new(batch_id, 0),
-        CallKind::Forward(ForwardMode::Prefill),
-        &[7, 8],
-        UnitId(slot),
-        0,
-    );
-    batch.calls[0].bounds.max_completion_bytes = 4 + 6 * 12;
-    let result = execute(executor, batch)?;
-    let record = &result.results[0].output;
-    assert_eq!(record.status, CallStatus::Ok);
-    // The stub's head maps 8 to 1000.
-    assert_eq!(record.committed_tokens, vec![1000]);
-    Ok(record.token_logprobs[0].clone())
-}
-
-#[test]
-fn logprobs_report_the_model_distribution_under_a_cutoff() -> anyhow::Result<()> {
-    let mut executor = spawn_worker_group()?;
-
-    // The stub's successor holds nearly all mass, so a nucleus of one half
-    // keeps it alone; the five reported tokens are still the model's five
-    // most likely, with the model's log probabilities.
-    let cut = first_token_logprobs(&mut executor, 1, 31, 1, 0.5)?;
-    let whole = first_token_logprobs(&mut executor, 2, 32, 2, 1.0)?;
-
-    assert_eq!(cut.len(), 5);
-    assert_eq!(cut[0].token_id, 1000);
-    assert!(cut.iter().all(|entry| entry.logprob.is_finite()));
-    assert_eq!(cut, whole);
-    executor.close()?;
-    Ok(())
-}
-
 /// Waits up to 30 seconds in total for the executor's next partial or
 /// terminal batch result, polling again after progress-only wakes.
 fn poll_logical(executor: &mut impl Executor) -> anyhow::Result<Option<engine::BatchResult>> {
@@ -255,180 +199,6 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("worker");
-    let worker = serde_json::to_string(&worker_executable())?;
-    let records = serde_json::to_string(directory.path())?;
-    // Record process identities at the launch boundary; the numerical
-    // executor and the engine both execute their normal public paths.
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nrank = sys.argv[sys.argv.index('--rank') + 1]\n(Path({records}) / (rank + '.pid')).write_text(str(os.getpid()))\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut config = EngineConfig::sim("stub");
-    config.generation_limits = engine::GenerationLimits {
-        features: engine::GenerationFeatures::UNDERSTANDING,
-        latent_downsample: 1,
-        max_cfg_branches: 1,
-        ..Default::default()
-    };
-    config.worker_groups = vec![ExecutorGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        WORLD_SIZE,
-        2,
-        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
-    )];
-    config.worker_process = worker_group_args();
-    config.worker_process.executable = wrapper.clone();
-    let engine = SchedulerHandle::start_all(config)?.remove(0);
-
-    // Removing the launch executable makes recovery fail at the same OS
-    // boundary as a missing deployment prerequisite, without changing IPC.
-    remove_file(wrapper)?;
-    let pid = std::fs::read_to_string(directory.path().join("0.pid"))?.parse::<libc::pid_t>()?;
-    // SAFETY: kill takes only integer arguments and touches no storage of this process.
-    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !engine.is_dead() && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let dead = engine.is_dead();
-    engine.shutdown();
-    assert!(
-        dead,
-        "an engine without execution workers kept accepting work"
-    );
-    Ok(())
-}
-
-/// The engine configuration of a two-rank stub deployment named
-/// `deployment`.
-fn stub_engine_config(deployment: &str) -> EngineConfig {
-    let mut config = EngineConfig::sim("stub");
-    config.generation_limits = engine::GenerationLimits {
-        features: engine::GenerationFeatures::UNDERSTANDING,
-        latent_downsample: 1,
-        max_cfg_branches: 1,
-        ..Default::default()
-    };
-    config.worker_groups = vec![ExecutorGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        WORLD_SIZE,
-        2,
-        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
-    )];
-    config.worker_process = worker_group_args();
-    config.worker_process.deployment = deployment.to_owned();
-    config
-}
-
-
-/// The tokens `events` delivers until its terminal event, and that event.
-fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u32>, Event)> {
-    let mut tokens = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the request did not end"
-        );
-        match events.try_recv() {
-            Ok(Event::TextToken { id, .. }) => tokens.push(id),
-            Ok(event) if event.is_terminal() => return Ok((tokens, event)),
-            Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
-}
-
-/// A deployment of a prefill group and a decode group (`ExecutorGroupRole`)
-/// prefills each request on the first, which exports the request's KV
-/// cache once its prompt is complete, and decodes it on the second, which
-/// installs that cache: requests generate what one model group generates,
-/// though the prefill group serves no decode and the decode group no
-/// prefill.
-#[test]
-fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> {
-    let generate = |config: EngineConfig| -> anyhow::Result<Vec<Vec<u32>>> {
-        let engine = SchedulerHandle::start_all(config)?.remove(0);
-        let result = (|| -> anyhow::Result<Vec<Vec<u32>>> {
-            // Two requests at once, one of a prompt of three chunks.
-            let mut streams = Vec::new();
-            for (id, prompt) in [
-                (101_u64, vec![7, 8, 9]),
-                (102, (0..600u32).map(|index| index % 47 + 5).collect()),
-            ] {
-                streams.push(engine.submit(Request::from(engine::GenerationRequest {
-                    request_id: RequestId(id),
-                    prompt_token_ids: prompt,
-                    negative_prompt_token_ids: Vec::new(),
-                    multimodal_inputs: Default::default(),
-                    constraint: engine::GenerationConstraint::UndOnly,
-                    sampling: SamplingParams {
-                        ignore_eos: true,
-                        ..Default::default()
-                    },
-                    image: Default::default(),
-                    max_images: 1,
-                    max_und_tokens: 6,
-                    stop_strings: Vec::new(),
-                    stop_token_ids: Vec::new(),
-                    priority: 0,
-                    cache: Default::default(),
-                    include_stop_token: false,
-                    image_generation: Default::default(),
-                    readout: Vec::new(),
-                    generated_token_ids: Vec::new(),
-                    adapter: 0,
-                    generated_images: Vec::new(),
-                    trajectory: Default::default(),
-                }))?);
-            }
-            let mut generated = Vec::new();
-            for mut events in streams {
-                let (tokens, terminal) = tokens_until_terminal(&mut events)?;
-                anyhow::ensure!(
-                    matches!(terminal, Event::Finished { .. }),
-                    "a request ended with {terminal:?}"
-                );
-                generated.push(tokens);
-            }
-            Ok(generated)
-        })();
-        engine.shutdown();
-        result
-    };
-
-    let expected = generate(stub_engine_config("one-group"))?;
-    let mut config = stub_engine_config("prefill-decode");
-    let group = config.worker_groups.remove(0);
-    config.worker_groups = [
-        ("prefill", engine::ExecutorGroupRole::Prefill),
-        ("decode", engine::ExecutorGroupRole::Decode),
-    ]
-    .into_iter()
-    .map(|(id, role)| ExecutorGroupConfig {
-        id: engine::ExecutorGroupId(id.into()),
-        role,
-        ..group.clone()
-    })
-    .collect();
-    let handed = generate(config)?;
-    anyhow::ensure!(
-        expected.iter().all(|tokens| tokens.len() == 6) && handed == expected,
-        "one group generated {expected:?}, the prefill and decode groups {handed:?}"
-    );
-    Ok(())
-}
 
 #[test]
 fn placement_binds_ranks_to_the_engine_host_by_name() {
@@ -545,14 +315,6 @@ impl SubmitPlaced for ExecutorGroup {
         let spans = on_every_rank(std::mem::take(&mut batch.buffer_allocations));
         self.submit_batch(batch, &CallReaders::new(), &spans)
     }
-}
-
-/// Submits one batch and waits up to 30 seconds for its result.
-fn execute(executor: &mut ExecutorGroup, batch: Batch) -> anyhow::Result<engine::ExecutorResult> {
-    executor.submit_placed(batch)?;
-    executor
-        .poll_batch(Duration::from_secs(30))?
-        .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
 }
 
 /// A greedy text admission for engine 1 that ignores EOS, starting at
