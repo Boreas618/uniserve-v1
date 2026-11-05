@@ -917,6 +917,12 @@ impl VideoDecoder {
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
+        // The stitch copies each seam's neighbour into one contiguous block before the blend reads it:
+        // `cross_fade` addresses its sources flat, and a neighbour in a raster wider than the tile is
+        // not one contiguous block. One copy serves every seam and every canvas, whatever the tile's
+        // extents, because its key is the pair of element types and the extents are a launch value.
+        use ops::copy_block::CopyBlock as CopyBlockOp;
+        programs.launch::<CopyBlockOp>(&nn::layers::CopyBlock::descriptor_of(dtype));
 
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
