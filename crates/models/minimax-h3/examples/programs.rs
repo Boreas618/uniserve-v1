@@ -46,7 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The video decoder's precision is the checkpoint's, not the config's: the design converts
     // nothing at load, so the deployment states the element type its weights are in.
-    let mut dtype: Option<ops::DType> = None;
+    // The four components' stored element types, as the caller's tensor table states them. A
+    // deployment's element type is its own per component (the design's precision rule), so a single
+    // `--dtype` handed to every component is the defect this flag replaces: the video VAE asked for
+    // the stack's type states rows no launch asks for.
+    let mut types: Option<PathBuf> = None;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
     let mut tokens: Vec<u32> = Vec::new();
@@ -139,13 +143,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
+            "--types" => types = Some(PathBuf::from(value.as_str())),
+            // Refused, not ignored: a run that states an element type believes it chose one, and the
+            // type is each component's own - the checkpoint's, or the table `--types` names.
             "--dtype" => {
-                dtype = Some(match value.as_str() {
-                    "f16" => ops::DType::F16,
-                    "bf16" => ops::DType::BF16,
-                    "f32" => ops::DType::F32,
-                    other => return Err(format!("{other} is not a float type").into()),
-                });
+                return Err(format!(
+                    "--dtype {value} states one element type for four components; each component's \
+                     type is its own, so state --types <table> or let the checkpoint's shard headers \
+                     answer"
+                )
+                .into());
             }
             other => return Err(format!("unknown flag {other}").into()),
         }
@@ -175,7 +182,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let dtype = dtype.ok_or("--dtype is the checkpoint's and has no default")?;
+    // **`--dtype` is gone.** A deployment's element type is its own per component (the design's
+    // precision rule: BF16 text encoder and DiT, FP32 video VAE), so one flag could only ever state
+    // three components wrong. A stated `--dtype` is refused rather than ignored: a run that thinks it
+    // chose a type should learn that it did not.
     if tokens.is_empty() {
         return Err("--tokens is the deployment's and has no default".into());
     }
@@ -238,6 +248,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rows: Vec<(String, String)> = Vec::new();
 
+    // Each component's stored element type: the caller's table where it is at hand, the checkpoint's
+    // own shard headers where they are, and a refusal naming both where neither is. The video and
+    // audio VAEs are the components whose type is *not* the stack's, and handing them `--dtype` was
+    // a measured defect: seven decoder rows and two postprocessor rows appear at the wrong type.
+    let stated = match types.as_deref() {
+        Some(table) => Some(minimax_h3::load::ElementTypes::read(table)?),
+        None => None,
+    };
+    let checkpoint = nn::Checkpoint::open(&root).ok();
+    let text_type =
+        minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "text_encoder")?;
+    let stack_type =
+        minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "transformer")?;
+    let vae_type = minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "vae")?;
+    let audio_type =
+        minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "audio_vae")?;
+
     let audio = root.join("audio_vae/config.json");
     if audio.exists() {
         let config = AudioVaeConfig::parse(&read(&audio)?)?;
@@ -262,8 +289,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        rows.extend(VideoDecoder::programs(&config, dtype)?);
-        rows.extend(VideoPostprocessor::programs(dtype, &rasters));
+        rows.extend(VideoDecoder::programs(&config, vae_type)?);
+        rows.extend(VideoPostprocessor::programs(vae_type, &rasters));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
@@ -279,12 +306,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // One row per prompt length: the attention's key bound is the deployment's, and the gated
         // activation's `wide` form follows from it.
         for tokens in &tokens {
-            rows.extend(TextEncoder::programs(&config, &partition, dtype, *tokens)?);
+            rows.extend(TextEncoder::programs(
+                &config, &partition, text_type, *tokens,
+            )?);
         }
         // The tower attends grids of the deployment's largest image; its programs do not depend on
         // them beyond the bound the module is accepted for.
         let sequence = tokens.iter().copied().max().unwrap_or(0);
-        rows.extend(VisionTower::programs(&config.vision, dtype, sequence)?);
+        rows.extend(VisionTower::programs(&config.vision, text_type, sequence)?);
     } else {
         eprintln!("not walked: text_encoder");
     }
@@ -337,7 +366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows.extend(Denoiser::programs(
             &config,
             attention,
-            dtype,
+            stack_type,
             max,
             Groups::of(conditioned),
             &partition,
@@ -366,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         partition.ulysses_degree
     );
     println!(
-        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --dtype {dtype} --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
+        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --types <table> --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
         samples
             .iter()
             .map(u32::to_string)
