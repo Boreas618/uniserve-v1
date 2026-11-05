@@ -1043,6 +1043,19 @@ impl Transformer {
         loader: &mut WeightLoader<'_>,
         heads: Option<StudentHeads>,
     ) -> Result<Self> {
+        // A sparse deployment's key-tile bound is a statement about the deployment (`Layouts::
+        // tiles_bound`), and every layer that compresses reduces over it. Zero is legal only for a
+        // dense stack, where nothing reads it: a sparse stack holding zero would hand `VsaTiles` a
+        // bound of nothing, and the descriptor a plan reads would name a reduction over no tiles
+        // rather than refuse. A harness that passes zero for a sparse deployment is refused here
+        // instead of one layer later.
+        if matches!(kind, AttentionKind::Sparse { .. }) && tile_bound == 0 {
+            return Err(Error::config(
+                "a sparse deployment states its key-tile bound and this stack was handed zero: \
+                 `Layouts::tiles_bound` is the deployment's own, and a compression reduces over it"
+                    .to_owned(),
+            ));
+        }
         match (config.output_heads, heads.is_some()) {
             (1, false) | (2.., true) => {}
             (0, _) => {
