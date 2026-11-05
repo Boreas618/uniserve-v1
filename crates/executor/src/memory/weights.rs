@@ -113,6 +113,11 @@ pub struct WeightStore<S: WeightStorage> {
     device: platform::DeviceId,
     /// Every weight this rank has mapped, by storage key.
     mapped: BTreeMap<[u8; 32], Backing>,
+    /// How many weights this rank read back from the storage rather than converting itself.
+    from_store: usize,
+    /// How many weights this rank published to the storage, which is how many keys it added to a
+    /// store that never releases one (§8: a content-addressed cache that outlives its epochs).
+    published: usize,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
@@ -122,6 +127,8 @@ impl<S: WeightStorage> WeightStore<S> {
             storage,
             device,
             mapped: BTreeMap::new(),
+            from_store: 0,
+            published: 0,
         }
     }
 
@@ -133,6 +140,20 @@ impl<S: WeightStorage> WeightStore<S> {
     /// How many weights this rank holds, for the metrics report and for tests.
     pub fn mapped(&self) -> usize {
         self.mapped.len()
+    }
+
+    /// How many weights this rank read back from the storage instead of converting them.
+    pub fn from_store(&self) -> usize {
+        self.from_store
+    }
+
+    /// How many weights this rank published to the storage.
+    ///
+    /// A retained store never releases a key, so this is exactly what the host gained: a run that
+    /// published nothing grew the store by nothing, and one that published after a key change added
+    /// that many records beside the ones the previous key left.
+    pub fn published(&self) -> usize {
+        self.published
     }
 
     /// The storage behind the store.
@@ -182,7 +203,30 @@ impl<S: WeightStorage> WeightStore<S> {
             return Ok(None);
         };
         self.mapped.insert(storage_key, backing);
+        self.from_store += 1;
         Ok(Some(backing))
+    }
+}
+
+impl<S: WeightStorage> Drop for WeightStore<S> {
+    /// One line, when the epoch's store is released: what this rank's loads read back and what they
+    /// published.
+    ///
+    /// A retained store never releases a key, so a reader looking at its size after a key change has
+    /// no way to tell a run that reused it from one that grew it. These are those two figures, and
+    /// they are printed once per store rather than per weight because the question is about the
+    /// store, not about a weight.
+    fn drop(&mut self) {
+        if self.from_store == 0 && self.published == 0 {
+            return;
+        }
+        tracing::info!(
+            device = %self.device,
+            mapped = self.mapped.len(),
+            from_store = self.from_store,
+            published = self.published,
+            "the epoch's retained weights: what this rank mapped, read back and published"
+        );
     }
 }
 
@@ -239,6 +283,7 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
             .store(self.device, &storage_key, bytes, allocation)
             .map_err(|error| nn::Error::Unsupported(format!("publishing weight {key}: {error}")))?;
         self.mapped.insert(storage_key, backing);
+        self.published += 1;
         Ok(backing)
     }
 }
@@ -490,6 +535,13 @@ mod tests {
         // And each deployment's own restart maps its own table rather than recomputing it.
         let mut restarted = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         assert!(restarted.retained(&reference).expect("a hit").is_some());
+
+        // The two figures a reader needs to tell a run that grew the store from one that reused it:
+        // the first deployment published and read nothing back, the restart read and published
+        // nothing.
+        assert_eq!((first.from_store(), first.published()), (0, 1));
+        assert_eq!((second.from_store(), second.published()), (0, 1));
+        assert_eq!((restarted.from_store(), restarted.published()), (1, 0));
     }
 
     #[test]
