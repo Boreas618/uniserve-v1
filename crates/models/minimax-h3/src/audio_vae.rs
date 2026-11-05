@@ -1378,6 +1378,16 @@ impl Decoder for BigVgan {
         }
     }
 
+    /// The interleaved PCM window one decode of `audio` writes.
+    ///
+    /// The window's frames are the track's latent steps multiplied by the product of the seven
+    /// stages' rates, which is what [`track_samples`] answers from the checkpoint's own constants;
+    /// the two channels are [`PCM_CHANNELS`]. Both are stated once here so a runner sizes its column
+    /// from the model rather than restating the rates.
+    fn pcm_window(&self, audio: &nn::capability::LatentShape) -> nn::Result<(u64, u32)> {
+        Ok((track_samples(&self.config, audio.frames), PCM_CHANNELS))
+    }
+
     /// Decode one run of latent frames into interleaved PCM.
     ///
     /// The audio decoder has no layout constants: every table it reads is a weight, bound at load, so
