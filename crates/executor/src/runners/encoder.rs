@@ -615,7 +615,8 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(pools);
+        self.lifecycle.attach_pools(Arc::clone(&pools));
+        self.pools = Some(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
