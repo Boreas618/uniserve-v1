@@ -187,6 +187,28 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
     --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
 
+# 3b. One file, one attention backend. The dense and sparse walks differ by seven operators
+# (`sparse_attention` and the six `vsa_*`), so a dense fixture that names one of them is the union of
+# two deployments - a store with cells no launch of that deployment reads, and the omni fixture was
+# deleted for exactly this. The check is a grep because the alternative is a rule nobody runs.
+echo 'one deployment per file:'
+for pair in "dense:$fixture_dense:" "sparse:$fixture_sparse:sparse"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    fixture=${rest%%:*}
+    want=${rest#*:}
+    others=$(grep -cP '^(sparse_attention|vsa_[a-z_]+)\t' "$fixture")
+    if [ "$name" = dense ] && [ "$others" -ne 0 ]; then
+        printf '  %-10s FAILED - %s row(s) of the sparse backend in the dense file\n' "$name" "$others"
+        exit 1
+    fi
+    if [ "$name" = sparse ] && [ "$others" -eq 0 ]; then
+        printf '  %-10s FAILED - no row of the sparse backend in the sparse file\n' "$name"
+        exit 1
+    fi
+    printf '  %-10s ok (%s row(s) of the sparse backend)\n' "$name" "$others"
+done
+
 # 4. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
 echo 'certify:'
