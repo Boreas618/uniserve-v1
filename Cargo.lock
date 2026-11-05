@@ -1243,6 +1243,7 @@ dependencies = [
  "ipc",
  "libc",
  "libloading",
+ "media",
  "nn",
  "nvtx",
  "ops",

@@ -173,6 +173,20 @@ pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
 ///
 /// At 24 fps and 40 Hz the exact value is never halfway between two steps, so the rounding
 /// direction is unambiguous; it is round-half-to-even because the reference uses Python's `round`.
+///
+/// **This is the request's direction, and it is not the encode's.** At 24 fps and 32 kHz a frame is
+/// `4000 / 3` samples and a latent step is `800`, so 5 latents span 3 frames exactly and a request's
+/// latent count is `5n / 3` rounded: its track is `800 * round(5n / 3)` samples against an exact
+/// `4000n / 3`, and the two differ by a third of a hop (`800 / 3` = 266.67 samples) with the sign set
+/// by `n mod 3`. A frame count of `0 mod 3` is exact; of `1 mod 3` the track is long (124 frames,
+/// 207 latents, `165600` samples against `165333.33`); of `2 mod 3` it is **short** (107 frames, 178
+/// latents, `142400` against `142666.67`). **So a request's track may be shorter than its video**, and
+/// whoever muxes them states each stream's own length rather than deriving either from the duration.
+///
+/// [`crate::encoding::audio_latent_frames`] is the other direction - samples to latents, `ceil` - and
+/// it is the one that can never be short, because its input is a sample count rather than a frame
+/// count. The two keep distinct-looking names for that reason: one answers "what does this request
+/// need", the other "what does this track encode to".
 pub fn audio_latent_frames(num_frames: u32) -> u32 {
     let exact =
         f64::from(num_frames) * f64::from(crate::config::AUDIO_LATENTS_PER_SECOND) / f64::from(FPS);
@@ -1502,6 +1516,29 @@ mod tests {
             assert_eq!(audio_rows(frames), 2 * latents);
             // One `AUDIO_HOP` of samples per audio latent step.
             assert_eq!(audio_samples(frames), latents * AUDIO_HOP);
+        }
+    }
+
+    /// A request's track is a third of a hop either side of the duration it asked for, and which side
+    /// is `frames % 3`.
+    ///
+    /// The exact duration of `n` frames is `4000n / 3` samples: a frame is not a whole number of
+    /// samples at 24 fps and 32 kHz, so the comparison is stated in thirds - `3 * track` against
+    /// `4000n` - and the difference is `+800`, `-800` or `0`, which is a hop's third in each
+    /// direction. **The short cases are the ones a mux must not "correct":** a sound track 266.67
+    /// samples shorter than its video is the model's answer for 107 and 362 frames, and padding it
+    /// to the video's length is a track of zeros the checkpoint never produced.
+    #[test]
+    fn a_tracks_length_is_a_third_of_a_hop_from_its_request() {
+        for (frames, thirds) in [(107, -800_i64), (124, 800), (192, 0), (243, 0), (362, -800)] {
+            let track = i64::from(audio_samples(frames));
+            assert_eq!(
+                3 * track - 4000 * i64::from(frames),
+                thirds,
+                "{frames} frames: {} samples against an exact {}/3",
+                track,
+                4000 * i64::from(frames)
+            );
         }
     }
 
