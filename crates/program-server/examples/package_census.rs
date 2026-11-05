@@ -101,8 +101,8 @@ fn read_fixtures(paths: &[PathBuf]) -> Result<Vec<Fixture>, String> {
 /// paths are (`<op>/<backend>`).
 fn read_packages(root: &Path, fixtures: &[Fixture]) -> Result<Vec<Package>, String> {
     let mut packages = Vec::new();
-    let ops = std::fs::read_dir(root)
-        .map_err(|error| format!("reading {}: {error}", root.display()))?;
+    let ops =
+        std::fs::read_dir(root).map_err(|error| format!("reading {}: {error}", root.display()))?;
     for op_entry in ops {
         let op_entry = op_entry.map_err(|error| format!("{}: {error}", root.display()))?;
         if !op_entry.path().is_dir() {
@@ -141,9 +141,7 @@ fn read_packages(root: &Path, fixtures: &[Fixture]) -> Result<Vec<Package>, Stri
             });
         }
     }
-    packages.sort_by(|left, right| {
-        (&left.op, &left.backend).cmp(&(&right.op, &right.backend))
-    });
+    packages.sort_by(|left, right| (&left.op, &left.backend).cmp(&(&right.op, &right.backend)));
     Ok(packages)
 }
 
@@ -178,7 +176,10 @@ fn report(packages: &[Package], fixtures: &[Fixture]) {
             *entry = *entry || package.observed;
         }
     }
-    let asked: BTreeSet<&str> = fixtures.iter().map(|fixture| fixture.key.as_str()).collect();
+    let asked: BTreeSet<&str> = fixtures
+        .iter()
+        .map(|fixture| fixture.key.as_str())
+        .collect();
     let unclaimed: Vec<&&str> = asked
         .iter()
         .filter(|key| !observers.contains_key(**key))
@@ -190,7 +191,10 @@ fn report(packages: &[Package], fixtures: &[Fixture]) {
         observers.len() - observed
     );
     if !unclaimed.is_empty() {
-        println!("{} fixture descriptors no package covers at all", unclaimed.len());
+        println!(
+            "{} fixture descriptors no package covers at all",
+            unclaimed.len()
+        );
         for key in unclaimed {
             println!("  no package   {key}");
         }
