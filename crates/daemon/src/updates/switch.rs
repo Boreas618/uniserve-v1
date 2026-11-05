@@ -884,6 +884,33 @@ impl Switch {
                 self.parked(roster, &host, parked.generation);
             }
             (Phase::Promoting, Some(Kind::Promoted(promoted))) if self.is_target(generation) => {
+                // The programs the promotion reports are the ones the process
+                // holds, and the epoch serves the ones its children prepared
+                // (`EpochRecord::generation`). A standby whose precopy the
+                // epoch reverted holds an older generation, and moving the
+                // frontend onto it would serve programs the epoch no longer
+                // runs — refused here, with the frontend left where it is and
+                // the target abandoned rather than reverted. An unstated `0`
+                // is a process that holds no programs, which is the behaviour
+                // a minor-4 engine has.
+                let held = promoted.program_generation;
+                if let (true, Some(epoch)) = (held != 0, self.record.generation) {
+                    if held != epoch {
+                        self.failed(
+                            roster,
+                            Failure {
+                                kind: "stale_programs".to_owned(),
+                                reason: format!(
+                                    "the promoted process on {host} holds program generation \
+                                     {held} and this epoch's is {epoch}: the frontend is not \
+                                     moved onto programs the epoch does not serve"
+                                ),
+                                device: None,
+                            },
+                        );
+                        return;
+                    }
+                }
                 self.promoted(roster, &host, promoted.generation);
             }
             (Phase::Serving, Some(Kind::Drained(drained)))
@@ -1278,6 +1305,63 @@ mod tests {
         switch.advance(roster);
         switch.parked(roster, "n0", 6);
         switch.parked(roster, "n1", 6);
+    }
+
+    /// A promotion that reports programs the epoch does not serve is refused:
+    /// the frontend stays where it is, the target is abandoned with the reason
+    /// rather than reverted, and the previous epoch serves on. A promotion that
+    /// states the epoch's own generation serves, and one that states none (`0`)
+    /// keeps the behaviour of an engine that holds no programs.
+    #[test]
+    fn a_promotion_holding_other_programs_leaves_the_frontend_where_it_is() {
+        use proto::process::Promoted;
+
+        let promotion = |program_generation: u64| {
+            report(process::report::Kind::Promoted(Promoted {
+                generation: 6,
+                program_generation,
+            }))
+        };
+
+        // A standby whose precopy the epoch reverted holds an older generation.
+        let (epochs, mut switch) = setup();
+        switch.record.generation = Some(11);
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.report(&mut roster, "n0".to_owned(), 6, promotion(10));
+        assert_eq!(
+            switch.phase(),
+            Phase::Abandoned,
+            "the target is abandoned, never served"
+        );
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("stale_programs")
+        );
+        assert!(
+            roster.serves.is_empty(),
+            "the frontend was not moved onto programs the epoch does not serve"
+        );
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Purged)
+        );
+
+        // The epoch's own generation serves.
+        let (_epochs, mut switch) = setup();
+        switch.record.generation = Some(11);
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.report(&mut roster, "n0".to_owned(), 6, promotion(11));
+        assert_ne!(switch.phase(), Phase::Abandoned);
+
+        // A process that states no programs keeps today's behaviour.
+        let (_epochs, mut switch) = setup();
+        switch.record.generation = Some(11);
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.report(&mut roster, "n0".to_owned(), 6, promotion(0));
+        assert_ne!(switch.phase(), Phase::Abandoned);
     }
 
     /// Promotes on every node and drains the old epoch away.
