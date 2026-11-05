@@ -111,6 +111,18 @@ pub struct ExecutionBatch {
     /// mechanism could not state them — a batch no executor may serve, as
     /// opposed to one served on invented values.
     pub columns: Option<executor::batch::BatchColumns>,
+    /// A media computation's own columns, and `None` for every token batch (2.4).
+    ///
+    /// One batch is one computation: a media batch states the computation its kernels were
+    /// captured for and, per request, the buffers the model's family prepared, and it carries
+    /// no token column. The two fields are therefore never both `Some`.
+    ///
+    /// The mechanism is the one that fills this, and it fills it only with facts it owns: the
+    /// computation comes from the plan the scheduler selected the call in, the extent from the
+    /// bucket the executor states it would serve that computation in, and the buffers from the
+    /// request's own stated parameters. A media batch whose inputs the mechanism cannot state is
+    /// left without columns and is refused at submission by name, never served on invented bytes.
+    pub media: Option<executor::batch::MediaColumns>,
 }
 
 /// Batches compare by what the mechanism decided: their identity, their
@@ -126,6 +138,7 @@ impl PartialEq for ExecutionBatch {
             && self.cache_inputs == other.cache_inputs
             && self.page_offloads == other.page_offloads
             && self.columns.is_some() == other.columns.is_some()
+            && self.media.is_some() == other.media.is_some()
     }
 }
 
@@ -157,6 +170,7 @@ impl ExecutionBatch {
             cache_inputs: Vec::new(),
             page_offloads: None,
             columns: None,
+            media: None,
         }
     }
 
@@ -310,7 +324,18 @@ impl ExecutionBatch {
             // The worker-process wire batch carries no columns: they are the
             // in-process executor's layout, not the wire protocol's.
             columns: _,
+            // A media computation's buffers are the in-process executor's, and
+            // the wire batch has nowhere to carry them: refusing here is the
+            // difference between a media call that stops by name and one a
+            // worker serves with no inputs at all.
+            media,
         } = self;
+        anyhow::ensure!(
+            media.is_none(),
+            "a media computation is served in process, and the wire batch carries no media \
+             columns: {:?}",
+            media.map(|columns| columns.computation.call)
+        );
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
         let mut forward = ForwardBatch::default();

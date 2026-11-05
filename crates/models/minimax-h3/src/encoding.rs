@@ -2477,6 +2477,29 @@ pub fn video_encoder_tile_arena(
     Ok(plan)
 }
 
+/// The buffers a **run** of tiles encodes in: one set per distinct tile extent, not one per tile.
+///
+/// A driver reserves once before its loop and hands the same set to every tile
+/// ([`VideoEncoder::reserve`], called from `tiled_encode::ClipEncoder::encode`), because the arena
+/// never rewinds: a reservation inside the loop is multiplied by the tile count, and one tile's buffers
+/// are most of a gigabyte at the served canvas. A plan that sums [`video_encoder_tile_arena`] over the
+/// grid therefore states the tile count times what the run reserves - at 17 frames of 768x768 that is
+/// 65,360 MiB against the 6,150 MiB the run actually holds.
+///
+/// A run's tiles are uniform at the served grids (`Seams::split` keeps every tile at the raster's tile
+/// size and spends the slack on wider seams), so the list is usually one extent and the answer is one
+/// set. It is passed whole because a raster smaller than a tile is the case where they differ.
+pub fn video_encoder_run_arena(
+    config: &VideoVaeConfig,
+    extents: &[Extent],
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    for extent in distinct(extents) {
+        plan.extend(video_encoder_tile_arena(config, extent)?);
+    }
+    Ok(plan)
+}
+
 /// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
 ///
 /// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
@@ -2926,21 +2949,30 @@ mod tests {
             "a raster changes the pads' columns, not the frame statistics"
         );
 
-        // **The residuals are keyed on the levels' widths in pixels, so the raster moves them.** A
-        // block adds `rows(out)` to `rows(residual)`, and `rows` takes `dim(4)` of a
-        // `[1, channels, frames, height, width]` buffer as its columns - the width, not the channel
-        // count. The recorder is the independent witness: 672x1536 launches at 1536, 768, 384, 192 and
-        // 96, and 768x1024 at 1024, 512, 256, 128 and 64.
+        // **The residuals are not keyed on the levels' widths.** A block adds `rows(out)` to
+        // `rows(residual)` and `rows` takes `dim(4)` of the raster as its columns, but `columns` left
+        // `ScaledAddDescriptor` on purpose (`crates/ops/src/residual.rs`): the kernel takes the extent
+        // as an argument and derives the row width from the operand's own shape, so a key that named it
+        // stated one row per clip length the walk happened to name and left every other length with no
+        // kernel. One program therefore serves every level of every raster, and the raster moves the
+        // pads alone.
         let residuals = |rows: &[(String, String)]| -> Vec<String> {
             rows.iter()
                 .filter(|(name, _)| name == "scaled_add")
                 .map(|(_, key)| key.clone())
                 .collect()
         };
-        assert_ne!(
+        assert_eq!(
             residuals(&other),
             residuals(&programs),
-            "the residual columns are the levels' widths: a narrower raster launches narrower ones"
+            "one residual program serves every level width of every raster"
+        );
+        assert!(
+            residuals(&programs)
+                .iter()
+                .all(|key| !key.contains("columns_")),
+            "the residual's width is a launch argument, not a key field: {:?}",
+            residuals(&programs)
         );
         let stack = Stack::of(&config).expect("the stack");
         let extents = stack.extents(Extent {
@@ -2948,27 +2980,19 @@ mod tests {
             height: raster[0].0,
             width: raster[0].1,
         });
-        for extent in extents.iter().take(stack.widths.len()) {
-            let width = extent.width;
-            assert!(
-                residuals(&programs)
-                    .iter()
-                    .any(|key| key.contains(&format!("columns_{width}_"))),
-                "no residual row for a level {width} pixels wide: {:?}",
-                residuals(&programs)
-            );
-        }
-        // Levels can share a width - `[2, 2, 2, 2, 1, 1]` makes the last two the same - and the rows
-        // are a set, so the count is over the **distinct** widths rather than over the levels.
+        // The levels' widths are distinct quantities - `[2, 2, 2, 2, 1, 1]` makes the last two the
+        // same - and the block adds at each of them. **The row set does not grow with them**: the width
+        // is the operand's, so one program serves every level of every raster.
         let distinct: std::collections::BTreeSet<u32> = extents
             .iter()
             .take(stack.widths.len())
             .map(|extent| extent.width)
             .collect();
+        assert!(distinct.len() > 1, "the levels add at more than one width");
         assert_eq!(
             residuals(&programs).len(),
-            distinct.len(),
-            "one residual row per distinct level width: {:?}",
+            1,
+            "one residual program for every level width: {:?}",
             residuals(&programs)
         );
     }
@@ -3102,20 +3126,19 @@ mod tests {
             1,
             "one residual add for every stage, track and the projection: {residuals:?}"
         );
-        for extent in &extents {
-            assert!(
-                residuals
-                    .iter()
-                    .any(|key| key.contains(&format!("columns_{extent}_"))),
-                "no residual row for the stage's extent {extent}: {residuals:?}"
-            );
-        }
+        // **Not one row per extent, and none for the projection's channel-wide add either.** The
+        // extent is the operand's - `columns` left `ScaledAddDescriptor` because it changed no compiled
+        // code and it made a row set describe one track length - so the rows are one key and it names
+        // no columns. The extents below are what the launches pass, not what they compile.
         assert!(
-            residuals
-                .iter()
-                .any(|key| key.contains(&format!("columns_{channels}_"))),
-            "no residual row for the projection's {channels} channels: {residuals:?}"
+            extents.len() > 1,
+            "the stages add at more than one extent: {extents:?}"
         );
+        assert!(
+            residuals.iter().all(|key| !key.contains("columns_")),
+            "the residual's extent is a launch argument: {residuals:?}"
+        );
+        assert!(channels > 0, "the projection adds over its channels");
         // An unpadded track reaches no stage, so it states no program: the pad is the caller's, and a
         // row for the unpadded length would be a width no launch passes.
         assert!(
@@ -3148,9 +3171,14 @@ mod tests {
             "{programs:?}"
         );
 
-        // A longer track is another residual program, because the unit's whole output is its width.
+        // **A longer track is not another program.** The residual's extent is the operand's, so the
+        // whole row set is the same at every track length: the requests that differ are two launches
+        // of one program, and a key that named the length would be a set of rows per duration.
         let longer = AudioEncoder::programs(&config, &[88_200]).expect("a longer track");
-        assert_ne!(longer, programs);
+        assert_eq!(
+            longer, programs,
+            "one row set serves every track length: the extent is a launch value"
+        );
     }
     use super::*;
     use crate::video_vae::tests::video_config;
@@ -3360,6 +3388,43 @@ mod tests {
             distinct(&[tile(192, 192), tile(256, 256)]),
             vec![tile(192, 192), tile(256, 256)],
             "the order is the order they are named"
+        );
+    }
+
+    #[test]
+    fn a_run_of_tiles_reserves_one_set_and_not_one_per_tile() {
+        let config = video_config();
+        // Sixteen tiles of one extent - the served grids' shape - reserve exactly one tile's set,
+        // because the driver hoists the reservation out of its loop and hands the same buffers to every
+        // tile. A plan that summed the tile arena over the grid would state sixteen times the memory a
+        // run holds, and the caller would meet it as an arena of 65,360 MiB for a 768x768 raster.
+        let tile = Extent {
+            frames: 17,
+            height: 256,
+            width: 256,
+        };
+        let grid = vec![tile; 16];
+        let run = video_encoder_run_arena(&config, &grid).expect("the run's plan");
+        let one = video_encoder_tile_arena(&config, tile).expect("one tile's plan");
+        assert_eq!(
+            run, one,
+            "sixteen tiles of one extent are one set of buffers"
+        );
+        // A raster smaller than a tile is the case where a run's tiles are not uniform: two distinct
+        // extents are two sets, and neither is dropped.
+        let small = Extent {
+            frames: 17,
+            height: 192,
+            width: 192,
+        };
+        let mixed = video_encoder_run_arena(&config, &[tile, small, tile]).expect("the mixed plan");
+        assert_eq!(mixed.len(), run.len() + one.len());
+        assert_eq!(
+            mixed.len(),
+            video_encoder_tile_arena(&config, small)
+                .expect("the small tile's plan")
+                .len()
+                + one.len()
         );
     }
 
@@ -3783,5 +3848,4 @@ mod tests {
         assert!(AudioEncoder::check_track(Shape::new(&[2, 3, 44_100])).is_err());
         assert!(AudioEncoder::check_track(Shape::new(&[2, 44_100])).is_err());
     }
-
 }

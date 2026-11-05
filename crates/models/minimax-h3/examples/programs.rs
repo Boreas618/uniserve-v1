@@ -313,6 +313,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "text_encoder")?;
     let stack_type =
         minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "transformer")?;
+    // **The transformer's second element type, where the checkpoint stores one**: the four boundary
+    // projections and the timestep embedder's pair. `None` means the component is single-typed and
+    // the stack's type is the only one, which is what every other component's answer is.
+    let boundary_type =
+        minimax_h3::load::boundary_dtype(stated.as_ref(), checkpoint.as_ref(), "transformer")?
+            .unwrap_or(stack_type);
     let vae_type = minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "vae")?;
     let audio_type =
         minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "audio_vae")?;
@@ -326,6 +332,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Types {
             text_encoder: text_type,
             transformer: stack_type,
+            transformer_boundary: boundary_type,
             video: vae_type,
             audio: audio_type,
         },
@@ -477,7 +484,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // row, and nothing but iterating the served set states it.
         for groups in [Groups::of(false), Groups::of(true)] {
             rows.extend(Denoiser::programs(
-                &config, attention, stack_type, max, groups, &partition, &elements, tiles,
+                &config,
+                attention,
+                stack_type,
+                boundary_type,
+                max,
+                groups,
+                &partition,
+                &elements,
+                tiles,
             )?);
         }
     }

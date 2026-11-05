@@ -437,6 +437,48 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
 /// bulk the layers compute in. The remainder are **crossings**, and a layer that narrows or widens
 /// states its own type at the site that does it (`modulation.rs`'s projections, the four boundary
 /// projections of the transformer), so asking this function never decides a crossing.
+/// The element type a component's **boundary tensors** are stored in, when it stores two.
+///
+/// A component whose weights are all one type has no boundary, and a row keyed from that one type
+/// is the row the forward launches. The transformer is the component this checkpoint stores in two -
+/// twelve F32 among 626 BF16 - and the twelve are the four boundary projections (`proj_in`,
+/// `proj_out`, `audio_proj_in`, `audio_proj_out`) and the timestep embedder's pair
+/// (`linear_1`, `linear_2`). They read a BF16 activation and are F32 weights, so a statement that
+/// names only the stack's type describes four products the runtime never makes.
+///
+/// The minority type is the boundary, by count and not by name: a component with one F32 tensor has
+/// no layers at that type to speak of, and the checkpoint's own counts say which reading is which.
+pub fn boundary_dtype(
+    stated: Option<&ElementTypes>,
+    checkpoint: Option<&nn::Checkpoint>,
+    component: &str,
+) -> Result<Option<nn::DType>> {
+    let counts: Vec<(String, usize)> = if let Some(types) = stated
+        && let Some(found) = types
+            .components
+            .iter()
+            .find(|entry| entry.component == component)
+    {
+        found.dtypes.clone()
+    } else if let Some(checkpoint) = checkpoint {
+        count_stored_types(checkpoint, component)?
+    } else {
+        return Ok(None);
+    };
+    if counts.len() < 2 {
+        return Ok(None);
+    }
+    let Some((dtype, _)) = counts.iter().min_by_key(|(_, count)| *count) else {
+        return Ok(None);
+    };
+    dtype_of(dtype).map(Some).ok_or_else(|| {
+        Error::checkpoint(format!(
+            "`{component}` states the element type `{dtype}`, which is not a type a weight can be \
+             stored in"
+        ))
+    })
+}
+
 pub fn deployment_dtype(
     stated: Option<&ElementTypes>,
     checkpoint: Option<&nn::Checkpoint>,
