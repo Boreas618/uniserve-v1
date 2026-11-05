@@ -1191,30 +1191,85 @@ fn stage_block(args: &Args) -> Result<()> {
         conditions: &[],
         vision_spans: &[],
     };
-    let (_, packing) = layouts.layout(&request)?;
+    let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
     // The canvas is the model's answer for the request - one rounding of the pixels, the same one
     // the layout's rows were computed from. A canvas reconstructed from the layout would be a second
     // statement of that rounding, right only where the rounding is the identity.
     let canvas = layouts.canvas(&request)?;
-    let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
-    let tokens = u64::from(packing.padded_tokens);
-    if tables.position_ids.len() as u64 != tokens || tables.groups.len() as u64 != tokens {
+    // **The tables are the deployment's kind's, not the dense packing's.** A sparse stack reads the
+    // valid rows of each tile, the segment of each tile and the keep table, and its row count is the
+    // segment packing's - a different packing of the same request. Handing a sparse stack dense
+    // tables leaves it with no views at all, which the layer refuses by name (`a sparse layer was
+    // handed no segment views`); that refusal is what this harness met while the model's own step
+    // passed them.
+    let (packed_rows, position_ids, groups, used, sparse_views) = match denoiser.attention {
+        AttentionKind::Dense => {
+            let tables =
+                packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
+            (
+                packing.padded_tokens,
+                tables.position_ids,
+                tables.groups,
+                Some(tables.used),
+                None,
+            )
+        }
+        AttentionKind::Sparse {
+            sparsity,
+            reference_keep,
+            ..
+        } => {
+            let segment = layouts.segment_of(&layout)?;
+            let conditions = packing::condition_segments(&[], &canvas, denoiser.clip)?;
+            let tables = packing::segment_tables(
+                &segment,
+                frames,
+                &canvas,
+                request.text_tokens,
+                &conditions,
+                &[],
+                packing::Sparsity {
+                    sparsity,
+                    reference_keep,
+                },
+            )?;
+            (
+                segment.extent.padded_tokens,
+                tables.position_ids,
+                tables.groups,
+                None,
+                Some((
+                    tables.variable_block_sizes,
+                    tables.tile_segments,
+                    tables.segment_keep,
+                )),
+            )
+        }
+    };
+    let tokens = u64::from(packed_rows);
+    if position_ids.len() as u64 != tokens || groups.len() as u64 != tokens {
         return Err(Failure::message(format!(
             "the row tables hold {} coordinates and {} groups for {tokens} packed rows",
-            tables.position_ids.len(),
-            tables.groups.len()
+            position_ids.len(),
+            groups.len()
         )));
     }
     println!(
-        "request: {}x{}, {} frames, {} rows packed of {} padded, {} attended",
-        args.width,
-        args.height,
-        frames,
-        packing.video_rows + packing.audio_rows,
-        tokens,
-        tables.used,
+        "request: {}x{}, {} frames, {} rows packed of {} padded",
+        args.width, args.height, frames, packed_rows, tokens,
     );
+    match (&used, &sparse_views) {
+        (Some(used), None) => println!("attention: dense, {used} attended"),
+        (None, Some((sizes, _, _))) => {
+            println!("attention: sparse, {} tile(s)", sizes.len());
+        }
+        _ => {
+            return Err(Failure::message(
+                "the tables do not match the deployment's attention kind".to_owned(),
+            ));
+        }
+    }
 
     // 4. Weights on the device, through the loader's own boundary.
     let mut weights = DeviceWeights::new(&device, 0)?;
@@ -1331,7 +1386,7 @@ fn stage_block(args: &Args) -> Result<()> {
     cache_projections(&forward, &projections, &memory)?;
 
     // 7. The inputs: the packed rows' rotary, the row table, the step, and the tokens themselves.
-    let positions = transpose_positions(&stream, &arena, &tables.position_ids, tokens)?;
+    let positions = transpose_positions(&stream, &arena, &position_ids, tokens)?;
     // A factor table holds one column per rotated pair, not per rotated channel: `rotated_width()`
     // counts channels (three axes of `2 * rope_freq_dim`) and the rotation reads `rotated / 2`.
     let cosine = arena.tensor(
@@ -1343,7 +1398,7 @@ fn stage_block(args: &Args) -> Result<()> {
         Shape::new(&[tokens, rotated_width(&config) / 2]),
     )?;
     stack.factors(&forward, positions, cosine, sine)?;
-    let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
+    let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &groups)?;
     // The evaluation the stack runs: the schedule's first, which is also the row the modulation
     // cache's entry table is indexed at. It is printed and written into `case.json`, because the
     // reference producer runs its own stack at one step and two sides at different steps differ by
@@ -1354,8 +1409,16 @@ fn stage_block(args: &Args) -> Result<()> {
     // `tokens` rows while the reference producer masks each query to `used` keys - the two sides
     // would compute different functions on the same input, and the comparison would report the
     // harness's mask as an arithmetic difference.
-    let used = i32::try_from(tables.used)
-        .map_err(|_| Failure::message(format!("{} attended rows", tables.used)))?;
+    // A sparse stack reads no visibility at all - its layers read the tiles and the keep table -
+    // so the pair is stated only for a dense deployment, and the sparse case falls back to the
+    // packed row count rather than to a number this harness invented.
+    let used =
+        match used {
+            Some(used) => i32::try_from(used)
+                .map_err(|_| Failure::message(format!("{used} attended rows")))?,
+            None => i32::try_from(tokens)
+                .map_err(|_| Failure::message(format!("{tokens} packed rows")))?,
+        };
     let packed =
         i32::try_from(tokens).map_err(|_| Failure::message(format!("{tokens} packed rows")))?;
     let cu_seq_lens_q = upload_i32(&stream, &arena, Shape::new(&[2]), &[0, packed])?;
@@ -1372,6 +1435,25 @@ fn stage_block(args: &Args) -> Result<()> {
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
     println!("step    {evaluation} of the schedule");
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
+    // The segment views a sparse stack reads: the rows of each tile, the segment of each tile and
+    // the key tiles each segment keeps - the three tables the model declares as the block's state,
+    // taken from the segment packing above rather than rebuilt here.
+    let segment_views = match &sparse_views {
+        None => None,
+        Some((sizes, segments, keep)) => {
+            let tiles = u64::try_from(sizes.len())
+                .map_err(|_| Failure::message("more tiles than a u64 states".to_owned()))?;
+            let rows = sizes
+                .iter()
+                .map(|rows| i32::try_from(*rows).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>();
+            Some(minimax_h3::attention_sparse::Segments {
+                sizes: upload_i32(&stream, &arena, Shape::new(&[tiles]), &rows)?,
+                segments: upload_i32(&stream, &arena, Shape::new(&[tiles]), segments)?,
+                keep: upload_i32(&stream, &arena, Shape::new(&[tiles]), keep)?,
+            })
+        }
+    };
     let forward_result = stack.forward(
         &forward,
         &cache,
@@ -1380,7 +1462,7 @@ fn stage_block(args: &Args) -> Result<()> {
         rows,
         Factors { cosine, sine },
         Some(&visible),
-        None,
+        segment_views.as_ref(),
         total,
         None,
     );
