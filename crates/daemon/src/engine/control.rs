@@ -728,7 +728,17 @@ impl EngineControl {
                 Err(error) => return Err(error).context("accepting the engine's connection"),
             }
             if let Some(control) = control.as_deref_mut() {
-                exited(control)?;
+                // Which connection closed is the whole content of this failure: the successor
+                // waits on the engine's process link, and an end here means that link went away,
+                // not the handoff channel it is talking to the predecessor over.
+                if let Err(error) = exited(control) {
+                    tracing::warn!(
+                        engine,
+                        %error,
+                        "the engine's process connection closed while this daemon was adopting it"
+                    );
+                    return Err(error);
+                }
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
