@@ -70,7 +70,7 @@ impl Function {
             // SAFETY: the function is live and belongs to the context entered above, and the driver
             // writes a pointer to a NUL-terminated string the function owns.
             unsafe { (driver.func_get_name)(&mut text, self.raw) },
-            "cuFuncGetName_v2",
+            "cuFuncGetName",
         )?;
         if text.is_null() {
             return Ok(String::new());
