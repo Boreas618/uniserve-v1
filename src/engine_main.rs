@@ -578,12 +578,28 @@ struct Served {
     /// Events written to a front so far, which is the position a takeover
     /// names and the consumer reports.
     sent: u64,
-    /// The events not yet reported as consumed, by their position, at most
-    /// `EVENT_WINDOW` of them: an older event than that is beyond what any
-    /// consumer can be behind by, since the same bound gates the credit this
-    /// process waits on.
+    /// The events written to a front that a takeover from an earlier position
+    /// has to replay, by their position.
+    ///
+    /// Bounded by [`KEPT_EVENTS`], not by the event window the consumer's credit
+    /// names: this process hands every event to the daemon as it is produced and
+    /// the daemon files them into a channel it drains at the client's pace, so
+    /// the consumer can be further behind the producer than any window. The
+    /// events the consumer reported consumed are dropped as they are reported.
     kept: std::collections::VecDeque<(u64, proto::request::wire::Event)>,
 }
+
+/// How many events one request's journal keeps for a takeover to replay.
+///
+/// This is a memory guard, not a protocol bound. It has to exceed every backlog
+/// a consumer can be behind by, and that backlog is not the event window: the
+/// daemon's reader files events without bound and the body writes them to a
+/// socket the client drains at its own speed. At 25 ms a decoded token the
+/// backlog reaches tens of events on an ordinary connection — which is exactly
+/// the range a window-sized journal drops, silently losing the tokens a handover
+/// was meant to carry. A request that reaches this bound has a consumer that
+/// stopped; the takeover logs the gap when it is asked for one.
+const KEPT_EVENTS: usize = 4096;
 
 pub(crate) struct MainProcess {
     control: Control,
@@ -3302,13 +3318,11 @@ impl MainProcess {
         if let Some(reason) = promote_refusal(self.standby, held) {
             tracing::warn!(%reason, "a promotion this process cannot serve is refused");
             self.send_report(proto::process::Report {
-                kind: Some(proto::process::report::Kind::Fault(
-                    proto::process::Fault {
-                        kind: "promote".to_owned(),
-                        reason: reason.clone(),
-                        device: 0,
-                    },
-                )),
+                kind: Some(proto::process::report::Kind::Fault(proto::process::Fault {
+                    kind: "promote".to_owned(),
+                    reason: reason.clone(),
+                    device: 0,
+                })),
             });
             bail!("{reason}");
         }
@@ -3760,6 +3774,23 @@ impl MainProcess {
                 // The request is this daemon's from the position its consumer states: what the
                 // predecessor produced past it is replayed, because its own consumer stopped
                 // reading at the pause.
+                //
+                // A position older than the journal is a gap the successor would serve as if it
+                // were continuous, so the gap is stated: nothing below can fill it, and the count
+                // the client reads is the only other place it would appear.
+                if let Some((oldest, _)) = served.kept.front()
+                    && *oldest > takeover.events + 1
+                {
+                    tracing::warn!(
+                        request = command.request,
+                        front,
+                        from = takeover.events,
+                        oldest = *oldest,
+                        lost = *oldest - takeover.events - 1,
+                        "a takeover names a position this process no longer holds: the events \
+                         between are lost"
+                    );
+                }
                 let replay = replay_after(&served.kept, takeover.events);
                 served.front = front;
                 for event in replay {
@@ -4221,10 +4252,7 @@ impl MainProcess {
                         // The position this event is written at, and the copy a takeover from an
                         // earlier position replays.
                         served.sent += 1;
-                        served.kept.push_back((served.sent, wire.clone()));
-                        while served.kept.len() > proto::request::EVENT_WINDOW as usize {
-                            served.kept.pop_front();
-                        }
+                        keep_event(&mut served.kept, served.sent, wire.clone());
                         self.send_event(
                             served.front,
                             proto::request::wire::from_engine::Kind::Event(wire),
@@ -4728,6 +4756,18 @@ fn replay_after(
         .filter(|(position, _)| *position > from)
         .map(|(_, event)| event.clone())
         .collect()
+}
+
+/// Journals one event at `position`, dropping the oldest past [`KEPT_EVENTS`].
+fn keep_event(
+    kept: &mut std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    position: u64,
+    event: proto::request::wire::Event,
+) {
+    kept.push_back((position, event));
+    while kept.len() > KEPT_EVENTS {
+        kept.pop_front();
+    }
 }
 
 /// What the engine answers a command whose owner is the epoch layer: the same operation exists,
@@ -5816,7 +5856,9 @@ fn updated_programs(named: &Programs, serving: &Programs) -> Programs {
                 .iter()
                 .filter(|(held, _)| {
                     held.op == slot.op
-                        && (held.phase == slot.phase || held.phase.is_none() || slot.phase.is_none())
+                        && (held.phase == slot.phase
+                            || held.phase.is_none()
+                            || slot.phase.is_none())
                 })
                 .any(|(_, held)| {
                     held.backend != program.backend || held.revision != program.revision
@@ -6907,6 +6949,73 @@ mod tests {
         assert!(
             replay_after(&kept, 4).is_empty(),
             "a consumer at the last event has nothing left to replay"
+        );
+    }
+
+    /// A takeover replays a backlog wider than the consumer's event window.
+    ///
+    /// The window is the credit a consumer reports in, not the distance it can
+    /// be behind by: the daemon files this process's events without bound and
+    /// writes them at the client's pace, so at a fast decode the body of a
+    /// response that pauses is tens of events behind what was produced. A
+    /// journal capped at the window drops the oldest of those and the handover
+    /// loses exactly them.
+    #[test]
+    fn a_takeover_replays_a_backlog_wider_than_the_event_window() {
+        let event = |request: u64, message: &str| proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Error(
+                proto::request::wire::Failed {
+                    message: message.to_owned(),
+                },
+            )),
+        };
+        let backlog = proto::request::EVENT_WINDOW as usize * 3;
+        let mut kept = std::collections::VecDeque::new();
+        for at in 1..=backlog as u64 {
+            keep_event(&mut kept, at, event(9, "e"));
+        }
+
+        assert!(
+            kept.len() > proto::request::EVENT_WINDOW as usize,
+            "the journal holds the whole backlog: {} of {backlog}",
+            kept.len()
+        );
+        assert_eq!(
+            replay_after(&kept, 1).len(),
+            backlog - 1,
+            "a takeover from the first event replays the backlog whole"
+        );
+    }
+
+    /// The journal drops its oldest only past [`KEPT_EVENTS`], and what it holds
+    /// is replayable from any position inside it.
+    #[test]
+    fn the_journal_is_bounded_by_its_own_bound_and_not_by_the_window() {
+        let event = |request: u64, message: &str| proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Error(
+                proto::request::wire::Failed {
+                    message: message.to_owned(),
+                },
+            )),
+        };
+        let mut kept = std::collections::VecDeque::new();
+        let positions = KEPT_EVENTS as u64 + 10;
+        for at in 1..=positions {
+            keep_event(&mut kept, at, event(9, "e"));
+        }
+
+        assert_eq!(kept.len(), KEPT_EVENTS, "the journal keeps its own bound");
+        assert_eq!(
+            kept.front().map(|(position, _)| *position),
+            Some(positions - KEPT_EVENTS as u64 + 1),
+            "the oldest event kept is the one at the bound"
+        );
+        assert_eq!(
+            replay_after(&kept, 0).len(),
+            KEPT_EVENTS,
+            "a takeover from before the journal replays all of it"
         );
     }
 
