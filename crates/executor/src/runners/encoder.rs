@@ -312,7 +312,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             phase: PhaseKind::Prefill,
             page_size: 0,
             num_tokens: bucket.tokens,
-            max_kv_len: 0,
+            // A row attends over its own tokens, and a bucket holds no more than its tokens.
+            max_kv_len: bucket.tokens,
             draft_lens: None,
         })
     }
