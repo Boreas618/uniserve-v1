@@ -1989,13 +1989,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_i32(&mut self.encoded, &batch.logits_rows[..rows]);
         self.columns.logits_rows.write(&self.encoded)?;
 
+        // The sampler gathers rows of the `[tokens, hidden]` stack, and a row that samples reads
+        // the **last token of its own query range**: a prefill's row is its whole prompt, so the
+        // row index and the token index are the same only when every row holds one token. Reading
+        // the row index here samples a prefill from its first token - a decode is unaffected,
+        // which is why this shows as a wrong first token and not as a fault.
+        //
         // A row that samples nothing still gathers some in-range token; its id is discarded.
-        self.indices.clear();
-        self.indices.extend(
-            batch.logits_rows[..rows]
-                .iter()
-                .map(|row| if *row < 0 { 0 } else { *row }),
-        );
+        gather_indices(
+            &batch.logits_rows,
+            &batch.query_offsets,
+            rows,
+            &mut self.indices,
+        )?;
         encode_i32(&mut self.encoded, &self.indices);
         self.columns.indices.write(&self.encoded)?;
 
@@ -2564,8 +2570,70 @@ fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> R
     Ok(())
 }
 
+/// The rows of the `[tokens, hidden]` stack the sampler gathers, one per batch row.
+///
+/// `logits_rows` names, per row, the row whose logits are wanted and is negative where nothing is
+/// sampled; the token whose logits that row samples is the **last token of the row's own query
+/// range**, which `query_offsets` states. The two indices agree only when every row holds one
+/// token - a decode - so a batch whose rows carry several tokens reads its prefill from the wrong
+/// row without this mapping. A row that samples nothing gathers the stack's first token, whose id
+/// the sampler discards.
+fn gather_indices(
+    logits_rows: &[i32],
+    query_offsets: &[i32],
+    rows: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    if logits_rows.len() < rows || query_offsets.len() < rows + 1 {
+        return Err(Error::Invalid(format!(
+            "a batch of {rows} rows states {} logits rows and {} query offsets",
+            logits_rows.len(),
+            query_offsets.len()
+        )));
+    }
+    out.clear();
+    for row in 0..rows {
+        out.push(if logits_rows[row] < 0 {
+            0
+        } else {
+            query_offsets[row + 1].saturating_sub(1).max(0)
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// A prefill's row is its whole prompt, and the sampler must read the row of the stack that
+    /// token ends: the gather index is the last token of the row's own range, not the row's own
+    /// index. A decode is the case where the two agree, which is why reading the row index fails
+    /// only on a prefill and only from the first token on.
+    #[test]
+    fn a_prefill_samples_the_last_token_of_its_row_and_not_the_rows_own_index() {
+        use super::gather_indices;
+
+        let mut indices = Vec::new();
+        // One call of three prompt tokens, ending its prompt.
+        gather_indices(&[0], &[0, 3], 1, &mut indices).expect("a prefill");
+        assert_eq!(indices, vec![2], "the prefill samples its last token");
+
+        // Two calls, one of three prompt tokens and one of a single token.
+        gather_indices(&[0, 1], &[0, 3, 4], 2, &mut indices).expect("two prefills");
+        assert_eq!(indices, vec![2, 3]);
+
+        // A decode of three one-token rows: the row index is the token index.
+        gather_indices(&[0, 1, 2], &[0, 1, 2, 3], 3, &mut indices).expect("a decode");
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // A chunked prefill that ends no prompt samples nothing, and its row gathers an in-range
+        // token the sampler discards, so the row after it still reads its own last token.
+        gather_indices(&[-1, 1], &[0, 2, 3], 2, &mut indices).expect("a chunk and a row");
+        assert_eq!(indices, vec![0, 2]);
+
+        // Fewer columns than rows is refused rather than read past.
+        assert!(gather_indices(&[0], &[0, 3], 2, &mut indices).is_err());
+    }
+
     use super::*;
 
     /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
