@@ -1475,6 +1475,18 @@ impl nn::capability::Denoiser for Denoiser {
         self.rules.cover(request)
     }
 
+    /// The bytes one evaluation of `request` reserves, from this deployment's own plan.
+    ///
+    /// The layout is the trait's own and the plan is [`Denoiser::denoise_arena`], so a caller sizes
+    /// storage from the number the forward fills rather than from a literal beside it. Nothing here
+    /// allocates or touches a device: the model states what its forward needs and the runtime owner
+    /// allocates to it.
+    fn arena_bytes(&self, request: &VideoRequest<'_>) -> nn::Result<u64> {
+        let layout = self.layout(request);
+        let plan = self.denoise_arena(&layout).map_err(flattened)?;
+        Ok(crate::decoding::arena_reservation(&plan))
+    }
+
     fn draw_noise(
         &self,
         f: &Forward,

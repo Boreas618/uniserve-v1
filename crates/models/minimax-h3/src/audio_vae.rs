@@ -345,7 +345,10 @@ impl Pcm {
 /// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
 /// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
 /// therefore large: at 207 latent frames each buffer of stages one to six is `[2, c, L]` with `c · L` near
-/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against 0.12 GiB of weights. The
+/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against the decoder's 248 MiB of weights - the
+/// deployment table's 64,939,353 parameters at the checkpoint's F32, 124 MiB only in a converted
+/// deployment. The parameter count is `deployment_sizes`' reading of the checkpoint's index and is
+/// quoted here rather than re-derived. The
 /// remaining reduction is the shape-family one - `c · L` is within a factor of the patch area across the
 /// stages, so a set sized for the largest and viewed per stage would serve all seven - and it would make
 /// the plan a *bound* rather than a sum of distinct buffers. The stage loop states one shape per stage
@@ -1323,6 +1326,28 @@ impl Decoder for BigVgan {
         nn::DType::F32
     }
 
+    /// The bytes one decode of `layout` needs, from the audio VAE's own plan.
+    ///
+    /// `layout.audio` is the subject: the plan is keyed by the track's latent frames, so a layout
+    /// that states no audio track is refused by name rather than answered with the plan for zero
+    /// frames - an arena of no bytes for a decode that would run past it.
+    fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "BigVgan",
+            problem,
+        };
+        let audio = layout
+            .audio
+            .ok_or_else(|| refuse("this layout states no audio track to decode".to_owned()))?;
+        let plan = crate::audio_vae::audio_arena(&self.config, audio.frames).map_err(|error| {
+            refuse(format!(
+                "this decoder's plan for a track of {} latent step(s): {error}",
+                audio.frames
+            ))
+        })?;
+        Ok(crate::decoding::arena_reservation(&plan))
+    }
+
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
@@ -1697,6 +1722,33 @@ pub(crate) mod tests {
         let bound = parameters(&fewer).expect("six stages' list");
         assert!(bound.len() < parameters(&config).expect("seven stages' list").len());
         check_table(&table, &bound).expect("the two agree with six stages");
+    }
+
+    /// A weight the audio VAE cannot compute in is refused at the load, by name.
+    ///
+    /// Both audio halves compute in FP32 - the alias-free resample's Kaiser-sinc filters, the
+    /// SnakeBeta exponentials and the seven stages' transposed convolutions are stated in it - and
+    /// the loader converts nothing by default. A checkpoint whose audio weights are stored narrower
+    /// would therefore reach an FP32 operator with weights that are not, and the refusal at the
+    /// loading boundary is the whole of what stops it: without this, the mismatch appears at the
+    /// kernel that reads one type and is handed another, if the kernel checks at all.
+    ///
+    /// A shapes-only loader answers each request in its own shape and at the stated type
+    /// (`WeightLoader::load`), so the first weight the load reads is enough to reach the refusal.
+    #[test]
+    fn a_weight_the_audio_vae_cannot_compute_in_is_refused_by_name() {
+        let config = audio_config();
+        let mut loader = WeightLoader::stated(DType::F16, None);
+        // `BigVgan` is not `Debug`, so the outcome is matched rather than unwrapped.
+        let error = match BigVgan::load(&config, &mut loader) {
+            Ok(_) => panic!("an F16 audio weight was accepted"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("must be converted at load"),
+            "the refusal names the type the audio VAE cannot compute in: {message}"
+        );
     }
     use super::*;
 
