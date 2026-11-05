@@ -642,6 +642,22 @@ pub struct Step {
     pub sigma_next: f32,
 }
 
+/// One clip's decoded raster extent, as the runtime states it.
+///
+/// Frames, rows and columns of the **decoded** media, which is what a runtime bucket is keyed by.
+/// A decoder's tables and its arena are keyed by the latents the raster decodes from, and the
+/// ratios between the two are the checkpoint's - so the map is the decoder's to state and the
+/// runtime never learns it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Clip {
+    /// Frames of the decoded raster.
+    pub frames: u32,
+    /// Rows of one decoded frame.
+    pub height: u32,
+    /// Columns of one decoded frame.
+    pub width: u32,
+}
+
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
@@ -834,6 +850,25 @@ pub trait Decoder {
     /// already the right length; the executor uploads it. Host bytes only: no allocation, no
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and
+    /// this decoder's tables, scratch and arena are keyed by its latents. The ratios between them
+    /// belong to the checkpoint, so the decoder states the map: a runtime that computed it would be
+    /// holding model knowledge, and the first deployment with another temporal or spatial
+    /// compression would find it in two places.
+    ///
+    /// A decoder whose decoded raster is not its latent layout scaled by ratios it knows refuses by
+    /// name, the way [`Decoder::splice`] does, rather than answering with a layout that reads as
+    /// one.
+    fn layout_of(&self, clip: Clip) -> Result<Layout> {
+        let _ = clip;
+        Err(Error::shape(
+            "Decoder",
+            "this decoder states no latent layout for a clip's raster".to_owned(),
+        ))
+    }
 
     /// Decode `latents` into `out`, reading the layout's tables in order.
     fn decode(
