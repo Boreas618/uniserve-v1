@@ -13,21 +13,17 @@
 //! this one is handed the mechanism's batch and answers it. Everything between
 //! those two points is the code under test.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::{
     BatchCapacity, EngineConfig, Event, GenerationConstraint, GenerationRequest, SchedulerHandle,
     Stage,
 };
-use executor::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
-    SubmissionId,
-};
-use executor::completion::Outcome;
-use ipc::{
-    ComponentConfig, ImageParams, SamplingParams, TimingCounters, WorkerEndpoint, WorkerInfo,
-};
+use executor::batch::{Batch, Batches, Inventory, Placement};
+use ipc::{ComponentConfig, ImageParams, SamplingParams, WorkerEndpoint, WorkerInfo};
+
+use crate::support::SAMPLED;
 
 /// How long a command answer may take.
 ///
@@ -40,71 +36,17 @@ const ANSWER: Duration = Duration::from_secs(60);
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(60);
 
-/// The token this pool samples for the `index`th call of every batch.
-const SAMPLED: u32 = 1000;
-
 /// Blocks until a command answers, and answers its result.
+///
+/// `track_caller` so a timeout names the command that was awaited rather than
+/// the helper: every wait here shares one bound, and a location inside the
+/// helper cannot tell one unanswered command from another.
+#[track_caller]
 fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
     match receiver.recv_timeout(ANSWER) {
         Ok(result) => result,
         Err(error) => panic!("the scheduler did not answer: {error}"),
     }
-}
-
-/// One rank of a text pool: prefill and decode, eight request rows, and the
-/// batch bounds the launch stated.
-fn rank(host: &str) -> WorkerInfo {
-    WorkerInfo {
-        endpoint: WorkerEndpoint {
-            host: host.to_owned(),
-            address_space: format!("{host}-space"),
-            incarnation: format!("{host}-rank"),
-        },
-        supported_calls: vec![
-            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
-            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
-        request_slots: 8,
-        max_batch_calls: 16,
-        max_batch_tokens: 512,
-        // A text pool serves token generation, so it advertises the paged KV
-        // pool every such worker has (`WorkerInfo::default`): a worker with no
-        // prefix cache is refused a token request at submission, which is the
-        // rule for a media-only rank and not for this one.
-        buffer_pool_bytes: 1 << 20,
-        ..WorkerInfo::default()
-    }
-}
-
-/// A text pool of one rank named `model`.
-fn pool() -> Inventory {
-    Inventory {
-        group: "model".to_owned(),
-        ranks: vec![rank("gpu-a")],
-        placement: Placement {
-            queue_depth: 1,
-            ranks: 1,
-            components: std::collections::BTreeMap::from([(
-                ipc::DEFAULT_COMPONENT.to_owned(),
-                ComponentConfig {
-                    ranks: vec![0],
-                    parallel_config: Default::default(),
-                    units_per_rank: 1,
-                    weights: Default::default(),
-                    distribution: None,
-                },
-            )]),
-        },
-        max_model_len: 4096,
-    }
-}
-
-/// The configuration a main process holds: the simulation's facts, since this
-/// test runs no device.
-fn config() -> EngineConfig {
-    let mut config = EngineConfig::sim("in-process-completion");
-    config.max_running_requests = 4;
-    config
 }
 
 /// A greedy text request of `prompt` tokens that generates at most `max_tokens`.
@@ -133,98 +75,10 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
     }
 }
 
-/// A pool that serves every batch with the values the mechanism reads back.
-struct Serving {
-    inventory: Vec<Inventory>,
-    /// Every batch the mechanism handed over, in submission order: what the
-    /// mechanism asked for is half of what this test observes.
-    submitted: Mutex<Vec<Batch>>,
-    next: Mutex<u64>,
-}
-
-impl Serving {
-    fn new(inventory: Vec<Inventory>) -> Self {
-        Self {
-            inventory,
-            submitted: Mutex::new(Vec::new()),
-            next: Mutex::new(1),
-        }
-    }
-
-    fn submitted(&self) -> Vec<Batch> {
-        self.submitted.lock().expect("the pool's batches").clone()
-    }
-
-    /// The batch's calls, each answered as a completed call that sampled
-    /// [`SAMPLED`] and leaves the cache extent its row was stated with.
-    ///
-    /// The extents are the columns', not invented: `seq_lens` is a row's
-    /// attention length, cached prefix plus its own query, which is exactly the
-    /// cache the call leaves behind - so a prefill of eight prompt tokens
-    /// leaves eight, and a decode of one token on top leaves nine. The
-    /// mechanism's next call reads them to know what a successor may read.
-    fn serve(&self, batch: Batch) -> Submission {
-        let calls = batch
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(index, call)| {
-                let seen = batch
-                    .columns
-                    .rows
-                    .seq_lens
-                    .get(index)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as u32;
-                CallOutput::completed(
-                    *call,
-                    vec![SAMPLED + index as u32],
-                    RowState {
-                        // Text carries no denoising trajectory: the step index
-                        // is a media row's, and this pool serves forwards.
-                        step_index: 0,
-                        cache_computed_len: seen,
-                        cache_visible_len: seen,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut next = self.next.lock().expect("the pool's submissions");
-        let submission = Submission::completed(
-            SubmissionId(*next),
-            Outcome::Success(BatchOutput {
-                calls,
-                timing: TimingCounters::default(),
-            }),
-        );
-        *next += 1;
-        submission
-    }
-}
-
-impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        self.submitted
-            .lock()
-            .expect("the pool's batches")
-            .push(batch.clone());
-        Ok(self.serve(batch))
-    }
-
-    fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
-        Ok(self.serve(batch))
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        &self.inventory
-    }
-}
-
 /// The `fcfs` program, instantiated for the capacity this pool was built for:
 /// a policy declares its own limits and the mechanism refuses a declaration
 /// above the ceilings the ranks were started for.
-fn policy_program(pool: &Serving) -> engine::PolicyProgram {
+fn policy_program(pool: &crate::support::Serving) -> engine::PolicyProgram {
     // A pool's capacity is the rank's own statement: what the launch built it
     // for, which the policy's declaration must not exceed.
     let rank = pool
@@ -251,7 +105,7 @@ fn policy_program(pool: &Serving) -> engine::PolicyProgram {
 
 /// The epoch's first policy: prepared, then switched in on the handle's own
 /// command surface, which is the launched path's.
-fn install(handle: &SchedulerHandle, pool: &Serving) {
+fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
     let source: Arc<dyn engine::PolicySource + Send + Sync> =
         Arc::new(engine::PolicyBytes::new(crate::support::policy_module()));
     answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
@@ -260,9 +114,15 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
 
 #[test]
 fn a_request_is_served_through_the_executors_own_batch_path() {
-    let serving = Arc::new(Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(
+        crate::support::serving::config(&serving, "in-process-completion"),
+        batches,
+    )
+    .expect("the pool serves");
     install(&handle, &serving);
     // The kernels this epoch serves on, as the control thread's switchover arm
     // publishes it. The handle's stage command is not the arm that numbers a
@@ -298,16 +158,25 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     );
 
     // The mechanism asked for a prefill and then a decode: one batch per phase
-    // per step, each stated with the shape its columns are served from.
-    let batches = serving.submitted();
-    let prefilled = batches
-        .iter()
-        .any(|batch| batch.shape.variant.name().starts_with("prefill"));
-    let decoded = batches
-        .iter()
-        .any(|batch| batch.shape.variant.name().starts_with("decode"));
+    // per step, each stated with the shape its columns are served from. The
+    // two batches come from two steps, so the second is waited for rather than
+    // read off a snapshot: the first token is the prefill's, and reading the
+    // pool the instant it arrives would measure the race, not the schedule.
+    let phase = |batches: &[Batch], name: &str| {
+        batches
+            .iter()
+            .any(|batch| batch.shape.variant.name().starts_with(name))
+    };
+    let deadline = Instant::now() + FIRST_TOKEN;
+    let batches = loop {
+        let batches = serving.submitted();
+        if (phase(&batches, "prefill") && phase(&batches, "decode")) || Instant::now() >= deadline {
+            break batches;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     assert!(
-        prefilled && decoded,
+        phase(&batches, "prefill") && phase(&batches, "decode"),
         "the pool was asked for both phases: {} batches",
         batches.len()
     );
@@ -335,9 +204,11 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
 /// world that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
-    let serving = Arc::new(Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let mut config = config();
+    let mut config = crate::support::serving::config(&serving, "in-process-completion");
     config.max_running_requests = 1;
     let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
     install(&handle, &serving);
@@ -357,10 +228,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
                 match event {
                     Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
                     refused @ (Event::Rejected { .. } | Event::Error { .. }) => {
-                        panic!(
-                            "request {} was refused, not queued: {refused:?}",
-                            index + 1
-                        )
+                        panic!("request {} was refused, not queued: {refused:?}", index + 1)
                     }
                     _ => {}
                 }
@@ -389,9 +257,15 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// a batch handed to the executor with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
-    let serving = Arc::new(Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(
+        crate::support::serving::config(&serving, "in-process-completion"),
+        batches,
+    )
+    .expect("the pool serves");
     install(&handle, &serving);
     // The consumer is kept open for the case's length: a world whose client
     // went away ends its requests, which is not what is under test.

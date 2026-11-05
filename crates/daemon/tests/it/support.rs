@@ -132,6 +132,8 @@ impl Engine {
             host: host.into(),
             group: group.into(),
             routable,
+            // Reserved by the connection that also spawns it.
+            engine: 0,
         };
         match self.request(request::Kind::Reserve(reserve)) {
             Reply {
