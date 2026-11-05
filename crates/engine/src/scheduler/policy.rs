@@ -606,8 +606,13 @@ impl Cost {
     /// instance is dropped. Adding it to the decisions as well as to the call
     /// count keeps `calls` and the sum of the instances' decisions the same
     /// number by construction.
-    fn trial(&mut self, trial: TrialCost) {
-        self.calls += trial.decisions.each().map(|(_, calls)| calls).sum::<u64>();
+    fn trial(&mut self, trial: TrialCost, serving: &PolicyInstance) {
+        // The serving instance's own calls before it serves - its instantiation
+        // and the limits it read - are counted here once: `usage` reads the
+        // instance's cost live into the decisions, and `calls` has no other
+        // sight of them, so without this the two totals differ by exactly them.
+        self.calls += trial.decisions.each().map(|(_, calls)| calls).sum::<u64>()
+            + serving.cost().each().map(|(_, calls)| calls).sum::<u64>();
         self.decisions = self.decisions + trial.decisions;
         self.spent += trial.fuel;
     }
@@ -763,7 +768,7 @@ impl PolicySlot {
         // candidate's are (§12): a counter that dropped them would report an
         // epoch whose first policy never called the guest.
         let mut cost = Cost::default();
-        cost.trial(candidate.trial);
+        cost.trial(candidate.trial, &candidate.instance);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -966,7 +971,7 @@ impl PolicySlot {
     /// switchover: only a later precopy's result can be the one the daemon's
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(candidate.trial);
+        self.cost.trial(candidate.trial, &candidate.instance);
         self.candidate = Some(candidate);
     }
 
@@ -1225,7 +1230,7 @@ impl RoutePolicy {
         // Its trial's calls are the epoch's policy's, as a scheduler's first
         // policy counts them (§12).
         let mut cost = Cost::default();
-        cost.trial(candidate.trial);
+        cost.trial(candidate.trial, &candidate.instance);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -1324,7 +1329,7 @@ impl RoutePolicy {
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(candidate.trial);
+        self.cost.trial(candidate.trial, &candidate.instance);
         self.candidate = Some(candidate);
     }
 
