@@ -188,6 +188,11 @@ def main():
     if args.target not in TARGETS:
         sys.exit(f"target {args.target} is not one a package here declares ({sorted(TARGETS)})")
 
+    # Named, not assumed: a plain interpreter without the venv's Triton builds none of the PDL
+    # packages and raises `module 'triton.language.extra.cuda' has no attribute 'gdc_wait'` from
+    # inside a compile script, which reads like a kernel defect rather than a wrong toolchain.
+    print(f"# interpreter: {args.python}")
+
     packages = load_packages(Path(args.kernels))
     root = Path(args.root)
     # The fixture is read once: a second read of a pipe or a stream answers nothing, and a guard that
@@ -259,6 +264,16 @@ def main():
         else:
             skipped.append((op, key, "; ".join(failures)))
             continue
+    # A store that built nothing is not a store: the count line says "0 of N", and a reader who
+    # stops at it can carry on with an empty directory. The first failure is the evidence, and a
+    # missing capability in the interpreter is the common cause.
+    if not built:
+        first = skipped[0][2] if skipped else "no candidate package"
+        sys.exit(
+            f"the store is empty: none of {len(rows)} keys built for {args.target} with "
+            f"{args.python}\n  first failure: {skipped[0][0]} {skipped[0][1]}: {first}"
+            if skipped else f"the store is empty: no package covers a key of {args.fixture}"
+        )
     print(f"# built {len(built)} of {len(rows)} keys into {root} (revision {args.revision}, {args.target})")
 
     # How many of those cells hold the same program. A key field that reaches no compiled word
