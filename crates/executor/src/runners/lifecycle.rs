@@ -367,7 +367,7 @@ impl Lifecycle {
                          structure, so the bucket {bucket} cannot be rebound"
                     )));
                 }
-                differs |= walked_params.function.raw() != serving_params.function.raw();
+                differs |= !walked_params.function.same_kernel(&serving_params.function);
                 params.push(platform::OwnedKernelNodeParams {
                     parameters: serving_params.parameters,
                     ..walked_params
