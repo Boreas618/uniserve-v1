@@ -1533,6 +1533,53 @@ impl Decoder for VideoDecoder {
             })
     }
 
+    /// The latent layout this decoder's canvas decodes to a raster.
+    ///
+    /// **The decoder is built for one canvas** (`VideoDecoder::load` takes it), because its register
+    /// rows, its voxel-row table and its sequence offsets are the canvas's constants rather than a
+    /// request's. So this states that canvas's layout and refuses any other clip by both extents:
+    /// a runner that handed it another canvas would capture a graph whose constants belong to a
+    /// different raster.
+    ///
+    /// The ratios are the checkpoint's - `temporal_compression` frames per latent frame and
+    /// `spatial_compression()` pixels per latent cell - and they are why the map belongs here: a
+    /// runtime that divided by either would be holding this deployment's compression in its own
+    /// code.
+    fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let (width, height) = self.canvas.pixels(&self.config);
+        let frames = self.canvas.frames_out(&self.config);
+        if (clip.height, clip.width) != (height, width) {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes a {}x{height} raster and the call states a {}x{} one",
+                width, clip.height, clip.width,
+            )));
+        }
+        // The raster includes the padding frames the splice drops, so the clip is compared against
+        // the canvas's own native output rather than against a muxed frame count.
+        if clip.frames != frames {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes {frames} frame(s) and the call states {}",
+                clip.frames
+            )));
+        }
+        Ok(nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: self.config.latent_channels,
+                frames: self.canvas.frames,
+                height: self.canvas.height,
+                width: self.canvas.width,
+            },
+            audio: None,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        })
+    }
+
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them
