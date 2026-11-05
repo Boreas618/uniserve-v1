@@ -1339,6 +1339,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
+        let entered = std::time::Instant::now();
         let shape = batch.shape;
         // What a refusal is about, said before it happens: the classes the rows carry are the fact
         // no other owner of this batch can report, and a batch that mixes them is refused for them.
@@ -1379,7 +1380,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             // The host figures are the submitting thread's; the page readback is the device
             // thread's, because a copy issued from here would put a second thread on this
             // runner's stream (2.4).
-            Self::dump_batch(self, bucket, &batch, &shape);
+            Self::dump_batch(self, bucket, &batch, &shape, entered.elapsed());
         }
         // The columns are staged here, on the submitting thread; everything that touches the
         // device is the replay job, which this executor's device thread performs in `serve`: the
@@ -1602,6 +1603,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 captured.launch(&stream)?;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
+                }
+                if runner_dump() {
+                    // The node count is what separates a graph that does per-token work from one
+                    // that does per-batch work: a prefill an order of magnitude slower than a
+                    // decode and holding an order of magnitude more nodes is a graph shaped by its
+                    // token axis, not a slow kernel.
+                    tracing::info!(
+                        bucket = %bucket,
+                        kernels = captured.kernel_nodes(),
+                        launch_ms = launched.elapsed().as_secs_f64() * 1e3,
+                        "a replay issued its graph"
+                    );
                 }
                 // The sampled tokens are read back now, before the submission completes: the
                 // mechanism builds the next step's input ids from them (4.4). The wait covers the
@@ -1927,6 +1940,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
+                replay_ms = launched.elapsed().as_secs_f64() * 1e3,
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
@@ -2047,7 +2061,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ///
     /// The line is a string and the readback a page number, because the two are written on
     /// different threads: this runs at submit, on the scheduler's.
-    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape) {
+    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape, submit_ms: std::time::Duration) {
         let rows = shape.rows as usize;
         let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let page_of_slot = |slot: i32| -> Option<u32> {
@@ -2097,8 +2111,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     }
                     (table.start_page, out, table.allocated_tokens)
                 });
+        // The indices the sampler will gather, computed the same way `upload` computes them, so a
+        // reading of the line does not have to derive them by hand.
+        let mut gather: Vec<i32> = Vec::new();
+        let _ = gather_indices(
+            &self.staging.batch_rows().logits_rows,
+            &self.staging.batch_rows().query_offsets,
+            tokens,
+            rows,
+            &mut gather,
+        );
+        let gather = spelled(&gather, rows);
         let line = format!(
-            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} \
+            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
              positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
              slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
             bucket.variant,
@@ -2110,6 +2135,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         );
         // The page the readback names: the first live row's first page, which is the page a decode
         // must find the prefill's keys in.
+        let line = format!("{line} submit_ms={:.3}", submit_ms.as_secs_f64() * 1e3);
         let page = self
             .staging
             .batch_rows()
@@ -2144,9 +2170,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         let Some((_, view)) = planes
             .iter()
-            .find(|(name, _)| name == "prefix_cache.key.values")
+            .find(|(name, _)| name == "key.values")
         else {
-            return "no-key-plane".to_owned();
+            let mut names = String::new();
+            for (name, _) in &planes {
+                if !names.is_empty() {
+                    names.push(',');
+                }
+                names.push_str(name);
+            }
+            return format!("no-key-plane({names})");
         };
         let shape = view.shape().to_vec();
         let (Some(&_columns), Some(&units), Some(&plane_bytes)) =
