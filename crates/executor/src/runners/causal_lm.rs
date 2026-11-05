@@ -2267,6 +2267,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
         {
             self.greedy_first_tokens(logits, rows, sampling)?;
         }
+        // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
+        // a kernel that answers the width instead of the last index is a defect and not a token,
+        // and a token one past the vocabulary reaches the tokenizer as an out-of-range id. The
+        // check is here, once, on the readback of every batch: it costs one comparison and it
+        // turns a batch of nonsense tokens into a refusal at the first step that produced one.
+        if let Some(row) = ids.iter().position(|id| {
+            let id = *id;
+            id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
+        }) {
+            return Err(Error::Invariant(format!(
+                "row {row} sampled token {} outside the vocabulary of {}",
+                ids[row], self.geometry.vocabulary
+            )));
+        }
         let states = states_of(
             self.staging.slots(rows),
             self.staging.batch_rows(),
