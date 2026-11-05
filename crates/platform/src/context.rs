@@ -124,14 +124,16 @@ impl PrimaryContext {
     fn probe_stream(&self) -> Result<Handle> {
         let mut raw = std::ptr::null_mut();
         let created = in_context(self.raw(), |driver| {
-            driver.check(
-                // SAFETY: the driver writes one stream handle in the context
-                // this call made current.
-                unsafe {
-                    (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, 0)
-                },
-                "cuStreamCreateWithPriority",
-            )
+            // SAFETY: the driver writes one stream handle in the context this
+            // call made current.
+            let status =
+                unsafe { (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, 0) };
+            // The name says this call is the probe's own, not an application's stream being
+            // created: a sticky context refuses every creation, so a line reading
+            // `cuStreamCreateWithPriority failed` would read as "a stream was created here" when
+            // what happened is that this question was asked and the answer was the fault already
+            // in the context.
+            driver.check(status, "cuStreamCreateWithPriority (the sticky-error probe)")
         });
         created?;
         let shared = *self.retained.probe.get_or_init(|| raw as usize);
