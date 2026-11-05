@@ -219,6 +219,23 @@ pub struct Forward<'a> {
     /// arena is the bucket's. The value is device-resident because it changes per replay of one
     /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
     pub live_tokens: Option<TensorView>,
+    /// Observes every layer's attention output as this forward produces it, or `None`.
+    ///
+    /// A layer's attended output is written into a buffer the forward reuses for the next layer, so a
+    /// reader that digests it after the graph has run reads the last layer's bytes with every layer's
+    /// name. This is the only seam at which one layer's own output can be read while it exists, and it
+    /// is a diagnosis: nothing a forward computes depends on a probe being present.
+    pub attention_probe: Option<&'a dyn AttentionProbe>,
+}
+
+/// Observes one layer's attention output, at the launch that wrote it.
+///
+/// The forward calls it after the layer's attention program launched and before the projection that
+/// consumes it, on the stream that launched it, so an implementation that copies the bytes is ordered
+/// after the write.
+pub trait AttentionProbe {
+    /// Read one layer's attended output, as it stands after its own program wrote it.
+    fn attention_output(&self, layer: usize, out: TensorView, stream: &Stream);
 }
 
 impl<'a> Forward<'a> {
@@ -232,6 +249,7 @@ impl<'a> Forward<'a> {
             exchange: None,
             shadow: None,
             live_tokens: None,
+            attention_probe: None,
         }
     }
 
@@ -250,6 +268,7 @@ impl<'a> Forward<'a> {
             exchange: None,
             shadow: None,
             live_tokens: None,
+            attention_probe: None,
         }
     }
 
@@ -292,6 +311,12 @@ impl<'a> Forward<'a> {
     /// outlives the request.
     pub fn with_live_tokens(mut self, tokens: TensorView) -> Self {
         self.live_tokens = Some(tokens);
+        self
+    }
+
+    /// Observe every layer's attention output at the launch that wrote it.
+    pub fn with_attention_probe(mut self, probe: &'a dyn AttentionProbe) -> Self {
+        self.attention_probe = Some(probe);
         self
     }
 
