@@ -15,8 +15,11 @@
 //!
 //! ## The audio raster
 //!
-//! `[samples, 2]` **int16**, interleaved stereo: left then right, one pair per sample. The decoder
-//! writes the two channels channel-major and [`crate::audio_vae::Pcm`] states the quantization.
+//! `[samples, 2]` **int16**, interleaved stereo: left then right, one pair per sample. The decoder's
+//! transforms are channel-major (`[2, channels, length]` inside a stage, and `[2, length]` for the mono
+//! signal the last step reads); its final step, `pcm_interleave`, quantizes each sample and interleaves
+//! the two channels into this layout, which is why no caller transposes. [`crate::audio_vae::Pcm`]
+//! states the quantization and the scale.
 //!
 //! ## The overlap
 //!
