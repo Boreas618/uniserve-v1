@@ -117,12 +117,11 @@ pub struct SortArgs {
     /// means here: a deployment that has not been given one behaves exactly as it did before the
     /// operand existed, and the kernel reads a null pointer as "all rows are live".
     ///
-    /// It is a launch argument and not a descriptor field: the count changes no dimension, dtype or
-    /// tile, so a call with one and a call without compile the *same* program, and a key naming it
-    /// would build one binary into two cells. What it does change is what a program writes — a
-    /// padded row's route map states [`PADDED`] instead of a real index — so a comparison pairs two
-    /// programs that both read it, and a pair spanning the change is incomparable rather than
-    /// disagreeing.
+    /// It is a launch argument: the count's value changes per replay and changes no dimension,
+    /// dtype or tile. What the key states is the separate and constant fact that this source reads
+    /// a count at all ([`Descriptor::counted`]), so no cell doubles - and a module built before the
+    /// count existed cannot be paired with this one, because two programs that disagree about what
+    /// a padded row writes would report the pair's difference as a defect.
     pub live_tokens: Option<TensorView>,
     /// First logical expert this rank holds.
     pub local_offset: u32,
