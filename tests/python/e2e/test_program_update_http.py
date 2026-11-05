@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -329,6 +330,53 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
         yield {"socket": socket, "binary": binary, "log": log}
     finally:
         stop_server(process)
+
+
+@pytest.fixture(scope="module")
+def server(
+    model: Path, program_server, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[str]:
+    """One deployment of `model` beside this host's Program Server.
+
+    Module-scoped, like the epoch history the tests read back.
+
+    Every test here requests `server`, and until this fixture existed none of
+    them could start: pytest fails the setup of a test whose fixture is
+    undefined and reports it as an error rather than a failure, so a run of the
+    file read "no failures" with no test executed.
+
+    The deployment is module-scoped because the tests are one epoch history —
+    a rebind, a recapture with its policy, a revert and a refusal — each read
+    back through `/admin/status` and `/metrics` against the same deployment's
+    records. The options are `DEPLOYMENT_OPTIONS`, the live-update file's
+    deliberately, and the host KV cache is `HOST_GIB`, the figure that file
+    serves the same model with.
+    """
+    directory = tmp_path_factory.mktemp("deployment")
+    log = directory / "deployment.log"
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    command = [
+        str(require_uniserve_binary()),
+        "serve",
+        str(model),
+        "--served-model-name",
+        "qwen3-moe",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--worker-executable",
+        str(worker_executable()),
+        "--program-server",
+        str(program_server["socket"]),
+        "--set",
+        f"kv_cache_config.host_gib={HOST_GIB}",
+    ]
+    for option in DEPLOYMENT_OPTIONS:
+        command += ["--set", option]
+    with server_process(command, base_url, log, timeout_s=1800):
+        yield base_url
 
 
 RESIDENT_TOKENS = 512
