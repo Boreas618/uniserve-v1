@@ -2012,8 +2012,12 @@ impl AudioEncoder {
 
         let projection = Projection::load(config, &mut binder, frames)?;
         let channels = u64::from(config.latent_channels);
+        // The reference's mean projection is `nn.Conv1d(latent_channels, latent_channels, 1)`, so the
+        // checkpoint stores a three-dimensional filter `[out, in, kernel]` and not a matrix: a kernel
+        // of one makes the two the same arithmetic but not the same rank, and `Conv1d::new` refuses a
+        // filter that is not 3-d.
         let mean = Conv1d::new(
-            binder.region("mean_projection.weight", &[channels, channels])?,
+            binder.region("mean_projection.weight", &[channels, channels, 1])?,
             Some(binder.region("mean_projection.bias", &[channels])?),
             crate::audio_vae::geometry(1, 1, 0)?,
             false,
