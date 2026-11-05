@@ -68,6 +68,7 @@ which of the two it is.
 import argparse
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 from collections import Counter
@@ -682,7 +683,9 @@ def self_test() -> int:
                     argparse.Namespace(walk=[str(blank)], fixture=str(held))
                 )
             except SystemExit as refused:
-                assert "a walk with no rows proves nothing" in str(refused), refused
+                assert "a walk with no rows proves nothing" in str(refused), (
+                    refused
+                )
             else:
                 raise AssertionError(
                     f"an empty walk was compared by {compare.__name__}"
@@ -735,6 +738,70 @@ def self_test() -> int:
     return 0
 
 
+# Header lines that legitimately differ between a generated file and the checked-in
+# copy: the generator names itself and the revision it ran at, and a row set is
+# evidence only of the tree that produced it, so the copy carries that revision.
+GENERATED_HEADER = re.compile(r"^# (generator|commit):", re.IGNORECASE)
+
+
+def drift(
+    generated: set[tuple[str, str]], fixture: set[tuple[str, str]]
+) -> int:
+    """Compare a fresh run of the generator with the checked-in row set."""
+    only_generated = sorted(generated - fixture)
+    only_fixture = sorted(fixture - generated)
+    if not only_generated and not only_fixture:
+        print(
+            f"the list is the generator's rows: {len(fixture)} keys,"
+            " no key missing, no key extra"
+        )
+        return 0
+    for label, rows in (
+        ("the generator states and the file does not", only_generated),
+        ("the file holds and the generator does not", only_fixture),
+    ):
+        if rows:
+            print(f"{len(rows)} key(s) {label}:")
+            for operator, key in rows[:20]:
+                print(f"  {operator}\t{key}")
+    print(
+        "a file that is not the generator's rows is a row set from another"
+        " tree: re-cut it, or say which tree it came from - a store built"
+        " from it would answer about a model that is not this one"
+    )
+    return 1
+
+
+def generator_rows(root: str, extra: list[str]) -> set[tuple[str, str]]:
+    """Run the model's own enumeration and return the keys it prints."""
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "minimax-h3",
+        "--example",
+        "minimax_h3_keys",
+        "--",
+        "--root",
+        root,
+        *extra,
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    rows = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("#") or "\t" not in line:
+            continue
+        operator, key = line.split("\t", 1)
+        rows.add((operator, key))
+    if not rows:
+        raise SystemExit(
+            "the generator printed no rows: an empty run is a build failure,"
+            " not a row set"
+        )
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -778,6 +845,19 @@ def main(argv=None):
         "--fixture", help="the store list the caller builds from"
     )
     parser.add_argument(
+        "--generator",
+        metavar="ROOT",
+        help="compare the checked-in list with a fresh run of the model's own"
+        " enumeration at ROOT",
+    )
+    parser.add_argument(
+        "--generator-flag",
+        action="append",
+        default=[],
+        help="a flag passed through to the generator, such as `--types`;"
+        " repeatable",
+    )
+    parser.add_argument(
         "--unbound",
         action="store_true",
         help="list every fixture line no launch bound (the normal case for one deployment, so the "
@@ -791,13 +871,21 @@ def main(argv=None):
     # second side to be given.
     if args.wellformed and not args.fixture:
         parser.error("--wellformed reads the list: give it --fixture")
-    if not args.wellformed and (
+    if not args.wellformed and not args.generator and (
         not args.walk or (not args.fixture and not args.families)
     ):
         parser.error(
             "--walk and --fixture name the two sides, or --families reads the walks"
             " alone, or --self-test proves the tool"
         )
+    if args.generator:
+        if not args.fixture:
+            parser.error(
+                "--generator compares with the list: give it --fixture"
+            )
+        fixture = read_lines(args.fixture)
+        generated = generator_rows(args.generator, args.generator_flag)
+        return drift(generated, set(fixture))
     if args.by_shape:
         return by_shape(args)
     if args.families:
