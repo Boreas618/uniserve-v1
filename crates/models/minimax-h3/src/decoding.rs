@@ -492,15 +492,23 @@ impl ClipDecoder {
         // the wrong rows past the first. Refusing is the honest answer until the operator reads its
         // sources through their strides: a silently misread seam is a different picture, not a slower
         // one. Single-column grids are unaffected, because there the tile's rows are the raster's.
+        // The layout fact the refusal states, and the reason it is not a defect of one grid: the seam
+        // is always narrower than a tile (`MINIMUM_OVERLAP` and the grid's arithmetic keep `extent`
+        // below `TILE_PIXELS`), so a neighbour shifted by it is narrower than the raster whenever the
+        // grid has more than one column - which every canvas of this checkpoint has.
         if (tile.above != 0 || tile.left != 0) && view.shape.dim(3) != decoded.shape.dim(3) {
             return Err(Error::Unsupported(format!(
-                "the clip decoder cannot blend tile ({}, {}) of a {}x{} raster: a neighbour of a \
-                 {}-wide tile is not one contiguous block, and cross_fade reads its sources contiguously",
+                "the clip decoder cannot blend tile ({}, {}) of a raster {:?}: the tile's view is \
+                 {:?}, so a neighbour shifted by the seam ({} rows above, {} columns left) is not one \
+                 contiguous block, and cross_fade reads its sources contiguously; the seam is always \
+                 narrower than the {} the tile is cut at, so only a single-column grid can blend",
                 tile.row,
                 tile.column,
-                decoded.shape.dim(2),
-                decoded.shape.dim(3),
-                view.shape.dim(3)
+                decoded.shape.dims(),
+                view.shape.dims(),
+                tile.above,
+                tile.left,
+                crate::video_vae::TILE_PIXELS
             )));
         }
         // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
