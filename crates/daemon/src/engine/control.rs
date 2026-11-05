@@ -1249,6 +1249,22 @@ impl<'a> ProgramSwitch<'a> {
                     Some(report::Kind::Switched(switched)) => {
                         Some(answered(report, switched.generation == generation))
                     }
+                    // A generation that cannot warm up is answered with a
+                    // refusal, never with `Switched`: discarded before it took
+                    // over (`PrecopyFailed`) or reverted after it did
+                    // (`Reverted`). Waiting for the switchover answer would
+                    // turn a named engine failure into two minutes of silence
+                    // and then a timeout.
+                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                        kind: "precopy_failed".to_owned(),
+                        reason: failed.reason.clone(),
+                        device: None,
+                    })),
+                    Some(report::Kind::Reverted(reverted)) => Some(Err(crate::epoch::Failure {
+                        kind: "reverted".to_owned(),
+                        reason: reverted.reason.clone(),
+                        device: None,
+                    })),
                     _ => None,
                 },
             )?;
