@@ -47,6 +47,15 @@ fn main() {
     for name in LIBRARIES {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
+    // An FFmpeg that loads x264 as a shared library names it in its own
+    // DT_NEEDED, and the linker does not carry a loaded library's dependencies
+    // into the link: every `x264_*` symbol then reads as undefined at the final
+    // link. Naming it here, and only where the installation ships it, keeps a
+    // build working against either kind of runtime — one that loads x264 and
+    // one that has it linked in.
+    if has_shared(&lib, "x264") {
+        println!("cargo:rustc-link-lib=dylib=x264");
+    }
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     // The runtime's own `bin/ffmpeg` is the default reference-video decoder:
     // the same installation that provides the codecs provides the external
@@ -72,20 +81,24 @@ fn ffmpeg_prefix() -> PathBuf {
 
 /// Whether `lib` holds a shared libav* library.
 fn has_library(lib: &Path) -> bool {
-    LIBRARIES.iter().any(|name| {
-        ["so", "dylib"].iter().any(|extension| {
-            let file = format!("lib{name}.{extension}");
-            lib.join(&file).is_file()
-                || std::fs::read_dir(lib).is_ok_and(|mut entries| {
-                    entries.any(|entry| {
-                        entry.is_ok_and(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with(&format!("{file}."))
-                        })
+    LIBRARIES.iter().any(|name| has_shared(lib, name))
+}
+
+/// Whether `lib` holds `lib<name>` as a shared library, under either the plain
+/// name or a versioned one (`libx264.so.165`).
+fn has_shared(lib: &Path, name: &str) -> bool {
+    ["so", "dylib"].iter().any(|extension| {
+        let file = format!("lib{name}.{extension}");
+        lib.join(&file).is_file()
+            || std::fs::read_dir(lib).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("{file}."))
                     })
                 })
-        })
+            })
     })
 }
