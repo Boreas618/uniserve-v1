@@ -1369,19 +1369,12 @@ impl VideoEncoder {
                             true,
                             padded,
                         ));
-                        // The block's residual add is keyed on the level's **width in pixels**, and
-                        // the recorder is the witness: `block` adds `rows(out)` to `rows(residual)`,
-                        // `rows` takes `dim(4)` of a `[1, channels, frames, height, width]` buffer as
-                        // its columns, and that is the width. So the raster is load-bearing for this
-                        // row - 672x1536 launches at 1536, 768, 384, 192 and 96, and 768x1024 at 1024,
-                        // 512, 256, 128 and 64 - and a statement keyed on the channel count names a
-                        // key no launch asks for while leaving every key it does ask for unstated.
-                        let columns = u64::from(extent.width);
-                        // Stated or refused, never silently omitted: a width the descriptor cannot
-                        // hold cannot be launched either, so swallowing the refusal would turn a
-                        // configuration this VAE cannot run into a program list that looks complete.
-                        let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
-                        programs.launch::<ScaledAddOp>(&descriptor);
+                        // The block's residual add: `block` adds `rows(out)` to `rows(residual)`,
+                        // and `rows` takes `dim(4)` of a `[1, channels, frames, height, width]`
+                        // buffer as its columns. **That width is the operand's**, so it is passed at
+                        // launch and never keyed - a keyed one states a row set per raster, which is
+                        // a request's shape rather than a compiled class.
+                        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
                     }
                 }
                 // The output normalization convolves the last level's extent at the last width.
@@ -1944,7 +1937,7 @@ impl AudioEncoder {
         // The projection's **two** residual adds run over the latent channels, not over the track:
         // `shortcut` is `[frames, channels]` whatever the track's length is, so its last dimension is
         // the channel count and the two adds of one projection share one row.
-        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, u64::from(channels))?);
+        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
 
         // **One row per stage, from the list the launch walks.** A track of `samples` reaches the
         // residual add at five extents, not one: the input at its own length and then once per stage
@@ -1960,11 +1953,11 @@ impl AudioEncoder {
         for samples in samples {
             // The pad is the caller's before the first convolution, so the rows are the pad's lengths.
             let padded = padded_samples(u64::from(*samples), hop)?;
-            for extent in AudioEncoder::stage_extents(config, padded)? {
-                // As above: the refusal is the statement's, not a reason to leave the row out.
-                let descriptor = ScaledAdd.descriptor(dtype, dtype, extent)?;
-                programs.launch::<ScaledAddOp>(&descriptor);
-            }
+            // Each stage's residual add is one program at every stage and every track: its width is
+            // the operand's. `stage_extents` is still asked, because a stage the encoder cannot size
+            // is a configuration this VAE cannot run and the refusal belongs to the statement.
+            AudioEncoder::stage_extents(config, padded)?;
+            programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
         }
 
         Ok(programs.finish())

@@ -122,10 +122,6 @@ const HIDDEN: u32 = 5376;
 /// gated residual over the whole trajectory, so that width is both an input and a residual.
 const VIDEO_CHANNELS: u32 = 24;
 
-/// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
-/// tables and the one cast that narrows the timestep activation into them are this wide.
-const TIME_DIM: u32 = 2688;
-
 /// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
 /// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
 const ROPE_FREQ_DIM: u32 = 16;
@@ -1294,7 +1290,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::residual::ScaledAddDescriptor {
             target: deployment,
             source: DType::F32,
-            columns: HIDDEN,
             block: ops::residual::RESIDUAL_BLOCK,
         }
         .to_string(),
@@ -1316,24 +1311,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target: deployment,
                 source: DType::F32,
-                columns: TIME_DIM,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
     }
-    for columns in [32, 96, HIDDEN] {
-        push(
-            "scaled_add",
-            ops::residual::ScaledAddDescriptor {
-                target: DType::F32,
-                source: deployment,
-                columns,
-                block: ops::residual::RESIDUAL_BLOCK,
-            }
-            .to_string(),
-        );
-    }
+    // One row, not three: the columns these three widths state are the operands' and reach no
+    // compiled code, so a row per width is a row set that describes one request's shape.
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::F32,
+            source: deployment,
+            block: ops::residual::RESIDUAL_BLOCK,
+        }
+        .to_string(),
+    );
     // **The conditioner's per-head normalization.** `TokenRefiner::programs` states two norm widths -
     // the hidden state's and **one head's**, `config.head_dim` = 128 - because its attention
     // normalizes each query and key over a head rather than through the fused `qk_norm_rope` the DiT's
@@ -1358,7 +1351,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target,
                 source,
-                columns: 4 * VIDEO_CHANNELS,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
@@ -1823,18 +1815,15 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // FP32 throughout. `scaled_add` is the operator that widens and narrows in the diffusion path, and
     // no row of it existed at any of these four widths: the encoder's residual adds are the only
     // consumer of that family at a VAE channel count.
-    for columns in [128_u32, 256, 512, 1024] {
-        push(
-            "scaled_add",
-            ops::residual::ScaledAddDescriptor {
-                target: DType::F32,
-                source: DType::F32,
-                columns,
-                block: ops::residual::RESIDUAL_BLOCK,
-            }
-            .to_string(),
-        );
-    }
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::F32,
+            source: DType::F32,
+            block: ops::residual::RESIDUAL_BLOCK,
+        }
+        .to_string(),
+    );
 
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
     //
