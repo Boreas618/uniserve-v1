@@ -7,12 +7,17 @@
 # this lane has hit most often.
 #
 # Usage:
-#   tools/recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]
+#   tools/recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]
 #
 #   <checkpoint root>     e.g. /opt/uv/models/MiniMax-H3
 #   <element-types json>  the `--types` fallback, used where the host has no shard headers,
 #                         e.g. artifacts/h3-reference/component-tensors.json
 #   <commit>              the revision the rows are stamped with; defaults to HEAD
+#   <recorder print>      optional: the dense recording's row print (`record`'s output, from a host
+#                         with weights). When it is given the fixture is compared against it, which is
+#                         the only check that finds a flag reaching a key - `--elements` did
+#                         (`wide_false` recorded, `wide_true` in the file), and no walk-versus-fixture
+#                         delta can see it because both sides carry the same flag's answer.
 #
 # Everything is written to a staging directory first and only moved into `notes/programs/` once both
 # files certify, so an interrupted run leaves the checked-in fixtures untouched rather than half
@@ -20,8 +25,12 @@
 
 set -eu
 
-root=${1:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]}
-types=${2:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]}
+root=${1:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]}
+types=${2:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]}
+# A recording of the same deployment, where a host with weights has made one. The comparison against
+# it is the one instrument that catches a flag reaching a program's key: the walk and the fixture share
+# their flags, so a delta between them cannot see a class the deployment's own bound decides.
+recorder=${4:-}
 # The revision the rows are stamped with. In a git tree it defaults to HEAD and the tree must be clean:
 # a walk reads the working tree, so a fixture cut from a dirty tree would be stamped with a commit that
 # did not produce it, and the stamp is the only thing tying a row set to the code that enumerated it.
@@ -208,6 +217,24 @@ for pair in "dense:$fixture_dense:" "sparse:$fixture_sparse:sparse"; do
     fi
     printf '  %-10s ok (%s row(s) of the sparse backend)\n' "$name" "$others"
 done
+
+# 3c. The recording, where one was given: the fixture must be the recorder's rows exactly. This is the
+#     only comparison that sees a flag reach a key - `--elements` decided `wide` and the walk and the
+#     file agreed with each other while both disagreed with the model.
+if [ -n "$recorder" ]; then
+    echo 'against the recording:'
+    if RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p ops --example keys_delta -- \
+        --fixture "$fixture_dense" --walk "$recorder" 2>&1 | grep -q 'the fixture is the walk.s rows'; then
+        printf '  %-10s delta   ok\n' dense
+    else
+        printf '  %-10s delta   FAILED - the fixture is not the recording\n' dense
+        RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+            cargo run -q -p ops --example keys_delta -- --fixture "$fixture_dense" --walk "$recorder" \
+            2>&1 | sed 's/^/    /' | head -20
+        exit 1
+    fi
+fi
 
 # 4. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
