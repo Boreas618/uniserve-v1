@@ -86,6 +86,7 @@ constexpr int32_t kDescriptorExecutionPlan = 5;
 constexpr int32_t kDescriptorOperationForward = 10;
 constexpr int32_t kDescriptorOperationBackwardData = 12;
 constexpr int32_t kDescriptorOperationGraph = 15;
+constexpr int32_t kDescriptorDeviceProp = 38;
 constexpr int32_t kDescriptorVariantPack = 16;
 constexpr int32_t kDescriptorTensor = 17;
 
@@ -100,6 +101,8 @@ constexpr int32_t kAttrConvolutionSpatialDims = 106;
 constexpr int32_t kAttrEngineHeurMode = 200;
 constexpr int32_t kAttrEngineHeurOperationGraph = 201;
 constexpr int32_t kAttrEngineHeurResults = 202;
+constexpr int32_t kAttrEngineHeurSmCount = 203;
+constexpr int32_t kAttrEngineHeurDeviceProp = 204;
 constexpr int32_t kAttrEngineCfgEngine = 300;
 constexpr int32_t kAttrExecutionPlanEngineConfig = 401;
 constexpr int32_t kAttrExecutionPlanWorkspaceSize = 402;
@@ -131,6 +134,7 @@ constexpr int64_t kTensorByteAlignment = 16;
 constexpr int32_t kAttrVariantPackUniqueIds = 1000;
 constexpr int32_t kAttrVariantPackDataPointers = 1001;
 constexpr int32_t kAttrVariantPackWorkspace = 1003;
+constexpr int32_t kAttrDevicePropDeviceId = 2700;
 constexpr int32_t kAttrEngineGlobalIndex = 1301;
 constexpr int32_t kAttrEngineNumericalNote = 1303;
 
@@ -468,6 +472,39 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
             set(heuristic, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1, &graph) &&
             set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &kHeuristicModeA) &&
             finalize(heuristic, "the heuristic");
+    // **Two of the heuristic's five attributes were never stated.** `SM_COUNT_TARGET` is the
+    // device's multiprocessor count and `DEVICEPROP` names the device the plan is for; cuDNN
+    // treats both as optional, and an engine that needs a device property the request does not
+    // name is not proposed at all - so a shape can have an engine and still come back with three
+    // empty lists. Both are stated best-effort: a cuDNN that refuses either still asks, and the
+    // refusal records which it accepted, because a sentence about an empty list cannot say whether
+    // the request reached the library the way the caller meant.
+    bool sm_counted = false;
+    bool device_named = false;
+    int32_t ordinal = 0;
+    int multiprocessors = 0;
+    if (built && cudaGetDevice(&ordinal) == cudaSuccess &&
+        cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, ordinal) ==
+            cudaSuccess &&
+        multiprocessors > 0) {
+      int64_t target = multiprocessors;
+      sm_counted =
+          library.backend_set(heuristic, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
+          kSuccess;
+      int64_t device_id = ordinal;
+      void* properties = nullptr;
+      const bool made =
+          library.backend_create(kDescriptorDeviceProp, &properties) == kSuccess &&
+          library.backend_set(properties, kAttrDevicePropDeviceId, kTypeInt64, 1, &device_id) ==
+              kSuccess &&
+          library.backend_finalize(properties) == kSuccess;
+      device_named = made && library.backend_set(heuristic, kAttrEngineHeurDeviceProp,
+                                                 kTypeBackendDescriptor, 1, &properties) ==
+                                 kSuccess;
+      if (!device_named && properties != nullptr) {
+        library.backend_destroy(properties);
+      }
+    }
     void* configs[kMaxEngineConfigs] = {};
     int64_t count = 0;
     bool listed = false;
@@ -491,10 +528,40 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
                count > 0;
     }
     if (built && !listed) {
-      *status = refuse(error,
-                       "cuDNN proposes no engine for this convolution in any heuristic mode: the "
-                       "shortlist, the exhaustive list and the fallback list all name none for "
-                       "this shape, these tensor descriptors and this cuDNN version");
+      // **The graph travels with the refusal.** An empty engine list is an answer about one exact
+      // request: these dims, these strides, this geometry, this element type and this permission.
+      // A reader given only the sentence has to guess which of them cuDNN would not take - and the
+      // caller of this operator cannot see them at all, because the descriptor carries no geometry.
+      char why[512];
+      std::snprintf(
+          why, sizeof(why),
+          "cuDNN proposes no engine for this convolution: %s, x [%lld %lld %lld %lld %lld] "
+          "strides [%lld %lld %lld %lld %lld] type %d, w [%lld %lld %lld %lld %lld] type %d, "
+          "y [%lld %lld %lld %lld %lld] type %d, kernel [%lld %lld %lld] stride [%lld %lld %lld] "
+          "padding [%lld %lld %lld] dilation [%lld %lld %lld], tf32 %d, channels_last %d, "
+          "sm_count_target %s, device_property %s - the shortlist, the exhaustive list and the "
+          "fallback list all name none",
+          transposed ? "backward-data" : "forward", static_cast<long long>(x_dims[0]),
+          static_cast<long long>(x_dims[1]), static_cast<long long>(x_dims[2]),
+          static_cast<long long>(x_dims[3]), static_cast<long long>(x_dims[4]),
+          static_cast<long long>(x_strides[0]), static_cast<long long>(x_strides[1]),
+          static_cast<long long>(x_strides[2]), static_cast<long long>(x_strides[3]),
+          static_cast<long long>(x_strides[4]), static_cast<int>(x_type),
+          static_cast<long long>(w_dims[0]), static_cast<long long>(w_dims[1]),
+          static_cast<long long>(w_dims[2]), static_cast<long long>(w_dims[3]),
+          static_cast<long long>(w_dims[4]), static_cast<int>(w_type),
+          static_cast<long long>(y_dims[0]), static_cast<long long>(y_dims[1]),
+          static_cast<long long>(y_dims[2]), static_cast<long long>(y_dims[3]),
+          static_cast<long long>(y_dims[4]), static_cast<int>(y_type),
+          static_cast<long long>(call.kernel[0]), static_cast<long long>(call.kernel[1]),
+          static_cast<long long>(call.kernel[2]), static_cast<long long>(call.stride[0]),
+          static_cast<long long>(call.stride[1]), static_cast<long long>(call.stride[2]),
+          static_cast<long long>(call.padding[0]), static_cast<long long>(call.padding[1]),
+          static_cast<long long>(call.padding[2]), static_cast<long long>(call.dilation[0]),
+          static_cast<long long>(call.dilation[1]), static_cast<long long>(call.dilation[2]),
+          static_cast<int>(call.tf32), static_cast<int>(call.channels_last),
+          sm_counted ? "stated" : "not stated", device_named ? "stated" : "not stated");
+      *status = refuse(error, why);
       built = false;
     }
     // The engine: the one the tuning data names, else the heuristic's first proposal
