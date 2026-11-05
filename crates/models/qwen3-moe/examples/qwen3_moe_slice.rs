@@ -2821,10 +2821,14 @@ fn prompt_ids(text: &str) -> Result<Vec<i32>> {
 
 /// Every key this run would ask the store for, printed in the deployment list's own format.
 ///
-/// `--preflight` answers one question without a device: does the deployment's list hold every
-/// program a run of this shape launches? A key the list lacks is a fact about a file, and the
-/// stage that would launch it is named here rather than discovered by a kernel that cannot find
-/// its module.
+/// `--preflight` answers one question without a device: **which** of the deployment list's programs
+/// a run of this shape installs. A stage's packed products are compiled per row class, so the answer
+/// is a class fact and not a count, and it is printed in the list's own form so it can be compared
+/// with a built store.
+///
+/// It does not answer the other half - whether the list holds what the model compiles at all -
+/// because it filters the list and cannot see past it. That is `examples/keys_check.rs`'s question,
+/// which walks the model's own enumeration (`qwen3_moe::keys::keys`) against the same file.
 fn preflight(args: &Args) -> Result<()> {
     let declared = Representation::read(&args.checkpoint)?;
     let count = u64::try_from(prompt_ids(&args.tokens)?.len()).unwrap_or(0);
