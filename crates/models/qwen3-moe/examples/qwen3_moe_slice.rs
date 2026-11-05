@@ -2077,7 +2077,9 @@ mod tests {
         // A count the fixture names no row for is refused with both numbers, before any launch: the
         // alternative is a run that installs nothing for its product and reports a missing kernel
         // for a row its store never had.
-        let missing = super::needed_keys(
+        // The launch states the smallest class that holds its rows, so a prompt of 16 rows is
+        // served by the `m_128` cells exactly as a prompt of 128 rows is.
+        let short = super::needed_keys(
             root,
             Stage::Decode,
             false,
@@ -2088,10 +2090,47 @@ mod tests {
                 generated: None,
             },
         )
-        .expect_err("a count the fixture does not name");
-        let message = format!("{missing}");
-        assert!(message.contains("16 row(s)"), "{message}");
-        assert!(message.contains("128"), "{message}");
+        .expect("a prompt of 16 rows is served by the m_128 class");
+        assert_eq!(
+            short
+                .iter()
+                .filter(|(operator, _)| operator == "nvfp4_gemm")
+                .count(),
+            3,
+            "{short:?}"
+        );
+        // A continuation's single row is the same class, so `--generate` is not refused either.
+        assert!(
+            super::needed_keys(
+                root,
+                Stage::Decode,
+                false,
+                KvPages::Bf16,
+                super::Encoded {
+                    declared: true,
+                    tokens: Some(16),
+                    generated: Some(1),
+                },
+            )
+            .is_ok(),
+            "a continuation launches the same class"
+        );
+        // A batch above the largest class has no row at all, and is refused naming both numbers.
+        let large = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded {
+                declared: true,
+                tokens: Some(5000),
+                generated: None,
+            },
+        )
+        .expect_err("a batch above the largest class");
+        let message = format!("{large}");
+        assert!(message.contains("5000"), "{message}");
+        assert!(message.contains("4096"), "{message}");
     }
 
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
@@ -2775,9 +2814,26 @@ fn needed_keys(
         ))
     })?;
     let mut keys = Vec::new();
-    // A packed product is compiled per row count, so the counts the fixture names for it are the
+    // A packed product is compiled per row class, so the classes the fixture names for it are the
     // only ones a run can install.
-    let mut stated: BTreeSet<u64> = BTreeSet::new();
+    let mut stated: BTreeSet<u32> = BTreeSet::new();
+    // The launch states the smallest class that holds its rows (`nn::layers::packed_rows`), never
+    // the raw count: a 16-row prompt asks for `m_128` exactly as a 128-row one does, and a
+    // continuation's single row asks for the same class. Comparing a raw count with the fixture's
+    // classes instead would refuse every prompt shorter than the first class and every
+    // continuation, which is the whole of a decode deployment.
+    let mut classes: Vec<u32> = Vec::new();
+    for count in [encoded.tokens, encoded.generated].into_iter().flatten() {
+        let rows = u32::try_from(count).unwrap_or(u32::MAX);
+        let class = nn::layers::packed_rows(rows).map_err(|error| {
+            Failure::message(format!(
+                "a batch of {count} row(s) has no packed row class: {error}"
+            ))
+        })?;
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2801,10 +2857,9 @@ fn needed_keys(
         // packed product is compiled per row count, so only the counts this run will launch are
         // required - the prompt's, and one row when a continuation will follow it.
         let packed_row = operator == "nvfp4_gemm"
-            && [encoded.tokens, encoded.generated]
-                .into_iter()
-                .flatten()
-                .any(|rows| descriptor.contains(&format!("_m_{rows}_")));
+            && classes
+                .iter()
+                .any(|class| descriptor.contains(&format!("_m_{class}_")));
         if operator == "nvfp4_gemm"
             && let Some(rows) = packed_rows_in(descriptor)
         {
@@ -2829,16 +2884,16 @@ fn needed_keys(
     // would report it as a missing kernel for a row the store never had. Name both numbers here,
     // where a run learns what to regenerate instead of where it stops.
     if encoded.declared {
-        for count in [encoded.tokens, encoded.generated].into_iter().flatten() {
-            if !stated.contains(&count) {
+        for class in &classes {
+            if !stated.contains(class) {
                 return Err(Failure::message(format!(
-                    "the fixture states no `nvfp4_gemm` row for a batch of {count} row(s), which \
-                     this run launches: it states {}. A packed product is compiled per row count, \
-                     so a count the fixture does not name has no program to install — regenerate \
-                     the fixture for this deployment's counts, or run at one it names.",
+                    "the fixture states no `nvfp4_gemm` row for the {class}-row class, which this \
+                     run launches: it states {}. A packed product is compiled per row class, so a \
+                     class the fixture does not name has no program to install — regenerate the \
+                     fixture for this deployment's classes.",
                     stated
                         .iter()
-                        .map(u64::to_string)
+                        .map(u32::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
                 )));
@@ -2849,7 +2904,7 @@ fn needed_keys(
 }
 
 /// The row count a `nvfp4_gemm` descriptor names, which is the batch it was compiled for.
-fn packed_rows_in(descriptor: &str) -> Option<u64> {
+fn packed_rows_in(descriptor: &str) -> Option<u32> {
     let mut fields = descriptor.split('_');
     while let Some(field) = fields.next() {
         if field == "m" {
