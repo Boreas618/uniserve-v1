@@ -2935,7 +2935,6 @@ mod tests {
             configured_tokenizer(),
             "lost-engine-model".into(),
             vec![Arc::clone(&client)],
-            None,
         );
         assert!(engine.is_healthy());
 
@@ -2975,7 +2974,6 @@ mod tests {
             configured_tokenizer(),
             "sim-model".into(),
             clients.clone(),
-            None,
         );
 
         // Both requests are submitted before either stream is read, so the
