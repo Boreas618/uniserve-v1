@@ -2042,17 +2042,20 @@ impl AudioEncoder {
         let length = shape.dim(2);
         let frames = self.frames(length)?;
         // The network's stages divide the length exactly, so a track that is not a whole number of
-        // latent frames is right-padded with zeros to one, which is what the reference's
-        // `unpack_samples` does before it convolves. Writing that pad needs a zero-fill the operator set
-        // does not have yet (a `zero_pad` over the trailing axis); until it exists this is refused by
-        // name rather than truncated, because truncating drops the last latent frame.
+        // latent frames must be right-padded with zeros to one - what the reference's `unpack_samples`
+        // does before it convolves. **The pad is the caller's**, and that is not a punt: the padded
+        // span depends on the request's own sample count, so it is a request buffer, which the runner
+        // allocates and may fill on the host before it uploads. `padded_samples` states the length and
+        // this refusal states the length too, so a caller that meets it needs no operator: truncating
+        // instead would drop the last latent frame, which is why this is a refusal and not a rounding.
         let hop = self.hop();
         if !length.is_multiple_of(hop) {
             let padded = padded_samples(length, hop)?;
             return Err(Error::config(format!(
-                "{length} samples is not a whole number of {hop}-sample latent frames: the reference \
-                 right-pads the track with zeros to {padded} samples and this build has no zero-fill \
-                 program"
+                "{length} samples is not a whole number of {hop}-sample latent frames: hand this call \
+                 the track right-padded with zeros to {padded} samples (`padded_samples`), as the \
+                 reference's `unpack_samples` does before it convolves - the pad is a request \
+                 buffer's tail, so it is the caller's to fill"
             )));
         }
         if frames > u64::from(self.frames) {
