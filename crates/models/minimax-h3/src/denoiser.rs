@@ -46,8 +46,8 @@ use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 use crate::attention::{Factors, Visible};
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
-use crate::partition::Partition;
 use crate::packing::{self, DensePacking};
+use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
 use crate::transformer::Transformer;
@@ -2076,7 +2076,9 @@ impl Denoiser {
 
         // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
         programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(dtype));
-        programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor());
+        programs.launch::<Unpatchify>(
+            &nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor(),
+        );
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
             dtype,
             NoiseKind::Normal,

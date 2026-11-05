@@ -57,7 +57,9 @@ fn run() -> Result<(), String> {
             "--commit" => {
                 let stated = value()?;
                 if stated.is_empty() {
-                    return Err("--commit is the tree the walk came from, and it cannot be empty".into());
+                    return Err(
+                        "--commit is the tree the walk came from, and it cannot be empty".into(),
+                    );
                 }
                 commit = Some(stated);
             }
@@ -69,8 +71,8 @@ fn run() -> Result<(), String> {
         "the fixture names the commit the walk came from: pass --commit <revision>, as a row set is \
          evidence only of the tree that produced it",
     )?;
-    let print = std::fs::read_to_string(&walk)
-        .map_err(|error| format!("{}: {error}", walk.display()))?;
+    let print =
+        std::fs::read_to_string(&walk).map_err(|error| format!("{}: {error}", walk.display()))?;
 
     // The walk's rows, in the order it printed them, and its own header lines unread: the deployment
     // line is the header line that names the deployment, and the row count is printed once every row
