@@ -1612,9 +1612,15 @@ pub(crate) mod tests {
         let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
         let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
         assert_eq!(magnitudes, directions, "every magnitude has its direction");
+        // One pre-convolution, one post-convolution, and per stage its upsampler plus two per
+        // residual kernel in each of the three blocks. The input projection is not among them: the
+        // reference declares it plain and the export stores it as one weight.
+        let stages = config.decoder_rates.len();
+        let kernels = config.resblock_kernel_sizes.len();
         assert_eq!(
-            magnitudes, 136,
-            "the decoder's weight-normalized convolutions"
+            magnitudes,
+            2 + stages * (1 + BLOCKS_PER_STAGE * kernels * 2),
+            "the decoder's weight-normalized convolutions, by structure rather than by count"
         );
         // The encoder reads a different half of a different directory; a shared name would be one
         // block binding the other's tensor.
@@ -1983,14 +1989,18 @@ pub(crate) mod tests {
             .iter()
             .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
             .count();
-        // 136 weighted convolutions: the input projection, the pre- and post-convolutions, seven
-        // upsamplers and the 126 anti-aliased multi-periodicity convolutions.
-        assert_eq!(normalized, 136);
-        // 127 activations of four tensors each, plus the input projection's pair, the two
-        // convolution biases, the seven upsampler biases and the 126 AMP biases.
-        // 127 alias-free activations of four tensors each, their convolutions' own biases (126), the
-        // upsamplers' and the two bias-carrying projections' — the post-convolution has none.
-        assert_eq!(table.len(), 136 + 127 * 4 + 126 + 7 + 2);
+        // The same count by structure: the pre- and post-convolutions plus every stage's upsampler
+        // and its blocks' convolutions. The input projection is not among them.
+        let stages = config.decoder_rates.len();
+        let kernels = config.resblock_kernel_sizes.len();
+        let normalized_by_structure = 2 + stages * (1 + BLOCKS_PER_STAGE * kernels * 2);
+        assert_eq!(normalized, normalized_by_structure);
+        // The table's total is not asserted here: it would be a fourth restatement of the same
+        // structure, and the set is already pinned exactly against the export's own 914 names
+        // (`the_audio_decoders_names_are_the_checkpoints`), which is the check a count can only
+        // approximate. What the count would catch and the set does not is a table that names the
+        // checkpoint's parameters in the wrong representation - and the pair rule below is that
+        // check, stated directly.
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())

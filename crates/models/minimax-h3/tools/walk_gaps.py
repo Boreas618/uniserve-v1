@@ -12,6 +12,11 @@ and a walk at one element type cannot show the rows of a stack that runs at anot
 walk of this tree states 136 launches and the two together name shapes neither names alone.
 `--walk` is repeatable for exactly this reason.
 
+**And read each component's rows from the walk whose element type is that component's.** A
+walk keys every component at one type (`--dtype` is the example's, not the deployment's), while
+a served deployment has the stack at BF16 and the video VAE at the checkpoint's own FP16; so the
+pair gives each *shape* at two types and only one of them is the type that shape is launched at.
+
 **A gap is a defect only when the walk and the file were asked the same question**, and
 a question has a raster, a clip length, a token count and an element count. The walk's own
 header states those, so the check prints them and answers a gap in three disjoint ways: a row
@@ -259,7 +264,13 @@ def by_shape(args):
         elif operator in CANVAS_CLASS:
             mark = "  RASTER-DEPENDENT"
         else:
-            mark = "  MISSING at every type"
+            # The element types the walk launched it at, in the verdict line: the comparison
+            # normalises the type away, so the one field a row is *written* with is the one the
+            # count lost - a shape missing at every type is a row to add, but only a reader who
+            # sees `f16` knows which row.
+            mark = (
+                f"  MISSING at every type, launched at {', '.join(launched_at)}"
+            )
         print(f"{mark}: {operator}\t{key}")
         print(f"    launched at {', '.join(launched_at)} by {', '.join(where)}")
     if canvas:
