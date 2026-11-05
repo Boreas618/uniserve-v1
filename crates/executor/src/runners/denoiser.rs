@@ -45,6 +45,7 @@ use crate::batch::{Batch, BatchOutput, Job, Jobs};
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
+use crate::runners::diag::Diag;
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
@@ -311,6 +312,10 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     columns: DenoiseColumns,
+    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
+    diag: Diag,
+    /// The step of the schedule the staged batch is, which names the diagnosis dumps.
+    staged_step: Option<u32>,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -367,6 +372,8 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             counters: None,
             tables: Tables::new(),
             columns,
+            diag: Diag::from_env(),
+            staged_step: None,
         })
     }
 
@@ -605,10 +612,56 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Writes the coefficient index the step reads, before a walk or a replay.
+    /// Writes the coefficient index the step reads, before a walk or a replay, and records it for
+    /// the diagnosis.
     fn stage_step(&mut self, step: &Step) -> Result<()> {
         self.columns.staged.step = step.index.to_le_bytes().to_vec();
+        self.staged_step = Some(step.index);
         Ok(())
+    }
+
+    /// Writes the latents of the staged step under the block-by-block diagnosis' own names.
+    ///
+    /// The protocol's names are per evaluation: the state on entry to evaluation `e` is what both
+    /// implementations dump, so a replay writes `denoiser/latents_video_e` before it launches and
+    /// `latents_video_{e+1}` after it - the runner's step updates the latents in place, so the exit
+    /// state of one evaluation is the entry state of the next and the two trees hold the same names.
+    /// Evaluation zero's entry state is the request's noise, so it is written under that name too.
+    ///
+    /// A dump never fails a request (design 10): `Diag::write` reports and the step goes on.
+    fn dump_latents(&self, bucket: Bucket, index: u32) {
+        if !self.diag.enabled() {
+            return;
+        }
+        let Ok(video) = self.video_latents(bucket, 0) else {
+            return;
+        };
+        self.write_latent("video", video, index);
+        if let Ok(Some(audio)) = self.audio_latents(bucket, 0) {
+            self.write_latent("audio", audio, index);
+        }
+    }
+
+    /// One modality's latents, at the step's own names.
+    fn write_latent(&self, modality: &str, view: TensorView, index: u32) {
+        let _ = self.diag.write(
+            self.device,
+            &self.stream,
+            "denoiser",
+            &format!("latents_{modality}_{index}"),
+            view,
+        );
+        if index == 0 {
+            // Evaluation zero's entry state is the request's noise, and the reference dumps it under
+            // that name; the two names hold one tensor rather than two computations.
+            let _ = self.diag.write(
+                self.device,
+                &self.stream,
+                "denoiser",
+                &format!("noise_{modality}"),
+                view,
+            );
+        }
     }
 
     /// Stages a bucket with no batch behind it, so a first capture has defined columns to read.
@@ -860,8 +913,17 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
+                let step = self.staged_step;
+                if let Some(step) = step {
+                    self.dump_latents(*bucket, step);
+                }
                 let launched = std::time::Instant::now();
                 captured.launch(&stream)?;
+                if let Some(step) = step {
+                    // The step updates the latents in place, so the exit state of this evaluation is
+                    // the entry state of the next one, which is the name both trees dump.
+                    self.dump_latents(*bucket, step + 1);
+                }
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
