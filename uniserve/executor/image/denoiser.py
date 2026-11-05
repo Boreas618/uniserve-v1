@@ -1,6 +1,6 @@
 """An image model's denoiser on row buckets: trajectories, steps, conditions.
 
-The denoiser computation of an image model (BAGEL, SenseNova) runs three
+The denoiser computation of an image model runs three
 kinds of work on its stream:
 
 - a latent preparation opens a request's trajectory and writes its seeded
