@@ -3882,16 +3882,29 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 seq_lens: span.0,
                 query_offsets: span.1,
                 logits_rows: vec![-1; rows],
-                calls: vec![nn::BatchRow {
-                    request: 0,
-                    kind: if bucket.variant.is_decode() {
-                        nn::RowKind::Decode
-                    } else {
-                        nn::RowKind::Prefill
-                    },
-                    cache_group: 0,
-                    rows: 0..bucket.tokens,
-                }],
+                // A decode batch is one call per row. `Staging::stage` extends a batch to one call
+                // per padded row in exactly that form, and a serving decode batch is built the same
+                // way, so a warm pose that states one call holding the bucket's whole token run is
+                // a shape no decode batch ever has - and a captured graph states that shape to the
+                // model for the life of the bucket. A prefill row genuinely carries a run, so its
+                // pose keeps one call over the bucket's tokens.
+                calls: if bucket.variant.is_decode() {
+                    (0..rows as u32)
+                        .map(|row| nn::BatchRow {
+                            request: 0,
+                            kind: nn::RowKind::Decode,
+                            cache_group: 0,
+                            rows: row..row + 1,
+                        })
+                        .collect()
+                } else {
+                    vec![nn::BatchRow {
+                        request: 0,
+                        kind: nn::RowKind::Prefill,
+                        cache_group: 0,
+                        rows: 0..bucket.tokens,
+                    }]
+                },
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
@@ -3906,7 +3919,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
-            commit: inert_commit(1),
+            commit: inert_commit(if bucket.variant.is_decode() { rows } else { 1 }),
             // The geometry the upload hands the model, and the same two values the serving pose
             // states (`token_batch_with`): a captured node's page size and key bound are its own,
             // so a warm pose that stated its own would freeze a page of one token and a reduction
