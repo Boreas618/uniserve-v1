@@ -508,6 +508,14 @@ impl KvProvider for ResidentCache {
         self.gather(group, slots, stream)
     }
 
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView> {
+        let table = self
+            .tables
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))?;
+        Ok(table.view_rows(row_count(group, table.rows, slots)?))
+    }
+
     fn planes(&self, group: usize) -> Result<Vec<KvPlanes>> {
         let cache = self
             .cache

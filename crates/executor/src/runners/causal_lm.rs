@@ -1456,6 +1456,14 @@ pub trait KvProvider: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<TensorView>;
 
+    /// The same table's view over `slots`' rows, with no copy issued.
+    ///
+    /// A capture records every copy with the addresses it had, so a gather inside a recording bakes
+    /// the pose's pool rows into the graph, and each replay would then overwrite the batch's table
+    /// with them. A recording addresses the table through this view, and `block_table` fills it
+    /// before each launch.
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView>;
+
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
 
@@ -2091,6 +2099,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                // The graph holds no gather: the table it reads is filled here, on the stream the
+                // launch follows, from this batch's own slots.
+                let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+                for group in 0..self.kv.groups() {
+                    self.kv.block_table(group, &slots, &self.stream)?;
+                }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -4061,7 +4075,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.max_kv_len,
         );
         // The page table's row, from the column the kernel addresses.
-        match self.kv.block_table(0, &slots, &self.stream) {
+        match self.kv.block_table_view(0, &slots) {
             Ok(table) => {
                 let mut entries = [0_i32; 8];
                 let bytes = entries.len() * std::mem::size_of::<i32>();
@@ -4271,7 +4285,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             match scratch_pages {
                 None => {
                     layers.push(self.kv.planes(group)?);
-                    tables.push(self.kv.block_table(group, slots, &self.stream)?);
+                    tables.push(if self.capturing {
+                        self.kv.block_table_view(group, slots)?
+                    } else {
+                        self.kv.block_table(group, slots, &self.stream)?
+                    });
                 }
                 Some(pages) => {
                     let (table, planes) = self.kv.scratch(group, slots, pages, &self.stream)?;
