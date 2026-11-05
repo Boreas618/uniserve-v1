@@ -10,12 +10,14 @@
 //! written as one logistic rather than as `0.5·x·(1+tanh(u))` because the logistic needs one
 //! exponential and saturates exactly at both ends.
 //!
-//! Which approximation a model uses is its checkpoint's, not a preference: H3's audio VAE gates with
-//! `approximate="tanh"` (`uniserve/models/minimax_h3/audio_vae.py:386`), the diffusion transformer's
-//! MLPs take `gelu_pytorch_tanh` (`uniserve/models/diffusion_gemma/config.py:289`), and a checkpoint
-//! that names plain `gelu` — Qwen3-VL accepts it (`uniserve/models/qwen3_vl/config.py:18`) — is the
-//! exact form. The approximation is therefore part of the compilation, and the two are separate
-//! programs.
+//! Which approximation a model uses is its checkpoint's, not a preference, and both forms have a
+//! consumer in this tree: H3's audio VAE gates with `approximate="tanh"`
+//! (`uniserve/models/minimax_h3/audio_vae.py:386`) and its vision tower's activation is the
+//! checkpoint's choice between the two (`crates/models/minimax-h3/src/vision.rs:832`), whose merger
+//! takes the exact form (`vision.rs:898`, `Gelu::exact`). The diffusion transformer's MLPs take
+//! `gelu_pytorch_tanh` (`uniserve/models/diffusion_gemma/config.py:289`), and a checkpoint that names
+//! plain `gelu` — Qwen3-VL accepts it (`uniserve/models/qwen3_vl/config.py:18`) — is the exact form
+//! too. The approximation is therefore part of the compilation, and the two are separate programs.
 //!
 //! Elementwise over `[rows, columns]`, one element per thread. The result is elementwise, so its
 //! tolerance is the output's own rounding plus one envelope: both implementations evaluate the same
