@@ -1467,7 +1467,13 @@ impl VideoDecoder {
                 offsets,
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
-                attended,
+                // The attention writes one row per head, so its output is the same three axes its
+                // inputs are: the scratch buffer is a flat `[rows, width]` block and the heads are
+                // the middle axis of the same bytes. Passing the flat view was `dense_attention:
+                // expected 3 axes, found 2` at the first device run - the only call site of the six
+                // in this model that did not reshape its output, and the shapes of the other five
+                // were already `[rows, heads, head]` at the arena.
+                per_head(attended),
             )?;
             layer.output.forward(f, attended, update)?;
             layer.residual1.forward(f, hidden, update)?;
