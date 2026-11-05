@@ -46,13 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The video decoder's precision is the checkpoint's, not the config's: the design converts
     // nothing at load, so the deployment states the element type its weights are in.
-    let mut dtype: Option<ops::DType> = None;
+    // No `--dtype`: the deployment states four element types and there is no single value that
+    // matches them, so each component's rows key from its own (`load::deployment_dtype`).
     // The caller's `component-tensors.json`, which states the four components' stored element types.
     let mut types: Option<PathBuf> = None;
-    // The VAE container's element type is the checkpoint's, not the deployment's: the export stores its
-    // VAE weights in one type (`dtype = "auto"` converts nothing), and both VAE halves compute in it.
-    // FP32 is what this export's VAE is stored in; another export is another value, stated here.
-    let mut vae_dtype = ops::DType::F32;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
     let mut tokens: Vec<u32> = Vec::new();
@@ -144,49 +141,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
-            "--vae-dtype" => {
-                vae_dtype = match value.as_str() {
-                    "f16" => ops::DType::F16,
-                    "bf16" => ops::DType::BF16,
-                    "f32" => ops::DType::F32,
-                    other => return Err(format!("{other} is not a float type").into()),
-                };
-            }
             // The four components' stored element types, from the caller's tensor table: a row is keyed
             // by an element type, and no shardless host can read them from the checkpoint, so a
             // deployment states them or the fixture cannot be attributed.
             "--types" => types = Some(PathBuf::from(value.as_str())),
-            "--dtype" => {
-                dtype = Some(match value.as_str() {
-                    "f16" => ops::DType::F16,
-                    "bf16" => ops::DType::BF16,
-                    "f32" => ops::DType::F32,
-                    other => return Err(format!("{other} is not a float type").into()),
-                });
-            }
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
     if samples.is_empty() || rasters.is_empty() {
         return Err("both --samples and --rasters are the deployment's and have no default".into());
     }
-    let dtype = dtype.ok_or("--dtype is the checkpoint's and has no default")?;
+    // Each component's element type, from one source with a fallback: the caller's `--types` table
+    // where it is at hand, the checkpoint's own shard headers where they are, and a refusal naming
+    // both when neither is. A walk has no `--dtype` because a deployment does not have one type.
+    let checkpoint = nn::Checkpoint::open(&root).ok();
+    let stated_types = match types.as_deref() {
+        Some(table) => Some(minimax_h3::load::ElementTypes::read(table)?),
+        None => None,
+    };
+    if let (Some(stated), Some(checkpoint)) = (&stated_types, &checkpoint) {
+        stated.verify(checkpoint)?;
+    }
+    let dtype_of = |component: &str| {
+        minimax_h3::load::deployment_dtype(stated_types.as_ref(), checkpoint.as_ref(), component)
+    };
     // The four types are stated when the caller's table is at hand, and said to be unstated when it is
     // not: the table is an artifact of an export (`artifacts/` is not in the tree), so requiring it
     // would make the walk refuse on a host that simply has not exported one. A row set without its
     // element types is still unattributable - that is a statement about the header, and the gate is
     // the fixture's generator rather than this diagnostic.
-    let element_types = match types.as_deref() {
-        Some(table) => {
-            let stated = minimax_h3::load::ElementTypes::read(table)?;
-            // Checked where it can be: a host with the checkpoint's shards compares the statement
-            // with them and refuses a disagreement by name, and a host with none states it unchecked.
-            if let Ok(checkpoint) = nn::Checkpoint::open(&root) {
-                stated.verify(&checkpoint)?;
-            }
-            format!("[{}] from {}", stated.field(), table.display())
-        }
-        None => format!("[{}]", minimax_h3::load::UNSTATED),
+    let element_types = match (&stated_types, types.as_deref()) {
+        (Some(stated), Some(table)) => format!("[{}] from {}", stated.field(), table.display()),
+        _ => format!("[{}]", minimax_h3::load::UNSTATED),
     };
     if tokens.is_empty() {
         return Err("--tokens is the deployment's and has no default".into());
@@ -263,10 +249,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        // The container's type, not the deployment's: the decoder's tensor space is the checkpoint's
-        // and the recorder measures it at that type (M5319).
-        rows.extend(VideoDecoder::programs(&config, vae_dtype)?);
-        rows.extend(VideoPostprocessor::programs(dtype, &rasters));
+        // The container's own stored type, from the same source as every other component: the
+        // decoder's tensor space is the checkpoint's, not a deployment's choice, and a flag here was
+        // the last one that decided a row's element type.
+        rows.extend(VideoDecoder::programs(&config, dtype_of("vae")?)?);
+        rows.extend(VideoPostprocessor::programs(dtype_of("vae")?, &rasters));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
@@ -289,12 +276,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // One row per prompt length: the attention's key bound is the deployment's, and the gated
         // activation's `wide` form follows from it.
         for tokens in &tokens {
-            rows.extend(TextEncoder::programs(&config, &partition, dtype, *tokens)?);
+            rows.extend(TextEncoder::programs(
+                &config,
+                &partition,
+                dtype_of("text_encoder")?,
+                *tokens,
+            )?);
         }
         // The tower attends grids of the deployment's largest image; its programs do not depend on
-        // them beyond the bound the module is accepted for.
+        // them beyond the bound the module is accepted for. **It keys from `text_encoder`'s type
+        // because that component is where the checkpoint stores it** - the vision tower is a tensor
+        // set inside the text encoder's component, not a fifth component with storage of its own.
         let sequence = tokens.iter().copied().max().unwrap_or(0);
-        rows.extend(VisionTower::programs(&config.vision, dtype, sequence)?);
+        rows.extend(VisionTower::programs(
+            &config.vision,
+            dtype_of("text_encoder")?,
+            sequence,
+        )?);
     } else {
         eprintln!("not walked: text_encoder");
     }
@@ -380,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows.extend(Denoiser::programs(
             &config,
             attention,
-            dtype,
+            dtype_of("transformer")?,
             rows_bound,
             Groups::of(conditioned),
             &partition,
@@ -403,12 +401,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         names.len()
     };
     println!("# {} data rows, {operators} operators", rows.len());
-    println!("# the VAE container runs {vae_dtype}");
+    // Read from the same function the decoder's rows were keyed from, so the header cannot state one
+    // element type while the rows below it say another.
+    println!("# the VAE container runs {}", dtype_of("vae")?);
     println!(
         "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, element types: {element_types}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}", partition.ulysses_degree
     );
     println!(
-        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --dtype {dtype} --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
+        "# generated by `cargo run -p minimax-h3 --example programs -- <pipeline root> --samples {} --rasters {} --tokens {} --rows {} --elements {} --track {} --sparse {} --tp {degree}`",
         samples.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
         rasters.iter().map(|(height, width)| format!("{height}x{width}")).collect::<Vec<_>>().join(","),
         tokens.iter().map(u32::to_string).collect::<Vec<_>>().join(","),

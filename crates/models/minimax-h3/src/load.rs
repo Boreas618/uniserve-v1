@@ -421,6 +421,70 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
     }
 }
 
+/// The element type a component's programs are keyed from.
+///
+/// A row is keyed by an element type, so an enumeration that took one type for the whole deployment
+/// would state rows for a deployment nobody serves: the four components are stored as
+/// `text_encoder` BF16, `transformer` BF16 with twelve F32 crossings, and both VAEs F32. So each
+/// component asks for its own, from **one source with a fallback**: the caller's statement where it
+/// is at hand, the checkpoint's own shard headers where they are, and a refusal naming both when
+/// neither is.
+///
+/// A component of several stored types answers with the type most of its tensors are stored in - the
+/// bulk the layers compute in. The remainder are **crossings**, and a layer that narrows or widens
+/// states its own type at the site that does it (`modulation.rs`'s projections, the four boundary
+/// projections of the transformer), so asking this function never decides a crossing.
+pub fn deployment_dtype(
+    stated: Option<&ElementTypes>,
+    checkpoint: Option<&nn::Checkpoint>,
+    component: &str,
+) -> Result<nn::DType> {
+    // One source with a fallback: the caller's statement first (it is a command-line fact), then the
+    // checkpoint's own headers (it is the thing itself). Both are checked against each other where
+    // both exist, by `ElementTypes::verify`, so this order is a convenience rather than a second
+    // source.
+    if let Some(types) = stated
+        && let Some(found) = types.components.iter().find(|entry| entry.component == component)
+        && let Some((dtype, _)) = found.dtypes.iter().max_by_key(|(_, count)| *count)
+    {
+        return dtype_of(dtype).ok_or_else(|| {
+            Error::checkpoint(format!(
+                "{}: `{component}` states the element type `{dtype}`, which is not a type a weight \
+                 can be stored in",
+                types.source.display()
+            ))
+        });
+    }
+    if let Some(checkpoint) = checkpoint {
+        let counts = count_stored_types(checkpoint, component)?;
+        if let Some((dtype, _)) = counts.iter().max_by_key(|(_, count)| *count) {
+            return dtype_of(dtype).ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "the checkpoint stores `{component}` as `{dtype}`, which is not a type a \
+                     weight can be stored in"
+                ))
+            });
+        }
+    }
+    Err(Error::checkpoint(format!(
+        "no element type is stated for `{component}`: pass the caller's --types table, or a --root \
+         whose checkpoint holds its shards. A row is keyed by an element type, so an enumeration \
+         with neither cannot state a deployment"
+    )))
+}
+
+/// An element type by the name a table or a shard header gives it.
+fn dtype_of(name: &str) -> Option<nn::DType> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "f16" => nn::DType::F16,
+        "bf16" => nn::DType::BF16,
+        "f32" => nn::DType::F32,
+        "f8e4m3" | "e4m3fn" => nn::DType::F8E4M3,
+        "f4e2m1" | "nvfp4" => nn::DType::F4E2M1,
+        _ => return None,
+    })
+}
+
 /// The element type of one tensor of a component.
 ///
 /// A component may store several types (a release that keeps a loading derivation's operand in
