@@ -35,9 +35,9 @@ pub(crate) use transfers::TransferBases;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use platform::{DeviceId, Event, EventFlags, Stream};
 use ipc::CallId;
 use ipc::{BlockTable, BufferId, CacheTransfer, PageCopy, RequestKey, Wake};
+use platform::{DeviceId, Event, EventFlags, Stream};
 use tvm_ffi::Any;
 
 use self::block_tables::{AttentionRow, BlockTableStorage, BlockTables, GroupTable, TablePages};
@@ -535,7 +535,7 @@ impl PrefixCache {
         let unit_tokens = self.plan().unit_tokens();
         let spans: Vec<_> = units.iter().map(|&unit| (unit, 0, unit_tokens)).collect();
         self.accesses.require_reusable(&spans)?;
-        column.recycle(&self.planes, units, stream)
+        column.recycle(units, stream)
     }
 
     /// Clear released slots' rows on `stream` (ordered after every batch
