@@ -385,11 +385,13 @@ const _: () = assert!(offset_of!(FrameMomentsCall, mean) == 80);
 const _: () = assert!(offset_of!(FrameMomentsCall, error) == 96);
 const _: () = assert!(size_of::<FrameMomentsCall>() == 96 + MESSAGE);
 
-/// One compilation of `frame_moments`.
+/// One compilation of `frame_moments`: the element type and nothing else.
 ///
 /// The reduction class is a *declared bound*, not a compilation: the program reads the frame's shape
-/// as scalars, so nothing in it changes with the class. It therefore sits in the descriptor and not
-/// in the key, as every declared bound does, and the launch refuses a frame outside it.
+/// as scalars, so nothing in it changes with the class, and it sits in the descriptor and not in the
+/// key, as every declared bound does. The epsilon is a *call field*: the entry reads it from the call
+/// structure, so two launches that differ only in it run one object - measured, the `.text` section is
+/// byte-identical between two of them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FrameMomentsDescriptor {
     /// Element type of the values and the statistics.
@@ -403,10 +405,9 @@ pub struct FrameMomentsDescriptor {
 
 impl fmt::Display for FrameMomentsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
-            .field("dtype", self.dtype)
-            .field("epsilon", self.epsilon)
-            .finish(formatter)
+        // The epsilon is absent on purpose: it travels in the call, so the key would name several
+        // cells for one program.
+        Key::new().field("dtype", self.dtype).finish(formatter)
     }
 }
 
@@ -523,12 +524,14 @@ impl Op for FrameMoments {
     }
 }
 
-/// One compilation of `frame_norm_pad`.
+/// One compilation of `frame_norm_pad`: the element type and nothing else.
 ///
 /// The entry derives the output's order from the strides the call carries and branches between the
-/// two store paths itself (`frame.cu`, `channels_last ? launch(<true>) : launch(<false>)`), so the
-/// order is **not** what a compilation is chosen by: `channels_last` is a claim the launch checks
-/// against the view, and the key states only what the object is built for.
+/// two store paths itself (`frame.cu`, `channels_last ? launch(<true>) : launch(<false>)`), reads the
+/// normalization branch from a call field, and treats a one-pixel frame as one case among the rest.
+/// So none of the three below is what a compilation is chosen by: they are claims the launch checks
+/// against the arguments, and the key states the element type alone. Measured rather than argued: the
+/// `.text` section is byte-identical across all eight combinations this descriptor used to name.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FrameNormPadDescriptor {
     /// Element type of the values, the parameters and the output.
@@ -543,20 +546,23 @@ pub struct FrameNormPadDescriptor {
     /// key. Two launches that differ only here run one object.
     pub channels_last: bool,
     /// Normalize with the affine parameters (`false`), or with none (`true`).
+    ///
+    /// A checked claim like the order: the branch travels in the call (`normalization`), so two
+    /// launches that differ only here run one object.
     pub centered: bool,
     /// Every frame holds a single pixel, the reduction's shortest path.
+    ///
+    /// A checked claim: the launch refuses a descriptor whose claim and whose frame's extent
+    /// disagree, and the object handles either extent.
     pub single_pixel: bool,
 }
 
 impl fmt::Display for FrameNormPadDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `channels_last` is absent on purpose: the object derives the order at run time, so the
-        // key would name two cells for one program.
-        Key::new()
-            .field("dtype", self.dtype)
-            .field("centered", self.centered)
-            .field("single_pixel", self.single_pixel)
-            .finish(formatter)
+        // Three fields are absent on purpose: the object derives the order and the normalization
+        // branch at run time and treats a one-pixel frame as one case among the rest, so naming any
+        // of them would key several cells to one program.
+        Key::new().field("dtype", self.dtype).finish(formatter)
     }
 }
 
