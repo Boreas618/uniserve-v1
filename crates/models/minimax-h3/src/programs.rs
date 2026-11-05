@@ -168,6 +168,28 @@ impl Deployment {
             .collect()
     }
 
+    /// The rows the text encoder and its vision tower state, at the prompt length the deployment
+    /// holds.
+    ///
+    /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
+    /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
+    /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
+    pub fn text_rows(&self, partition: &Partition, tokens: u32) -> Result<Vec<(String, String)>> {
+        let mut programs = Programs::default();
+        programs.extend(crate::text_encoder::TextEncoder::programs(
+            &self.config.text_encoder,
+            partition,
+            self.types.text_encoder,
+            tokens,
+        )?);
+        programs.extend(crate::vision::VisionTower::programs(
+            &self.config.text_encoder.vision,
+            self.types.text_encoder,
+            tokens,
+        )?);
+        Ok(programs.finish())
+    }
+
     /// The rows the two DiTs state: their stacks, the orchestration around them, and the
     /// conditioner.
     ///
