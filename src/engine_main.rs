@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _, Result};
 use clap::Args;
 
-use crate::engine_plan::EpochPlan;
+use crate::engine_plan::{EpochPlan, PrefillCatalogue};
 use daemon::epoch::BuildConfig;
 use engine::{PolicyProgram, PolicySource, ProgramSource};
 use executor::batch::Submission;
@@ -649,6 +649,10 @@ pub(crate) struct MainProcess {
     /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
     /// worker's row count includes the guidance prefix, which is not a request.
     max_running_requests: u32,
+    /// The catalogue of prefill buckets this rank captures and whether the deployment stated it
+    /// (§4.5): the ceiling a policy's `max_num_batched_tokens` is refused against (§4.4), named
+    /// with the policy's own figure when that refusal is rendered.
+    catalogue: PrefillCatalogue,
     /// Whether this process was launched as the epoch's standby (§2.5): it admits nothing until
     /// the daemon promotes it *and* the epoch reaches its boundary.
     standby: bool,
@@ -866,6 +870,7 @@ impl MainProcess {
             admission_owed: false,
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
+            catalogue: plan.prefill_catalogue(),
             standby: launch.standby,
             promoted: false,
             parked: None,
@@ -2367,9 +2372,15 @@ impl MainProcess {
                         return Ok(());
                     }
                     Some(StageFailure::Failed(reason)) => {
+                        let stated = precopy
+                            .policy
+                            .arguments
+                            .get(TOKEN_LIMIT)
+                            .map(|value| value.to_string());
+                        let error = limit_refusal(&reason, stated.as_deref(), self.catalogue);
                         return self.abandon_precopy(
                             generation,
-                            UpdateFailure::Policy { error: reason },
+                            UpdateFailure::Policy { error },
                             precopy.reply,
                         );
                     }
@@ -4886,6 +4897,64 @@ impl HostAction for Install {
     }
 }
 
+/// The argument a policy's step is bounded by: the figure §4.4 checks against this rank's
+/// catalogue of prefill buckets.
+const TOKEN_LIMIT: &str = "max_num_batched_tokens";
+
+/// The sentence a policy's token-limit refusal needs beside it (§4.4).
+///
+/// The mechanism's own words are `max_num_batched_tokens is 8192, above the build config's 512`,
+/// and every figure in them is right and none of them is actionable: `512` is this rank's
+/// catalogue of captured prefill buckets rather than a name, and `8192` is a figure no one in the
+/// deployment chose when the policy's program names none. The refusal itself is the mechanism's
+/// and is not changed here - what is added is where each figure came from, and the two changes
+/// that would satisfy it.
+///
+/// A message that is not this refusal is answered unchanged, so every other policy failure reads
+/// exactly as the mechanism wrote it.
+fn limit_refusal(error: &str, stated: Option<&str>, catalogue: PrefillCatalogue) -> String {
+    if !error.contains(TOKEN_LIMIT) || !error.contains("above the build config's") {
+        return error.to_owned();
+    }
+    // The policy's own figure: the mechanism renders `{name} is {limit}, above …`, and that figure
+    // is what a deployment would have to raise the catalogue to for the policy to fit.
+    let declared = error
+        .split(&format!("{TOKEN_LIMIT} is "))
+        .nth(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|digits| !digits.is_empty());
+    let origin = if catalogue.stated {
+        "the deployment's cuda_graph.prefill_token_sizes"
+    } else {
+        "the build's default catalogue, which this deployment's launch file does not state"
+    };
+    // Whose figure the policy's is: a program that names no such argument states none, and the
+    // policy then applies its own default - the number nobody in this deployment chose.
+    let source_of_policy = match stated {
+        Some(value) => format!("the deployment states {TOKEN_LIMIT} = {value}"),
+        None => {
+            format!("the deployment states no {TOKEN_LIMIT}, so this is the policy's own default")
+        }
+    };
+    let bound = catalogue.bound;
+    let ways = match &declared {
+        Some(figure) => format!(
+            "state {TOKEN_LIMIT} at or below {bound}, or capture prefill buckets up to {figure}"
+        ),
+        None => {
+            format!("state {TOKEN_LIMIT} at or below {bound}, or capture wider prefill buckets")
+        }
+    };
+    format!(
+        "{error}. This rank captures prefill buckets up to {bound} token(s), from {origin}; \
+         {source_of_policy}. Either {ways}."
+    )
+}
+
 /// The precopy of one generation, advanced between serve passes (§7.3 step 2).
 struct Precopy {
     generation: u64,
@@ -5410,6 +5479,87 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The refusal a deployment reader acts on names both figures, where each came from, and the
+    /// two changes that would satisfy it - and keeps the mechanism's own words in front of them.
+    #[test]
+    fn a_token_limit_refusal_names_the_catalogue_and_where_the_policys_figure_came_from() {
+        let catalogue = PrefillCatalogue {
+            bound: 512,
+            stated: true,
+        };
+        let mechanism = "max_num_batched_tokens is 8192, above the build config's 512";
+
+        let refusal = limit_refusal(mechanism, None, catalogue);
+
+        assert!(
+            refusal.starts_with(mechanism),
+            "the mechanism's own refusal was not kept: {refusal}"
+        );
+        assert!(refusal.contains("up to 512 token(s)"), "{refusal}");
+        assert!(
+            refusal.contains("the deployment's cuda_graph.prefill_token_sizes"),
+            "the catalogue's origin is not named: {refusal}"
+        );
+        assert!(
+            refusal.contains("the deployment states no max_num_batched_tokens"),
+            "the policy's figure is not attributed to the policy: {refusal}"
+        );
+        assert!(
+            refusal.contains("state max_num_batched_tokens at or below 512"),
+            "the first way out is missing: {refusal}"
+        );
+        assert!(
+            refusal.contains("capture prefill buckets up to 8192"),
+            "the second way out is missing: {refusal}"
+        );
+    }
+
+    /// A deployment that states the token bound is named as the one that chose it, and a catalogue
+    /// the launch file does not state says so rather than reading as the deployment's own figure.
+    #[test]
+    fn a_token_limit_the_deployment_stated_is_attributed_to_the_deployment() {
+        let catalogue = PrefillCatalogue {
+            bound: 512,
+            stated: false,
+        };
+
+        let refusal = limit_refusal(
+            "max_num_batched_tokens is 4096, above the build config's 512",
+            Some("4096"),
+            catalogue,
+        );
+
+        assert!(
+            refusal.contains("the deployment states max_num_batched_tokens = 4096"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("the build's default catalogue"),
+            "an unstated catalogue reads as stated: {refusal}"
+        );
+    }
+
+    /// Every other policy failure is the mechanism's sentence and nothing else: a rendering that
+    /// guessed at a message it does not know would put a wrong cause in a log.
+    #[test]
+    fn a_policy_failure_that_is_not_a_token_limit_is_answered_unchanged() {
+        let catalogue = PrefillCatalogue {
+            bound: 512,
+            stated: true,
+        };
+        for mechanism in [
+            "max_batch is 512, above the build config's 16",
+            "the policy's trial refused every decision",
+            "timeout is zero; a resident request would be starved from the first step",
+        ] {
+            assert_eq!(
+                limit_refusal(mechanism, None, catalogue),
+                mechanism,
+                "a message that is not the token refusal was rewritten"
+            );
+        }
+    }
+
     /// A named program chooses its operator's implementation and never states the operator set:
     /// the generation's programs are the store's listing with the named ones overlaid by operator.
     #[test]
