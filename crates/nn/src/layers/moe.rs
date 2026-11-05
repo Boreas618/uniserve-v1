@@ -108,7 +108,7 @@ const MMA_TILE: (u32, u32) = (128, 128);
 /// The cluster shape the grouped products' packages are compiled for.
 const MMA_CLUSTER: (u32, u32) = (1, 1);
 
-/// Rows per permutation tile: the row extent of [`MMA_TILE`], which is what a sort's permutation
+/// Rows per permutation tile: the row extent of `MMA_TILE`, which is what a sort's permutation
 /// buffer is padded to.
 pub const TILE_ROWS: u32 = MMA_TILE.0;
 

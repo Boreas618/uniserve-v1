@@ -73,6 +73,61 @@ Recorded here rather than run because this host has the text encoder's index and
 the load's name check passes (see above) and the first payload read stops.
 COMMANDS
 sed 's/^/   /' "$run/stage1-commands.txt" | head -3
+# 2b. Stage 2: the denoiser's own blocks. The probe catalogue is read from the harness that draws
+#     the reference, so the list and the probes cannot drift; the host-only probes are attempted
+#     when a case is given, and whatever stops them is named rather than assumed away. The device
+#     half needs the run host and is printed as stage 1's is.
+echo
+echo "== stage 2: the denoiser's probes"
+.venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --list \
+    > "$run/denoiser-probes.txt" 2>&1 || true
+sed 's/^/   /' "$run/denoiser-probes.txt" | head -7
+
+# A probe's name is the reference's; `case.json` is the request's own statement, so the script
+# takes it rather than inventing one - a case this script made up would compare against a request
+# nobody serves. `artifacts/diagnosis/denoiser-rows/case.json` is a stated example.
+case_file=${H3_DIAGNOSIS_CASE:-}
+if [ -n "$case_file" ] && [ -f "$case_file" ]; then
+    for probe in noise rows; do
+        .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint "$root" \
+            --case "$case_file" --probe "$probe" --out "$run/ref-$probe" \
+            > "$run/ref-$probe.log" 2>&1 || true
+        if [ -d "$run/ref-$probe" ] && [ -n "$(ls -A "$run/ref-$probe" 2>/dev/null)" ]; then
+            echo "   ${probe}: the reference's dump is $run/ref-$probe"
+        else
+            # A probe that cannot run must say what it was missing; an empty directory reads as a
+            # probe that ran and found nothing.
+            missing=$(grep -m1 -E "Error|OSError|ModuleNotFound|No module" "$run/ref-$probe.log" 2>/dev/null \
+                | sed 's/^ *//')
+            echo "   ${probe}: not drawn here - ${missing:-no reason printed in $run/ref-$probe.log}"
+        fi
+    done
+else
+    echo "   the host-only probes did not run: H3_DIAGNOSIS_CASE names no case file"
+    echo "   (a stated example is artifacts/diagnosis/denoiser-rows/case.json)"
+fi
+
+cat >"$run/stage2-commands.txt" <<COMMANDS
+Stage 2 (the denoiser) numeric half: the reference's probes, then ours against them.
+
+  # the reference's host-only probes, on the host that can import its stack
+  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
+      --case <case.json> --probe noise --out $run/ref-noise
+  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
+      --case <case.json> --probe rows --out $run/ref-rows
+
+  # ours against each of them, as a per-block report
+  cargo run -p minimax-h3 --example compare_blocks -- --dumps $run/ref-noise \\
+      --candidate <candidate dump dir> --out $run/report-noise.md
+
+  # and the served forward's own trajectory, which a runner dumps under \$UNISERVE_DIAG_DIR
+  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --probe trajectory \\
+      --checkpoint $root --case <case.json> --out $run/ref-trajectory
+  python3 tools/diagnosis/compare.py --ref $run/ref-trajectory --got <diag dir> \\
+      --out $run/report-denoiser.json
+COMMANDS
+sed 's/^/   /' "$run/stage2-commands.txt" | head -3
+
 
 # 3. The reading. A block is explained by its layer when the difference is at that layer's rounding:
 #    float32 evaluation order on a value near 1 is ~1.2e-07 absolute, and a table of indices is
@@ -101,8 +156,14 @@ echo "== the first block whose error its layer does not explain"
         echo "   stage 3 produced no comparison; the artifact is $run/schedule-compare.txt"
     fi
     echo "   stage 1 has no numbers on this host: see $run/stage1-commands.txt"
+    if [ -f "$run/report-noise.md" ]; then
+        echo "   stage 2 has a comparison: $run/report-noise.md"
+    else
+        echo "   stage 2 has no numbers on this host: see $run/stage2-commands.txt"
+    fi
 } | tee "$run/reading.txt"
 
 echo
-echo "artifacts under $run: the schedule dump, its comparison, the stage-1 commands and the reading."
+echo "artifacts under $run: the schedule dump, its comparison, the probe catalogue, the stage-1"
+echo "and stage-2 commands, and the reading."
 echo "This is a diagnosis (design 10): nothing above gates the branch."

@@ -13,13 +13,13 @@
 //! [`super::max_permuted_rows`] so they are invariant across a captured graph's replays.
 //!
 //! A route whose expert lies outside this rank's `[local_offset, local_offset + local_experts)`
-//! window is left out: the sort writes `-1` into its entry of [`Args::expanded_to_permuted`] as it
+//! window is left out: the sort writes `-1` into its entry of [`SortArgs::expanded_to_permuted`] as it
 //! counts, so a caller never pre-fills that map and no launch can leave an entry stale, and the
 //! expert-parallel exchange carries the route to the rank that owns it.
 //!
 //! Two paddings are one word and they are two subjects. A **token** row the batch does not fill is a
 //! row of the batch's extent that has no route; a **permuted** row past an expert's last live one is
-//! padding inside a tile group, which [`Args::total_padded_tokens`] counts. Neither count answers the
+//! padding inside a tile group, which [`SortArgs::total_padded_tokens`] counts. Neither count answers the
 //! other's question, and a page that reads one as the other is the shape of defect this crate keeps
 //! removing.
 

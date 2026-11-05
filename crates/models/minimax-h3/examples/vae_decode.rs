@@ -1264,8 +1264,22 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
     //    tile because the scene reads every tile's pixels in one call, the conditioning buffers the stint
     //    produces, and the latent this stage reads back. Summing the tile arena over the grid instead
     //    states the tile count times the run - 65,360 MiB against 6,150 MiB at 17 frames of 768x768.
-    let mut arena_plan =
-        minimax_h3::encoding::video_encoder_run_arena(&config.video_vae, &tile_extents)?;
+    // The raster plan is the encoder's set **and the stitcher's ring and hand-off**, which
+    // `Scene::encode` takes after `VideoEncoder::reserve` returns: a run sized from the encoder's own
+    // set alone stops at the first ring block - 737,280 B past the plan for a still and 1,474,560 B
+    // for a clip at 768p 16:9. The grid's tile columns are what the ring is a block wide per column of.
+    let ring_columns = {
+        let mut starts: Vec<u32> = plan.tiles.iter().map(|tile| tile.columns.0).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts.len()
+    };
+    let mut arena_plan = minimax_h3::encoding::video_raster_arena(
+        &config.video_vae,
+        &tile_extents,
+        ring_columns,
+        latent_frames,
+    )?;
     arena_plan.extend(minimax_h3::encoding::conditioning_arena(
         &config.video_vae,
         frames,

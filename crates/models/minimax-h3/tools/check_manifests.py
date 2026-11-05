@@ -61,7 +61,6 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
     hidden = config["hidden_size"]
     ffn = config["ffn_dim"]
     time_hidden = config["time_embed_hidden_dim"]
-    patches = config["in_channels"] * 4
     # The timestep groups a step reads: the generated pair (§`t2va`), and the two conditioned
     # levels on top of it (`fl2va`, `ref2va`).
     groups = [2, 4]
@@ -145,18 +144,20 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
     for field in ("gate_stride", "value_stride"):
         add(("act_and_mul/triton", field, str(2 * ffn), "transformer.rs: the packed gate and value"))
     add(("silu/triton", "columns", str(time_hidden), "modulation.rs: the cache's activation"))
-    # The one crossing inside the cache: the timestep activation is narrowed into the modulation
-    # projections' type, so its width is the timestep embedding's output and not the hidden width.
-    add(
-        (
-            "scaled_add/triton",
-            "columns",
-            str(config["time_embed_dim"]),
-            "modulation.rs: the timestep activation narrowed into the modulation type",
-        )
-    )
-    add(("scaled_add/triton", "columns", str(hidden), "transformer.rs: a widened hidden row"))
-    add(("scaled_add/triton", "columns", str(patches), "transformer.rs: a widened patch row"))
+    # `scaled_add` keys `target`, `source` and `block` - **not a width**. The row width is the
+    # operand's: the kernel takes the extent as an argument and derives the width from the target's
+    # own shape, so keying it would state rows for the clips a walk happened to name and leave every
+    # other length with no kernel (`ops/src/residual.rs:654-659`). The three crossings that used to
+    # be listed here - the timestep activation narrowed into the modulation type, a widened hidden
+    # row and a widened patch row - are launch extents, and their keys are the two element types.
+    for target, source, why in (
+        ("bf16", "f32", "transformer.rs: a widened source into a narrowed hidden row"),
+        ("f32", "bf16", "transformer.rs: a narrowed source widened into an f32 row"),
+        ("bf16", "bf16", "modulation.rs: the timestep activation in the modulation type"),
+    ):
+        add(("scaled_add/triton", "target", target, why))
+        add(("scaled_add/triton", "source", source, why))
+    add(("scaled_add/triton", "block", "1024", "residual.rs: the elements one program walks"))
     add(("scaled_residual/triton", "columns", "1", "solver.rs: a scalar step coefficient"))
     return rows
 
