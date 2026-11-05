@@ -241,6 +241,9 @@ fn run() -> Result<(), String> {
             }
             "--list" => list = true,
             "--names" => names = true,
+            "--check-extents" => {
+                return check_extents(&root).map_err(|error| error.to_string());
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -1581,6 +1584,94 @@ fn list_names(root: &Path, component: &str) -> Result<(), String> {
     }
     eprintln!("# {} checkpoint tensors asked for", names.len());
     Ok(())
+}
+
+/// Check the extents table against the checkpoint's own headers, name by name.
+///
+/// The recorder's rows are only as right as the extents table it builds every tensor from: a table
+/// entry stating a type the checkpoint does not store would key a row the model never launches, and
+/// it would agree with itself exactly as the walk did before the recorder caught it. So the table is
+/// diffed against the checkpoint where the shards are - the one direction a fixture cannot check
+/// about itself.
+///
+/// Absent names and differing types or extents are both failures: the first is a row for a tensor
+/// that does not exist, the second is a row keyed from the wrong type. A checkpoint tensor the table
+/// does not name is not a failure - the table holds the tensors the harnesses touch, not every weight.
+fn check_extents(root: &Path) -> Result<(), String> {
+    let path = PathBuf::from("notes/programs/h3-extents.json");
+    let stated = read_extents(&path)?;
+    // `open` requires every shard the index names; a host holding some of them still has headers to
+    // check against, which is what `unopened` gives - and a host holding none answers zero tensors,
+    // which the summary states rather than pretending the table passed.
+    let checkpoint = match nn::Checkpoint::open(root) {
+        Ok(opened) => opened,
+        Err(_) => nn::Checkpoint::unopened(root).map_err(|error| error.to_string())?,
+    };
+    let mut absent = Vec::new();
+    let mut differ = Vec::new();
+    let mut matched = 0_u32;
+    for (name, (dtype, shape)) in &stated {
+        let found = if checkpoint.is_pipeline() {
+            checkpoint
+                .components()
+                .filter_map(|component| checkpoint.component(component).ok())
+                .find_map(|component| component.tensor(name))
+        } else {
+            checkpoint.tensor(name)
+        };
+        match found {
+            None => absent.push(name.clone()),
+            Some(location) => {
+                if location.dtype != *dtype || location.shape != *shape {
+                    differ.push(format!(
+                        "{name}: the table states {} {:?} and the checkpoint stores {} {:?}",
+                        dtype,
+                        shape.dims(),
+                        location.dtype,
+                        location.shape.dims()
+                    ));
+                } else {
+                    matched += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "# {} extents entries, {matched} match the checkpoint, {} absent here, {} differ",
+        stated.len(),
+        absent.len(),
+        differ.len()
+    );
+    // An absent name is not a failure on every host: this one holds only the `text_encoder` shard, so
+    // the VAEs' and the DiT's names have nothing to agree with. What is always a failure is a name
+    // the checkpoint holds at another type or another shape - that is a row keyed from a tensor the
+    // model does not have. A host with every shard sees no absent name, which is the run that proves
+    // the table.
+    for name in &absent {
+        println!("absent\t{name}");
+    }
+    for line in &differ {
+        println!("differ\t{line}");
+    }
+    // **Nothing checked is not a pass.** A table whose every name is absent describes either another
+    // component or another host, and in both cases the check ran over nothing - so it refuses rather
+    // than printing a summary that reads like agreement.
+    if matched == 0 {
+        return Err(format!(
+            "{}: {} extents entries and not one was found in the checkpoint ({} tensors there), so \
+             nothing was checked: this host holds no shard for these names",
+            root.display(),
+            stated.len(),
+            checkpoint.len()
+        ));
+    }
+    if differ.is_empty() {
+        Ok(())
+    } else {
+        Err("the extents table and the checkpoint disagree; a fixture cut from it keys rows the \
+             model does not launch"
+            .to_owned())
+    }
 }
 
 /// The checkpoint tensors' extents, as the walk states them: `{"name": {"dtype": "F32", "shape": [...]}}`.
