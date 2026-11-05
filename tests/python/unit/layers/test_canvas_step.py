@@ -1,15 +1,21 @@
 """The portable canvas sampler step follows the reference denoising loop.
 
-The reference is the pinned Transformers ``DiffusionGemmaGenerationMixin``:
-its temperature processor, entropy-bound acceptance, stable-and-confident
-stop, self-conditioning embedding and canvas finalization. Its multinomial
-and re-noise draws come from torch's generator; the step draws them from
-the Philox contract of ``uniserve.diffusion.tokens`` instead, so the test
-checks those draws against that contract.
+The sampler is a general block-diffusion mechanism of this repository, and the
+loop it implements is checked here against the pinned Transformers reference:
+``DiffusionGemmaGenerationMixin``'s temperature processor, entropy-bound
+acceptance, stable-and-confident stop, self-conditioning embedding and canvas
+finalization. The mixin's name is the upstream reference's, not this
+repository's: no model family here is named by it. Its multinomial and re-noise
+draws come from torch's generator; the step draws them from the Philox contract
+of ``uniserve.diffusion.tokens`` instead, so the test checks those draws against
+that contract.
 """
 
 import pytest
 import torch
+
+# The pinned upstream reference: Transformers' name for the block-diffusion
+# sampler this repository's canvas mechanism is checked against.
 from transformers.models.diffusion_gemma import (
     generation_diffusion_gemma as reference,
 )
