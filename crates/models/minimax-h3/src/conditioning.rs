@@ -276,7 +276,14 @@ impl TokenRefiner {
     /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
     /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
     /// gated activation, and the residual each block folds its two updates through.
-    pub fn programs(config: &TransformerConfig, dtype: nn::DType) -> Result<Vec<(String, String)>> {
+    /// `dtype` is the type the blocks' output has - the stack's - and `boundary` is the type the
+    /// refiner's stream carries. The two differ on a checkpoint whose boundary tensors are F32 while
+    /// the stack is BF16, and every row below follows one or the other for its own reason.
+    pub fn programs(
+        config: &TransformerConfig,
+        dtype: nn::DType,
+        boundary: nn::DType,
+    ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::activation::ActAndMul as ActAndMulOp;
         use ops::attention::dense::DenseAttention;
@@ -288,31 +295,40 @@ impl TokenRefiner {
         let inner = config.num_attention_heads * config.head_dim;
         let head = config.head_dim;
         let heads = config.num_attention_heads;
+        // The refiner's stream is the boundary's type: it is handed the prompt's features where
+        // they are widened into the network. The identity scale is the one exception - it is
+        // applied at the type the blocks' output has, which is the stack's.
+        let stream = boundary;
         let mut programs = Programs::default();
 
         // Every projection: the input one, the four of each block's attention and its feed-forward
         // pair. None carries a bias.
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
-            dtype,
-            dtype,
+            stream,
+            stream,
             WeightOrder::NxK,
             false,
-            dtype,
+            stream,
         ));
 
         // Two normalization widths: the hidden state's and one head's, which the query and the key
         // normalize over.
         for columns in [hidden, head] {
-            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, dtype));
+            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, stream));
         }
 
         // The identity residual each block folds both of its updates through.
         programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            dtype,
+            stream,
             u64::from(hidden),
             false,
         )?);
+        // The refiner's identity scale: one published FP32 value applied to the whole stream, so the
+        // row is one column wide and keyed at the stream's own type - the target's, not the scale's.
+        // A conditioned request is the only one that reaches the refiner, which is why this row
+        // appears in no unconditioned recording.
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, 1, false)?);
 
         // The attention over the request's document, and the stepwise gated activation.
         let attention = Attention::dense(
@@ -326,17 +342,24 @@ impl TokenRefiner {
         )
         .map_err(Error::from)?;
         programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(dtype, dtype, dtype, hidden, true),
+            &attention.dense_descriptor(stream, stream, stream, hidden, true),
         );
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-            dtype,
-            u64::from(config.intermediate_size),
-            Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
-            u64::from(inner),
-            true,
-        )?);
+        // **Both row strides are twice the width**: the refiner reads its two halves through the
+        // same packed projection the transformer does, so each half's row stride is `2 *
+        // intermediate` - the launch record states `gate_stride_28672` where this stated 14336.
+        // And both width classes are reachable, as at the transformer's packed site.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
+        for elements in [u64::from(inner), 1] {
+            programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+                stream,
+                u64::from(config.intermediate_size),
+                Activation::Silu,
+                packed_stride,
+                packed_stride,
+                elements,
+                true,
+            )?);
+        }
 
         Ok(programs.finish())
     }

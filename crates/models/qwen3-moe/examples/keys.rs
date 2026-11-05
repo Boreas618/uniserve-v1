@@ -107,12 +107,17 @@ fn main() -> ExitCode {
             },
             "--quantization" => match arguments.next().as_deref() {
                 Some("bf16") => deployment.quantization = Some(Representation::Dense),
-                Some("nvfp4") => deployment.quantization = Some(Representation::Nvfp4 {
-                    excluded: Vec::new(),
-                    also_excluded: Vec::new(),
-                }),
+                Some("nvfp4") => {
+                    deployment.quantization = Some(Representation::Nvfp4 {
+                        excluded: Vec::new(),
+                        also_excluded: Vec::new(),
+                        packed: None,
+                    })
+                }
                 other => {
-                    return usage(&format!("--quantization takes bf16 or nvfp4, not {other:?}"));
+                    return usage(&format!(
+                        "--quantization takes bf16 or nvfp4, not {other:?}"
+                    ));
                 }
             },
             "--page" => match number(arguments.next(), "--page") {
@@ -166,19 +171,26 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
     // The checkpoint's own declaration says which representation its weights are in, and that is
     // what decides whether the encoded programs are named at all — read from metadata, like the
     // configuration.
-    let declared = Representation::read(root)
-        .map_err(|error| format!("{}: {error}", root.display()))?;
+    let declared =
+        Representation::read(root).map_err(|error| format!("{}: {error}", root.display()))?;
     // The rule that keeps a stated representation honest: a checkpoint that declares one cannot be
     // overridden — its own metadata is the ground truth and a flag that disagrees is a refusal —
     // while a checkpoint that declares nothing leaves the flag as the only statement there is, and
     // the header says which of the two it was.
     let (packed, source) = match (&declared, &deployment.quantization) {
-        (Representation::Dense, Some(stated)) => (stated.is_encoded(), "flag (the checkpoint declares nothing)"),
+        (Representation::Dense, Some(stated)) => (
+            stated.is_encoded(),
+            "flag (the checkpoint declares nothing)",
+        ),
         (declared, Some(stated)) if declared.is_encoded() != stated.is_encoded() => {
             return Err(format!(
                 "the checkpoint declares {} and --quantization says {}: its own metadata is the ground \
                  truth, and a flag that disagrees with it is not a deployment",
-                if declared.is_encoded() { "NVFP4" } else { "no quantization" },
+                if declared.is_encoded() {
+                    "NVFP4"
+                } else {
+                    "no quantization"
+                },
                 if stated.is_encoded() { "NVFP4" } else { "none" },
             ));
         }

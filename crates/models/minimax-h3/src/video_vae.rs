@@ -1467,7 +1467,13 @@ impl VideoDecoder {
                 offsets,
                 u32::try_from(rows)
                     .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?,
-                attended,
+                // The attention writes one row per head, so its output is the same three axes its
+                // inputs are: the scratch buffer is a flat `[rows, width]` block and the heads are
+                // the middle axis of the same bytes. Passing the flat view was `dense_attention:
+                // expected 3 axes, found 2` at the first device run - the only call site of the six
+                // in this model that did not reshape its output, and the shapes of the other five
+                // were already `[rows, heads, head]` at the arena.
+                per_head(attended),
             )?;
             layer.output.forward(f, attended, update)?;
             layer.residual1.forward(f, hidden, update)?;
@@ -1525,6 +1531,60 @@ impl Decoder for VideoDecoder {
                 owner: "VideoDecoder",
                 problem: error.to_string(),
             })
+    }
+
+    /// The checkpoint's own element type, read at load rather than chosen (design 1).
+    fn element_type(&self) -> nn::DType {
+        self.dtype
+    }
+
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// The argument is the **decoded raster** - frames, rows and columns of the media this block
+    /// writes - and the return is the **latent** layout its tables and arena are keyed by. The
+    /// ratios between them are this deployment's own, read at construction from the checkpoint's
+    /// config (`temporal_compression` frames per latent frame, `spatial_compression()` pixels per
+    /// latent cell), which is why the map is the decoder's: a runtime that divided by either would
+    /// be holding this checkpoint's compression in its own code.
+    ///
+    /// **The decoder is built for one canvas** (`VideoDecoder::load` takes it), because its register
+    /// rows, its voxel-row table and its sequence offsets are the canvas's constants rather than a
+    /// request's. So this states that canvas's layout and refuses any other clip by both extents:
+    /// a runner that handed it another canvas would capture a graph whose constants belong to a
+    /// different raster.
+    fn layout_of(&self, clip: nn::capability::Clip) -> nn::Result<nn::capability::Layout> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let (width, height) = self.canvas.pixels(&self.config);
+        let frames = self.canvas.frames_out(&self.config);
+        if (clip.height, clip.width) != (height, width) {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes a {}x{height} raster and the call states a {}x{} one",
+                width, clip.height, clip.width,
+            )));
+        }
+        // The raster includes the padding frames the splice drops, so the clip is compared against
+        // the canvas's own native output rather than against a muxed frame count.
+        if clip.frames != frames {
+            return Err(refuse(format!(
+                "this decoder's canvas decodes {frames} frame(s) and the call states {}",
+                clip.frames
+            )));
+        }
+        Ok(nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: self.config.latent_channels,
+                frames: self.canvas.frames,
+                height: self.canvas.height,
+                width: self.canvas.width,
+            },
+            audio: None,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        })
     }
 
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
@@ -2256,11 +2316,13 @@ pub(crate) mod tests {
         // the blend reads it, because a blend addresses its sources flat and a neighbour in a raster
         // wider than the tile is not one contiguous block. One copy serves every seam of every canvas.
         assert_eq!(count("copy_block"), 1);
+        // A copy's key names its element types as `source_*_out_*`, not `dtype_*`: the two operands
+        // are the only thing that selects the program, and this decoder states them as one pair.
         assert!(
             programs
                 .iter()
-                .any(|(name, key)| name == "copy_block" && key.contains("source_f16_out_f16")),
-            "the copy states the deployment's element type twice, as its source and its out"
+                .any(|(name, key)| name == "copy_block" && key.contains("source_bf16_out_bf16")),
+            "the copy states the deployment's element type twice, as its source and its out: {programs:?}"
         );
 
         // The stitch compiles one blend per seam width on each of the two axes.
@@ -2307,8 +2369,11 @@ pub(crate) mod tests {
             // FP32 whatever the decode is. Everything else in the row is the deployment's type.
             // The row's own element type is the deployment's. An operand that stays FP32 - the
             // rotation's positions, the attention's kv - is a layer's declaration, not the row's.
+            // A row names its element type in one of two spellings: `dtype_*` where the program has
+            // one operand type, and `source_*_out_*` where it has a pair (the stitch's copy). Both are
+            // a statement of the deployment's type, so the check is that f16 appears, not where.
             assert!(
-                converted.1.contains("dtype_f16"),
+                converted.1.contains("f16"),
                 "{} did not follow the deployment: {} at f16",
                 converted.0,
                 converted.1
