@@ -336,7 +336,6 @@ driver_table! {
             *const LaunchConfig, Handle, *mut *mut c_void, *mut *mut c_void,
         );
         func_set_attribute = "cuFuncSetAttribute": fn(Handle, i32, i32);
-        func_get_name = "cuFuncGetName_v2": fn(*mut *const c_char, Handle);
 
         stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, i32);
         stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
@@ -372,6 +371,10 @@ driver_table! {
             *mut u64, *mut u64, *mut usize, usize, *mut MemcpyAttributes, *mut usize, usize, Handle,
         );
         memcpy_3d_batch_async = "cuMemcpy3DBatchAsync_v2": fn(usize, *mut Memcpy3DBatchOp, u64, Handle);
+        // The name of a captured node's kernel. It is a diagnostic, so a driver that does not
+        // export it degrades the dump rather than failing the device: the entry is lazy, and a
+        // `name()` that finds it absent answers an empty string.
+        func_get_name = "cuFuncGetName": fn(*mut *const c_char, Handle);
     }
 }
 
