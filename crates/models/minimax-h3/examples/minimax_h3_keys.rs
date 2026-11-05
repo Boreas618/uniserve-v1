@@ -319,6 +319,28 @@ fn main() {
         },
     );
 
+    // ---- The video decoder and the postprocessor: derived, like the encoder, and for the same
+    // reason.
+    //
+    // Neither was called here, so the decoder's own rows were **launched and never listed** - twelve
+    // `scaled_add` widths at the decoder's stack, which a walk printed at every canvas and a check
+    // read as a disagreement about the canvas because the same shape survived a change of one. The
+    // decoder runs at the export's own element type, so both of the VAE's are stated
+    // (`VideoDecoder::programs` takes the type; the postprocessor takes the rasters too, because its
+    // `scaled_add` covers a whole frame).
+    //
+    // A component the generator does not call is a component whose rows are missing from every store
+    // built from this list, and nothing in the list can say so: the file reads complete.
+    for dtype in VAES {
+        match minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, dtype) {
+            Ok(rows) => lines.extend(rows),
+            Err(error) => panic!("the video decoder states no programs at {dtype:?}: {error}"),
+        }
+        lines.extend(minimax_h3::output::VideoPostprocessor::programs(
+            dtype, &rasters,
+        ));
+    }
+
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
