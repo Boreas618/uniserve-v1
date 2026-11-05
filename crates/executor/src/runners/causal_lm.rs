@@ -2006,8 +2006,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if let Some((page, line)) = self.pending_dump.take() {
             let bytes = self.dump_page_bytes(page);
             let prefill = self.last_prefill.clone().unwrap_or_else(|| "none".to_owned());
+            let arguments = self.dump_kernel_arguments(bucket);
             tracing::info!(
                 %line,
+                %arguments,
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
@@ -2017,7 +2019,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
-                self.last_prefill = Some(format!("{line} page={page} key_page={bytes}"));
+                // The prefill's own arguments travel beside the decode's, so one run compares the
+                // two ends of one request's cache without a second launch.
+                self.last_prefill = Some(format!(
+                    "{line} page={page} key_page={bytes} arguments={arguments}"
+                ));
             }
         }
         let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
@@ -2313,6 +2319,98 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 }
             }
             None => out.push_str(" init=no-flags"),
+        }
+        out
+    }
+
+    /// The cache description the attention kernel is handed, read from the device (2.4, 4.5).
+    ///
+    /// The batch's own line states what its rows *mean*; this states what the kernel is *given*,
+    /// and the two can disagree. The block table is read back from the column the launch points at
+    /// rather than from the batch's `unit_ids`, because a row's units are the engine's statement
+    /// and the column is what a kernel reads. The plane views are the ones `KvProvider::planes`
+    /// hands `nn`, so the shape and strides printed here are the numbers the attention `Call`
+    /// carries (`kv_stride_page`, `kv_stride_tokens`, `kv_stride_heads` are strides 0, 1 and 2).
+    ///
+    /// It reads memory, so it runs only under the dump and only on the device thread, and every
+    /// failure becomes text: a diagnosis never fails the batch it describes.
+    fn dump_kernel_arguments(&self, bucket: Bucket) -> String {
+        let rows = bucket.rows as usize;
+        let spelled = |view: &ops::TensorView| {
+            let mut shape = String::from("[");
+            for axis in 0..view.shape.rank() {
+                if axis > 0 {
+                    shape.push(',');
+                }
+                shape.push_str(&view.shape.dim(axis).to_string());
+            }
+            shape.push(']');
+            let mut strides = String::from("[");
+            for axis in 0..view.strides.rank() {
+                if axis > 0 {
+                    strides.push(',');
+                }
+                strides.push_str(&view.strides.get(axis).to_string());
+            }
+            strides.push(']');
+            format!("{:#x} {:?} shape={shape} strides={strides}", view.ptr.address(), view.dtype)
+        };
+        if self.kv.groups() == 0 {
+            return "groups=0".to_owned();
+        }
+        let slots = self.staging.slots(rows).to_vec();
+        let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
+        let live = seq_lens.iter().filter(|&&length| length > 0).count();
+        let mut out = format!(
+            "rows={rows} live_rows={live} seq_lens={seq_lens:?} slots={slots:?} page_size={} \
+             max_kv_len={}",
+            self.kv.page_size(),
+            self.geometry.max_kv_len,
+        );
+        // The page table's row, from the column the kernel addresses.
+        match self.kv.block_table(0, &slots, &self.stream) {
+            Ok(table) => {
+                let mut entries = [0_i32; 8];
+                let bytes = entries.len() * std::mem::size_of::<i32>();
+                // SAFETY: the source is this view's first eight `i32`, whose extent the view
+                // states, and the destination is this function's own buffer of that length.
+                let copied = unsafe {
+                    platform::memcpy_async(
+                        entries.as_mut_ptr() as u64,
+                        table.ptr.address(),
+                        bytes,
+                        &self.stream,
+                    )
+                };
+                let first = if copied.is_ok() && self.stream.synchronize().is_ok() {
+                    format!("{entries:?}")
+                } else {
+                    "read-failed".to_owned()
+                };
+                out.push_str(&format!(" table={} first8={first}", spelled(&table)));
+            }
+            Err(error) => out.push_str(&format!(" table=refused({error})")),
+        }
+        // The planes the kernel reads K and V out of, for the group's first layer: the group's
+        // layers share the pool, so one layer's views describe every layer's addressing.
+        match self.kv.planes(0) {
+            Ok(layers) => match layers.first() {
+                Some(layer) => {
+                    out.push_str(&format!(" key={} value={}", spelled(&layer.key), spelled(&layer.value)));
+                    let key = &layer.key;
+                    if key.shape.rank() == 4 {
+                        out.push_str(&format!(
+                            " num_pages={} pages_per_row={} kv_heads={} head_dim={}",
+                            key.shape.dim(0),
+                            key.shape.dim(1),
+                            key.shape.dim(2),
+                            key.shape.dim(3),
+                        ));
+                    }
+                }
+                None => out.push_str(" planes=none"),
+            },
+            Err(error) => out.push_str(&format!(" planes=refused({error})")),
         }
         out
     }
