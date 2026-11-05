@@ -373,7 +373,8 @@ fn run() -> Result<(), String> {
     // conditioned stream's offsets are both keyed by it, and the two enumerations are only comparable
     // when they were invoked identically. The rule is called here rather than restated.
     {
-        let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+        let config =
+            minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
         let latents = minimax_h3::packing::audio_latent_frames(request.clip);
         let implied = minimax_h3::audio_vae::track_samples(&config.audio_vae, latents);
         if u64::from(request.track) != implied {
@@ -469,10 +470,7 @@ fn run() -> Result<(), String> {
         if refused_names.is_empty() {
             String::new()
         } else {
-            format!(
-                ": {}",
-                refused_names.join(", ")
-            )
+            format!(": {}", refused_names.join(", "))
         }
     );
 
@@ -544,7 +542,10 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // One row encodes half a track of latent frames and every count downstream accepts it, so the
     // shape is stated here rather than left to the caller's convenience.
     let samples = arena
-        .tensor(DType::F32, Shape::new(&[u64::from(minimax_h3::config::AUDIO_CHANNELS), 1, length]))
+        .tensor(
+            DType::F32,
+            Shape::new(&[u64::from(minimax_h3::config::AUDIO_CHANNELS), 1, length]),
+        )
         .map_err(|error| error.to_string())?;
     let frames = encoder.frames(length).map_err(|error| error.to_string())?;
     let channels = u64::from(config.latent_channels);
@@ -1234,7 +1235,10 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     // the request that reaches the audio condition is a `ref2va` one whose reference is decoded to a
     // latent frame or more - one encoder clip, which is the shortest reference the model serves.
     let piece_frames = 17u32;
-    let piece_latent = network.clip.latent_frames(piece_frames).map_err(|error| error.to_string())?;
+    let piece_latent = network
+        .clip
+        .latent_frames(piece_frames)
+        .map_err(|error| error.to_string())?;
     // The capacity this request needs is the packing's own count for its condition - the reference's
     // visual rows **and its soundtrack's** - so it is asked of the packing rather than restated: a
     // capacity that held only the visual rows refused the load by 80 rows on the first canvas.
@@ -1717,9 +1721,11 @@ fn check_extents(root: &Path) -> Result<(), String> {
     if differ.is_empty() {
         Ok(())
     } else {
-        Err("the extents table and the checkpoint disagree; a fixture cut from it keys rows the \
+        Err(
+            "the extents table and the checkpoint disagree; a fixture cut from it keys rows the \
              model does not launch"
-            .to_owned())
+                .to_owned(),
+        )
     }
 }
 
