@@ -120,15 +120,22 @@ impl Sparse {
             .with_norm()
             .with_rotation(rotated)?
             .with_tile_bound(tile_bound)?;
+        // The fine attention writes the rows the projections produce, so its output type is the
+        // projection's own: the stack's, which is the checkpoint's representation at `auto`. Writing
+        // BF16 here was a constant that agreed with a BF16 deployment and disagreed with every other
+        // one - an FP16 stack would have had its attended rows narrowed to BF16 by a layer that never
+        // asked what the stack was.
+        let query_weight = matrix(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?;
+        let stack = query_weight.dtype();
         let fine = SegmentAttention::new(
             u64::from(tile_rows),
             u64::from(local_heads),
             head,
             u64::from(rows),
-            nn::DType::BF16,
+            stack,
         )?;
         Ok(Self {
-            query: projection(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?,
+            query: Linear::new(query_weight, None, WeightOrder::NxK)?,
             key: projection(loader, &format!("{prefix}.to_k.weight"), inner, hidden)?,
             value: projection(loader, &format!("{prefix}.to_v.weight"), inner, hidden)?,
             gate: projection(
@@ -378,17 +385,28 @@ fn frequencies(
     )?)
 }
 
+/// One projection's weight, before it is wrapped: its element type is the stack's, and a caller
+/// that needs to know what the stack is reads it here.
+fn matrix(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    out_features: u64,
+    in_features: u64,
+) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(
+        name,
+        0,
+        Shape::new(&[out_features, in_features]),
+    ))?)
+}
+
 fn projection(
     loader: &mut WeightLoader<'_>,
     name: &str,
     out_features: u64,
     in_features: u64,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[out_features, in_features]),
-    ))?;
+    let weight = matrix(loader, name, out_features, in_features)?;
     Ok(Linear::new(weight, None, WeightOrder::NxK)?)
 }
 
