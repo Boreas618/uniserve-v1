@@ -58,6 +58,10 @@ pub struct ProgramSlot {
     /// `None` when one program fills every phase of the operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<PhaseKind>,
+    /// The backend, when the operator's packages divide its descriptors between
+    /// them with no phase to tell them apart: each holds a slot of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
 }
 
 impl ProgramSlot {
@@ -66,6 +70,7 @@ impl ProgramSlot {
         Self {
             op: op.into(),
             phase: None,
+            part: None,
         }
     }
 
@@ -74,6 +79,7 @@ impl ProgramSlot {
         Self {
             op: op.into(),
             phase: Some(phase),
+            part: None,
         }
     }
 }
