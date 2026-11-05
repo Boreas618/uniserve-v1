@@ -511,18 +511,41 @@ fn stage_decode(args: &Args) -> Result<()> {
         latent_channels
     );
 
+    // The tile grid, before the arena: the plan and the harness's own latent buffer both count the
+    // tiles' voxels, so the grid is read once and both readings use it.
+    let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
+    let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
     // 5. The arena: `video_arena` is the plan the runner reserves by, and this harness uses it rather
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
-    let plan = video_arena(&config.video_vae, &canvas)?;
+    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
     let mut planned = 0_u64;
     for buffer in &plan {
         planned += buffer.elements * buffer.width()?;
     }
-    // The plan's own number. A stated `--arena-gib` may raise it - a real over-reserve is honest if it
-    // says so - and the line below prints both, so a short plan is visible as a number rather than as
-    // a reservation failure inside the decode.
-    let arena_bytes = planned.max(args.arena_gib << 30);
+    // **The harness is also the runner.** The latents it uploads and the raster it decodes into are,
+    // in service, the request's latent and `DecodedMedia.video` - the caller's buffers, which the
+    // runner allocates and the plan deliberately does not count (`video_arena`'s note). Here they come
+    // out of this region because the harness has one device pointer to give, so they are counted
+    // separately and named: a harness that reserved the plan alone would be short by its own two
+    // buffers, and the failure would read as the plan again.
+    let element_bytes = dtype.bytes().ok_or_else(|| {
+        Failure::message(format!(
+            "the decode is {dtype}, which has no whole-byte element size"
+        ))
+    })?;
+    let (pixel_height, pixel_width) = canvas.pixels(&config.video_vae);
+    let held = element_bytes
+        * (voxels * latent_channels
+            + u64::from(minimax_h3::output::Rgb::CHANNELS)
+                * u64::from(canvas.frames_out(&config.video_vae))
+                * u64::from(pixel_height)
+                * u64::from(pixel_width));
+    // The plan's own number plus what this harness holds. A stated `--arena-gib` may raise it - a real
+    // over-reserve is honest if it says so - and the line below prints all three, so a short
+    // reservation is visible as a number rather than as a failure inside the decode.
+    let reserved = planned + held;
+    let arena_bytes = reserved.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
         platform::PoolKind::Graph,
@@ -535,12 +558,14 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {}, {} KiB held by this harness, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
+        minimax_h3::text_encoder::element_of(dtype),
+        held >> 10,
         arena_bytes >> 20,
-        if arena_bytes > planned {
-            " (the flag raised it; the plan alone is what the decode needs)"
+        if arena_bytes > reserved {
+            " (the flag raised it; the plan and this harness's two buffers are what the decode needs)"
         } else {
             ""
         }
@@ -681,7 +706,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         }
         None => String::new(),
     };
-    let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
+
     let packed = pack_latents(&latent_bytes, &tiles, &canvas, dtype)?;
     println!(
         "latents: {} bytes = {} elements at {dtype}; the rows this stage reads hold {}",
@@ -689,7 +714,6 @@ fn stage_decode(args: &Args) -> Result<()> {
         u64::try_from(latent_bytes.len()).unwrap_or(0) / dtype.bytes().unwrap_or(1),
         packed.len()
     );
-    let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
     let latents = upload(
         &stream,
         &arena,
@@ -740,11 +764,11 @@ fn stage_decode(args: &Args) -> Result<()> {
     // line is the one that says which of the two happened.
     let peak = arena.used();
     println!(
-        "arena used: {} MiB of {} MiB planned{}",
+        "arena used: {} MiB of {} MiB reserved{}",
         peak >> 20,
-        planned >> 20,
-        if peak > planned {
-            " - THE PLAN IS SHORT BY THE DIFFERENCE"
+        reserved >> 20,
+        if peak > reserved {
+            " - THE RESERVATION IS SHORT BY THE DIFFERENCE"
         } else {
             ""
         }

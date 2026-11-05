@@ -1088,11 +1088,15 @@ fn stage_encode(args: &Args) -> Result<()> {
         // while it was being written. The line names all three and the file's time, because a reader
         // who sees only "cannot be paired" will look for a defect in the pool instead.
         Some((names, sizes)) if names.len() != sizes.len() => println!(
-            "regions: {} published, {} measured, and the file holds no keys to pair them by - it was\n         \
-             written by an older build of `--stage weights`, by a run with another `--out`, or while it\n         \
-             was being written; run both stages from this binary into this directory\n         \
-             ({}, {})",
+            "regions: {} published, and the file cannot pair them by key - it holds {} keys and {} \
+             sizes, because it was written by an older build of `--stage weights`, by a run with \
+             another `--out`, or while it was being written; run both stages from this binary into \
+             this directory (a file older than the binary) ({}, {})",
             weights.published.len(),
+            // Both counts answer different questions: `0 keys` is a file from another build, and
+            // `N keys` below `M sizes` is one key published twice - two regions and one identity,
+            // which is the measurement's own arithmetic rather than a stale file.
+            names.len(),
             sizes.len(),
             measured.display(),
             written_time(&measured),
