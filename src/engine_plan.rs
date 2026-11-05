@@ -1283,8 +1283,13 @@ pub(crate) fn media_rank_report(
     // hold nothing any pool asks for.
     let mut media_components = std::collections::BTreeMap::new();
     media_components.insert(MediaCall::TextEncoding, "text_encoder".to_owned());
+    media_components.insert(MediaCall::LatentPreparation, "transformer".to_owned());
     media_components.insert(MediaCall::Denoising, "transformer".to_owned());
     media_components.insert(MediaCall::VideoDecoding, "video_decoder".to_owned());
+    media_components.insert(MediaCall::AudioDecoding, "audio_decoder".to_owned());
+    media_components.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
+    media_components.insert(MediaCall::AudioEncoding, "muxer".to_owned());
+    media_components.insert(MediaCall::Muxing, "muxer".to_owned());
     let supported_calls: Vec<ipc::CallKind> = media_components
         .keys()
         .copied()
@@ -2217,6 +2222,7 @@ fn host_phases() -> Vec<PhaseId> {
         engine::PhaseKind::VideoEncode,
         engine::PhaseKind::AudioEncode,
         engine::PhaseKind::Mux,
+        engine::PhaseKind::LatentPrepare,
     ]
     .into_iter()
     .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
@@ -2241,6 +2247,7 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             Variant::VideoEncode => engine::PhaseKind::VideoEncode,
             Variant::AudioEncode => engine::PhaseKind::AudioEncode,
             Variant::Mux => engine::PhaseKind::Mux,
+            Variant::LatentPrepare => engine::PhaseKind::LatentPrepare,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
