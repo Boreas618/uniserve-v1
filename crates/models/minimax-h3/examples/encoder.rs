@@ -1214,12 +1214,6 @@ fn stage_encode(args: &Args) -> Result<()> {
         logits_rows,
         phase: ops::PhaseKind::Encode,
         page_size: 1,
-        live_tokens: upload_i32(
-            &stream,
-            &arena,
-            Shape::new(&[1]),
-            &[i32::try_from(tokens).unwrap_or(i32::MAX)],
-        )?,
         num_tokens: tokens,
         max_kv_len: tokens,
         draft_lens: None,
