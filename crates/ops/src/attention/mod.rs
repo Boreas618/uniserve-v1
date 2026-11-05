@@ -20,6 +20,12 @@
 //! two offsets, or interleaves pages, needs no copy. Keys and values may address the same pages as
 //! one view of twice the extent.
 //!
+//! `page_table`'s entries are indices below `pages`, and nothing here checks that: the kernel
+//! dereferences every entry it reads into the cache with no bound, so the invariant belongs to the
+//! table's producer — the allocator that attaches a page — and a check on this side would have to
+//! read device memory to say anything. `max_pages` bounds the *columns* a row may use, not the
+//! values in them.
+//!
 //! # The mathematics
 //!
 //! For query row `t` with head `h`, with `s_j = scale · q_t,h · k_{j,h}` over the visible keys `j`:
