@@ -2787,7 +2787,7 @@ mod tests {
             !keys.iter().any(|key| key.contains(".block.5.weight")),
             "a widening convolution at index 5 is one entry past the reference's block"
         );
-        let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
+        let decoder = crate::audio_vae::BigVgan::keys(&config).expect("the decoder's keys");
         assert!(
             keys.iter().all(|key| !decoder.contains(key)),
             "the two audio halves read disjoint tensors"

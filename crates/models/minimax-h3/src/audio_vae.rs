@@ -771,7 +771,7 @@ impl Statistics {
 /// Layout everywhere is `[batch, channels, samples]`, the form the one-dimensional convolutions take.
 /// The batch is two because the reference decodes a stereo pair of identical rows and interleaves them;
 /// nothing in the network mixes the rows, so both output channels carry the same signal.
-pub struct AudioDecoder {
+pub struct BigVgan {
     config: AudioVaeConfig,
     /// The latent statistics as one one-by-one convolution: a diagonal of the deviations and the means
     /// as its bias, which is `value · std + mean` per latent channel.
@@ -825,7 +825,7 @@ const PCM_CHANNELS: u32 = 2;
 
 /// Every parameter name the audio decoder's load binds, in the order it binds them.
 ///
-/// One source of truth for the load and its check: [`AudioDecoder::load`] binds exactly these names, and
+/// One source of truth for the load and its check: [`BigVgan::load`] binds exactly these names, and
 /// [`sources`] must name exactly the same set — a name in one and not the other is a load failure rather
 /// than a checkpoint field silently dropped or a tensor bound to the wrong layer.
 pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
@@ -868,7 +868,7 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
     Ok(names)
 }
 
-impl AudioDecoder {
+impl BigVgan {
     /// Every checkpoint tensor the audio decoder reads, by name.
     ///
     /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
@@ -1159,15 +1159,13 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
-        // The residual add's width is the **sample count at that stage**, not the channel count:
-        // the stage's buffers are `[PCM_CHANNELS, channels, length]` and the add reshapes them to
-        // `[PCM_CHANNELS · channels, length]` (`rows`), so the descriptor's `columns` is the length
-        // the stage's upsampling leaves. Stating `channels × bucket` named keys no launch asks for.
-        for track in tracks {
-            let mut length = u64::from(*track);
-            for stage in &stages {
-                length *= u64::from(stage.rate);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, length)?);
+        // The residual add at each stage's own buffers: `[PCM_CHANNELS, channels, length]` reshaped
+        // to `[PCM_CHANNELS · channels, length]`, so its width is the length the stage's upsampling
+        // leaves. That width is the operand's and reaches no compiled code, so one descriptor covers
+        // every stage of every track - a row per (track, stage) stated the request's duration in a key.
+        for _track in tracks {
+            for _stage in &stages {
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
             }
         }
         Ok(programs.finish())
@@ -1314,7 +1312,7 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
     Ok(())
 }
 
-impl Decoder for AudioDecoder {
+impl Decoder for BigVgan {
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
@@ -1331,7 +1329,7 @@ impl Decoder for AudioDecoder {
             Ok(())
         } else {
             Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder has no layout tables; {} buffers were offered",
                     out.len()
@@ -1358,7 +1356,7 @@ impl Decoder for AudioDecoder {
     ) -> nn::Result<()> {
         if !state.is_empty() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder reads no layout table, {} were given",
                     state.len()
@@ -1366,18 +1364,18 @@ impl Decoder for AudioDecoder {
             });
         }
         let audio = out.audio.ok_or_else(|| nn::Error::Shape {
-            owner: "AudioDecoder",
+            owner: "BigVgan",
             problem: "an audio decode writes the request's PCM window".to_owned(),
         })?;
         if out.video.is_some() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: "the audio decoder writes no video raster".to_owned(),
             });
         }
         self.forward(f, latents, audio)
             .map_err(|error| nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!("{error}"),
             })
     }
@@ -1588,7 +1586,7 @@ pub(crate) mod tests {
     #[test]
     fn the_audio_decoders_names_are_the_checkpoints() {
         let config = audio_config();
-        let mut ours = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
         ours.sort_unstable();
         let fixture: Vec<&str> = include_str!("../tests/data/audio-decoder-names.txt")
             .lines()
@@ -1619,7 +1617,7 @@ pub(crate) mod tests {
     #[test]
     fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
         let config = audio_config();
-        let keys = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let keys = BigVgan::keys(&config).expect("the decoder's keys");
         let mut unique = keys.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -1700,7 +1698,7 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_states_its_programs_from_its_own_config() {
         let config = audio_config();
-        let programs = AudioDecoder::programs(&config, &[64, 256]).expect("the decoder's programs");
+        let programs = BigVgan::programs(&config, &[64, 256]).expect("the decoder's programs");
         assert!(!programs.is_empty());
         for (operator, key) in &programs {
             assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");

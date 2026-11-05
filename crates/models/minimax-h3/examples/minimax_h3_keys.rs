@@ -567,7 +567,7 @@ fn main() {
         )
         .collect();
     if !clip_frames.is_empty() {
-        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &latents) {
+        match minimax_h3::audio_vae::BigVgan::programs(audio, &latents) {
             Ok(rows) => lines.extend(rows),
             Err(error) => panic!("the audio decoder states no programs: {error}"),
         }
