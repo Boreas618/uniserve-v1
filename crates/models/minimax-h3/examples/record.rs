@@ -44,7 +44,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
-use minimax_h3::denoiser::{Arrangement, Denoiser};
+use minimax_h3::checkpoint::Dit;
+use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
+use nn::capability::{VideoRequest, VideoTask};
 use minimax_h3::AttentionKind;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use minimax_h3::Partition;
@@ -423,38 +425,125 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     Ok(recorded.0)
 }
 
-/// The denoiser's own load, and so the one question a harness can answer before it drives a step:
-/// does the network's arithmetic need a byte of the checkpoint, or does its statement suffice?
+/// The denoiser's own step, at one canvas and one schedule position.
+///
+/// The network's own `denoise` reads a `Step`, the request's latents, and the conditioning: text rows,
+/// the request's own conditions, and the tables the layout names. All of them are statements of
+/// shapes here — the arena is null-backed and the forward records instead of launching — so a step
+/// costs no device and no checkpoint byte.
 fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
     let network = config
         .denoisers
-        .get(&minimax_h3::Dit::Base)
+        .get(&Dit::Base)
         .ok_or("this checkpoint holds no base network")?
         .clone();
-    let arrangement =
-        Arrangement::new(&network, request.rows, request.rows, 1).map_err(|error| error.to_string())?;
+    let config_hidden = network.transformer.hidden_size;
+    // The two prefix capacities are the request's own: a prompt of the walk's length and one unit of
+    // condition rows, which a `t2va` request leaves empty. The bound is the deployment's.
+    let arrangement = Arrangement::new(&network, 4096, 64, 1)
+        .map_err(|error| error.to_string())?;
+    // The layout rule is the same statement the network loads with: the tables a step reads are the
+    // rule's, and a harness that built its own would be a second source of truth for them.
+    let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
     let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
-    let loaded = Denoiser::load(
+    let partition = Partition {
+        tensor_parallel: 1,
+        tensor_rank: 0,
+        ulysses_degree: 1,
+        ..Partition::single()
+    };
+    let denoiser = Denoiser::load(
         network,
         arrangement,
         request.rows,
-        &Partition {
-            tensor_parallel: 1,
-            tensor_rank: 0,
-            ulysses_degree: 1,
-            ..Partition::single()
-        },
+        &partition,
         &mut loader,
         None,
-    );
-    match loaded {
-        Ok(_) => {
-            eprintln!("# denoiser: loaded from shapes alone, no checkpoint byte");
-            Ok(Vec::new())
-        }
-        Err(error) => Err(error.to_string()),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let (height, width) = request.raster;
+    let asked = VideoRequest {
+        task: VideoTask::TextToVideoAudio,
+        width,
+        height,
+        frames: request.clip,
+        fps: 24,
+        first_frames: 0,
+        last_frames: 0,
+        references: 0,
+        text_tokens: 4096,
+        conditions: &[],
+        vision_spans: &[],
+    };
+    let (layout, packing) = rules.layout(&asked).map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+    // Every table the layout names, at the shape and type the model declares for it.
+    let specs = rules.table_specs(&layout).map_err(|error| error.to_string())?;
+    let mut tables = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        tables.push(
+            arena
+                .tensor(spec.dtype, spec.shape)
+                .map_err(|error| error.to_string())?,
+        );
     }
+    let hidden = u64::from(config_hidden);
+    let text = arena
+        .tensor(
+            request.dtype,
+            Shape::new(&[u64::from(packing.text_rows), hidden]),
+        )
+        .map_err(|error| error.to_string())?;
+    // The latents are the trajectory's, and a trajectory is FP32 whatever the stack's own type is:
+    // the solver accumulates into it, and the two cross at the stack's boundary (the four crossings the
+    // walk states).
+    let video = arena
+        .tensor(
+            ops::DType::F32,
+            Shape::new(&[
+                u64::from(config.video_vae.latent_channels),
+                u64::from(layout.video.frames),
+                u64::from(layout.video.height),
+                u64::from(layout.video.width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    let step = nn::Step {
+        index: 0,
+        count: 1,
+        sigma: 1.0,
+        sigma_next: 0.0,
+    };
+    // The audio trajectory: the layout's audio rows are two channels of stereo, so its steps are half
+    // of them.
+    let steps = u64::from(packing.audio_rows) / 2;
+    let audio = arena
+        .tensor(ops::DType::F32, Shape::new(&[2, steps]))
+        .map_err(|error| error.to_string())?;
+    let latents = nn::Latents {
+        video,
+        audio: Some(audio),
+    };
+    let cond = nn::Conditioning {
+        text,
+        source: None,
+        media: &[],
+        images: None,
+        audio: None,
+        state: &tables,
+        step: None,
+    };
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = denoiser.denoise(&forward, &step, latents, cond);
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
 }
 
 fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
