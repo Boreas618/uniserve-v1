@@ -8,8 +8,9 @@
 # and the same sampling settings. The three cells differ only in the
 # checkpoint path and the KV cache dtype; every other setting is identical, so
 # a comparison isolates precision. A BF16 accuracy measured in another run set
-# differs by whatever else changed between the runs and is history, not a
-# denominator.
+# is history, not a denominator, because the two runs then differ by whatever
+# else changed between their commits and the interval would answer a question
+# nobody asked.
 #
 # A server command names no `--worker-executable`: today's default worker
 # binary is the daemon's own executable, so `run --executable <new binary>`
