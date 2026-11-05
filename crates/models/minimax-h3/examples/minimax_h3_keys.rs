@@ -208,13 +208,52 @@ const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
 const VAES: [DType; 2] = [DType::F16, DType::F32];
 
 fn main() {
+    // The checkpoint states the geometry the derived rows are built from, so the generator reads it
+    // rather than restating it: `--root`, or the deployment's own path. A generator that transcribed
+    // these numbers could not be checked against the checkpoint at all.
+    let mut arguments = std::env::args().skip(1);
+    let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut rasters: Vec<(u32, u32)> = Vec::new();
+    while let Some(flag) = arguments.next() {
+        match flag.as_str() {
+            "--root" => {
+                root = std::path::PathBuf::from(
+                    arguments
+                        .next()
+                        .expect("--root needs the checkpoint's directory"),
+                );
+            }
+            "--rasters" => {
+                for raster in arguments
+                    .next()
+                    .expect("--rasters needs HxW,...")
+                    .split(',')
+                {
+                    let (height, width) = raster.trim().split_once('x').expect("HxW");
+                    rasters.push((
+                        height.parse().expect("a height"),
+                        width.parse().expect("a width"),
+                    ));
+                }
+            }
+            other => panic!("unknown flag {other}"),
+        }
+    }
+    if rasters.is_empty() {
+        rasters = minimax_h3::NAMED_CANVASES
+            .iter()
+            .map(|canvas| (canvas.height, canvas.width))
+            .collect();
+    }
+    let config = minimax_h3::config::Config::read(&root, None)
+        .expect("the checkpoint's configuration, read at the loading boundary");
     // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
     // twice, once per element type, which is the point.
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
-        lines.extend(rows(deployment));
+        lines.extend(rows(deployment, &config, &rasters));
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -239,12 +278,15 @@ fn main() {
     .unwrap_or_else(|error| panic!("{sidecar} is not JSON: {error}"));
     let video_vae = minimax_h3::config::VideoVaeConfig::parse(&values)
         .unwrap_or_else(|error| panic!("{sidecar}: {error}"));
-    // **One raster: the one this tree's runs, walks and acceptance cases use.** The encoder's
-    // canvas-class rows for the canvases the model *offers* (`NAMED_CANVASES`, short edge 768) are a
-    // further 36, and the package set does not declare a cell for them yet - so they are a decision
-    // about which canvases a deployment admits and a package build, not a row to slip into the list.
-    // Generating them is this vector with those canvases appended; the header states what is served.
-    let rasters = vec![(480_u32, 832_u32)];
+    // **The canvases the deployment serves**, which are the ones the model offers - not the raster a
+    // test case happens to use. The encoder's frame operators key on the canvas, so this is the whole
+    // reason the rows are derived: a written set covers one canvas and leaves the others without a
+    // program. `NAMED_CANVASES` is the offered set, and every one of them is a request the store must
+    // answer.
+    let rasters = minimax_h3::NAMED_CANVASES
+        .iter()
+        .map(|canvas| (canvas.width, canvas.height))
+        .collect::<Vec<_>>();
     lines.extend(
         minimax_h3::encoding::VideoEncoder::programs(&video_vae, &rasters)
             .unwrap_or_else(|error| panic!("the video encoder's programs: {error}")),
@@ -331,7 +373,11 @@ fn header(lines: &[(String, String)]) {
 }
 
 /// Every row one deployment's dtype asks for.
-fn rows(deployment: DType) -> Vec<(String, String)> {
+fn rows(
+    deployment: DType,
+    config: &minimax_h3::config::Config,
+    rasters: &[(u32, u32)],
+) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -2086,6 +2132,19 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
+
+    // ---- The video encoder: derived from the component, not written here.
+    //
+    // `VideoEncoder::programs` is the function the block that launches these rows calls, so a row it
+    // states cannot disagree with that block. The section was hand-written until it held 5 of the 20
+    // rows the encoder launches at the deployment's canvases, and the store, built from this file,
+    // would have stopped a `ref2va` encode at its first pad. The encoder runs FP32 at every raster
+    // (spec 9's TF32 row), so this call takes no element type: a dtype argument here would be the
+    // deployment's for a component the deployment does not decide.
+    lines.extend(
+        minimax_h3::encoding::VideoEncoder::programs(&config.video_vae, rasters)
+            .expect("the video encoder's programs from its own configuration"),
+    );
 
     // Gaps this file does not fill, named rather than invented. Each is a number the deployment
     // owns, not one this file could read off a config:
