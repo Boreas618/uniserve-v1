@@ -125,7 +125,14 @@ fn run() -> Result<(), String> {
     let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
     let mut component = String::from("all");
     let mut clip = 256u32;
-    let mut raster = (480u32, 832u32);
+    // The first canvas the deployment offers: every harness that reads one raster (the denoiser's,
+    // the decoder's) reads this one, and the others are added by `--raster`.
+    let mut raster = {
+        let first = minimax_h3::config::offered_canvases()
+            .first()
+            .map(|canvas| (canvas.height, canvas.width));
+        first.unwrap_or((672, 1536))
+    };
     // **One canvas by default, and every `--raster` given is claimed.** A recorder over one canvas
     // certifies one canvas, so the output states which ones it drove; a caller that wants the
     // deployment's extremes passes both, and the classes each one reaches are then visible.
@@ -246,7 +253,28 @@ fn run() -> Result<(), String> {
         bound,
         clip,
         raster,
-        rasters: if claimed.is_empty() { vec![raster] } else { claimed },
+        rasters: {
+            // The deployment's own canvases, and a stated one must be among them: recording a canvas
+            // the engine cannot be asked for certifies a class no request reaches.
+            let offered: Vec<(u32, u32)> = minimax_h3::config::offered_canvases()
+                .iter()
+                .map(|canvas| (canvas.height, canvas.width))
+                .collect();
+            if claimed.is_empty() {
+                offered
+            } else {
+                for pair in &claimed {
+                    if !offered.contains(pair) {
+                        return Err(format!(
+                            "--raster {}x{} is not one of the deployment's offered canvases {offered:?}",
+                            pair.0, pair.1
+                        )
+                        .into());
+                    }
+                }
+                claimed
+            }
+        },
         tokens,
         track,
         elements,

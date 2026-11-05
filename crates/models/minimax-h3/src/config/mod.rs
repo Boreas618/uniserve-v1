@@ -36,7 +36,9 @@ use std::path::Path;
 use nn::VideoTask;
 
 pub use audio_vae::AudioVaeConfig;
-pub use canvas::{CANVAS_SHORT_EDGE, Canvas, DMD_CANVASES, NAMED_ASPECT_RATIOS, NAMED_CANVASES};
+pub use canvas::{
+    CANVAS_SHORT_EDGE, Canvas, DMD_CANVASES, NAMED_ASPECT_RATIOS, NAMED_CANVASES, offered_canvases,
+};
 pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
