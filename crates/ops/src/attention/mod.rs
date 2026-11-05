@@ -804,8 +804,6 @@ struct PagedLaunch {
 }
 
 impl PagedAttention {
-
-
     /// Launch this crate's own Triton program for an `E4M3` page.
     ///
     /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
@@ -853,7 +851,10 @@ impl PagedAttention {
         if !launch.q_heads.is_multiple_of(launch.kv_heads) {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{} query heads do not divide into {} key-value heads", launch.q_heads, launch.kv_heads),
+                format!(
+                    "{} query heads do not divide into {} key-value heads",
+                    launch.q_heads, launch.kv_heads
+                ),
             ));
         }
 
@@ -895,7 +896,10 @@ impl PagedAttention {
             .i32(stride("the output's row stride", &args.out, 0)?)
             .i32(stride("the output's head stride", &args.out, 1)?)
             .i32(stride("the output's element stride", &args.out, 2)?)
-            .i32(word("the page table's width", args.page_table.shape.dim(1))?)
+            .i32(word(
+                "the page table's width",
+                args.page_table.shape.dim(1),
+            )?)
             .i32(word("the page size", launch.page_size)?)
             .f32(args.scale);
         if descriptor.phase == Phase::Prefill {
