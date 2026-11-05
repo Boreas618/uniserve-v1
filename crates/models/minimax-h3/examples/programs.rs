@@ -27,6 +27,7 @@ use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
 use minimax_h3::partition::Partition;
 use minimax_h3::programs::{Deployment, Types};
+use minimax_h3::tiled_encode::ClipEncoder;
 use minimax_h3::video_vae::VideoDecoder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -404,6 +405,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
+        // **The encoder's tiled driver.** A canvas larger than one tile is encoded by tiles that
+        // cross-fade where they meet, and `ClipEncoder` states the blends the grid produces and the
+        // frame operators at each tile's extent - rows no whole-canvas call describes. Without it the
+        // walk described one of the encoder's two drivers, which is how thirteen rows a launch takes
+        // came to be absent from every walk.
+        for frames in &samples {
+            rows.extend(ClipEncoder::programs(&config, &rasters, *frames)?);
+        }
     } else {
         eprintln!("not walked: {} has no video VAE config", root.display());
     }
@@ -462,16 +471,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rows_bound.div_ceil(contract.tile).next_power_of_two()
             }
         };
-        rows.extend(Denoiser::programs(
-            &config,
-            attention,
-            stack_type,
-            max,
-            Groups::of(conditioned),
-            &partition,
-            &elements,
-            tiles,
-        )?);
+        // **The groups are the served tasks', not this walk's.** A task fixes how many timestep
+        // groups the modulation cache holds and the cache's width is a program key, so stating one
+        // task's cache leaves another task's requests with no cell - `logits_gather columns_2` is that
+        // row, and nothing but iterating the served set states it.
+        for groups in [Groups::of(false), Groups::of(true)] {
+            rows.extend(Denoiser::programs(
+                &config, attention, stack_type, max, groups, &partition, &elements, tiles,
+            )?);
+        }
     }
 
     // Deduplicate first: a count of the launches before deduplication is a count of something else

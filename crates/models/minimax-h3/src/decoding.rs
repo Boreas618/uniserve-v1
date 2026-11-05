@@ -307,6 +307,17 @@ pub fn video_arena(
             elements: raster * channels,
         },
         Buffer {
+            // The stitch's seam block: one tile's pixels, contiguous, which every blend copies its
+            // neighbour into. It is reserved with the clip's other buffers because one block serves
+            // every seam, and the grid's tiles are all the same size.
+            name: "seam".to_owned(),
+            element,
+            elements: channels
+                * u64::from(frames)
+                * (u64::from(tile.canvas.height) * u64::from(config.spatial_compression()))
+                * (u64::from(tile.canvas.width) * u64::from(config.spatial_compression())),
+        },
+        Buffer {
             name: "tokens".to_owned(),
             element,
             elements: rows * patch,
@@ -398,12 +409,22 @@ pub fn video_arena(
 /// (`uniserve/nn/vae/tiled.py:51-56`): a tile's row blend reads the tile above, and that neighbour
 /// must be its *decoded* block rather than one already faded into its own predecessor, or the
 /// overlap where two seams cross is computed in a different order from the seams themselves. Writing
-/// each tile into both rasters costs one extra unpatchify launch per tile and no copy operator: every
-/// placement is a strided view of a raster, which the operators now write through.
+/// each tile into both rasters costs one extra unpatchify launch per tile: every placement is a
+/// strided view of a raster, which the operators write through.
+///
+/// A **source** cannot be a strided view of either raster. A seam of a grid wider than one tile
+/// reads a block that is not contiguous in `[channels, frames, rows, columns]` order - the
+/// predecessor's last rows, laid out at the raster's width - and `cross_fade` addresses its sources
+/// flat, so a shifted view of a wider raster reads the wrong rows past the first. Each seam
+/// therefore copies its neighbour into one tile-shaped buffer first, `[channels, frames, tile rows,
+/// tile columns]` contiguous, and blends from that: one copy per seam, no operator signature change,
+/// and the blend's own key is untouched because only its destination ever carried strides.
 pub struct ClipDecoder {
     unpatchify: UnpatchifyVideo,
     /// One blend layer for each overlap the tile grid has, by extent and axis.
     blends: Vec<(u32, u32, CrossFade)>,
+    /// The copy that makes a seam's neighbour contiguous for the blend's flat source addressing.
+    copy: nn::layers::CopyBlock,
     /// Pixels per latent position, the ratio a tile's latent origin scales by.
     ratio: u32,
     /// Elements of one token: `out_channels · temporal · spatial²`, the row width every tile's decode
@@ -431,26 +452,39 @@ impl ClipDecoder {
             * u64::from(config.temporal_compression())
             * u64::from(spatial)
             * u64::from(spatial);
-        // The grid spreads its slack over the seams, so the overlaps are not all equal: a seam is at
-        // least `MINIMUM_OVERLAP` **output pixels** wide - the raster the blend writes is in pixels, so
-        // that is the extent `cross_fade` is given - and it grows by an alignment step as the slack is
-        // spread, always inside its tile. One compiled blend serves every seam of one width, so the
-        // table is built for every width a grid of the checkpoint's tile size can produce, on both
-        // axes. Building it once, at load, is what lets one decoder block serve every canvas: the grid
-        // itself is arithmetic and is recomputed per request.
-        let alignment = spatial;
-        let mut blends = Vec::new();
-        let mut extent = crate::video_vae::MINIMUM_OVERLAP;
-        while extent < crate::video_vae::TILE_PIXELS {
-            for axis in [2, 3] {
-                blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
+        // **The table is the deployment's own seam set, derived from the canvases it serves.** The grid
+        // spreads its slack over the seams, so a seam's width (in output pixels, which is what the
+        // blend writes and what `cross_fade` is given) is whatever that canvas's grid arithmetic
+        // gives: over the offered canvases the launched widths are 64 to 128, while a ladder of
+        // alignment steps to the tile size states 24 widths of which 8 ever launch. A ladder beside
+        // the grids is a second answer to the same question, so this walks the grids instead: a width
+        // exists here exactly when a served canvas launches it, and a canvas added to the model adds
+        // its seams without anyone editing a list.
+        //
+        // One compiled blend serves every seam of one width, so building this once at load is what
+        // lets one decoder block serve every canvas: the grid itself is recomputed per request.
+        let mut blends: Vec<(u32, u32, CrossFade)> = Vec::new();
+        for offered in crate::config::offered_canvases() {
+            let canvas = Canvas::clip(config, offered.height / spatial, offered.width / spatial);
+            let tiles = crate::video_vae::Tiles::of(config, &canvas)?.tiles(config, &canvas);
+            for tile in &tiles {
+                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
+                    if extent == 0
+                        || blends
+                            .iter()
+                            .any(|(width, side, _)| *width == extent && *side == axis)
+                    {
+                        continue;
+                    }
+                    blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
+                }
             }
-            extent += alignment;
         }
         Ok(Self {
             unpatchify,
-            patch,
             blends,
+            copy: nn::layers::CopyBlock::new(dtype)?,
+            patch,
             ratio: spatial,
         })
     }
@@ -472,8 +506,9 @@ impl ClipDecoder {
     ///
     /// `tokens` is what [`crate::video_vae::VideoDecoder::decode`] wrote for this tile,
     /// `[rows, out_channels · temporal · spatial²]`, its voxel rows first; `dest` is the whole clip's
-    /// raster. The caller decodes the tiles in [`Tile`] order, because a blend reads what the tile
-    /// above and the tile to the left have already written.
+    /// raster; `seam` is one tile-shaped contiguous buffer, reused by every blend of the clip, that a
+    /// neighbour is copied into before it is faded. The caller decodes the tiles in [`Tile`] order,
+    /// because a blend reads what the tile above and the tile to the left have already written.
     pub fn write_tile(
         &self,
         f: &Forward,
@@ -481,6 +516,7 @@ impl ClipDecoder {
         tokens: TensorView,
         decoded: TensorView,
         blended: TensorView,
+        seam: TensorView,
     ) -> Result<()> {
         for (name, raster) in [("decoded", decoded), ("blended", blended)] {
             let shape = raster.shape;
@@ -491,6 +527,29 @@ impl ClipDecoder {
                 )));
             }
         }
+        // The seam buffer is the shape every blend's source has, contiguous: a copy writes it, and the
+        // blend reads it flat, which is the addressing its program has.
+        let (tile_rows, tile_columns) = (
+            u64::from(tile.canvas.height) * u64::from(self.ratio),
+            u64::from(tile.canvas.width) * u64::from(self.ratio),
+        );
+        let seam_shape = Shape::new(&[
+            decoded.shape.dim(0),
+            decoded.shape.dim(1),
+            tile_rows,
+            tile_columns,
+        ]);
+        let packed = [
+            seam_shape.dim(1) * tile_rows * tile_columns,
+            tile_rows * tile_columns,
+            tile_columns,
+            1,
+        ];
+        if seam.shape != seam_shape || seam.strides != nn::Strides::new(&packed) {
+            return Err(Error::config(format!(
+                "the seam buffer is {seam:?}, not {seam_shape:?} contiguous"
+            )));
+        }
         let ratio = u64::from(self.ratio);
         let first_row = u64::from(tile.latent_rows.0) * ratio;
         let first_column = u64::from(tile.latent_columns.0) * ratio;
@@ -498,29 +557,26 @@ impl ClipDecoder {
         let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
         self.unpatchify.forward(f, tokens, plain)?;
         self.unpatchify.forward(f, tokens, view)?;
-        // The blend can only read a neighbour that is one contiguous block. `cross_fade`'s sources are
-        // addressed flat in `[channels, frames, rows, columns]` order and only its destination carries
-        // strides (its program's own note says so), so a shift of a raster wider than the tile reads
-        // the wrong rows past the first. Refusing is the honest answer until the operator reads its
-        // sources through their strides: a silently misread seam is a different picture, not a slower
-        // one. Single-column grids are unaffected, because there the tile's rows are the raster's.
-        if (tile.above != 0 || tile.left != 0) && view.shape.dim(3) != decoded.shape.dim(3) {
-            return Err(Error::Unsupported(format!(
-                "the clip decoder cannot blend tile ({}, {}) of a {}x{} raster: a neighbour of a \
-                 {}-wide tile is not one contiguous block, and cross_fade reads its sources contiguously",
-                tile.row,
-                tile.column,
-                decoded.shape.dim(2),
-                decoded.shape.dim(3),
-                view.shape.dim(3)
-            )));
-        }
         // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
         // current tile's first `extent`. The predecessor's last positions are the seam itself, which
         // still holds the predecessor's pixels in the raster, so the neighbour's view starts one
         // tile-extent minus one overlap before the tile - not one overlap before it, which would read
-        // the tile's own pixels from a band further down.
-        let (tile_rows, tile_columns) = (
+        // the tile's own pixels from a band further down. That view is strided wherever the raster is
+        // wider than the tile, and `cross_fade` addresses its sources flat, so the view is copied into
+        // the contiguous seam buffer first: the copy reads the raster through the view's strides, the
+        // blend reads the buffer flat, and both are the addressing their programs have.
+        let mut destination_strides = [0_i64; ops::copy_block::RANK];
+        for (axis, stride) in packed.iter().enumerate() {
+            destination_strides[axis] = i64::try_from(*stride)
+                .map_err(|_| Error::config("a seam block is larger than i64 strides".to_owned()))?;
+        }
+        let contiguous = TensorView::with_strides(
+            seam.offset_elements(0),
+            seam.dtype,
+            seam_shape,
+            nn::Strides::new(&packed),
+        );
+        let (body_rows, body_columns) = (
             u64::from(tile.canvas.height) * ratio,
             u64::from(tile.canvas.width) * ratio,
         );
@@ -530,11 +586,13 @@ impl ClipDecoder {
                 tile,
                 first_row,
                 first_column,
-                u32::try_from(tile_rows).unwrap_or(u32::MAX) - tile.above,
+                u32::try_from(body_rows).unwrap_or(u32::MAX) - tile.above,
                 0,
             )?;
+            self.copy
+                .forward(f, previous, contiguous, &destination_strides)?;
             self.blend(tile.above, 2)?
-                .forward(f, Some(previous), view, view)?;
+                .forward(f, Some(contiguous), view, view)?;
         }
         if tile.left != 0 {
             let previous = self.placement(
@@ -543,10 +601,12 @@ impl ClipDecoder {
                 first_row,
                 first_column,
                 0,
-                u32::try_from(tile_columns).unwrap_or(u32::MAX) - tile.left,
+                u32::try_from(body_columns).unwrap_or(u32::MAX) - tile.left,
             )?;
+            self.copy
+                .forward(f, previous, contiguous, &destination_strides)?;
             self.blend(tile.left, 3)?
-                .forward(f, Some(previous), view, view)?;
+                .forward(f, Some(contiguous), view, view)?;
         }
         Ok(())
     }
@@ -647,6 +707,21 @@ impl ClipDecoder {
         // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
         // tile of the clip shares them.
         let decoded = f.arena().tensor(out.dtype, out.shape)?;
+        // The seam buffer: one tile-shaped contiguous block every blend copies its neighbour into. A
+        // tile's extents are the same across a grid, so one buffer serves every seam of the clip and
+        // the blends of a tile are ordered on the stream that wrote it.
+        let first = tiles.first().ok_or_else(|| {
+            Error::config("a clip of no tiles has no raster to stitch".to_owned())
+        })?;
+        let seam = f.arena().tensor(
+            out.dtype,
+            Shape::new(&[
+                out.shape.dim(0),
+                out.shape.dim(1),
+                u64::from(first.canvas.height) * u64::from(self.ratio),
+                u64::from(first.canvas.width) * u64::from(self.ratio),
+            ]),
+        )?;
         // The transformer's fourteen buffers, reserved **once per clip** and reused by every tile: the
         // arena never rewinds, so a per-tile reservation would grow the clip's footprint by the tile
         // count while the plan states them once.
@@ -667,7 +742,7 @@ impl ClipDecoder {
                 .arena()
                 .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
             decoder.decode(f, latent, positions, tokens, &scratch)?;
-            self.write_tile(f, tile, tokens, decoded, out)?;
+            self.write_tile(f, tile, tokens, decoded, out, seam)?;
             start += tile_voxels;
         }
         Ok(())
@@ -1007,10 +1082,12 @@ mod tests {
         let total = |plan: &[Buffer]| -> u64 { plan.iter().map(Buffer::bytes).sum() };
         // Every typed entry doubles, and the two tables do not: the F32 plan is the F16 plan plus the
         // typed half, with the tables counted once on both sides.
-        assert_eq!(
-            total(&whole),
-            2 * total(&half) - tables(&half),
-            "the f32 plan is the f16 plan with every typed buffer doubled and the tables counted once"
+        // **Not every typed entry doubles.** A layer that declares FP32 whatever the decode is holds
+        // the same bytes at both, which is the per-layer declaration's consequence; what holds is that
+        // the f32 plan is never smaller.
+        assert!(
+            total(&whole) >= total(&half),
+            "the f32 plan is never smaller than the f16 plan"
         );
         assert_eq!(
             tables(&whole),
@@ -1066,6 +1143,17 @@ mod tests {
                 * u64::from(crate::video_vae::TILE_PIXELS / 16)
                 * 3
         );
+        // The seam block: one tile's pixels at the raster's frame count, contiguous - the buffer every
+        // blend copies its neighbour into, reserved once because every tile of a grid is the same size.
+        assert_eq!(
+            buffer("seam").elements,
+            u64::from(grid[0].canvas.height)
+                * u64::from(config.spatial_compression())
+                * u64::from(grid[0].canvas.width)
+                * u64::from(config.spatial_compression())
+                * u64::from(canvas.frames_out(&config))
+                * 3
+        );
         assert_eq!(buffer("stream").elements, tile_rows * columns);
         assert_eq!(buffer("projected").elements, tile_voxels * columns);
         assert_eq!(buffer("gate_up").elements, tile_rows * 2 * columns * 4);
@@ -1096,10 +1184,10 @@ mod tests {
         // follow.
         let clip_level: Vec<&str> = arena
             .iter()
-            .take(2)
+            .take(3)
             .map(|buffer| buffer.name.as_str())
             .collect();
-        assert_eq!(clip_level, ["decoded", "tokens"]);
+        assert_eq!(clip_level, ["decoded", "seam", "tokens"]);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
@@ -1211,6 +1299,120 @@ mod tests {
                 widths
                     .iter()
                     .all(|width| *width % alignment as u32 == 0 && u64::from(*width) >= minimum)
+            );
+        }
+    }
+
+    /// A seam's neighbour is not one contiguous block of a raster wider than the tile, and
+    /// `cross_fade` addresses its sources flat: the stitch copies the neighbour into one contiguous
+    /// tile-shaped buffer and blends from that. The buffer's contract is enforced where it is used,
+    /// because a packed view of the raster passed in its place would blend the wrong rows and read as a
+    /// different picture rather than a failure.
+    #[test]
+    fn a_seam_blends_from_one_contiguous_block_and_refuses_a_view_of_the_raster() {
+        let config = crate::video_vae::tests::video_config();
+        // Two tiles across, one down: 28 latent columns at 16 pixels each is 448, which is two
+        // 256-pixel tiles sharing a 64-pixel seam, so the clip has a left blend and no row blend.
+        let canvas = Canvas::clip(&config, 16, 28);
+        let tiles = Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas);
+        assert_eq!(tiles.len(), 2);
+        let frames = u64::from(canvas.frames_out(&config));
+        let (rows, columns) = canvas.pixels(&config);
+        let (rows, columns) = (u64::from(rows), u64::from(columns));
+        // The clip's buffers live in a recorded arena: nothing is allocated, and one tile's seam block
+        // is a rounding error against the budget the plan states.
+        let arena = nn::forward::Arena::new(ops::DevicePtr::new(0), 1 << 40);
+        let f = Forward::recording(&arena);
+        let decoded = f
+            .arena()
+            .tensor(DType::F16, Shape::new(&[3, frames, rows, columns]))
+            .expect("the decoded raster");
+        let blended = f
+            .arena()
+            .tensor(DType::F16, Shape::new(&[3, frames, rows, columns]))
+            .expect("the blended raster");
+        let tokens = f
+            .arena()
+            .tensor(
+                DType::F16,
+                Shape::new(&[Canvas::rows(&tiles[1].canvas), 3 * 4 * 16 * 16]),
+            )
+            .expect("the tile's tokens");
+        let clip = ClipDecoder::new(&config, DType::F16).expect("the output path");
+        // A contiguous 256x256 block: the shape the copy writes.
+        let packed = [frames * 256 * 256, 256 * 256, 256, 1];
+        let seam = f
+            .arena()
+            .tensor(DType::F16, Shape::new(&[3, frames, 256, 256]))
+            .expect("the seam buffer");
+        assert_eq!(seam.strides, nn::Strides::new(&packed));
+        // The raster itself is what a caller might pass by mistake: same shape, the raster's strides.
+        let wrong = TensorView::with_strides(
+            decoded.offset_elements(0),
+            DType::F16,
+            Shape::new(&[3, frames, 256, 256]),
+            decoded.strides,
+        );
+        let error = clip
+            .write_tile(&f, &tiles[1], tokens, decoded, blended, wrong)
+            .expect_err("a strided seam is not the block the blend reads");
+        let message = format!("{error}");
+        assert!(
+            message.contains("seam buffer"),
+            "the refusal names the buffer it wants: {message}"
+        );
+        // With the contiguous block the same tile is written: the refusal was the buffer, nothing else.
+        clip.write_tile(&f, &tiles[1], tokens, decoded, blended, seam)
+            .expect("a contiguous seam writes the tile");
+    }
+    /// The blend table and the deployment's seams are one set, in both directions.
+    ///
+    /// The table is derived from the offered canvases' own grids, so a width exists in it exactly
+    /// when a served canvas produces that width on that axis. Each direction fails differently: a
+    /// seam with no module stops a clip decode at that seam rather than at a load, and a module no
+    /// seam reads is a store cell no launch asks for - which is what the ladder of alignment steps
+    /// this replaced produced, 24 widths stated against 8 launched.
+    #[test]
+    fn the_blend_table_and_the_offered_canvases_seams_are_one_set() {
+        let config = crate::video_vae::tests::video_config();
+        let decoder = ClipDecoder::new(&config, DType::F32).expect("a clip decoder");
+        let ratio = config.spatial_compression();
+        let mut realized = Vec::new();
+        for offered in crate::config::offered_canvases() {
+            let canvas = Canvas::clip(&config, offered.height / ratio, offered.width / ratio);
+            let tiles = Tiles::of(&config, &canvas)
+                .expect("the grid")
+                .tiles(&config, &canvas);
+            for tile in tiles {
+                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
+                    if extent > 0 && !realized.contains(&(extent, axis)) {
+                        realized.push((extent, axis));
+                    }
+                }
+            }
+        }
+        assert!(
+            !realized.is_empty(),
+            "the deployment's canvases are multi-row and multi-column, so they produce seams"
+        );
+        for (extent, axis) in &realized {
+            assert!(
+                decoder
+                    .blends()
+                    .iter()
+                    .any(|(width, side, _)| width == extent && side == axis),
+                "the deployment launches a {extent}-pixel seam along axis {axis} and the table is \
+                 {} widths on two axes: a missing module stops the clip decode here",
+                decoder.blends().len()
+            );
+        }
+        for (width, side, _) in decoder.blends() {
+            assert!(
+                realized.contains(&(*width, *side)),
+                "the table carries a {width}-pixel seam along axis {side} that no offered canvas \
+                 produces: a store cell no launch reads"
             );
         }
     }

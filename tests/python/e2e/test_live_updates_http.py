@@ -1176,6 +1176,44 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
             _stop_pid(pid)
 
 
+def _first_stream_frame(
+    base_url: str, model: str, timeout_s: float = 120.0
+) -> None:
+    """Reads one streamed frame, or says why none arrived.
+
+    A stream that produces nothing for five minutes and one that produces
+    tokens slowly are the same failure to a test that waits for a count. One
+    frame tells them apart in a minute: it proves the streaming path carries a
+    frame end to end, and when it does not it reports the status, the content
+    type and the opening bytes instead of a timeout with no cause.
+    """
+    with httpx.stream(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Count from 1 to 20."}],
+            "temperature": 0,
+            "max_completion_tokens": 8,
+            "stream": True,
+        },
+        timeout=timeout_s,
+    ) as response:
+        content_type = response.headers.get("content-type", "")
+        if response.status_code != 200:
+            raise AssertionError(
+                "a streamed request was refused: "
+                f"{response.status_code}: {response.read()[:400]!r}"
+            )
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                return
+    raise AssertionError(
+        f"the stream carried no frame in {timeout_s:.0f} s "
+        f"(content-type {content_type!r})"
+    )
+
+
 def _restart_while_streaming(
     base_url: str, name: str, log: Path, successors: list[int]
 ) -> None:
@@ -1202,6 +1240,11 @@ def _restart_while_streaming(
     choice = (answered.get("choices") or [{}])[0]
     content = choice.get("message", {}).get("content")
     assert content, f"the deployment answered no content: {answered}"
+
+    # And one frame of one stream: the three streams below each need 32 counts,
+    # so a silent stream and a slow one are the same failure at 300 s. This
+    # says which in a minute.
+    _first_stream_frame(base_url, name)
 
     # Three streams in flight at the restart, of different lengths so their
     # boundaries fall at different events of different requests.

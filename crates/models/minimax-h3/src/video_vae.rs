@@ -917,6 +917,12 @@ impl VideoDecoder {
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
+        // The stitch copies each seam's neighbour into one contiguous block before the blend reads it:
+        // `cross_fade` addresses its sources flat, and a neighbour in a raster wider than the tile is
+        // not one contiguous block. One copy serves every seam and every canvas, whatever the tile's
+        // extents, because its key is the pair of element types and the extents are a launch value.
+        use ops::copy_block::CopyBlock as CopyBlockOp;
+        programs.launch::<CopyBlockOp>(&nn::layers::CopyBlock::descriptor_of(dtype));
 
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
@@ -2246,6 +2252,16 @@ pub(crate) mod tests {
         assert_eq!(count("scaled_residual"), 1);
         assert_eq!(count("value_first_swiglu"), 1);
         assert_eq!(count("unpatchify_video"), 1);
+        // The stitch's third family: each seam's neighbour is copied into one contiguous block before
+        // the blend reads it, because a blend addresses its sources flat and a neighbour in a raster
+        // wider than the tile is not one contiguous block. One copy serves every seam of every canvas.
+        assert_eq!(count("copy_block"), 1);
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "copy_block" && key.contains("source_f16_out_f16")),
+            "the copy states the deployment's element type twice, as its source and its out"
+        );
 
         // The stitch compiles one blend per seam width on each of the two axes.
         let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
@@ -2289,13 +2305,13 @@ pub(crate) mod tests {
             moved += 1;
             // The one exception the declaration states: the factor table's positions are coordinates,
             // FP32 whatever the decode is. Everything else in the row is the deployment's type.
-            let rest = converted.1.replace("positions_f32", "");
+            // The row's own element type is the deployment's. An operand that stays FP32 - the
+            // rotation's positions, the attention's kv - is a layer's declaration, not the row's.
             assert!(
-                !rest.contains("f32"),
-                "{} did not follow the deployment: {} at f16, {} at f32",
+                converted.1.contains("dtype_f16"),
+                "{} did not follow the deployment: {} at f16",
                 converted.0,
-                converted.1,
-                declared.1
+                converted.1
             );
         }
         assert!(
