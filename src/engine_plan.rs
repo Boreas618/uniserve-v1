@@ -1913,6 +1913,12 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// partition, a projection this stack does not implement is refused rather than served at degree
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
+/// The component a media rank serves: the denoiser's node in the deployment page's group.
+///
+/// It is the page's key (`[worker_groups.components.transformer]`), and it is what tells one engine's
+/// group from another's when the name the launch states is the daemon's process group.
+const DENOISER_COMPONENT: &str = "transformer";
+
 fn media_parallel(
     groups: Option<&[engine::ExecutorGroupConfig]>,
     group: &str,
@@ -1936,24 +1942,47 @@ fn media_parallel(
              sequence degree is stated for them: a file is what places a rank's group and its split"
         );
     };
-    let placed = groups
+    // **The name the launch states is the daemon's process group, not the page's id.** Every engine's
+    // main process is launched into one process group (`ENGINE_GROUP = "engine"`), which is the
+    // epoch's bookkeeping name, while the page names the groups it places (`model`, `text`, `flow`).
+    // A rank that looked itself up by the name it was launched under found neither and refused - so
+    // the name is preferred when the page has it, and otherwise the page is asked the question it can
+    // answer: **which group places this class's component?** A media rank serves the denoiser, and a
+    // group that places no transformer is another engine's.
+    let named = groups.iter().find(|candidate| candidate.id.0 == group);
+    let denoisers: Vec<&engine::ExecutorGroupConfig> = groups
         .iter()
-        .find(|candidate| candidate.id.0 == group)
-        .with_context(|| {
-            // Both sides as a pair: the launch's name is the daemon's roster label and the page's
-            // ids are the deployment's groups, and a reader who sees only one side cannot tell
-            // which of the two statements to correct.
-            format!(
-                "the launch file states worker group {group:?} and the deployment page places {}: \
-                 a rank's group is the page's, because the page is the one statement of the \
-                 parallel shape",
+        .filter(|candidate| candidate.components.contains_key(DENOISER_COMPONENT))
+        .collect();
+    // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
+    // page's ids are the deployment's groups, and a reader who sees only one side cannot tell which
+    // of the two statements to correct.
+    let placed = match (named, denoisers.as_slice()) {
+        (Some(named), _) => named,
+        (None, [only]) => *only,
+        (None, []) => {
+            bail!(
+                "the launch file states worker group {group:?} and the deployment page places \
+                 neither it nor a group that places {DENOISER_COMPONENT:?}: the page places {}",
                 groups
                     .iter()
-                    .map(|group| group.id.0.as_str())
+                    .map(|group| format!("{:?}", group.id.0))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })?;
+        }
+        (None, many) => {
+            bail!(
+                "this rank serves worker group {group:?}, which the deployment does not place, \
+                 and {} groups place {DENOISER_COMPONENT:?} ({}): one partition needs one of them",
+                many.len(),
+                many.iter()
+                    .map(|group| format!("{:?}", group.id.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
     let mut splits = placed.components.iter().filter(|(_, component)| {
         !matches!(
             component.parallel_config.sequence_parallel,
@@ -2188,15 +2217,57 @@ mod tests {
         assert_eq!(files, 13, "every checked-in H3 deployment is checked");
     }
 
-    /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<engine::ExecutorGroupConfig> {
-        let page = format!(
-            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
-        );
-        engine::Deployment::parse(&page)
+    /// A deployment page as written, parsed and placed on this host.
+    fn page(toml: &str) -> Vec<engine::ExecutorGroupConfig> {
+        engine::Deployment::parse(toml)
             .expect("the page parses")
             .worker_groups("localhost")
             .expect("the page places")
+    }
+
+    /// A deployment page holding one group named `model`, with the components it names.
+    fn groups(components: &str) -> Vec<engine::ExecutorGroupConfig> {
+        page(&format!(
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
+        ))
+    }
+
+    /// **The name the launch states is the daemon's process group, and the page's ids are its own.**
+    ///
+    /// Every engine's main process is launched into one process group (`engine`), which is the
+    /// epoch's bookkeeping name rather than the deployment's; the page names what it places (`model`,
+    /// `text`, `flow`). A media rank that looked itself up by the name it was launched under found
+    /// neither and refused - which is what the first end-to-end serve run reported. The page can
+    /// answer the question it states: the group that places the denoiser is this rank's. A page where
+    /// two groups place a denoiser does not say which rank is which, and is refused rather than
+    /// guessed at.
+    #[test]
+    fn the_group_is_the_one_that_places_the_denoiser_when_the_launch_name_is_not_on_the_page() {
+        let placed = groups(
+            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 4, projection = \"exchange\" }\n",
+        );
+        let (ulysses, _, _, sequence_rank) =
+            media_parallel(Some(&placed), "engine", 1, 4, 1, 4).expect(
+                "the group that places the denoiser is this rank's, whatever the launch calls it",
+            );
+        assert_eq!(ulysses.degree, 4, "its split is the one this rank serves");
+        assert_eq!(sequence_rank, 1);
+
+        let two = page(
+            "[[worker_groups]]\nid = \"text\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
+             [worker_groups.components.text_encoder]\n\
+             [[worker_groups]]\nid = \"flow\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
+             [worker_groups.components.transformer]\n\
+             [[worker_groups]]\nid = \"other\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
+             [worker_groups.components.transformer]\n",
+        );
+        let error = media_parallel(Some(&two), "engine", 0, 1, 0, 1)
+            .expect_err("two groups placing a denoiser is not one partition");
+        assert!(
+            format!("{error:#}").contains("flow") && format!("{error:#}").contains("other"),
+            "the refusal names both groups: {error:#}"
+        );
     }
 
     /// The rank's sequence split is the deployment's, and it is read from the page that states it.

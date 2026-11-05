@@ -1090,7 +1090,7 @@ fn attention_edges(captured: &crate::captured::Captured) -> String {
         if *operator != "paged_attention" || reported >= 2 {
             continue;
         }
-        let dependents = match graph.dependents(node) {
+        let dependents = match graph.dependents_with_edges(node) {
             Ok(dependents) => dependents,
             Err(error) => {
                 out.push_str(&format!(" attention{reported}=unreadable({error})"));
@@ -1100,12 +1100,22 @@ fn attention_edges(captured: &crate::captured::Captured) -> String {
         };
         let named: Vec<String> = dependents
             .iter()
-            .map(|dependent| match graph.kernel_node_params(dependent) {
-                Ok(params) => params
-                    .function
-                    .name()
-                    .unwrap_or_else(|error| format!("unnamed({error})")),
-                Err(_) => "not-a-kernel".to_owned(),
+            .map(|(dependent, edge)| {
+                let name = match graph.kernel_node_params(dependent) {
+                    Ok(params) => params
+                        .function
+                        .name()
+                        .unwrap_or_else(|error| format!("unnamed({error})")),
+                    Err(_) => "not-a-kernel".to_owned(),
+                };
+                // An edge that lets the consumer start early is a consumer that must wait for the
+                // producer's data itself; one recorded for a launch that never asked for it is the
+                // ordering defect, and it leaves every scalar in both launches agreeing.
+                if edge.is_programmatic() {
+                    format!("{name}@port{} PROGRAMMATIC", edge.port)
+                } else {
+                    name
+                }
             })
             .collect();
         out.push_str(&format!(
