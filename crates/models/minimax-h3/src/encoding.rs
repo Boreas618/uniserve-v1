@@ -2671,6 +2671,38 @@ pub fn video_encoder_run_arena(
     Ok(plan)
 }
 
+/// Every buffer one **raster** encode takes from `Forward::arena()`: the encoder's set, then the
+/// stitcher's ring and hand-off.
+///
+/// [`VideoEncoder::reserve`] funds the tile set and `Scene::encode` takes the stitcher's buffers
+/// *after* it, so a run sized from [`video_encoder_run_arena`] alone stops at the first of them.
+/// This is the plan a raster driver allocates: one statement of both halves, in the order the
+/// forward takes them.
+///
+/// `extents` are the tile extents the run reserves, one per distinct extent; their first is the
+/// tile whose latent size the stitcher's block is taken from, because a run's tiles are uniform and
+/// `Scene::encode` refuses a run whose tiles are not. `columns` is the grid's tile columns and
+/// `latent_frames` the raster's frame extent - the stitcher blends the raster the caller funds.
+pub fn video_raster_arena(
+    config: &VideoVaeConfig,
+    extents: &[Extent],
+    columns: usize,
+    latent_frames: u32,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = video_encoder_run_arena(config, extents)?;
+    let tile = extents
+        .first()
+        .ok_or_else(|| Error::config("a raster plan without a tile".to_owned()))?;
+    plan.extend(crate::tiled_encode::stitch_arena(
+        config,
+        columns,
+        u64::from(latent_frames),
+        u64::from(tile.height / SPATIAL_RATIO),
+        u64::from(tile.width / SPATIAL_RATIO),
+    )?);
+    Ok(plan)
+}
+
 /// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
 ///
 /// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
@@ -2970,6 +3002,49 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+    /// The raster plan is the encoder's set followed by the stitcher's ring, and nothing else.
+    ///
+    /// `Scene::encode` reserves the set through `VideoEncoder::reserve` and then takes the stitcher's
+    /// buffers, so a driver's plan must state both halves in that order: a plan with only the set
+    /// stops at the first stitcher block, and a plan that counted a buffer twice would allocate what
+    /// nothing reads.
+    #[test]
+    fn the_raster_plan_is_the_encoder_set_and_then_the_stitcher() {
+        let config = crate::video_vae::tests::video_config();
+        let extents = [crate::encoding::Extent {
+            frames: 17,
+            height: 256,
+            width: 256,
+        }];
+        let set = video_encoder_run_arena(&config, &extents).expect("the encoder's set");
+        let stitch = crate::tiled_encode::stitch_arena(&config, 3, 2, 16, 16).expect("the stitch");
+        let raster = video_raster_arena(&config, &extents, 3, 2).expect("the raster plan");
+
+        assert_eq!(raster.len(), set.len() + stitch.len());
+        assert_eq!(
+            crate::decoding::arena_reservation(&raster),
+            crate::decoding::arena_reservation(&set) + crate::decoding::arena_reservation(&stitch)
+        );
+        let names: Vec<&str> = raster.iter().map(|buffer| buffer.name.as_str()).collect();
+        assert_eq!(
+            names[set.len()..],
+            [
+                "stitch.ring0.0",
+                "stitch.ring0.1",
+                "stitch.ring0.2",
+                "stitch.ring1.0",
+                "stitch.ring1.1",
+                "stitch.ring1.2",
+                "stitch.handed",
+            ],
+            "the stitcher's blocks follow the set in `encode`'s own order"
+        );
+        assert!(
+            set.iter().all(|buffer| !buffer.name.starts_with("stitch.")),
+            "the encoder's set states no stitcher block"
+        );
+    }
+
     #[test]
     fn the_audio_encoders_keys_are_the_encoders_half_and_name_every_part() {
         let config = crate::audio_vae::tests::audio_config();
