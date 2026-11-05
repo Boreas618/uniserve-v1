@@ -571,7 +571,9 @@ impl Nvfp4Linear {
         let scales = arena.tensor(ops::DType::U8, scale_shape)?;
         let token_scale_region = arena.tensor(ops::DType::F32, ops::Shape::new(&[class]))?;
         let values = prefix_rows(values_region, rows, k / 2);
-        let token_scale = prefix_rows(token_scale_region, rows, 1);
+        // One scalar per row, so the view is rank one: the encode checks `[rows]`, and a `[rows, 1]`
+        // view is a different shape than the one it states for a per-row factor.
+        let token_scale = prefix_scalars(token_scale_region, rows);
         let encoded_scale_shape = self.layout.shape(rows, k);
         let encoded_scales = if encoded_scale_shape == scale_shape {
             scales
@@ -611,6 +613,17 @@ impl Nvfp4Linear {
 ///
 /// The pointers are the same: a shorter view of a larger region is what lets one allocation serve
 /// both the request's rows and the class they are launched in.
+/// The first `rows` scalars of a rank-one region, as a rank-one view.
+fn prefix_scalars(buffer: TensorView, rows: u64) -> TensorView {
+    let shape = ops::Shape::new(&[rows]);
+    TensorView::with_strides(
+        buffer.ptr,
+        buffer.dtype,
+        shape,
+        ops::Strides::row_major(shape),
+    )
+}
+
 fn prefix_rows(buffer: TensorView, rows: u64, width: u64) -> TensorView {
     let shape = ops::Shape::new(&[rows, width]);
     TensorView::with_strides(
