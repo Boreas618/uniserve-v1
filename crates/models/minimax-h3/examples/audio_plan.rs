@@ -22,9 +22,9 @@ use nn::weights::WeightLoader;
 use nn::{Arena, DType, Forward, Shape};
 
 use minimax_h3::audio_vae::{BigVgan, audio_arena, track_samples};
-use nn::capability::Decoder;
 use minimax_h3::decoding::arena_reservation;
 use minimax_h3::encoding::{AudioEncoder, audio_encoder_arena};
+use nn::capability::Decoder;
 
 fn main() {
     if let Err(error) = run() {

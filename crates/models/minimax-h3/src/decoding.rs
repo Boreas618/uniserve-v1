@@ -695,6 +695,37 @@ impl ClipDecoder {
                 out.shape.dims()
             )));
         }
+        // **One canvas per decoder object: the tiles handed here are the grid of the canvas the decoder
+        // was built for.** A decoder built for the clip's canvas scatters a tile's rows with the clip's
+        // permutation - the table is a constant of that canvas - so the mismatch is a write past a
+        // tile-sized buffer, and it is refused by name here instead.
+        let (covered_frames, covered_height, covered_width) =
+            tiles
+                .iter()
+                .fold((0_u32, 0_u32, 0_u32), |(frames, height, width), tile| {
+                    // The tile's **latent span**, not its grid index: `row`/`column` count tiles and the
+                    // extent a grid covers is the end of each tile's span.
+                    (
+                        frames.max(tile.canvas.frames),
+                        height.max(tile.latent_rows.1),
+                        width.max(tile.latent_columns.1),
+                    )
+                });
+        let built = decoder.canvas();
+        if (built.frames, built.height, built.width)
+            != (covered_frames, covered_height, covered_width)
+        {
+            return Err(Error::config(format!(
+                "the tiled decode was handed a decoder built for {}x{} latent cells of {} frame(s) \
+                 and its tiles cover {}x{} of {}: one decoder serves one canvas's grid",
+                built.height,
+                built.width,
+                built.frames,
+                covered_height,
+                covered_width,
+                covered_frames
+            )));
+        }
         // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
         // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
         // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every

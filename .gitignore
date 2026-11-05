@@ -54,3 +54,6 @@ AGENTS.md
 
 # A reference run's dumped rows: host artifacts, read by path, never committed.
 notes/reference/qwen3-hidden/
+
+# Run outputs (certification records, check dumps) are not source.
+.scratch/
