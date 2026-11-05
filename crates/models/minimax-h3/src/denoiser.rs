@@ -1458,31 +1458,6 @@ impl ConditionEncoders {
     }
 }
 
-/// The rank-two view the initial-noise operator addresses: every axis but the last folded into the
-/// rows, the last kept as the width.
-///
-/// `philox_noise` draws a **flat stream** - a value is a function of `(seed, element)` - and reads a
-/// two-axis buffer. Under a scalar key it addresses the buffer flattened (the element index is the
-/// flat index), so **where the fold falls changes no value**: the element order is the buffer's
-/// row-major order either way. That is what makes one rule enough for latents of different ranks.
-///
-/// The ranks do differ, measured: the executor's runner hands both latents as the native four-axis
-/// raster (`[channels, frames, height, width]`), and a recorder's arrangement hands the audio one as
-/// `[AUDIO_CHANNELS · ?, frames]`. A rule that required four axes refused the second and took the
-/// denoiser's whole component out of a recording - a smaller number where a defect was, which is
-/// why this folds every rank and refuses only a buffer with no axes at all.
-fn noise_view(shape: Shape) -> Result<Shape> {
-    let dims = shape.dims();
-    let Some((width, folded)) = dims.split_last() else {
-        return Err(Error::config("a latent to draw has no axes".to_owned()));
-    };
-    let rows = folded.iter().try_fold(1_u64, |rows, extent| {
-        rows.checked_mul(*extent)
-    });
-    let rows = rows.ok_or_else(|| Error::config(format!("a latent of {:?} has no row count", dims)))?;
-    Ok(Shape::new(&[rows, *width]))
-}
-
 /// A model error as the capability's.
 fn flattened(error: Error) -> nn::Error {
     nn::Error::Weight {
@@ -1593,9 +1568,7 @@ impl nn::capability::Denoiser for Denoiser {
         // order is the raster's flat order either way. Handing the four-axis view over is what the
         // operator refused (`expected 2 axes, found 4`), and it refused it after the load, one
         // launch after the first stage's.
-        let flat = out
-            .video
-            .reshape(noise_view(out.video.shape).map_err(flattened)?);
+        let flat = out.video;
         // Both draws carry the **same** `stage` and `draw`, and only the offset differs: the
         // operator's address is `counter = [pair_low, pair_high, stage, draw]`, so either of those
         // words selects a different stream rather than a later position in this one. The reference
@@ -1608,10 +1581,7 @@ impl nn::capability::Denoiser for Denoiser {
         // which no shape or type refuses.
         noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, video_offset)?;
         if let Some(audio) = out.audio {
-            // The same merge, for the same reason: the audio latent arrives as the four-axis raster
-            // the sample is (`[channels, frames, 1, 1]`), and the operator's addressing is flat.
-            let flat = audio.reshape(noise_view(audio.shape).map_err(flattened)?);
-            noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, audio_offset)?;
+            noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 0, audio_offset)?;
         }
         Ok(())
     }
@@ -4401,33 +4371,6 @@ mod tests {
         assert_eq!(one.condition, expected);
         assert_eq!(one.video, one.condition);
         assert_eq!(one.audio, one.video + bare.audio);
-    }
-
-    /// The draw's addressing is flat, so every latent is handed the same fold and none keeps the
-    /// raster's four axes. The audio one used to: the draw was handed it as the sample arrives and
-    /// the operator refused `expected 2 axes, found 4` after the video's stage had already been
-    /// drawn, which is a stop one stage into a request.
-    #[test]
-    fn every_latent_is_drawn_as_one_flat_stream() {
-        let video = Shape::new(&[24, 37, 48, 84]);
-        let flat = noise_view(video).unwrap();
-        assert_eq!(flat.dims(), &[24 * 37 * 48, 84]);
-        assert_eq!(flat.numel(), video.numel(), "the fold loses no element");
-
-        // The audio latent of a 121-frame request: two channels of 64 features over 37 latent
-        // frames, the raster's last two axes unit as the sample carries them.
-        let audio = Shape::new(&[2 * 64, 37, 1, 1]);
-        let flat = noise_view(audio).unwrap();
-        assert_eq!(flat.dims(), &[2 * 64 * 37, 1]);
-        assert_eq!(flat.numel(), audio.numel());
-
-        // The rank a recorder's arrangement hands the audio latent. A rule that required four
-        // axes refused this one, and the refusal took the denoiser out of a recording without
-        // stopping the recording - the case this test exists for.
-        let recorder = Shape::new(&[2, 207]);
-        let flat = noise_view(recorder).unwrap();
-        assert_eq!(flat.dims(), &[2, 207]);
-        assert_eq!(flat.numel(), recorder.numel());
     }
 
     #[test]
