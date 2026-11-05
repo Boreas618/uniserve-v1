@@ -293,7 +293,7 @@ impl Deployment {
         samples: &[u32],
     ) -> Result<Vec<(String, String)>> {
         let mut programs = Programs::default();
-        programs.extend(crate::audio_vae::AudioDecoder::programs(
+        programs.extend(crate::audio_vae::BigVgan::programs(
             &self.config.audio_vae,
             latents,
         )?);
