@@ -687,11 +687,12 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     for (int64_t at = 0; at < count; ++at) {
       library.backend_destroy(configs[at]);
     }
-    if (properties != nullptr) {
-      library.backend_destroy(properties);
-    }
+    // The winning heuristic names the device-properties descriptor, so it outlives it.
     if (heuristic != nullptr) {
       library.backend_destroy(heuristic);
+    }
+    if (properties != nullptr) {
+      library.backend_destroy(properties);
     }
   }
   library.backend_destroy(graph);
