@@ -114,6 +114,13 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
         .recv_timeout(POLICY_ANSWER)
         .expect("the switchover is answered within the bound")
         .expect("the switchover applies at the next batch boundary");
+    // A scheduler that fatal-stops leaves its handle dead, and a dead handle is what
+    // an engine reports as "no live scheduler answered the state the route policy is
+    // instantiated on" - a sentence about the wrong subject. Its own reason is here,
+    // and standard error is where a test run carries it.
+    if let Some(reason) = core.failure() {
+        eprintln!("the simulated scheduler stopped after its policy was installed: {reason}");
+    }
 }
 
 /// How long a fixture waits for an answer it cannot proceed without.
