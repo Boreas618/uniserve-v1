@@ -2977,9 +2977,9 @@ mod tests {
             width,
         });
         let mut columns = vec![width + 2];
-        for index in 0..stack.widths.len() {
+        for (index, extent) in extents.iter().enumerate().take(stack.widths.len()) {
             if stack.downsamples(index) {
-                columns.push(extents[index].width + 2);
+                columns.push(extent.width + 2);
             }
         }
         let reflect = matches!(
