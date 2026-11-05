@@ -1954,13 +1954,16 @@ fn media_parallel(
         .iter()
         .filter(|candidate| candidate.components.contains_key(DENOISER_COMPONENT))
         .collect();
+    // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
+    // page's ids are the deployment's groups, and a reader who sees only one side cannot tell which
+    // of the two statements to correct.
     let placed = match (named, denoisers.as_slice()) {
         (Some(named), _) => named,
         (None, [only]) => *only,
         (None, []) => {
             bail!(
-                "this rank serves worker group {group:?} and no group of the deployment places \
-                 {DENOISER_COMPONENT:?}: the deployment places {}",
+                "the launch file states worker group {group:?} and the deployment page places \
+                 neither it nor a group that places {DENOISER_COMPONENT:?}: the page places {}",
                 groups
                     .iter()
                     .map(|group| format!("{:?}", group.id.0))
