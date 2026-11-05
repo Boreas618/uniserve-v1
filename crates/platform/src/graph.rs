@@ -21,7 +21,10 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::driver::{self, Handle, KernelNodeParams as RawKernelNodeParams};
+use crate::driver::{
+    self, CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC, GraphEdgeData, Handle,
+    KernelNodeParams as RawKernelNodeParams,
+};
 use crate::launch::Function;
 use crate::{Device, DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
 
@@ -627,6 +630,7 @@ impl Capture {
         )?;
 
         let (status, graph, frontier) = capture_info(stream)?;
+        let frontier: Vec<Handle> = frontier.into_iter().map(|(node, _)| node).collect();
         if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
                 "the stream's capture is in status {status} right after it began"
@@ -654,6 +658,21 @@ impl Capture {
     /// the nodes are that operation's, and the owner records which operation
     /// they belong to for a later rebind.
     pub fn record(&mut self) -> Result<Vec<GraphNode>> {
+        Ok(self
+            .record_walk()?
+            .into_iter()
+            .map(|walked| walked.node)
+            .collect())
+    }
+
+    /// [`Self::record`], with the kind of every dependency that reaches each node.
+    ///
+    /// This is the walk a structure comparison reads: two captures of the same work
+    /// are compared per operation and per position, so the kinds belong to the
+    /// positions rather than to the handles. A rebind sets node parameters and keeps
+    /// the template's edges, so a launch whose edge became programmatic is a
+    /// structure change and its bucket is recaptured.
+    pub fn record_walk(&mut self) -> Result<Vec<WalkedNode>> {
         let (status, _, frontier) = capture_info(&self.stream)?;
         if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
@@ -662,31 +681,57 @@ impl Capture {
         }
 
         let mut found: Vec<Handle> = Vec::new();
-        let mut queue: std::collections::VecDeque<Handle> = self.frontier.iter().copied().collect();
+        let mut fresh: HashSet<usize> = HashSet::new();
+        let mut kinds: std::collections::HashMap<usize, Vec<EdgeKind>> =
+            std::collections::HashMap::new();
+        // The frontier's own edge data is read and dropped: the driver refuses a
+        // frontier query that asks for its nodes without it, and what it describes is
+        // the edge the *next* operation will add - which the walk reads from that
+        // edge itself once it exists. Attributing it here would state a kind for an
+        // edge this operation did not create.
+        for (_, data) in &frontier {
+            EdgeKind::of(data)?;
+        }
+        let mut queue: std::collections::VecDeque<Handle> =
+            frontier.iter().map(|(node, _)| *node).collect();
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
         for root in root_handles(&self.core)? {
             if self.seen.insert(root as usize) {
                 found.push(root);
+                fresh.insert(root as usize);
                 queue.push_back(root);
             }
         }
         while let Some(node) = queue.pop_front() {
-            for dependent in dependent_handles(node)? {
+            // Both edge kinds are dependencies: a programmatic edge lets the
+            // downstream node start early, not become unrelated to it.
+            for (dependent, data) in dependent_edges(node)? {
+                if fresh.contains(&(dependent as usize)) {
+                    // Every edge between the nodes this operation added is stated,
+                    // in the order the walk reaches their upstream ends, so the list
+                    // is the same for two captures of the same work.
+                    let entry = kinds.entry(dependent as usize).or_default();
+                    entry.push(EdgeKind::of(&data)?);
+                }
                 if self.seen.insert(dependent as usize) {
                     found.push(dependent);
+                    fresh.insert(dependent as usize);
                     queue.push_back(dependent);
                 }
             }
         }
-        self.frontier = frontier;
+        self.frontier = frontier.into_iter().map(|(node, _)| node).collect();
 
         Ok(found
             .into_iter()
-            .map(|raw| GraphNode {
-                core: Arc::clone(&self.core),
-                raw,
+            .map(|raw| WalkedNode {
+                node: GraphNode {
+                    core: Arc::clone(&self.core),
+                    raw,
+                },
+                incoming: kinds.remove(&(raw as usize)).unwrap_or_default(),
             })
             .collect())
     }
@@ -730,15 +775,25 @@ impl Drop for Capture {
     }
 }
 
+/// The nodes the next operation will depend on, each with what its edge says.
+type Frontier = Vec<(Handle, GraphEdgeData)>;
+
 /// The stream's capture status, the graph being captured, and the dependency
-/// set of the next node (`cuStreamGetCaptureInfo`).
-fn capture_info(stream: &Stream) -> Result<(i32, Handle, Vec<Handle>)> {
+/// set of the next node, with what each of those edges says
+/// (`cuStreamGetCaptureInfo_v3`).
+///
+/// **The edge-data array is read for the same reason the walk reads it:** the
+/// driver refuses a query that asks for a capture's dependencies without their
+/// edge data when one of them carries non-default data
+/// (`CUDA_ERROR_LOSSY_QUERY`), and the frontier edge of a programmatic
+/// dependent launch is exactly such an edge.
+fn capture_info(stream: &Stream) -> Result<(i32, Handle, Frontier)> {
     let driver = driver::driver()?;
     let mut status = 0;
     let mut id = 0u64;
     let mut graph: Handle = std::ptr::null_mut();
     let mut dependencies: *const Handle = std::ptr::null();
-    let mut edge_data: *const c_void = std::ptr::null();
+    let mut edge_data: *const GraphEdgeData = std::ptr::null();
     let mut count = 0usize;
     driver.check(
         // SAFETY: the stream is live; each pointer addresses a local the
@@ -760,46 +815,136 @@ fn capture_info(stream: &Stream) -> Result<(i32, Handle, Vec<Handle>)> {
     let frontier = if dependencies.is_null() || count == 0 {
         Vec::new()
     } else {
-        // SAFETY: the driver returns `count` node handles, valid until the
-        // next call that operates on the stream.
-        unsafe { std::slice::from_raw_parts(dependencies, count) }.to_vec()
+        // SAFETY: the driver returns `count` node handles, and `count` edge
+        // data entries when it was asked for them, valid until the next call
+        // that operates on the stream.
+        let nodes = unsafe { std::slice::from_raw_parts(dependencies, count) };
+        let data = if edge_data.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: as above; the array is `count` entries and was returned
+            // with the node array.
+            unsafe { std::slice::from_raw_parts(edge_data, count) }.to_vec()
+        };
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (*node, data.get(index).copied().unwrap_or_default()))
+            .collect()
     };
     Ok((status, graph, frontier))
 }
 
-/// The nodes that depend directly on `node` (`cuGraphNodeGetDependentNodes`).
-fn dependent_handles(node: Handle) -> Result<Vec<Handle>> {
+/// The nodes that depend directly on `node`, with what each edge says
+/// (`cuGraphNodeGetDependentNodes`).
+///
+/// # Why both arrays are always passed
+///
+/// The driver refuses a query that asks for dependent nodes without their edge
+/// data as soon as one edge carries non-default data: `CUDA_ERROR_LOSSY_QUERY`
+/// (`cuda.h`, `cuGraphNodeGetDependentNodes`: "if an edge has non-zero
+/// (non-default) edge data and `edgeData` is NULL, this API will return
+/// CUDA_ERROR_LOSSY_QUERY"). A programmatic dependent launch is exactly such an
+/// edge, so a captured kernel that triggers its successor early made this walk
+/// fail on a null array - and `edgeData` cannot be passed alone either, because
+/// the driver requires `dependentNodes` with it.
+///
+/// The array sizes are therefore guessed and grown rather than counted first:
+/// there is no way to ask for the count of a graph whose edges carry data. The
+/// driver fills what fits and answers how many it wrote, so one call with room
+/// for eight is most nodes and the loop is bounded by the real out-degree.
+fn dependent_edges(node: Handle) -> Result<Vec<(Handle, GraphEdgeData)>> {
     let driver = driver::driver()?;
-    let mut count = 0usize;
-    driver.check(
-        // SAFETY: the node is live with its graph; a null array asks only for
-        // the count.
-        unsafe {
-            (driver.graph_node_get_dependent_nodes)(
-                node,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut count,
-            )
-        },
-        "cuGraphNodeGetDependentNodes",
-    )?;
-    if count == 0 {
-        return Ok(Vec::new());
+    let mut capacity = 8usize;
+    loop {
+        let mut nodes = vec![std::ptr::null_mut(); capacity];
+        let mut data = vec![GraphEdgeData::default(); capacity];
+        let mut count = capacity;
+        driver.check(
+            // SAFETY: both arrays hold `capacity` entries and the driver writes
+            // at most that many, answering the number it wrote.
+            unsafe {
+                (driver.graph_node_get_dependent_nodes)(
+                    node,
+                    nodes.as_mut_ptr(),
+                    data.as_mut_ptr(),
+                    &mut count,
+                )
+            },
+            "cuGraphNodeGetDependentNodes",
+        )?;
+        if count <= capacity {
+            nodes.truncate(count);
+            data.truncate(count);
+            return Ok(nodes.into_iter().zip(data).collect());
+        }
+        // The driver filled the array whole: more dependents than it held.
+        capacity = count;
     }
-    let mut nodes = vec![std::ptr::null_mut(); count];
-    driver.check(
-        // SAFETY: the array holds `count` handles, which the driver fills.
-        unsafe {
-            (driver.graph_node_get_dependent_nodes)(
-                node,
-                nodes.as_mut_ptr(),
-                std::ptr::null_mut(),
-                &mut count,
-            )
-        },
-        "cuGraphNodeGetDependentNodes",
-    )?;
-    nodes.truncate(count);
-    Ok(nodes)
+}
+
+/// What one edge of a captured graph means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// The downstream node starts when the upstream node has finished
+    /// executing, with the upstream node's writes visible to it.
+    Completion,
+    /// **A programmatic dependent launch.** The downstream node may start
+    /// before the upstream node finishes: it is launched at the upstream node's
+    /// programmatic trigger point and synchronizes itself with
+    /// `cudaGridDependencySynchronize`.
+    ///
+    /// It is still a dependency - the walk follows it, and the node it reaches
+    /// belongs to the operation that issued it - but it orders **less** than a
+    /// completion edge: the upstream node has not finished when the downstream
+    /// one begins, so nothing may treat the two as interchangeable. Anything
+    /// that reorders, rebinds or compares captured graphs reads the kind, and a
+    /// comparison of two graph structures that ignores it compares two different
+    /// orders as one.
+    Programmatic,
+}
+
+impl EdgeKind {
+    /// The kind `data` states, or an error for a value this walk does not know.
+    ///
+    /// A kind it does not know is refused rather than read as a completion
+    /// edge: the driver may add kinds, and a walk that guessed would put a
+    /// weaker order where a stronger one was meant.
+    ///
+    /// The driver states a programmatic edge in either of two ways - the
+    /// dependency kind itself, or the default kind with the upstream node's
+    /// programmatic port - so both are read, and a comparison of two captures
+    /// does not depend on which encoding the driver used in each.
+    fn of(data: &GraphEdgeData) -> Result<Self> {
+        let programmatic_port = data.from_port == CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC;
+        match data.kind {
+            driver::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT if !programmatic_port => Ok(Self::Completion),
+            driver::CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC
+            | driver::CU_GRAPH_DEPENDENCY_TYPE_DEFAULT => Ok(Self::Programmatic),
+            other => Err(Error::invalid(format!(
+                "a graph edge states dependency kind {other}, which this walk does not know"
+            ))),
+        }
+    }
+}
+
+/// One node an operation added, with the kinds of the dependencies that reach it.
+///
+/// The edges are stated **per node, in the walk's order**, rather than as pairs of
+/// driver handles. Two captures of the same work are compared position by position
+/// (design 4.5's rebind condition), and a handle belongs to one graph while a
+/// position belongs to the order both walks agree on.
+///
+/// `incoming` holds a kind for every edge that reaches this node from another node
+/// of the same walk, in the order their upstream ends are walked - so two captures of
+/// the same work state the same vectors. An edge into a node added by an earlier
+/// operation is not listed: it is that operation's, and it was stated then.
+#[derive(Clone, Debug)]
+pub struct WalkedNode {
+    /// The node the operation added.
+    pub node: GraphNode,
+    /// The kinds of the edges from the nodes already walked into this one, in the
+    /// driver's order. A node an operation added after another operation's nodes has
+    /// one entry per dependency that crosses the boundary.
+    pub incoming: Vec<EdgeKind>,
 }
