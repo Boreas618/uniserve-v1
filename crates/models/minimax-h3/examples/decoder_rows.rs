@@ -440,7 +440,9 @@ fn fit_arenas(
         }
     }
     if failures.is_empty() {
-        println!("# every canvas's clip fits its plan exactly, at every element type a deployment can name.");
+        println!(
+            "# every canvas's clip fits its plan exactly, at every element type a deployment can name."
+        );
         Ok(())
     } else {
         for failure in &failures {
