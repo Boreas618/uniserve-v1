@@ -3750,8 +3750,36 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 } else {
                     String::new()
                 };
+                // The launch's **input**, which nothing so far has read. Q travels inside
+                // `tmaQ_`'s first word, and that word encodes the base address with alignment and
+                // swizzle bits, so the raw word is tried first and then with its low bits cleared:
+                // whichever lands inside the arena is the buffer the kernel reads. An output nobody
+                // wrote has two causes and this separates them - an input that never arrived, or an
+                // input that did and a kernel that did not write.
+                let read = if layer < 2 {
+                    let tma_q = params
+                        .as_ref()
+                        .and_then(|params| params.parameters.first())
+                        .and_then(|blob| blob.get(0..8))
+                        .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                        .unwrap_or(0);
+                    let q_address = [tma_q, tma_q & !0x7F, tma_q & !0xF, tma_q & !0x3]
+                        .into_iter()
+                        .find(|candidate| *candidate != 0 && inside(*candidate))
+                        .unwrap_or(0);
+                    match self.read_device(q_address, width) {
+                        Some(raw) if q_address != 0 => format!(
+                            " q={:016x} qnz={}",
+                            platform::fnv1a(&raw),
+                            raw.iter().filter(|byte| **byte != 0).count()
+                        ),
+                        _ => format!(" q=nomap({tma_q:#x})"),
+                    }
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
-                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}"
+                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}{read}"
                 ));
                 if layer0_out != 0 && address == layer0_out && layer > 0 {
                     out.push_str("(shared)");
