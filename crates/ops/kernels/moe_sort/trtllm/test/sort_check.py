@@ -10,6 +10,11 @@ outputs with TensorRT-LLM's routing order computed here in integer arithmetic.
 
     python sort_check.py <module_dir> [--tokens 64] [--top 8] [--experts 128]
                          [--local 128] [--offset 0] [--tile 128] [--scales f32]
+                         [--live N]
+
+``--live N`` stages the batch's live token count on the device, and every row of ``token >= N``
+must then have ``-2`` in all ``top`` of its route map entries; unset passes no count, which is every
+row live.
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory with
 ``module.so``. Run it on the GPU host with the Program Server's own environment

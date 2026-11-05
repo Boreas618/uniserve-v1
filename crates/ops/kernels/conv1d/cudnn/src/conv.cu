@@ -120,6 +120,14 @@ constexpr int32_t kAttrTensorDataType = 901;
 constexpr int32_t kAttrTensorDimensions = 902;
 constexpr int32_t kAttrTensorStrides = 903;
 constexpr int32_t kAttrTensorUniqueId = 906;
+constexpr int32_t kAttrTensorByteAlignment = 900;
+/// The alignment every tensor of this program is handed to cuDNN with.
+///
+/// cuDNN 9 requires a tensor's byte alignment to be stated before its graph is finalized, and
+/// answers a missing one with the attribute number rather than a sentence. The buffers are the
+/// caller's: the exchange's and the arena's allocations are at least this aligned (the arena pads
+/// every tensor to `ALIGNMENT`), so 16 is a statement about the allocation and not a request.
+constexpr int64_t kTensorByteAlignment = 16;
 constexpr int32_t kAttrVariantPackUniqueIds = 1000;
 constexpr int32_t kAttrVariantPackDataPointers = 1001;
 constexpr int32_t kAttrVariantPackWorkspace = 1003;
@@ -328,6 +336,8 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
            set(*descriptor, kAttrTensorDimensions, kTypeInt64, kSpatial + 2, dims) &&
            set(*descriptor, kAttrTensorStrides, kTypeInt64, kSpatial + 2, strides) &&
            set(*descriptor, kAttrTensorUniqueId, kTypeInt64, 1, &uid) &&
+           set(*descriptor, kAttrTensorByteAlignment, kTypeInt64, 1,
+               &kTensorByteAlignment) &&
            finalize_tensor(*descriptor, which, dims, strides, dtype);
   };
   /// Row-major strides of a contiguous tensor, the last axis running fastest.
