@@ -803,14 +803,136 @@ struct PagedLaunch {
     max_q_len: u64,
 }
 
+/// One word of the Triton program's signature, in the order the program declares it.
+///
+/// The launch packs these in this order and the test beside this file reads the program's signature
+/// and compares. Two lists that must agree are one list too many unless something holds them; this
+/// is the something, and it exists because the prefill kernel takes its offsets immediately after
+/// `seq_lens` while the decode kernel has none — the one position that is easy to pack at the end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PagedWord {
+    Out,
+    Query,
+    Key,
+    Value,
+    KeyScale,
+    ValueScale,
+    PageTable,
+    SeqLens,
+    /// The packed query offsets, prefill only.
+    CumSeqLensQ,
+    QueryRow,
+    QueryHead,
+    QueryElement,
+    KeyPage,
+    KeyToken,
+    KeyHead,
+    KeyElement,
+    ValuePage,
+    ValueToken,
+    ValueHead,
+    ValueElement,
+    OutRow,
+    OutHead,
+    OutElement,
+    /// The page table's width: the most pages any row may name.
+    MaxPages,
+    PageSize,
+    Scale,
+    /// The longest query row, prefill only.
+    MaxQueryRow,
+    /// Whether the batch carries offsets, prefill only.
+    Packed,
+}
+
+impl PagedWord {
+    /// The name the Triton program declares this word under, for the test that holds this list to
+    /// the program's own signature.
+    #[cfg(test)]
+    fn program_name(self) -> &'static str {
+        match self {
+            Self::Out => "out_ptr",
+            Self::Query => "query_ptr",
+            Self::Key => "key_ptr",
+            Self::Value => "value_ptr",
+            Self::KeyScale => "key_scale_ptr",
+            Self::ValueScale => "value_scale_ptr",
+            Self::PageTable => "page_table_ptr",
+            Self::SeqLens => "seq_lens_ptr",
+            Self::CumSeqLensQ => "cum_seq_lens_q_ptr",
+            Self::QueryRow => "q_stride_tokens",
+            Self::QueryHead => "q_stride_heads",
+            Self::QueryElement => "q_stride_dim",
+            Self::KeyPage => "k_stride_pages",
+            Self::KeyToken => "k_stride_tokens",
+            Self::KeyHead => "k_stride_heads",
+            Self::KeyElement => "k_stride_dim",
+            Self::ValuePage => "v_stride_pages",
+            Self::ValueToken => "v_stride_tokens",
+            Self::ValueHead => "v_stride_heads",
+            Self::ValueElement => "v_stride_dim",
+            Self::OutRow => "o_stride_tokens",
+            Self::OutHead => "o_stride_heads",
+            Self::OutElement => "o_stride_dim",
+            Self::MaxPages => "max_pages",
+            Self::PageSize => "page_size",
+            Self::Scale => "softmax_scale",
+            Self::MaxQueryRow => "max_q_len",
+            Self::Packed => "packed",
+        }
+    }
+}
+
+/// The words one phase's launch packs, in the program's own order.
+fn words(phase: Phase) -> Vec<PagedWord> {
+    let mut words = vec![
+        PagedWord::Out,
+        PagedWord::Query,
+        PagedWord::Key,
+        PagedWord::Value,
+        PagedWord::KeyScale,
+        PagedWord::ValueScale,
+        PagedWord::PageTable,
+        PagedWord::SeqLens,
+    ];
+    if phase == Phase::Prefill {
+        words.push(PagedWord::CumSeqLensQ);
+    }
+    words.extend([
+        PagedWord::QueryRow,
+        PagedWord::QueryHead,
+        PagedWord::QueryElement,
+        PagedWord::KeyPage,
+        PagedWord::KeyToken,
+        PagedWord::KeyHead,
+        PagedWord::KeyElement,
+        PagedWord::ValuePage,
+        PagedWord::ValueToken,
+        PagedWord::ValueHead,
+        PagedWord::ValueElement,
+        PagedWord::OutRow,
+        PagedWord::OutHead,
+        PagedWord::OutElement,
+        PagedWord::MaxPages,
+        PagedWord::PageSize,
+        PagedWord::Scale,
+    ]);
+    if phase == Phase::Prefill {
+        words.push(PagedWord::MaxQueryRow);
+        words.push(PagedWord::Packed);
+    }
+    words
+}
+
 impl PagedAttention {
     /// Launch this crate's own Triton program for an `E4M3` page.
     ///
     /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
-    /// cache needs a program of ours (`notes/programs/paged_attention_fp8.md`). **This program serves
-    /// the decode phase alone**: one program per (query row, query head) walks the row's page table
-    /// once, carrying a running maximum, a running normaliser and an accumulator — a prefill has a
-    /// mask and several query rows per table row and is a second landing, not the same kernel.
+    /// cache needs a program of ours (`notes/programs/paged_attention_fp8.md`). **It serves both
+    /// phases from two kernels of one module**: decode walks one program per (query row, query head)
+    /// along the row's page table with a running maximum, normaliser and accumulator; prefill takes
+    /// the packed query rows as its first grid dimension, masks each row at its own key count and
+    /// reads the row's first token from the offsets.
     ///
     /// The refusals here are the operator's own conditions stated where the program's compilation
     /// makes them true: an E4M3 cache read without its scale, a window this program was not compiled
@@ -872,46 +994,105 @@ impl PagedAttention {
             word(name, view.strides.get(axis))
         };
 
+        // The program's words, in the order its signature declares them. One list holds the order,
+        // so a launch and a program that disagree are a test failure (`the_paged_attention_packs_`
+        // `the_words_its_program_declares`) rather than a wrong read on the device.
+        let packed = args.cum_seq_lens_q.numel() > 0;
         let mut arguments = Arguments::new();
-        arguments
-            .view(args.out)
-            .view(args.query)
-            .view(args.key)
-            .view(args.value)
-            .view(key_scale)
-            .view(value_scale)
-            .view(args.page_table)
-            .view(args.seq_lens)
-            .i32(stride("the query's row stride", &args.query, 0)?)
-            .i32(stride("the query's head stride", &args.query, 1)?)
-            .i32(stride("the query's element stride", &args.query, 2)?)
-            .i32(stride("the key cache's page stride", &args.key, 0)?)
-            .i32(stride("the key cache's token stride", &args.key, 1)?)
-            .i32(stride("the key cache's head stride", &args.key, 2)?)
-            .i32(stride("the key cache's element stride", &args.key, 3)?)
-            .i32(stride("the value cache's page stride", &args.value, 0)?)
-            .i32(stride("the value cache's token stride", &args.value, 1)?)
-            .i32(stride("the value cache's head stride", &args.value, 2)?)
-            .i32(stride("the value cache's element stride", &args.value, 3)?)
-            .i32(stride("the output's row stride", &args.out, 0)?)
-            .i32(stride("the output's head stride", &args.out, 1)?)
-            .i32(stride("the output's element stride", &args.out, 2)?)
-            .i32(word(
-                "the page table's width",
-                args.page_table.shape.dim(1),
-            )?)
-            .i32(word("the page size", launch.page_size)?)
-            .f32(args.scale);
-        if descriptor.phase == Phase::Prefill {
-            // A packed batch states each row's first query token; an unpacked one gives every row
-            // `max_q_len`, which the program derives from the row index.
-            let packed = args.cum_seq_lens_q.numel() > 0;
-            // The view is passed whether or not the batch is packed: `packed` is what the program
-            // branches on, and an unpacked call leaves the pointer unread.
-            arguments
-                .view(args.cum_seq_lens_q)
-                .i32(word("the longest query row", launch.max_q_len)?)
-                .i32(i32::from(packed));
+        for parameter in words(descriptor.phase) {
+            match parameter {
+                PagedWord::Out => {
+                    let _ = arguments.view(args.out);
+                }
+                PagedWord::Query => {
+                    let _ = arguments.view(args.query);
+                }
+                PagedWord::Key => {
+                    let _ = arguments.view(args.key);
+                }
+                PagedWord::Value => {
+                    let _ = arguments.view(args.value);
+                }
+                PagedWord::KeyScale => {
+                    let _ = arguments.view(key_scale);
+                }
+                PagedWord::ValueScale => {
+                    let _ = arguments.view(value_scale);
+                }
+                PagedWord::PageTable => {
+                    let _ = arguments.view(args.page_table);
+                }
+                PagedWord::SeqLens => {
+                    let _ = arguments.view(args.seq_lens);
+                }
+                // Passed whether or not the batch is packed: `packed` is what the program branches
+                // on, and an unpacked call leaves the pointer unread.
+                PagedWord::CumSeqLensQ => {
+                    let _ = arguments.view(args.cum_seq_lens_q);
+                }
+                PagedWord::QueryRow => {
+                    let _ = arguments.i32(stride("the query's row stride", &args.query, 0)?);
+                }
+                PagedWord::QueryHead => {
+                    let _ = arguments.i32(stride("the query's head stride", &args.query, 1)?);
+                }
+                PagedWord::QueryElement => {
+                    let _ = arguments.i32(stride("the query's element stride", &args.query, 2)?);
+                }
+                PagedWord::KeyPage => {
+                    let _ = arguments.i32(stride("the key cache's page stride", &args.key, 0)?);
+                }
+                PagedWord::KeyToken => {
+                    let _ = arguments.i32(stride("the key cache's token stride", &args.key, 1)?);
+                }
+                PagedWord::KeyHead => {
+                    let _ = arguments.i32(stride("the key cache's head stride", &args.key, 2)?);
+                }
+                PagedWord::KeyElement => {
+                    let _ = arguments.i32(stride("the key cache's element stride", &args.key, 3)?);
+                }
+                PagedWord::ValuePage => {
+                    let _ = arguments.i32(stride("the value cache's page stride", &args.value, 0)?);
+                }
+                PagedWord::ValueToken => {
+                    let _ =
+                        arguments.i32(stride("the value cache's token stride", &args.value, 1)?);
+                }
+                PagedWord::ValueHead => {
+                    let _ = arguments.i32(stride("the value cache's head stride", &args.value, 2)?);
+                }
+                PagedWord::ValueElement => {
+                    let _ =
+                        arguments.i32(stride("the value cache's element stride", &args.value, 3)?);
+                }
+                PagedWord::OutRow => {
+                    let _ = arguments.i32(stride("the output's row stride", &args.out, 0)?);
+                }
+                PagedWord::OutHead => {
+                    let _ = arguments.i32(stride("the output's head stride", &args.out, 1)?);
+                }
+                PagedWord::OutElement => {
+                    let _ = arguments.i32(stride("the output's element stride", &args.out, 2)?);
+                }
+                PagedWord::MaxPages => {
+                    let _ = arguments.i32(word(
+                        "the page table's width",
+                        args.page_table.shape.dim(1),
+                    )?);
+                }
+                PagedWord::PageSize => {
+                    let _ = arguments.i32(word("the page size", launch.page_size)?);
+                }
+                PagedWord::Scale => {
+                    let _ = arguments.f32(args.scale);
+                }
+                PagedWord::MaxQueryRow => {
+                    let _ = arguments.i32(word("the longest query row", launch.max_q_len)?);
+                }
+                PagedWord::Packed => {
+                    let _ = arguments.i32(i32::from(packed));
+                }
+            }
         }
 
         // One program per (query row, query head): at decode a table row is one query token, and at
@@ -1130,6 +1311,48 @@ pub(super) fn to_i64(operator: &'static str, value: u64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parameter names the Triton program declares, in order, without its constexprs.
+    fn program_parameters(kernel: &str) -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels/paged_attention/triton/src/paged_attention.py");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
+        let start = source
+            .find(&format!("def {kernel}("))
+            .unwrap_or_else(|| panic!("{kernel} is not in the program's source"));
+        let signature = &source[start..];
+        let open = signature.find('(').expect("the signature opens");
+        let close = signature.find("):").expect("the signature closes");
+        signature[open + 1..close]
+            .split(',')
+            .map(|one| one.trim())
+            .filter(|one| !one.is_empty() && !one.contains("tl.constexpr"))
+            .map(|one| one.split(':').next().unwrap_or(one).trim().to_owned())
+            .collect()
+    }
+
+    /// The program's signature is the operator's ABI, so the launch's words must be the program's
+    /// parameters in the program's order. The prefill kernel takes its offsets immediately after
+    /// `seq_lens`; packing them last is a launch the metadata check refuses at run time and nothing
+    /// catches at build time, which is why the order is asserted here rather than read carefully.
+    #[test]
+    fn the_paged_attention_packs_the_words_its_program_declares() {
+        for (phase, kernel) in [
+            (Phase::Decode, "_paged_attention_decode_kernel"),
+            (Phase::Prefill, "_paged_attention_prefill_kernel"),
+        ] {
+            let declared = program_parameters(kernel);
+            let packed: Vec<&str> = words(phase)
+                .iter()
+                .map(|word| word.program_name())
+                .collect();
+            assert_eq!(
+                packed, declared,
+                "the {phase:?} launch's words are not {kernel}'s parameters, in the program's order"
+            );
+        }
+    }
 
     /// A BF16 causal decode module of Qwen3-30B-A3B at TP=8, page size 64.
     fn decode() -> Descriptor {
