@@ -988,7 +988,11 @@ impl VideoDecoder {
         // every canvas only where every canvas is the same tiles. A deployment whose rasters tile
         // differently would need a table per raster, and is refused by both named.
         let tile = largest_tile(config, canvas.height, canvas.width)?;
-        let rows_bound = canvases.iter().map(|canvas| canvas.rows()).max().unwrap_or(0);
+        let rows_bound = canvases
+            .iter()
+            .map(|canvas| canvas.rows())
+            .max()
+            .unwrap_or(0);
         for other in &canvases[1..] {
             if largest_tile(config, other.height, other.width)? != tile {
                 return Err(Error::config(format!(
