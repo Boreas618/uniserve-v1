@@ -1319,7 +1319,7 @@ impl VideoEncoder {
             // The input convolution reads padded pixels and normalizes nothing of its own.
             pad(&mut programs, u64::from(*width) + 2);
             // Each level's blocks run at the level's incoming extent and its incoming width.
-            for (index, out) in stack.widths.iter().enumerate() {
+            for (index, _out) in stack.widths.iter().enumerate() {
                 let extent = extents[index];
                 let channels = if index == 0 {
                     stack.input_channels
@@ -1349,8 +1349,12 @@ impl VideoEncoder {
                         true,
                         padded,
                     ));
-                    // The block's residual add covers the whole level: `frames · extent · channels`.
-                    let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                    // The block's residual add reads the level's frame as `[rows, columns]`
+                    // (`rows(...)` reshapes with the last axis — the frame's **width** — kept), so the
+                    // descriptor's columns are the level's width and not its element count. The
+                    // recorder found this by launching the model's own `forward`: the walk stated
+                    // `frames · pixels · channels` and the launch passed the width.
+                    let columns = u64::from(extent.width);
                     if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
                         programs.launch::<ScaledAddOp>(&descriptor);
                     }
