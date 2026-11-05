@@ -575,11 +575,14 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
     are few of them whatever the moment.
     """  # noqa: D205
     try:
-        trouble = [
-            line
-            for line in _log_lines(log)
-            if " WARN" in line or " ERROR" in line
-        ]
+        # The engine writes `WARNING` and `ERROR`; a process that dies writes
+        # neither, so a panic and the daemon's own account of the loss are
+        # matched by their text as well.
+        marks = (" WARN", " ERROR", "panicked", "the engine was lost")
+        trouble = []
+        for line in _log_lines(log):
+            if any(mark in line for mark in marks):
+                trouble.append(line)
     except OSError as error:
         return f"\n(server log unreadable at {log}: {error})"
     if not trouble:

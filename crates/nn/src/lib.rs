@@ -18,17 +18,17 @@
 //!
 //! ## The layers
 //!
-//! [`layers`] holds what a model composes: [`Linear`](layers::Linear),
-//! [`RmsNorm`](layers::RmsNorm), [`LayerNorm`](layers::LayerNorm), [`Rotary`](layers::Rotary),
-//! [`Embedding`](layers::Embedding), [`Attention`](layers::Attention), [`Moe`](layers::Moe),
-//! [`Conv3d`](layers::Conv3d), [`Conv1d`](layers::Conv1d),
-//! [`ConvTranspose1d`](layers::ConvTranspose1d), [`UlyssesExchange`](layers::UlyssesExchange),
-//! [`Sampler`](layers::Sampler) and [`ParallelLMHead`](layers::ParallelLMHead); the diffusion and
-//! video models add [`Patch`](layers::Patch), [`UnpatchifyVideo`](layers::UnpatchifyVideo),
-//! [`CrossFade`](layers::CrossFade), [`RgbBytes`](layers::RgbBytes),
-//! [`Transpose`](layers::Transpose) and [`SegmentAttention`](layers::SegmentAttention), and the
+//! [`layers`] holds what a model composes: [`Linear`],
+//! [`RmsNorm`], [`LayerNorm`], [`Rotary`],
+//! [`Embedding`], [`Attention`], [`Moe`],
+//! [`Conv3d`], [`Conv1d`],
+//! [`ConvTranspose1d`], [`UlyssesExchange`],
+//! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
+//! video models add [`Patch`], [`UnpatchifyVideo`](layers::UnpatchifyVideo),
+//! [`CrossFade`], [`RgbBytes`],
+//! [`Transpose`](layers::Transpose) and [`SegmentAttention`], and the
 //! audio path adds
-//! [`Snake`](layers::Snake), [`AdaptivePool`](layers::AdaptivePool) and
+//! [`Snake`], [`AdaptivePool`] and
 //! [`BiasAdd`](layers::BiasAdd). Each holds weight views and geometry, and its forward calls
 //! operators.
 //!
