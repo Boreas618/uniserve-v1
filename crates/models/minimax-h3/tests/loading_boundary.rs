@@ -114,15 +114,19 @@ fn two_representations_are_refused_by_name() {
     let message = stored_dtype(&checkpoint, "transformer")
         .expect_err("a component of two float types has no answer")
         .to_string();
+    // The refusal must name the element types and the tensors that disagree; which case the crate's
+    // `DType` renders in is the crate's business, so the comparison folds case and the test asserts
+    // naming rather than spelling.
+    let folded = message.to_lowercase();
     for named in [
-        "BF16",
-        "F32",
+        "bf16",
+        "f32",
         "proj_in.weight",
         "adaln.table",
         "transformer",
     ] {
         assert!(
-            message.contains(named),
+            folded.contains(named),
             "the refusal must name {named}, and it says: {message}"
         );
     }
@@ -150,9 +154,10 @@ fn a_mixed_text_and_dit_pair_is_refused() {
     let message = refiner_types(DType::BF16, DType::F32, "transformer")
         .expect_err("a bf16 encoder over an f32 DiT is one mixed gemm")
         .to_string();
-    for named in ["BF16", "F32", "transformer", "refiner", "gemm"] {
+    let folded = message.to_lowercase();
+    for named in ["bf16", "f32", "transformer", "refiner", "gemm"] {
         assert!(
-            message.contains(named),
+            folded.contains(named),
             "the refusal must name {named}, and it says: {message}"
         );
     }

@@ -118,6 +118,30 @@ impl SegmentAttention {
     /// `query`, `key` and `value` are `[tiles · block, heads, head_dim]`; `out` has the query's
     /// shape. The softmax scale is `1/sqrt(head_dim)`, applied once to `q · k`: the sparse path has
     /// no learned softmax scale.
+    /// The descriptor one fine-attention launch takes, from the block geometry and the query's element
+    /// type. A walk states it from the same fields the launch reads.
+    pub fn descriptor_of(&self, dtype: DType) -> SparseDescriptor {
+        SparseDescriptor {
+            block: self.block,
+            dtype,
+            output: self.output,
+            head_dim: self.head_dim,
+            lse: false,
+            keys: self.keys,
+        }
+    }
+
+    /// The descriptor the padding-row zeroing takes: the output's element type and the tile geometry.
+    pub fn zero_descriptor(&self) -> segments::ZeroPaddingDescriptor {
+        segments::ZeroPaddingDescriptor {
+            dtype: self.output,
+            heads: self.heads,
+            tile_rows: self.block,
+            width: self.head_dim,
+            block_rows: BLOCK_ROWS,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -128,14 +152,7 @@ impl SegmentAttention {
         out: TensorView,
     ) -> Result<()> {
         let head_dim = f64::from(self.head_dim);
-        let descriptor = SparseDescriptor {
-            block: self.block,
-            dtype: query.dtype,
-            output: self.output,
-            head_dim: self.head_dim,
-            lse: false,
-            keys: self.keys,
-        };
+        let descriptor = self.descriptor_of(query.dtype);
         f.operate::<SparseAttention>(
             &descriptor,
             SparseArgs {
@@ -153,13 +170,7 @@ impl SegmentAttention {
         // The padding rows of a partial last tile are the packed sequence's, and nothing may leak
         // from them into the residual that adds this output; the same sizes that bound the key
         // tiles bound the query tiles.
-        let zeroing = segments::ZeroPaddingDescriptor {
-            dtype: self.output,
-            heads: self.heads,
-            tile_rows: self.block,
-            width: self.head_dim,
-            block_rows: BLOCK_ROWS,
-        };
+        let zeroing = self.zero_descriptor();
         f.operate::<VsaZeroPadding>(
             &zeroing,
             segments::ZeroPaddingArgs {

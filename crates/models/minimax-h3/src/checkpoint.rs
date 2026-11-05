@@ -96,8 +96,24 @@ pub struct Contract {
     pub audio_shift: f32,
     /// The student's schedule.
     pub schedule: ContractSchedule,
-    /// The student's sparse attention.
-    pub attention: SparseContract,
+    /// The student's attention backend, as the export states it.
+    pub backend: AttentionBackend,
+    /// The student's sparse attention, stated exactly when the backend is sparse.
+    pub attention: Option<SparseContract>,
+}
+
+/// The attention backend a FastH3 export states for its student.
+///
+/// The checkpoints say so themselves (`attention_backend`), and it is the fact that decides whether a
+/// dense or a tiled attention is served: inferring it from the presence of the sparse knobs would make a
+/// student that states dense attention but keeps its distillation's `vsa_*` values read as sparse, and the
+/// inference would be invisible until a device disagreed with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttentionBackend {
+    /// Full bidirectional attention over the packed row set: what the base release runs.
+    Dense,
+    /// VSA sparse attention over spatiotemporal tiles.
+    VideoSparseH3,
 }
 
 /// The schedule a FastH3 export states, one of the two kinds a student is distilled with.
@@ -259,17 +275,40 @@ impl Contract {
         let video_shift = single(object, "video_scheduler_shift")?;
         let audio_shift = single(object, "audio_scheduler_shift")?;
         let schedule = Self::schedule(object)?;
-        let attention = SparseContract {
-            tile: integer(object, "vsa_tile_size")?,
-            sparsity: number(object, "vsa_sparsity")?,
-            reference_keep: match object.get("vsa_ref_keep_rate") {
-                None | Some(Value::Null) => None,
-                Some(value) => Some(value.as_f64().ok_or_else(|| {
-                    Error::checkpoint(
-                        "fastvideo_inference.json vsa_ref_keep_rate must be a number".to_owned(),
-                    )
-                })?),
+        // The backend is the export's own statement. A contract that names none attends densely: the
+        // sparse knobs are the distillation's, and a dense student need carry none of them.
+        let backend = match object.get("attention_backend") {
+            None | Some(Value::Null) => AttentionBackend::Dense,
+            Some(Value::String(name)) => match name.as_str() {
+                "VIDEO_SPARSE_ATTN_H3" => AttentionBackend::VideoSparseH3,
+                "DENSE" => AttentionBackend::Dense,
+                other => {
+                    return Err(Error::checkpoint(format!(
+                        "fastvideo_inference.json states the attention backend {other:?}, which this \
+                         build does not serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3"
+                    )));
+                }
             },
+            Some(_) => {
+                return Err(Error::checkpoint(
+                    "fastvideo_inference.json attention_backend must be a string".to_owned(),
+                ));
+            }
+        };
+        let attention = match backend {
+            AttentionBackend::Dense => None,
+            AttentionBackend::VideoSparseH3 => Some(SparseContract {
+                tile: integer(object, "vsa_tile_size")?,
+                sparsity: number(object, "vsa_sparsity")?,
+                reference_keep: match object.get("vsa_ref_keep_rate") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(value.as_f64().ok_or_else(|| {
+                        Error::checkpoint(
+                            "fastvideo_inference.json vsa_ref_keep_rate must be a number".to_owned(),
+                        )
+                    })?),
+                },
+            }),
         };
         Ok(Self {
             task,
@@ -278,6 +317,7 @@ impl Contract {
             video_shift,
             audio_shift,
             schedule,
+            backend,
             attention,
         })
     }
@@ -726,6 +766,7 @@ mod tests {
                 "video_scheduler_shift": 10.0,
                 "audio_scheduler_shift": 3.0,
                 "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+                "attention_backend": "VIDEO_SPARSE_ATTN_H3",
                 "vsa_tile_size": 64,
                 "vsa_sparsity": 0.8
             }"#,
@@ -750,15 +791,64 @@ mod tests {
             contract.schedule,
             ContractSchedule::Rungs(vec![999, 874, 749, 624, 500, 375, 250, 125])
         );
+        assert_eq!(contract.backend, AttentionBackend::VideoSparseH3);
         assert_eq!(
             contract.attention,
-            SparseContract {
+            Some(SparseContract {
                 tile: 64,
                 sparsity: 0.8,
                 reference_keep: None
-            }
+            })
         );
         assert!(contract.base_revision.is_none());
+    }
+
+    #[test]
+    fn an_export_states_its_attention_backend_and_an_unknown_one_is_refused() {
+        let dense: serde_json::Value = serde_json::from_str(
+            r#"{
+                "task": "t2av",
+                "video_scheduler_shift": 10.0,
+                "audio_scheduler_shift": 3.0,
+                "dmd_denoising_steps": [10],
+                "attention_backend": "DENSE",
+                "vsa_tile_size": 64,
+                "vsa_sparsity": 0.9
+            }"#,
+        )
+        .expect("json");
+        let contract = Contract::parse(dense.as_object().expect("object")).expect("a dense export");
+        assert_eq!(contract.backend, AttentionBackend::Dense);
+        // The knobs are the distillation's, not the backend's: a dense student carries none.
+        assert_eq!(contract.attention, None);
+
+        // A contract that names no backend attends densely, which is what a base release does.
+        let silent: serde_json::Value = serde_json::from_str(
+            r#"{
+                "task": "t2av",
+                "video_scheduler_shift": 10.0,
+                "audio_scheduler_shift": 3.0,
+                "dmd_denoising_steps": [10]
+            }"#,
+        )
+        .expect("json");
+        let contract = Contract::parse(silent.as_object().expect("object")).expect("a base release");
+        assert_eq!(contract.backend, AttentionBackend::Dense);
+        assert_eq!(contract.attention, None);
+
+        let unknown: serde_json::Value = serde_json::from_str(
+            r#"{
+                "task": "t2av",
+                "video_scheduler_shift": 10.0,
+                "audio_scheduler_shift": 3.0,
+                "dmd_denoising_steps": [10],
+                "attention_backend": "FLEX_ATTENTION"
+            }"#,
+        )
+        .expect("json");
+        let error = Contract::parse(unknown.as_object().expect("object"))
+            .expect_err("an unserved backend is refused by name");
+        assert!(error.to_string().contains("FLEX_ATTENTION"), "{error}");
     }
 
     #[test]
@@ -774,6 +864,7 @@ mod tests {
                 "audio_scheduler_shift": 3.0,
                 "pdd_step_indices": [0, 4, 8, 12, 16, 20, 24, 28, 32],
                 "grid_max_t": 0.999,
+                "attention_backend": "VIDEO_SPARSE_ATTN_H3",
                 "vsa_tile_size": 128,
                 "vsa_sparsity": 0.9,
                 "vsa_ref_keep_rate": 0.1
@@ -797,7 +888,12 @@ mod tests {
                 max_t: 0.999
             }
         );
-        assert_eq!(contract.attention.reference_keep, Some(0.1));
+        let SparseContract {
+            tile,
+            sparsity,
+            reference_keep,
+        } = contract.attention.expect("an OmniRef export states its sparse attention");
+        assert_eq!((tile, sparsity, reference_keep), (128, 0.9, Some(0.1)));
     }
 
     #[test]

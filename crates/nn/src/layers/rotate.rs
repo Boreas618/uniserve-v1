@@ -67,6 +67,22 @@ impl Rotate {
         })
     }
 
+    /// The descriptor one rotation launch takes, for a walk that asks a model which programs it
+    /// launches with no device: the geometry is the module's and the element types are the call's.
+    pub fn descriptor(&self, input: ops::DType, output: ops::DType) -> RopeApplyDescriptor {
+        RopeApplyDescriptor {
+            dtype: input,
+            output,
+            head_dim: self.head_dim,
+            heads: self.heads,
+            rotation: self.rotation,
+            rotated: self.rotated,
+            rows: ROWS,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// Turn only the leading `rotated` channels of each head, copying the rest unchanged.
     ///
     /// The default is the whole head. A model whose heads interleave a rotation of a few axes with
@@ -113,17 +129,7 @@ impl Rotate {
         sine: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let descriptor = RopeApplyDescriptor {
-            dtype: x.dtype,
-            output: out.dtype,
-            head_dim: self.head_dim,
-            heads: self.heads,
-            rotation: self.rotation,
-            rotated: self.rotated,
-            rows: ROWS,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor(x.dtype, out.dtype);
         f.operate::<RopeApply>(
             &descriptor,
             RopeApplyArgs {

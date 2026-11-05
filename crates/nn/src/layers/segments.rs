@@ -1,17 +1,24 @@
 //! Selecting the key tiles a video sparse attention reads (VSA).
 //!
 //! The sequence is cut into `tile_rows`-row tiles and a query tile attends only to the key tiles its
-//! pooled scores select. Five programs do it, none of them allocating, all of them leaving their
+//! pooled scores select. **Six programs** do it, none of them allocating, all of them leaving their
 //! indices on the device so a captured graph replays the selection (specs/worker.md 9, "VSA 分块";
 //! `ops::segments`):
 //!
 //! ```text
 //! prepare     normalize and rotate Q and K in place, zero each tile's padding rows, pool the means
 //! zero        zero each tile's padding rows, in place
-//! add_gated   fold the compressed branch's gated rows into a tile's rows, in place
-//! compose     write one row interval of every member's gated rows, member-major
+//! scores      one dot product per (query tile, key tile) and head, over the pooled means
 //! select      choose each query tile's key tiles from its pooled scores
+//! compress    reduce each (head, query tile) over the tiles it selects, pooled value in, rows out
+//! add_gated   fold the compressed branch's gated rows into a tile's rows, in place
 //! ```
+//!
+//! `ops::segments` also declares `vsa_compose_gated_rows` — the member-major composition of one row
+//! interval from several members — which **no launch in this model reaches**: the sparse chain here
+//! composes a single member per query interval, and the multi-member form belongs to a caller that
+//! has not appeared. It stays declared for that reason and not as a stage this chain fuses; a store
+//! built for it would have no launch to serve.
 //!
 //! The layer holds the geometry — tile rows, heads, features, the rotation's extent — and the
 //! epsilon of the Q/K normalization. Every activation, every score and every derived table is the
@@ -128,12 +135,16 @@ impl VsaTiles {
         self.width
     }
 
-    /// The descriptor one launch of each of this layer's five programs takes.
+    /// The descriptor this layer's `vsa_prepare_tiles` launch takes.
     ///
-    /// Five, not one: the chain's five launches are five different operators (`vsa_prepare_tiles`,
-    /// `vsa_zero_padding`, `vsa_add_gated_tiles`, `vsa_compose_gated_rows`, `vsa_select_tiles`), so a
-    /// walk that asks which programs a model launches needs each by its own name and with the
-    /// geometry that launch reads.
+    /// Each program needs its own accessor rather than one shared descriptor, because they are
+    /// different operators with different geometry: `vsa_prepare_tiles`, `vsa_zero_padding`,
+    /// `vsa_scores`, `vsa_select_tiles`, `vsa_compress_pooled` and `vsa_add_gated_tiles` are the six
+    /// this chain launches, and `vsa_compose_gated_rows` is declared and reached by no launch here.
+    ///
+    /// The prepare launch is the one whose descriptor reads **strides**, so a walk without a device
+    /// can state it only for the layout the model's buffers have: `query_row_stride` and
+    /// `query_head_stride` are the caller's views, not the layer's geometry.
     pub fn prepare_tiles_descriptor(
         &self,
         query: TensorView,
@@ -251,6 +262,63 @@ impl VsaTiles {
         Ok(())
     }
 
+    /// The descriptor one `vsa_prepare_tiles` launch takes, from the geometry and the strides.
+    ///
+    /// The strides are **compiled in** (`crates/ops/kernels/vsa_prepare_tiles/triton/src/build.py`
+    /// hands them to the build as constants), so they are in the key, and a walk states them from the
+    /// layout the model's own buffers have rather than from a caller's choice.
+    pub fn prepare_descriptor(
+        dtype: DType,
+        geometry: [u32; 5],
+        norm: bool,
+        strides: [u64; 7],
+        epsilon: Float,
+    ) -> segments::PrepareTilesDescriptor {
+        let [heads, width, rotated, tile_rows, block_rows] = geometry;
+        let [query_row, query_head, key_row, key_head, value_row, value_head, factor] = strides;
+        segments::PrepareTilesDescriptor {
+            dtype,
+            heads,
+            width,
+            rotated,
+            tile_rows,
+            block_rows,
+            epsilon,
+            norm,
+            query_row_stride: query_row,
+            query_head_stride: query_head,
+            key_row_stride: key_row,
+            key_head_stride: key_head,
+            value_row_stride: value_row,
+            value_head_stride: value_head,
+            factor_stride: factor,
+        }
+    }
+
+    /// The descriptor the launch takes for a `[rows, heads, width]` row-major view and a factor table
+    /// whose rows are `factor_row` long — the layout the model's arena buffers have.
+    pub fn contiguous_prepare_descriptor(
+        &self,
+        dtype: DType,
+        factor_row: u64,
+    ) -> segments::PrepareTilesDescriptor {
+        let row = u64::from(self.heads) * u64::from(self.width);
+        let head = u64::from(self.width);
+        Self::prepare_descriptor(
+            dtype,
+            [
+                self.heads,
+                self.width,
+                self.rotated,
+                self.tile_rows,
+                self.block_rows,
+            ],
+            self.norm,
+            [row, head, row, head, row, head, factor_row],
+            Float::from(self.eps),
+        )
+    }
+
     /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
     ///
     /// `query`, `key` and `value` are `[tiles · tile_rows, heads, width]` and are modified in place;
@@ -274,23 +342,27 @@ impl VsaTiles {
         pooled_value: TensorView,
     ) -> Result<()> {
         self.check_prepare(query_weight.is_some(), key_weight.is_some(), cosine, sine)?;
-        let descriptor = segments::PrepareTilesDescriptor {
-            dtype: query.dtype,
-            heads: self.heads,
-            width: self.width,
-            rotated: self.rotated,
-            tile_rows: self.tile_rows,
-            block_rows: self.block_rows,
-            epsilon: Float::from(self.eps),
-            norm: self.norm,
-            query_row_stride: query.strides.get(0),
-            query_head_stride: query.strides.get(1),
-            key_row_stride: key.strides.get(0),
-            key_head_stride: key.strides.get(1),
-            value_row_stride: value.strides.get(0),
-            value_head_stride: value.strides.get(1),
-            factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
-        };
+        let descriptor = Self::prepare_descriptor(
+            query.dtype,
+            [
+                self.heads,
+                self.width,
+                self.rotated,
+                self.tile_rows,
+                self.block_rows,
+            ],
+            self.norm,
+            [
+                query.strides.get(0),
+                query.strides.get(1),
+                key.strides.get(0),
+                key.strides.get(1),
+                value.strides.get(0),
+                value.strides.get(1),
+                cosine.map(|table| table.strides.get(0)).unwrap_or(0),
+            ],
+            Float::from(self.eps),
+        );
         let args = segments::PrepareTilesArgs {
             query,
             key,
@@ -406,6 +478,30 @@ impl VsaTiles {
     /// `[heads, query tiles, tiles]` FP32, contiguous, written here and read by [`Self::select`]. One
     /// dot product per (query tile, key tile) and head — no scale and no softmax, because the
     /// selection only compares and the attention scales its own products.
+    /// The descriptor one score launch takes: the head count, the features per head and the bound on
+    /// the dot product's length. A walk states it from the layer's own geometry.
+    pub fn scores_descriptor(&self) -> segments::ScoresDescriptor {
+        segments::ScoresDescriptor::new(
+            self.heads,
+            self.width,
+            self.width.next_power_of_two(),
+            false,
+        )
+    }
+
+    /// The descriptor one compression launch takes: the element type, the head count, the features
+    /// per head, and the bound on the key tiles one reduction covers.
+    pub fn compress_descriptor(&self, dtype: DType) -> segments::CompressPooledDescriptor {
+        segments::CompressPooledDescriptor::new(
+            dtype,
+            self.heads,
+            self.width,
+            self.max_tiles,
+            self.width.next_power_of_two(),
+            false,
+        )
+    }
+
     pub fn scores(
         &self,
         f: &Forward,
@@ -422,14 +518,19 @@ impl VsaTiles {
                 ),
             ));
         }
-        let width = u32::try_from(pooled_query.shape.dim(2)).map_err(|_| {
-            Error::shape(
+        // The pooled features are the layer's own width: the program sums that many per head, and a
+        // wider query would be read through a stride the descriptor never declared.
+        if pooled_query.shape.dim(2) != u64::from(self.width) {
+            return Err(Error::shape(
                 "VsaTiles",
-                format!("{} features per head", pooled_query.shape.dim(2)),
-            )
-        })?;
-        let descriptor =
-            segments::ScoresDescriptor::new(self.heads, width, width.next_power_of_two(), false);
+                format!(
+                    "the pooled query holds {} features per head, the layer {}",
+                    pooled_query.shape.dim(2),
+                    self.width
+                ),
+            ));
+        }
+        let descriptor = self.scores_descriptor();
         let args = segments::ScoresArgs {
             pooled_query,
             pooled_key,
@@ -458,14 +559,7 @@ impl VsaTiles {
         out: TensorView,
     ) -> Result<()> {
         self.check_compress(scores, values, sizes, out)?;
-        let descriptor = segments::CompressPooledDescriptor::new(
-            out.dtype,
-            self.heads,
-            self.width,
-            self.max_tiles,
-            self.width.next_power_of_two(),
-            false,
-        );
+        let descriptor = self.compress_descriptor(out.dtype);
         let args = segments::CompressPooledArgs {
             scores,
             values,
