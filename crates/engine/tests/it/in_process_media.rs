@@ -175,6 +175,12 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
 /// If this case passes while `unsupported_media_is_rejected_without_stopping_the_engine`
 /// fails, the engine serves and the rejection is what blocks the later
 /// request. If both fail, the construct starves and rejections are innocent.
+///
+/// **This is a probe with a disposal instruction, not a permanent case.** When
+/// it answers: if text is served, fold it into
+/// `unsupported_media_is_rejected_without_stopping_the_engine` and delete it —
+/// the behaviour it states is that case's. If text is refused, it stays: an
+/// admission that closes behind a rejection is a behaviour worth naming.
 #[test]
 fn text_is_served_before_any_rejection() {
     let pool = Arc::new(Serving::new(vec![support::pool("model")]));
