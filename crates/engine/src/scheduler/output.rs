@@ -2064,7 +2064,7 @@ struct PublishedPages<'a> {
 )]
 fn offloads(
     kv_offload: &KvOffloadManager,
-    worker: &crate::WorkerGroupId,
+    worker: &crate::ExecutorGroupId,
     request: RequestId,
     pool: &BlockPool,
     allocation: &CacheAllocation,

@@ -23,7 +23,7 @@ use crate::executors::IncarnationRegistry;
 /// placed on.
 pub(crate) fn refuse_shared_storage_off_engine_host(
     engine_host: &str,
-    ranks: &[crate::WorkerRank],
+    ranks: &[crate::ExecutorRank],
     components: &BTreeMap<String, crate::executor::ComponentConfig>,
     media_components: &BTreeMap<ipc::MediaCall, String>,
 ) -> anyhow::Result<()> {
@@ -98,7 +98,7 @@ pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Opti
 pub(crate) fn media_consumer_slots(
     consuming: &[ipc::MediaCall],
     routing: &BTreeMap<ipc::MediaCall, String>,
-    routed: &BTreeMap<String, crate::WorkerGroupId>,
+    routed: &BTreeMap<String, crate::ExecutorGroupId>,
     worker: &str,
     components: &BTreeMap<String, crate::ComponentConfig>,
     peers: &BTreeMap<String, BTreeMap<String, crate::ComponentConfig>>,
@@ -174,7 +174,7 @@ impl ExecutorGroup {
     pub(super) fn consumer_slots(
         &self,
         call: &ipc::Call,
-        routed: Option<&BTreeMap<String, crate::WorkerGroupId>>,
+        routed: Option<&BTreeMap<String, crate::ExecutorGroupId>>,
         members: &[usize],
         rank: usize,
     ) -> Vec<u32> {
@@ -214,7 +214,7 @@ impl ExecutorGroup {
     pub fn placement(
         &self,
     ) -> (
-        &[crate::WorkerRank],
+        &[crate::ExecutorRank],
         &BTreeMap<String, crate::ComponentConfig>,
     ) {
         (&self.process_args.ranks, &self.process_args.components)
@@ -243,7 +243,7 @@ impl ExecutorGroup {
     /// incarnations, which every group of the deployment then shares.
     pub(crate) fn share_incarnations(&mut self, incarnations: IncarnationRegistry) {
         incarnations.assign(
-            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
+            &crate::ExecutorGroupId(self.process_args.worker_id.clone()),
             self.workers.iter().map(|worker| &worker.info().endpoint),
         );
         self.incarnations = incarnations;
@@ -283,7 +283,7 @@ pub(super) fn rank_projection(
             // at a time to the ranks the call names, or to its ranks in
             // configured order when the call names none, so only the ranks
             // the call's `max_units` reach take part.
-            // `WorkerGroupConfig::validate_members`, which `spawn_workers` calls,
+            // `ExecutorGroupConfig::validate_members`, which `spawn_workers` calls,
             // rejects a zero `units_per_rank`.
             if entry.distribution.is_none() {
                 return Ok(entry.ranks.clone());
@@ -444,7 +444,7 @@ pub(super) fn rank_projection(
 #[cfg(test)]
 mod tests {
     use super::{output_owner, rank_projection, refuse_shared_storage_off_engine_host};
-    use crate::WorkerRank;
+    use crate::ExecutorRank;
     use crate::executor::ComponentConfig;
     use ipc::MediaCall;
     use std::collections::BTreeMap;
@@ -495,11 +495,11 @@ mod tests {
         assert_eq!(output_owner(&ranks, &[]), None);
     }
 
-    fn placement(hosts: &[&str]) -> Vec<WorkerRank> {
+    fn placement(hosts: &[&str]) -> Vec<ExecutorRank> {
         hosts
             .iter()
             .enumerate()
-            .map(|(index, host)| WorkerRank {
+            .map(|(index, host)| ExecutorRank {
                 host: (*host).to_owned(),
                 device: format!("cuda:{index}"),
             })

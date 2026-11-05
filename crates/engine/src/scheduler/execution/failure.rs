@@ -1,5 +1,5 @@
 //! Failure reconciliation: `on_executor_error` retires only the work a
-//! `WorkerFailure` invalidates. Any other executor error, and a worker failure
+//! `ExecutorFailure` invalidates. Any other executor error, and a worker failure
 //! classified as a control-plane invariant violation, is engine-fatal.
 
 use super::*;
@@ -8,13 +8,13 @@ impl Scheduler {
     /// Preserves unrelated requests after a reconciled Worker failure. Unclassified
     /// executor errors and control-plane invariant violations remain fatal.
     ///
-    /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
+    /// A `ExecutorFailure` is reconciled by `fail_after_worker_failure`; the
     /// failure class `InvariantViolation` also latches engine-fatal. Losing
     /// every execution-capable worker also stops the engine, so later
     /// admissions cannot wait for capacity that will never return. Any other error latches engine-fatal and fails every in-flight
     /// call.
     pub(in crate::scheduler) fn on_executor_error(&mut self, error: anyhow::Error) {
-        if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
+        if let Some(failure) = error.downcast_ref::<ExecutorFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code);
             // Requests refused earlier keep their place while a call of
@@ -271,7 +271,7 @@ impl Scheduler {
     /// `loss` names as refused is rejected with the reason the worker stated
     /// rather than failed. A retired call that has no pending record latches
     /// engine-fatal and stops reconciliation.
-    fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
+    fn fail_after_worker_failure(&mut self, loss: &ExecutorFailure) {
         // Blocks published from an invalidated worker incarnation leave
         // prefix-cache lookup; pages still referenced keep their owners.
         if let Some(cache) = &self.storage.cache {

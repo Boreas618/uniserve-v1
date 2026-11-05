@@ -1,4 +1,4 @@
-//! Reconciliation of a [`WorkerFailure`]: a lost group's resident requests,
+//! Reconciliation of a [`ExecutorFailure`]: a lost group's resident requests,
 //! buffers and exports, or the named calls, requests or batch of an intact one,
 //! and every call, request and buffer that depends on them.
 
@@ -7,8 +7,8 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::Context;
 
 use super::Dispatcher;
-use crate::executor::WorkerResult;
-use crate::executor::{CommandOutcome, WorkerFailure};
+use crate::executor::ExecutorResult;
+use crate::executor::{CommandOutcome, ExecutorFailure};
 
 impl Dispatcher {
     /// Reconciles abandoned work and its dependents while retaining live physical owners.
@@ -23,13 +23,13 @@ impl Dispatcher {
     /// and `buffers` include the dependents found here, and `retired` lists
     /// every pending call that will now never complete, each removed from its
     /// pending batch. Batches left with no pending executor publish an empty
-    /// terminal result. An error that is not a `WorkerFailure` is returned
+    /// terminal result. An error that is not a `ExecutorFailure` is returned
     /// unchanged.
     pub(super) fn reconcile_worker_failure(
         &mut self,
         error: anyhow::Error,
-    ) -> anyhow::Result<WorkerFailure> {
-        let mut loss = error.downcast::<WorkerFailure>()?;
+    ) -> anyhow::Result<ExecutorFailure> {
+        let mut loss = error.downcast::<ExecutorFailure>()?;
         let index = *self
             .routing
             .get(&loss.worker_id)
@@ -244,7 +244,7 @@ impl Dispatcher {
                 .get(&batch_id)
                 .is_some_and(|pending| pending.workers.is_empty())
             {
-                self.publish_result(WorkerResult {
+                self.publish_result(ExecutorResult {
                     batch_id,
                     done: true,
                     results: Vec::new(),

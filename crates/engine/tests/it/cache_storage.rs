@@ -3,11 +3,11 @@
 //! world beside everything else the ledger books and what a successor adds,
 //! lets the requests that hold the tail it withdraws run to their end (or
 //! recomputes them past its bound, or once they cannot get a unit to
-//! continue) before the workers give the tail back,
+//! continue) before the executors give the tail back,
 //! and refuses a successor whose limit cannot hold the first segment; a
 //! restore creates the tail again and a growth as much of it as the
 //! ledger's room holds; a sleeping scheduler admits nothing until it wakes,
-//! and a weight update rewrites the weights while the workers sleep.
+//! and a weight update rewrites the weights while the executors sleep.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use engine::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
     ExecutorError, ExecutorInfo, ExecutorSubmitError, FinishReason, SchedulerConfig, SimEngine,
-    SimExecutor, Successor, WeightsInFlight, WorkerGroupId,
+    SimExecutor, Successor, WeightsInFlight, ExecutorGroupId,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
@@ -37,15 +37,15 @@ const BLOCK: u32 = 16;
 const UNIT_BYTES: u64 = 250;
 const SEGMENT_BYTES: u64 = SEGMENT_UNITS as u64 * UNIT_BYTES;
 
-/// The serving world of the simulated workers.
+/// The serving world of the simulated executors.
 const WORLD: u64 = 1;
 
-/// What the simulated workers report and the hooks they ran.
+/// What the simulated executors report and the hooks they ran.
 #[derive(Default)]
-struct Workers {
-    /// The quota of the worker's GPU.
+struct SimExecutors {
+    /// The quota of the executor's GPU.
     quota: u64,
-    /// What the worker's process books beside its weights and its cache.
+    /// What the executor's process books beside its weights and its cache.
     process_bytes: u64,
     /// The serving world's captured graph allocations.
     graph_bytes: u64,
@@ -60,24 +60,24 @@ struct Workers {
     weights_bytes: u64,
     /// Free device bytes.
     free_bytes: u64,
-    /// Segments the worker holds.
+    /// Segments the executor holds.
     held: u32,
     /// Device bytes of the head segment a successor creates.
     head_bytes: u64,
     /// The units a configured token capacity holds; `None` for a cache
     /// sized by storage.
     capacity_units: Option<u64>,
-    /// Whether an expert worker, which holds no cache, reports beside the
-    /// worker that holds it.
+    /// Whether an expert executor, which holds no cache, reports beside the
+    /// executor that holds it.
     experts: bool,
-    /// What the expert worker's process books on a GPU of its own whose
-    /// quota is 1000 bytes; `None` for an expert worker that reports no
+    /// What the expert executor's process books on a GPU of its own whose
+    /// quota is 1000 bytes; `None` for an expert executor that reports no
     /// ledger.
     expert_process: Option<u64>,
     /// Each hook run, with its payload.
     hooks: Vec<String>,
     /// The graph share a successor's warmup takes on the GPU, and whether
-    /// the worker's model can be captured at all.
+    /// the executor's model can be captured at all.
     graph_share_bytes: u64,
     capturable: bool,
     /// The bandwidth from host storage to the GPU the Transfer Server
@@ -85,8 +85,8 @@ struct Workers {
     host_link: Option<u64>,
 }
 
-impl Workers {
-    /// The serving workers of a GPU whose quota their cache of eight
+impl SimExecutors {
+    /// The serving executors of a GPU whose quota their cache of eight
     /// segments and their process of `process_bytes` fill.
     fn filling(process_bytes: u64) -> Self {
         Self {
@@ -98,7 +98,7 @@ impl Workers {
         }
     }
 
-    /// The deployment's ledger of the worker's GPU: each held segment of the
+    /// The deployment's ledger of the executor's GPU: each held segment of the
     /// serving world, its process, and the other world's and the Transfer
     /// Server's bookings.
     fn ledger(&self) -> GpuLedger {
@@ -176,11 +176,11 @@ impl Workers {
     }
 }
 
-/// The simulator, whose workers answer the engine's own hooks as workers
+/// The simulator, whose executors answer the engine's own hooks as executors
 /// with segmented planes do and whose results take `STEP` each.
 struct Segmented {
     inner: SimExecutor,
-    workers: Arc<Mutex<Workers>>,
+    executors: Arc<Mutex<SimExecutors>>,
 }
 
 /// How long each batch result takes.
@@ -191,11 +191,11 @@ impl Executor for Segmented {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 
@@ -217,8 +217,8 @@ impl Executor for Segmented {
     }
 
     fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
-        let mut workers = self.workers.lock().unwrap();
-        workers
+        let mut executors = self.executors.lock().unwrap();
+        executors
             .hooks
             .push(format!("{name} {payload}").trim_end().to_owned());
         let result = match name {
@@ -230,23 +230,23 @@ impl Executor for Segmented {
                         units: SEGMENT_UNITS,
                     })
                     .collect::<Vec<_>>(),
-                "held": workers.held,
+                "held": executors.held,
                 "unit_bytes": UNIT_BYTES,
-                "head_bytes": workers.head_bytes,
-                "capacity_units": workers.capacity_units,
+                "head_bytes": executors.head_bytes,
+                "capacity_units": executors.capacity_units,
                 "scratch_units": 0,
-                "free_bytes": workers.free_bytes,
-                "graph_share_bytes": workers.graph_share_bytes,
-                "capturable": workers.capturable,
+                "free_bytes": executors.free_bytes,
+                "graph_share_bytes": executors.graph_share_bytes,
+                "capturable": executors.capturable,
                 "host": "node0",
                 "scope": {"deployment": "model", "group": "model", "rank": 0},
                 "world": WORLD,
-                "ledger": workers.ledger(),
+                "ledger": executors.ledger(),
                 "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
             }),
             "uniserve.release_cache" => {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
-                workers.held = payload["from"].as_u64().unwrap() as u32;
+                executors.held = payload["from"].as_u64().unwrap() as u32;
                 serde_json::Value::Null
             }
             "uniserve.restore_cache" => {
@@ -255,18 +255,18 @@ impl Executor for Segmented {
                 } else {
                     serde_json::from_str(payload)?
                 };
-                workers.held = match payload["segments"].as_u64() {
-                    Some(count) => (workers.held + count as u32).min(SEGMENTS),
+                executors.held = match payload["segments"].as_u64() {
+                    Some(count) => (executors.held + count as u32).min(SEGMENTS),
                     None => SEGMENTS,
                 };
                 serde_json::Value::Null
             }
             "uniserve.wake" => {
-                workers.held = SEGMENTS;
+                executors.held = SEGMENTS;
                 serde_json::Value::Null
             }
             "uniserve.sleep" => {
-                workers.held = 0;
+                executors.held = 0;
                 serde_json::Value::Null
             }
             "uniserve.update_weights" => serde_json::json!({ "group": null, "page_contents": [] }),
@@ -274,8 +274,8 @@ impl Executor for Segmented {
             other => anyhow::bail!("no worker hook {other}"),
         };
         let mut results = vec![result.to_string()];
-        if workers.experts && name == "uniserve.cache_storage" {
-            let ledger = workers.expert_process.map(|process| GpuLedger {
+        if executors.experts && name == "uniserve.cache_storage" {
+            let ledger = executors.expert_process.map(|process| GpuLedger {
                 gpu: [8; 16],
                 deployment: "model".into(),
                 total: 2_000,
@@ -295,7 +295,7 @@ impl Executor for Segmented {
                 transfer_context: 0,
             });
             // The device has free what its total leaves beside the process.
-            let free = workers.expert_process.map_or(0, |process| 2_000 - process);
+            let free = executors.expert_process.map_or(0, |process| 2_000 - process);
             results.push(
                 serde_json::json!({
                     "free_bytes": free,
@@ -311,18 +311,18 @@ impl Executor for Segmented {
     }
 }
 
-/// A scheduler over the simulator whose `workers` serve a cache of
+/// A scheduler over the simulator whose `executors` serve a cache of
 /// segmented planes of 32 units of `BLOCK` tokens.
-fn start(workers: Workers) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
-    start_split(workers, None)
+fn start(executors: SimExecutors) -> (CommandSender, Arc<Mutex<SimExecutors>>, thread::JoinHandle<()>) {
+    start_split(executors, None)
 }
 
-/// [`start`], the workers reporting their planes' segments when `split`,
+/// [`start`], the executors reporting their planes' segments when `split`,
 /// the first `inherited` of them past the head mapped from a predecessor.
 fn start_split(
-    workers: Workers,
+    executors: SimExecutors,
     split: Option<u32>,
-) -> (CommandSender, Arc<Mutex<Workers>>, thread::JoinHandle<()>) {
+) -> (CommandSender, Arc<Mutex<SimExecutors>>, thread::JoinHandle<()>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(10_000);
     sim.set_num_units(SEGMENTS * SEGMENT_UNITS);
@@ -330,11 +330,11 @@ fn start_split(
     if let Some(inherited) = split {
         sim.set_segments(SEGMENTS, SEGMENT_UNITS, inherited);
     }
-    let workers = Arc::new(Mutex::new(workers));
+    let executors = Arc::new(Mutex::new(executors));
     let scheduler = support::scheduler_with(
         Box::new(Segmented {
             inner: SimExecutor::new(sim),
-            workers: Arc::clone(&workers),
+            executors: Arc::clone(&executors),
         }),
         SimEngine::special_tokens(),
         SchedulerConfig::default(),
@@ -344,7 +344,7 @@ fn start_split(
     let thread = thread::spawn(move || {
         let _ = scheduler.run(rx);
     });
-    (CommandSender::new(tx), workers, thread)
+    (CommandSender::new(tx), executors, thread)
 }
 
 /// A text request of `pages` cache pages of prompt that generates up to
@@ -420,11 +420,11 @@ fn resize(handle: &CommandSender, change: CacheChange) -> Result<Vec<String>, St
 /// world's cache 4.5 segments' bytes: the shrink gives back the last four
 /// segments (units 16..32). The request holding units 1..=19, whose last
 /// page has room for every token it generates, runs on to its end, and the
-/// workers give the tail back once it let the units go. A request that fits
+/// executors give the tail back once it let the units go. A request that fits
 /// the whole cache and not what is left waits until the restore.
 #[test]
 fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     let mut holder = handle
         .submit(request_of(1, 18 * BLOCK as usize + 6, 8))
         .unwrap();
@@ -445,7 +445,7 @@ fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
             .is_ok()
     );
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec![
             "uniserve.cache_storage".to_owned(),
             r#"uniserve.release_cache {"from":4}"#.to_owned(),
@@ -457,7 +457,7 @@ fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
     assert_eq!(next_token(&mut waiting, Duration::from_millis(300)), None);
     assert!(resize(&handle, CacheChange::Restore).is_ok());
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some("uniserve.restore_cache")
     );
     assert!(matches!(
@@ -476,10 +476,10 @@ fn a_shrink_lets_the_holders_of_the_tail_run_and_a_restore_returns_it() {
 /// withdraws nothing while the quota holds the successor.
 #[test]
 fn a_configured_capacity_withdraws_room_for_a_successors_head() {
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: 1 << 40,
         head_bytes: 9 * UNIT_BYTES,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     assert!(
         resize(
@@ -492,11 +492,11 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
         .is_ok()
     );
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec!["uniserve.cache_storage".to_owned()]
     );
 
-    workers.lock().unwrap().capacity_units = Some(u64::from(SEGMENTS * SEGMENT_UNITS));
+    executors.lock().unwrap().capacity_units = Some(u64::from(SEGMENTS * SEGMENT_UNITS));
     assert!(
         resize(
             &handle,
@@ -508,7 +508,7 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
         .is_ok()
     );
     assert_eq!(
-        workers.lock().unwrap().hooks[1..],
+        executors.lock().unwrap().hooks[1..],
         [
             "uniserve.cache_storage".to_owned(),
             r#"uniserve.release_cache {"from":5}"#.to_owned(),
@@ -526,11 +526,11 @@ fn a_configured_capacity_withdraws_room_for_a_successors_head() {
 /// grow into.
 #[test]
 fn a_redistributing_successor_leaves_a_configured_capacity_whole() {
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: 1 << 40,
         head_bytes: 9 * UNIT_BYTES,
         capacity_units: Some(u64::from(SEGMENTS * SEGMENT_UNITS)),
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let redistributing = Successor {
         unmapped_cache: true,
@@ -550,7 +550,7 @@ fn a_redistributing_successor_leaves_a_configured_capacity_whole() {
         .is_ok()
     );
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec![
             "uniserve.cache_storage".to_owned(),
             "uniserve.cache_storage".to_owned()
@@ -561,17 +561,17 @@ fn a_redistributing_successor_leaves_a_configured_capacity_whole() {
     thread.join().unwrap();
 }
 
-/// An expert worker's report, which holds no cache, leaves the shrink to
-/// the worker that holds it: the configured capacity withdraws room for a
+/// An expert executor's report, which holds no cache, leaves the shrink to
+/// the executor that holds it: the configured capacity withdraws room for a
 /// successor's head as it does without one.
 #[test]
 fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: 1 << 40,
         head_bytes: 9 * UNIT_BYTES,
         capacity_units: Some(u64::from(SEGMENTS * SEGMENT_UNITS)),
         experts: true,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     assert!(
         resize(
@@ -584,7 +584,7 @@ fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
         .is_ok()
     );
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         [
             "uniserve.cache_storage".to_owned(),
             r#"uniserve.release_cache {"from":5}"#.to_owned(),
@@ -604,11 +604,11 @@ fn a_worker_without_a_cache_leaves_the_shrink_to_the_others() {
 fn a_shrink_leaves_the_successor_what_the_device_has_free() {
     // The quota holds the whole cache beside the successor's head segment;
     // the device has 1500 bytes free.
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 3 * SEGMENT_BYTES,
         head_bytes: 2 * SEGMENT_BYTES,
         free_bytes: 1_500,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&plans[0]).unwrap();
@@ -626,7 +626,7 @@ fn a_shrink_leaves_the_successor_what_the_device_has_free() {
     );
     assert!(shrunk.is_ok(), "{shrunk:?}");
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some(r#"uniserve.release_cache {"from":7}"#)
     );
 
@@ -640,11 +640,11 @@ fn a_shrink_leaves_the_successor_what_the_device_has_free() {
 /// successor creates on another GPU leave this one's limit as it was.
 #[test]
 fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 3 * SEGMENT_BYTES,
         head_bytes: 2 * SEGMENT_BYTES,
         free_bytes: 1 << 40,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let creating = |gpu: [u8; 16]| Successor {
         rank_budgets: engine::RankBudgets::from([(
@@ -680,7 +680,7 @@ fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
     );
     assert!(shrunk.is_ok(), "{shrunk:?}");
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some(format!(r#"uniserve.release_cache {{"from":{}}}"#, SEGMENTS - 2).as_str())
     );
 
@@ -693,10 +693,10 @@ fn the_weights_a_successor_creates_leave_the_serving_world_less_cache() {
 /// charging that capacity twice as a head plus a configured pool.
 #[test]
 fn a_target_rank_reserves_its_own_capacity_within_its_quota() {
-    let (handle, _, thread) = start(Workers {
+    let (handle, _, thread) = start(SimExecutors {
         quota: 20_000,
         head_bytes: 9_000,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let target = Successor {
         rank_budgets: engine::RankBudgets::from([(
@@ -738,9 +738,9 @@ fn a_target_rank_reserves_its_own_capacity_within_its_quota() {
 
 #[test]
 fn recomputation_uses_the_target_window_and_page_storage() {
-    let (handle, _, thread) = start(Workers {
+    let (handle, _, thread) = start(SimExecutors {
         quota: 20_000,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let mut running = handle.submit(request(1, 4, 10_000)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
@@ -793,10 +793,10 @@ fn recomputation_uses_the_target_window_and_page_storage() {
 /// for promotion. Transfer estimates use values, not unused segment padding.
 #[test]
 fn host_staging_reserves_device_segments_and_copies_only_values() {
-    let (handle, _, thread) = start(Workers {
+    let (handle, _, thread) = start(SimExecutors {
         quota: 12_000,
         host_link: Some(1_000),
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let target = Successor {
         unmapped_cache: true,
@@ -838,10 +838,10 @@ fn host_staging_reserves_device_segments_and_copies_only_values() {
 /// switches its owner to eager execution.
 #[test]
 fn an_eager_predecessor_leaves_its_graph_budget_to_the_successor() {
-    let (handle, _, thread) = start(Workers {
+    let (handle, _, thread) = start(SimExecutors {
         quota: 12_000,
         graph_bytes: 3_000,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let target = Successor {
         rank_budgets: engine::RankBudgets::from([(
@@ -872,18 +872,18 @@ fn an_eager_predecessor_leaves_its_graph_budget_to_the_successor() {
     thread.join().unwrap();
 }
 
-/// The GPU of an expert worker, which holds no cache to give back, must
+/// The GPU of an expert executor, which holds no cache to give back, must
 /// hold a successor's process beside the serving world's: a process of 400
 /// bytes fits twice in a quota of 1000 and the plan reports that GPU, one
 /// of 600 does not, and the shrink is refused before anything is withdrawn,
 /// naming that GPU's items.
 #[test]
 fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
-    let (handle, workers, thread) = start(Workers {
+    let (handle, executors, thread) = start(SimExecutors {
         quota: 1 << 40,
         experts: true,
         expert_process: Some(400),
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     assert_eq!(plans.len(), 2, "{plans:?}");
@@ -897,7 +897,7 @@ fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
         )
     );
 
-    workers.lock().unwrap().expert_process = Some(600);
+    executors.lock().unwrap().expert_process = Some(600);
     let refused = resize(
         &handle,
         CacheChange::Shrink {
@@ -911,7 +911,7 @@ fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
         "{refused}"
     );
     assert!(
-        !workers
+        !executors
             .lock()
             .unwrap()
             .hooks
@@ -925,10 +925,10 @@ fn a_gpu_without_a_cache_must_hold_the_successor_beside_the_serving_world() {
 }
 
 /// A shrink past its bound recomputes the requests still holding the tail:
-/// they end as migratable, and the workers give the tail back.
+/// they end as migratable, and the executors give the tail back.
 #[test]
 fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     let mut holder = handle.submit(request(1, 20, 10_000)).unwrap();
     assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
 
@@ -953,7 +953,7 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
         "the request holding the tail is recomputed"
     );
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some(r#"uniserve.release_cache {"from":4}"#)
     );
 
@@ -964,11 +964,11 @@ fn a_shrink_past_its_bound_recomputes_the_holders_of_the_tail() {
 /// A request holding the tail that cannot get a unit to continue is
 /// recomputed at once, though the shrink has no bound: the request holding
 /// units 1..=20 and more has none left to grow by once the shrink withdraws
-/// units 16..32, so it ends as migratable, and the workers give the tail
+/// units 16..32, so it ends as migratable, and the executors give the tail
 /// back.
 #[test]
 fn a_shrink_recomputes_the_holders_of_the_tail_that_cannot_continue() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     let mut holder = handle.submit(request(1, 20, 10_000)).unwrap();
     assert!(next_token(&mut holder, Duration::from_secs(10)).is_some());
 
@@ -993,7 +993,7 @@ fn a_shrink_recomputes_the_holders_of_the_tail_that_cannot_continue() {
         "the request that cannot continue is recomputed"
     );
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some(r#"uniserve.release_cache {"from":4}"#)
     );
 
@@ -1005,7 +1005,7 @@ fn a_shrink_recomputes_the_holders_of_the_tail_that_cannot_continue() {
 /// room within the quota holds, and returns their units to allocation.
 #[test]
 fn a_growth_creates_the_segments_the_ledgers_room_holds() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     assert!(
         resize(
             &handle,
@@ -1016,24 +1016,24 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
         )
         .is_ok()
     );
-    assert_eq!(workers.lock().unwrap().held, 4);
+    assert_eq!(executors.lock().unwrap().held, 4);
 
     // Another world's process of 1.5 segments' bytes leaves two and a half
     // segments' bytes of the quota: two segments grow back, although the
     // device has more free.
-    workers.lock().unwrap().other_world_bytes = 1_500;
+    executors.lock().unwrap().other_world_bytes = 1_500;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert!(
-        workers
+        executors
             .lock()
             .unwrap()
             .hooks
             .iter()
             .any(|hook| hook == r#"uniserve.restore_cache {"segments":2}"#),
         "{:?}",
-        workers.lock().unwrap().hooks
+        executors.lock().unwrap().hooks
     );
-    assert_eq!(workers.lock().unwrap().held, 6);
+    assert_eq!(executors.lock().unwrap().held, 6);
     // Twenty-two pages fit the 23 units of six segments.
     let mut served = handle.submit(request(1, 22, 1)).unwrap();
     assert!(matches!(
@@ -1047,14 +1047,14 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
 
 /// Room for a profiling session's device storage on a GPU whose quota the
 /// cache and the process fill: 1500 bytes take the last two segments, which
-/// the request holding units 1..=27 keeps until it ends, before the workers
+/// the request holding units 1..=27 keeps until it ends, before the executors
 /// give them back; once the session's storage is released, a growth
 /// creates them again. A ledger with room withdraws nothing, and storage
 /// that even every segment past the first does not make room for is
 /// refused, naming the bytes, with the cache kept whole.
 #[test]
 fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     let mut holder = handle
         .submit(request_of(1, 26 * BLOCK as usize + 6, 8))
         .unwrap();
@@ -1086,18 +1086,18 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         )
         .is_ok()
     );
-    assert_eq!(workers.lock().unwrap().held, 6);
+    assert_eq!(executors.lock().unwrap().held, 6);
     // The session books its storage, and releases it as it ends.
-    workers.lock().unwrap().process_bytes = 5_000;
+    executors.lock().unwrap().process_bytes = 5_000;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert_eq!(
-        workers.lock().unwrap().held,
+        executors.lock().unwrap().held,
         6,
         "the session's storage holds the room"
     );
-    workers.lock().unwrap().process_bytes = 3_500;
+    executors.lock().unwrap().process_bytes = 3_500;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
-    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+    assert_eq!(executors.lock().unwrap().held, SEGMENTS);
 
     let error = resize(
         &handle,
@@ -1115,7 +1115,7 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         error.contains("11500 of a quota of 11500 bytes booked"),
         "{error}"
     );
-    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+    assert_eq!(executors.lock().unwrap().held, SEGMENTS);
     let mut served = handle.submit(request(2, 30, 1)).unwrap();
     assert!(matches!(
         terminal(&mut served),
@@ -1128,10 +1128,10 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
 
 #[test]
 fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
-    let (handle, _workers, thread) = start(Workers {
+    let (handle, _workers, thread) = start(SimExecutors {
         experts: true,
         expert_process: Some(900),
-        ..Workers::filling(3_500)
+        ..SimExecutors::filling(3_500)
     });
     let request = |expert_bytes| CacheChange::MakeRoom {
         bytes: 0,
@@ -1176,7 +1176,7 @@ fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
 /// its host, and requests go on with the whole cache.
 #[test]
 fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
-    let (handle, workers, thread) = start(Workers::filling(7_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(7_500));
     let error = resize(
         &handle,
         CacheChange::Shrink {
@@ -1200,7 +1200,7 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
     );
     assert!(error.contains("host node0: admits"), "{error}");
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec!["uniserve.cache_storage".to_owned()]
     );
     let mut served = handle.submit(request(1, 20, 4)).unwrap();
@@ -1221,13 +1221,13 @@ fn a_shrink_that_cannot_make_room_fails_and_keeps_the_cache() {
 fn a_plan_reports_each_devices_storage_and_withdraws_nothing() {
     // The Transfer Server holds no context on the GPU while no transfer
     // runs, so the ledger books none; the change's transfers will need it.
-    let mut fill = Workers::filling(3_500);
+    let mut fill = SimExecutors::filling(3_500);
     fill.transfer_context = 1_500;
     fill.quota += 1_500;
-    let (handle, workers, thread) = start(fill);
+    let (handle, executors, thread) = start(fill);
     let plans = resize(&handle, CacheChange::Plan(Successor::default())).unwrap();
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec!["uniserve.cache_storage".to_owned()]
     );
     let [plan] = plans.as_slice() else {
@@ -1254,7 +1254,7 @@ fn a_plan_reports_each_devices_storage_and_withdraws_nothing() {
         )
         .is_ok()
     );
-    assert_eq!(workers.lock().unwrap().held, 4);
+    assert_eq!(executors.lock().unwrap().held, 4);
 
     handle.shutdown();
     thread.join().unwrap();
@@ -1268,7 +1268,7 @@ fn a_plan_reports_each_devices_storage_and_withdraws_nothing() {
 /// bookings are the successor's, whose four deferred segments then fit.
 #[test]
 fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for() {
-    let (handle, workers, thread) = start(Workers::filling(3_500));
+    let (handle, executors, thread) = start(SimExecutors::filling(3_500));
     assert!(
         resize(
             &handle,
@@ -1280,7 +1280,7 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
         .is_ok()
     );
     // The previous world's process books the room the shrink left.
-    workers.lock().unwrap().other_world_bytes = 4 * SEGMENT_BYTES;
+    executors.lock().unwrap().other_world_bytes = 4 * SEGMENT_BYTES;
     let parked = engine::ParkedCache {
         pages: Vec::new(),
         lent: Vec::new(),
@@ -1323,11 +1323,11 @@ fn a_promotion_counts_the_segments_the_previous_worlds_release_leaves_room_for()
 fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
     // Bytes per second from host storage to the GPU.
     const HOST_LINK: u64 = 1_000;
-    let (handle, _workers, thread) = start(Workers {
+    let (handle, _workers, thread) = start(SimExecutors {
         weights_bytes: 2_000,
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
         host_link: Some(HOST_LINK),
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let plan_of = |successor| -> serde_json::Value {
         let plans = resize(&handle, CacheChange::Plan(successor)).unwrap();
@@ -1403,7 +1403,7 @@ fn a_successor_of_other_weights_and_its_own_cache_needs_more_room() {
 /// generated), and the other runs to its end on the units it let go.
 #[test]
 fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
-    let (handle, _workers, thread) = start(Workers::filling(0));
+    let (handle, _workers, thread) = start(SimExecutors::filling(0));
     // Each takes 10 pages of prompt and 10 more of the 160 tokens it
     // generates: 40 pages of the 31 units past the sentinel.
     let mut first = handle.submit(request(1, 10, 10 * BLOCK as usize)).unwrap();
@@ -1436,7 +1436,7 @@ fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
 /// a request that needs more than the units it kept waits for that resume.
 #[test]
 fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
-    let (handle, _workers, thread) = start_split(Workers::filling(0), Some(0));
+    let (handle, _workers, thread) = start_split(SimExecutors::filling(0), Some(0));
     let mut running = handle.submit(request(1, 2, 10_000)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut generated = 0;
@@ -1514,7 +1514,7 @@ fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
 #[test]
 fn a_successor_allocates_the_segments_its_predecessor_lent() {
     // Segments 1 to 4 (units 4 to 19) map the predecessor's units 0 to 15.
-    let (handle, workers, thread) = start_split(Workers::filling(0), Some(4));
+    let (handle, executors, thread) = start_split(SimExecutors::filling(0), Some(4));
     let parked = engine::ParkedCache {
         pages: Vec::new(),
         lent: Vec::new(),
@@ -1542,13 +1542,13 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
         .expect("the scheduler answers");
     assert!(promoted.is_ok(), "{promoted:?}");
     assert!(
-        workers
+        executors
             .lock()
             .unwrap()
             .hooks
             .contains(&r#"uniserve.adopt_cache {"borrowed":[[8,12],[16,20]]}"#.to_owned()),
         "{:?}",
-        workers.lock().unwrap().hooks
+        executors.lock().unwrap().hooks
     );
 
     // Its own 15 free units and the 8 lent hold a request of 22 prompt
@@ -1568,7 +1568,7 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
 /// rollback, it creates them again.
 #[test]
 fn a_parked_world_evicts_its_cache_past_its_first_segment() {
-    let (handle, workers, thread) = start(Workers::filling(0));
+    let (handle, executors, thread) = start(SimExecutors::filling(0));
     assert!(resize(&handle, CacheChange::Evict).is_err());
 
     let parked = handle
@@ -1583,7 +1583,7 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
         evicted["evicted_bytes"],
         u64::from(SEGMENTS - 1) * SEGMENT_BYTES
     );
-    assert_eq!(workers.lock().unwrap().held, 1);
+    assert_eq!(executors.lock().unwrap().held, 1);
 
     // The rollback resumes the world, which creates its cache again and
     // serves a request on all of it.
@@ -1593,7 +1593,7 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
         .expect("the scheduler answers");
     assert!(resumed.is_ok(), "{resumed:?}");
     assert!(resize(&handle, CacheChange::Restore).is_ok());
-    assert_eq!(workers.lock().unwrap().held, SEGMENTS);
+    assert_eq!(executors.lock().unwrap().held, SEGMENTS);
     let mut request = handle.submit(request(1, 20, 4)).unwrap();
     assert!(matches!(
         terminal(&mut request),
@@ -1610,11 +1610,11 @@ fn a_parked_world_evicts_its_cache_past_its_first_segment() {
 /// serving world's cache that share.
 #[test]
 fn a_successor_that_captures_no_graphs_takes_no_graph_share() {
-    let (handle, _workers, thread) = start(Workers {
+    let (handle, _workers, thread) = start(SimExecutors {
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
         graph_share_bytes: 2_000,
         capturable: true,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let plan_of = |successor| -> serde_json::Value {
         let plans = resize(&handle, CacheChange::Plan(successor)).unwrap();
@@ -1634,11 +1634,11 @@ fn a_successor_that_captures_no_graphs_takes_no_graph_share() {
     thread.join().unwrap();
 
     // A model that cannot be captured serves eagerly whatever the policy.
-    let (handle, _workers, thread) = start(Workers {
+    let (handle, _workers, thread) = start(SimExecutors {
         quota: u64::from(SEGMENTS) * SEGMENT_BYTES + 2_000,
         graph_share_bytes: 2_000,
         capturable: false,
-        ..Workers::filling(0)
+        ..SimExecutors::filling(0)
     });
     let plans = resize(
         &handle,
@@ -1659,7 +1659,7 @@ fn a_successor_that_captures_no_graphs_takes_no_graph_share() {
 /// admits nothing until the wake.
 #[test]
 fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
-    let (handle, workers, thread) = start(Workers::filling(0));
+    let (handle, executors, thread) = start(SimExecutors::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -1672,7 +1672,7 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
         })
     ));
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec!["uniserve.sleep".to_owned()]
     );
 
@@ -1680,7 +1680,7 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
     assert_eq!(next_token(&mut waiting, Duration::from_millis(300)), None);
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
-        workers.lock().unwrap().hooks.last().map(String::as_str),
+        executors.lock().unwrap().hooks.last().map(String::as_str),
         Some("uniserve.wake")
     );
     assert!(matches!(
@@ -1693,11 +1693,11 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
 }
 
 /// A weight update that recomputes the requests in flight ends those that
-/// run as migratable, and rewrites the weights while the workers sleep,
+/// run as migratable, and rewrites the weights while the executors sleep,
 /// which they wake from after; requests are served again.
 #[test]
 fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sleep() {
-    let (handle, workers, thread) = start(Workers::filling(0));
+    let (handle, executors, thread) = start(SimExecutors::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -1714,7 +1714,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
         })
     ));
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec![
             "uniserve.sleep".to_owned(),
             r#"uniserve.update_weights {"model_path":"/checkpoints/next"}"#.to_owned(),
@@ -1736,7 +1736,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
 /// without being handed back.
 #[test]
 fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
-    let (handle, workers, thread) = start(Workers::filling(0));
+    let (handle, executors, thread) = start(SimExecutors::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 
@@ -1746,7 +1746,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
         .expect("the scheduler answers");
     assert!(updated.is_ok(), "{updated:?}");
     assert_eq!(
-        workers.lock().unwrap().hooks,
+        executors.lock().unwrap().hooks,
         vec![
             r#"uniserve.update_weights {"model_path":"/checkpoints/next","keep":true}"#.to_owned()
         ]
@@ -1767,7 +1767,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
 /// running and the one queued, aborted.
 #[test]
 fn a_weight_update_aborting_the_requests_in_flight_ends_them() {
-    let (handle, _workers, thread) = start(Workers::filling(0));
+    let (handle, _workers, thread) = start(SimExecutors::filling(0));
     let mut running = handle.submit(request(1, 2, 150)).unwrap();
     assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
 

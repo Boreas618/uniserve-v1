@@ -7,7 +7,7 @@
 //! execute and every command of the batch, and sends each projection through
 //! that rank's `ExecutorProcess`. Returned rank results wait in per-rank buffers
 //! until every rank planned for a set of calls has reported them; `try_join`
-//! then merges those reports into one `WorkerResult` published by the calls'
+//! then merges those reports into one `ExecutorResult` published by the calls'
 //! output owner, the first rank of their component they are planned on
 //! (`routing::output_owner`). An execution error that
 //! every failing rank reports identically, while no succeeding rank holds an
@@ -31,14 +31,14 @@ pub(crate) mod routing;
 mod spawn;
 mod standby;
 
-use crate::executor::WorkerResult;
+use crate::executor::ExecutorResult;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::registry::Registry;
 use super::{BatchSubmitError, IncarnationRegistry, ExecutorProcess};
-use crate::executor::{RankBuffer, WorkerExecError, WorkerFailure};
+use crate::executor::{RankBuffer, ExecuteError, ExecutorFailure};
 use ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
 
 use crate::executors::ExecutorProcessArgs;
@@ -55,7 +55,7 @@ pub struct ExecutorGroup {
     /// Results each rank returned, indexed by rank. `take_rank_calls`
     /// consumes their calls as they are joined, and `finish_batch` drops what
     /// remains of a retired batch.
-    buffers: Vec<VecDeque<WorkerResult>>,
+    buffers: Vec<VecDeque<ExecutorResult>>,
     /// The group's agreed capabilities: rank 0's report with the group-wide
     /// product storage and cache byte accounting `from_ranks` derives.
     info: WorkerInfo,
@@ -137,7 +137,7 @@ type CallIdentity = (u64, u64, u64, ipc::CallId);
 
 /// The executor routed to each component reading a call's products, keyed by
 /// the call's request and call identifiers (`RequestPlacement::readers`).
-pub type CallReaders = HashMap<(RequestKey, ipc::CallId), BTreeMap<String, crate::WorkerGroupId>>;
+pub type CallReaders = HashMap<(RequestKey, ipc::CallId), BTreeMap<String, crate::ExecutorGroupId>>;
 
 /// A physical batch and its participating ranks share one retirement lifetime.
 struct PendingBatch {
@@ -156,7 +156,7 @@ struct RankPrefix {
     /// Whether the rank returned its result for the batch.
     complete: bool,
     /// The execution error the rank reported for the batch, if any.
-    error: Option<WorkerExecError>,
+    error: Option<ExecuteError>,
 }
 
 /// Returns the request and call identifiers carried by an executor call.
@@ -241,13 +241,13 @@ impl ExecutorGroup {
 
     /// Records a rank's execution error against its pending batch.
     ///
-    /// Fails, without recording, when the error is not a `WorkerExecError`,
+    /// Fails, without recording, when the error is not a `ExecuteError`,
     /// carries no batch identifier, names a batch or rank with no pending
     /// entry, or differs from an error the rank already reported for that
     /// batch.
     fn record_worker_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
         let execution = error
-            .downcast_ref::<WorkerExecError>()
+            .downcast_ref::<ExecuteError>()
             .ok_or_else(|| anyhow::anyhow!("rank {rank} failed: {error:#}"))?;
         let batch_id = execution.batch_id.ok_or_else(|| {
             anyhow::anyhow!("rank {rank} returned an execution error without a batch identity")
@@ -278,7 +278,7 @@ impl ExecutorGroup {
     /// group arrives at its failure domain, whose relaunch runs on a thread
     /// of its own, and installs the relaunched executors when it is polled
     /// after they are posted (`install_relaunched`); it is not ready
-    /// meanwhile. Returns the [`WorkerFailure`] that reports the lost
+    /// meanwhile. Returns the [`ExecutorFailure`] that reports the lost
     /// allocations: recovery always invalidates resident work, so the result
     /// is an error either way.
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Error {
@@ -316,15 +316,15 @@ impl ExecutorGroup {
         // The lost incarnations stop resolving at once, so a publication they
         // made is never bound as an input while the group is relaunched.
         self.incarnations.assign(
-            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
+            &crate::ExecutorGroupId(self.process_args.worker_id.clone()),
             [],
         );
         self.clear_execution();
         self.readiness_changed = true;
-        let worker_id = crate::WorkerGroupId(self.process_args.worker_id.clone());
-        let execution = cause.downcast_ref::<WorkerExecError>().cloned();
+        let worker_id = crate::ExecutorGroupId(self.process_args.worker_id.clone());
+        let execution = cause.downcast_ref::<ExecuteError>().cloned();
         let failure = |message: String| -> anyhow::Error {
-            WorkerFailure {
+            ExecutorFailure {
                 worker_id,
                 endpoints,
                 requests,
@@ -417,7 +417,7 @@ impl ExecutorGroup {
     ///
     /// A relaunch that failed, or whose executors describe other capabilities
     /// than the lost ones, closes the group, and the error is a
-    /// [`WorkerFailure`] without endpoints or requests, whose message says
+    /// [`ExecutorFailure`] without endpoints or requests, whose message says
     /// why: the loss already reported everything the group held.
     fn install_relaunched(&mut self) -> anyhow::Result<bool> {
         let Some(expected) = &self.awaiting else {
@@ -459,8 +459,8 @@ impl ExecutorGroup {
                     "rank recovery failed: {error:#}"
                 );
                 self.closed = true;
-                Err(WorkerFailure {
-                    worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
+                Err(ExecutorFailure {
+                    worker_id: crate::ExecutorGroupId(self.process_args.worker_id.clone()),
                     endpoints: Vec::new(),
                     requests: Vec::new(),
                     refusals: HashMap::new(),
@@ -522,7 +522,7 @@ impl ExecutorGroup {
         // info keeps everything but rank 0's new endpoint.
         self.info.endpoint = workers[0].info().endpoint.clone();
         self.incarnations.assign(
-            &crate::WorkerGroupId(self.process_args.worker_id.clone()),
+            &crate::ExecutorGroupId(self.process_args.worker_id.clone()),
             workers.iter().map(|worker| &worker.info().endpoint),
         );
         self.workers = workers;
@@ -549,7 +549,7 @@ impl ExecutorGroup {
     /// then retired. When nothing is joinable, `join_worker_errors` may resolve
     /// a batch whose ranks reported execution errors, returning its error;
     /// otherwise the result is `None`.
-    fn try_join(&mut self) -> anyhow::Result<Option<WorkerResult>> {
+    fn try_join(&mut self) -> anyhow::Result<Option<ExecutorResult>> {
         let Some((batch_id, output_rank, call_ids)) = self.joinable_report_key() else {
             // Preserve successful partial results already agreed by every rank
             // before retiring the unresolved remainder of a failed batch.
@@ -645,9 +645,9 @@ impl ExecutorGroup {
     /// succeeded still holds unjoined calls, the ranks disagree: the batch is
     /// retired and a plain error returned. Otherwise every error must be
     /// identical, or a plain error is returned. A fatal error, an
-    /// `InvariantViolation` code, or a batch carrying a `Free` command returns the `WorkerExecError` itself; `poll_batch`
+    /// `InvariantViolation` code, or a batch carrying a `Free` command returns the `ExecuteError` itself; `poll_batch`
     /// answers these and the plain errors with recovery. Any other error
-    /// retires the batch and returns a `WorkerFailure` naming its unjoined
+    /// retires the batch and returns a `ExecutorFailure` naming its unjoined
     /// calls and affected requests, which `poll_batch` returns without
     /// recovery.
     fn join_worker_errors(&mut self) -> anyhow::Result<()> {
@@ -724,8 +724,8 @@ impl ExecutorGroup {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            let failure = WorkerFailure {
-                worker_id: crate::WorkerGroupId(self.process_args.worker_id.clone()),
+            let failure = ExecutorFailure {
+                worker_id: crate::ExecutorGroupId(self.process_args.worker_id.clone()),
                 endpoints: Vec::new(),
                 requests,
                 refusals: HashMap::new(),
@@ -939,7 +939,7 @@ impl ExecutorGroup {
     /// or input binding returns `Failed` with no state change; a failed input
     /// binding carries the first refusing rank's `UnroutableInputs`. A rank
     /// submission that fails after the batch is recorded replaces the rank
-    /// group and returns `Failed` with the recovery's `WorkerFailure`.
+    /// group and returns `Failed` with the recovery's `ExecutorFailure`.
     ///
     /// `readers` names, for the batch's routed media calls, the executor each
     /// consuming component was routed to; each call's products then name
@@ -1072,30 +1072,30 @@ impl ExecutorGroup {
     /// Waits for rank progress and returns the next fully agreed physical result.
     ///
     /// Returns `None` when `timeout` passes without a joinable result, and at
-    /// once for a closed group. The `WorkerFailure` of an agreed execution
+    /// once for a closed group. The `ExecutorFailure` of an agreed execution
     /// error that `join_worker_errors` retires with its batch is returned as is
     /// and the group stays usable. Any other error, including rank loss, a
     /// protocol violation, an agreed error `join_worker_errors` does not retire,
     /// a job a rank reports stalled, and an expired
     /// `ExecutorProcessArgs::watchdog_timeout` (measured from the group's last
     /// progress and enforced only while a batch is pending), replaces the
-    /// rank group and returns the recovery's `WorkerFailure`. While its
+    /// rank group and returns the recovery's `ExecutorFailure`. While its
     /// failure domain relaunches it, the group returns `None` and installs
     /// the relaunched ranks once they are posted; a relaunch that failed
-    /// closes the group and returns a `WorkerFailure` without endpoints that
+    /// closes the group and returns a `ExecutorFailure` without endpoints that
     /// says why.
-    pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
+    pub fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<ExecutorResult>> {
         if self.closed {
             return Ok(None);
         }
         match self.poll_progress(timeout) {
             Ok(report) => Ok(report),
-            Err(error) if error.is::<WorkerFailure>() => Err(error),
+            Err(error) if error.is::<ExecutorFailure>() => Err(error),
             Err(error) => Err(self.recover_workers(&error)),
         }
     }
 
-    fn poll_progress(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
+    fn poll_progress(&mut self, timeout: Duration) -> anyhow::Result<Option<ExecutorResult>> {
         let deadline = Instant::now() + timeout;
         self.poll_standby();
         // A group waiting for its failure domain's relaunch makes no progress

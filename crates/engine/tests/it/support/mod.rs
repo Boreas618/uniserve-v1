@@ -1,7 +1,7 @@
 //! Scheduler construction shared by the engine's integration tests.
 //!
 //! Serving states a deployment's model limits from the model's description;
-//! these tests have no model, so a simulated worker's limits follow from the
+//! these tests have no model, so a simulated executor's limits follow from the
 //! call kinds it serves.
 
 pub(crate) mod serving;
@@ -59,10 +59,10 @@ use ipc::{CallKind, ForwardMode, MediaCall};
 
 /// Builds a scheduler whose model limits follow from `executor`'s call kinds.
 ///
-/// A token-denoising worker without text decode serves canvas readouts over
+/// A token-denoising executor without text decode serves canvas readouts over
 /// prompts that may carry encoded images; one that prepares latents without
 /// decoding text serves video diffusion, which needs no generation feature.
-/// Any other denoising, vision-encoding or latent-encoding worker serves
+/// Any other denoising, vision-encoding or latent-encoding executor serves
 /// interleaved text and images without bound, and the rest serve text.
 pub(crate) fn scheduler_with(
     executor: Box<dyn Executor>,
@@ -237,9 +237,9 @@ pub(crate) fn scheduler_with_depth(
     )
 }
 
-/// The leader daemon this test process runs for the worker groups its tests
+/// The leader daemon this test process runs for the executor groups its tests
 /// launch, as a deployment of one node whose host is `localhost`; returns
-/// its process socket. The workers it starts are children of its service
+/// its process socket. The executors it starts are children of its service
 /// thread and end with the test process.
 pub(crate) fn daemon() -> String {
     static DAEMON: std::sync::OnceLock<(daemon::Daemon, String)> = std::sync::OnceLock::new();
@@ -263,7 +263,7 @@ pub(crate) fn daemon() -> String {
         .clone()
 }
 
-/// The `uniserve` executable the workers run as, and that starts the node's
+/// The `uniserve` executable the executors run as, and that starts the node's
 /// Storage Server: `UNISERVE_WORKER_EXECUTABLE`, or else the repository
 /// environment's.
 pub(crate) fn uniserve_executable() -> std::path::PathBuf {

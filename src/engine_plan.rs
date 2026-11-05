@@ -135,7 +135,7 @@ pub(crate) struct EpochPlan {
     world_size: usize,
     /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
     queue_depth: usize,
-    /// This rank's worker group, which the rank facts name as its identity.
+    /// This rank's executor group, which the rank facts name as its identity.
     group: String,
     /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
     watchdog_override: Option<Duration>,

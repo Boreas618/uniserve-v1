@@ -1,6 +1,6 @@
-//! Deployment files: the worker groups a server launches, stated in TOML.
+//! Deployment files: the executor groups a server launches, stated in TOML.
 //!
-//! A deployment file lists worker groups as `[[worker_groups]]` tables. Each group
+//! A deployment file lists executor groups as `[[worker_groups]]` tables. Each group
 //! names its ranks compactly and the components placed on them:
 //!
 //! ```toml
@@ -18,10 +18,10 @@
 //! ```
 //!
 //! [`Deployment::read`] parses a file; [`Deployment::worker_groups`] places its
-//! ranks on hosts and expands it into the engine's [`WorkerGroupConfig`] list,
+//! ranks on hosts and expands it into the engine's [`ExecutorGroupConfig`] list,
 //! which every launch path consumes. Reading checks the file's syntax and
 //! schema; placement validates the expanded groups with
-//! [`WorkerGroupConfig::validate_all`], so a file that names no host can be
+//! [`ExecutorGroupConfig::validate_all`], so a file that names no host can be
 //! checked only once the engine's own host identity is known.
 
 use std::collections::BTreeMap;
@@ -33,8 +33,8 @@ use ipc::{
 use ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
-use crate::executor::WorkerGroupId;
+use crate::core::{ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank};
+use crate::executor::ExecutorGroupId;
 
 /// Serde default for a degree, a replica count and `units_per_rank`.
 const fn one() -> usize {
@@ -45,7 +45,7 @@ const fn one() -> usize {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
-    /// Worker groups in file order; a replicated group expands in place.
+    /// Executor groups in file order; a replicated group expands in place.
     worker_groups: Vec<GroupEntry>,
 }
 
@@ -56,7 +56,7 @@ struct GroupEntry {
     /// Group identity; replica `i` of a replicated group is `<id>-<i>`.
     id: String,
     #[serde(default)]
-    role: WorkerGroupRole,
+    role: ExecutorGroupRole,
     /// Copies of the group, each over an equal consecutive block of `ranks`.
     /// The copies' components are replicas of the same numerical components
     /// under one scheduler, which binds each request to one copy.
@@ -179,10 +179,10 @@ impl TryFrom<String> for RankRange {
 }
 
 impl Deployment {
-    /// Encodes resolved worker groups as a deployment snapshot. Each rank
+    /// Encodes resolved executor groups as a deployment snapshot. Each rank
     /// names its host and device explicitly; component membership and group
     /// identities are preserved across independently launched replicas.
-    pub fn snapshot(groups: &[WorkerGroupConfig]) -> anyhow::Result<String> {
+    pub fn snapshot(groups: &[ExecutorGroupConfig]) -> anyhow::Result<String> {
         let deployment = Self {
             worker_groups: groups
                 .iter()
@@ -252,7 +252,7 @@ impl Deployment {
         Ok(deployment)
     }
 
-    /// Places the deployment's ranks and returns its worker groups.
+    /// Places the deployment's ranks and returns its executor groups.
     ///
     /// A rank entry without a host runs on `engine_host`, the launching
     /// process's own host identity. A group with `replicas = N` becomes `N`
@@ -266,32 +266,32 @@ impl Deployment {
     ///
     /// Fails when a group's replica count is zero or does not divide its
     /// ranks, when the decoder or codec states another unit count, or when
-    /// [`WorkerGroupConfig::validate_all`] refuses the expanded groups.
-    pub fn worker_groups(&self, engine_host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+    /// [`ExecutorGroupConfig::validate_all`] refuses the expanded groups.
+    pub fn worker_groups(&self, engine_host: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
         let mut workers = Vec::new();
         for entry in &self.worker_groups {
             entry
                 .expand(engine_host, &mut workers)
-                .with_context(|| format!("worker {}", entry.id))?;
+                .with_context(|| format!("executor {}", entry.id))?;
         }
-        WorkerGroupConfig::validate_all(&workers)?;
+        ExecutorGroupConfig::validate_all(&workers)?;
         Ok(workers)
     }
 }
 
 impl GroupEntry {
-    /// Appends this group's replicas to `workers`.
+    /// Appends this group's replicas to `executors`.
     fn expand(
         &self,
         engine_host: &str,
-        workers: &mut Vec<WorkerGroupConfig>,
+        workers: &mut Vec<ExecutorGroupConfig>,
     ) -> anyhow::Result<()> {
         let ranks = self
             .ranks
             .iter()
             .flat_map(|range| {
                 let host = range.host.as_deref().unwrap_or(engine_host);
-                range.devices.iter().map(move |device| WorkerRank {
+                range.devices.iter().map(move |device| ExecutorRank {
                     host: host.to_owned(),
                     device: device.clone(),
                 })
@@ -322,8 +322,8 @@ impl GroupEntry {
             } else {
                 format!("{}-{index}", self.id)
             };
-            workers.push(WorkerGroupConfig {
-                id: WorkerGroupId(id),
+            workers.push(ExecutorGroupConfig {
+                id: ExecutorGroupId(id),
                 role: self.role,
                 ranks: block.to_vec(),
                 components: components.clone(),
@@ -372,12 +372,12 @@ impl ComponentEntry {
 mod tests {
     use super::*;
 
-    fn workers(text: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+    fn workers(text: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
         Deployment::parse(text)?.worker_groups("engine")
     }
 
-    fn rank(host: &str, device: &str) -> WorkerRank {
-        WorkerRank {
+    fn rank(host: &str, device: &str) -> ExecutorRank {
+        ExecutorRank {
             host: host.into(),
             device: device.into(),
         }
@@ -494,7 +494,7 @@ mod tests {
         }
     }
 
-    /// Every deployment the repository publishes for `--worker-groups` places.
+    /// Every deployment the repository publishes for `--executor-groups` places.
     #[test]
     fn published_deployments_place() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs");

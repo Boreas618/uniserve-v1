@@ -4,11 +4,11 @@
 //! `serve` (a node's daemon, and on the leader the application), `frontend`
 //! (the deployment's application process), `engine` (a node's main process
 //! for one epoch), `storage` (a host's Storage Server), `program-server` (a
-//! host's Program Server) and `worker` (one worker of the Python runtime the
+//! host's Program Server) and `executor` (one executor of the Python runtime the
 //! daemon still starts). `serve` installs tracing and builds the Tokio
 //! runtime; its module hands the resolved configuration to `daemon::serve`
-//! with a cancellation token that fires on Ctrl-C or SIGTERM. `worker` and
-//! `storage` run before any thread exists: a worker loads the Python runtime
+//! with a cancellation token that fires on Ctrl-C or SIGTERM. `executor` and
+//! `storage` run before any thread exists: an executor loads the Python runtime
 //! on the main thread, and a Storage Server started with `--daemon` forks.
 //!
 //! The runtime, the cancellation token and the supervision lifeline are the
@@ -44,7 +44,7 @@ const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
 const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Caps the default number of Tokio worker threads when `TOKIO_WORKER_THREADS` is unset.
+/// Caps the default number of Tokio executor threads when `TOKIO_WORKER_THREADS` is unset.
 ///
 /// The cap bounds scheduling overhead on machines with many logical CPUs.
 /// Returns `None`, leaving the choice to Tokio's builder, when the variable
@@ -63,7 +63,7 @@ fn tokio_worker_threads() -> Option<usize> {
                 info!(
                     available_parallelism = available,
                     capped_worker_threads = worker_threads,
-                    "capping tokio worker threads, set {TOKIO_WORKER_THREADS_ENV} to override"
+                    "capping tokio executor threads, set {TOKIO_WORKER_THREADS_ENV} to override"
                 );
             }
             worker_threads

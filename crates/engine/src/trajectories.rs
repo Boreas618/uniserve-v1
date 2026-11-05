@@ -17,7 +17,7 @@
 //! - **Offload.** A preempted request whose calls completed at step `k`
 //!   (`0 < k <` its schedule) has every page of its trajectory that holds
 //!   its samples reserved in its rank's pool under the page's key; the next
-//!   batch to the denoiser's worker group, one of latent offloads alone,
+//!   batch to the denoiser's executor group, one of latent offloads alone,
 //!   copies the pages of the committed bank into the reserved slots
 //!   (`Batch::latent_offloads`), and its output commits them, or aborts
 //!   them when it failed. A page the pool holds already (the same part of
@@ -29,7 +29,7 @@
 //!   preparation is offered. When every page is pinned, every restoring
 //!   rank lays the stored values out in its own pages through the copy
 //!   manifest from the stored ranks' layouts to its own
-//!   (`worker::storage::latent::restore`), copying a page it lays out as a
+//!   (`executor::storage::latent::restore`), copying a page it lays out as a
 //!   stored rank did whole, and the preparation commits the trajectory at
 //!   the stored step (`Call::latent_restore`); when one is missing, it
 //!   starts from noise, which computes the same trajectory, and the pages
@@ -99,7 +99,7 @@ use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::executor::WorkerGroupId;
+use crate::executor::ExecutorGroupId;
 use crate::host_tier::Servers;
 
 /// The version of [`Record`]: a record of another version names no pages.
@@ -329,7 +329,7 @@ enum OffloadStage {
     /// Reservations submitted; each rank's slots once it answered.
     Reserving(Vec<Option<Vec<PageSlot>>>),
     /// Every rank reserved what it does not hold: the copies wait for a
-    /// batch of the denoiser's worker group.
+    /// batch of the denoiser's executor group.
     Queued,
     /// The copies are carried by the submitted batch.
     Carried(u64),
@@ -344,7 +344,7 @@ enum OffloadStage {
 }
 
 struct Offload {
-    worker: WorkerGroupId,
+    worker: ExecutorGroupId,
     request_key: RequestKey,
     steps: u32,
     /// Every page's key, by rank.
@@ -423,9 +423,9 @@ pub(crate) struct TrajectoryStore {
     servers: Servers<Purpose>,
     /// The engine's host.
     host: String,
-    /// The denoising ranks of each worker group the store serves, in rank
+    /// The denoising ranks of each executor group the store serves, in rank
     /// order.
-    workers: HashMap<WorkerGroupId, Vec<RankPool>>,
+    workers: HashMap<ExecutorGroupId, Vec<RankPool>>,
     /// The latent seed of what the scheduler's denoising computes.
     seed: u64,
     offloads: HashMap<RequestId, Offload>,
@@ -458,13 +458,13 @@ impl TrajectoryStore {
         self.servers.client(local, endpoint)
     }
 
-    /// Serve `worker`, whose denoising ranks (`ranks`, each with its rank
+    /// Serve `executor`, whose denoising ranks (`ranks`, each with its rank
     /// index in the group) report host latent pools of equal trajectory
     /// pages, when every one's server is reachable. Returns whether the
     /// store serves it.
     pub(crate) fn add_worker(
         &mut self,
-        worker: &WorkerGroupId,
+        worker: &ExecutorGroupId,
         ranks: &[(u32, RankLatents<'_>)],
     ) -> bool {
         let Some((_, first)) = ranks.first() else {
@@ -496,7 +496,7 @@ impl TrajectoryStore {
             worker = %worker.0,
             ranks = pools.len(),
             trajectory_pages,
-            "the host latent pools serve the worker group"
+            "the host latent pools serve the executor group"
         );
         self.workers.insert(worker.clone(), pools);
         true
@@ -514,24 +514,24 @@ impl TrajectoryStore {
         self.seed
     }
 
-    /// Whether the store serves `worker`.
-    pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
+    /// Whether the store serves `executor`.
+    pub(crate) fn serves(&self, worker: &ExecutorGroupId) -> bool {
         self.workers.contains_key(worker)
     }
 
     /// Start storing `request`'s trajectory `trajectory` after `steps` steps
-    /// in the pools of `worker`'s denoising ranks, whose committed bank
+    /// in the pools of `executor`'s denoising ranks, whose committed bank
     /// holds it (`request_key`'s slot) laid out as `layouts` state, each
     /// rank's pages of the trajectory by its rank index
     /// (`CallOutput::latent_layouts`). Returns `false`, starting nothing,
-    /// when the store does not serve `worker` or a rank's layout is missing
+    /// when the store does not serve `executor` or a rank's layout is missing
     /// or malformed; an offload a server could not be asked for fails
     /// ([`Self::offloaded`]) once the others answered.
     pub(crate) fn offload(
         &mut self,
         request: RequestId,
         request_key: RequestKey,
-        worker: &WorkerGroupId,
+        worker: &ExecutorGroupId,
         trajectory: u64,
         steps: u32,
         layouts: &BTreeMap<u32, String>,
@@ -610,14 +610,14 @@ impl TrajectoryStore {
     }
 
     /// The copies of `request`'s offload once every rank reserved its
-    /// pages, for a batch of the denoiser's worker group with id `batch`,
+    /// pages, for a batch of the denoiser's executor group with id `batch`,
     /// which carries them from now on; `None` while the reservations are
     /// answered, or once the copies were taken.
     pub(crate) fn take_offload(
         &mut self,
         request: RequestId,
         batch: u64,
-    ) -> Option<(WorkerGroupId, LatentOffload)> {
+    ) -> Option<(ExecutorGroupId, LatentOffload)> {
         let offload = self.offloads.get_mut(&request)?;
         if !matches!(offload.stage, OffloadStage::Queued) {
             return None;
@@ -709,8 +709,8 @@ impl TrajectoryStore {
         self.sweep();
     }
 
-    /// `worker` was lost: the offloads its batches carried did not happen.
-    pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
+    /// `executor` was lost: the offloads its batches carried did not happen.
+    pub(crate) fn worker_failed(&mut self, worker: &ExecutorGroupId) {
         let failed: Vec<RequestId> = self
             .offloads
             .iter()
@@ -855,14 +855,14 @@ impl TrajectoryStore {
     /// Pin `request`'s trajectory `trajectory` after `steps` steps, stored
     /// under `state_seed` or the store's own seed where `stored_layout` (the
     /// storing engine's record, `Trajectory::stored_layout`) says, for the
-    /// denoising ranks of `worker` to lay out in their own pages. Returns
-    /// `false`, starting nothing, when the store does not serve `worker`; a
+    /// denoising ranks of `executor` to lay out in their own pages. Returns
+    /// `false`, starting nothing, when the store does not serve `executor`; a
     /// restore whose record names no pages, or whose pages lie where a
     /// restoring rank that needs them cannot read them, resolves as a miss.
     pub(crate) fn restore(
         &mut self,
         request: RequestId,
-        worker: &WorkerGroupId,
+        worker: &ExecutorGroupId,
         trajectory: u64,
         steps: u32,
         state_seed: Option<u64>,

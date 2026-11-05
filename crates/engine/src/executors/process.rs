@@ -25,12 +25,12 @@
 
 mod descriptor;
 
-use crate::executor::WorkerResult;
+use crate::executor::ExecutorResult;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::BatchSubmitError;
-use crate::executor::WorkerExecError;
+use crate::executor::ExecuteError;
 use anyhow::{Context, bail};
 use ipc::Channel;
 use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
@@ -79,7 +79,7 @@ pub(super) struct ExecutorProcess {
     pending: HashMap<u64, OutstandingKind>,
     /// Routed results and errors, in arrival order, that `poll_batch` has
     /// not returned yet.
-    ready: VecDeque<anyhow::Result<WorkerResult>>,
+    ready: VecDeque<anyhow::Result<ExecutorResult>>,
     /// Next message identity to assign. Identities start at 1 and are never
     /// zero, which is the identity a channel gives a response that states
     /// none.
@@ -388,7 +388,7 @@ impl ExecutorProcess {
             WorkerResponse::Result { result, .. } => {
                 // Receiving claims any media the result published, so the
                 // shared-memory objects are released rather than left named.
-                drop(WorkerResult::receive(result));
+                drop(ExecutorResult::receive(result));
                 bail!("unexpected startup result response");
             }
             other => bail!("unexpected startup response: {:?}", other.kind()),
@@ -613,17 +613,17 @@ impl ExecutorProcess {
     /// Routes one batch response and appends its result to `ready`.
     ///
     /// The result is received, which claims any media it published
-    /// (`WorkerResult::receive`). Returns an error and appends nothing when
+    /// (`ExecutorResult::receive`). Returns an error and appends nothing when
     /// the executor answered with an
-    /// execution error (as a `WorkerExecError`) or an unexpected response
+    /// execution error (as a `ExecuteError`) or an unexpected response
     /// kind, a product locator names an endpoint other than this rank's
     /// reported one, or the result's batch identity differs from the
     /// submitted batch.
     fn route(&mut self, kind: OutstandingKind, response: WorkerResponse) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
         let report = match response {
-            WorkerResponse::Result { result, .. } => Ok(WorkerResult::receive(result)),
-            WorkerResponse::Error { error, .. } => Err(WorkerExecError {
+            WorkerResponse::Result { result, .. } => Ok(ExecutorResult::receive(result)),
+            WorkerResponse::Error { error, .. } => Err(ExecuteError {
                 batch_id: Some(batch_id),
                 fatal: error.fatal,
                 code: error.code,
@@ -729,7 +729,7 @@ impl ExecutorProcess {
     /// Results already received are returned before a rank exit, startup
     /// cancellation, the rank's connection closing, or a failed wait fails
     /// the call.
-    pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<WorkerResult>> {
+    pub(super) fn poll_batch(&mut self, timeout: Duration) -> anyhow::Result<Option<ExecutorResult>> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(result) = self.ready.pop_front() {
