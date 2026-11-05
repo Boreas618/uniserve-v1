@@ -912,7 +912,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Served, Memory, ipc::WorkerInfo, GraphStorage)> {
+    ) -> Result<(Served, Memory, ipc::MainProcessInfo, GraphStorage)> {
         let placement = &self.placement;
         match ModelClass::of(&self.checkpoint)? {
             ModelClass::CausalLm => {
@@ -989,7 +989,7 @@ impl EpochPlan {
         &self,
         served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
+    ) -> Result<(Memory, ipc::MainProcessInfo, GraphStorage)> {
         let device = *self
             .devices
             .first()
@@ -1128,7 +1128,7 @@ impl EpochPlan {
         .map_err(|error| error)
         .context("opening the rank's resident memory")?;
         // The plan's own account of this rank is what the scheduler is told about its pool: the
-        // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
+        // capacities it fitted, the cache it holds and where it is. It is the same `MainProcessInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
         // rank rather than a second one derived here.
         Ok((memory, planned.plan.info.clone(), graph))
@@ -1173,7 +1173,7 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
     Ok(executor::capacity::Report {
-        endpoint: ipc::WorkerEndpoint {
+        endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             // The address space this rank's tensors live in: one main process, one pid.
             address_space: std::process::id().to_string(),
@@ -1236,7 +1236,7 @@ pub(crate) fn media_rank_report(
         })
         .collect();
     Ok(executor::capacity::Report {
-        endpoint: ipc::WorkerEndpoint {
+        endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             address_space: std::process::id().to_string(),
             incarnation: format!("{at}"),

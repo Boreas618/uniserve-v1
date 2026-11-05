@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use super::registry::Registry;
 use super::{BatchSubmitError, IncarnationRegistry, ExecutorProcess};
 use crate::executor::{RankBuffer, ExecuteError, ExecutorFailure};
-use ipc::{Batch, BatchCommand, RequestKey, WorkerInfo};
+use ipc::{Batch, BatchCommand, RequestKey, MainProcessInfo};
 
 use crate::executors::ExecutorProcessArgs;
 
@@ -58,7 +58,7 @@ pub struct ExecutorGroup {
     buffers: Vec<VecDeque<ExecutorResult>>,
     /// The group's agreed capabilities: rank 0's report with the group-wide
     /// product storage and cache byte accounting `from_ranks` derives.
-    info: WorkerInfo,
+    info: MainProcessInfo,
     /// Physical runs admitted concurrently, from the ranks' queue depth.
     depth: usize,
     /// The last accepted batch identifier; `submit_batch` refuses a batch
@@ -102,7 +102,7 @@ pub struct ExecutorGroup {
     /// While the group waits for its failure domain's relaunch: the info
     /// its executors reported, with what their planes held when they were
     /// lost, which their replacements must match.
-    awaiting: Option<Vec<WorkerInfo>>,
+    awaiting: Option<Vec<MainProcessInfo>>,
     /// The deployment's connection to its daemons, shared with the other
     /// groups. A daemon ends the processes an engine started when the
     /// connection closes, so the group holds it for as long as it holds those
@@ -838,7 +838,7 @@ impl ExecutorGroup {
 /// `planes`, the group's record of them, states it: the leading segments
 /// held, which a world's cache changes give back and create again, and the
 /// units inherited from a predecessor world, which its commit takes.
-fn holding(info: &WorkerInfo, planes: Option<&ipc::PrefixCacheInfo>) -> WorkerInfo {
+fn holding(info: &MainProcessInfo, planes: Option<&ipc::PrefixCacheInfo>) -> MainProcessInfo {
     let mut info = info.clone();
     if let (Some(cache), Some(planes)) = (info.prefix_cache.as_mut(), planes) {
         cache.held_segments = planes.held_segments;
@@ -853,8 +853,8 @@ fn holding(info: &WorkerInfo, planes: Option<&ipc::PrefixCacheInfo>) -> WorkerIn
 /// stands ([`ExecutorGroup::replacement_infos`]), apart from its endpoint,
 /// which must name a new incarnation.
 fn validate_replacement_info(
-    expected: &WorkerInfo,
-    actual: &WorkerInfo,
+    expected: &MainProcessInfo,
+    actual: &MainProcessInfo,
     rank: usize,
 ) -> anyhow::Result<()> {
     let mut normalized_expected = expected.clone();
@@ -900,7 +900,7 @@ impl ExecutorGroup {
     }
 
     /// Returns the group's agreed executor metadata.
-    pub fn info(&self) -> &WorkerInfo {
+    pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
@@ -927,7 +927,7 @@ impl ExecutorGroup {
     }
 
     /// Returns the loaded physical endpoints used for transfer binding.
-    pub(crate) fn worker_info(&self, rank: usize) -> Option<&WorkerInfo> {
+    pub(crate) fn main_process_info(&self, rank: usize) -> Option<&MainProcessInfo> {
         self.workers.get(rank).map(ExecutorProcess::info)
     }
 

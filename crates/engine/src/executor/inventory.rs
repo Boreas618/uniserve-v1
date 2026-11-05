@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::ensure;
-use ipc::WorkerInfo;
+use ipc::MainProcessInfo;
 
 use crate::ExecutorGroupId;
 use crate::executor::{ExecutorInfo, PoolPlacement, RankEncoderPools};
@@ -161,7 +161,7 @@ impl ExecutorInfo {
 /// and transfer tickets a pool holds are its narrowest rank's, the image facts are those the ranks
 /// holding them agree on, and the prefix cache's layers and heads are their union. The fields a rank
 /// reports for itself alone — its host latent and encoder pool — are left for the rank-by-rank maps.
-pub(crate) fn pool_info(ranks: &[WorkerInfo]) -> anyhow::Result<WorkerInfo> {
+pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcessInfo> {
     ensure!(!ranks.is_empty(), "a pool has at least one rank");
 
     // Rank 0's report becomes the pool's.
@@ -330,7 +330,7 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ipc::{ComponentConfig, MediaCall, WorkerEndpoint};
+    use ipc::{ComponentConfig, MediaCall, MainProcessEndpoint};
     use std::collections::BTreeSet;
 
     /// A rank's report, with the fields a mechanism reads distinguishable per
@@ -339,16 +339,16 @@ mod tests {
         host: &str,
         buffer_pool_bytes: u64,
         prefix_cache: Option<ipc::PrefixCacheInfo>,
-    ) -> WorkerInfo {
-        WorkerInfo {
-            endpoint: WorkerEndpoint {
+    ) -> MainProcessInfo {
+        MainProcessInfo {
+            endpoint: MainProcessEndpoint {
                 host: host.to_owned(),
                 address_space: format!("{host}-space"),
                 incarnation: format!("{host}-rank"),
             },
             buffer_pool_bytes,
             prefix_cache,
-            ..WorkerInfo::default()
+            ..MainProcessInfo::default()
         }
     }
 
@@ -372,7 +372,7 @@ mod tests {
 
     fn pool(
         group: &str,
-        ranks: Vec<WorkerInfo>,
+        ranks: Vec<MainProcessInfo>,
         placed_ranks: usize,
         components: BTreeMap<String, ComponentConfig>,
         max_model_len: u32,

@@ -40,7 +40,7 @@ use anyhow::Context as _;
 use executor::batch::Batches;
 #[cfg(test)]
 use ipc::ComponentDistribution;
-use ipc::WorkerInfo;
+use ipc::MainProcessInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
 use proto::request::ExpertExchange;
 
@@ -733,7 +733,7 @@ impl EngineConfig {
 /// down and joins its thread.
 pub struct SchedulerHandle {
     commands: CommandSender,
-    info: WorkerInfo,
+    info: MainProcessInfo,
     /// Media units one call of each routed media call covers at once
     /// (`ExecutorInfo::media_units`).
     media_units: BTreeMap<MediaCall, u32>,
@@ -1255,7 +1255,7 @@ impl SchedulerHandle {
     /// lower the limit. Executors without a prefix cache fit their request pools
     /// to device storage, and the scheduler bounds their requests by the rows
     /// they report.
-    fn check_rows(info: &WorkerInfo, max_running_requests: usize) -> anyhow::Result<()> {
+    fn check_rows(info: &MainProcessInfo, max_running_requests: usize) -> anyhow::Result<()> {
         let request_rows = info.request_slots as usize;
         let needed_rows = max_running_requests + guidance_prefix_rows(info);
         anyhow::ensure!(
@@ -1585,7 +1585,7 @@ impl SchedulerHandle {
     ///
     /// With several ExecutorGroups this is the executor's merged view
     /// (`ExecutorInfo::runtime_info`), not any single group's report.
-    pub fn info(&self) -> &WorkerInfo {
+    pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 

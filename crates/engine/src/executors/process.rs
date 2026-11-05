@@ -13,7 +13,7 @@
 //! connection has closed as dead, and a rank exits when its connection to
 //! the engine closes. A rank that has not registered yet is known lost by
 //! its daemon's exit report. A rank whose builder thread stays inside one
-//! job reports it unasked (`WorkerResponse::Stalled`), and the engine fails
+//! job reports it unasked (`MainProcessResponse::Stalled`), and the engine fails
 //! that rank as it fails a dead one. The daemon that started a rank reaps it and removes
 //! the CUDA driver storage a rank that did not end in order left behind.
 //!
@@ -33,7 +33,7 @@ use super::BatchSubmitError;
 use crate::executor::ExecuteError;
 use anyhow::{Context, bail};
 use ipc::Channel;
-use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
+use ipc::{Batch, LaunchDescriptor, MainProcessInfo, MainProcessRequest, MainProcessResponse};
 
 use crate::executors::ExecutorProcessArgs;
 use crate::executors::processes::Processes;
@@ -65,7 +65,7 @@ pub(super) struct ExecutorProcess {
     client: Channel,
     /// The rank's validated startup report; the default value until
     /// `finish_startup` stores it.
-    info: WorkerInfo,
+    info: MainProcessInfo,
     /// The startup cancellation flag shared by the ranks launched together,
     /// which the teardown of any of them sets. `ExecutorGroup` detaches it
     /// with `set_startup_cancel(None)` once the group is ready.
@@ -294,7 +294,7 @@ impl PendingWorker {
 
         Ok(ExecutorProcess {
             client: channel,
-            info: WorkerInfo::default(),
+            info: MainProcessInfo::default(),
             startup_cancel: Some(startup_abort),
             process,
             depth,
@@ -345,7 +345,7 @@ impl ExecutorProcess {
     /// `poll_startup` takes the answer.
     pub(super) fn request_startup(&mut self) -> anyhow::Result<()> {
         let message_id = self.alloc_call_id();
-        let mut request = WorkerRequest::info();
+        let mut request = MainProcessRequest::info();
         request.set_message_id(Some(message_id));
         self.client.send(&request)?;
         self.starting = true;
@@ -361,7 +361,7 @@ impl ExecutorProcess {
     pub(super) fn poll_startup(&mut self) -> anyhow::Result<bool> {
         let response = self
             .client
-            .try_recv::<WorkerResponse>()
+            .try_recv::<MainProcessResponse>()
             .with_context(|| format!("rank {} was lost during startup", self.rank))?;
         // A rank that is ready stays under watch until its peers are: the
         // receive above is what notices its connection closing.
@@ -372,8 +372,8 @@ impl ExecutorProcess {
             return Ok(false);
         };
         let info = match response {
-            WorkerResponse::Info { info, .. } => info,
-            WorkerResponse::Error { error, .. } => {
+            MainProcessResponse::Info { info, .. } => info,
+            MainProcessResponse::Error { error, .. } => {
                 tracing::error!(
                     rank = self.rank,
                     "rank failed during startup: {}",
@@ -385,7 +385,7 @@ impl ExecutorProcess {
                     error.message
                 )
             }
-            WorkerResponse::Result { result, .. } => {
+            MainProcessResponse::Result { result, .. } => {
                 // Receiving claims any media the result published, so the
                 // shared-memory objects are released rather than left named.
                 drop(ExecutorResult::receive(result));
@@ -401,7 +401,7 @@ impl ExecutorProcess {
         Ok(true)
     }
 
-    /// Asks a parked standby rank to promote (`WorkerRequest::Promote`): it
+    /// Asks a parked standby rank to promote (`MainProcessRequest::Promote`): it
     /// takes write access to the exclusive storages its predecessor held,
     /// which the Storage Server shoots down if it still holds them, restores
     /// what it suspended while it parked, and serves. Returns the request's
@@ -410,7 +410,7 @@ impl ExecutorProcess {
     /// rank of it is asked before any answer is awaited ([`promote_all`]).
     pub(super) fn request_promotion(&mut self) -> anyhow::Result<u64> {
         let message_id = self.alloc_call_id();
-        let mut request = WorkerRequest::promote();
+        let mut request = MainProcessRequest::promote();
         request.set_message_id(Some(message_id));
         self.client.send(&request)?;
         Ok(message_id)
@@ -429,16 +429,16 @@ impl ExecutorProcess {
         loop {
             let response = self
                 .client
-                .try_recv::<WorkerResponse>()
+                .try_recv::<MainProcessResponse>()
                 .with_context(|| format!("standby rank {} was lost", self.rank))?;
             match response {
-                Some(WorkerResponse::Ok {
+                Some(MainProcessResponse::Ok {
                     message_id: Some(id),
                 }) if id == message_id => {
                     tracing::info!(rank = self.rank, "the standby rank was promoted");
                     return Ok(());
                 }
-                Some(WorkerResponse::Error { error, .. }) => {
+                Some(MainProcessResponse::Error { error, .. }) => {
                     bail!(
                         "standby rank {} was not promoted: {}",
                         self.rank,
@@ -460,12 +460,12 @@ impl ExecutorProcess {
     }
 
     /// Asks the rank to run the executor hook `name` with `payload`
-    /// (`WorkerRequest::Hook`). Returns the request's message, whose answer
+    /// (`MainProcessRequest::Hook`). Returns the request's message, whose answer
     /// [`Self::await_hook`] waits for. The engine asks only while the rank
     /// runs no batch, so no other answer is outstanding.
     pub(super) fn request_hook(&mut self, name: &str, payload: &str) -> anyhow::Result<u64> {
         let message_id = self.alloc_call_id();
-        let mut request = WorkerRequest::hook(name, payload);
+        let mut request = MainProcessRequest::hook(name, payload);
         request.set_message_id(Some(message_id));
         self.client.send(&request)?;
         Ok(message_id)
@@ -485,17 +485,17 @@ impl ExecutorProcess {
         loop {
             let response = self
                 .client
-                .try_recv::<WorkerResponse>()
+                .try_recv::<MainProcessResponse>()
                 .with_context(|| format!("rank {} was lost", self.rank))?;
             match response {
-                Some(WorkerResponse::Hooked {
+                Some(MainProcessResponse::Hooked {
                     message_id: Some(id),
                     result,
                 }) if id == message_id => return Ok(result),
-                Some(WorkerResponse::Error { error, .. }) => {
+                Some(MainProcessResponse::Error { error, .. }) => {
                     bail!("rank {}: {}", self.rank, error.message)
                 }
-                Some(WorkerResponse::Stalled { stall }) => return Err(self.stalled(&stall)),
+                Some(MainProcessResponse::Stalled { stall }) => return Err(self.stalled(&stall)),
                 Some(other) => bail!("unexpected hook response: {:?}", other.kind()),
                 None => {}
             }
@@ -582,14 +582,14 @@ impl ExecutorProcess {
     /// routed.
     fn drain_ready(&mut self) -> anyhow::Result<usize> {
         let mut drained = 0usize;
-        while let Some(response) = self.client.try_recv::<WorkerResponse>()? {
+        while let Some(response) = self.client.try_recv::<MainProcessResponse>()? {
             // A stall report answers no request: it fails the rank.
-            if let WorkerResponse::Stalled { stall } = response {
+            if let MainProcessResponse::Stalled { stall } = response {
                 return Err(self.stalled(&stall));
             }
             // An error that answers no request is the rank's own failure,
             // which it reports before it closes: it fails the rank.
-            if let WorkerResponse::Error {
+            if let MainProcessResponse::Error {
                 message_id: None,
                 error,
             } = response
@@ -619,11 +619,11 @@ impl ExecutorProcess {
     /// kind, a product locator names an endpoint other than this rank's
     /// reported one, or the result's batch identity differs from the
     /// submitted batch.
-    fn route(&mut self, kind: OutstandingKind, response: WorkerResponse) -> anyhow::Result<()> {
+    fn route(&mut self, kind: OutstandingKind, response: MainProcessResponse) -> anyhow::Result<()> {
         let OutstandingKind::Batch { batch_id } = kind;
         let report = match response {
-            WorkerResponse::Result { result, .. } => Ok(ExecutorResult::receive(result)),
-            WorkerResponse::Error { error, .. } => Err(ExecuteError {
+            MainProcessResponse::Result { result, .. } => Ok(ExecutorResult::receive(result)),
+            MainProcessResponse::Error { error, .. } => Err(ExecuteError {
                 batch_id: Some(batch_id),
                 fatal: error.fatal,
                 code: error.code,
@@ -694,7 +694,7 @@ impl ExecutorProcess {
 
 impl ExecutorProcess {
     /// Returns metadata for the physical executor.
-    pub(super) fn info(&self) -> &WorkerInfo {
+    pub(super) fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
@@ -711,7 +711,7 @@ impl ExecutorProcess {
         }
         let batch_id = batch.batch_id;
         let message_id = self.alloc_call_id();
-        let mut req = WorkerRequest::submit(batch);
+        let mut req = MainProcessRequest::submit(batch);
         req.set_message_id(Some(message_id));
         self.client
             .send(&req)
@@ -806,7 +806,7 @@ impl ExecutorProcess {
             // A rank still running after the drain is asked to shut down.
             if self.process.exited().is_none() {
                 let message_id = self.alloc_call_id();
-                let mut req = WorkerRequest::close();
+                let mut req = MainProcessRequest::close();
                 req.set_message_id(Some(message_id));
                 acknowledgment = self.client.send(&req).ok().map(|()| message_id);
             }
@@ -834,7 +834,7 @@ impl ExecutorProcess {
             // which answers the request as finally as a response does. A
             // response to anything else is a result nobody waits for any more.
             while let Some(message_id) = acknowledgment {
-                match self.client.try_recv::<WorkerResponse>() {
+                match self.client.try_recv::<MainProcessResponse>() {
                     Ok(Some(response)) if response.message_id() != Some(message_id) => {}
                     Ok(None) => break,
                     Ok(Some(_)) | Err(_) => acknowledgment = None,

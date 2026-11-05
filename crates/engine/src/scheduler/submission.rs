@@ -54,11 +54,11 @@ pub struct Submissions {
 
 /// Which executor serves this scheduler's batches.
 enum Path {
-    /// Worker processes, over the ipc protocol.
-    Workers(Box<dyn Executor>),
+    /// A main process's executors, over the ipc protocol.
+    MainProcess(Box<dyn Executor>),
     /// The device executor of this process (2.4). Boxed: the arm holds the
     /// batch path, the waiting thread's two channels and the shadows, and a
-    /// scheduler built on the worker-process path should not carry that much
+    /// scheduler built on the main-process path should not carry that much
     /// unused room.
     InProcess(Box<InProcess>),
 }
@@ -118,7 +118,7 @@ struct Pending {
 impl Submissions {
     pub fn new(executor: Box<dyn Executor>) -> Self {
         Self {
-            path: Path::Workers(executor),
+            path: Path::MainProcess(executor),
         }
     }
 
@@ -187,7 +187,7 @@ impl Submissions {
     /// The pool's capabilities: its workers, components, pools, and limits.
     pub(super) fn info(&self) -> &ExecutorInfo {
         match &self.path {
-            Path::Workers(executor) => executor.info(),
+            Path::MainProcess(executor) => executor.info(),
             Path::InProcess(arm) => &arm.info,
         }
     }
@@ -195,7 +195,7 @@ impl Submissions {
     /// Whether every worker of `worker` is ready to accept execution.
     pub(super) fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::Workers(executor) => executor.is_ready(worker),
+            Path::MainProcess(executor) => executor.is_ready(worker),
             // The arm serves the pools its inventory states and no others.
             Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
         }
@@ -204,7 +204,7 @@ impl Submissions {
     /// Whether `worker` executes nothing further.
     pub(super) fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::Workers(executor) => executor.is_closed(worker),
+            Path::MainProcess(executor) => executor.is_closed(worker),
             // A device of this process is closed when the process ends.
             Path::InProcess(_) => false,
         }
@@ -213,7 +213,7 @@ impl Submissions {
     /// Whether `worker` has an unclaimed destination submission slot.
     pub(super) fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::Workers(executor) => executor.has_capacity(worker),
+            Path::MainProcess(executor) => executor.has_capacity(worker),
             // `Batches::submit` queues on the device's own stream and never
             // refuses for capacity, so a stated pool always has room here.
             Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
@@ -223,7 +223,7 @@ impl Submissions {
     /// Whether `command` can be handed to a worker now.
     pub(super) fn command_has_capacity(&self, command: &BatchCommand) -> bool {
         match &self.path {
-            Path::Workers(executor) => executor.command_has_capacity(command),
+            Path::MainProcess(executor) => executor.command_has_capacity(command),
             // A lifecycle command travels inside the batch it belongs to.
             Path::InProcess(_) => true,
         }
@@ -232,7 +232,7 @@ impl Submissions {
     /// Submits one logical batch without blocking for capacity.
     pub(super) fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.submit(batch),
+            Path::MainProcess(executor) => executor.submit(batch),
             Path::InProcess(arm) => arm.submit(batch),
         }
     }
@@ -251,7 +251,7 @@ impl Submissions {
         computation: &executor::plan::Computation,
     ) -> Option<executor::plan::Bucket> {
         match &self.path {
-            Path::Workers(_) => None,
+            Path::MainProcess(_) => None,
             Path::InProcess(arm) => arm.batches.media(phase, computation).ok().flatten(),
         }
     }
@@ -282,7 +282,7 @@ impl Submissions {
         generation: u64,
     ) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
-            Path::Workers(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+            Path::MainProcess(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "a worker-process executor shadows a world on its workers, not through this door"
             ))),
             Path::InProcess(arm) => arm.shadow(batch, generation),
@@ -296,7 +296,7 @@ impl Submissions {
     /// refuses it at submission, and the pass is answered with that refusal.
     pub(super) fn shadow_status(&mut self) -> ShadowStatus {
         match &mut self.path {
-            Path::Workers(_) => ShadowStatus::Settled,
+            Path::MainProcess(_) => ShadowStatus::Settled,
             Path::InProcess(arm) => arm.shadow_status(),
         }
     }
@@ -305,7 +305,7 @@ impl Submissions {
     /// mechanism's own completion type.
     pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => Ok(executor.poll(timeout)?.map(BatchReport::from_wire)),
+            Path::MainProcess(executor) => Ok(executor.poll(timeout)?.map(BatchReport::from_wire)),
             Path::InProcess(arm) => arm.poll(timeout),
         }
     }
@@ -313,7 +313,7 @@ impl Submissions {
     /// Closes the pool and its physical workers.
     pub(super) fn close(&mut self) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.close(),
+            Path::MainProcess(executor) => executor.close(),
             // The devices of this process are its own: nothing outlives the call.
             Path::InProcess(_) => Ok(()),
         }
@@ -322,7 +322,7 @@ impl Submissions {
     /// The nodes that hold the deployment's storage.
     pub(super) fn storage_nodes(&self) -> BTreeMap<String, String> {
         match &self.path {
-            Path::Workers(executor) => executor.storage_nodes(),
+            Path::MainProcess(executor) => executor.storage_nodes(),
             // This process's devices hold no deployment storage of their own;
             // the engine's host KV path is served by the storage server it
             // reaches itself.
@@ -337,7 +337,7 @@ impl Submissions {
         tokens: u64,
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.map_host_cache(tokens),
+            Path::MainProcess(executor) => executor.map_host_cache(tokens),
             // No rank of this process maps a host page pool, so the mechanism
             // plans no host KV write rather than one nothing answers.
             Path::InProcess(_) => Ok(Vec::new()),
@@ -348,7 +348,7 @@ impl Submissions {
     /// storage it mapped read-only.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.commit(),
+            Path::MainProcess(executor) => executor.commit(),
             // The world this process serves is the executor's own, committed
             // when it was spawned; there is no worker to tell.
             Path::InProcess(_) => Ok(Vec::new()),
@@ -358,7 +358,7 @@ impl Submissions {
     /// Publishes this world's immutable pages after its commit decision.
     pub(super) fn publish_world(&mut self) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.publish_world(),
+            Path::MainProcess(executor) => executor.publish_world(),
             Path::InProcess(_) => Ok(()),
         }
     }
@@ -366,7 +366,7 @@ impl Submissions {
     /// Ends the storage of every world of `worlds` on the pool's nodes.
     pub(super) fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.retire(worlds),
+            Path::MainProcess(executor) => executor.retire(worlds),
             Path::InProcess(_) => Ok(()),
         }
     }
@@ -379,7 +379,7 @@ impl Submissions {
         cache_keys: &[Vec<u8>],
     ) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.keep_weights(worlds, to_host, cache_keys),
+            Path::MainProcess(executor) => executor.keep_weights(worlds, to_host, cache_keys),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -387,7 +387,7 @@ impl Submissions {
     /// Halves, or restores when not `halve`, the deployment's link budgets.
     pub(super) fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.throttle(halve),
+            Path::MainProcess(executor) => executor.throttle(halve),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -395,7 +395,7 @@ impl Submissions {
     /// The storage ledgers of the pool's nodes.
     pub(super) fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.ledgers(),
+            Path::MainProcess(executor) => executor.ledgers(),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -403,7 +403,7 @@ impl Submissions {
     /// Runs the worker hook `name` on every worker while none runs a batch.
     pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.hook(name, payload),
+            Path::MainProcess(executor) => executor.hook(name, payload),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -416,7 +416,7 @@ impl Submissions {
         payload: &str,
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.hook_groups(name, payload),
+            Path::MainProcess(executor) => executor.hook_groups(name, payload),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -427,7 +427,7 @@ impl Submissions {
         order: &BTreeMap<String, Vec<u32>>,
     ) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::Workers(executor) => executor.commit_experts(order),
+            Path::MainProcess(executor) => executor.commit_experts(order),
             // The expert allocation of a world this process serves is its own
             // setup's (7.6), applied where the world is built.
             Path::InProcess(_) => Ok(Vec::new()),
@@ -747,7 +747,7 @@ mod tests {
             let delivered = Arc::new(Mutex::new(Vec::new()));
             let inventory = Inventory {
                 group: "gpu".to_owned(),
-                ranks: vec![ipc::WorkerInfo::default()],
+                ranks: vec![ipc::MainProcessInfo::default()],
                 placement: Placement::default(),
                 max_model_len: 4096,
             };

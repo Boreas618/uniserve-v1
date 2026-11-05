@@ -127,7 +127,7 @@ pub struct ExecutorProcessArgs {
     /// that dies is detected at once; this bounds a rank that is alive but
     /// stuck, for example in a collective. The launch descriptor carries it
     /// to every rank, which reports a job that has run for half of it
-    /// (`WorkerResponse::Stalled`), so a rank that stays inside a call is
+    /// (`MainProcessResponse::Stalled`), so a rank that stays inside a call is
     /// reported, and named in the failure of its requests, before this
     /// expires, even for a forward that started up to half of it after the
     /// group's last progress.

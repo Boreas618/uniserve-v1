@@ -197,7 +197,7 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
 
 /// The blocks of a worker group: the component names its replicas bind, sorted
 /// so a [`ComponentId`] means the same component in every view of the epoch.
-pub(crate) fn blocks(info: &WorkerInfo) -> Vec<String> {
+pub(crate) fn blocks(info: &MainProcessInfo) -> Vec<String> {
     let mut names: Vec<String> = info
         .components
         .iter()
@@ -231,7 +231,7 @@ pub(crate) fn world_blocks(world: &dyn super::submission::World) -> Vec<String> 
 
 /// The block that runs `kind` on this worker group: the component the worker
 /// reports for its media call, or the protocol's default component.
-fn block_of(table: &[String], info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
+fn block_of(table: &[String], info: &MainProcessInfo, kind: PhaseKind) -> ComponentId {
     let name = match phase_call(kind) {
         Some(CallKind::Media(call)) => info
             .media_components
@@ -246,12 +246,12 @@ fn block_of(table: &[String], info: &WorkerInfo, kind: PhaseKind) -> ComponentId
 ///
 /// `Snapshot::phases`, built once per epoch: a policy reads a request's
 /// `PhaseId` here to learn its kind and its block.
-pub(crate) fn phases(info: &WorkerInfo) -> Vec<PhaseView> {
+pub(crate) fn phases(info: &MainProcessInfo) -> Vec<PhaseView> {
     phases_in(info, &blocks(info))
 }
 
 /// Every phase this worker group can run, numbered in the world's block table.
-pub(crate) fn phases_in(info: &WorkerInfo, table: &[String]) -> Vec<PhaseView> {
+pub(crate) fn phases_in(info: &MainProcessInfo, table: &[String]) -> Vec<PhaseView> {
     PHASES
         .iter()
         .copied()
@@ -1172,7 +1172,7 @@ fn holds_request(
 }
 
 /// The phase kinds a worker can run.
-fn worker_phases(info: &WorkerInfo) -> Vec<PhaseKind> {
+fn worker_phases(info: &MainProcessInfo) -> Vec<PhaseKind> {
     let mut kinds: Vec<PhaseKind> = info
         .supported_calls
         .iter()
@@ -1249,7 +1249,7 @@ fn candidate_facts<'a>(
     scheduler: &'a Scheduler,
     request: RequestKey,
     kind: CallKind,
-    candidates: impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a WorkerInfo)>,
+    candidates: impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)>,
 ) -> Vec<(ReplicaView, crate::ExecutorGroupId, String)> {
     let world = &scheduler.executor;
     let table = world_blocks(world);
@@ -1261,11 +1261,11 @@ fn candidate_facts<'a>(
     candidates
         .filter(|(id, _, _)| !decode_stage || !scheduler.placement.prefill_groups.contains(*id))
         .enumerate()
-        .map(|(index, (worker, bound, worker_info))| {
+        .map(|(index, (worker, bound, main_process_info))| {
             let view = replica_view(ReplicaFacts {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
-                kinds: worker_phases(worker_info),
+                kinds: worker_phases(main_process_info),
                 resident_requests: resident_requests(&scheduler.placement, worker),
                 // The executor reports whether a worker's queue has room, not
                 // how many rows that is; a plan may submit one call's worth.
@@ -1705,7 +1705,7 @@ mod tests {
 
     #[test]
     fn an_epoch_offers_the_phases_its_workers_serve() {
-        let mut info = WorkerInfo::default();
+        let mut info = MainProcessInfo::default();
         info.components = vec![ipc::ComponentInfo {
             name: "model".into(),
             outputs: Vec::new(),

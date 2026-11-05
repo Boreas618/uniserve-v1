@@ -4,7 +4,7 @@
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
 //! The backing storage itself lives in the executor processes, which report its
-//! capacity in `WorkerInfo`; these pools assign its rows, units, pages, and
+//! capacity in `MainProcessInfo`; these pools assign its rows, units, pages, and
 //! byte ranges. Row zero of the request state, unit zero of the cache pool and
 //! page zero of the latent pool are the executor's inactive sentinels, so no
 //! pool ever hands them out, and the executor IPC validation rejects a request
@@ -15,7 +15,7 @@
 //! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
-use ipc::{RequestKey, WorkerInfo};
+use ipc::{RequestKey, MainProcessInfo};
 
 mod bytes;
 pub(crate) use bytes::ByteAllocator;
@@ -125,7 +125,7 @@ pub(crate) struct LatentPool {
 impl LatentPool {
     /// Creates an allocator with page zero reserved for inactive input.
     ///
-    /// `num_pages` counts that sentinel page, as `WorkerInfo::latent_pages`
+    /// `num_pages` counts that sentinel page, as `MainProcessInfo::latent_pages`
     /// does, so pages `1..num_pages` are allocatable.
     pub(crate) fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
@@ -184,7 +184,7 @@ impl PrefixCacheManager {
     /// Returns `None` when `info` has no prefix cache. `BlockPool::new` panics on
     /// a pool without an allocatable unit and `BlockTable::new` on an empty
     /// page shape; `PrefixCacheInfo::validate` rejects each of these.
-    pub(crate) fn from_worker_info(info: &WorkerInfo) -> Option<Self> {
+    pub(crate) fn from_main_process_info(info: &MainProcessInfo) -> Option<Self> {
         info.prefix_cache.as_ref().map(|prefix_cache| {
             let block_pool = BlockPool::new(prefix_cache.num_units, prefix_cache.scratch_units);
             // The units of the segments the planes do not hold (a

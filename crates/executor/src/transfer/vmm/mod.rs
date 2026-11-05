@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ipc::{Locator, TransferTransport, WorkerEndpoint};
+use ipc::{Locator, TransferTransport, MainProcessEndpoint};
 use platform::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
     Stream, memset_d32,
@@ -510,7 +510,7 @@ impl CudaExports {
     /// the transport of `source` (see [`crate::transfer::Transport::issue_fetch`]).
     pub(crate) fn read(
         &self,
-        source: &WorkerEndpoint,
+        source: &MainProcessEndpoint,
         locator: &Locator,
         device: MemoryKind,
         destination: Option<&Spans>,
