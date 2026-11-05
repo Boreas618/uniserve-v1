@@ -28,6 +28,14 @@ impl Programs {
             .push((O::NAME.to_owned(), ops::descriptor::key(descriptor)));
     }
 
+    /// Add rows another component stated, keeping its operators and keys as they are.
+    ///
+    /// A denoiser composes two stacks and their orchestration; absorbing each stack's rows rather than
+    /// restating them is what keeps one construction per program.
+    pub fn extend(&mut self, rows: impl IntoIterator<Item = (String, String)>) {
+        self.rows.extend(rows);
+    }
+
     /// The rows, deduplicated and ordered by operator and then key.
     pub fn finish(mut self) -> Vec<(String, String)> {
         self.rows.sort();
