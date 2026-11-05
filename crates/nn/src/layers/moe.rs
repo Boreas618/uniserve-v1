@@ -712,6 +712,7 @@ enum ExpertStacks {
 /// All of them are the forward's arena, sized from the routing geometry, so a captured graph
 /// replays over the same addresses however the router routes a later batch.
 #[derive(Clone, Copy)]
+
 struct Routes {
     /// `[tokens, top]` i32: the weight row of each route.
     local_ids: TensorView,
@@ -1260,6 +1261,7 @@ impl Moe {
             permuted_to_expanded,
             total_padded_tokens,
             num_non_exiting_tiles,
+            live_tokens: f.live_of(),
             local_offset: 0,
         };
 
@@ -1864,6 +1866,13 @@ impl Moe {
             permuted_to_expanded,
             total_padded_tokens,
             num_non_exiting_tiles,
+            // The expert-parallel path's `tokens` is `received` - the routes this rank holds,
+            // gathered from many batches - not the batch's token rows. A batcher's live count
+            // is a number over the pre-dispatch batch, so passing it here would compare a count
+            // of one population against a shape of another. The exchange delivers a route only
+            // to the rank that owns it, so every delivered row is live and this path states no
+            // count: padding exists on the single-rank path, which is where the bucket is padded.
+            live_tokens: None,
             local_offset: self.local_offset,
         };
 
