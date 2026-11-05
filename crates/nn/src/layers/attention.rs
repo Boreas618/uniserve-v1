@@ -506,10 +506,10 @@ impl Attention {
         // Read the query and the output after the launch: the output buffer is the forward's and the
         // next layer overwrites it, so this is the only moment it holds this layer's bytes under this
         // layer's name.
-        if let Some(probe) = f.attention_probe {
-            if let Ok(stream) = f.stream() {
-                probe.attention(layer, query, out, stream);
-            }
+        if let Some(probe) = f.attention_probe
+            && let Ok(stream) = f.stream()
+        {
+            probe.attention(layer, query, out, stream);
         }
         Ok(())
     }

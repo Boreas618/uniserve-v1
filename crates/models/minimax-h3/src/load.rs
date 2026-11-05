@@ -640,6 +640,7 @@ pub fn load(
     checkpoint: &nn::Checkpoint,
     partition: Partition,
     dtype: Option<nn::DType>,
+    canvas: (u32, u32),
     loader: &mut nn::weights::WeightLoader<'_>,
 ) -> Result<MinimaxH3> {
     let (layout, sidecars) = sidecars(checkpoint)?;
@@ -890,15 +891,23 @@ pub fn load(
                     "decoder",
                     "vae",
                 )?;
-                // One block serves every canvas: the tile grid is arithmetic on a request's raster,
-                // so the block is loaded against the checkpoint's tile - the largest tile any canvas
-                // of this checkpoint produces, since the grid is uniform wherever the canvas holds a
-                // whole tile - and the seam blends are built here, at load.
+                // The block is built for the deployment's raster, which the caller states in
+                // pixels: the decoder's register rows, its voxel-row table and its sequence offsets
+                // are that raster's constants, published here at load, and the seam blends are
+                // built here too so that no layer is built on a request's path.
                 let spatial = config.video_vae.spatial_compression();
+                let (pixel_width, pixel_height) = canvas;
+                if pixel_width % spatial != 0 || pixel_height % spatial != 0 {
+                    return Err(Error::checkpoint(format!(
+                        "the deployment's canvas is {pixel_width}x{pixel_height} pixels and this \
+                         checkpoint's decoder compresses {spatial} pixels into one latent cell, so \
+                         the raster is not a whole number of cells"
+                    )));
+                }
                 let canvas = crate::video_vae::Canvas::clip(
                     &config.video_vae,
-                    crate::video_vae::TILE_PIXELS / spatial,
-                    crate::video_vae::TILE_PIXELS / spatial,
+                    pixel_height / spatial,
+                    pixel_width / spatial,
                 );
                 // The clip's rows are packed in the attention's order, so the decoder needs it at
                 // load. It is the denoisers' and it must be one: two partitions that attend

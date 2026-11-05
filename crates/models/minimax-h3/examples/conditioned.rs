@@ -914,7 +914,11 @@ fn encode(args: &Args) -> Result<(), String> {
         // can never disagree: `None` is `auto`, the checkpoint's own representation with each
         // request's pin deciding; `Some(stated)` converts every weight once, keyed by the conversion.
         let mut loader = WeightLoader::new(&checkpoint, &mut weights, deployment, None);
-        minimax_h3::load(&checkpoint, partition, deployment, &mut loader).map_err(show)?
+        // The example's own raster: it exercises the conditioned path against the checkpoint's
+        // tile canvas, which is what it can state without a deployment's options.
+        let tile = minimax_h3::video_vae::TILE_PIXELS;
+        minimax_h3::load(&checkpoint, partition, deployment, (tile, tile), &mut loader)
+            .map_err(show)?
     };
     let denoiser = std::sync::Arc::clone(
         model
