@@ -129,6 +129,49 @@ pub struct Scene<'a> {
     pub blended: TensorView,
 }
 
+/// The stitcher's ring and hand-off: the buffers [`Scene::encode`] takes after the encoder's set.
+///
+/// Two decoded rows of a two-row ring, one block per tile column, and one more block that a tile whose
+/// fade is both ways hands to its second blend - `2 * columns + 1` blocks in all, in the order
+/// `encode` reserves them. The block is the caller's raster's channel and frame extent by the tile's
+/// latent extent, because the stitcher blends the raster the caller funds and not a shape of its own;
+/// `latent_frames` is therefore the raster's frame extent, not the request's.
+///
+/// A run sized from the encoder's own set alone stops at the first of these buffers, which is why
+/// they are stated by name: a plan is what a caller allocates, and bytes it does not name are bytes
+/// the forward takes past its arena.
+pub fn stitch_arena(
+    config: &crate::VideoVaeConfig,
+    columns: usize,
+    latent_frames: u64,
+    tile_rows: u64,
+    tile_columns: u64,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    // The raster's channel extent, `2 * latent_channels`: the encoder writes a mean and a deviation
+    // per latent channel and the clip's plan splits them.
+    let block = 2
+        * u64::from(config.latent_channels)
+        * latent_frames
+        * tile_rows
+        * tile_columns;
+    let mut plan = Vec::with_capacity(2 * columns + 1);
+    for ring in 0..2 {
+        for column in 0..columns {
+            plan.push(crate::decoding::Buffer {
+                name: format!("stitch.ring{ring}.{column}"),
+                element: "f32",
+                elements: block,
+            });
+        }
+    }
+    plan.push(crate::decoding::Buffer {
+        name: "stitch.handed".to_owned(),
+        element: "f32",
+        elements: block,
+    });
+    Ok(plan)
+}
+
 /// The tiled encoding of one raster: the tile grid, and the band arithmetic over it.
 ///
 /// The raster's extents are input pixels and must be multiples of the spatial compression, which is
@@ -520,6 +563,43 @@ mod tests {
 
     use super::*;
     use crate::config::CLIP_FRAMES;
+
+    /// The stitcher's plan is one ring block per column and a hand-off block, by name.
+    ///
+    /// `Scene::encode` reserves exactly these, in this order, after the encoder's own set: two rows of
+    /// a two-row ring, one block per tile column of the grid, then the block a two-way fade hands to
+    /// its second blend. Each block is the caller's raster extent - its channels and its frames - by
+    /// the tile's latent extent, which is why the plan takes the frames as an argument rather than
+    /// reading them from the request: the stitcher blends the raster the caller funds.
+    #[test]
+    fn the_stitch_plan_is_a_ring_per_column_and_one_handed_block() {
+        let config = crate::video_vae::tests::video_config();
+        let plan = stitch_arena(&config, 3, 2, 16, 16).expect("the stitcher's plan");
+        let block = 2 * u64::from(config.latent_channels) * 2 * 16 * 16;
+        assert_eq!(plan.len(), 2 * 3 + 1, "two ring rows of three columns, and the hand-off");
+        for buffer in &plan {
+            assert_eq!(buffer.elements, block, "{} holds {block} elements", buffer.name);
+            assert_eq!(buffer.element, "f32");
+        }
+        let names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "stitch.ring0.0",
+                "stitch.ring0.1",
+                "stitch.ring0.2",
+                "stitch.ring1.0",
+                "stitch.ring1.1",
+                "stitch.ring1.2",
+                "stitch.handed",
+            ]
+        );
+
+        // A wider raster's grid is more blocks, not bigger ones.
+        let wider = stitch_arena(&config, 7, 2, 16, 16).expect("the wider plan");
+        assert_eq!(wider.len(), 2 * 7 + 1);
+        assert_eq!(wider[0].elements, block);
+    }
 
     /// The 768 by 1344 canvas the fixtures use: 48 by 84 latents, four tile rows and seven columns.
     fn canvas() -> ClipEncoder {

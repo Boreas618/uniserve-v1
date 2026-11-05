@@ -1587,6 +1587,33 @@ impl Decoder for VideoDecoder {
         })
     }
 
+    /// The bytes one decode of `layout` needs, from this block's own plan.
+    ///
+    /// The layout states the canvas's latent extents, and the block decodes one canvas, so a layout
+    /// naming another raster is refused by name - the same mismatch `layout_of` refuses from its side,
+    /// reached here by a caller that built the layout itself. The plan is [`video_arena`]'s for that
+    /// canvas at this decoder's element type, so the number and the plan a runner allocates from are
+    /// one statement rather than two.
+    fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
+        let canvas = Canvas::clip(&self.config, layout.video.height, layout.video.width);
+        if canvas != self.canvas {
+            return Err(nn::Error::Shape {
+                owner: "VideoDecoder",
+                problem: format!(
+                    "this decoder's canvas holds {}x{} latent cells and the layout states {}x{}",
+                    self.canvas.width, self.canvas.height, layout.video.width, layout.video.height,
+                ),
+            });
+        }
+        let plan = crate::decoding::video_arena(&self.config, &canvas, self.dtype).map_err(
+            |error| nn::Error::Shape {
+                owner: "VideoDecoder",
+                problem: format!("this decoder's plan for its canvas: {error}"),
+            },
+        )?;
+        Ok(crate::decoding::arena_reservation(&plan))
+    }
+
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them
@@ -1764,6 +1791,108 @@ pub fn fold_input_affine(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A decoder of one canvas, built from stated weights: the geometry is the subject, so neither a
+    /// checkpoint nor a device is needed.
+    fn stated_decoder(config: &VideoVaeConfig, canvas: Canvas) -> VideoDecoder {
+        let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
+        let mut loader = WeightLoader::stated(DType::F32, None);
+        let projection = loader
+            .load(&WeightRequest::region(
+                "virtual.proj_in.weight",
+                0,
+                Shape::new(&[u64::from(width), u64::from(config.latent_channels)]),
+            ))
+            .expect("a stated projection");
+        let bias = loader
+            .load(&WeightRequest::region(
+                "virtual.proj_in.bias",
+                0,
+                Shape::new(&[u64::from(width)]),
+            ))
+            .expect("a stated bias");
+        let input = Linear::new(projection, Some(bias), WeightOrder::NxK).expect("a linear");
+        VideoDecoder::load(config, canvas, AttentionKind::Dense, DType::F32, input, &mut loader)
+            .expect("the decoder")
+    }
+
+    /// The clip a canvas decodes: the raster's pixels and its native frame count.
+    fn clip_of(config: &VideoVaeConfig, canvas: Canvas) -> nn::capability::Clip {
+        let (width, height) = canvas.pixels(config);
+        nn::capability::Clip {
+            frames: canvas.frames_out(config),
+            height,
+            width,
+        }
+    }
+
+    /// The decoder is one canvas, and it refuses a clip of another by both extents.
+    ///
+    /// `VideoDecoder::load` binds a canvas because its registers, its row counts and its seam table
+    /// belong to one raster, and `layout_of` is where a runner learns that: a decode of another clip
+    /// would capture a graph whose constants belong to a different raster. Both refusals are asserted
+    /// by what they name, because a runner reads them to know which side was wrong, and a refusal that
+    /// fired for another reason would leave the mismatch to the first launch.
+    #[test]
+    fn the_decoder_states_its_own_canvas_and_refuses_another_by_both_extents() {
+        let config = video_config();
+        let ratio = config.spatial_compression();
+        // A latent canvas small enough to build from stated weights: the geometry is what is under
+        // test, and every extent below follows from it.
+        let canvas = Canvas::clip(&config, 2 * ratio, 2 * ratio);
+        let decoder = stated_decoder(&config, canvas);
+
+        let clip = clip_of(&config, canvas);
+        let layout = decoder.layout_of(clip).expect("its own canvas");
+        assert_eq!(
+            (layout.video.height, layout.video.width, layout.video.frames),
+            (canvas.height, canvas.width, canvas.frames),
+            "the layout is the canvas's own latent extents"
+        );
+
+        let wider = nn::capability::Clip {
+            width: clip.width + ratio,
+            ..clip
+        };
+        let error = decoder.layout_of(wider).expect_err("a raster of another width");
+        assert!(
+            error.to_string().contains(&format!("{}x{}", clip.width, clip.height)),
+            "the refusal names the raster it decodes: {error}"
+        );
+
+        let longer = nn::capability::Clip {
+            frames: clip.frames + 1,
+            ..clip
+        };
+        let error = decoder.layout_of(longer).expect_err("another frame count");
+        assert!(
+            error.to_string().contains(&format!("{} frame(s)", clip.frames)),
+            "the refusal names the frame count it decodes: {error}"
+        );
+
+        // The arena is the canvas's own plan: a wider raster needs more bytes, and this decoder
+        // refuses the other's layout by name rather than answering with a number for its own raster.
+        let bytes = decoder.arena_bytes(&layout).expect("the plan of its own canvas");
+        let wider_canvas = Canvas::clip(&config, 2 * ratio, 3 * ratio);
+        let wider_decoder = stated_decoder(&config, wider_canvas);
+        let wider_layout = wider_decoder
+            .layout_of(clip_of(&config, wider_canvas))
+            .expect("the wider decoder's own canvas");
+        let wider_bytes = wider_decoder
+            .arena_bytes(&wider_layout)
+            .expect("the wider canvas's plan");
+        assert!(
+            bytes > 0 && wider_bytes > bytes,
+            "the wider canvas states {wider_bytes} B, not more than the {bytes} B of the narrower one"
+        );
+        let error = decoder
+            .arena_bytes(&wider_layout)
+            .expect_err("the layout of another canvas");
+        assert!(
+            error.to_string().contains("latent cells"),
+            "the refusal names the canvas mismatch: {error}"
+        );
+    }
 
     fn seams(starts: &[u32], overlaps: &[u32], length: u32) -> Seams {
         Seams {

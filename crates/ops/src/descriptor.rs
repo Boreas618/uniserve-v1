@@ -8,7 +8,7 @@
 //! - Fields are appended in the order the descriptor declares them, as `_<name>_<value>`, with no
 //!   separators inside a value beyond what the value itself prints.
 //! - A floating-point value enters as the hexadecimal bit pattern of its `f32`/`f64` form
-//!   ([`float`]), never as decimal text, so `0.1` and its nearest printed form cannot disagree.
+//!   (`float`), never as decimal text, so `0.1` and its nearest printed form cannot disagree.
 //!
 //! Boolean values print as `true`/`false`; enums print their chosen short name.
 
