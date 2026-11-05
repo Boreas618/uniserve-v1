@@ -120,6 +120,24 @@ impl RawEngine {
                 if let Some(channel) = listener.try_accept()? {
                     break channel;
                 }
+                // A worker that cannot start its own Python exits at once and
+                // never connects: reporting the status here says what the
+                // bound alone cannot, and names the interpreter it used.
+                if let Some(status) = child.try_wait()? {
+                    let executable = resolved(&worker_executable());
+                    // The interpreter is named as the worker will run it: its
+                    // path is what makes it a virtual environment's, so it is
+                    // not resolved further.
+                    let interpreter = executable
+                        .parent()
+                        .map_or_else(|| executable.clone(), |bin| bin.join("python"));
+                    anyhow::bail!(
+                        "the worker exited with {status} before its rank connected: {} \
+                         (its interpreter is {})",
+                        executable.display(),
+                        interpreter.display()
+                    );
+                }
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
                     "no rank connected within 60 seconds"
@@ -2989,6 +3007,13 @@ fn stub_launch_descriptor() -> LaunchDescriptor {
         fence_probes_off: Vec::new(),
         graph_pc_sampling: false,
     }
+}
+
+/// A path as the filesystem names it, so a report does not carry the
+/// `../..` a build's relative path is made of; the path itself when it is
+/// gone.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn worker_executable() -> PathBuf {
