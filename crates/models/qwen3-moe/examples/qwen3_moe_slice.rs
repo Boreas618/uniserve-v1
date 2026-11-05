@@ -1659,7 +1659,11 @@ fn generate(
     let mut differed = false;
     for step in 0..steps {
         // The prompt's row answers the token at position `start`; a decode step's row answers the
-        // one after it, so the position of this step's token is `start + step`.
+        // one after it, so the position of this step's token is `start + step`. `label` is this
+        // step as a reader counts it - one for the first token - and every line about the run
+        // prints it, so one launch cannot appear under two step numbers. A *reference index* stays
+        // the loop's own, because it addresses the reference file.
+        let label = step + 1;
         let position = start.saturating_add(u64::try_from(step).unwrap_or(0));
         let slot = slot_for(position, page_size, block_table)?;
         check_continuation(
@@ -1685,9 +1689,8 @@ fn generate(
                     // finding about the sampler and not about the model.
                     if theirs != chosen {
                         println!(
-                            "generate: step {}: `Sampler::greedy` chose {theirs} and the raw row's \
-                             argmax is {chosen}",
-                            step + 1
+                            "generate: step {label}: `Sampler::greedy` chose {theirs} and the raw \
+                             row's argmax is {chosen}"
                         );
                     }
                     chosen = theirs;
@@ -1697,16 +1700,15 @@ fn generate(
                     // would produce an id list that cannot say which path chose it, and a decode
                     // run is the only evidence the decode path has.
                     return Err(Failure::message(format!(
-                        "generate: step {}: the sampler path did not run ({error}); pass \
-                         `--greedy host` to ask for the host argmax deliberately",
-                        step + 1
+                        "generate: step {label}: the sampler path did not run ({error}); pass \
+                         `--greedy host` to ask for the host argmax deliberately"
                     )));
                 }
             }
         }
         let best = top_logprobs(&row, 5);
         println!(
-            "generate: step {step} of {steps}: position {position}, slot {slot}, seq_len {}, token \
+            "generate: step {label} of {steps}: position {position}, slot {slot}, seq_len {}, token \
              {chosen} ({source})",
             position.saturating_add(1)
         );
@@ -1716,16 +1718,16 @@ fn generate(
         chosen_ids.push(chosen);
         if let Some(dir) = args.dump.as_deref() {
             // The file carries the reference's own index, so a first difference names its file.
-            let file = dir.join(format!("logits_step_{step:02}.npy"));
+            let file = dir.join(format!("logits_step_{label:02}.npy"));
             write_npy(&file, &row, 1, vocabulary)?;
             println!(
-                "dump: {} is step {step}'s row, 1 x {vocabulary} f32",
+                "dump: {} is step {label}'s row, 1 x {vocabulary} f32",
                 file.display()
             );
         }
         // The comparison is the measurement: a list that differs says nothing about where, and the
-        // first differing step names the launch the defect is in - step 0 is the prefill's own
-        // answer, step 1 is the decode's first launch, and a later step is the slot or the page.
+        // first differing reference index names the launch the defect is in - index 0 is the
+        // prefill's own answer, index 1 is the decode's first launch, a later one the slot or page.
         if let Some(expected) = expected.as_deref() {
             match expected.get(step) {
                 Some(want) if *want == chosen => agreed += 1,
@@ -1745,7 +1747,7 @@ fn generate(
                                  chose {want} with margin {shown}; {step} of {steps} ids agree \
                                  before it"
                             );
-                            println!("generate: step {step}'s top-5, on our row:");
+                            println!("generate: step {label}'s top-5, on our row:");
                             for (token, logprob) in &best {
                                 println!("  {token}\t{logprob:.6}");
                             }
@@ -1942,9 +1944,10 @@ fn check_continuation(
     let wanted = start.saturating_add(u64::try_from(step).unwrap_or(0));
     if position != wanted {
         return Err(Failure::message(format!(
-            "decode step {step} of a {start} row prompt is at position {position}, and the token it \
+            "decode step {} of a {start} row prompt is at position {position}, and the token it \
              appends is the one at {wanted}: a continuation that skips or repeats a position writes \
-             its keys beside another token's"
+             its keys beside another token's",
+            step + 1
         )));
     }
     if slot != position {
