@@ -1266,6 +1266,55 @@ mod tests {
         }
     }
 
+    /// The rank facts a planner is given, with the cache geometry as the class states it.
+    fn rank_facts(cache: Option<CacheGeometry>) -> RankFacts<'static> {
+        RankFacts {
+            device: Device::Cuda(DeviceId(0)),
+            host: "rank",
+            world: 0,
+            world_size: 1,
+            queue_depth: 2,
+            block_size: Some(64),
+            max_batch_calls: 16,
+            max_batch_tokens: 2048,
+            max_request_pool_size: 8,
+            max_model_len: 4096,
+            mem_fraction_static: 0.5,
+            cache,
+            kv_dtype: ipc::PrefixCacheDtype::BFloat16,
+        }
+    }
+
+    /// The two planners are told apart by whether the rank keeps a paged cache, and each refuses
+    /// the other's value by name. A zero geometry standing for absence would be fitted rather than
+    /// refused, which is the failure this makes unrepresentable: the plan would then book a cache
+    /// the class never addresses.
+    ///
+    /// Both refusals are answered before the device is read, so neither needs one.
+    #[test]
+    fn a_planner_refuses_the_other_class_explicitly() {
+        let group = HostGroup::single(0);
+        let absent = rank_facts(None);
+        let Err(refused) = plan_rank(&absent, report(), &group) else {
+            panic!("a rank that states no geometry must not be planned a cache");
+        };
+        let said = format!("{refused}");
+        assert!(
+            said.contains("plan_media"),
+            "a rank with no geometry must be pointed at `plan_media`, and the refusal said {said:?}"
+        );
+
+        let present = rank_facts(Some(geometry()));
+        let Err(refused) = plan_media(&present, report(), &group) else {
+            panic!("a rank that keeps a paged cache must not be planned by the media planner");
+        };
+        let said = format!("{refused}");
+        assert!(
+            said.contains("plan_rank"),
+            "a rank with a geometry must be pointed at `plan_rank`, and the refusal said {said:?}"
+        );
+    }
+
     fn plan(geometry: CacheGeometry) -> Plan {
         token_plan(
             &request(),
