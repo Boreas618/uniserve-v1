@@ -954,58 +954,6 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
-/// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
-///
-/// The package hands `TllmGenFmhaRunnerParams` to the kernel **by value**, so the node's argument
-/// blob is that struct: every pointer it holds was resolved at capture and every scalar in it is
-/// what the replay uses, with no host-side figure of the batch anywhere in between. Offsets are
-/// `sizeof`/`offsetof` of the shipped header
-/// (`flashinfer/data/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h`, 496 bytes), read with a
-/// three-line C++ probe compiled against that header rather than counted by hand.
-fn decode_fmha_params(bytes: &[u8]) -> String {
-    const SIZE: usize = 496;
-    if bytes.len() < SIZE {
-        return format!("blob={}B (not the {SIZE} of TllmGenFmhaRunnerParams)", bytes.len());
-    }
-    let pointer = |at: usize| -> u64 {
-        u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
-    };
-    let integer = |at: usize| -> i32 {
-        i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
-    };
-    format!(
-        "fmha blob={} mask={} kernel={} sched={} multi_cta={} q={:#x} k={:#x} v={:#x} \
-         page_idx={:#x} seq_lens_kv={:#x} cum_q={:#x} out={:#x} batch={} max_q={} max_kv={} \
-         sum_q={} sum_kv={} pages_per_seq={} tokens_per_page={} pages_in_pool={} heads_q={} \
-         q_stride_tokens={} k_stride_kv={} pdl={} stream={:#x}",
-        bytes.len(),
-        integer(4),
-        integer(8),
-        integer(12),
-        bytes[16] != 0,
-        pointer(24),
-        pointer(32),
-        pointer(40),
-        pointer(152),
-        pointer(128),
-        pointer(136),
-        pointer(296),
-        integer(380),
-        integer(388),
-        integer(392),
-        integer(404),
-        integer(408),
-        integer(412),
-        integer(416),
-        integer(420),
-        integer(368),
-        integer(312),
-        integer(320),
-        bytes[488] != 0,
-        pointer(480)
-    )
-}
-
 /// Whether a block table view holds `bytes` readable bytes of page indices.
 ///
 /// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
@@ -2611,15 +2559,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return format!("{shape} no-parameters");
         };
         if bytes.len() != 8 {
-            // The two plane pointers the launch carries, beside the addresses this runner's own
-            // layer 0 has: a graph reading another plane is invisible from every host-side figure,
-            // and the digest below would then describe bytes the kernel never touched.
-            let key = u64::from_ne_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
-            let value = u64::from_ne_bytes(bytes[40..48].try_into().unwrap_or([0; 8]));
+            // A native package does not hand the kernel a pointer to the operator's call: the
+            // trtllm-gen entry builds the kernel's own `KernelParams` and launches it by value, so
+            // the node's argument **is** that struct - 1344 bytes, its first 512 five TMA
+            // descriptors rather than addresses. Every scalar in it is what the replay uses, and
+            // its three grid extents name the launch this node holds.
             return format!(
-                "{shape} {}{}{}",
-                decode_fmha_params(bytes),
-                self.plane_verdict(key, value),
+                "{shape} {}{}",
+                self.decode_kernel_params(bytes),
                 self.dump_cache_digests(first_page)
             );
         }
@@ -2801,6 +2748,92 @@ impl<M: CausalLm> CausalLmRunner<M> {
         out
     }
 
+    /// The bounds and pointers the trtllm-gen FMHA launch was given, decoded from its argument.
+    ///
+    /// The entry hands the kernel `flashinfer::trtllm::fmha::KernelParams` **by value**, so the
+    /// node's argument blob is that struct: 1344 bytes whose first 896 are seven `CUtensorMap`
+    /// descriptors (Q, K, the sparse pool, V, O, and the two FP4 scale descriptors), followed by
+    /// the grid, the output pointer, the sequence and page vectors, and the launch's integers.
+    ///
+    /// **The offsets are the struct's own, and the run confirmed two of them independently:**
+    /// `cum_seq_lens_q` landed at 936 and `seq_lens` at 1096 in the blob the caller printed, which
+    /// is where `ptrCumSeqLensQ` and `ptrSeqLensKv` sit. The remaining fields follow that same
+    /// field order, so the numbers below are read at their declared positions rather than guessed.
+    ///
+    /// **Q, K and V are not plain pointers here.** They travel inside `tmaQ_`/`tmaK_`/`tmaV_`, and a
+    /// descriptor stores its base address encoded with swizzle and alignment bits - which is why a
+    /// scan of the blob finds the sequence vectors verbatim and no plane address at all. That
+    /// verdict compares the descriptor's first word with the plane under an alignment mask and says
+    /// `masked` when they agree only after it, `OTHER` when they do not.
+    fn decode_kernel_params(&self, bytes: &[u8]) -> String {
+        const SIZE: usize = 1344;
+        if bytes.len() < SIZE {
+            return format!("kparams blob={}B (not the {SIZE} of fmha::KernelParams)", bytes.len());
+        }
+        let pointer = |at: usize| -> u64 {
+            u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
+        };
+        let integer = |at: usize| -> i32 {
+            i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+        };
+        let verdict = |name: &str, at: u64, own: u64| -> String {
+            if at == 0 {
+                format!(" {name}=null")
+            } else if at == own {
+                format!(" {name}=own")
+            } else {
+                format!(" {name}=OTHER({at:#x})")
+            }
+        };
+        let mut out = format!(
+            "kparams blob={} grid=[{},{},{}] batch={} window={} chunked_log2={} \
+             out={:#x} cum_q={:#x} cum_kv={:#x} page_idx={:#x} seq_lens_kv={:#x} \
+             counter={:#x} partial_o={:#x} stats={:#x} tmaK={:#x} tmaV={:#x}",
+            bytes.len(),
+            integer(896),
+            integer(900),
+            integer(904),
+            integer(1132),
+            integer(1128),
+            integer(1136),
+            pointer(912),
+            pointer(936),
+            pointer(944),
+            pointer(1016),
+            pointer(1096),
+            pointer(1000),
+            pointer(1024),
+            pointer(1112),
+            pointer(128),
+            pointer(384)
+        );
+        out.push_str(&verdict("cum_q", pointer(936), self.columns.query_offsets.device.ptr.address()));
+        out.push_str(&verdict("seq_lens_kv", pointer(1096), self.columns.seq_lens.device.ptr.address()));
+        match self.kv.planes(0) {
+            Ok(planes) => match planes.first() {
+                Some(first) => {
+                    let masked = |at: u64, own: u64| -> &'static str {
+                        if at & !0x3ff == own & !0x3ff {
+                            "masked"
+                        } else {
+                            "OTHER"
+                        }
+                    };
+                    out.push_str(&format!(
+                        " planes=layer0:{}/{}(K,V descriptor vs plane) layer0K={:#x} layer0V={:#x}",
+                        masked(pointer(128), first.key.ptr.address()),
+                        masked(pointer(384), first.value.ptr.address()),
+                        first.key.ptr.address(),
+                        first.value.ptr.address()
+                    ));
+                }
+                None => out.push_str(" planes=empty"),
+            },
+            Err(error) => out.push_str(&format!(" planes=refused({error})")),
+        }
+        out
+    }
+
     /// Whether the plane pointers a launch carries are this runner's own layer 0 planes.
     fn plane_verdict(&self, key: u64, value: u64) -> String {
         let Ok(planes) = self.kv.planes(0) else {
@@ -2846,6 +2879,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let live = self.staging.live_tokens().max(1);
         let held = page_size.min(live);
         let mut out = String::from(" cache:");
+        let first_elements = planes
+            .first()
+            .map(|plane| plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3)))
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "(page {page}, {held} token(s), {} bytes each)",
+            held.saturating_mul(first_elements).saturating_mul(element)
+        ));
         for (layer, plane) in planes.iter().enumerate() {
             let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
             let page_elements = page_size.saturating_mul(token_elements);
