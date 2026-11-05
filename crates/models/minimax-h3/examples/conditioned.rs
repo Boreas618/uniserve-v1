@@ -665,8 +665,12 @@ fn encode(args: &Args) -> Result<(), String> {
     // condition rows, then one zero row. `zero_row` is the model's statement of where the last
     // begins, so nothing here re-derives it.
     let rows = u64::from(packing.zero_row()) + 1;
+    let mode = match deployment {
+        Some(stated) => format!("stated by --dtype {stated}"),
+        None => "auto, the checkpoint's own".to_owned(),
+    };
     println!(
-        "loaded: {dtype} is the stack's element type (auto, the checkpoint's own), hidden {hidden}, \
+        "loaded: {dtype} is the stack's element type ({mode}), hidden {hidden}, \
          text {} rows of capacity, \
          conditions {} rows of capacity, prefix {rows} rows",
         layout.text_rows, layout.condition_rows
@@ -846,8 +850,10 @@ fn encode(args: &Args) -> Result<(), String> {
     let text_bytes = pseudo_bytes(text_elements, dtype);
     upload_bytes(&stream, text, &text_bytes)?;
     upload_bytes(&stream, source, &pseudo_bytes(source_elements, dtype))?;
-    // The pixels are the encoder's input: `[frames, height, width, channels]`, normalised. A
-    // deterministic ramp stands in for an image and the case says so.
+    // The pixels are the encoder's input in the encoder's own order, `[channels, frames, height,
+    // width]`, normalised: the order `pixels.h3t` is written in below and the one the reference
+    // probe reads, so no transpose can sit between this ramp and the convolution. A deterministic
+    // ramp stands in for an image, and the case says so.
     let mut pixels_host = Vec::with_capacity(pixel_elements as usize * 4);
     for plane in 0..channels {
         for element in 0..(pixel_elements / channels) {

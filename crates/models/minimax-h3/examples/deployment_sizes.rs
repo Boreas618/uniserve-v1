@@ -586,7 +586,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         );
         let still = minimax_h3::video_vae::Canvas {
             frames: 1,
-            ..latent.clone()
+            ..latent
         };
         let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?
             .iter()
