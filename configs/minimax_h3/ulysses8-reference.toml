@@ -7,7 +7,7 @@ ranks = ["cuda:0-7"]
 queue_depth = 6
 
 [worker_groups.components.transformer_ref]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 8 }
+sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange" }
 
 [worker_groups.components.text_encoder]
 tensor_parallel_size = 8
