@@ -518,16 +518,27 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
     let canvas = layouts.canvas(&request)?;
+    // The attended row count is the *dense* packing's. A sparse deployment reads its tiles instead,
+    // so the summary below says which of the two it is: a dense number printed over a sparse run is
+    // a page that cannot be read, which is the whole reason the kind is printed at all.
     let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
     let tokens = u64::from(packing.padded_tokens);
     println!(
-        "request: {}x{}, {} frames, {} rows packed of {} padded, {} attended",
+        "request: {}x{}, {} frames, {} rows packed of {} padded, {}",
         args.width,
         args.height,
         frames,
         packing.video_rows + packing.audio_rows,
         tokens,
-        tables.used
+        match denoiser_config.attention {
+            AttentionKind::Dense => format!("{} attended", tables.used),
+            AttentionKind::Sparse { tile, .. } => {
+                format!(
+                    "sparse over {} tiles of {tile} rows",
+                    tokens / u64::from(tile)
+                )
+            }
+        }
     );
 
     // 3. The whole block in one loader: the stack, the projections, the AdaLN cache and the solver,
