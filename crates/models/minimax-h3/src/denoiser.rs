@@ -2059,6 +2059,7 @@ impl Denoiser {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use nn::layers::gather_rows_descriptor;
+        use ops::gemm::Gemm as GemmOp;
         use ops::noise::NoiseKind;
         use ops::noise::PhiloxNoise as NoiseOp;
         use ops::patch::Patch as PatchOp;
@@ -2148,6 +2149,22 @@ impl Denoiser {
         // A conditioned deployment carries audio, so its patched audio rows cross the boundary too.
         if groups == crate::modulation::Groups::Conditioned {
             crossings.push((nn::DType::F32, dtype, u64::from(config.audio_channels)));
+        }
+        // The conditioner's own projection: its weight is one of the checkpoint's twelve FP32 tensors
+        // (`modulation.rs` pins each projection matrix to `Some(DType::F32)`), so the launch is FP32
+        // rows against an FP32 weight and **one rounding into the prefix's type** - a biased product
+        // whose output type is the deployment's. The stack's shared `gemm` row is keyed by the
+        // deployment's type on both sides and states nothing here; the recorder found the launch, not
+        // the walk.
+        if groups == crate::modulation::Groups::Conditioned {
+            programs.launch::<GemmOp>(&nn::layers::Linear::descriptor_of(
+                config.hidden_size,
+                nn::DType::F32,
+                nn::layers::WeightOrder::NxK,
+                true,
+                nn::DType::F32,
+                dtype,
+            ));
         }
         for (target, source, columns) in crossings {
             programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
