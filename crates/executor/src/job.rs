@@ -45,9 +45,6 @@ pub(crate) struct Entry {
     pub(crate) kind: JobKind,
     /// The batch the command serves, when it serves one.
     pub(crate) batch: Option<crate::batch::BatchId>,
-    /// Whether this entry is the last step of its submission (4.5: a precopy or a capture pass is
-    /// performed one job per queue step, so serving batches interleave with it).
-    pub(crate) final_step: bool,
     /// What this command is doing, written when it is queued: the first half of a failure's report,
     /// which the device thread completes with the job it was performing.
     pub(crate) label: String,
@@ -209,7 +206,6 @@ impl JobQueue {
             submission_id,
             kind,
             batch,
-            final_step: true,
         });
         drop(state);
         self.ready.notify_one();
@@ -236,7 +232,6 @@ impl JobQueue {
             submission_id: entry.submission_id,
             kind: entry.kind,
             batch: entry.batch,
-            final_step: false,
         });
         drop(state);
         self.ready.notify_one();
@@ -271,7 +266,6 @@ impl JobQueue {
             submission_id: None,
             kind: JobKind::After,
             batch: None,
-            final_step: true,
         });
         drop(state);
         self.ready.notify_one();
@@ -324,10 +318,11 @@ impl JobQueue {
             }
         }
         if let Some(submission) = entry.submission {
-            if !entry.final_step {
-                // A middle step of a multi-job command: the submission waits for the last one.
-                return;
-            }
+            // `complete` is called for an entry only when its command has no further step: a step
+            // that puts the rest of its command back at the tail answers `Step::Requeued` and the
+            // device loop does not reach here at all. So every call finishes the submission, and a
+            // rule that asked whether this step was the last one could only be wrong - the steps
+            // after the first are all requeued, so none of them was ever the last.
             let outcome = match result {
                 Ok(output) => Outcome::Success(output),
                 Err(error) => {
@@ -651,6 +646,111 @@ mod tests {
         assert!(
             queue.next(Some(Duration::from_millis(10))).is_none(),
             "the rest of the command was performed after a failure"
+        );
+    }
+
+    /// A step that fails after the first one still fails its submission: the steps of a multi-job
+    /// command are all requeued (4.5's interleaving), so a rule that finished a submission only on
+    /// its "last step" never found one and left a warmup that broke on its second capture pending
+    /// for ever - the daemon's answer from it was a switchover timeout, not the device's error.
+    #[test]
+    fn a_failure_in_a_later_step_fails_its_submission() {
+        let (queue, _events) = queue();
+        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let jobs: Vec<Job> = (0..3)
+            .map(|_| Job::Capture {
+                runner: crate::runner::RunnerId(0),
+                bucket,
+                generation: 2,
+            })
+            .collect();
+        let (warmup, _) = Submission::pending(crate::batch::SubmissionId(0));
+        queue
+            .submit(
+                Command::Steps {
+                    generation: Some(2),
+                    jobs,
+                },
+                &warmup,
+                JobKind::Warmup,
+                None,
+            )
+            .expect("queued");
+
+        // The first capture succeeds and puts the rest of the command back at the tail.
+        let first = queue.next(Some(Duration::from_secs(1))).expect("the first step");
+        let remaining = match first.command.clone() {
+            Command::Steps { generation, jobs } => Command::Steps {
+                generation,
+                jobs: jobs.into_iter().skip(1).collect(),
+            },
+            _ => panic!("the command was not a job list"),
+        };
+        queue.requeue(&first, remaining).expect("the remainder");
+        assert!(
+            warmup.outcome().is_none(),
+            "the submission finished before the command did"
+        );
+
+        // The second one fails, and that is the whole command's answer.
+        let second = queue.next(Some(Duration::from_secs(1))).expect("the next step");
+        assert_ne!(second.id, first.id, "the next step is the requeued one");
+        queue.complete(second, Err(Error::State("the second capture failed")), None);
+        assert!(
+            matches!(warmup.outcome(), Some(Outcome::Failed(_))),
+            "a warmup that broke left its submission pending, which is the silence the daemon \
+             reported as a switchover timeout"
+        );
+    }
+
+    /// The last step of a command that requeued every step before it finishes the submission. The
+    /// same rule as the failure above, on the success side: no requeued step is ever "final", so a
+    /// rule that asked whether it was left every warmup unfinished.
+    #[test]
+    fn the_last_requeued_step_finishes_its_submission() {
+        let (queue, _events) = queue();
+        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let jobs: Vec<Job> = (0..2)
+            .map(|_| Job::Capture {
+                runner: crate::runner::RunnerId(0),
+                bucket,
+                generation: 2,
+            })
+            .collect();
+        let (warmup, _) = Submission::pending(crate::batch::SubmissionId(0));
+        queue
+            .submit(
+                Command::Steps {
+                    generation: Some(2),
+                    jobs,
+                },
+                &warmup,
+                JobKind::Warmup,
+                None,
+            )
+            .expect("queued");
+
+        let first = queue.next(Some(Duration::from_secs(1))).expect("the first step");
+        let remaining = match first.command.clone() {
+            Command::Steps { generation, jobs } => Command::Steps {
+                generation,
+                jobs: jobs.into_iter().skip(1).collect(),
+            },
+            _ => panic!("the command was not a job list"),
+        };
+        queue.requeue(&first, remaining).expect("the remainder");
+
+        // The entry that ends the command arrived from a requeue, never from `submit`.
+        let last = queue.next(Some(Duration::from_secs(1))).expect("the last step");
+        assert_ne!(last.id, first.id, "the last step is the requeued one");
+        assert!(
+            matches!(last.command, Command::Steps { ref jobs, .. } if jobs.len() == 1),
+            "the last step does not carry the command's last job"
+        );
+        queue.complete(last, Ok(BatchOutput::default()), None);
+        assert!(
+            matches!(warmup.outcome(), Some(Outcome::Success(_))),
+            "a warmup whose captures all ran never finished its submission"
         );
     }
 
