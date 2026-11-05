@@ -58,7 +58,31 @@ const AUDIO_VAE: &str = "audio_vae";
 /// The `.h3t` element-type codes this harness writes, from `tools/dump_tables.py`'s table.
 const H3T_F32: u8 = 1;
 
+/// What the conditional harness takes, printed for `--help`.
+///
+/// This is the one harness a conditioned deployment (`fl2va`, `ref2va`) is driven from, and its flags
+/// are how a task is named: the stage, the task, the condition images, and the canvas the decode is
+/// checked at. A caller who guesses wrong gets a refusal that names one flag at a time; this prints
+/// the set.
+fn usage() -> String {
+    "conditioned --root <checkpoint> [--store <dir>] [--stage weights|plan|encode]\n\
+     \x20          [--task t2va|fl2va|ref2va] [--image <pixels>] [--canvas <width>x<height>]\n\
+     \x20          [--frames <n>] [--text-tokens <n>] [--dtype auto|bf16|f16|f32]\n\
+     \x20          [--device <n>] [--seed <n>] [--place deployment|conditioner] [--diag <dir>]\n\
+     \x20          [--out <dir>] [--commit <revision>]\n\n\
+     --stage weights reads the checkpoint's own placement, `plan` the encoder's tile walk without a\n\
+     device, and `encode` one image on a device (which needs `--store`, or `UNISERVE_STORE`).\n"
+        .to_owned()
+}
+
 fn main() -> ExitCode {
+    if std::env::args()
+        .skip(1)
+        .any(|flag| flag == "--help" || flag == "-h")
+    {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {

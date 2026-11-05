@@ -677,6 +677,12 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 "an encoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"
             ))),
+            // A host call is no device work: the media stage performs it, and a device runner
+            // handed one was given a job another runner returned.
+            Job::Host { call, .. } => Err(Error::Invariant(format!(
+                "a runner that serves device work was asked for host call {}",
+                call.0
+            ))),
         }
     }
 }
