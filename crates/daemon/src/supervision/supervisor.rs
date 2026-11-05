@@ -151,24 +151,29 @@ impl Supervisor {
         }) {
             // Which of the three cases this is decides three different fixes:
             // the reservation is gone (a race between two launches), it names
-            // another group, or it names another engine.
+            // another group, or it names another engine. The table is named
+            // with the absent case, so an entry filed under another peer or
+            // another id is visible rather than missing.
             match self.reservations.get(reservation) {
-                None => eprintln!(
-                    "[dbg] RESERVE-MISS id={reservation} case=absent spawn.engine={engine} \
-                     spawn.group={:?} held={:?}",
-                    spawn.group,
-                    self.reservations
+                None => tracing::warn!(
+                    reservation,
+                    engine,
+                    spawn_group = ?spawn.group,
+                    held = ?self
+                        .reservations
                         .iter()
                         .map(|(id, held)| (*id, held.engine, held.group.clone()))
                         .collect::<Vec<_>>(),
+                    "a spawn inherits a reservation the node does not hold"
                 ),
-                Some(held) => eprintln!(
-                    "[dbg] RESERVE-MISS id={reservation} case={} spawn.engine={engine} \
-                     spawn.group={:?} held.engine={} held.group={:?}",
-                    if held.engine != engine { "engine" } else { "group" },
-                    spawn.group,
-                    held.engine,
-                    held.group,
+                Some(held) => tracing::warn!(
+                    reservation,
+                    case = if held.engine != engine { "engine" } else { "group" },
+                    engine,
+                    spawn_group = ?spawn.group,
+                    held_engine = held.engine,
+                    held_group = ?held.group,
+                    "a spawn inherits a reservation filed under another identity"
                 ),
             }
             return Err(format!(
@@ -230,9 +235,11 @@ impl Supervisor {
         self.next_reservation += 1;
         // The process that inherits the socket finds it at this number.
         let descriptor = listener.as_raw_fd();
-        eprintln!(
-            "[dbg] RESERVE id={reservation} engine={engine} group={:?}",
-            reserve.group
+        tracing::debug!(
+            reservation,
+            engine,
+            group = ?reserve.group,
+            "a node reserved a socket"
         );
         self.reservations.insert(
             reservation,
