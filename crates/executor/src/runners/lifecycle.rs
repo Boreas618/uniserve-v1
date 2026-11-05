@@ -344,16 +344,24 @@ impl Lifecycle {
             Vec::with_capacity(walked.nodes.len());
         let mut ordinal_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
-        for (operator, _, launch) in &walked.nodes {
+        for ((operator, _, launch), (_, _, held)) in walked.nodes.iter().zip(served.nodes()) {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
-            for node in launch {
+            // Only a launch the walk states differently is set: the executable starts from the
+            // template, so every other node already holds what it should, and a node that is
+            // rewritten for nothing is a chance to disturb a kernel the update never touched.
+            let mut differs = false;
+            for (node, serving) in launch.iter().zip(held) {
                 if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(walked.template.kernel_node_params(&node.node)?);
+                let walked_params = walked.template.kernel_node_params(&node.node)?;
+                differs |= walked_params != template.kernel_node_params(&serving.node)?;
+                params.push(walked_params);
             }
-            launches.push((*operator, *ordinal, params));
+            if differs {
+                launches.push((*operator, *ordinal, params));
+            }
             *ordinal += 1;
         }
         let held = hold_kernels(kernels, &walked.nodes)?;
