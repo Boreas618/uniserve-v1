@@ -668,9 +668,18 @@ pub fn load(
                 Dit::Reference => partition.blocks.contains(Component::TransformerRef),
             };
             if placed {
+                // The probe is the refiner's first attention projection: it is the gemm this
+                // check is about - the encoder's features multiplied by a weight of the DiT - and
+                // the export states it. The refiner has no input projection to probe: its layers
+                // are `token_refiner.refiner_blocks.<n>` and `token_refiner.final_norm`, which is
+                // the prefix the reference reads too (`uniserve/models/minimax_h3/conditioning.py`).
                 refiner_types(
                     deployment(Component::TextEncoder)?,
-                    tensor_dtype(checkpoint, dit.directory(), "token_refiner.input.weight")?,
+                    tensor_dtype(
+                        checkpoint,
+                        dit.directory(),
+                        "token_refiner.refiner_blocks.0.attn.to_q.weight",
+                    )?,
                     dit.directory(),
                 )?;
             }

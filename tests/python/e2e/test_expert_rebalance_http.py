@@ -122,7 +122,7 @@ def test_expert_rebalancing_preserves_a_stream_and_its_world(
             "--set",
             "moe_config.exchange=megamoe",
             "--set",
-            "quantization_config.mode=mxfp8-experts",
+            "quantization.mode=mxfp8-experts",
         )
     elif topology == "dwdp":
         devices, options = _topology("experts", tmp_path)

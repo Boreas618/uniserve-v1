@@ -40,6 +40,25 @@ use crate::model::{
 use crate::representation::{self, Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
+/// The block-scale layout the first product's kernels read the **expert weights** in.
+///
+/// The gate/up product fuses the gated activation, and every E2M1 kernel of that form in the
+/// artifact was built with the weight side **plain**: one factor per sixteen elements, in the order
+/// the matrix stores them (`gather_gemm_nvfp4/trtllm/src/entry.cpp` states it as the form its
+/// variants serve, and `build.py`'s selection finds no such kernel with a swizzled weight side).
+/// So the shard's own table is published unchanged here.
+pub const GATHER_WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
+
+/// The block-scale layout the second product's kernels read the **expert weights** in.
+///
+/// The down product is linear — no fused activation — and the artifact's linear family takes the
+/// weight side in the 128x4 swizzled form (`build.py`'s selection finds no linear kernel with a
+/// plain weight side at any tile), so the loader builds that table once at load.
+///
+/// The two products genuinely differ, and the artifact is the authority for both: a product's
+/// weight plane is in the form its own kernels index, never in a form chosen for the pair.
+pub const ROUTE_WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
 ///
 /// `root` holds `config.json` and the safetensors shards (an index or a directory of shards); the
@@ -795,9 +814,9 @@ fn expert_block(
             )));
         }
         let vocabulary = as_u32(config.num_experts, "num_experts")?;
-        // The shard's block scales are the export's own — linear, one per sixteen elements — and the
-        // products read the swizzled 128x4 table, which the loader builds once at load. A checkpoint
-        // that already holds a converted table is refused here rather than swizzled a second time.
+        // The shard's block scales are the export's own — linear, one per sixteen elements — and a
+        // product that reads a swizzled table has it built once here. A checkpoint that already
+        // holds a converted table is refused rather than swizzled a second time.
         if layout != ScaleLayout::Linear {
             return Err(Error::Unsupported(format!(
                 "{parameter} declares {layout} block scales, and this loader builds the published \
@@ -814,7 +833,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                ScaleLayout::Swizzled128X4,
+                GATHER_WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -828,7 +847,7 @@ fn expert_block(
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
                 },
-                ScaleLayout::Swizzled128X4,
+                ROUTE_WEIGHT_SCALE_LAYOUT,
                 false,
             )
             .map_err(Error::from)?;
@@ -1271,5 +1290,46 @@ mod tests {
 
     fn config_without_yarn() -> Config {
         config()
+    }
+
+    /// The block-scale layout each product's kernels were built for, held against the packages.
+    ///
+    /// A product's weight plane is read by kernels that were **compiled** with a weight-side layout,
+    /// and nothing checks the two against each other at runtime: the layout is not an option the
+    /// runner's lookup compares (`GemmOptions` carries no `SfLayout`), so a package built for the
+    /// plain form handed a swizzled table reads every expert factor at the wrong offset and answers
+    /// plausible numbers. This is the one place the two statements meet.
+    ///
+    /// The activation side is `Moe::ACTIVATION_SCALE_LAYOUT` for both products; the weight side is
+    /// each product's own, because the artifact's gated family and its linear family were built with
+    /// opposite weight layouts.
+    #[test]
+    fn a_products_package_states_the_scale_layouts_nn_publishes() {
+        let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/kernels");
+        let cases = [
+            ("gather_gemm_nvfp4", GATHER_WEIGHT_SCALE_LAYOUT),
+            ("route_gemm_nvfp4", ROUTE_WEIGHT_SCALE_LAYOUT),
+        ];
+        for (operator, weights) in cases {
+            let package = kernels.join(operator).join("trtllm/package.toml");
+            let stated = std::fs::read_to_string(&package)
+                .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
+            // The layouts' names as the manifest states them; the artifact's own enumeration numbers
+            // them (`SfLayoutDecl.h`: Linear 0, R8c4 1, R8c16 2, R128c4 3), and a name that named a
+            // different number would be a second statement of that enumeration.
+            let name = |layout: ScaleLayout| match layout {
+                ScaleLayout::Linear => "\"linear\"",
+                ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
+            };
+            let (activation, weights) = (name(Moe::ACTIVATION_SCALE_LAYOUT), name(weights));
+            for (option, expected) in [("mSfLayoutA", activation), ("mSfLayoutB", weights)] {
+                let line = format!("{option} = {expected}");
+                assert!(
+                    stated.contains(&line),
+                    "{operator}'s package does not state `{line}`: the kernels it publishes would \
+                     read a plane nn publishes in another form, and nothing at launch would say so"
+                );
+            }
+        }
     }
 }
