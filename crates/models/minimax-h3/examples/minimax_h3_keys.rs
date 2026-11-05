@@ -6,7 +6,7 @@
 //! cargo run -p minimax-h3 --example minimax_h3_keys [-- --root <checkpoint>] [--rasters HxW,...]
 //! ```
 //!
-//! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
+//! The output is `notes/programs/minimax-h3-keys.txt`: **the store's list** - every row
 //! every component this build loads states, over both element types - so no package has to guess a
 //! variant.
 //!
@@ -35,9 +35,9 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-deployment-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-//!     --against notes/programs/minimax-h3-deployment-keys.txt
+//!     --against notes/programs/minimax-h3-keys.txt
 //! ```
 //!
 //! The second command is a host-side set difference in one direction only: it asks whether every key
