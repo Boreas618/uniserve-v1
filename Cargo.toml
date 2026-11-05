@@ -71,6 +71,9 @@ workspace = true
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["mm"] }
+# A test states the arguments a deployment pinned on a program, which are a TOML table
+# (`program_server::Program`); production code never names `toml` from this package.
+toml.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 

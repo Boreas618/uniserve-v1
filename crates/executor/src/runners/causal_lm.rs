@@ -1213,25 +1213,41 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
+        // Every program of the prepared generation ends this pass in one of three states: compared,
+        // paired against another key of the same operator, or recorded as unmeasured. An operator
+        // split across two backends holds one program per phase, and both are launched by their own
+        // descriptor, so `covered` is what stops the second of them being neither.
+        let mut covered: Vec<(&'static str, String)> = Vec::new();
         for (operator, key, kernel) in self.lifecycle.generation.iter() {
             let candidate = match next.kernel(operator, key) {
-                Ok(candidate) => candidate,
+                Ok(candidate) => {
+                    covered.push((operator, key.to_owned()));
+                    candidate
+                }
                 // A recapture replaces the operator's program by another compilation, whose
                 // descriptor text may differ. The comparison pairs by operator (7.3 step 2), and
                 // the previous program is resolved by the key it served with, so the update is
                 // still compared rather than silently committed. The walk has already recaptured
                 // this bucket for the new descriptor; the comparison is what measures the program.
+                //
+                // That pairing is sound only while the operator holds **one** program: an operator
+                // split across two backends holds two, and pairing this launch with the other one
+                // would compare two different computations and call the result a measurement.
                 Err(_) => {
-                    let Some(other) = next.keys(operator).next() else {
-                        // The operator left the deployment: no program of the prepared generation
-                        // launches it, so there is nothing for a comparison to pair.
+                    let mut keys = next.keys(operator);
+                    let first = keys.next();
+                    let only = first.filter(|_| keys.next().is_none());
+                    let Some(other) = only else {
                         tracing::debug!(
                             operator,
                             key,
-                            "the prepared generation holds no program for this operator; no paired forward"
+                            programs = next.keys(operator).count(),
+                            "the prepared generation holds no program under this key and more than \
+                             one for the operator: no paired forward"
                         );
                         continue;
                     };
+                    covered.push((operator, other.to_owned()));
                     next.kernel(operator, other)?
                 }
             };
@@ -1246,19 +1262,36 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation: batch.generation,
             });
         }
-        // An operator the prepared generation *adds* has no program in the serving generation to
-        // be compared against: the update's evidence does not cover it, and saying so is the
-        // difference between an update that was measured and one that merely ran.
+        // A program the prepared generation *adds* has nothing in the serving generation to be
+        // compared against - a new operator, and equally a new phase of an operator the deployment
+        // already serves. The update's evidence does not cover it, and saying so is the difference
+        // between an update that was measured and one that merely ran.
         for (operator, key, _) in next.iter() {
-            if self.lifecycle.generation.keys(operator).next().is_some() {
+            if self.lifecycle.generation.contains(operator, key) {
                 continue;
             }
-            self.note_uncompared(format!(
-                "operator {operator} is new in generation {}: the serving generation holds no \
-                 program of it, so there is nothing to compare it against (its {key} program is \
-                 unmeasured)",
-                batch.generation
-            ));
+            if covered
+                .iter()
+                .any(|(covered_by, covered_key)| *covered_by == operator && covered_key == key)
+            {
+                continue;
+            }
+            let new_operator = self.lifecycle.generation.keys(operator).next().is_none();
+            if new_operator {
+                self.note_uncompared(format!(
+                    "operator {operator} is new in generation {}: the serving generation holds no \
+                     program of it, so there is nothing to compare it against (its {key} program is \
+                     unmeasured)",
+                    batch.generation
+                ));
+            } else {
+                self.note_uncompared(format!(
+                    "operator {operator} {key} is new in generation {}: the deployment already \
+                     serves this operator under another program, and no launch of the serving one \
+                     computes this descriptor, so this program is unmeasured",
+                    batch.generation
+                ));
+            }
         }
         Ok(Jobs::new(jobs))
     }
