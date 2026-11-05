@@ -204,12 +204,16 @@ else
         echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s)"
         if [ -s "$recorded_txt.missing" ]; then
             sed 's/^/     NOT IN THE FILE: /' "$recorded_txt.missing" | head -6
-            fail "a forward launches a descriptor $(basename "$fixture_path") does not state"
+            # The file's own name is taken by parameter expansion: a command substitution
+            # nested inside this double-quoted string is parsed by the shell wrapper this
+            # host's `/bin/sh` is, and it reports the line as a syntax error rather than
+            # running it.
+            fail "a forward launches a descriptor ${fixture_path##*/} does not state"
         fi
     }
 
     record_deployment "$fixture" "$scratch/recorded.dense" || true
-    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse 64,0.9,0.9 || true
+    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse 64,0.9 || true
 fi
 
 echo "== four walks: one per task, and a sparse one"
