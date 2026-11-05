@@ -2928,13 +2928,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// `r · pages .. (r + 1) · pages`, which is what its block table states; so the new kernel's
     /// writes land in the row's own scratch pages and never in a page a served request reads (7.3).
     fn upload_scratch_slots(&mut self, bucket: Bucket, pages: u32) -> Result<()> {
-        let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
+        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let batch = self.staging.batch_rows();
-        let mapping = crate::shadow::scratch_slot_mapping(
-            &batch.positions[..tokens],
-            &batch.query_offsets[..rows + 1],
-            &batch.slot_mapping[..tokens],
+        let mapping = crate::shadow::scratch_column(
+            &batch.positions,
+            &batch.query_offsets,
+            &batch.slot_mapping,
+            live,
+            tokens,
             pages,
             self.geometry.page_size,
         )?;
