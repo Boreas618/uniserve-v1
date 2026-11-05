@@ -47,6 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The video decoder's precision is the checkpoint's, not the config's: the design converts
     // nothing at load, so the deployment states the element type its weights are in.
     let mut dtype: Option<ops::DType> = None;
+    // The four components' stored element types, as the caller's tensor table states them. A
+    // deployment's element type is its own per component (the design's precision rule), so a single
+    // `--dtype` handed to every component is the defect this flag replaces: the video VAE asked for
+    // the stack's type states rows no launch asks for.
+    let mut types: Option<PathBuf> = None;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
     let mut tokens: Vec<u32> = Vec::new();
@@ -139,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
+            "--types" => types = Some(PathBuf::from(value.as_str())),
             "--dtype" => {
                 dtype = Some(match value.as_str() {
                     "f16" => ops::DType::F16,
@@ -233,10 +239,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     samples.sort_unstable();
     samples.dedup();
+    // A stated clip is checked against the rule the model produces clips by, and a stated track
+    // against the clip it belongs to: `--samples` and `--track` are two statements of one clip, and
+    // nothing compared them - so a walk could state an audio decoder at one clip and an audio encoder
+    // at another, and every row would be a real program at a length no request names.
+    let generated = minimax_h3::programs::Deployment::generated();
+    for frames in &samples {
+        if !generated.contains(frames) {
+            return Err(format!(
+                "--samples {frames} is not a clip this model produces: the packing accepts 17n + 5 \
+                 over 22 to 1008, and a clip outside it is a request the sampler cannot be handed"
+            )
+            .into());
+        }
+    }
+    for stated_track in &track {
+        let named = samples
+            .iter()
+            .find(|frames| minimax_h3::packing::audio_samples(**frames) == *stated_track);
+        if named.is_none() {
+            let implied: Vec<u32> = samples
+                .iter()
+                .map(|frames| minimax_h3::packing::audio_samples(*frames))
+                .collect();
+            return Err(format!(
+                "--track {stated_track} is not the track of any stated clip: --samples {samples:?} \
+                 imply tracks {implied:?}, and the audio encoder would be walked at a clip the \
+                 audio decoder is not"
+            )
+            .into());
+        }
+    }
     rasters.sort_unstable();
     rasters.dedup();
 
     let mut rows: Vec<(String, String)> = Vec::new();
+
+    // Each component's stored element type: the caller's table where it is at hand, the checkpoint's
+    // own shard headers where they are, and a refusal naming both where neither is. The video and
+    // audio VAEs are the components whose type is *not* the stack's, and handing them `--dtype` was
+    // a measured defect: seven decoder rows and two postprocessor rows appear at the wrong type.
+    let stated = match types.as_deref() {
+        Some(table) => Some(minimax_h3::load::ElementTypes::read(table)?),
+        None => None,
+    };
+    let checkpoint = nn::Checkpoint::open(&root).ok();
+    let vae_type = minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "vae")?;
+    let audio_type =
+        minimax_h3::load::deployment_dtype(stated.as_ref(), checkpoint.as_ref(), "audio_vae")?;
 
     let audio = root.join("audio_vae/config.json");
     if audio.exists() {
@@ -262,8 +312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        rows.extend(VideoDecoder::programs(&config, dtype)?);
-        rows.extend(VideoPostprocessor::programs(dtype, &rasters));
+        rows.extend(VideoDecoder::programs(&config, vae_type)?);
+        rows.extend(VideoPostprocessor::programs(vae_type, &rasters));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);
