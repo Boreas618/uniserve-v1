@@ -40,7 +40,10 @@ fi
 
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
-samples=256
+# The clip length is a count of **generated frames**, and a generated frame count is `17n + 5`: the
+# legal clips are 22, 39, 56, ... A round number like 256 is not one of them, so a walk cut at 256
+# states rows for a clip no request can ask for.
+samples=22
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -51,7 +54,15 @@ rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
 elements=123456
-track=44100
+# The track is a **function of the clip**, not a second number that can disagree with it:
+# `packing::audio_samples(frames) = audio_latent_frames(frames) * AUDIO_HOP`, and for 22 frames that
+# is 29600. The pair is part of the fixture's identity because the audio VAE's `scaled_add` widths
+# are derived from it: measured, 256/44100 and 22/29600 state the same 150 rows with **12 `scaled_add`
+# rows different** and nothing else, so a fixture cut at one pair does not serve a request at the
+# other. The walk still takes `--track` as a free number; deriving it from `--samples` there is owed,
+# exactly as `rows_bound()` is owed, and until then this is the pair both enumerations accept — the
+# recorder refuses any other by name.
+track=29600
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
