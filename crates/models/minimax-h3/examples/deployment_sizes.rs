@@ -574,6 +574,39 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             arena / (1 << 20)
         );
     }
+    // A **still** request decodes one latent frame, and the decode plan's clip-level buffers are the
+    // raster of what it decodes - so a deployment that serves only stills reserves a fraction of a
+    // clip's 10,897 MiB. The delta is printed here rather than left to a reader's arithmetic: the
+    // decoder's arena is the row that decides whether a decoding rank can be small.
+    for canvas in NAMED_CANVASES {
+        let latent = minimax_h3::video_vae::Canvas::clip(
+            &config.video_vae,
+            canvas.height / ratio,
+            canvas.width / ratio,
+        );
+        let still = minimax_h3::video_vae::Canvas {
+            frames: 1,
+            ..latent.clone()
+        };
+        let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+        let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &still, decode)?
+            .iter()
+            .map(|buffer| buffer.bytes())
+            .sum();
+        if canvas.width == 1344 || canvas.width == 1536 {
+            println!(
+                "decode plan {}x{}: one frame {} MiB, a {}-frame clip {} MiB at {decode}",
+                canvas.width,
+                canvas.height,
+                one / (1 << 20),
+                latent.frames,
+                clip / (1 << 20)
+            );
+        }
+    }
     for frames in [124_u32, 362] {
         // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
         // the request's frame count reaches them through the packing rule.
