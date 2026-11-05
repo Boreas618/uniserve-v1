@@ -304,7 +304,10 @@ impl ElementTypes {
         let mut components = Vec::with_capacity(COMPONENTS.len());
         for component in COMPONENTS {
             let mut dtypes: Vec<(String, usize)> = Vec::new();
-            if let Some(value) = table_json.get(component).and_then(|value| value.as_object()) {
+            if let Some(value) = table_json
+                .get(component)
+                .and_then(|value| value.as_object())
+            {
                 for (key, entry) in value {
                     // A summary states the counts themselves: `{"BF16": 626}`.
                     if let Some(count) = entry.as_u64() {
@@ -444,7 +447,10 @@ pub fn deployment_dtype(
     // both exist, by `ElementTypes::verify`, so this order is a convenience rather than a second
     // source.
     if let Some(types) = stated
-        && let Some(found) = types.components.iter().find(|entry| entry.component == component)
+        && let Some(found) = types
+            .components
+            .iter()
+            .find(|entry| entry.component == component)
         && let Some((dtype, _)) = found.dtypes.iter().max_by_key(|(_, count)| *count)
     {
         return dtype_of(dtype).ok_or_else(|| {
@@ -517,6 +523,57 @@ pub fn resident_bytes(component: &nn::Checkpoint, keys: &[String], granularity: 
             bytes.max(1).next_multiple_of(block)
         })
         .sum()
+}
+
+/// A checkpoint tensor a component's load deliberately leaves alone, and why it may.
+pub struct Exclusion {
+    /// The tensor's name inside its component's directory.
+    pub name: &'static str,
+    /// Why no inference forward needs it. An empty reason is not allowed: a name on this list
+    /// without a reason is a weight nobody decided about.
+    pub reason: &'static str,
+}
+
+/// The checkpoint tensors a component's load does not ask for, each with the reason it need not.
+///
+/// **A load is not required to read every tensor a file holds** — a training head's weights sit in
+/// the checkpoint and no inference path evaluates them, so asking for them would be a requirement
+/// on the export rather than on the model. What the load owes is to **name** them: an unasked
+/// tensor that is not on this list is a weight the model silently skips, and the difference between
+/// "this head is unused" and "this group was forgotten" is exactly this table. [`unasked`] is the
+/// subtraction that keeps the two apart.
+pub fn excluded_names(component: &str) -> &'static [Exclusion] {
+    match component {
+        // The audio VAE's spectral loss head: `logs_proj` scores training audio through a mel
+        // transform, and the decoder's forward reads the latent to samples and nothing else. The
+        // two tensors are 1 088 bytes of the component's 1 087 tensors, and `--names` measured the
+        // rest as asked for.
+        "audio_vae" => &[
+            Exclusion {
+                name: "logs_proj.weight",
+                reason: "the spectral loss head: it scores training audio, and no inference forward \
+                         evaluates it",
+            },
+            Exclusion {
+                name: "logs_proj.bias",
+                reason: "the spectral loss head, its bias - the same head, the same reason",
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// Every name of `component` that is **neither asked for nor named as an exclusion**.
+///
+/// This is the finding, not the count: a name here is a tensor the checkpoint holds, the load
+/// leaves alone, and nobody has said why. An exclusion answers it; a filter that hides it does not.
+pub fn unasked<'a>(component: &str, asked: &[String], held: &'a [String]) -> Vec<&'a str> {
+    let exclusions = excluded_names(component);
+    held.iter()
+        .map(String::as_str)
+        .filter(|name| !asked.iter().any(|asked| asked == name))
+        .filter(|name| !exclusions.iter().any(|exclusion| exclusion.name == *name))
+        .collect()
 }
 
 /// Load the deployment this rank places.
@@ -927,5 +984,44 @@ mod element_types_tests {
         // A component the table says nothing about is said to be unstated rather than left out: a
         // header that dropped the field would read as a deployment with no audio VAE.
         assert!(stated.field().contains("audio_vae: unstated"));
+    }
+
+    #[test]
+    fn an_unasked_tensor_is_named_and_a_forgotten_one_is_reported() {
+        // The audio VAE's two excluded tensors are its spectral loss head, and every exclusion
+        // carries a reason: a name on the list without one is a weight nobody decided about.
+        let exclusions = excluded_names("audio_vae");
+        assert_eq!(
+            exclusions
+                .iter()
+                .map(|exclusion| exclusion.name)
+                .collect::<Vec<_>>(),
+            vec!["logs_proj.weight", "logs_proj.bias"]
+        );
+        assert!(exclusions.iter().all(|exclusion| !exclusion.reason.is_empty()));
+
+        // The subtraction reports what neither list covers - the finding - and stays quiet about the
+        // two cases that are decided: a tensor the load asks for, and one it names as excluded.
+        let held: Vec<String> = [
+            "decoder.conv_pre.weight_g",
+            "logs_proj.weight",
+            "logs_proj.bias",
+            "encoder.block.0.norm.weight",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        let asked: Vec<String> = ["decoder.conv_pre.weight_g"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            unasked("audio_vae", &asked, &held),
+            vec!["encoder.block.0.norm.weight"]
+        );
+
+        // A component with no exclusions reports every unasked name, which is the correct answer for
+        // a load that asks for everything its component holds.
+        assert!(excluded_names("vae").is_empty());
     }
 }
