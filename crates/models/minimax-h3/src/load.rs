@@ -998,7 +998,11 @@ mod element_types_tests {
                 .collect::<Vec<_>>(),
             vec!["logs_proj.weight", "logs_proj.bias"]
         );
-        assert!(exclusions.iter().all(|exclusion| !exclusion.reason.is_empty()));
+        assert!(
+            exclusions
+                .iter()
+                .all(|exclusion| !exclusion.reason.is_empty())
+        );
 
         // The subtraction reports what neither list covers - the finding - and stays quiet about the
         // two cases that are decided: a tensor the load asks for, and one it names as excluded.
