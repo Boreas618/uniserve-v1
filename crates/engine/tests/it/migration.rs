@@ -292,27 +292,27 @@ fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
     );
 }
 
-/// How the workers of [`FaultingExecutor`] fail once told to.
+/// How the executors of [`FaultingExecutor`] fail once told to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
-    /// Every poll fails, as a worker process's exit does.
+    /// Every poll fails, as an executor process's exit does.
     Lost,
-    /// Every call reports non-finite logits, as a worker whose forward
+    /// Every call reports non-finite logits, as an executor whose forward
     /// produced a NaN does (`ErrorCode::NumericalFault`).
     NonFinite,
-    /// Every call fails on the device, as a worker whose forward hit an
+    /// Every call fails on the device, as an executor whose forward hit an
     /// illegal memory access reports it (`ErrorCode::ComputeError`).
     Compute,
-    /// The worker refuses the request's next calls as invalid input
+    /// The executor refuses the request's next calls as invalid input
     /// (`ErrorCode::InputError`); the calls of the batch after them, which
     /// read the refused calls' products, fail for want of them
     /// (`ErrorCode::InvalidDescriptor`), refusing nothing themselves.
     Refused,
 }
 
-/// The simulator's workers, which fail as `fault` states from the moment it
+/// The simulator's executors, which fail as `fault` states from the moment it
 /// is set. A batch whose calls computed non-finite logits is reported as
-/// workers report one: the failure of the work that depends on its calls
+/// executors report one: the failure of the work that depends on its calls
 /// first, and the batch's result, its failed calls included, at the next
 /// poll.
 struct FaultingExecutor {
@@ -333,11 +333,11 @@ impl engine::Executor for FaultingExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &engine::WorkerGroupId) -> bool {
+    fn is_ready(&self, worker: &engine::ExecutorGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &engine::WorkerGroupId) -> bool {
+    fn has_capacity(&self, worker: &engine::ExecutorGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 
@@ -400,7 +400,7 @@ impl engine::Executor for FaultingExecutor {
 }
 
 impl FaultingExecutor {
-    /// Fails every call of `report` with `code` as workers report it: the
+    /// Fails every call of `report` with `code` as executors report it: the
     /// failure of the work that depends on its calls now, naming the
     /// requests refused when `code` refuses input, and the report itself at
     /// the next poll.
@@ -424,8 +424,8 @@ impl FaultingExecutor {
             .filter(|_| code == ipc::ErrorCode::InputError)
             .map(|result| (result.output.request_key, "invalid input".to_owned()))
             .collect();
-        let failure = engine::WorkerFailure {
-            worker_id: engine::WorkerGroupId("sim".to_owned()),
+        let failure = engine::ExecutorFailure {
+            worker_id: engine::ExecutorGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: report
                 .results
@@ -435,7 +435,7 @@ impl FaultingExecutor {
             refusals,
             retired: Vec::new(),
             buffers: Vec::new(),
-            execution: engine::WorkerExecError::non_finite(
+            execution: engine::ExecuteError::non_finite(
                 report.batch_id,
                 report.results.iter().map(|result| &result.output),
             ),
@@ -461,7 +461,7 @@ struct Faulted {
 }
 
 /// Runs a request on a scheduler, on trial or not, until it generated a few
-/// tokens, then fails its workers with `fault`.
+/// tokens, then fails its executors with `fault`.
 fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) -> Faulted {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
@@ -533,7 +533,7 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
     }
 }
 
-/// A world on trial is not repaired: a lost worker stops its scheduler,
+/// A world on trial is not repaired: a lost executor stops its scheduler,
 /// which hands every request that resumes from its generated tokens back
 /// as migratable for a loss, after every token it delivered, and reports
 /// the loss as its first error.
@@ -567,7 +567,7 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
 }
 
 /// An image-generating request leaves as migratable for a loss when the
-/// workers of a world on trial are lost, whatever it was computing, as a
+/// executors of a world on trial are lost, whatever it was computing, as a
 /// text request does: the daemon submits it again, with its tokens and
 /// images, to the previous world.
 #[test]
@@ -618,7 +618,7 @@ fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost(
     );
 }
 
-/// A worker fault fails a world on trial as a whole, and its first error
+/// An executor fault fails a world on trial as a whole, and its first error
 /// names the batch the fault struck and that batch's requests, which the
 /// rollback keeps for diagnosis.
 #[test]
@@ -690,9 +690,9 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
     );
 }
 
-/// A request a worker refuses as invalid input fails alone, on trial too:
+/// A request an executor refuses as invalid input fails alone, on trial too:
 /// the calls of it already in flight then fail for want of the refused
-/// calls' products, and that failure is the refusal's, not a worker
+/// calls' products, and that failure is the refusal's, not an executor
 /// fault, so the world on trial serves on.
 #[test]
 fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {

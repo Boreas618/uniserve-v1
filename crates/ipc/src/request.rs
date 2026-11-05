@@ -1,12 +1,12 @@
 //! Worker request and response envelopes.
 //!
-//! One [`WorkerRequest`] or [`WorkerResponse`] is the message of one
+//! One [`MainProcessRequest`] or [`MainProcessResponse`] is the message of one
 //! [`Frame`]. Each envelope's optional `message_id` is the
 //! request-response correlation identity: a rank answers a request under the
 //! identity it carried, and a transport that matches a response to its request
 //! reads the identity from the decoded envelope, taking `None` as zero. It is
 //! unrelated to the planned calls' [`CallId`] values inside a batch. The one
-//! message a rank sends unasked, [`WorkerResponse::Stalled`], answers no
+//! message a rank sends unasked, [`MainProcessResponse::Stalled`], answers no
 //! request and carries no identity.
 
 use super::*;
@@ -43,7 +43,7 @@ impl RequestKind {
 /// Engine-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkerRequest {
+pub enum MainProcessRequest {
     /// Queries worker identity and capabilities.
     Info {
         /// Optional request-response correlation identity.
@@ -72,7 +72,7 @@ pub enum WorkerRequest {
     /// Runs the worker hook `name` (`uniserve.hooks`), which a plugin
     /// implements, with `payload`, a JSON value. The engine sends it while
     /// the worker runs no forward. Answered with
-    /// [`WorkerResponse::Hooked`] and the hook's JSON result.
+    /// [`MainProcessResponse::Hooked`] and the hook's JSON result.
     Hook {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
@@ -81,7 +81,7 @@ pub enum WorkerRequest {
     },
 }
 
-impl WorkerRequest {
+impl MainProcessRequest {
     /// Returns this envelope's request-kind discriminator.
     pub const fn kind(&self) -> RequestKind {
         match self {
@@ -186,7 +186,7 @@ pub struct ErrorCallIdentity {
 
 /// Structured worker failure with optional call identities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkerResponseError {
+pub struct MainProcessResponseError {
     /// Human-readable failure description.
     pub message: String,
     /// The failure's class, when the rank classified it.
@@ -231,13 +231,13 @@ pub struct Stall {
 /// Worker-to-engine response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkerResponse {
+pub enum MainProcessResponse {
     /// Returns worker identity and capabilities.
     Info {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Loaded worker capabilities.
-        info: WorkerInfo,
+        info: MainProcessInfo,
     },
     /// Returns partial or terminal batch progress.
     Result {
@@ -256,9 +256,9 @@ pub enum WorkerResponse {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
         /// Structured failure details.
-        error: WorkerResponseError,
+        error: MainProcessResponseError,
     },
-    /// Answers a [`WorkerRequest::Hook`] with the hook's JSON result.
+    /// Answers a [`MainProcessRequest::Hook`] with the hook's JSON result.
     Hooked {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
@@ -273,7 +273,7 @@ pub enum WorkerResponse {
     },
 }
 
-impl WorkerResponse {
+impl MainProcessResponse {
     /// Returns this envelope's response-kind discriminator.
     pub const fn kind(&self) -> ResponseKind {
         match self {
@@ -321,7 +321,7 @@ impl WorkerResponse {
     }
 
     /// Constructs a worker-capability response.
-    pub fn info(info: WorkerInfo) -> Self {
+    pub fn info(info: MainProcessInfo) -> Self {
         Self::Info {
             message_id: None,
             info,
@@ -342,7 +342,7 @@ impl WorkerResponse {
     }
 
     /// Constructs a structured worker-error response.
-    pub fn error(error: WorkerResponseError) -> Self {
+    pub fn error(error: MainProcessResponseError) -> Self {
         Self::Error {
             message_id: None,
             error,

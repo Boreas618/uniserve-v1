@@ -4,7 +4,7 @@
 //! the spec it hands the engine process; this module places the deployment's
 //! ranks (from its deployment file or the placement shorthand), reads the
 //! words the options name values by (policies, backends, element types) into
-//! the engine's own values, and completes every worker's launch arguments.
+//! the engine's own values, and completes every executor's launch arguments.
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -16,13 +16,13 @@ use proto::request::wire::{CudaGraphs, EngineSpec, FlashInfer, Placement, Schedu
 use serde::de::DeserializeOwned;
 
 use crate::DEFAULT_COMPONENT;
-use crate::core::{EngineConfig, WorkerGroupConfig};
+use crate::core::{EngineConfig, ExecutorGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
 };
-use crate::worker::WorkerProcessArgs;
+use crate::executors::ExecutorProcessArgs;
 
 /// The value the word `value` names for the option at `option`, read as the
 /// serving options name it.
@@ -83,7 +83,7 @@ impl EngineConfig {
         }
         anyhow::ensure!(
             !config.worker_groups.is_empty() && config.worker_groups.len().is_multiple_of(count),
-            "worker groups must form {count} equal independent replicas"
+            "executor groups must form {count} equal independent replicas"
         );
         let groups_per_replica = config.worker_groups.len() / count;
         let transfers = TransferConfig::parse(&spec.transfer)?;
@@ -91,7 +91,7 @@ impl EngineConfig {
             .worker_groups
             .chunks(groups_per_replica)
             .map(|groups| {
-                let contains = |id: &crate::executor::WorkerGroupId| {
+                let contains = |id: &crate::executor::ExecutorGroupId| {
                     groups.iter().any(|group| &group.id == id)
                 };
                 let mut local = TransferConfig::default();
@@ -134,7 +134,7 @@ impl EngineConfig {
         let placement = required(&spec.placement, "placement")?;
         let scheduling = required(&spec.scheduling, "scheduling")?;
         let kv_cache = required(&spec.kv_cache, "kv_cache")?;
-        let workers = required(&spec.workers, "workers")?;
+        let workers = required(&spec.workers, "executors")?;
         let graphs = required(&spec.cuda_graphs, "cuda_graphs")?;
         let flashinfer = required(&spec.flashinfer, "flashinfer")?;
         let video = required(&spec.video, "video")?;
@@ -169,7 +169,7 @@ impl EngineConfig {
                     .context("a retained cache key must contain 32 bytes")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let worker_process = WorkerProcessArgs {
+        let worker_process = ExecutorProcessArgs {
             executable: PathBuf::from(&workers.executable),
             // A deployment is what one daemon serves under its served name.
             deployment: spec.deployment.clone(),
@@ -251,10 +251,10 @@ impl EngineConfig {
             video_text_capacities: sizes(&video.text_capacities),
             ffmpeg: PathBuf::from(&video.ffmpeg),
             // Each forward batch is bounded by the scheduler's batch and
-            // token budgets, which the worker's launch descriptor carries.
+            // token budgets, which the executor's launch descriptor carries.
             max_batch_calls: scheduling.max_batch,
             max_batch_tokens: u32::try_from(max_num_batched_tokens)
-                .context("`max_num_batched_tokens` exceeds the worker field width")?,
+                .context("`max_num_batched_tokens` exceeds the executor field width")?,
             max_video_seconds: video.max_seconds,
             min_video_seconds: (video.min_seconds > 0.0).then_some(video.min_seconds),
             max_condition_rows: video.max_condition_rows,
@@ -404,10 +404,10 @@ fn required<'a, T>(table: &'a Option<T>, name: &str) -> anyhow::Result<&'a T> {
         .with_context(|| format!("the engine spec states no `{name}`"))
 }
 
-/// The deployment's worker groups: its deployment file placed on `host`, or
+/// The deployment's executor groups: its deployment file placed on `host`, or
 /// the shorthand's groups of one component, with the ranks spread in blocks
 /// over `host` and the hosts after it.
-fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
     if !placement.worker_groups_content.is_empty() {
         return Deployment::parse(&placement.worker_groups_content)?
             .worker_groups(host)
@@ -424,13 +424,13 @@ fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupCon
             .cloned(),
     );
     let tensor_parallel_size = placement.tensor_parallel_size.max(1) as usize;
-    let mut groups = WorkerGroupConfig::data_parallel(
+    let mut groups = ExecutorGroupConfig::data_parallel(
         &hosts,
         &placement.device,
         placement.data_parallel_size.max(1) as usize,
         tensor_parallel_size,
         placement.queue_depth.max(1) as usize,
-        WorkerGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
+        ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
     );
     if !placement.devices.is_empty() {
         order_devices(&mut groups, &placement.device, &placement.devices)?;
@@ -449,7 +449,7 @@ fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<WorkerGroupCon
 /// Fails unless `device` is CUDA, `devices` names one device per rank, and
 /// no two ranks of a host share a device.
 fn order_devices(
-    groups: &mut [WorkerGroupConfig],
+    groups: &mut [ExecutorGroupConfig],
     device: &str,
     devices: &[u32],
 ) -> anyhow::Result<()> {
@@ -480,8 +480,8 @@ fn order_devices(
 fn graph_arguments(
     graphs: &CudaGraphs,
     flashinfer: &FlashInfer,
-) -> anyhow::Result<WorkerProcessArgs> {
-    Ok(WorkerProcessArgs {
+) -> anyhow::Result<ExecutorProcessArgs> {
+    Ok(ExecutorProcessArgs {
         graph_policy: named(&graphs.policy, "cuda_graph_config.policy")?,
         decode_graph_batch_sizes: sizes(&graphs.decode_batch_sizes),
         prefill_graph_token_sizes: sizes(&graphs.prefill_token_sizes),
@@ -505,7 +505,7 @@ fn graph_arguments(
         flashinfer_decode_split_tile_size: flashinfer.decode_split_tile_size,
         flashinfer_prefill_split_tile_size: flashinfer.prefill_split_tile_size,
         flashinfer_split_kv: flashinfer.split_kv,
-        ..WorkerProcessArgs::default()
+        ..ExecutorProcessArgs::default()
     })
 }
 

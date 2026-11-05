@@ -137,12 +137,12 @@ use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
     Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange, DimBound,
     ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
-    ShapeBound, TensorRef, TimingCounters, WorkerInfo,
+    ShapeBound, TensorRef, TimingCounters, MainProcessInfo,
 };
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
 
-use crate::executor::{RankBuffer, WorkerFailure};
+use crate::executor::{RankBuffer, ExecutorFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
@@ -292,7 +292,7 @@ impl GuidancePrefix {
 ///
 /// The text-unconditional branch attends to the request's negative prompt
 /// tokens. The image-unconditional branch attends to the prefix the worker
-/// states for its model (`WorkerInfo::image_unconditional_token_ids`), or to
+/// states for its model (`MainProcessInfo::image_unconditional_token_ids`), or to
 /// the request's own context when it states none. Each distinct prefix holds
 /// its own slot until `Scheduler::free_guidance_prefix` releases them after
 /// the last denoising step or the request finishes.
@@ -478,7 +478,7 @@ pub struct Scheduler {
     storage: allocation::Storage,
     placement: placement::Placement,
     /// Aggregate capacity view of the loaded workers.
-    info: WorkerInfo,
+    info: MainProcessInfo,
     generation_limits: crate::GenerationLimits,
     special_tokens: SpecialTokenIds,
     /// Token requests awaiting admission, in admission order: arrival order,

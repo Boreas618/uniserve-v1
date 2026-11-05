@@ -2,7 +2,7 @@
 //! process.
 //!
 //! An engine starts its world's ranks from the launch arguments of their
-//! worker groups (`SchedulerHandle::start_all`): each rank's process gets
+//! executor groups (`SchedulerHandle::start_all`): each rank's process gets
 //! its executable, its environment and, once it registered, its launch
 //! descriptor. A daemon that plans a world before starting it reads the same
 //! launches from the world's spec here ([`rank_launches`]): which model each
@@ -18,12 +18,12 @@ use proto::request::wire::EngineSpec;
 use crate::core::{EngineConfig, SchedulerHandle};
 
 /// The ranks that load their weights together: their union's when the
-/// world's replicas share their experts, else their worker group's.
+/// world's replicas share their experts, else their executor group's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Agreement {
     /// The expert-parallel union of the deployment.
     ExpertUnion,
-    /// The worker group of this identity.
+    /// The executor group of this identity.
     Group(String),
 }
 
@@ -34,7 +34,7 @@ pub struct RankLaunch {
     pub scheduler: Option<usize>,
     /// The rank's host, by host identity.
     pub host: String,
-    /// The rank's worker group and its rank there.
+    /// The rank's executor group and its rank there.
     pub group: String,
     pub rank: u32,
     /// The ranks the rank loads its weights with, and its index among them
@@ -67,7 +67,7 @@ pub fn rank_launches(spec: &EngineSpec) -> anyhow::Result<Vec<RankLaunch>> {
         let executable = args
             .executable
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("the worker executable's path is not valid text"))?
+            .ok_or_else(|| anyhow::anyhow!("the executor executable's path is not valid text"))?
             .to_owned();
         for rank in 0..args.world_size() {
             // A planned rank holds no claim: it retains nothing.
@@ -141,7 +141,7 @@ pub fn plan_ranks(
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use crate::worker::{claims::Claims, processes, registry};
+    use crate::executors::{claims::Claims, processes, registry};
     use anyhow::Context;
 
     let config = EngineConfig::from_spec(spec)?;
@@ -159,7 +159,7 @@ pub fn plan_ranks(
         .next()
         .context("the deployment has no leader node")?;
     let registry =
-        registry::WorkerRegistry::bind(launches.iter().any(|rank| rank.host != coordinator))?;
+        registry::ExecutorRegistry::bind(launches.iter().any(|rank| rank.host != coordinator))?;
     let reachable = processes::lock(&processes)?.address(&coordinator)?;
     let mut generations = BTreeMap::new();
     for launch in &launches {
@@ -181,11 +181,11 @@ pub fn plan_ranks(
             generation,
             executable: launch.executable.clone(),
             arguments: vec![
-                "worker".into(),
+                "executor".into(),
                 "--plan".into(),
                 "--engine".into(),
                 address,
-                "--worker-id".into(),
+                "--executor-id".into(),
                 launch.group.clone(),
                 "--rank".into(),
                 launch.rank.to_string(),

@@ -135,7 +135,7 @@ pub(crate) struct EpochPlan {
     world_size: usize,
     /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
     queue_depth: usize,
-    /// This rank's worker group, which the rank facts name as its identity.
+    /// This rank's executor group, which the rank facts name as its identity.
     group: String,
     /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
     watchdog_override: Option<Duration>,
@@ -913,7 +913,7 @@ impl EpochPlan {
     /// The media class's parallel shape is the deployment's, and the page states it beside the
     /// component it splits; the same reader the launcher used answers it here, so a rank and the
     /// engine that started it cannot disagree about the group's degrees.
-    fn deployment_groups(&self) -> Result<Option<Vec<engine::WorkerGroupConfig>>> {
+    fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
         let Some(path) = self.build.worker_groups.as_ref() else {
             return Ok(None);
         };
@@ -937,7 +937,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Served, Memory, ipc::WorkerInfo, GraphStorage)> {
+    ) -> Result<(Served, Memory, ipc::MainProcessInfo, GraphStorage)> {
         let placement = &self.placement;
         match ModelClass::of(&self.checkpoint)? {
             ModelClass::CausalLm => {
@@ -1037,7 +1037,7 @@ impl EpochPlan {
         &self,
         served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
+    ) -> Result<(Memory, ipc::MainProcessInfo, GraphStorage)> {
         let device = *self
             .devices
             .first()
@@ -1176,7 +1176,7 @@ impl EpochPlan {
         .map_err(|error| error)
         .context("opening the rank's resident memory")?;
         // The plan's own account of this rank is what the scheduler is told about its pool: the
-        // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
+        // capacities it fitted, the cache it holds and where it is. It is the same `MainProcessInfo` the
         // deployment's other ranks report, so the scheduler plans against one description of a
         // rank rather than a second one derived here.
         Ok((memory, planned.plan.info.clone(), graph))
@@ -1221,7 +1221,7 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
     Ok(executor::capacity::Report {
-        endpoint: ipc::WorkerEndpoint {
+        endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             // The address space this rank's tensors live in: one main process, one pid.
             address_space: std::process::id().to_string(),
@@ -1284,7 +1284,7 @@ pub(crate) fn media_rank_report(
         })
         .collect();
     Ok(executor::capacity::Report {
-        endpoint: ipc::WorkerEndpoint {
+        endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             address_space: std::process::id().to_string(),
             incarnation: format!("{at}"),
@@ -1914,7 +1914,7 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
 fn media_parallel(
-    groups: Option<&[engine::WorkerGroupConfig]>,
+    groups: Option<&[engine::ExecutorGroupConfig]>,
     group: &str,
     rank: u32,
     tensor_parallel: u32,
@@ -2189,7 +2189,7 @@ mod tests {
     }
 
     /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<engine::WorkerGroupConfig> {
+    fn groups(components: &str) -> Vec<engine::ExecutorGroupConfig> {
         let page = format!(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
         );

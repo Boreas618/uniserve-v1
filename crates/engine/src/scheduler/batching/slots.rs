@@ -10,7 +10,7 @@
 //! A request's KV lives in physical cache units. One logical page of a cache
 //! group holds `block_size` tokens and occupies `units_per_page` units
 //! (`ipc::CacheGroup`, reported by the worker at handshake and kept in
-//! `WorkerInfo`). The KV-write kernels address one row of the cache planes per
+//! `MainProcessInfo`). The KV-write kernels address one row of the cache planes per
 //! token and store it themselves as `unit * block_size + position % block_size`,
 //! the number this module states in the batch's slot column. Nothing else
 //! derives it: the executor submits the column, it does not build it.

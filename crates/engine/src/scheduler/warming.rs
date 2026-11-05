@@ -21,7 +21,7 @@ pub(super) struct Reserved {
     pub(super) reference: PageRef,
     pub(super) hash: u64,
     pub(super) tokens: Vec<u32>,
-    pub(super) source: Arc<ipc::WorkerEndpoint>,
+    pub(super) source: Arc<ipc::MainProcessEndpoint>,
     pub(super) resume: proto::request::CacheResume,
     pub(super) published: bool,
 }
