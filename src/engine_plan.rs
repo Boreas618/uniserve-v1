@@ -913,7 +913,7 @@ impl EpochPlan {
     /// The media class's parallel shape is the deployment's, and the page states it beside the
     /// component it splits; the same reader the launcher used answers it here, so a rank and the
     /// engine that started it cannot disagree about the group's degrees.
-    fn deployment_groups(&self) -> Result<Option<Vec<engine::WorkerGroupConfig>>> {
+    fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
         let Some(path) = self.build.worker_groups.as_ref() else {
             return Ok(None);
         };
@@ -1914,7 +1914,7 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
 fn media_parallel(
-    groups: Option<&[engine::WorkerGroupConfig]>,
+    groups: Option<&[engine::ExecutorGroupConfig]>,
     group: &str,
     rank: u32,
     tensor_parallel: u32,
@@ -2184,7 +2184,7 @@ mod tests {
     }
 
     /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<engine::WorkerGroupConfig> {
+    fn groups(components: &str) -> Vec<engine::ExecutorGroupConfig> {
         let page = format!(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
         );
