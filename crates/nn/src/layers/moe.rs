@@ -766,6 +766,17 @@ impl Moe {
     /// the two must not be swapped.
     pub const ACTIVATION_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
+    /// The block-scale layout of the **gated product's operand**, which is the one plane the two
+    /// families disagree about.
+    ///
+    /// The artifact's gated (swiGlu) kernels read their tokens operand in the **linear** form and its
+    /// plain kernels read theirs swizzled: `gather_gemm_nvfp4`'s manifest states
+    /// `mSfLayoutB = linear` and `route_gemm_nvfp4`'s states it swizzled, and the artifact's own
+    /// `BatchedGemmOptions.h` says it as a rule — "Tokens need use SF linear layout when being
+    /// routed". One encoding for both is the defect that made the first end-to-end NVFP4 run produce
+    /// a row no argmax could read.
+    pub const GATED_TOKEN_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
+
     /// A block whose router is `router` and whose experts are `up_gate` and `down`.
     ///
     /// `up_gate` is `[experts, 2 · intermediate, hidden]` with the up projection first, `down` is
@@ -1609,7 +1620,7 @@ impl Moe {
         // the plain product's kernels read them swizzled (`flashinferMetaInfo.h`: the gated family's
         // tokens operand is `SfLayout(0)`, the plain family's `SfLayout(3)`). One encoding for both is
         // the defect that made the first end-to-end NVFP4 run produce a row no argmax could read.
-        let input_layout = ScaleLayout::Linear;
+        let input_layout = Self::GATED_TOKEN_SCALE_LAYOUT;
         let gated_layout = Self::ACTIVATION_SCALE_LAYOUT;
         // The step's whole working set from one table: the plan sums the same extents to size the
         // arena, so every buffer a launch writes is a buffer the plan reserved.
@@ -1636,13 +1647,13 @@ impl Moe {
         let gated = arena.tensor(step.gated.dtype, step.gated.shape)?;
         let workspace = arena.tensor(step.scratch.dtype, step.scratch.shape)?;
         // The scale's element type is the **checkpoint's**, read off the stack it belongs to; the
-        // layout the product states is the activation plane's, because that is the plane it encodes
-        // and reads. The weights' own form is not in the descriptor: it is a property of `up_gate`'s
-        // stack, which the loader publishes in the form this product's kernels were built for.
+        // layout the product states is the **tokens plane's**, because that is the plane it reads
+        // and the one this encoding wrote. The weights' own form is not in the descriptor: it is a
+        // property of `up_gate`'s stack, published in the form this product's kernels index.
         let descriptor = self.gather_nvfp4_descriptor(
             hidden.dtype,
             up_gate.scales.dtype(),
-            Self::ACTIVATION_SCALE_LAYOUT,
+            Self::GATED_TOKEN_SCALE_LAYOUT,
         );
         let args = GatherGemmNvfp4Args {
             hidden: values,
@@ -2142,7 +2153,12 @@ pub(super) mod tests {
         let moe = quantized_block(2048, 768).expect("the encoded block");
         let tokens = 15;
         let step = moe
-            .encoded_step(tokens, ScaleLayout::Linear, ScaleLayout::Swizzled128X4, DType::BF16)
+            .encoded_step(
+                tokens,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+            )
             .expect("the step's buffers");
         // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
         // tile per route, so the step's rows are 15 360 and not 120.
@@ -2208,7 +2224,7 @@ pub(super) mod tests {
             ScaleLayout::Swizzled128X4,
             DType::BF16,
         )
-            .expect("the encoded term");
+        .expect("the encoded term");
         assert_eq!(planned, step.bytes().expect("the step's bytes"));
         assert_eq!(
             moe.step_bytes(
@@ -2217,7 +2233,7 @@ pub(super) mod tests {
                 ScaleLayout::Swizzled128X4,
                 DType::BF16,
             )
-                .expect("the step"),
+            .expect("the step"),
             routing_bytes(tokens, geometry, DType::BF16).expect("the prefix") + planned
         );
     }
@@ -2283,14 +2299,19 @@ pub(super) mod tests {
                 ScaleLayout::Swizzled128X4,
                 DType::BF16,
                 false,
-            ).expect("dense step"),
+            )
+            .expect("dense step"),
             86_576_384
         );
         assert_eq!(
             encoded_bytes(
-            15, geometry, ScaleLayout::Linear, ScaleLayout::Swizzled128X4, DType::BF16,
-        )
-                .expect("the encoded step"),
+                15,
+                geometry,
+                ScaleLayout::Linear,
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+            )
+            .expect("the encoded step"),
             94_217_728
         );
         assert_eq!(
@@ -2301,7 +2322,8 @@ pub(super) mod tests {
                 ScaleLayout::Swizzled128X4,
                 DType::BF16,
                 true,
-            ).expect("encoded step"),
+            )
+            .expect("encoded step"),
             94_286_592
         );
         assert_eq!(
@@ -2338,14 +2360,14 @@ pub(super) mod tests {
         assert!(
             small
                 < step_bytes(
-                15,
-                geometry,
-                ScaleLayout::Linear,
-                ScaleLayout::Swizzled128X4,
-                DType::BF16,
-                true,
-            )
-                    .expect("the encoded single-rank step"),
+                    15,
+                    geometry,
+                    ScaleLayout::Linear,
+                    ScaleLayout::Swizzled128X4,
+                    DType::BF16,
+                    true,
+                )
+                .expect("the encoded single-rank step"),
             "{small} is not below the single-rank reservation"
         );
         // Prefill: the same group over a full batch is the case the single-rank plan gets wrong.
@@ -2363,7 +2385,7 @@ pub(super) mod tests {
             DType::BF16,
             false,
         )
-            .expect("the single-rank step");
+        .expect("the single-rank step");
         let exchanged =
             exchanged_bytes(1_024, geometry, prefill, DType::BF16).expect("the exchanged step");
         // The combined rows alone are 8 192 tokens of hidden width.

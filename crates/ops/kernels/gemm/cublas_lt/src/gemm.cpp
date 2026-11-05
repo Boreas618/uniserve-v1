@@ -203,6 +203,12 @@ struct PlanKeyHash {
 /// operation each call.
 class Plans {
  public:
+  /// Whether a plan for this shape exists, without building one.
+  bool contains(const PlanKey& key) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return plans_.find(key) != plans_.end();
+  }
+
   /// The plan for one shape, built when it is first asked for.
   Plan* of(const PlanKey& key, cublasLtHandle_t handle, std::string* error) {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -364,6 +370,21 @@ extern "C" int uniserve_gemm(UniserveGemmCall* call, void* stream) {
               call->n,     call->k,
               call->input_row_stride, call->weight_row_stride,
               call->out_row_stride};
+  // A plan is built on its first call and that build allocates the algorithm's workspace with
+  // `cudaMalloc`, which a capture cannot carry: the allocation is not part of the graph, and the
+  // kernel then reads a pointer the graph never recorded. The refusal names the shape and the
+  // remedy rather than letting the fault surface as an illegal address at the kernel's first read.
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(stream), &capture) == cudaSuccess &&
+      capture != cudaStreamCaptureStatusNone && !plans().contains(key)) {
+    return fail(call,
+                "the plan for [%lld, %lld] over %lld has not been built yet and building it "
+                "allocates its workspace, which a capture cannot carry; this shape has to run "
+                "once outside the bucket that captures it",
+                static_cast<long long>(call->m), static_cast<long long>(call->n),
+                static_cast<long long>(call->k));
+  }
+
   std::string error;
   Plan* plan = plans().of(key, handle, &error);
   if (plan == nullptr) {
