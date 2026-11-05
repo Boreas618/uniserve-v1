@@ -16,6 +16,12 @@
 //! window is left out: the sort writes `-1` into its entry of [`Args::expanded_to_permuted`] as it
 //! counts, so a caller never pre-fills that map and no launch can leave an entry stale, and the
 //! expert-parallel exchange carries the route to the rank that owns it.
+//!
+//! Two paddings are one word and they are two subjects. A **token** row the batch does not fill is a
+//! row of the batch's extent that has no route; a **permuted** row past an expert's last live one is
+//! padding inside a tile group, which [`Args::total_padded_tokens`] counts. Neither count answers the
+//! other's question, and a page that reads one as the other is the shape of defect this crate keeps
+//! removing.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -69,10 +75,19 @@ pub struct SortArgs {
     pub tile_to_limit: TensorView,
     /// `[tokens, top]` i32: permuted row of each expanded route, and `-1` for a route this rank does
     /// not hold, which the sort writes. The buffer needs no initial value.
+    ///
+    /// `-1` means one thing here and only one: **this rank does not hold the route**. A *token* row a
+    /// bucket holds but the batch does not fill is a different subject - a row that is not live has no
+    /// route for any rank to own - and it is not written at all today, because nothing in a launch
+    /// knows how many of a bucket's rows the batch fills.
     pub expanded_to_permuted: TensorView,
     /// `[max_permuted_rows]` i32: expanded route of each permuted row.
     pub permuted_to_expanded: TensorView,
-    /// `[1]` i32: padded rows the GEMMs must cover.
+    /// `[1]` i32: padded **permuted** rows the GEMMs must cover.
+    ///
+    /// This is the tail of an expert's last tile, and it is not the same subject as a token row a batch
+    /// does not fill: one is a permuted row inside a tile group, the other is a row of the batch's own
+    /// extent. A reader who needs the second cannot read it from this count.
     pub total_padded_tokens: TensorView,
     /// `[1]` i32: tiles that hold live rows.
     pub num_non_exiting_tiles: TensorView,
