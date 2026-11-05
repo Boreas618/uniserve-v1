@@ -651,27 +651,36 @@ impl Transformer {
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
-        for columns in [
-            u64::from(groups.count()),
-            18 * u64::from(hidden),
-            2 * u64::from(hidden),
+        //
+        // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
+        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
+        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
+        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
+        // i32 for all three named two keys no launch binds.
+        for (dtype, columns) in [
+            (nn::DType::I32, u64::from(groups.count())),
+            (dtype, 18 * u64::from(hidden)),
+            (dtype, 2 * u64::from(hidden)),
         ] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                nn::DType::I32,
-                columns,
-            )?);
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
         }
 
-        // The block's two modulated normalizations: the attention's (no update, no gate) and the
+        // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
         // feed-forward's (both, retaining the normalized row for the projection).
-        for (update, retain) in [(false, false), (true, true)] {
+        //
+        // The gate stride is `0` for the first because `forward` builds that norm with `None` for its
+        // gate - there is no gate projection on the attention's normalization, which is what the
+        // reference's `modulation` omits. Stating the cache row's stride there named a key no launch
+        // binds while the key the launch binds had no row: one wrong number on each side of the same
+        // defect, and a store built from the statement would have missed the row a run needs.
+        for (update, retain, gate) in [(false, false, 0), (true, true, interaction)] {
             programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
                 dtype,
                 dtype,
                 nn::DType::I32,
                 hidden,
                 config.norm_eps,
-                interaction,
+                gate,
                 interaction,
                 interaction,
                 update,
@@ -727,12 +736,21 @@ impl Transformer {
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
+        //
+        // **Both row strides are twice the width, because the two halves come from one packed
+        // projection.** `forward` reads them through `projection_halves`, which keeps the packed
+        // tensor's strides: a `[rows, 2 * intermediate]` buffer gives each half a row stride of
+        // `2 * intermediate`, and that is the number the kernel's descriptor carries - so this
+        // statement, the launch, and the deployment list's row are one value, not three. Stating the
+        // width here instead would have been a second, wrong answer to a question the launch already
+        // answers, and the walk that records the launch is what a store is built from.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
         programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
             dtype,
             u64::from(config.intermediate_size),
             nn::layers::Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
+            packed_stride,
+            packed_stride,
             u64::from(rows) * u64::from(config.intermediate_size),
             true,
         )?);
