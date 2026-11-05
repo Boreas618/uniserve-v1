@@ -103,7 +103,10 @@ def declares_pdl(operator, key):
 
 rows = []
 declared_blocked = set()
-for fixture in ('notes/programs/qwen3-moe-keys.txt', 'notes/programs/minimax-h3-keys.txt'):
+# H3's dense rows are the deployment's own generator's file, which the coverage and store tools
+# certify; `minimax-h3-keys.txt` is the older enumeration's walk print.
+for fixture in ('notes/programs/qwen3-moe-keys.txt',
+                'notes/programs/minimax-h3-deployment-keys.txt'):
     for line in pathlib.Path(fixture).read_text().split('\n'):
         # A fixture is rows plus a header. `#` carries the deployment, the walk's revision and the
         # rows no package declares yet — those are `# blocked:`, a tab, then operator, key and the
