@@ -37,8 +37,8 @@ use ipc::PhaseId;
 use ops::DType;
 use ops::Generation;
 use platform::DeviceId;
-use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 use program_server::Target;
+use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 
 use crate::engine_main::Launch;
 
@@ -448,11 +448,7 @@ impl EpochPlan {
     /// facts, which neither the launch file nor the model's configuration states.
     /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
     /// fails with the fact it is missing rather than planning against a made-up value.
-    pub(crate) fn rank_facts(
-        &self,
-        memory: &Memory,
-        served: &Served,
-    ) -> Result<engine::RankFacts> {
+    pub(crate) fn rank_facts(&self, memory: &Memory, served: &Served) -> Result<engine::RankFacts> {
         let Served::Text(model) = served else {
             return self.media_rank_facts();
         };
@@ -867,10 +863,7 @@ impl EpochPlan {
 /// returns through the batch, not as an exported tensor), so no device product is exported and no
 /// media component is routed: the deployment is one class of computation, and saying otherwise
 /// would make the engine reserve storage for exports that never happen.
-pub(crate) fn rank_report(
-    device: DeviceId,
-    host: &str,
-) -> Result<executor::capacity::Report> {
+pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capacity::Report> {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
@@ -935,10 +928,16 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
     // configuration alone, and an architecture that states a beginning states it there.
     let generation = read_json(&dir.join("generation_config.json")).ok();
     let tokenizer = read_json(&dir.join("tokenizer_config.json")).ok();
-    let end_of_text = tokenizer.as_ref().and_then(|value| added_token(value, "<|endoftext|>"));
+    let end_of_text = tokenizer
+        .as_ref()
+        .and_then(|value| added_token(value, "<|endoftext|>"));
 
     let bos = token_id(config.get("bos_token_id"))
-        .or_else(|| generation.as_ref().and_then(|value| token_id(value.get("bos_token_id"))))
+        .or_else(|| {
+            generation
+                .as_ref()
+                .and_then(|value| token_id(value.get("bos_token_id")))
+        })
         .or(end_of_text)
         .with_context(|| {
             format!(
@@ -951,7 +950,9 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
 
     let mut eos = Vec::new();
     for value in [
-        generation.as_ref().and_then(|value| value.get("eos_token_id")),
+        generation
+            .as_ref()
+            .and_then(|value| value.get("eos_token_id")),
         config.get("eos_token_id"),
     ]
     .into_iter()
@@ -980,8 +981,8 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
 
 /// Reads one JSON file of a checkpoint.
 fn read_json(path: &Path) -> Result<serde_json::Value> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -1213,13 +1214,100 @@ fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Resul
         .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
 }
 
+/// The warm candidates a media deployment binds its denoiser with.
+///
+/// **One candidate per (task, canvas, prompt capacity) the deployment serves.** A denoiser bucket is
+/// a layout, and a layout counts the prompt's rows and the request's conditions, so a deployment
+/// that captures three prompt capacities at two canvases has six layouts to walk - and
+/// `warm::distinct` keeps one candidate per layout, because two candidates that the model's padding
+/// collapses would capture the same graph twice.
+///
+/// **`t2va` only, for now.** It is the one task whose requests carry no condition media, so it is
+/// the one whose candidate a caller can state without the model's condition arithmetic. `fl2va` and
+/// `ref2va` are refused by name here rather than bound to a graph that could not run: `ref2va`
+/// additionally needs the encoder's `Source` product, which the model does not publish
+/// (`EncoderOutputs` holds one region).
+///
+/// The canvas set is the intersection of what the deployment prepares and what the checkpoint
+/// serves, and the frames are the deployment's longest clip at the model's frame rate - the model
+/// snaps them to a legal count itself, which is why the request states the plain figure.
+fn media_candidates(
+    video: &daemon::options::VideoOptions,
+    capacities: &[u32],
+) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
+    use minimax_h3::config::{FPS, NAMED_CANVASES};
+    let mut candidates = Vec::new();
+    let frames = (video.max_seconds * f64::from(FPS)).round();
+    if !(frames.is_finite() && frames >= 1.0) {
+        bail!(
+            "this deployment's longest clip is {} seconds, which is not a positive number of \
+             frames at {FPS} frames per second",
+            video.max_seconds
+        );
+    }
+    let frames = frames as u32;
+    for edge in &video.resolutions {
+        let short_edge: u32 = edge
+            .strip_suffix('p')
+            .and_then(|value| value.parse().ok())
+            .with_context(|| {
+                format!("the deployment's resolution class {edge:?} does not name a short edge in pixels")
+            })?;
+        for ratio in &video.aspect_ratios {
+            let (width, height) = ratio
+                .split_once(':')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                .with_context(|| format!("the deployment's aspect ratio {ratio:?} is not W:H"))?;
+            let canvas = NAMED_CANVASES
+                .iter()
+                .find(|canvas| canvas.short_edge == short_edge && canvas.aspect == (width, height))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "this deployment prepares {edge} at {ratio}, and the checkpoint serves no \
+                         such canvas: it serves {}",
+                        NAMED_CANVASES
+                            .iter()
+                            .map(|canvas| format!(
+                                "{}p {}:{}",
+                                canvas.short_edge, canvas.aspect.0, canvas.aspect.1
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            for capacity in capacities {
+                candidates.push(executor::runners::denoiser::WarmRequest {
+                    task: nn::capability::VideoTask::TextToVideoAudio,
+                    width: canvas.width,
+                    height: canvas.height,
+                    frames,
+                    fps: FPS,
+                    first_frames: 0,
+                    last_frames: 0,
+                    references: 0,
+                    text_tokens: *capacity,
+                    conditions: Vec::new(),
+                    vision_spans: Vec::new(),
+                });
+            }
+        }
+    }
+    if candidates.is_empty() {
+        bail!(
+            "this deployment prepares no resolution class at any aspect ratio, so a media runner \
+             would be bound with no canvas to serve"
+        );
+    }
+    Ok(candidates)
+}
+
 /// The model class a checkpoint declares, as its `config.json` states it.
 fn architectural_class(checkpoint: &Path) -> Result<String> {
     let path = checkpoint.join("config.json");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let class = config
         .get("architectures")
         .and_then(|architectures| architectures.as_array())
@@ -1254,7 +1342,11 @@ impl Placement {
         }
         let data_parallel = u32::try_from(build.data_parallel_size.get())
             .context("a data-parallel degree larger than u32::MAX")?;
-        let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
+        let expert_parallel = if build.expert_parallel {
+            data_parallel
+        } else {
+            1
+        };
         Ok(Self {
             tensor_parallel,
             tensor_rank: launch.rank % tensor_parallel,
@@ -1267,7 +1359,6 @@ impl Placement {
         })
     }
 }
-
 
 /// The phases this node's runner serves, in the numbering the scheduler plans with: one id per phase
 /// kind this plan's own buckets are launched as.
@@ -1351,7 +1442,10 @@ mod tests {
     #[test]
     fn a_qwen3_checkpoint_states_its_ends_and_its_tokenizer_names_the_beginning() {
         let directory = checkpoint(&[
-            ("config.json", r#"{"bos_token_id": null, "eos_token_id": 151645}"#),
+            (
+                "config.json",
+                r#"{"bos_token_id": null, "eos_token_id": 151645}"#,
+            ),
             (
                 "tokenizer_config.json",
                 r#"{"added_tokens_decoder": {
@@ -1373,13 +1467,19 @@ mod tests {
     #[test]
     fn the_stated_beginning_wins_and_the_generation_default_orders_the_ends() {
         let directory = checkpoint(&[
-            ("config.json", r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#),
+            (
+                "config.json",
+                r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#,
+            ),
             ("generation_config.json", r#"{"eos_token_id": 2}"#),
         ]);
 
         let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
 
-        assert_eq!(control.bos, 5, "the architecture's own beginning is the one it means");
+        assert_eq!(
+            control.bos, 5,
+            "the architecture's own beginning is the one it means"
+        );
         // `eos[0]` is what the engine gives a completion that commits none, so the generation
         // default leads and the architecture's remaining ids follow, each stated once.
         assert_eq!(control.eos, vec![2, 3]);
@@ -1446,7 +1546,11 @@ mod tests {
         let limits = understanding_limits();
 
         assert!(limits.features.contains(GenerationFeatures::UNDERSTANDING));
-        assert!(!limits.features.contains(GenerationFeatures::IMAGE_GENERATION));
+        assert!(
+            !limits
+                .features
+                .contains(GenerationFeatures::IMAGE_GENERATION)
+        );
         assert!(!limits.features.contains(GenerationFeatures::VISION_ENCODE));
         // The two figures the Qwen3 profile states as one, because zero divides and admits nothing.
         assert_eq!(limits.latent_downsample, 1);
