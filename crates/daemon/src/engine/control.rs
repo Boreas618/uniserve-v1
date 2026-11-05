@@ -24,6 +24,8 @@ use crate::engine::launch::{self, Launch};
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
 
+/// How long a switch's target may take to load and state what it is.
+const TARGET_START: Duration = Duration::from_secs(600);
 /// How long an engine process takes to connect back to the request socket
 /// once the daemon started it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -268,6 +270,64 @@ impl EngineControl {
     /// The identity the next engine this control starts takes.
     pub fn next_engine(&self) -> u64 {
         self.next_engine.load(Ordering::Relaxed)
+    }
+
+    /// Joins an epoch switch's target: the child the switch started dials this daemon's request
+    /// socket, is welcomed with the epoch's spec, and states what it is. The switch commands it on
+    /// the process link, so this connection carries only its requests from `Serve` on.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the child does not connect in time, speaks another major version, or fails to
+    /// start.
+    pub fn join_target(
+        &self,
+        engine: u64,
+        spec: wire::EngineSpec,
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
+        let world = spec.world;
+        let (mut reader, mut writer, hello) = self.accept(engine, None)?;
+        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+            format!(
+                "the engine speaks major version {} and this daemon {}",
+                hello.major,
+                proto::PROTOCOL_MAJOR
+            )
+        } else {
+            String::new()
+        };
+        writer.send(&wire::Welcome {
+            major: proto::PROTOCOL_MAJOR,
+            minor: proto::PROTOCOL_MINOR,
+            build: proto::BUILD.to_owned(),
+            refusal: refusal.clone(),
+            spec: refusal.is_empty().then_some(spec),
+        })?;
+        anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
+        let deadline = Instant::now() + TARGET_START;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "engine {engine} stated nothing in time");
+            let Some(message) = reader.recv::<wire::FromEngine>(remaining)? else {
+                continue;
+            };
+            let Some(wire::from_engine::Kind::State(state)) = message.kind else {
+                continue;
+            };
+            let known = match wire::EngineState::try_from(state.state) {
+                Ok(wire::EngineState::Standby) => EngineState::Standby,
+                Ok(wire::EngineState::Ready) => EngineState::Ready,
+                Ok(wire::EngineState::Failed) => {
+                    anyhow::bail!("the target failed to start: {}", state.error)
+                }
+                _ => continue,
+            };
+            let info = state.info.context("the engine reported no info")?;
+            tracing::info!(engine, build = %hello.build, "the switch's target joined this daemon");
+            return EngineClient::new(reader, writer, info.into(), known, stats, None)
+                .map(|client| client.numbered(engine).in_world(world));
+        }
     }
 
     /// Takes over the engine `engine` a daemon this one replaced started,
