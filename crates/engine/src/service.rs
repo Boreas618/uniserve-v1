@@ -251,14 +251,34 @@ impl Routing {
     /// The state a policy is instantiated with, as the first live scheduler
     /// holds it and with the ranks the control thread knows (§7.3).
     ///
-    /// `None` when no scheduler is alive or none answered in time: the caller
-    /// decides whether that fails the operation, and a hollow state is never
-    /// used in its place.
-    fn policy_state(&self, ranks: &[RankView]) -> Option<TrialState> {
-        self.slots
-            .iter()
-            .find(|slot| !slot.handle.is_dead())
-            .and_then(|slot| slot.handle.policy_state(ranks.to_vec()))
+    /// The error names which of the three ways there was no state it was: no
+    /// scheduler at all, every scheduler stopped (with the reason one of them
+    /// gave), or a live scheduler that did not answer in time. A hollow state is
+    /// never used in its place, and a stopped scheduler's own fatal reason is
+    /// preferred to a sentence about the absence.
+    fn policy_state(&self, ranks: &[RankView]) -> Result<TrialState, String> {
+        // Three ways to have no state, and they are three different sentences because they are
+        // three different defects: a process with no scheduler, every scheduler stopped (whose own
+        // fatal reason is what a reader needs), and a live scheduler that did not answer. A single
+        // sentence for all three is what let a stopped fixture read as a silent one.
+        if self.slots.is_empty() {
+            return Err("this main process runs no scheduler".to_owned());
+        }
+        let Some(slot) = self.slots.iter().find(|slot| !slot.handle.is_dead()) else {
+            let reason = self
+                .slots
+                .iter()
+                .find_map(|slot| slot.handle.failure())
+                .unwrap_or_else(|| "it stopped without stating why".to_owned());
+            let stopped = self.slots.len();
+            return Err(format!(
+                "every scheduler of this main process stopped ({stopped} of {stopped}): {reason}"
+            ));
+        };
+        slot.handle.policy_state(ranks.to_vec()).ok_or_else(|| {
+            "a live scheduler did not answer the state the route policy is instantiated on"
+                .to_owned()
+        })
     }
 
     /// `route`: the rank that serves a request that has just arrived (§4.4).
@@ -324,10 +344,10 @@ impl Routing {
         };
         let ranks = self.ranks();
         let report = match self.policy_state(&ranks) {
-            Some(current) => policy.fail(&error, &current),
+            Ok(current) => policy.fail(&error, &current),
             // Without a state to instantiate on, the previous policy cannot
             // answer either: the epoch fails, as a scheduler's failure does.
-            None => Err(error),
+            Err(_) => Err(error),
         };
         match report {
             Ok(report) => state.reports.push(report),
@@ -361,27 +381,7 @@ impl Routing {
                 .to_owned()
         })?;
         let ranks = self.ranks();
-        let Some(state) = self.policy_state(&ranks) else {
-            // Why no scheduler answered is the whole of this refusal's use: a scheduler that
-            // stopped fatally holds the error that stopped it, and a reader told only that none
-            // answered cannot tell a worker failure from a scheduler that never started.
-            let stopped: Vec<String> = self
-                .slots
-                .iter()
-                .filter_map(|slot| slot.handle.failure())
-                .collect();
-            return Err(if stopped.is_empty() {
-                "no live scheduler answered the state the route policy is instantiated on: every \
-                 scheduler handle is dead and none states a failure"
-                    .to_owned()
-            } else {
-                format!(
-                    "no live scheduler answered the state the route policy is instantiated on: \
-                     every scheduler handle is dead, and the first failure is {}",
-                    stopped[0]
-                )
-            });
-        };
+        let state = self.policy_state(&ranks)?;
         let candidate =
             RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)
                 .map_err(|error| error.to_string())?;
@@ -421,9 +421,9 @@ impl Routing {
     /// instantiated on the state the schedulers hold now.
     fn revert_route(&self) -> Result<(), String> {
         let ranks = self.ranks();
-        let Some(current) = self.policy_state(&ranks) else {
-            return Err("no scheduler holds a state to revert the route policy on".to_owned());
-        };
+        let current = self
+            .policy_state(&ranks)
+            .map_err(|why| format!("no scheduler holds a state to revert the route policy on: {why}"))?;
         let mut state = crate::lock(&self.route);
         state.candidate = None;
         match state.instance.as_mut() {
