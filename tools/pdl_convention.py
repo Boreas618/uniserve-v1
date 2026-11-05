@@ -6,10 +6,12 @@ package whose kernel does take one and an operator that packs one are consistent
 an operator that packs a word the module does not declare shifts the two scratch addresses the
 compiler's launcher appends after every kernel's parameters -- so this reports both sides.
 
-Each operator gets one of four lines, and the two non-answers are named rather than counted:
-`ok`, `MISMATCH` (the operator packs the word and the module does not declare it), `uncovered`
-(no declared table of the package parses the key -- a manifest's answer, not a flag's), and
-`unknown` (a package exists but its `spec` states no signature, so this checker cannot ask it).
+Each operator gets one of four lines, and each `ok` carries its reason. An operator that packs no
+dependent-launch word is `ok` whatever its module does -- no launcher's parameter list can shift, so
+the flag is the module's own business. An operator that does pack one is `ok` when the module
+declares it as a runtime parameter, `MISMATCH` when it does not, `uncovered` when no declared table
+of the package parses the key (a manifest's answer, not a flag's), and `unknown` when the package's
+`spec` states no signature -- which is the only shape of answer this checker cannot give.
 A package's key reader ends an unusable key with `SystemExit`, so the parse is guarded at that
 width: one table or one backend that cannot place the key must not end the run.
 """
@@ -124,14 +126,19 @@ for operator, key in rows:
     seen.add(operator)
     packs = packs_pdl(operator)
     declares = declares_pdl(operator, key)
+    if packs is False:
+        # The operator packs no dependent-launch word, so no launcher's parameter list can shift:
+        # whatever the module does with the flag is the module's own business, not this question.
+        print(f'ok       {operator:22} op packs False, so no launch parameter can shift')
+        continue
     if declares == 'no-table':
         # No package's tables cover this key: the manifest owes a declaration, not a flag.
-        print(f'uncovered {operator:22} op packs {str(packs):5} no declared table parses {key}')
+        print(f'uncovered {operator:22} op packs True  no declared table parses {key}')
         continue
     if declares is None:
-        # A package was found but could not be asked (its `spec` states no signature): the
-        # checker says so rather than reading it as a missing declaration.
-        print(f'unknown  {operator:22} op packs {str(packs):5} the package states no signature')
+        # A package was found but could not be asked (its `spec` states no signature) and the
+        # operator does pack the word: this is the one shape of answer the checker cannot give.
+        print(f'unknown  {operator:22} op packs True  the package states no signature')
         continue
-    mark = 'MISMATCH' if packs and declares is False else 'ok      '
+    mark = 'MISMATCH' if declares is False else 'ok      '
     print(f'{mark} {operator:22} op packs {str(packs):5} module declares {declares}')
