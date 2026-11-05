@@ -806,7 +806,10 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
     let splice = Splice::CLIP;
-    let (height, width) = request.raster;
+    // **Every canvas the recording claims.** The seam blend's rows are per pixel count, so one
+    // raster records one canvas's blend and leaves the others' stated and unrecorded.
+    let mut recorded = Recorded::default();
+    for (height, width) in request.rasters.clone() {
     let clip = arena
         .tensor(
             vae_type,
@@ -843,11 +846,11 @@ fn video_postprocessor(request: &Request) -> Result<Vec<(String, String)>, Strin
         )
         .map_err(|error| error.to_string())?;
 
-    let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
     let run = post.forward(&forward, Some(previous), clip, &splice, out);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
+    }
     Ok(recorded.0)
 }
 
