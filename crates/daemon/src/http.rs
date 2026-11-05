@@ -221,6 +221,7 @@ pub(crate) async fn serve_leader(
         accepting.clone(),
     )?);
     let handed_over = Arc::clone(&restarter.handed_over);
+    let restarting = restarter.restarting();
     let mut decided = restarter.decide();
     serve_on(
         &engine,
@@ -236,7 +237,9 @@ pub(crate) async fn serve_leader(
     // A restart in flight speaks for the deployment. Exiting here would close the handoff
     // channel under the successor while it is still adopting the engines, and the successor
     // would report that close as its own failure (`bdf651928`).
-    if decided.borrow().is_none() {
+    // Only a restart that is still running can be waited for: the channel starts
+    // at `None`, so its state alone cannot tell "nothing asked" from "in flight".
+    if restarting.load(std::sync::atomic::Ordering::Acquire) && decided.borrow().is_none() {
         let waited = tokio::time::timeout(
             crate::restart::RESTART_GRACE,
             decided.wait_for(Option::is_some),
