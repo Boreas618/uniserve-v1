@@ -6,7 +6,13 @@ deployment's rows at one element type, so a file that serves several deployments
 more than one type - and the failure that matters is the shape that is absent at *every* type, because
 that key cannot be built by any run. `--by-shape` compares walks and file with the element type
 normalised to `<t>` and takes any number of `--walk` files, which is the union rule: the union of the
-walks each stage has produced, against the file. **A gap is a defect only when the walk and the file were asked the same question**, and
+walks each stage has produced, against the file. **Run it twice at the deployment's own element type, once conditioned and once not, and
+take the union.** An unconditioned walk never reaches the audio encoder or the video decoder,
+and a walk at one element type cannot show the rows of a stack that runs at another; each
+walk of this tree states 136 launches and the two together name shapes neither names alone.
+`--walk` is repeatable for exactly this reason.
+
+**A gap is a defect only when the walk and the file were asked the same question**, and
 a question has a raster, a clip length, a token count and an element count. The walk's own
 header states those, so the check prints them and answers a gap in three disjoint ways: a row
 the file lacks (a run stops at `no kernel`), a raster-class row (`frame_pad`, `scaled_add`),
