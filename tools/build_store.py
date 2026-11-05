@@ -11,7 +11,8 @@ The output is a store a reader can use: `program_server::store::Store::open([roo
 run; the published layout and the environment are the Program Server's own, so the two cannot
 disagree about what a module looks like.
 
-Every cell states the digest of the source it was built from, and `--verify` answers whether the
+Every cell states the digest of the source it was built from, every build ends by verifying what it
+wrote, and `--verify` answers whether the
 cells a fixture needs were built from the source this tree holds. A store outlives the tree it was
 built from, and a cell that says nothing about its source cannot be told from one built yesterday
 against a package that has changed since - which is how two runs stopped inside kernels whose
@@ -281,7 +282,7 @@ def write_source_record(directory: Path, digest: str, target: str) -> None:
     )
 
 
-def verify(root: Path, rows, packages, target, revision, fixture) -> int:
+def verify(root: Path, rows, packages, target, revision, fixture, refuse_absent: bool = True) -> int:
     """Answer whether every cell this fixture needs was built from the source this tree holds.
 
     This is where a stale store is refused by name. The install cannot ask the question - a
@@ -334,7 +335,12 @@ def verify(root: Path, rows, packages, target, revision, fixture) -> int:
         f"# {fresh} of {len(rows)} cells were built from this tree's source; "
         f"{len(stale)} are stale, {len(absent)} absent"
     )
-    return 1 if stale or absent else 0
+    # Two callers ask two questions. A build is asked whether the store it just wrote is this tree's,
+    # and a row it could not build was already named as SKIPPED there. A check is asked whether this
+    # store can serve this fixture, and a store short of a row cannot.
+    if stale:
+        return 1
+    return 1 if absent and refuse_absent else 0
 
 
 def read_rows(fixture):
@@ -529,6 +535,12 @@ def main():
         print(f"built\t{op}\t{backend}\t{key}")
     for op, key, reason in skipped:
         print(f"SKIPPED\t{op}\t{reason}\t{key}")
+    # Every build ends by stating the store's age, so a cell that another source built cannot be read
+    # as this one's: the check has a caller by default rather than only when someone remembers it.
+    verdict = verify(root, rows, packages, args.target, args.revision, args.fixture,
+                     refuse_absent=False)
+    if verdict:
+        sys.exit(verdict)
     # A skipped key may have left an empty chain behind; the store holds cells, not the shape of an
     # attempt.
     prune_empty_directories(root)
