@@ -2,18 +2,20 @@
 //! supervised rank does when a test checks that the supervisor accounts for the
 //! driver's shared memory per rank.
 //!
-//! `crates/daemon`'s supervisor test needs a *separate process* with its own
-//! primary context that makes the driver create the shared memory it names for
-//! that process — the thing under test is the supervisor reading those names
-//! after a rank dies. A Python stand-in did that with `ctypes` against
-//! `libcuda.so.1`; this binary does the same through `platform`'s types, so no
-//! crate outside `platform` has to call the driver.
+//! The test that makes that check needs a *separate process* with its own
+//! primary context, since the driver names the shared memory for the process
+//! that created the event, and the thing under test is the supervisor reading
+//! those names after a rank dies. `crates/daemon`'s supervisor test re-executes
+//! its own test binary as that stand-in
+//! (`supervision::supervisor::tests::event_holder_rank`), because a lib test
+//! cannot count on another package's example being built; this binary is the
+//! same role run by hand, so a probe needs no test harness:
 //!
 //!     cargo run -p platform --example interprocess_event_holder
 //!
 //! It prints the event's 64-byte interprocess handle as hex on one line and
-//! then sleeps for an hour, so a test can pass the handle to a second process
-//! (`Event::open_ipc`) or simply read the shared memory the driver created for
+//! then sleeps for an hour, so a second process can pass the handle to
+//! `Event::open_ipc` or simply read the shared memory the driver created for
 //! this one.
 
 use std::time::Duration;

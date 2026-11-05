@@ -942,21 +942,42 @@ mod tests {
         assert_eq!(last, "line 23");
     }
 
-    /// A stand-in rank: creates an interprocess event on device 0, which
-    /// makes the driver create its shared memory named for this process, and
-    /// waits to be killed.
-    const EVENT_HOLDER: &str = "\
-import ctypes, time
-cuda = ctypes.CDLL('libcuda.so.1')
-device, context, event = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
-assert cuda.cuInit(0) == 0
-assert cuda.cuDeviceGet(ctypes.byref(device), 0) == 0
-assert cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device) == 0
-assert cuda.cuCtxPushCurrent_v2(context) == 0
-# CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS
-assert cuda.cuEventCreate(ctypes.byref(event), 2 | 4) == 0
-time.sleep(600)
-";
+    /// Names the role of the process [`event_holder_rank`] runs in.
+    const EVENT_HOLDER_PROCESS: &str = "UNISERVE_TEST_EVENT_HOLDER";
+
+    /// The child role [`hold_event`] re-executes this test binary as: it creates
+    /// an interprocess event on device 0 through `platform`, which makes the
+    /// driver create the shared memory it names for this process, and waits to
+    /// be killed.
+    ///
+    /// The role is a rank's, not the supervisor's: a rank is a process of its
+    /// own, and the driver calls this stand-in makes are `platform`'s, so the
+    /// supervisor's code reaches no driver entry point. It is a test of its own
+    /// so that this binary can be run as the stand-in — the mechanism
+    /// `crates/executor/src/transfer/cache_export.rs:625` uses for a child
+    /// process, and `crates/platform/tests/it/gpu.rs:404` for a role.
+    #[test]
+    #[ignore = "a stand-in rank process, started by `hold_event`"]
+    fn event_holder_rank() {
+        if std::env::var_os(EVENT_HOLDER_PROCESS).is_none() {
+            return;
+        }
+        let device = platform::Device::new(platform::DeviceId(0)).expect("device 0");
+        let stream = device.stream().expect("a stream on device 0");
+        // Timing and interprocess are exclusive, and interprocess is what makes
+        // the driver name shared memory for this process.
+        let event = platform::Event::new(platform::EventFlags {
+            timing: false,
+            interprocess: true,
+            external: false,
+        });
+        event.record(&stream).expect("an interprocess event");
+        stream.synchronize().expect("the event recorded");
+        // Exporting the handle is what makes the driver publish that storage.
+        let handle = event.ipc_handle().expect("the event's interprocess handle");
+        assert_ne!(handle.0, [0; 64], "the handle names no event");
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 
     /// A stand-in rank that maps shared memory under NCCL's prefix, as a
     /// communicator's proxy maps its pool, writes the object's path to the
@@ -995,16 +1016,35 @@ time.sleep(600)
             .collect()
     }
 
-    /// Starts an [`EVENT_HOLDER`] and waits until its event storage exists.
+    /// Starts [`event_holder_rank`] and waits until its event storage exists.
     fn hold_event() -> (Holder, Vec<PathBuf>) {
-        let mut command = Command::new("python3");
-        command.args(["-c", EVENT_HOLDER]);
-        let holder = Holder(Child::spawn(&mut command).unwrap());
+        let mut command = Command::new(
+            std::env::current_exe().expect("this test's own executable"),
+        );
+        // The name is this binary's own path to the role: a test binary passes
+        // the module path it printed in its own diagnostics, which is this
+        // crate's modules under `daemon`'s lib.
+        command
+            .args([
+                "--exact",
+                "supervision::supervisor::tests::event_holder_rank",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(EVENT_HOLDER_PROCESS, "1")
+            // The stand-in's own output is not what this test reads.
+            .stdout(Stdio::null());
+        let mut holder = Holder(Child::spawn(&mut command).unwrap());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let storage = event_storage(holder.0.id());
             if !storage.is_empty() {
                 return (holder, storage);
+            }
+            // A stand-in that ended has made no storage and never will, so its
+            // failure is reported here rather than as a full minute of waiting.
+            if let Some(ended) = holder.0.try_wait().expect("the stand-in's state") {
+                panic!("the rank stand-in ended before it created an event: {ended:?}");
             }
             assert!(
                 Instant::now() < deadline,
