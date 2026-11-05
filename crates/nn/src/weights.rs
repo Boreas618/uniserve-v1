@@ -889,6 +889,30 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Refuses a tensor whose stored bytes are all zero, naming it.
+    ///
+    /// A matrix that multiplies the hidden state is never all zero in a trained or a calibrated
+    /// checkpoint: the product would answer zeros for every activation, and whatever the loader
+    /// published from it reads as "this projection is broken" long after the loading boundary could
+    /// have said so. The packed path refuses the same defect from the codes and the block scales
+    /// (`nvfp4`); this is the dense export's way to the same mistake, and one host read per tensor at
+    /// load buys the sentence. A shapes-only loader reads nothing and passes.
+    pub fn refuse_zeros(&self, request: &WeightRequest) -> Result<()> {
+        if self.is_shapes() {
+            return Ok(());
+        }
+        let bytes = self.shards()?.read(&request.tensor)?;
+        if bytes.bytes.iter().all(|byte| *byte == 0) {
+            return Err(Error::weight(
+                &request.tensor,
+                "every stored byte is zero: the product would answer zeros for every activation, \
+                 so this tensor is missing its export"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The retained store this loader publishes into.
     fn retention(&mut self) -> Result<&mut (dyn RetainedWeights + 'a)> {
         match self.store.as_deref_mut() {
@@ -2374,6 +2398,85 @@ pub fn f32_to_half(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write one shard of `tensors` - each `(name, dtype, shape, bytes)` - into `directory`.
+    ///
+    /// The header is composed from the format's own grammar here, rather than through the parser a
+    /// test is meant to exercise.
+    fn shard(directory: &std::path::Path, tensors: &[(&str, &str, &[usize], &[u8])]) {
+        let mut body = String::from("{");
+        let mut payload = Vec::new();
+        for (index, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let start = payload.len();
+            payload.extend_from_slice(bytes);
+            let extents = shape
+                .iter()
+                .map(|extent| extent.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!(
+                r#""{name}":{{"dtype":"{dtype}","shape":[{extents}],"data_offsets":[{start},{}]}}"#,
+                payload.len()
+            ));
+        }
+        body.push('}');
+        // The header length is a multiple of eight so the payload stays aligned, as every exporter
+        // writes it; JSON permits the spaces that padding needs.
+        let padded = body.len().div_ceil(8) * 8;
+        body.push_str(&" ".repeat(padded - body.len()));
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        file.extend_from_slice(body.as_bytes());
+        file.extend_from_slice(&payload);
+        std::fs::write(directory.join("model.safetensors"), &file).expect("a shard");
+    }
+
+    /// A dense tensor whose every stored byte is zero is a missing export, not a value.
+    ///
+    /// The packed path already refuses the same defect from the codes and the block scales; this is
+    /// the dense export's way to it, and the sentence names the tensor that is missing.
+    #[test]
+    fn a_dense_tensor_of_zeros_is_refused_by_name_and_a_live_one_passes() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        let zeros = [0u8; 8];
+        // Two BF16 elements each: one tensor holds nothing but zeros, the other holds a value.
+        let live = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        shard(
+            root.path(),
+            &[
+                ("layers.0.attention.v_proj.weight", "BF16", &[2, 2], &zeros),
+                ("layers.0.attention.k_proj.weight", "BF16", &[2, 2], &live),
+            ],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        let mut store = HostStore::new();
+        let loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+
+        let zero = WeightRequest::region("layers.0.attention.v_proj.weight", 0, Shape::new(&[2, 2]));
+        let problem = loader
+            .refuse_zeros(&zero)
+            .expect_err("an all-zero projection is refused");
+        let text = problem.to_string();
+        assert!(text.contains("v_proj.weight"), "the refusal names the tensor: {text}");
+        assert!(text.contains("every stored byte is zero"), "and what is wrong with it: {text}");
+
+        let live_request =
+            WeightRequest::region("layers.0.attention.k_proj.weight", 0, Shape::new(&[2, 2]));
+        loader
+            .refuse_zeros(&live_request)
+            .expect("a tensor that holds a value passes");
+
+        // A shapes-only loader states extents and reads no bytes, so it has nothing to refuse: the
+        // walk of a model's programs must not depend on a shard.
+        WeightLoader::shapes(DType::BF16)
+            .refuse_zeros(&zero)
+            .expect("a shapes-only loader reads nothing");
+    }
 
     /// A shapes-only loader answers a weight request with the extents the caller asked for, at
     /// address zero, and reads nothing: no checkpoint, no shard, no device.

@@ -669,13 +669,16 @@ fn dense_projection(
     bias: bool,
 ) -> Result<Linear> {
     let start = as_u64(partition.tensor_rank, "the tensor rank")? * rows * columns;
-    let weight = region(
-        loader,
-        sources,
-        &format!("{parameter}.weight"),
+    let request = WeightRequest::region(
+        checkpoint_name(sources, &format!("{parameter}.weight"))?,
         start,
         Shape::new(&[rows, columns]),
-    )?;
+    );
+    // A dense projection is a matrix that multiplies the hidden state, so an all-zero one is a
+    // missing export and not a value: the packed path refuses the same defect from its codes and
+    // scales (`WeightLoader::nvfp4`), and this is the dense export's way to it.
+    loader.refuse_zeros(&request).map_err(Error::from)?;
+    let weight = loader.load(&request).map_err(Error::from)?;
     let bias = if bias {
         Some(region(
             loader,
@@ -735,6 +738,7 @@ fn dense_output_projection(
         hidden,
         reduction,
     )?;
+    loader.refuse_zeros(&request).map_err(Error::from)?;
     let weight = loader.load(&request).map_err(Error::from)?;
     let bias = if bias {
         Some(region(
