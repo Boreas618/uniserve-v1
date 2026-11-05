@@ -3,8 +3,9 @@
 
 This is the GPU check a build host cannot do: it loads the module the store
 holds (``module.so``), calls the operator's entry with the call structure of
-``crates/ops/src/moe/sort.rs`` (632 bytes: ``ids`` 0, ``scales`` 8, the six
-outputs 16..64, the extents 64..120, ``error`` 120), and compares all six
+``crates/ops/src/moe/sort.rs`` (640 bytes: ``ids`` 0, ``scales`` 8, the six
+outputs 16..64, the extents 64..120, ``error`` 120, ``live_tokens`` 632), and
+compares all six
 outputs with TensorRT-LLM's routing order computed here in integer arithmetic.
 
     python sort_check.py <module_dir> [--tokens 64] [--top 8] [--experts 128]
@@ -74,7 +75,26 @@ class Call(ctypes.Structure):
         ("tile_tokens", ctypes.c_int64),
         ("scales_dtype", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
+        ("live_tokens", ctypes.c_void_p),
     ]
+
+
+def declared_size():
+    """The `sizeof` the package header's `static_assert` pins, read rather than repeated."""
+    header = pathlib.Path(__file__).resolve().parents[1] / "include" / "uniserve_moe_sort.h"
+    text = header.read_text()
+    marker = "sizeof(uniserve_moe_sort_call) =="
+    if marker not in text:
+        raise SystemExit(f"{header}: no `{marker}` static_assert")
+    digits = text.split(marker, 1)[1].lstrip(" =").split()[0].rstrip(",")
+    return int(digits)
+
+
+if ctypes.sizeof(Call) != declared_size():
+    raise SystemExit(
+        f"the check's `Call` holds {ctypes.sizeof(Call)} bytes and the header declares "
+        f"{declared_size()}: the mirror is stale, and the module would read past it"
+    )
 
 
 def max_tiles(tokens, top, local_experts, tile):
@@ -85,13 +105,18 @@ def max_tiles(tokens, top, local_experts, tile):
     return (expanded + (tile - 1) * local_experts) // tile
 
 
-def reference(ids, tokens, top, experts, local, offset, tile):
+def reference(ids, tokens, top, experts, local, offset, tile, live=None):
     """The six outputs TensorRT-LLM's routing order gives for `ids`.
 
-    `ids` is `[tokens, top]` on the host, as Python lists of expert ids.
+    `ids` is `[tokens, top]` on the host, as Python lists of expert ids. `live` is the batch's token
+    count when the caller stages one, and `None` when the call passes no count: a row of `token >=
+    live` is not live, so it is counted into no tile and its route map entry is `-2` - padding, which
+    dominates rank ownership and is a different absence from the `-1` of a route this rank lacks.
     """
     counts = [0] * local
     for token in range(tokens):
+        if live is not None and token >= live:
+            continue
         for route in range(top):
             expert = ids[token][route] - offset
             if 0 <= expert < local:
@@ -127,6 +152,9 @@ def reference(ids, tokens, top, experts, local, offset, tile):
     for token in range(tokens):
         for route in range(top):
             expanded = token * top + route
+            if live is not None and token >= live:
+                expanded_to_permuted[expanded] = -2
+                continue
             expert = ids[token][route] - offset
             if 0 <= expert < local:
                 row = tile_offsets[expert] * tile + filled[expert]
@@ -167,6 +195,13 @@ def main() -> int:
     parser.add_argument("--local", type=int, default=128)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--tile", type=int, default=128)
+    parser.add_argument(
+        "--live",
+        type=int,
+        default=None,
+        help="the batch's live token count to stage on the device; unset passes no count, "
+        "which is every row live",
+    )
     parser.add_argument("--scales", default="f32", choices=sorted(TORCH_TYPES))
     parser.add_argument("--seed", type=int, default=0)
     arguments = parser.parse_args()
@@ -217,14 +252,24 @@ def main() -> int:
 
     tile_to_expert = torch.full((tiles,), -1, dtype=torch.int32, device=device)
     tile_to_limit = torch.full((tiles,), -1, dtype=torch.int32, device=device)
+    # A sentinel the sort must overwrite: pre-filling with -1 would hide a kernel that never writes
+    # the absent entries, which is the defect this check exists to catch.
     expanded_to_permuted = torch.full(
-        (tokens, top), -1, dtype=torch.int32, device=device
+        (tokens, top), -7, dtype=torch.int32, device=device
     )
     permuted_to_expanded = torch.full(
         (permuted,), -1, dtype=torch.int32, device=device
     )
     total_padded_tokens = torch.zeros((1,), dtype=torch.int32, device=device)
     num_non_exiting_tiles = torch.zeros((1,), dtype=torch.int32, device=device)
+
+    live_tokens = None
+    if arguments.live is not None:
+        if not 0 <= arguments.live <= tokens:
+            raise SystemExit(f"--live {arguments.live} is not inside a batch of {tokens}")
+        live_tokens = torch.full(
+            (1,), arguments.live, dtype=torch.int32, device=device
+        )
 
     call = Call()
     call.ids = ctypes.c_void_p(ids.data_ptr())
@@ -244,6 +289,9 @@ def main() -> int:
     call.local_offset = offset
     call.tile_tokens = tile
     call.scales_dtype = ELEMENT_TYPES[arguments.scales]
+    call.live_tokens = (
+        None if live_tokens is None else ctypes.c_void_p(live_tokens.data_ptr())
+    )
 
     stream = torch.cuda.current_stream().cuda_stream
     status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
@@ -257,7 +305,7 @@ def main() -> int:
         return 1
 
     expected = reference(
-        ids.tolist(), tokens, top, experts, local, offset, tile
+        ids.tolist(), tokens, top, experts, local, offset, tile, arguments.live
     )
     padded = int(total_padded_tokens[0])
     live_tiles = int(num_non_exiting_tiles[0])

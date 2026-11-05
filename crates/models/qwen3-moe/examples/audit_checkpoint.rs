@@ -75,16 +75,18 @@ fn main() -> ExitCode {
     }
 
     let mut resolved = 0;
-    let mut by_fallback = 0;
+    let mut normalized = 0;
     let mut absent: Vec<(String, String)> = Vec::new();
     for (checkpoint, parameter) in &claimed {
         if present.contains(checkpoint) {
             resolved += 1;
         } else if let Some(stripped) = checkpoint.strip_prefix("model.") {
             if present.contains(stripped) {
-                // The loader's documented fallback: the stack serialized without the prefix.
+                // The audit's normalization, not the loader's rule: a load matches a name exactly as
+                // the checkpoint stores it, so a name this branch rescues is coverage the audit has
+                // and the load does not. That is why the count is printed rather than assumed.
                 resolved += 1;
-                by_fallback += 1;
+                normalized += 1;
             } else {
                 absent.push((checkpoint.clone(), parameter.clone()));
             }
@@ -128,7 +130,20 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("# {by_fallback} resolved only through the loader's `model.`-prefix fallback");
+    // The count decides which subject the line above is about, so it is printed rather than implied:
+    // zero means the audit and the load agree name for name, and any other number is coverage the
+    // load would refuse. A normalization a reader cannot see is a statement they cannot check.
+    match normalized {
+        0 => println!(
+            "# 0 name(s) needed the audit's `model.`-prefix normalization, so this coverage is the \
+             load's, name for name"
+        ),
+        stripped => println!(
+            "# {stripped} name(s) needed the audit's `model.`-prefix normalization; the load matches \
+             a name exactly as the checkpoint stores it, so {stripped} of those resolved name(s) are \
+             coverage this audit has and the load does not"
+        ),
+    }
     println!(
         "# {} present but unclaimed: {} declared and not consumed, {} to judge",
         unclaimed.len(),

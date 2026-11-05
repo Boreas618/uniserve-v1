@@ -74,6 +74,10 @@ pub struct Staging {
     max_kv_len: u32,
     /// The mechanism's call ids of the staged rows, in the order `rows.calls` lists them.
     calls: Vec<CallId>,
+    /// The tokens the batch really holds, before the padding this staging appends to reach the
+    /// bucket's count. A captured graph states the bucket's token count as a constant, so a kernel
+    /// that must bound its work by what the batch holds reads this from the device instead.
+    live_tokens: i32,
     /// The bucket the last [`Staging::stage`] padded the columns to.
     /// The bucket the held columns were padded to. A capture must reuse a batch of exactly the
     /// bucket it captures: two buckets of one variant differ in size, and a graph captured from
@@ -124,6 +128,8 @@ impl Staging {
             )));
         }
         let tokens = columns.rows.tokens();
+        self.live_tokens = i32::try_from(tokens)
+            .map_err(|_| Error::Invalid("a batch of more tokens than an i32 counts".into()))?;
         // A batch has two counts and each of its columns belongs to one of them: the sampler's
         // `slots` and `parameters` are per **row** (a verify call carries several rows for one
         // call), and the commit table states one row per **call**.
@@ -291,6 +297,11 @@ impl Staging {
         &self.rows
     }
 
+    /// The tokens the staged batch holds, before the padding to its bucket.
+    pub fn live_tokens(&self) -> u64 {
+        u64::try_from(self.live_tokens).unwrap_or(0)
+    }
+
     /// The staged token ids, as the embedding upload reads them.
     pub fn input_ids(&self, tokens: usize) -> &[i32] {
         &self.input_ids[..tokens]
@@ -372,6 +383,9 @@ struct Columns {
     parameters: Column,
     slots: Column,
     draws: Column,
+    /// `[1]` i32 the tokens the batch really holds, which a kernel bounds its work by: the bucket's
+    /// own token count is a constant inside a captured graph and cannot bound anything.
+    live_tokens: Column,
     /// `[rows]` the sampled ids, read back after a replay.
     readback: platform::PinnedBuffer,
     /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
@@ -422,6 +436,7 @@ impl Columns {
             parameters: Column::new(device, DType::F32, parameters)?,
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
+            live_tokens: Column::new(device, DType::I32, 1)?,
             readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             logits_row: platform::PinnedBuffer::new(
                 device,
@@ -1685,7 +1700,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.columns.scratch_slots.extent(0..u64::from(bucket.tokens)),
         )?;
         let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
-        let forward = Forward::new(&stream, next, &arena).with_shadow(shadow);
+        // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
+        // the served one, so the comparison sees one count (7.3).
+        let forward = Forward::new(&stream, next, &arena)
+            .with_shadow(shadow)
+            .with_live_tokens(self.columns.live_tokens.device);
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -1935,6 +1954,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_f32(&mut self.encoded, &self.draws);
         self.columns.draws.write(&self.encoded)?;
 
+        // The batch's live token count, which no shape of the bucket states: a captured graph reads
+        // the bucket's token count as a constant, so the MoE sort - which must write a sentinel into
+        // every route row of a padded token - reads this column instead.
+        encode_i32(&mut self.encoded, &[self.staging.live_tokens]);
+        self.columns.live_tokens.write(&self.encoded)?;
+
         self.commit
             .stage(self.staging.commit(), rows, self.commit.capacity as usize)?;
 
@@ -1949,6 +1974,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             &self.columns.parameters,
             &self.columns.slots,
             &self.columns.draws,
+            &self.columns.live_tokens,
         ] {
             column.upload(&self.stream)?;
         }
@@ -2072,7 +2098,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.pool()?.reserved(),
         );
         let batch = self.token_batch(bucket)?;
-        let forward = Forward::new(&stream, generation, &arena);
+        let forward = Forward::new(&stream, generation, &arena)
+            .with_live_tokens(self.columns.live_tokens.device);
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -2801,6 +2828,65 @@ mod tests {
                 "padded token {token} writes no cache page"
             );
         }
+        Ok(())
+    }
+
+    /// The live token count is the batch's own, not the bucket's: a captured graph reads the
+    /// bucket's count as a constant, and a kernel that must bound its work - the MoE sort writes a
+    /// route sentinel into every row of a token the batch does not own - reads this count instead.
+    ///
+    /// The batch here is the one the delivery run meets: 289 tokens in a 512-token bucket, so 223
+    /// padded tokens follow it.
+    #[test]
+    fn the_live_token_count_is_the_batchs_and_not_its_buckets() -> Result<()> {
+        let tokens = 289i32;
+        let bucket = Bucket::prefill(1, 512, Variant::PrefillOutput);
+        let buckets = Buckets::new([bucket]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let count = tokens as usize;
+        let mut columns = BatchColumns {
+            rows: nn::BatchRows {
+                positions: (0..tokens).collect(),
+                slot_mapping: (0..tokens).collect(),
+                seq_lens: vec![tokens],
+                query_offsets: vec![0, tokens],
+                logits_rows: vec![tokens - 1],
+                calls: vec![nn::BatchRow {
+                    request: 0,
+                    kind: nn::RowKind::Prefill,
+                    cache_group: 0,
+                    rows: 0..1,
+                }],
+            },
+            input_ids: (0..tokens).map(|token| token + 1).collect(),
+            slots: vec![0],
+            parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
+            commit: committed(&[0]),
+            page_size: 16,
+            max_kv_len: 4096,
+        };
+        columns.input_ids.truncate(count);
+        staging.stage(
+            &columns,
+            &[CallId(1)],
+            &Shape::prefill(1, tokens as u32, Variant::PrefillOutput),
+            bucket,
+        )?;
+
+        assert_eq!(
+            staging.live_tokens(),
+            count as u64,
+            "the staged count is the batch's, not the {} of the bucket",
+            512
+        );
+        assert_eq!(staging.input_ids.len(), 512, "the bucket's tokens are staged");
+        // The padded tail is still a token whose output is discarded, and the count is the only
+        // statement of where the batch ends.
+        assert_eq!(staging.input_ids[count], 0);
+        assert_eq!(staging.batch_rows().slot_mapping[count], -1);
+        assert_eq!(staging.input_ids[511], 0);
+        assert_eq!(staging.batch_rows().slot_mapping[511], -1);
         Ok(())
     }
 
