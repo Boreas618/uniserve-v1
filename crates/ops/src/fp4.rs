@@ -365,6 +365,26 @@ const _: () = assert!(
     "the call's size moved without the package's header"
 );
 
+/// An encoded activation's block scales: one byte per scale, declared by whoever produced it.
+///
+/// `nvfp4_quantize` writes the E4M3 *integer* byte (`scale_bytes` in the Triton program), so the
+/// encoder's output plane is bytes; a checkpoint may publish the same table as an `f8e4m3` tensor.
+/// The product reads either bit-for-bit, so the element type is the producer's declaration and not
+/// a property of the product. What a kernel does depend on is one byte per scale, which is what
+/// this states — pinning one declaration instead refused the other producer and cost a run.
+pub fn require_byte_scale(op: &'static str, view: TensorView, columns: u64) -> Result<()> {
+    if !matches!(view.dtype, DType::U8 | DType::F8E4M3) {
+        return Err(Error::argument(
+            op,
+            format!(
+                "block scales are one byte each, declared U8 or f8e4m3, found {}",
+                view.dtype
+            ),
+        ));
+    }
+    view.require_row(op, view.dtype, columns)
+}
+
 /// The operand pair an NVFP4 product requires, checked where a descriptor can be built.
 ///
 /// The truth here is the descriptor's alone — the packed weight is E2M1 pairs carried as bytes and
@@ -421,14 +441,25 @@ impl Op for Nvfp4Gemm {
         args.weight
             .require_shape(Self::NAME, Shape::new(&[n, u64::from(descriptor.k / 2)]))?;
         args.weight.require_row(Self::NAME, DType::U8, k)?;
-        args.input_scales
-            .require_row(Self::NAME, DType::U8, args.input_scales.shape.last())?;
+        // The activation's block scales are the encoder's output, so their element type is the
+        // encoder's declaration (`require_byte_scale`); the weight's are the checkpoint's, which the
+        // descriptor's key names.
+        require_byte_scale(
+            Self::NAME,
+            args.input_scales,
+            args.input_scales.shape.last(),
+        )?;
         args.input_scales.require_shape(
             Self::NAME,
             descriptor.layout.shape(m, u64::from(descriptor.k)),
         )?;
-        args.weight_scales
-            .require_row(Self::NAME, DType::U8, args.weight_scales.shape.last())?;
+        // An E4M3 block scale, not a byte of packed values: the scale table is its own element
+        // type and the packed weight is the only U8 operand of this product.
+        args.weight_scales.require_row(
+            Self::NAME,
+            DType::F8E4M3,
+            args.weight_scales.shape.last(),
+        )?;
         args.weight_scales.require_shape(
             Self::NAME,
             ScaleLayout::Swizzled128X4.shape(n, u64::from(descriptor.k)),

@@ -591,6 +591,8 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "this process's interface",
             "the daemon closed the process interface",
             "the attached daemons still",
+            "the successor received the service",
+            "the daemon hands its service",
             "attaching a daemon failed",
             "a request was taken over",
             "the successor took the responses in flight over",
