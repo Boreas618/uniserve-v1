@@ -859,8 +859,11 @@ impl EpochPlan {
                     .buckets
                     .largest(Variant::DecodeGreedy)
                     .map_or(1, |bucket| bucket.rows);
+                let cache = memory.shared_cache().context(
+                    "a causal-language rank reads a paged cache, and this rank opened none",
+                )?;
                 let provider: Box<dyn KvProvider> =
-                    Box::new(ResidentCache::new(memory.shared_cache(), device, rows)?);
+                    Box::new(ResidentCache::new(cache, device, rows)?);
                 let runner = CausalLmRunner::new(
                     Binding {
                         id: RunnerId(0),
@@ -1447,7 +1450,9 @@ fn host_name() -> Result<String> {
 /// would read another request's tokens out of the cache - wrong tokens with no error - so this is a
 /// refusal at spawn, naming both figures, and the block table and the sampler read the same one.
 fn cache_page_size(memory: &Memory, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
-    let cache = memory.shared_cache();
+    let cache = memory.shared_cache().context(
+        "the model reads a paged cache and this rank opened none",
+    )?;
     let cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
