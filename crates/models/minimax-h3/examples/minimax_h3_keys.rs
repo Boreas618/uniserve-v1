@@ -1110,15 +1110,15 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The audio encoder's projection block: a **dense** attention and a **tanh-GELU** gated unit.
+    // The audio encoder's projection block: a **causal** attention and a **tanh-GELU** gated unit.
     //
     // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
     // `num_attention_heads 8` heads of 256, with as many key heads as query heads. The mask is
-    // `dense`, not `causal`: the encoder reads a whole waveform in one sequence
-    // (`encoding.rs`'s launch passes `false`) and `encoding.rs`'s own test names the key with
-    // `mask_dense ... cu_seq_lens_false`. This list stated `causal` for a release, so the launch had
-    // no row and the row had no launcher - a `causal` key here would silently compute over a mask the
-    // encoder never asks for, which is worse than the missing row because it runs. The gated unit is
+    // `causal`: a frame depends only on the audio before it (`audio_vae.py:433`), and **the object
+    // the load builds is the authority** - `Projection::load` constructs
+    // `Attention::dense(..., true, ...)`. This list once said `dense` on the strength of a
+    // `programs` parameter, which is a statement about the load rather than the load; the file's row
+    // is the one that follows the constructed layer. The gated unit is
     // `GatedActivation::new(GeluTanh)` over the
     // latent channels, whose gate and value are **two separate** `[frames, 2 · 32]` buffers rather
     // than one packed one - so the row stride is the width, and this row is the `gelu_tanh`
@@ -1132,7 +1132,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             head_dim: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
             q_heads: AUDIO_ATTENTION_HEADS,
             kv_heads: AUDIO_ATTENTION_HEADS,
-            mask: ops::attention::Mask::Dense,
+            mask: ops::attention::Mask::Causal,
             windowed: false,
             // A launch bound outside the key: the encoder attends one track's frames as one sequence.
             max_kv_len: 4096,
