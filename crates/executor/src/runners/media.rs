@@ -54,8 +54,9 @@ pub struct MediaWork {
     units: Vec<u32>,
     /// Which stage this is, and the extent it works at.
     stage: Stage,
-    /// The published bytes this stage reads.
-    input: platform::PinnedBuffer,
+    /// The published bytes this stage reads, and nothing for the stage that reads none: the mux's
+    /// inputs are the two encodes the deployment's output already holds.
+    input: Option<platform::PinnedBuffer>,
     /// The media group's host encoder, one per deployment.
     output: Arc<Output>,
 }
@@ -83,12 +84,16 @@ pub enum Stage {
 
 impl MediaWork {
     /// A stage of `request`'s artifact over `input`.
+    ///
+    /// `input` is the product the stage reads - the unit's frames for a unit, the track for a
+    /// track - and `None` for the mux, whose inputs are the encodes this action's `output` already
+    /// holds. A mux stage handed bytes would be a caller stating an input the muxer never reads.
     pub fn new(
         output: Arc<Output>,
         request: RequestKey,
         units: Vec<u32>,
         stage: Stage,
-        input: platform::PinnedBuffer,
+        input: Option<platform::PinnedBuffer>,
     ) -> Self {
         Self {
             request,
@@ -98,6 +103,19 @@ impl MediaWork {
             output,
         }
     }
+
+    /// The bytes this stage reads, or the refusal that names a stage with none.
+    fn bytes(&self) -> Result<&[u8]> {
+        let input = self.input.as_ref().ok_or_else(|| {
+            crate::Error::Invalid(format!(
+                "{:?} reads the product it was built from and this action carries no bytes",
+                self.stage
+            ))
+        })?;
+        // SAFETY: the bytes were copied into this buffer after their producer's write was waited
+        // out, and the action owns the buffer: nothing else writes it while `run` reads it.
+        Ok(unsafe { input.as_slice() })
+    }
 }
 
 impl HostAction for MediaWork {
@@ -105,15 +123,13 @@ impl HostAction for MediaWork {
     type Output = Option<Vec<u8>>;
 
     fn run(&self) -> Result<Self::Output> {
-        // SAFETY: the bytes were copied into this buffer after their producer's write was waited
-        // out, and the action owns the buffer: nothing else writes it while `run` reads it.
-        let bytes = unsafe { self.input.as_slice() };
         match self.stage {
             Stage::Unit {
                 frames,
                 height,
                 width,
             } => {
+                let bytes = self.bytes()?;
                 self.output.encode_clip(
                     self.request,
                     &self.units,
@@ -123,6 +139,7 @@ impl HostAction for MediaWork {
                 Ok(None)
             }
             Stage::Track { samples } => {
+                let bytes = self.bytes()?;
                 self.output.encode_track(self.request, bytes, samples)?;
                 Ok(None)
             }
