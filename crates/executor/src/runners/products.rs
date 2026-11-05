@@ -39,6 +39,9 @@
 //! refusal at the caller — *the step reads `text` and nothing produced it* — never an empty region,
 //! because an empty region is a step that runs on zeros.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use ipc::RequestKey;
 use ops::TensorView;
 use platform::DeviceId;
@@ -139,4 +142,308 @@ pub fn absent(request: RequestKey, kind: Product) -> crate::Error {
         request.request_id.0,
         kind.name()
     ))
+}
+
+/// The products of the requests in flight, as the executor holds them.
+///
+/// A store of **views**, not of memory: [`Products::publish`] is handed the region a call wrote, so
+/// this type allocates nothing and owns nothing. What it owns is the record of *where* each product
+/// is - its device and the stream that wrote it - which is the half a reader must consult before it
+/// reads: a view is only readable by work issued after the write that filled it.
+///
+/// # The two crossings it refuses, and why refusing is the safe answer
+///
+/// A product written on one stream and read on another needs an ordering the store cannot establish
+/// by itself - an event recorded at the write and awaited at the read - and a product written on one
+/// device and read on another needs that ordering **and** a copy. Both belong to the executor, which
+/// owns the event pool and the pools a copy allocates from, so this store refuses by name and says
+/// which of the two crossings it met. The refusal is what keeps a reader from aliasing a region
+/// whose write it did not wait for: a read that silently proceeded would be correct in the common
+/// case and wrong under load, which is the worst pair of outcomes to debug.
+///
+/// # Lifetime
+///
+/// A request's products live until the executor says the request is done
+/// ([`Held::forget`]). Without that call the map grows with the epoch, so a runner that finishes a
+/// request ends it here; the entries are views, so what leaks is bookkeeping and not memory.
+pub struct Held {
+    entries: Mutex<HashMap<(RequestKey, Product), Placed>>,
+}
+
+/// One product's region and the write that filled it.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    view: TensorView,
+    device: DeviceId,
+    stream: StreamId,
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Held {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// How many products the store holds, for a reader checking that a request ended cleanly.
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("the product store").len()
+    }
+
+    /// Whether the store holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drops every product of `request`, answering how many there were.
+    ///
+    /// The executor calls this when a request's last call has been served: a product outliving its
+    /// request is a region a later request of the same identity could read, and a request identity
+    /// is reused across epochs.
+    pub fn forget(&self, request: RequestKey) -> usize {
+        let mut entries = self.entries.lock().expect("the product store");
+        let before = entries.len();
+        entries.retain(|(key, _), _| *key != request);
+        before - entries.len()
+    }
+}
+
+impl Products for Held {
+    fn publish(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        device: DeviceId,
+        stream: StreamId,
+        view: &TensorView,
+    ) -> Result<()> {
+        // A trajectory is published again at every step and the last write is the one a reader
+        // wants, so publishing replaces rather than refusing a second write.
+        self.entries.lock().expect("the product store").insert(
+            (request, kind),
+            Placed {
+                view: *view,
+                device,
+                stream,
+            },
+        );
+        Ok(())
+    }
+
+    fn borrow(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        device: DeviceId,
+        stream: StreamId,
+    ) -> Result<Option<TensorView>> {
+        let placed = self
+            .entries
+            .lock()
+            .expect("the product store")
+            .get(&(request, kind))
+            .copied();
+        let Some(placed) = placed else {
+            return Ok(None);
+        };
+        if placed.device != device {
+            return Err(crate::Error::Invalid(format!(
+                "request {} reads its {} region on device {} and it was written on device {}: a \
+                 product that moves between devices needs a copy ordered after its producer, which \
+                 the executor issues and this store does not",
+                request.request_id.0,
+                kind.name(),
+                device.0,
+                placed.device.0
+            )));
+        }
+        if placed.stream != stream {
+            return Err(crate::Error::Invalid(format!(
+                "request {} reads its {} region on stream {} and it was written on stream {}: the \
+                 reader must wait for the writer's event, or read on the writer's stream",
+                request.request_id.0,
+                kind.name(),
+                stream.0,
+                placed.stream.0
+            )));
+        }
+        Ok(Some(placed.view))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ops::{DType, DevicePtr, Shape};
+    use platform::DeviceId;
+
+    fn request(id: u64) -> RequestKey {
+        RequestKey::new(1, ipc::RequestId(id), 0)
+    }
+
+    /// A view whose element count names it: `TensorView` exposes no address, so the count is what a
+    /// test compares - the store's contract is that the same view comes back, not that a number does.
+    fn view(address: u64, elements: u64) -> TensorView {
+        TensorView::new(
+            DevicePtr::new(address),
+            DType::BF16,
+            Shape::new(&[elements]),
+        )
+    }
+
+    /// The shape a request's own runner has: it writes the trajectory and reads it back on one
+    /// stream, and that must be the plain answer rather than a refusal.
+    #[test]
+    fn a_product_written_and_read_on_one_stream_is_returned() {
+        let store = Held::new();
+        store
+            .publish(
+                request(1),
+                Product::Latents,
+                DeviceId(0),
+                StreamId(1),
+                &view(4096, 2),
+            )
+            .expect("a store accepts a view");
+
+        let read = store
+            .borrow(request(1), Product::Latents, DeviceId(0), StreamId(1))
+            .expect("one stream needs no ordering")
+            .expect("the product was published");
+        assert_eq!(read.numel(), 2, "the same region comes back");
+    }
+
+    /// A reader on another device is refused, and the refusal names both devices: a silent answer
+    /// would alias a region whose copy was never ordered.
+    #[test]
+    fn a_product_read_on_another_device_is_refused_naming_both() {
+        let store = Held::new();
+        store
+            .publish(
+                request(1),
+                Product::Text,
+                DeviceId(0),
+                StreamId(1),
+                &view(8192, 3),
+            )
+            .expect("a store accepts a view");
+
+        let refusal = store
+            .borrow(request(1), Product::Text, DeviceId(2), StreamId(1))
+            .expect_err("another device needs a copy")
+            .to_string();
+        assert!(refusal.contains("device 2"), "names the reader: {refusal}");
+        assert!(refusal.contains("device 0"), "names the writer: {refusal}");
+    }
+
+    /// A reader on another stream of the **same** device is refused too, and names both streams: the
+    /// device is the same fact and the ordering is not.
+    #[test]
+    fn a_product_read_on_another_stream_is_refused_naming_both() {
+        let store = Held::new();
+        store
+            .publish(
+                request(1),
+                Product::Images,
+                DeviceId(0),
+                StreamId(1),
+                &view(16384, 4),
+            )
+            .expect("a store accepts a view");
+
+        let refusal = store
+            .borrow(request(1), Product::Images, DeviceId(0), StreamId(4))
+            .expect_err("another stream needs the writer's event")
+            .to_string();
+        assert!(refusal.contains("stream 4"), "names the reader: {refusal}");
+        assert!(refusal.contains("stream 1"), "names the writer: {refusal}");
+    }
+
+    /// A kind no call produced is `None`, which the runner turns into its own refusal by name: the
+    /// store does not invent a region and does not decide what the absence means.
+    #[test]
+    fn an_unwritten_product_answers_none() {
+        let store = Held::new();
+        assert!(
+            store
+                .borrow(request(1), Product::Audio, DeviceId(0), StreamId(1))
+                .expect("an absent product is not an error")
+                .is_none(),
+            "nothing wrote this kind"
+        );
+    }
+
+    /// A trajectory is published at every step, so the second write replaces the first: a reader
+    /// that got the first region would advance a step the solver already left.
+    #[test]
+    fn publishing_again_replaces_the_previous_region() {
+        let store = Held::new();
+        store
+            .publish(
+                request(1),
+                Product::Latents,
+                DeviceId(0),
+                StreamId(1),
+                &view(4096, 2),
+            )
+            .expect("first step");
+        store
+            .publish(
+                request(1),
+                Product::Latents,
+                DeviceId(0),
+                StreamId(1),
+                &view(4096, 2),
+            )
+            .expect("second step");
+
+        assert_eq!(store.len(), 1, "one product, published twice");
+        assert_eq!(
+            store
+                .borrow(request(1), Product::Latents, DeviceId(0), StreamId(1))
+                .expect("readable")
+                .expect("present")
+                .numel(),
+            2
+        );
+    }
+
+    /// A request's products end with the request and take nothing else with them: a later request of
+    /// the same identity must not read the earlier one's region.
+    #[test]
+    fn forget_drops_one_requests_products_and_no_other() {
+        let store = Held::new();
+        for kind in [Product::Text, Product::Latents] {
+            store
+                .publish(request(1), kind, DeviceId(0), StreamId(1), &view(4096, 2))
+                .expect("published");
+        }
+        store
+            .publish(
+                request(2),
+                Product::Text,
+                DeviceId(0),
+                StreamId(1),
+                &view(8192, 3),
+            )
+            .expect("published");
+
+        assert_eq!(store.forget(request(1)), 2, "both of the first request's");
+        assert_eq!(store.len(), 1, "the other request keeps its own");
+        assert!(
+            store
+                .borrow(request(1), Product::Text, DeviceId(0), StreamId(1))
+                .expect("absent, not an error")
+                .is_none(),
+            "the forgotten request keeps nothing"
+        );
+    }
 }
