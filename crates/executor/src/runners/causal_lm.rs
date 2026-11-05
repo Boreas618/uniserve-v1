@@ -954,19 +954,6 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
-/// A 64-bit digest of `bytes`, so two ends of a comparison can state one number per page.
-///
-/// FNV-1a: it costs nothing, needs no table and is stable across processes, which is what makes it
-/// quotable between the slice's run and the runner's.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// Whether a block table view holds `bytes` readable bytes of page indices.
 ///
 /// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
@@ -2604,7 +2591,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // layer above it then computes from zeros without any error anywhere.
         let out_pointer = word(LAYOUT.out);
         let out_digest = match self.read_device(out_pointer, 64) {
-            Some(raw) => format!("{:016x}", fnv(&raw)),
+            Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
             None => "unreadable".to_owned(),
         };
         out.push_str(&format!(" out={out_pointer:#x}/{out_digest}"));
@@ -2657,7 +2644,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .nodes()
             .iter()
             .filter(|(operator, _, _)| *operator == "paged_attention")
-            .take(4)
             .enumerate()
         {
             let Some(node) = launch.first() else {
@@ -2681,19 +2667,30 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 u64::from_ne_bytes(eight)
             };
             let page_size = at(LAYOUT.page_size).max(1);
-            let page_bytes = at(LAYOUT.kv_stride_page).max(1);
+            // Elements between two pages and between two tokens of one page, and the element's
+            // width: the digest covers one page's own bytes, so both halves of a comparison state
+            // the same quantity.
+            let page_elements = at(LAYOUT.kv_stride_page).max(1);
+            let token_elements = at(LAYOUT.kv_stride_tokens).max(1);
+            let element_bytes = ops::DType::from_i64(at(LAYOUT.dtype_key_value) as i64)
+                .and_then(ops::DType::bytes)
+                .unwrap_or(1)
+                .max(1);
+            let live = self.staging.live_tokens().max(1);
+            let held = page_size.min(live);
             let mut digests = String::new();
             for (plane, offset) in [("k", LAYOUT.key), ("v", LAYOUT.value)] {
                 let base = at(offset);
                 let pages_in_pool = at(LAYOUT.num_pages);
-                let bytes = (page_size * page_bytes) as usize;
+                let bytes = (held * token_elements * element_bytes) as usize;
                 if base == 0 || pages as u64 >= pages_in_pool || bytes > (1 << 20) {
                     digests.push_str(&format!(" {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"));
                     continue;
                 }
-                let digest = match self.read_device(base + pages as u64 * page_bytes as u64, bytes)
+                let start = base + pages as u64 * page_elements * element_bytes;
+                let digest = match self.read_device(start, bytes)
                 {
-                    Some(raw) => format!("{:016x}", fnv(&raw)),
+                    Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
                     None => "unreadable".to_owned(),
                 };
                 digests.push_str(&format!(" {plane}={base:#x}/{digest}"));
