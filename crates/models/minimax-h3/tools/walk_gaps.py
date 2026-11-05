@@ -135,6 +135,30 @@ def clips(path):
     return []
 
 
+LADDER = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
+
+
+def ladder(path):
+    """The clip lengths a file states it serves, from its own `axes:` line.
+
+    A row set is stated for a set of clips. A walk at a clip outside that set produces
+    audio rows for a length no row set covers - so the difference between the sides is a
+    difference of deployment, and the comparison cannot separate it from a gap.
+    """
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            found = LADDER.search(line)
+            if found:
+                return [
+                    int(value)
+                    for value in found["list"].split(",")
+                    if value.strip()
+                ]
+    return []
+
+
 def statements(path):
     """What a file says about the raster it describes: `(rasters, text)`.
 
@@ -410,6 +434,25 @@ def by_shape(args):
             f"{', '.join(empty)}: a walk with no rows proves nothing - every"
             " comparison here passes when one side is empty, so the run that"
             " produced this file failed before it printed a row"
+        )
+    # A walk at a clip the file does not serve is a different deployment, not a set of
+    # gaps: its audio rows are for a length no row set covers, and their widths would
+    # read as missing rows. Refused rather than classified.
+    served = ladder(args.fixture)
+    outside = sorted(
+        {
+            clip
+            for path in args.walk
+            for clip in clips(path)
+            if served and clip not in served
+        }
+    )
+    if outside:
+        raise SystemExit(
+            f"the walks state clip(s) {outside} and the file states {served}: a walk "
+            "at a clip the file does not serve produces audio rows for a length no row "
+            "set covers, so this comparison cannot separate a gap from a different "
+            "deployment of the same model"
         )
     fixture = read_lines(args.fixture)
     held = {shape_of(operator, key) for operator, key in fixture}
