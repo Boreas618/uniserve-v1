@@ -58,6 +58,14 @@ track=44100
 # by name.
 sparse=64,0.9,8192
 
+# The deployment's packed bound, restated here only because the walk still takes `--rows` as a flag.
+# **This is the value `rows_bound()` computes**: a bound the model can exceed belongs in the
+# descriptor with the launch refusing outside it, not in a walk argument that works because nothing
+# tested past it. Delete these two lines the moment the walk reads `rows_bound()`; until then a walk
+# cut below them stamps rows for a packed count the deployment cannot be asked to be.
+rows_dense=306896
+rows_sparse=353152
+
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 
@@ -107,19 +115,20 @@ EOF
 fi
 rm -f "$probe"
 
-# 1. The walks. No `--rows` and no `--dtype`: the deployment's own bound and each component's own
-#    type, both read from the checkpoint (or from `--types` where this host has no shards).
+# 1. The walks. No `--dtype`: each component's own type, read from the checkpoint (or from `--types`
+#    where this host has no shards). `--rows` is passed only because the walk still takes it as a flag;
+#    the two values are what `rows_bound()` computes.
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
-    --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
+    --samples "$samples" --rasters "$rasters" --tokens "$tokens" --rows "$rows_dense" \
     --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
     --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
-    --types "$types" --sparse "$sparse" >"$walk_sparse"
+    --types "$types" --rows "$rows_sparse" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
