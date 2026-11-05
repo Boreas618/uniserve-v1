@@ -1851,9 +1851,39 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// executable are the same for every runner, so those live in [`Lifecycle`].
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
+        self.warm(bucket, &kernels)?;
         let stream = self.stream.clone();
         let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
+    }
+
+    /// Walks a bucket's pose once *before* it is captured, so every operator's first-use host work
+    /// is done outside the recording.
+    ///
+    /// A capture records launches, not the host work behind them. An operator that builds a runner,
+    /// loads a cubin or compiles a module on its first call does that work inside the recording, and
+    /// the graph then replays a launch whose preparation never happened again - which is how a
+    /// captured attention writes nothing while the same call outside a graph works. One eager walk
+    /// of the same pose makes every operator ready, so the capture records launches of things that
+    /// exist. The operator's entry can refuse a capture that meets an unprepared runner; this is what
+    /// keeps that refusal from firing on a healthy warmup.
+    ///
+    /// It runs only where a bucket is first captured - a warmup, before the bucket serves - and not
+    /// where a bucket is rebound: a hot update's new operators are warmed by the shadow pass, and an
+    /// eager walk of a new generation over a serving bucket's own arena is work the switchover
+    /// design does not allow.
+    fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
+        let began = std::time::Instant::now();
+        self.walk(bucket, kernels)?;
+        // The warm launches are real device work on the pool's stream; a capture begun over them is
+        // legal and does not contain them, but nothing may plan a mapping while they are in flight.
+        self.stream.synchronize()?;
+        tracing::debug!(
+            bucket = %bucket,
+            warm_ms = began.elapsed().as_secs_f64() * 1e3,
+            "a bucket's operators were warmed before its capture"
+        );
+        Ok(())
     }
 
     /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
