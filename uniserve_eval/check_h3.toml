@@ -21,7 +21,7 @@
 # task already makes (MP4 validity: canvas, frame count, frame rate, stereo
 # soundtrack) and the protected performance metrics; nothing else is added.
 #
-# The launch's default dtype is bfloat16 and an empty quantization_config loads
+# The launch's default dtype is bfloat16 and an empty quantization loads
 # the model's first precision preset, quality (DiT and text encoder BF16, video
 # VAE decoder FP16), so no server states either: every cell measures the
 # representation the shipped performance profiles serve, and a cell states only
