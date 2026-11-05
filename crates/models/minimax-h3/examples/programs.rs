@@ -173,6 +173,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     elements.sort_unstable();
     elements.dedup();
+    // The checkpoint states how it must run: its `fastvideo_inference.json` names the attention
+    // backend and, when it is sparse, the tile and the keep rate. That statement is the deployment's,
+    // not this tool's, so it is read here as the model reads it — a caller's flag may not override it.
+    let stated = minimax_h3::Contract::read(&root)?.and_then(|contract| contract.attention);
+    let stated_attention = stated;
+    if stated.is_some() && sparse.is_some() {
+        return Err("this checkpoint states its own contract: --sparse states a deployment it already \
+                    states"
+            .into());
+    }
     let conditioned = conditioned.ok_or("--conditioned is the deployment's and has no default")?;
     let degree = tensor_parallel.ok_or("--tp is the deployment's and has no default")?;
     let partition = Partition {
@@ -184,7 +194,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The sparse chain composes each layer's compression across the exchange's members, and that
     // exchange is not written: the model refuses it by name at load, and the walk refuses the same
     // deployment here rather than printing rows that read as served.
-    if let Some((tile, _, _, _)) = sparse
+    if let Some(tile) = sparse
+        .map(|(tile, _, _, _)| tile)
+        .or(stated_attention.map(|sparse| sparse.tile))
         && partition.ulysses_degree > 1
     {
         return Err(format!(
@@ -265,12 +277,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The group count is the task set's: a conditioned deployment's modulation cache is another
         // program at the entries' width. The denoiser states its two stacks and the orchestration
         // around them, so the walk asks it rather than a stack.
-        let (attention, tiles) = match sparse {
-            Some((tile, sparsity, tiles, reference_keep)) => (
+        let (attention, tiles) = match (sparse, stated_attention) {
+            (_, Some(sparse_contract)) => (
+                AttentionKind::sparse(
+                    sparse_contract.tile,
+                    sparse_contract.sparsity,
+                    sparse_contract.reference_keep,
+                )?,
+                // The bound on the key tiles one compression reduces over: the deployments' packed
+                // rows over the tile's rows, rounded up to the next power of two because the bound is
+                // a compiled class rather than a request count.
+                (packed.iter().copied().max().unwrap_or(0).div_ceil(sparse_contract.tile))
+                    .next_power_of_two(),
+            ),
+            (Some((tile, sparsity, tiles, reference_keep)), None) => (
                 AttentionKind::sparse(tile, sparsity, reference_keep)?,
                 tiles,
             ),
-            None => (AttentionKind::Dense, 0),
+            (None, None) => (AttentionKind::Dense, 0),
         };
         rows.extend(Denoiser::programs(
             &config,

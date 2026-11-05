@@ -57,7 +57,9 @@ pub mod transformer;
 pub mod video_vae;
 pub mod vision;
 
-pub use checkpoint::{Contract, ContractSchedule, Dit, Layout, Sidecars, SparseContract};
+pub use checkpoint::{
+    AttentionBackend, Contract, ContractSchedule, Dit, Layout, Sidecars, SparseContract,
+};
 pub use config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, AttentionKind,
     AudioVaeConfig, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CLIP_FRAMES, CLIP_LATENTS, Canvas, Config,
