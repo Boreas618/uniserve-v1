@@ -830,6 +830,14 @@ def run_trajectory(
         "video_rows": int(packed.video_rows),
         "audio_rows": int(packed.audio_rows),
         "packed_rows": int(packed.padded_tokens),
+        # The grid, as well as the layout: two checkpoints' trajectories agree on every row count
+        # above whenever they ran the same layout, so a pair from a FastH3 student and from the base
+        # model would compare a block grid against a uniform one and print a table of arithmetic
+        # about nothing. The word is the checkpoint's own, which this function has already refused a
+        # case against, and the two step counts are the ones the print line below states.
+        "schedule": kind,
+        "evaluations": int(evaluations),
+        "num_steps": int(steps),
     }
     print(
         f"layout  {rows_stated['packed_rows']} packed rows ="

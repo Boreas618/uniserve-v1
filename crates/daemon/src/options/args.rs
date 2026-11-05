@@ -680,6 +680,101 @@ mod tests {
         }
     }
 
+    /// A token bound stated above the deployment's own graph catalog is refused
+    /// by the option's name, before any weight loads: the engine admits no batch
+    /// larger than its largest captured bucket, so the scheduling policy's
+    /// declared limits would be refused at the first prepare instead
+    /// (`crates/scheduling/src/limits.rs`). A bound at the ceiling is admitted,
+    /// and a stated value is never clamped to fit.
+    #[test]
+    fn a_token_bound_above_the_captured_graphs_is_refused_by_name() {
+        let catalog = "cuda_graph_config.prefill_token_sizes=[512]";
+
+        let (config, stated) =
+            resolved(&["m", "--set", catalog, "--set", "max_num_batched_tokens=512"]).unwrap();
+        config
+            .validate(&stated)
+            .expect("a bound at the catalog's ceiling is admitted");
+
+        // An unstated budget is the catalog's own largest shape, so the
+        // deployment needs to state nothing to be consistent.
+        let (config, stated) = resolved(&["m", "--set", catalog]).unwrap();
+        config
+            .validate(&stated)
+            .expect("an unstated budget follows the catalog");
+        assert_eq!(config.cuda_graph_config.tiers().tokens, Some(512));
+
+        let (config, stated) = resolved(&[
+            "m",
+            "--set",
+            catalog,
+            "--set",
+            "max_num_batched_tokens=1024",
+        ])
+        .unwrap();
+        let error = config
+            .validate(&stated)
+            .expect_err("a budget above the catalog is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("`max_num_batched_tokens` is 1024"),
+            "{message}"
+        );
+        assert!(
+            message.contains("512 tokens the deployment's captured graphs"),
+            "{message}"
+        );
+
+        // The batch of requests is the same rule against the largest decode
+        // graph: a deployment that leaves it unstated follows the catalog, and
+        // one that states more than it captured is refused by name.
+        let decodes = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]";
+        let (config, stated) = resolved(&["m", "--set", decodes]).unwrap();
+        config
+            .validate(&stated)
+            .expect("an unstated batch follows the catalog");
+        assert_eq!(config.cuda_graph_config.tiers().rows, Some(8));
+
+        let (config, stated) = resolved(&[
+            "m",
+            "--set",
+            decodes,
+            "--set",
+            "scheduler_config.max_batch=16",
+        ])
+        .unwrap();
+        let error = config
+            .validate(&stated)
+            .expect_err("a batch above the captured decode graphs is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("`scheduler_config.max_batch` is 16"),
+            "{message}"
+        );
+        assert!(
+            message.contains("8 requests the deployment's captured decode graphs"),
+            "{message}"
+        );
+
+        // The prefill chunk is the same bound and is refused the same way.
+        let (config, stated) = resolved(&[
+            "m",
+            "--set",
+            catalog,
+            "--set",
+            "scheduler_config.chunked_prefill_size=1024",
+        ])
+        .unwrap();
+        let error = config
+            .validate(&stated)
+            .expect_err("a chunk above the catalog is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("`scheduler_config.chunked_prefill_size` is 1024"),
+            "{message}"
+        );
+    }
+
     /// Resolves `args`, checks them, and derives the engine configuration
     /// the engine reads from the spec they state.
     fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, engine::EngineConfig)> {

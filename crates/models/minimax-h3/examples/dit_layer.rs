@@ -866,6 +866,13 @@ fn stage_denoise(args: &Args) -> Result<()> {
         args.seed,
         format_sample(&video_latents),
     );
+    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
+    // comma would otherwise cost a device run to discover, and the refusal names the file.
+    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
+        Failure::message(format!(
+            "the case this stage states is not JSON ({error}): {case}"
+        ))
+    })?;
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     // The arrangement, stated beside the case in the object the reference's producer writes too
@@ -874,9 +881,15 @@ fn stage_denoise(args: &Args) -> Result<()> {
     // files of the same shape and different trajectories, which a comparator can only report as an
     // arithmetic difference. This statement is what lets it refuse the pair instead
     // (`compare_trajectory.py`), and the line below prints the same numbers for a reader.
+    // The grid and the step count are the third thing a pair can differ in: two sides can agree on
+    // every layout field and still have run different schedules - a FastH3 student's `blocks` grid
+    // against the base `uniform` one, or a shortened run against a whole one - and their
+    // trajectories then differ everywhere for a reason that is not arithmetic. Stated here, in the
+    // model's own word for the grid, so the comparator refuses that pair instead of tabulating it.
     let arrangement = format!(
         "{{\"frames\": {frames}, \"canvas\": [{}, {}], \"text_rows\": {}, \
-         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}}}\n",
+         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}, \
+         \"schedule\": {grid:?}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}}}\n",
         canvas.height,
         canvas.width,
         packing.text_rows,
@@ -885,6 +898,14 @@ fn stage_denoise(args: &Args) -> Result<()> {
         packing.audio_rows,
         packing.padded_tokens,
     );
+    // The arrangement is JSON a comparator parses, so it is parsed here first for the same reason the
+    // case is: a format-string typo would otherwise surface on the run host as a comparator refusing
+    // a file nobody can see, and the refusal names the statement instead.
+    serde_json::from_str::<serde_json::Value>(&arrangement).map_err(|error| {
+        Failure::message(format!(
+            "the layout statement this stage writes is not JSON ({error}): {arrangement}"
+        ))
+    })?;
     std::fs::write(directory.join("layout.json"), arrangement)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     // The wording is the reference producer's own, so the two logs can be read side by side
@@ -1339,18 +1360,35 @@ fn stage_block(args: &Args) -> Result<()> {
         element_code(dtype)?,
         &output_bytes,
     )?;
+    // The row order the comparison indexes into, stated beside the tensor it wrote: the four
+    // segments in their packed order and the count they sum to. Without it a table of row blocks
+    // would have to re-derive the packing in another language, which is a second statement of the
+    // rounding - and a file whose order is not stated cannot be shown to be in the order the
+    // reference ran (`compare_stack.py`).
+    let width = args.width;
+    let height = args.height;
+    let text_tokens = request.text_tokens;
+    let layers = args.layers;
+    let video_rows = packing.video_rows;
+    let audio_rows = packing.audio_rows;
+    let text_rows = packing.text_rows;
+    let condition_rows = packing.condition_rows;
+    let checkpoint = args.root.display().to_string();
     let case = format!(
-        "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
-         \"layers\": {}, \"padded_tokens\": {}, \"hidden\": {}, \"step\": {}, \"dtype\": \"{dtype}\"}}\n",
-        args.width,
-        args.height,
-        frames,
-        request.text_tokens,
-        args.layers,
-        tokens,
-        hidden,
-        evaluation
+        "{{\"task\": \"t2va\", \"width\": {width}, \"height\": {height}, \"frames\": {frames}, \
+         \"text_tokens\": {text_tokens}, \"layers\": {layers}, \"padded_tokens\": {tokens}, \
+         \"packed_rows\": {tokens}, \"hidden\": {hidden}, \"video_rows\": {video_rows}, \
+         \"audio_rows\": {audio_rows}, \"text_rows\": {text_rows}, \
+         \"condition_rows\": {condition_rows}, \"step\": {evaluation}, \"dtype\": \"{dtype}\", \
+         \"checkpoint\": {checkpoint:?}}}\n"
     );
+    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
+    // comma would otherwise cost a device run to discover, and the refusal names the file.
+    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
+        Failure::message(format!(
+            "the case this stage states is not JSON ({error}): {case}"
+        ))
+    })?;
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let walk_path = args.out.join("walk.txt");

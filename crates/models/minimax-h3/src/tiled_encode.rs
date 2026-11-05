@@ -190,6 +190,58 @@ impl ClipEncoder {
         extents
     }
 
+    /// The programs one tiled encoding of `rasters` launches.
+    ///
+    /// The walk states the whole-frame encoder through [`VideoEncoder::programs`]; a condition's
+    /// pixels go through this path instead, because a raster larger than one tile becomes its latent
+    /// by tiles that cross-fade where they meet. Two families are this path's own and no other
+    /// enumeration reaches them: **the seam blends**, one program per `(extent, axis)` the grid
+    /// states, and **the encoder's rows at each tile's extent** rather than at the raster's, which
+    /// is where its residual adds and pads run at tile widths.
+    ///
+    /// `frames` is the piece's own (one for a still); the encoder's rows are stated for both a still
+    /// and a generated clip by [`VideoEncoder::programs`], so only the tiles' extents are taken here.
+    pub fn programs(
+        config: &crate::VideoVaeConfig,
+        rasters: &[(u32, u32)],
+        frames: u32,
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::cross_fade::CrossFade as CrossFadeOp;
+        let mut programs = Programs::default();
+        let mut extents: Vec<(u32, u32)> = Vec::new();
+        for (height, width) in rasters {
+            let encoder = Self::new(*height, *width)?;
+            // The pass-through blend `encode` places a run's first tile through: one position on the
+            // rows axis, given the same block twice, so it is exact. It is a launch of its own and no
+            // seam width states it.
+            let place = CrossFade::new(DType::F32, 1, 2).map_err(Error::from)?;
+            programs.launch::<CrossFadeOp>(&place.descriptor());
+            for (extent, axis) in encoder.blend_extents() {
+                let blend = CrossFade::new(DType::F32, extent, axis).map_err(Error::from)?;
+                programs.launch::<CrossFadeOp>(&blend.descriptor());
+            }
+            // A grid's tiles are uniform and a raster inside one tile is one tile of its own size, so
+            // the extents below are that raster's single tile class.
+            for extent in encoder.plan().tile_extents(frames) {
+                let tile = (extent.height, extent.width);
+                if !extents.contains(&tile) {
+                    extents.push(tile);
+                }
+            }
+        }
+        // The tiles' own extents, each stated as a raster of that size: the encoder's frame
+        // operators key on the extent they reduce over, and a tile is a smaller raster, not a
+        // different operator.
+        for (height, width) in extents {
+            programs.extend(crate::encoding::VideoEncoder::programs(
+                config,
+                &[(height, width)],
+            )?);
+        }
+        Ok(programs.finish())
+    }
+
     /// Encode one run of the raster: every tile of `plan`, stitched into `scene.blended`.
     ///
     /// The tiles are written in [`Plan::tiles`] order, because a seam blend reads the block above it

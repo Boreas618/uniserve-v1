@@ -209,6 +209,43 @@ pub struct Nvfp4Linear {
     n: u32,
 }
 
+/// The row classes the packed product is compiled for.
+///
+/// The product's `m` is a compile-time constant of its module (`nvfp4_gemm/cute_dsl` bakes
+/// `UNISERVE_NVFP4_M` into the program and its entry refuses any other row count), and its
+/// smallest tile is 128 rows, so a decode request of one or fifteen rows cannot be a module of
+/// its own. The row count a launch states is therefore **the smallest class that holds the
+/// request's rows**, and the caller pads its buffers to that class — the same division the sparse
+/// attention states for a partial tile: the padding belongs to the caller, the tile to the module.
+///
+/// The four classes are the set `nvfp4_gemm/cute_dsl/package.toml` declares. A class here without
+/// a cell there is a launch with no program, and a cell there without a class here is a program no
+/// launch states.
+pub const PACKED_M_CLASSES: [u32; 4] = [128, 256, 1024, 4096];
+
+/// The packed product's row class for `rows` activation rows: the smallest declared class that
+/// holds them.
+///
+/// A row count above the largest class has no module to serve it, so it is refused by name with
+/// both numbers rather than clamped: a launch clamped to 4 096 rows for a 5 000-row request is the
+/// same silent wrong-numbers defect one size up.
+pub fn packed_rows(rows: u32) -> Result<u32> {
+    PACKED_M_CLASSES
+        .iter()
+        .copied()
+        .find(|class| *class >= rows)
+        .ok_or_else(|| {
+            Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "{rows} activation rows: the largest packed tile class is {}, which no \
+                     program covers",
+                    PACKED_M_CLASSES[PACKED_M_CLASSES.len() - 1]
+                ),
+            )
+        })
+}
+
 impl Nvfp4Linear {
     /// A projection whose weight `weight` is the checkpoint's, in `layout` for its activations.
     ///
@@ -396,41 +433,38 @@ impl Nvfp4Linear {
         }
     }
 
-    /// The descriptor of the packed product, for `m` activation rows and an output of `output`.
+    /// The packed product's descriptor, from the geometry alone, for `rows` activation rows.
     ///
-    /// `m` is a key field here and not in [`Linear::descriptor`]: the product's grid is computed
-    /// from the row count and the module is compiled per row count, which is why the deployment
-    /// enumerates the bucket sizes the executor builds rather than an unbounded row count.
-    /// The packed product's descriptor, from the geometry alone.
-    ///
-    /// `m` is a key field here and not in [`Linear::descriptor_of`]: this product's grid is the row
-    /// count and the module is compiled per row count, which is why a deployment enumerates the
-    /// buckets its executor captures rather than an unbounded row count.
+    /// `rows` is the request's row count and **not** the descriptor's `m`: the key states the row
+    /// class that holds `rows` ([`packed_rows`]), because the module is compiled per class and its
+    /// entry refuses any other row count. The product's grid is the row count, which is why a
+    /// deployment enumerates the classes its executor builds rather than an unbounded row count.
     #[allow(clippy::too_many_arguments)]
     pub fn descriptor_of(
-        m: u32,
+        rows: u32,
         n: u32,
         k: u32,
         layout: ScaleLayout,
         bias: bool,
         output: DType,
-    ) -> GemmDescriptor {
-        GemmDescriptor {
+    ) -> Result<GemmDescriptor> {
+        Ok(GemmDescriptor {
             packed: DType::U8,
             scale: DType::F8E4M3,
             accumulate: ACCUMULATE,
             output,
             layout,
             epilogue: if bias { Epilogue::Bias } else { Epilogue::None },
-            m,
+            m: packed_rows(rows)?,
             n,
             k,
             pdl: false,
-        }
+        })
     }
 
-    pub fn descriptor(&self, m: u32, output: DType) -> GemmDescriptor {
-        GemmDescriptor {
+    /// This projection's descriptor for `rows` activation rows, keyed by their class.
+    pub fn descriptor(&self, rows: u32, output: DType) -> Result<GemmDescriptor> {
+        Ok(GemmDescriptor {
             packed: DType::U8,
             scale: self.scales.dtype(),
             accumulate: ACCUMULATE,
@@ -441,31 +475,49 @@ impl Nvfp4Linear {
             } else {
                 Epilogue::None
             },
-            m,
+            m: packed_rows(rows)?,
             n: self.n,
             k: self.k,
             pdl: false,
-        }
+        })
     }
 
-    /// The arena one launch of this projection carves for `rows` activation rows.
+    /// The arena one launch of this projection carves for a request of `rows` activation rows.
     ///
-    /// Three regions, each aligned up like the arena's own grants: the packed activation
-    /// (`[rows, k/2]` bytes), the block scales in this layout's shape, and one FP32 row factor per
-    /// activation row. A plan that does not reserve them is an arena the launch writes past, so the
-    /// model's plan asks this rather than estimating.
+    /// Three regions, each aligned up like the arena's own grants: the packed activation, the block
+    /// scales in this layout's shape, and one FP32 row factor per activation row.
+    ///
+    /// **The regions are the class's, not the request's** ([`packed_rows`]): the launch states the
+    /// class, so a region reserved for fifteen rows is a region a 128-row launch writes past — and
+    /// every other check would still agree, because the store has the cell, the descriptor matches
+    /// it and the launch runs. Only the arena would know, and it does not speak. A row count above
+    /// the largest class reserves its own rows; the launch refuses that launch by name.
     pub fn scratch_bytes(&self, rows: u64) -> u64 {
+        let class = PACKED_M_CLASSES
+            .iter()
+            .copied()
+            .map(u64::from)
+            .find(|class| *class >= rows)
+            .unwrap_or(rows);
         let align =
             |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
-        let values = align(rows * u64::from(self.k) / 2);
+        let values = align(class * u64::from(self.k) / 2);
         let scales = {
-            let shape = self.layout.shape(rows, u64::from(self.k));
+            let shape = self.layout.shape(class, u64::from(self.k));
             align(shape.numel())
         };
-        let token_scale = align(rows * 4);
+        let token_scale = align(class * 4);
         values + scales + token_scale
     }
 
+    /// `out = projection(input)`, with the product launched at the row *class* of `input`'s rows.
+    ///
+    /// The activation is encoded over the rows the request has, and the product runs at the class
+    /// that holds them ([`packed_rows`]) — so `out` must be class-height, and its rows past the
+    /// request's are computed and discarded. That padding is the caller's, as it is for the sparse
+    /// attention's partial tile; this layer refuses a short `out` by name rather than writing past
+    /// it. The cost is real and belongs here: on a decode step the product reads the expert weights
+    /// once and is bound by that read, so 128 rows for 15 spends bandwidth to buy nothing.
     pub fn forward(
         &self,
         f: &Forward,
@@ -490,40 +542,60 @@ impl Nvfp4Linear {
                 "a projection of no rows has no program".to_owned(),
             ));
         }
-        if out.rows() != rows {
+        let counted = u32::try_from(rows)
+            .map_err(|_| Error::shape("Nvfp4Linear", format!("{rows} activation rows")))?;
+        let class = u64::from(packed_rows(counted)?);
+        if out.rows() != class {
             return Err(Error::shape(
                 "Nvfp4Linear",
-                format!("{rows} input rows against {} output rows", out.rows()),
+                format!(
+                    "{rows} activation rows launch the {class}-row class, so the output must be \
+                     {class} rows to receive it, not {} — pad the buffer to the class and read \
+                     the first {rows}",
+                    out.rows()
+                ),
             ));
         }
-        let m = u32::try_from(rows)
-            .map_err(|_| Error::shape("Nvfp4Linear", format!("{rows} activation rows")))?;
 
         // 1. Encode the activation into the layout the product reads, into this forward's scratch.
         //
         // The encode is two-level: the block's E4M3 scale is relative to the row's own factor
         // (`amax(row) · global_scale`), and the product dequantizes a code as
         // `code · block_scale · row factor`. So the factor is an operand of the encode and an
-        // output of it, one per row.
+        // output of it, one per row. The regions are class-height and the encode writes the
+        // request's rows into their prefix; the product's rows past the request's are computed
+        // from bytes nothing reads and discarded with the rows they land in.
         let arena = f.arena();
-        let values = arena.tensor(ops::DType::U8, ops::Shape::new(&[rows, k / 2]))?;
-        let scale_shape = self.layout.shape(rows, k);
+        let values_region = arena.tensor(ops::DType::U8, ops::Shape::new(&[class, k / 2]))?;
+        let scale_shape = self.layout.shape(class, k);
         let scales = arena.tensor(ops::DType::U8, scale_shape)?;
-        let token_scale = arena.tensor(ops::DType::F32, ops::Shape::new(&[rows]))?;
+        let token_scale_region = arena.tensor(ops::DType::F32, ops::Shape::new(&[class]))?;
+        let values = prefix_rows(values_region, rows, k / 2);
+        let token_scale = prefix_rows(token_scale_region, rows, 1);
+        let encoded_scale_shape = self.layout.shape(rows, k);
+        let encoded_scales = if encoded_scale_shape == scale_shape {
+            scales
+        } else {
+            prefix_rows(
+                scales,
+                encoded_scale_shape.rows(),
+                encoded_scale_shape.last(),
+            )
+        };
         let quantize = self.encode_descriptor();
         let encoded = QuantizeArgs {
             input,
             values,
-            scales,
+            scales: encoded_scales,
             global_scale: self.input_scale.view(),
             token_scale,
         };
         f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
 
-        // 2. Contract the encoded activation with the checkpoint's weight.
-        let descriptor = self.descriptor(m, out.dtype);
+        // 2. Contract the encoded activation with the checkpoint's weight, over the class's rows.
+        let descriptor = self.descriptor(counted, out.dtype)?;
         let args = GemmArgs {
-            input: values,
+            input: values_region,
             weight: self.packed.view(),
             input_scales: scales,
             weight_scales: self.scales.view(),
@@ -533,6 +605,20 @@ impl Nvfp4Linear {
         };
         f.operate::<Nvfp4Gemm>(&descriptor, args)
     }
+}
+
+/// The first `rows` rows of a row-major `buffer` whose rows are `width` elements wide.
+///
+/// The pointers are the same: a shorter view of a larger region is what lets one allocation serve
+/// both the request's rows and the class they are launched in.
+fn prefix_rows(buffer: TensorView, rows: u64, width: u64) -> TensorView {
+    let shape = ops::Shape::new(&[rows, width]);
+    TensorView::with_strides(
+        buffer.ptr,
+        buffer.dtype,
+        shape,
+        ops::Strides::row_major(shape),
+    )
 }
 
 #[cfg(test)]
@@ -608,11 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn a_packed_product_is_keyed_per_activation_row_count_and_a_dense_one_is_not() {
+    fn a_packed_product_is_keyed_per_row_class_and_a_dense_one_is_not() {
         // The two products differ in what their module depends on: the dense one's grid and tile
         // are its geometry's, so every row count reaches one compiled module, while the packed
-        // product's is compiled per activation row count and a deployment therefore enumerates the
-        // buckets it builds. This is what a key enumeration reads off the layers.
+        // product's `m` is a compile-time constant of its module — so a deployment enumerates the
+        // row *classes* it builds, and two requests inside one class are one program. This is what
+        // a key enumeration reads off the layers.
         let packed = Nvfp4Linear::new(
             &packed(8, 64, ScaleLayout::Swizzled128X4),
             None,
@@ -621,9 +708,15 @@ mod tests {
             128,
         )
         .unwrap();
+        // One and eight rows are the 128-row class: the same program, not two.
+        assert_eq!(
+            packed.descriptor(1, DType::BF16).unwrap().to_string(),
+            packed.descriptor(8, DType::BF16).unwrap().to_string()
+        );
+        // A class boundary is a different module, and that is the only thing `m` distinguishes.
         assert_ne!(
-            packed.descriptor(1, DType::BF16).to_string(),
-            packed.descriptor(8, DType::BF16).to_string()
+            packed.descriptor(128, DType::BF16).unwrap().to_string(),
+            packed.descriptor(129, DType::BF16).unwrap().to_string()
         );
         // The activation encoding is one module whatever the row count: its key names the column
         // count, the layout and the block, and the rows travel in the launch.
@@ -638,6 +731,52 @@ mod tests {
             dense.descriptor(DType::BF16, DType::BF16).to_string(),
             dense.descriptor(DType::BF16, DType::BF16).to_string()
         );
+    }
+
+    #[test]
+    fn the_class_is_the_smallest_declared_one_that_holds_the_rows() {
+        // The classes are the set the package declares, and a request lands in the smallest that
+        // holds it: a decode of 1 or 15 rows is the 128-row tile, 129 is the 256-row one.
+        for (rows, class) in [
+            (1, 128),
+            (15, 128),
+            (128, 128),
+            (129, 256),
+            (256, 256),
+            (257, 1024),
+            (1024, 1024),
+            (1025, 4096),
+            (4096, 4096),
+        ] {
+            assert_eq!(packed_rows(rows).unwrap(), class, "{rows} rows");
+        }
+        assert_eq!(PACKED_M_CLASSES, [128, 256, 1024, 4096]);
+        // Above the largest class no program exists, so it is refused by name with both numbers
+        // rather than clamped: a 4 096-row module serving 5 000 rows is the same defect one size
+        // up, and it would run.
+        let error = packed_rows(4097).unwrap_err().to_string();
+        assert!(error.contains("4097"), "{error}");
+        assert!(error.contains("4096"), "{error}");
+    }
+
+    #[test]
+    fn the_projection_reserves_the_arena_its_class_writes() {
+        // The launch states the class, so the region must be the class's: a region reserved for
+        // the request's rows is one a 128-row launch writes past, and every other check agrees
+        // while it happens.
+        let packed = Nvfp4Linear::new(
+            &packed(8, 64, ScaleLayout::Swizzled128X4),
+            None,
+            ScaleLayout::Swizzled128X4,
+            DType::BF16,
+            128,
+        )
+        .unwrap();
+        assert_eq!(packed.scratch_bytes(15), packed.scratch_bytes(128));
+        assert_eq!(packed.scratch_bytes(129), packed.scratch_bytes(256));
+        // And it is larger than the request's own regions would be, which is the defect stated as
+        // a number rather than as an inequality: 15 rows of a 64-wide contraction.
+        assert!(packed.scratch_bytes(15) > 15 * 32 + 15 * 4);
     }
 
     #[test]

@@ -176,6 +176,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for component in chosen {
         let directories = component.directories();
         println!("component {} ({})", component.name(), component.block());
+        // **What the load deliberately leaves alone, printed with its reason.** A tensor the
+        // checkpoint holds, the load does not ask for and nobody has named is the finding this
+        // column exists to make visible; a named exclusion is a decision, and a reader who cannot
+        // see it cannot tell the two apart.
+        for exclusion in load::excluded_names(component.name()) {
+            println!("  not asked for: {} ({})", exclusion.name, exclusion.reason);
+        }
         let mut budget = 0_u64;
         for directory in directories {
             match directory_bytes(&checkpoint, directory) {

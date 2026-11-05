@@ -60,6 +60,13 @@ CATALOGUE = {
 ID_SAMPLE = 6
 
 
+def _numpy():
+    """NumPy, imported where it is used: the probes that write `.h3t` do not need it."""
+    import numpy
+
+    return numpy
+
+
 def reference(name: str):
     """Import one of the reference's modules, naming a missing compiled extension as the series does."""
     import importlib
@@ -397,14 +404,21 @@ def run_prompt_hidden(
     print(f"got     {tuple(hidden.shape)} {hidden.dtype}")
     (out / "text_encoder").mkdir(parents=True, exist_ok=True)
     dump(out, "text_encoder/prompt_hidden", hidden)
+    # The same numbers in the container the guild's comparison reads, so the text encoder's stack
+    # arrives in `tools/diagnosis/compare.py` beside every other component's rows. FP32 is what
+    # `numpy.save` writes; the candidate side widens its own checkpoint type to it exactly, so the
+    # pair differs only where the two computations differ.
+    numpy = _numpy()
+    numpy.save(
+        out / "text_encoder" / "prompt_hidden.npy", hidden.astype(numpy.float32)
+    )
     (out / "text_encoder" / "case.json").write_text(
         (stack / "case.json").read_text()
     )
     print(f"wrote   {out / 'text_encoder' / 'prompt_hidden.h3t'}")
     print(
-        "compare cargo run -p minimax-h3 --example compare_blocks --"
-        f" --reference {out}"
-        f" --candidate {stack.parent if stack.name == 'text_encoder' else stack}"
+        "compare .venv/bin/python tools/diagnosis/compare.py"
+        f" --ref {out} --got {stack.parent if stack.name == 'text_encoder' else stack}"
     )
     return 0
 

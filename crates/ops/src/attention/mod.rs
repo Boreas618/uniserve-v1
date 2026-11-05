@@ -75,7 +75,7 @@ use std::ffi::c_void;
 use std::fmt;
 
 use crate::descriptor::Key;
-use crate::kernel::{Kernel, NativeCall};
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
 use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 use crate::tolerance::{self, Tolerance};
@@ -695,6 +695,16 @@ impl Op for PagedAttention {
             }
         }
 
+        // A Triton program is this crate's own kernel and takes the arguments its package declares;
+        // a native module keeps the `Call` structure above. It is one operator served by two kinds
+        // of program, which is why the descriptor names no backend and the store decides.
+        if kernel.is_cubin() {
+            return Self::launch_program(
+                kernel, descriptor, &args, batch, q_heads, kv_heads, page_size, tokens, max_q_len,
+                stream,
+            );
+        }
+
         trace(descriptor, &args);
 
         let mut call = Call {
@@ -764,6 +774,133 @@ impl Op for PagedAttention {
         let value_term = 2.0 * gamma + accumulate.unit_roundoff();
         Tolerance::rounding(reduction, accumulate, descriptor.output)
             .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
+    }
+}
+
+impl PagedAttention {
+    /// Launch this crate's own Triton program for an `E4M3` page.
+    ///
+    /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
+    /// cache needs a program of ours (`notes/programs/paged_attention_fp8.md`). **This program serves
+    /// the decode phase alone**: one program per (query row, query head) walks the row's page table
+    /// once, carrying a running maximum, a running normaliser and an accumulator — a prefill has a
+    /// mask and several query rows per table row and is a second landing, not the same kernel.
+    ///
+    /// The refusals here are the operator's own conditions stated where the program's compilation
+    /// makes them true: an E4M3 cache read without its scale, a window this program was not compiled
+    /// for, a phase it does not serve. Each names what it refused, so a store that resolved the
+    /// wrong program is a launch error rather than plausible attention.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_program(
+        kernel: &Kernel,
+        descriptor: &Descriptor,
+        args: &Args,
+        batch: u64,
+        q_heads: u64,
+        kv_heads: u64,
+        page_size: u64,
+        tokens: u64,
+        max_q_len: u64,
+        stream: &Stream,
+    ) -> Result<()> {
+        if descriptor.key_value != DType::F8E4M3 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the Triton program decodes an E4M3 page and the descriptor's cache is {}; the                      full-precision rows are the vendor modules'",
+                    descriptor.key_value
+                ),
+            ));
+        }
+        let (Some(key_scale), Some(value_scale)) = (args.key_scale, args.value_scale) else {
+            return Err(Error::argument(
+                Self::NAME,
+                "an E4M3 page is read through one scale per page, and the call passes none"
+                    .to_owned(),
+            ));
+        };
+        if args.window_left != 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the Triton program is compiled without an attention window; the call asks for                      a {} token window",
+                    args.window_left
+                ),
+            ));
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("{q_heads} query heads do not divide into {kv_heads} key-value heads"),
+            ));
+        }
+
+        // The kernel's words are 32-bit: its strides and extents are bounded by the descriptor's
+        // geometry, and a call whose view cannot be stated in one is refused rather than truncated.
+        let word = |name: &str, value: u64| -> Result<i32> {
+            i32::try_from(value).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("{name} {value} does not fit the program's 32-bit word"),
+                )
+            })
+        };
+        let stride = |name: &str, view: &TensorView, axis: usize| -> Result<i32> {
+            word(name, view.strides.get(axis))
+        };
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.out)
+            .view(args.query)
+            .view(args.key)
+            .view(args.value)
+            .view(key_scale)
+            .view(value_scale)
+            .view(args.page_table)
+            .view(args.seq_lens)
+            .i32(stride("the query's row stride", &args.query, 0)?)
+            .i32(stride("the query's head stride", &args.query, 1)?)
+            .i32(stride("the query's element stride", &args.query, 2)?)
+            .i32(stride("the key cache's page stride", &args.key, 0)?)
+            .i32(stride("the key cache's token stride", &args.key, 1)?)
+            .i32(stride("the key cache's head stride", &args.key, 2)?)
+            .i32(stride("the key cache's element stride", &args.key, 3)?)
+            .i32(stride("the value cache's page stride", &args.value, 0)?)
+            .i32(stride("the value cache's token stride", &args.value, 1)?)
+            .i32(stride("the value cache's head stride", &args.value, 2)?)
+            .i32(stride("the value cache's element stride", &args.value, 3)?)
+            .i32(stride("the output's row stride", &args.out, 0)?)
+            .i32(stride("the output's head stride", &args.out, 1)?)
+            .i32(stride("the output's element stride", &args.out, 2)?)
+            .i32(word(
+                "the page table's width",
+                args.page_table.shape.dim(1),
+            )?)
+            .i32(word("the page size", page_size)?)
+            .f32(args.scale);
+        if descriptor.phase == Phase::Prefill {
+            // A packed batch states each row's first query token; an unpacked one gives every row
+            // `max_q_len`, which the program derives from the row index.
+            let packed = args.cum_seq_lens_q.numel() > 0;
+            // The view is passed whether or not the batch is packed: `packed` is what the program
+            // branches on, and an unpacked call leaves the pointer unread.
+            arguments
+                .view(args.cum_seq_lens_q)
+                .i32(word("the longest query row", max_q_len)?)
+                .i32(i32::from(packed));
+        }
+
+        // One program per (query row, query head): at decode a table row is one query token, and at
+        // prefill the row's query tokens are its first grid dimension. The head decides the
+        // key-value head the program reads.
+        let grid = match descriptor.phase {
+            Phase::Decode => LaunchGrid::new([batch, q_heads, 1])?,
+            // Over the packed token count rather than a row's length: the longest row is only known
+            // from the offsets on the device, so a shorter row's tiles return before reading a page.
+            Phase::Prefill => LaunchGrid::new([tokens, q_heads, batch])?,
+        };
+        kernel.launch(grid, &mut arguments, stream)
     }
 }
 

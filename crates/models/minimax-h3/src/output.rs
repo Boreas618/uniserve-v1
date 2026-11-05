@@ -243,11 +243,9 @@ impl VideoPostprocessor {
 
         let mut programs = Programs::default();
         programs.launch::<ops::rgb::RgbBytes>(&RgbBytes::descriptor_of(dtype, Rgb::CHANNELS));
-        for (height, width) in rasters {
-            let pixels = u64::from(*height) * u64::from(*width);
-            if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, pixels) {
-                programs.launch::<ScaledAddOp>(&descriptor);
-            }
+        // One descriptor for every raster: the width is the operand's and changes no compiled code.
+        if !rasters.is_empty() {
+            programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
         }
         programs.finish()
     }

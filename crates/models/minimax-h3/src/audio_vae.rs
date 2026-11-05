@@ -416,7 +416,6 @@ pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
     for source in sources {
         match &source.tensor {
             Tensor::Region(tensor) => keys.push(tensor.clone()),
-            Tensor::Parts(parts) => keys.extend(parts.iter().cloned()),
             Tensor::Normalized { value, gain } => {
                 keys.push(value.clone());
                 keys.push(gain.clone());
@@ -431,8 +430,6 @@ pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
 pub enum Tensor {
     /// One tensor under one key.
     Region(String),
-    /// Several checkpoint tensors that fill one parameter, in order (the fused query-key-value bias).
-    Parts(Vec<String>),
     /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
     /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
     /// below carries it (specs/worker.md 9, the BigVGAN row).
@@ -478,9 +475,13 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         }
     };
 
-    sources.push(normalized(
+    // The decoder's input is a plain 1x1 convolution in the reference - `nn.Conv1d(latent_channels,
+    // latent_dim, 1)` outside `_normalized` - and the checkpoint stores it as one weight, so a
+    // normalized pair here asked for two tensors the export does not have and left the one it does
+    // have unread. The body's 136 convolutions *are* weight-normalized and stay so.
+    sources.push(region(
         "input.weight".to_owned(),
-        "dec_in_proj".to_owned(),
+        "dec_in_proj.weight".to_owned(),
     ));
     sources.push(region(
         "input.bias".to_owned(),
@@ -770,7 +771,7 @@ impl Statistics {
 /// Layout everywhere is `[batch, channels, samples]`, the form the one-dimensional convolutions take.
 /// The batch is two because the reference decodes a stereo pair of identical rows and interleaves them;
 /// nothing in the network mixes the rows, so both output channels carry the same signal.
-pub struct AudioDecoder {
+pub struct BigVgan {
     config: AudioVaeConfig,
     /// The latent statistics as one one-by-one convolution: a diagonal of the deviations and the means
     /// as its bias, which is `value · std + mean` per latent channel.
@@ -812,14 +813,19 @@ struct DecoderStep {
 /// The alias-free activation's geometry, from the checkpoint's own constants.
 const ACTIVATION_KERNEL: u32 = 12;
 const ACTIVATION_RATIO: u32 = 2;
-/// The program's width, as the operator states it.
-const ACTIVATION_BLOCK: u32 = 256;
+/// The program's width, as the operator states it - **a key field**, not a request's length.
+///
+/// The launcher passes this to `AudioActivation::new`, so it is what the walk records and what the
+/// deployment list must hold. It is public because the fixture generator states the rows a store is
+/// built from, and a second copy of this number in that generator is how the file came to say 1024
+/// for seven rows the device launches at 256.
+pub const ACTIVATION_BLOCK: u32 = 256;
 /// The two channels the reference decodes and interleaves.
 const PCM_CHANNELS: u32 = 2;
 
 /// Every parameter name the audio decoder's load binds, in the order it binds them.
 ///
-/// One source of truth for the load and its check: [`AudioDecoder::load`] binds exactly these names, and
+/// One source of truth for the load and its check: [`BigVgan::load`] binds exactly these names, and
 /// [`sources`] must name exactly the same set — a name in one and not the other is a load failure rather
 /// than a checkpoint field silently dropped or a tensor bound to the wrong layer.
 pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
@@ -862,7 +868,7 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
     Ok(names)
 }
 
-impl AudioDecoder {
+impl BigVgan {
     /// Every checkpoint tensor the audio decoder reads, by name.
     ///
     /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
@@ -904,8 +910,19 @@ impl AudioDecoder {
             false,
         )?;
         let mut binder = Binder::new(loader, table);
+        // The input projection is one weight and a bias, and the weight is a **3-d filter**: the
+        // export holds `[latent_dim, latent_channels, 1]` - a kernel of one is the same arithmetic
+        // and not the same rank, and `Conv1d::new` refuses anything that is not 3-d. Asking for two
+        // dimensions would trade a mapping refusal for a rank refusal one line later.
         let input = Conv1d::new(
-            binder.normalized("input.weight")?,
+            binder.region(
+                "input.weight",
+                &[
+                    u64::from(config.latent_dim),
+                    u64::from(config.latent_channels),
+                    1,
+                ],
+            )?,
             Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
             geometry(1, 1, 0)?,
             false,
@@ -1048,10 +1065,15 @@ impl AudioDecoder {
     /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
     ///
     /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
-    /// the descriptor, so they are stated once per stage width and per sample count the deployment
-    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
-    /// clip of another length replays the compiled program.
-    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+    /// the descriptor, so they are stated once per latent track length the deployment serves
+    /// (`tracks`, in **latent frames**). The per-channel ones do not: a convolution's key is its
+    /// geometry, and a clip of another length replays the compiled program.
+    ///
+    /// A track is stated in latent frames because that is the quantity a decode starts from
+    /// (`forward` takes the latent's frame count and multiplies it by each stage's rate); a sample
+    /// count is that number times the decoder's 800-fold upsampling, so passing one here would state
+    /// every stage's width 800 times too wide.
+    pub fn programs(config: &AudioVaeConfig, tracks: &[u32]) -> Result<Vec<(String, String)>> {
         use ops::audio_activation::AudioActivation as AudioActivationOp;
         use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
         use ops::pcm::PcmInterleave as PcmInterleaveOp;
@@ -1137,10 +1159,13 @@ impl AudioDecoder {
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
 
-        for bucket in buckets {
-            for stage in &stages {
-                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
-                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+        // The residual add at each stage's own buffers: `[PCM_CHANNELS, channels, length]` reshaped
+        // to `[PCM_CHANNELS · channels, length]`, so its width is the length the stage's upsampling
+        // leaves. That width is the operand's and reaches no compiled code, so one descriptor covers
+        // every stage of every track - a row per (track, stage) stated the request's duration in a key.
+        for _track in tracks {
+            for _stage in &stages {
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
             }
         }
         Ok(programs.finish())
@@ -1287,7 +1312,7 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
     Ok(())
 }
 
-impl Decoder for AudioDecoder {
+impl Decoder for BigVgan {
     fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
         // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
@@ -1304,7 +1329,7 @@ impl Decoder for AudioDecoder {
             Ok(())
         } else {
             Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder has no layout tables; {} buffers were offered",
                     out.len()
@@ -1331,7 +1356,7 @@ impl Decoder for AudioDecoder {
     ) -> nn::Result<()> {
         if !state.is_empty() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!(
                     "the audio decoder reads no layout table, {} were given",
                     state.len()
@@ -1339,18 +1364,18 @@ impl Decoder for AudioDecoder {
             });
         }
         let audio = out.audio.ok_or_else(|| nn::Error::Shape {
-            owner: "AudioDecoder",
+            owner: "BigVgan",
             problem: "an audio decode writes the request's PCM window".to_owned(),
         })?;
         if out.video.is_some() {
             return Err(nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: "the audio decoder writes no video raster".to_owned(),
             });
         }
         self.forward(f, latents, audio)
             .map_err(|error| nn::Error::Shape {
-                owner: "AudioDecoder",
+                owner: "BigVgan",
                 problem: format!("{error}"),
             })
     }
@@ -1481,8 +1506,26 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// A row slice of a fused matrix is contiguous, which is what splits the audio encoder's query-key-
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
+    ///
+    /// **One entry may be sliced any number of times**, which is why this does not go through
+    /// [`Self::entry`]: that guard refuses a parameter bound twice, and a fused matrix is bound once
+    /// and read in three windows. What the guard protects is a parameter read twice *whole* - two
+    /// layers sharing one checkpoint tensor - and [`Self::region`] and [`Self::normalized`] still
+    /// refuse it.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
+        let index = self
+            .table
+            .iter()
+            .position(|source| source.parameter == parameter)
+            .ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "{}: {}",
+                    parameter.to_owned(),
+                    "the checkpoint's audio decoder has no such parameter".to_owned()
+                ))
+            })?;
+        self.used[index] = true;
+        match self.table[index].tensor.clone() {
             Tensor::Region(tensor) => {
                 let weight =
                     self.loader
@@ -1533,24 +1576,77 @@ impl<'a, 'b> Binder<'a, 'b> {
 #[cfg(test)]
 pub(crate) mod tests {
 
+    /// The audio decoder's names are the checkpoint's, tensor for tensor.
+    ///
+    /// A mapping that invents one name and drops another still asks the same count, so a count is not
+    /// the check - the set is. This is the decoder half of the same export the encoder's fixture
+    /// records: 912 `decoder.*` tensors and the 2 of `dec_in_proj.*`. It is what caught the input
+    /// projection being asked as a weight-normalized pair, one name each way, and the same class the
+    /// normalized-pair test above cannot see: that test reads the crate's own list.
+    #[test]
+    fn the_audio_decoders_names_are_the_checkpoints() {
+        let config = audio_config();
+        let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
+        ours.sort_unstable();
+        let fixture: Vec<&str> = include_str!("../tests/data/audio-decoder-names.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture.len(), 914, "the recorded export's decoder half");
+        let missing: Vec<&str> = fixture
+            .iter()
+            .copied()
+            .filter(|name| !ours.iter().any(|ours| ours == name))
+            .collect();
+        let extra: Vec<&str> = ours
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !fixture.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the checkpoint has decoder names this crate does not ask for: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "this crate asks for decoder names the checkpoint does not have: {extra:?}"
+        );
+    }
+
     #[test]
     fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
         let config = audio_config();
-        let keys = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let keys = BigVgan::keys(&config).expect("the decoder's keys");
         let mut unique = keys.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // The input projection is the one convolution the reference does not normalize, and the
+        // checkpoint therefore holds one weight for it: a list that asked for a pair would name two
+        // tensors the export does not have and leave the one it has unread (`M5621`'s measurement:
+        // 915 asked against 914 stored, one name each way).
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight"));
+        assert!(
+            keys.iter()
+                .all(|key| !key.starts_with("dec_in_proj.weight_")),
+            "the input projection holds no normalized pair"
+        );
         // A weight-normalized convolution reads a direction and a magnitude, and the load needs both:
         // a list that named only the direction would refuse a checkpoint that is complete.
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_v"));
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_g"));
+        assert!(keys.iter().any(|key| key == "decoder.conv_pre.weight_v"));
         let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
         let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
         assert_eq!(magnitudes, directions, "every magnitude has its direction");
+        // One pre-convolution, one post-convolution, and per stage its upsampler plus two per
+        // residual kernel in each of the three blocks. The input projection is not among them: the
+        // reference declares it plain and the export stores it as one weight.
+        let stages = config.decoder_rates.len();
+        let kernels = config.resblock_kernel_sizes.len();
         assert_eq!(
-            magnitudes, 136,
-            "the decoder's weight-normalized convolutions"
+            magnitudes,
+            2 + stages * (1 + BLOCKS_PER_STAGE * kernels * 2),
+            "the decoder's weight-normalized convolutions, by structure rather than by count"
         );
         // The encoder reads a different half of a different directory; a shared name would be one
         // block binding the other's tensor.
@@ -1602,7 +1698,7 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_states_its_programs_from_its_own_config() {
         let config = audio_config();
-        let programs = AudioDecoder::programs(&config, &[64, 256]).expect("the decoder's programs");
+        let programs = BigVgan::programs(&config, &[64, 256]).expect("the decoder's programs");
         assert!(!programs.is_empty());
         for (operator, key) in &programs {
             assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");
@@ -1919,14 +2015,18 @@ pub(crate) mod tests {
             .iter()
             .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
             .count();
-        // 136 weighted convolutions: the input projection, the pre- and post-convolutions, seven
-        // upsamplers and the 126 anti-aliased multi-periodicity convolutions.
-        assert_eq!(normalized, 136);
-        // 127 activations of four tensors each, plus the input projection's pair, the two
-        // convolution biases, the seven upsampler biases and the 126 AMP biases.
-        // 127 alias-free activations of four tensors each, their convolutions' own biases (126), the
-        // upsamplers' and the two bias-carrying projections' — the post-convolution has none.
-        assert_eq!(table.len(), 136 + 127 * 4 + 126 + 7 + 2);
+        // The same count by structure: the pre- and post-convolutions plus every stage's upsampler
+        // and its blocks' convolutions. The input projection is not among them.
+        let stages = config.decoder_rates.len();
+        let kernels = config.resblock_kernel_sizes.len();
+        let normalized_by_structure = 2 + stages * (1 + BLOCKS_PER_STAGE * kernels * 2);
+        assert_eq!(normalized, normalized_by_structure);
+        // The table's total is not asserted here: it would be a fourth restatement of the same
+        // structure, and the set is already pinned exactly against the export's own 914 names
+        // (`the_audio_decoders_names_are_the_checkpoints`), which is the check a count can only
+        // approximate. What the count would catch and the set does not is a table that names the
+        // checkpoint's parameters in the wrong representation - and the pair rule below is that
+        // check, stated directly.
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())

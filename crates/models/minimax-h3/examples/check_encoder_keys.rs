@@ -21,7 +21,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use minimax_h3::audio_vae::AudioDecoder;
+use minimax_h3::audio_vae::BigVgan;
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The audio directory holds both halves too, and against this checkpoint none of the tensors
     // either of them asks for is present - which is the answer `load` must give before a stage of
     // the audio path is built, so it is reported here rather than skipped.
-    let audio_decoder = AudioDecoder::keys(&config.audio_vae)?;
+    let audio_decoder = BigVgan::keys(&config.audio_vae)?;
     let audio_encoder = AudioEncoder::keys(&config.audio_vae)?;
 
     let mut failed = false;

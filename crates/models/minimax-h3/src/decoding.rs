@@ -171,6 +171,17 @@ impl Buffer {
         }
     }
 
+    /// The bytes the buffer occupies in an arena: its size rounded up to the arena's alignment.
+    ///
+    /// `plan::Arena::reserve` aligns every give-out to [`nn::forward::ALIGNMENT`], so a reservation
+    /// summed from raw sizes is short by up to `ALIGNMENT - 1` bytes **per buffer** - multiplied by
+    /// the number of buffers, which for the video decoder's sixteen is up to 4 KiB. The first run to
+    /// meet it was short by 64 bytes, exactly the padding of the two rotary tables (`1797 x 24 x 4`
+    /// is not a multiple of 256).
+    pub fn reservation(&self) -> u64 {
+        self.bytes().next_multiple_of(nn::forward::ALIGNMENT)
+    }
+
     /// The bytes the buffer occupies.
     pub fn bytes(&self) -> u64 {
         // A plan with an unknown element name is caught by [`Self::width`]; this answers for the four
@@ -229,6 +240,17 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
+/// The bytes a runner must reserve for `plan`: every buffer at the arena's alignment.
+///
+/// **A plan summed raw is short.** The arena aligns each give-out to [`nn::forward::ALIGNMENT`] and a
+/// plan's entries are not all multiples of it, so the reservation a runner makes has to be the
+/// aligned sum rather than the sum of the sizes. The failure this prevents is the smallest that has
+/// ever stopped a stage: `22081536 bytes requested at offset 368378880 of a 390460352-byte region`,
+/// 64 bytes past the end, because `1797 x 24 x 4` twice is 64 bytes of padding the sum left out.
+pub fn arena_reservation(plan: &[Buffer]) -> u64 {
+    plan.iter().map(Buffer::reservation).sum()
+}
+
 pub fn video_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
@@ -245,7 +267,19 @@ pub fn video_arena(
     // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
     // because a tile at the canvas's edge can be narrower than the tile size.
     let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+    // **The transformer's fourteen buffers are one tile's, not the grid's sum.** The decoder's canvas is
+    // one tile (`VideoDecoder`) and `TileScratch` is reserved once per clip and reused by every tile, so
+    // sizing them by the sum reserved the grid's worth of buffers for a decode that holds one tile's -
+    // eight times the need on a 16-tile canvas. `decode` refuses a grid whose tiles differ in rows, so
+    // the first tile is every tile.
+    let tile = grid.first().ok_or_else(|| {
+        Error::config(format!(
+            "a canvas of {} x {} pixels has no tile to decode",
+            height, width_px
+        ))
+    })?;
+    let tile_rows = tile.canvas.rows();
+    let tile_voxels = tile.canvas.voxels();
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
@@ -280,72 +314,72 @@ pub fn video_arena(
         Buffer {
             name: "stream".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "projected".to_owned(),
             element,
-            elements: voxels * columns,
+            elements: tile_voxels * columns,
         },
         Buffer {
             name: "cosine".to_owned(),
             element: "f32",
-            elements: rows * u64::from(rotated / 2),
+            elements: tile_rows * u64::from(rotated / 2),
         },
         Buffer {
             name: "sine".to_owned(),
             element: "f32",
-            elements: rows * u64::from(rotated / 2),
+            elements: tile_rows * u64::from(rotated / 2),
         },
         Buffer {
             name: "normalized".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "query".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "key".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "value".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "rotated_query".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "rotated_key".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "attended".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "update".to_owned(),
             element,
-            elements: rows * columns,
+            elements: tile_rows * columns,
         },
         Buffer {
             name: "gate_up".to_owned(),
             element,
-            elements: rows * 2 * columns * ffn,
+            elements: tile_rows * 2 * columns * ffn,
         },
         Buffer {
             name: "gated".to_owned(),
             element,
-            elements: rows * columns * ffn,
+            elements: tile_rows * columns * ffn,
         },
     ])
 }
@@ -899,6 +933,65 @@ mod tests {
     /// them but the rotary tables, which the block allocates at F32 whatever it decodes at. A plan
     /// that spelled one type for both reserved half of what an FP32 decode asks the arena for, and the
     /// shortfall surfaced inside the clip as "cannot give out" rather than as a plan that was short.
+    /// A reservation summed raw is short by every buffer's padding - and the buffers that pad are
+    /// the ones whose element count is not a multiple of the alignment, which for this decoder is the
+    /// two rotary tables. The first device run to meet it was 64 bytes short of a 372 MiB arena.
+    #[test]
+    fn a_plan_is_reserved_at_the_arenas_alignment_not_at_its_raw_sum() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 16, 16);
+        let plan = video_arena(&config, &canvas, nn::DType::F32).expect("the plan");
+        let raw: u64 = plan.iter().map(Buffer::bytes).sum();
+        let reserved = arena_reservation(&plan);
+        assert_eq!(
+            reserved,
+            plan.iter()
+                .map(|buffer| buffer.bytes().next_multiple_of(nn::forward::ALIGNMENT))
+                .sum::<u64>(),
+            "the reservation is each buffer at the arena's alignment"
+        );
+        assert!(reserved >= raw, "an aligned sum is never smaller");
+        // **The difference is padding, buffer by buffer, and not a multiple of anything.** An earlier
+        // version of this test asserted `(reserved - raw) % 256 == 0`, which is false whenever the
+        // buffers' raw sum is not itself a multiple of the alignment - the paddings sum to whatever
+        // they sum to. What is true is that each buffer pads by less than one alignment, and that the
+        // total difference is those paddings.
+        let padding: u64 = plan
+            .iter()
+            .map(|buffer| buffer.reservation() - buffer.bytes())
+            .sum();
+        assert_eq!(
+            reserved - raw,
+            padding,
+            "the difference is the buffers' padding"
+        );
+        for buffer in &plan {
+            assert!(
+                buffer.reservation() - buffer.bytes() < nn::forward::ALIGNMENT,
+                "{}: {} pads by no more than one alignment",
+                buffer.name,
+                buffer.bytes()
+            );
+        }
+        // And the function's own rule, on a size no canvas has to supply: a buffer whose element
+        // count is not a multiple of the alignment is rounded up, not down, and one that is a
+        // multiple is left alone. The device run that found this was 64 bytes short because two
+        // 172,512-byte tables were placed at their raw size.
+        let uneven = Buffer {
+            name: "a table".to_owned(),
+            element: "f32",
+            elements: 172_512 / 4,
+        };
+        assert_eq!(uneven.bytes(), 172_512);
+        assert_eq!(uneven.reservation(), 172_544, "rounded up to the next 256");
+        let even = Buffer {
+            name: "an aligned tensor".to_owned(),
+            element: "f32",
+            elements: 65_536 / 4,
+        };
+        assert_eq!(even.reservation(), even.bytes(), "a multiple is not moved");
+    }
+
     #[test]
     fn the_video_arena_is_stated_in_the_decodes_own_element_type() {
         let config = crate::video_vae::tests::video_config();
@@ -938,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn the_video_arena_holds_all_tiles_of_one_clip() {
+    fn the_video_arena_holds_one_tiles_scratch_and_every_tiles_tokens() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
         let arena = video_arena(&config, &canvas, nn::DType::F16).expect("the arena");
@@ -947,19 +1040,43 @@ mod tests {
         assert_eq!(canvas.frames, 7);
         assert_eq!(canvas.height, 48);
         assert_eq!(canvas.width, 84);
-        let tiles = crate::video_vae::Tiles::of(&config, &canvas)
+        let grid = crate::video_vae::Tiles::of(&config, &canvas)
             .expect("the grid")
-            .tiles(&config, &canvas)
-            .len();
-        assert_eq!(tiles, 28);
-        let tokens = arena
-            .iter()
-            .find(|buffer| buffer.name == "stream")
-            .expect("the residual stream");
-        assert_eq!(tokens.elements, 28 * 1797 * 2048);
-        assert_eq!(tokens.bytes(), tokens.elements * 2);
-        // The two rotary factor tables the code reserves, in the position it reserves them: half the
-        // rotated width each, so their sum is the rotated width - not the head.
+            .tiles(&config, &canvas);
+        assert_eq!(grid.len(), 28);
+        // **The transformer's buffers are one tile's, and the tokens are every tile's.** `decode`
+        // reserves `TileScratch` once per clip and reuses it for every tile, while each tile reserves
+        // its own token buffer inside the loop and the arena never rewinds. A plan that sized the
+        // fourteen by the grid summed two different lifetimes into one number.
+        let tile_rows: u64 = grid[0].canvas.rows();
+        let tile_voxels: u64 = grid[0].canvas.voxels();
+        let all_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
+        let all_voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+        let buffer = |name: &str| {
+            arena
+                .iter()
+                .find(|buffer| buffer.name == name)
+                .unwrap_or_else(|| panic!("the plan states {name}"))
+        };
+        let columns = 2048;
+        assert_eq!(
+            buffer("tokens").elements,
+            all_rows
+                * u64::from(crate::video_vae::TILE_PIXELS / 16)
+                * u64::from(crate::video_vae::TILE_PIXELS / 16)
+                * 3
+        );
+        assert_eq!(buffer("stream").elements, tile_rows * columns);
+        assert_eq!(buffer("projected").elements, tile_voxels * columns);
+        assert_eq!(buffer("gate_up").elements, tile_rows * 2 * columns * 4);
+        assert_eq!(buffer("gated").elements, tile_rows * columns * 4);
+        assert!(
+            all_rows > tile_rows,
+            "the clip's tiles outnumber one tile's rows"
+        );
+        let _ = all_voxels;
+        // The two rotary factor tables the code reserves once, in the position it reserves them: half
+        // the rotated width each, one tile's rows because they are the scratch's.
         let cosine = arena
             .iter()
             .position(|buffer| buffer.name == "cosine")
@@ -971,7 +1088,7 @@ mod tests {
         assert_eq!(sine, cosine + 1);
         assert_eq!(
             arena[cosine].elements + arena[sine].elements,
-            28 * 1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
+            tile_rows * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
         );
         assert_eq!(arena[cosine].elements, arena[sine].elements);
         // The clip-level buffers come first and the per-tile ones after, which is the order the model

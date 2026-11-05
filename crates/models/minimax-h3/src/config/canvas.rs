@@ -34,6 +34,17 @@ pub const NAMED_ASPECT_RATIOS: [(u32, u32); 6] =
 /// ratio's canvas.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
 
+/// The canvases a deployment with no stated ladder serves: the canvas rule's named table.
+///
+/// **This is the name an enumeration should ask**, not a typed list of rasters: a row keyed for a
+/// canvas the engine can never be asked for is a cell no launch reads, and 480x832 - the encoder's
+/// own test raster - is not one of these. `DenoiserConfig::offered_canvases` is the deployment's own
+/// answer where a checkpoint states a ladder; where none is stated it is this table, so a walk that
+/// cannot read the checkpoint and a walk that can agree on the default.
+pub const fn offered_canvases() -> &'static [Canvas] {
+    &NAMED_CANVASES
+}
+
 /// The canvas rule's canvases at [`CANVAS_SHORT_EDGE`]: every named aspect ratio's raster.
 ///
 /// The rule resolves a ratio into a canvas whose short edge starts at the class, whose area is at

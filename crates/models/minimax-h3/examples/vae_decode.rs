@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::config::AttentionKind;
+use minimax_h3::config::offered_canvases;
 use minimax_h3::decoding::{ClipDecoder, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder, folded_input};
 use nn::{
@@ -93,13 +94,16 @@ impl From<platform::Error> for Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
-/// The two stages of the run.
+/// The stages of the run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Weights,
     Decode,
+    Raster,
+    Plan,
 }
 
+#[derive(Clone)]
 struct Args {
     stage: Stage,
     root: PathBuf,
@@ -108,6 +112,26 @@ struct Args {
     latent_height: u32,
     latent_width: u32,
     latents: Option<PathBuf>,
+    /// The raster whose pixels `--stage raster` encodes: `[frames, rows, columns, channels]` FP32,
+    /// one still (one frame) or one clip of the model's clip length - the counts the video encoder
+    /// reads. Absent with `--pattern`, the stage draws one instead.
+    pixels: Option<PathBuf>,
+    /// Draw the raster to encode rather than reading one.
+    ///
+    /// A decode's own `raster.h3t` is **longer than a clip** - the decoder emits `frames_out` frames
+    /// and the clip keeps fewer - so a decoded raster is not an encoder input. This flag is the way to
+    /// run the raster path before a reference clip exists: the same habit the decode stage has with a
+    /// missing latent, and the page says which of the two produced the pixels.
+    pattern: bool,
+    /// The latent frames a decode reads, when it is not one clip's.
+    ///
+    /// A decode's canvas states how many latent frames it decodes, and one clip of the checkpoint is
+    /// [`minimax_h3::video_vae::decode_latents`] of them. A reference clip encoded by `--stage raster`
+    /// is a *different* count - the video encoder's own frame arithmetic (`clip_length` frames in,
+    /// `token_drop` fewer latent frames out) - so a decode of one says its count here rather than
+    /// asserting the clip's. Absent, the clip's own number is used, which is what every decode of a
+    /// generated trajectory wants.
+    frames: Option<u32>,
     /// An explicit arena size in GiB. Zero - the default - means the plan's own number, which is what
     /// a correct run needs; a stated size may only grow the reservation and the line says it did.
     arena_gib: u64,
@@ -124,6 +148,9 @@ impl Args {
             latent_height: 16,
             latent_width: 16,
             latents: None,
+            pixels: None,
+            pattern: false,
+            frames: None,
             arena_gib: 0,
             out: PathBuf::from("artifacts/h3-vae-decode"),
         };
@@ -145,9 +172,11 @@ impl Args {
                     args.stage = match value("--stage")?.as_str() {
                         "weights" => Stage::Weights,
                         "decode" => Stage::Decode,
+                        "raster" => Stage::Raster,
+                        "plan" => Stage::Plan,
                         other => {
                             return Err(Failure::message(format!(
-                                "unknown stage `{other}`; expected weights or decode"
+                                "unknown stage `{other}`; expected weights, decode, raster or plan"
                             )));
                         }
                     };
@@ -163,15 +192,18 @@ impl Args {
                 "--latent-height" => args.latent_height = number("--latent-height")?,
                 "--latent-width" => args.latent_width = number("--latent-width")?,
                 "--latents" => args.latents = Some(PathBuf::from(value("--latents")?)),
+                "--pixels" => args.pixels = Some(PathBuf::from(value("--pixels")?)),
+                "--pattern" => args.pattern = true,
+                "--frames" => args.frames = Some(number("--frames")?),
                 "--arena-gib" => {
                     args.arena_gib = u64::from(number("--arena-gib")?);
                 }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
-                        "vae_decode --stage weights|decode [--root PATH] [--store PATH] [--device N] \
-                         [--latent-height N] [--latent-width N] [--latents FILE] [--arena-gib N] \
-                         [--out DIR]",
+                        "vae_decode --stage weights|decode|raster [--root PATH] [--store PATH] \
+                         [--device N] [--latent-height N] [--latent-width N] [--latents FILE] \
+                         [--pixels FILE | --pattern] [--frames N] [--arena-gib N] [--out DIR]",
                     ));
                 }
                 other => {
@@ -237,6 +269,8 @@ fn run() -> Result<()> {
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Decode => stage_decode(&args),
+        Stage::Raster => stage_raster(&args),
+        Stage::Plan => stage_plan(&args),
     }
 }
 
@@ -383,7 +417,15 @@ fn stage_decode(args: &Args) -> Result<()> {
         )
     })?;
     let config = args.configuration()?;
-    let canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
+    // One clip's canvas, unless the caller states the latent frames: a reference clip encoded by
+    // `--stage raster` is the video encoder's own count, which is not one clip's.
+    let canvas = {
+        let mut canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
+        if let Some(frames) = args.frames {
+            canvas.frames = frames;
+        }
+        canvas
+    };
     let checkpoint = Checkpoint::open(&args.root)?;
 
     // 1. The device and the stream every launch is issued on, before any weight is allocated.
@@ -519,10 +561,13 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
     let plan = video_arena(&config.video_vae, &canvas, dtype)?;
-    let mut planned = 0_u64;
-    for buffer in &plan {
-        planned += buffer.elements * buffer.width()?;
-    }
+    // **Each buffer at the arena's alignment, not at its raw size.** The arena aligns every give-out
+    // to `nn::forward::ALIGNMENT`, so the raw sum is short by up to 255 bytes per buffer - and the
+    // first run to meet it was 64 bytes short of a 372 MiB region, which is the two rotary tables'
+    // padding and nothing else. `arena_reservation` is that sum, so a runner that reserves by the
+    // plan cannot be short by an alignment it did not know about.
+    let planned = minimax_h3::decoding::arena_reservation(&plan);
+    let raw: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
     // **The harness is also the runner.** The latents it uploads and the raster it decodes into are,
     // in service, the request's latent and `DecodedMedia.video` - the caller's buffers, which the
     // runner allocates and the plan deliberately does not count (`video_arena`'s note). Here they come
@@ -558,10 +603,12 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned at {}, {} KiB held by this harness, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {} ({} KiB of alignment), {} KiB held by this \
+         harness, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
         minimax_h3::text_encoder::element_of(dtype),
+        (planned - raw) >> 10,
         held >> 10,
         arena_bytes >> 20,
         if arena_bytes > reserved {
@@ -570,6 +617,23 @@ fn stage_decode(args: &Args) -> Result<()> {
             ""
         }
     );
+
+    // **Where each buffer will land.** A stop inside the arena names a size and an offset, and an
+    // offset is only readable against the placement that produced it - the harness's two buffers
+    // first, then the plan's entries at the arena's alignment. Printing it costs sixteen lines and
+    // turns "an arena that cannot give out" into a name and a number the moment it happens.
+    {
+        let mut at = held;
+        for buffer in &plan {
+            at = at.next_multiple_of(nn::forward::ALIGNMENT);
+            println!(
+                "  arena {:<22} {:>12} B at {at}",
+                buffer.name,
+                buffer.bytes()
+            );
+            at += buffer.bytes();
+        }
+    }
 
     // 6. The latents: the file the reference's own decoder is called with, packed into the rows this
     //    decoder reads. A missing file is generated from a fixed pattern instead, so the stage can run
@@ -819,10 +883,48 @@ fn stage_decode(args: &Args) -> Result<()> {
         element_of(dtype)?,
         &transposed,
     )?;
+    // **The raster in numpy's own container, beside the crate's.** `tools/diagnosis/compare.py`
+    // pairs the two implementations' trees by relative path and reads `.npy`; a raster written only
+    // as `.h3t` would appear there as a file the reference has and this crate does not - a false
+    // absence in a delivery artifact, which is worse than a missing row because it reads as a defect
+    // in the decoder. The two files hold the same numbers: the payload is the tensor's bytes, and the
+    // widening to `f32` is this container's one requirement (`diagnosis::write_npy`).
+    let raster_shape = [frames, u64::from(height), u64::from(width_px), channels];
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("raster.npy"),
+        &raster_shape,
+        &widen_to_f32(&transposed, dtype)?,
+    )
+    .map_err(Failure::message)?;
+    // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
+    // whole-raster residual: a seam that is faded with the wrong weight moves a band of a few dozen
+    // pixels, and the maximum over a 25-frame raster is somewhere else. The grid knows where every
+    // overlap is - each tile names the band it shares with the tile above and to its left, in output
+    // pixels - so the case states the bands and the comparator reports a row per band. The reference
+    // probe copies this `case.json` verbatim, so both sides are compared on the same bands rather
+    // than on two readings of the grid.
+    let ratio = config.video_vae.spatial_compression();
+    let mut seams = Vec::new();
+    for tile in &tiles {
+        for (axis, extent, start) in [
+            ("rows", tile.above, tile.latent_rows.0),
+            ("columns", tile.left, tile.latent_columns.0),
+        ] {
+            if extent == 0 {
+                continue;
+            }
+            let offset = start * ratio;
+            seams.push(format!(
+                "{{\"axis\": \"{axis}\", \"start\": {offset}, \"end\": {}}}",
+                offset + extent
+            ));
+        }
+    }
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
          \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
-         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}}}\n",
+         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}, \
+         \"seams\": [{}], \"checkpoint\": \"{}\"}}\n",
         height,
         width_px,
         canvas.frames,
@@ -832,6 +934,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         if generated { "generated" } else { "supplied" },
         tiles.len(),
         rows,
+        seams.join(", "),
+        args.root.display(),
     );
     std::fs::write(directory.join("case.json"), case).map_err(|error| {
         Failure::message(format!(
@@ -849,7 +953,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         walk_path.display()
     );
     println!(
-        "wrote {}/raster.h3t: [{frames}, {height}, {width_px}, {channels}] from {} tiles, latents {}",
+        "wrote {}/raster.h3t and raster.npy: [{frames}, {height}, {width_px}, {channels}] from {} \
+         tiles, latents {}",
         directory.display(),
         tiles.len(),
         if generated {
@@ -859,6 +964,547 @@ fn stage_decode(args: &Args) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// Stage 3: the raster path - `ref2va`'s video half, a reference clip's pixels to a latent and that
+/// latent back to a raster.
+///
+/// The decoder has its own stage and the video encoder is driven by the conditioner, but **no stage
+/// had the two meet in one process**, so the pair `ref2va` runs in sequence had never been measured
+/// against itself. This stage is that pair in one command: the raster's pixels are cut into the
+/// encoder's own tiles, encoded, projected and sampled into a latent, and the latent is handed to the
+/// decode of `--stage decode`, which runs here in process on the file this stage writes.
+///
+/// **Two frame arithmetics, and neither is the other.** The video encoder reads one still or one clip
+/// of `clip_length` frames and yields `token_drop` fewer latent frames
+/// ([`minimax_h3::encoding::VideoEncoder::latent_frames`]); the decoder decodes `canvas.frames` latent
+/// frames into `frames_out`. So this stage encodes the container's frame count, decodes the count the
+/// encoder states, and prints both: a decode told a clip's own number would read past its latent.
+///
+/// The input is the container `--stage decode` writes as `<out>/video_decoder/raster.h3t` -
+/// `[frames, rows, columns, channels]` FP32 - so the two stages chain without a conversion nobody
+/// recorded.
+/// Print the decoder's arena plan, and the tile grid it is derived from, with no device and no weights.
+///
+/// The plan is what the executor sizes the arena by, so a plan that is wrong is a run that stops with
+/// "the arena cannot give out" partway through a clip - the most expensive place to learn it. Every
+/// entry here is computed from the config and the canvas alone, so this stage answers on a host with no
+/// GPU, no store and no checkpoint shards, and it answers for a canvas the caller names rather than for
+/// the one this machine happens to serve.
+fn stage_plan(args: &Args) -> Result<()> {
+    let config = args.configuration()?;
+    let canvas = {
+        let mut canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
+        if let Some(frames) = args.frames {
+            canvas.frames = frames;
+        }
+        canvas
+    };
+    // The video VAE is F32 in every export this model serves (`component-tensors.json`: 703 tensors,
+    // all F32), and `--stage decode` pins the latent container to the checkpoint's own type for the
+    // same reason. The plan's element types follow the decode's, so the plan is stated at that type.
+    let dtype = nn::DType::F32;
+    let (height, width) = canvas.pixels(&config.video_vae);
+    let tiles = minimax_h3::video_vae::Tiles::of(&config.video_vae, &canvas)?;
+    let grid = tiles.tiles(&config.video_vae, &canvas);
+    println!(
+        "canvas: {} latent frames of {} x {} -> {} frames of {} x {} pixels, {} tile(s)",
+        canvas.frames,
+        canvas.height,
+        canvas.width,
+        canvas.frames_out(&config.video_vae),
+        height,
+        width,
+        grid.len()
+    );
+    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
+    let mut total = 0_u64;
+    for buffer in &plan {
+        let bytes = buffer.bytes();
+        total += buffer.reservation();
+        println!(
+            "  {:<14} {:<4} {:>12} elements {:>14} bytes",
+            buffer.name, buffer.element, buffer.elements, bytes
+        );
+    }
+    println!(
+        "plan: {} buffer(s), {} bytes = {} MiB (reserved {} MiB in the arena)",
+        plan.len(),
+        total,
+        total / (1 << 20),
+        plan.iter().map(|b| b.reservation()).sum::<u64>() / (1 << 20)
+    );
+    Ok(())
+}
+
+fn stage_raster(args: &Args) -> Result<()> {
+    let (latent_frames, latent_height, latent_width, latent_path) = encode_raster(args)?;
+    // The decode is the `decode` stage, unchanged: the same arithmetic, the same page, the same
+    // comparison. It is given the latent this stage wrote and the count the encoder stated.
+    let mut decoded = args.clone();
+    decoded.latents = Some(latent_path.clone());
+    decoded.frames = Some(latent_frames);
+    // The latent's own extents, which the encoder derived from the raster rather than from a flag: a
+    // decode told the flag's default would read a canvas the encode never produced.
+    decoded.latent_height = latent_height;
+    decoded.latent_width = latent_width;
+    println!(
+        "raster: encoded to {} latent frames -> {}; decoding them with the same stage a generated \
+         trajectory uses",
+        latent_frames,
+        latent_path.display()
+    );
+    stage_decode(&decoded)
+}
+
+/// The encode half of [`stage_raster`]: pixels to a latent, written where `--stage decode` reads one.
+///
+/// The device is opened, used and closed inside this function, because the decode that follows
+/// allocates its own pool: two components resident at once would ask the device for both the video
+/// encoder's and the decoder's weights, which no deployment of `ref2va` needs at once.
+fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
+    let store_root = args.store.clone().ok_or_else(|| {
+        Failure::message(
+            "stage `raster` needs a program store: pass --store <path> or set UNISERVE_STORE",
+        )
+    })?;
+    let config = args.configuration()?;
+    let ratio = config.video_vae.spatial_compression();
+
+    // 1. The raster, on the host: one still or one clip, FP32, `[frames, rows, columns, channels]`.
+    //    Its pixel extents are the encoder's input, so the latent extents are theirs divided by the
+    //    spatial compression rather than a flag that could disagree with them.
+    let (pixels_path, held, extents, payload) = match (&args.pixels, args.pattern) {
+        (Some(path), _) => {
+            let (held, extents, payload) = read_container(path)?;
+            (path.clone(), held, extents, payload)
+        }
+        (None, true) => {
+            // The **deployment's** canvas, not the latent flags' default: a drawn raster of extents no
+            // request can name is a raster no deployment serves, and this path exists to run the pair at
+            // the canvas the rows are keyed for. A flag pair that names an offered canvas is honoured;
+            // anything else - including the defaults - draws the first of the six.
+            let offered = offered_canvases();
+            let first = offered.first().ok_or_else(|| {
+                Failure::message("the deployment offers no canvas to draw".to_owned())
+            })?;
+            let canvas = offered
+                .iter()
+                .find(|canvas| {
+                    canvas.height == args.latent_height * ratio
+                        && canvas.width == args.latent_width * ratio
+                })
+                .unwrap_or(first);
+            let frames = config.video_vae.clip_length;
+            println!(
+                "raster: drawing the {} canvas, {frames} frames of {} x {} pixels",
+                canvas.name(),
+                canvas.height,
+                canvas.width
+            );
+            let (held, extents, payload) = pattern_pixels(frames, canvas.height, canvas.width)?;
+            (PathBuf::from("drawn"), held, extents, payload)
+        }
+        (None, false) => {
+            return Err(Failure::message(
+                "stage `raster` encodes a raster: pass --pixels <file>, one still or one clip of \
+                 `[frames, rows, columns, channels]` FP32 - or --pattern to draw one and run the path \
+                 before a reference clip exists",
+            ));
+        }
+    };
+    let (frames, rows, columns) = match extents.as_slice() {
+        [frames, rows, columns, channels] => {
+            if u64::from(minimax_h3::output::Rgb::CHANNELS) != *channels {
+                return Err(Failure::message(format!(
+                    "{}: {} channels; the video encoder reads {} (RGB)",
+                    pixels_path.display(),
+                    channels,
+                    minimax_h3::output::Rgb::CHANNELS
+                )));
+            }
+            (*frames, *rows, *columns)
+        }
+        other => {
+            return Err(Failure::message(format!(
+                "{}: holds {other:?}; this stage encodes one raster of [frames, rows, columns, \
+                 channels] - the layout `--stage decode` writes",
+                pixels_path.display()
+            )));
+        }
+    };
+    if held != CONTAINER_F32 {
+        return Err(Failure::message(format!(
+            "{}: element code {held}; the video encoder computes in F32, and this stage reads \
+             {CONTAINER_F32}",
+            pixels_path.display()
+        )));
+    }
+    let frames = u32::try_from(frames)
+        .map_err(|_| Failure::message(format!("{}: too many frames", pixels_path.display())))?;
+    let rows = u32::try_from(rows)
+        .map_err(|_| Failure::message(format!("{}: too many rows", pixels_path.display())))?;
+    let columns = u32::try_from(columns)
+        .map_err(|_| Failure::message(format!("{}: too many columns", pixels_path.display())))?;
+    // **The canvas is the deployment's, and it is refused by name.** A row keyed for a raster no
+    // request can name is a cell no launch reads, so the six the deployment offers are the only
+    // extents this stage encodes - the same rule the walks apply to their `--rasters`.
+    let offered = offered_canvases();
+    if !offered
+        .iter()
+        .any(|canvas| canvas.height == rows && canvas.width == columns)
+    {
+        let names: Vec<String> = offered
+            .iter()
+            .map(|canvas| format!("{} ({}x{})", canvas.name(), canvas.width, canvas.height))
+            .collect();
+        return Err(Failure::message(format!(
+            "{}: {rows}x{columns} is not one of the deployment's offered canvases {}",
+            pixels_path.display(),
+            names.join(", ")
+        )));
+    }
+    // **The frame count, before a weight is opened.** The encoder reads one still or one clip, and the
+    // clip's length is the configuration's: a raster of any other count has no path through the
+    // network, so the refusal belongs here rather than inside the first launch - a caller with a
+    // 3-frame container would otherwise load 4.5 GiB of weights to be told it cannot be read.
+    let clip_frames = config.video_vae.clip_length;
+    if frames != 1 && frames != clip_frames {
+        return Err(Failure::message(format!(
+            "{}: {frames} frames; the video encoder reads one still (1) or one {clip_frames}-frame \
+             clip, and a condition longer than a clip is cut by the runner into clips of that length",
+            pixels_path.display()
+        )));
+    }
+    // And `--frames` is a decode flag: this stage derives the latent's frame count from the raster and
+    // the encoder's own arithmetic, so a stated count would be silently replaced - refused instead.
+    if args.frames.is_some() {
+        return Err(Failure::message(
+            "stage `raster` derives the frame count from the raster and the encoder's clip \
+             arithmetic; `--frames` belongs to `--stage decode`, which reads a latent of that count"
+                .to_owned(),
+        ));
+    }
+    if !rows.is_multiple_of(ratio) || !columns.is_multiple_of(ratio) {
+        return Err(Failure::message(format!(
+            "{}: {rows} x {columns} pixels is not a multiple of the encoder's {ratio}-pixel spatial \
+             compression, so it has no latent raster",
+            pixels_path.display()
+        )));
+    }
+    let latent_height = rows / ratio;
+    let latent_width = columns / ratio;
+    let directory = args.out.join("video_decoder");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The checkpoint is opened **after** the raster is read: a wrong `--pixels` is a cheap failure and
+    // an index walk is not, so the input a caller typed is checked before the export is touched.
+    let checkpoint = Checkpoint::open(&args.root)?;
+
+    // 2. The device, the kernels, and the encoder's weights through the loader's own boundary.
+    let device = platform::Device::new(platform::DeviceId(args.device))?;
+    let _guard = device.enter()?;
+    let stream = device.stream()?;
+    let generation = load_generation(&device, &store_root)?;
+    let component = checkpoint.component(VAE)?;
+    let granularity =
+        u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    let needed = resident_bytes(
+        component,
+        minimax_h3::encoding::VideoEncoder::keys(&config.video_vae)?,
+        granularity,
+    )?;
+    let mut weights = DeviceWeights::new(&device, needed, granularity)?;
+    let encoder = {
+        let mut loader = WeightLoader::new(component, &mut weights, None, None);
+        minimax_h3::encoding::VideoEncoder::load(&config.video_vae, &mut loader)?
+    };
+    println!(
+        "weights: {} MiB published of {} MiB reserved (the video encoder alone - the decode that \
+         follows opens its own pool)",
+        weights.bytes >> 20,
+        weights.reserved >> 20
+    );
+
+    // 3. Two statements of the frame count, each its owner's. The encoder's clip arithmetic decides
+    //    the latent frames; nothing here restates it.
+    let latent_frames = encoder.latent_frames(frames)?;
+    let latent = minimax_h3::encoding::Extent {
+        frames: latent_frames,
+        height: latent_height,
+        width: latent_width,
+    };
+    println!(
+        "raster: {frames} frames of {rows} x {columns} pixels -> {latent_frames} latent frames of \
+         {latent_height} x {latent_width}"
+    );
+
+    // 4. The tiles the encoder's own grid splits the raster into, and the plan the driver executes.
+    let clip = minimax_h3::tiled_encode::ClipEncoder::new(rows, columns)?;
+    let plan = clip.plan();
+    let tile_extents = plan.tile_extents(frames);
+    let (origin, end) = plan.extent();
+    let run_rows = u64::from(end - origin);
+    println!(
+        "raster: {} tile(s), latents {} rows of {run_rows} run rows, {} seamless seam width(s)",
+        plan.tiles.len(),
+        end - origin,
+        clip.blend_extents().len()
+    );
+
+    // 5. The arena: the encoder's own set per tile extent, one pixel buffer per tile (the scene reads
+    //    every tile's pixels in one call, so the plan's single tile buffer is multiplied by the tile
+    //    count), the conditioning buffers the stint produces, and the latent this stage reads back.
+    let mut arena_plan = Vec::new();
+    for extent in &tile_extents {
+        arena_plan.extend(minimax_h3::encoding::video_encoder_tile_arena(
+            &config.video_vae,
+            *extent,
+        )?);
+    }
+    arena_plan.extend(minimax_h3::encoding::conditioning_arena(
+        &config.video_vae,
+        frames,
+        latent,
+    )?);
+    for extent in &tile_extents {
+        arena_plan.push(minimax_h3::decoding::Buffer {
+            name: "raster pixels".to_owned(),
+            element: "f32",
+            elements: u64::from(minimax_h3::output::Rgb::CHANNELS)
+                * u64::from(extent.frames)
+                * u64::from(extent.height)
+                * u64::from(extent.width),
+        });
+    }
+    let latent_channels = u64::from(config.video_vae.latent_channels);
+    let latent_elements =
+        latent_channels * u64::from(latent_frames) * run_rows * u64::from(latent_width);
+    arena_plan.push(minimax_h3::decoding::Buffer {
+        name: "raster latent".to_owned(),
+        element: "f32",
+        elements: latent_elements,
+    });
+    let planned = minimax_h3::decoding::arena_reservation(&arena_plan);
+    let allocator = weights.allocator();
+    let arena_bytes = planned.max(args.arena_gib << 30);
+    allocator.reserve(
+        platform::PoolKind::Graph,
+        usize::try_from(arena_bytes).unwrap_or(usize::MAX),
+    )?;
+    let region = allocator.allocate(
+        platform::PoolKind::Graph,
+        usize::try_from(arena_bytes).unwrap_or(usize::MAX),
+    )?;
+    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
+    println!(
+        "arena: {} buffers, {} MiB planned, {} MiB reserved",
+        arena_plan.len(),
+        planned >> 20,
+        arena_bytes >> 20
+    );
+
+    // 6. Every tile's pixels, cut from the raster on the host and packed: `FramePad` pads a frame's
+    //    rows in place of the source's own, so it reads a *packed* view, and a tile cut from a wider
+    //    raster carries the raster's row stride instead of the tile's width.
+    let mut views = Vec::with_capacity(plan.tiles.len());
+    for (tile, extent) in plan.tiles.iter().zip(&tile_extents) {
+        let packed = cut_raster_tile(
+            &payload,
+            frames,
+            rows,
+            columns,
+            tile.rows.0 * ratio,
+            tile.columns.0 * ratio,
+            extent,
+        )?;
+        let shape = Shape::new(&[
+            1,
+            u64::from(minimax_h3::output::Rgb::CHANNELS),
+            u64::from(extent.frames),
+            u64::from(extent.height),
+            u64::from(extent.width),
+        ]);
+        views.push(upload(&stream, &arena, DType::F32, shape, &packed)?);
+    }
+
+    // 7. The encode, the stitch, the projection and the posterior's sample: the crate's own order.
+    let blended = arena.tensor(
+        DType::F32,
+        Shape::new(&[
+            2 * latent_channels,
+            u64::from(latent_frames),
+            run_rows,
+            u64::from(latent_width),
+        ]),
+    )?;
+    clip.encode(
+        &forward,
+        &encoder,
+        &plan,
+        minimax_h3::tiled_encode::Scene {
+            pixels: &views,
+            blended,
+        },
+    )?;
+    let moments = arena.tensor(DType::F32, blended.shape)?;
+    encoder.project(&forward, blended, moments)?;
+    let drawn = arena.tensor(
+        DType::F32,
+        Shape::new(&[
+            latent_channels,
+            u64::from(latent_frames),
+            run_rows,
+            u64::from(latent_width),
+        ]),
+    )?;
+    let flat = drawn.reshape(Shape::new(&[
+        latent_channels * u64::from(latent_frames) * run_rows,
+        u64::from(latent_width),
+    ]));
+    nn::Noise::new().draw(
+        &forward,
+        flat,
+        nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
+        0,
+        0,
+        0,
+    )?;
+    let latent_view = arena.tensor(
+        DType::F32,
+        Shape::new(&[
+            latent_channels,
+            u64::from(latent_frames),
+            run_rows,
+            u64::from(latent_width),
+        ]),
+    )?;
+    encoder.posterior(&forward, moments, drawn, latent_view)?;
+    stream.synchronize()?;
+
+    // 8. The latent, read back and written in the container the decode already reads: a denoiser's
+    //    `[channels, frames, rows, columns]` in FP32, which `--stage decode` narrows to its own
+    //    element type and says so.
+    let elements = latent_elements;
+    let bytes = usize::try_from(elements * 4).unwrap_or(usize::MAX);
+    let host = download(&stream, latent_view, bytes)?;
+    if host.iter().all(|byte| *byte == 0) {
+        return Err(Failure::message(
+            "the encoded latent is all zeros: the encode wrote nothing, and a decode of it would be \
+             a decode of an empty buffer",
+        ));
+    }
+    let path = directory.join("latents.h3t");
+    write_h3t(
+        &path,
+        &[
+            latent_channels,
+            u64::from(latent_frames),
+            u64::from(latent_height),
+            u64::from(latent_width),
+        ],
+        CONTAINER_F32,
+        &host,
+    )?;
+    let case = directory.join("raster_case.json");
+    let stated = format!(
+        "{{\"raster\": \"{}\", \"frames\": {frames}, \"rows\": {rows}, \"columns\": {columns}, \
+         \"latent_frames\": {latent_frames}, \"latent_height\": {latent_height}, \
+         \"latent_width\": {latent_width}, \"tiles\": {}, \"checkpoint\": \"{}\"}}\n",
+        pixels_path.display(),
+        plan.tiles.len(),
+        args.root.display(),
+    );
+    std::fs::write(&case, stated)
+        .map_err(|error| Failure::message(format!("{}: {error}", case.display())))?;
+    println!(
+        "wrote {}: [{latent_channels}, {latent_frames}, {latent_height}, {latent_width}] FP32 from \
+         {frames} frames of {} - pass it to `--stage decode --frames {latent_frames}`",
+        path.display(),
+        pixels_path.display()
+    );
+    Ok((latent_frames, latent_height, latent_width, path))
+}
+
+/// A drawn raster: one clip of the model's own clip length, at the canvas's pixel extents.
+///
+/// The values are a fixed sawtooth, so two runs of the stage encode the same raster and a difference
+/// between their latents is the arithmetic rather than the input. A stage that needs real pixels is a
+/// stage that passes `--pixels`.
+fn pattern_pixels(frames: u32, rows: u32, columns: u32) -> Result<(u8, Vec<u64>, Vec<u8>)> {
+    let channels = u64::from(minimax_h3::output::Rgb::CHANNELS);
+    let elements = u64::from(frames) * u64::from(rows) * u64::from(columns) * channels;
+    let mut payload = Vec::with_capacity(usize::try_from(elements * 4).unwrap_or(0));
+    for index in 0..elements {
+        let value = f32::from(u16::try_from(index % 251).unwrap_or(0)) / 251.0;
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok((
+        CONTAINER_F32,
+        vec![
+            u64::from(frames),
+            u64::from(rows),
+            u64::from(columns),
+            channels,
+        ],
+        payload,
+    ))
+}
+
+/// One tile's pixels, cut from a `[frames, rows, columns, channels]` FP32 raster and packed as the
+/// encoder's `[1, channels, frames, tile_rows, tile_columns]`.
+///
+/// The copy is on the host because the raster arrives as host bytes: a caller uploads request pixels,
+/// and the encoder's `FramePad` reads a packed view, so the cut has to happen before the upload
+/// rather than as a device copy of a strided block.
+fn cut_raster_tile(
+    payload: &[u8],
+    frames: u32,
+    rows: u32,
+    columns: u32,
+    first_row: u32,
+    first_column: u32,
+    extent: &minimax_h3::encoding::Extent,
+) -> Result<Vec<u8>> {
+    let channels = u64::from(minimax_h3::output::Rgb::CHANNELS);
+    let mut out = Vec::with_capacity(
+        usize::try_from(
+            channels
+                * u64::from(extent.frames)
+                * u64::from(extent.height)
+                * u64::from(extent.width)
+                * 4,
+        )
+        .unwrap_or(0),
+    );
+    // The destination is channel-major (`[1, channels, frames, rows, columns]`) and the source is
+    // pixel-major (`[frames, rows, columns, channels]`), so the channel is the outer loop and the
+    // pixels are read from the one place the two layouts name the same element.
+    for channel in 0..channels {
+        for frame in 0..extent.frames {
+            for row in 0..extent.height {
+                for column in 0..extent.width {
+                    let pixel = (u64::from(frame) * u64::from(rows) + u64::from(first_row + row))
+                        * u64::from(columns)
+                        + u64::from(first_column + column);
+                    let at = (pixel * channels + channel) * 4;
+                    let at = usize::try_from(at).map_err(|_| {
+                        Failure::message("the raster's element offset is past usize".to_owned())
+                    })?;
+                    let four = payload.get(at..at + 4).ok_or_else(|| {
+                        Failure::message(format!(
+                            "the raster holds {at} bytes, which is short of [{frames}, {rows}, \
+                             {columns}, {channels}] at the tile starting at \
+                             ({first_row}, {first_column})"
+                        ))
+                    })?;
+                    out.extend_from_slice(four);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The `.h3t` element type of a dtype this harness writes.
@@ -1305,6 +1951,31 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// The `f32` bytes of a payload at `dtype`: the widening `diagnosis::write_npy` requires.
+///
+/// A decode at the checkpoint's own half precision writes its `.h3t` at that width, and the reference
+/// covers its `.npy` twin by widening on the reader's side. This crate writes both files from one
+/// payload, so the widening happens here: FP32 is copied, FP16 is widened exactly (every half is a
+/// value a `f32` holds), and any other width is refused by name rather than guessed at.
+fn widen_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::F32 => Ok(bytes.to_vec()),
+        DType::F16 => {
+            let mut widened = Vec::with_capacity(bytes.len() * 2);
+            for half in bytes.as_chunks::<2>().0 {
+                widened.extend_from_slice(
+                    &nn::weights::half_to_f32(u16::from_le_bytes(*half)).to_le_bytes(),
+                );
+            }
+            Ok(widened)
+        }
+        other => Err(Failure::message(format!(
+            "a raster at {other} has no `f32` twin this stage writes: it widens FP16 and copies \
+             FP32, and another width would have to be guessed at"
+        ))),
+    }
+}
+
 /// The frames one clip keeps: its body, the frames the final clip drops and the tail that overlaps the
 /// next clip - the span the decoder trims to, which is fewer than the frames it decodes.
 fn kept_frames(config: &minimax_h3::VideoVaeConfig) -> u64 {
@@ -1415,7 +2086,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     for element in bytes.chunks(from) {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
-            DType::F16 => out.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1453,7 +2124,7 @@ fn pattern_latents(
         // rounding and not in the pattern - which is what makes two pages comparable.
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
-            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1476,30 +2147,6 @@ fn bf16_bits(value: f32) -> u16 {
     } else {
         upper
     }
-}
-
-/// The nearest float16 bit pattern of `value`, by the round-to-nearest-even rule `DType::F16` keeps.
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00;
-    }
-    let shifted = exponent - 127 + 15;
-    if shifted >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if shifted <= 0 {
-        return sign;
-    }
-    let mut half = ((shifted as u32) << 10) | (mantissa >> 13);
-    let remainder = mantissa & 0x1fff;
-    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
-        half += 1;
-    }
-    sign | half as u16
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.

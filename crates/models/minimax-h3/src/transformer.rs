@@ -603,17 +603,30 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
+            // `SegmentAttention`'s fourth argument is the key **row** bound, not the tile bound:
+            // `keys` is "the largest key extent the compiled program serves, from the same
+            // packing", and the layer refuses a value that is not whole `tile`-row tiles. `tiles`
+            // is the reduction length in tiles, and passing it here compiled a program for
+            // `tiles` rows - 43x short of the deployment's packed bound - while passing the
+            // constructor's divisibility check whenever the tile bound happened to divide by the
+            // tile. The other call site (`attention_sparse.rs`) already passes `rows`.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles),
+                u64::from(rows),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
-            // `[rows, heads, width]` contiguous, and a factor row of `rotated` channels.
+            // `[rows, heads, width]` contiguous, and a factor row of **rotated pairs, not rotated
+            // channels**. The arena allocates the two tables `[tokens, pairs]` with
+            // `pairs = rope_frequency_dim * 3` (`denoiser.rs`, the two `arena.tensor` calls), which
+            // is half the `rotated` this operator counts: 48 against 96. Stating the channel count
+            // here named a key no launch asks for, and the launch would have refused it - the
+            // descriptor's stride is the table's own (`nn/src/layers/segments.rs`).
+            let pairs = u64::from(rotated) / 2;
             programs.launch::<ops::segments::VsaPrepareTiles>(
-                &tiles_layer.contiguous_prepare_descriptor(dtype, u64::from(rotated)),
+                &tiles_layer.contiguous_prepare_descriptor(dtype, pairs),
             );
             programs.launch::<ops::segments::VsaZeroPadding>(
                 &tiles_layer.zero_padding_descriptor(dtype),
@@ -651,27 +664,36 @@ impl Transformer {
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
-        for columns in [
-            u64::from(groups.count()),
-            18 * u64::from(hidden),
-            2 * u64::from(hidden),
+        //
+        // **The first gather is the only i32 one.** It reads each row's group tag, which the packing
+        // builds as i32; the other two read the AdaLN cache, whose tables the modulation projections
+        // build in the stack's own type (`dtype = "auto"` narrows the FP32 timestep pair into it once
+        // per evaluation), and `forward` gathers them from a table of the weight's own dtype. Stating
+        // i32 for all three named two keys no launch binds.
+        for (dtype, columns) in [
+            (nn::DType::I32, u64::from(groups.count())),
+            (dtype, 18 * u64::from(hidden)),
+            (dtype, 2 * u64::from(hidden)),
         ] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                nn::DType::I32,
-                columns,
-            )?);
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
         }
 
-        // The block's two modulated normalizations: the attention's (no update, no gate) and the
+        // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
         // feed-forward's (both, retaining the normalized row for the projection).
-        for (update, retain) in [(false, false), (true, true)] {
+        //
+        // The gate stride is `0` for the first because `forward` builds that norm with `None` for its
+        // gate - there is no gate projection on the attention's normalization, which is what the
+        // reference's `modulation` omits. Stating the cache row's stride there named a key no launch
+        // binds while the key the launch binds had no row: one wrong number on each side of the same
+        // defect, and a store built from the statement would have missed the row a run needs.
+        for (update, retain, gate) in [(false, false, 0), (true, true, interaction)] {
             programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
                 dtype,
                 dtype,
                 nn::DType::I32,
                 hidden,
                 config.norm_eps,
-                interaction,
+                gate,
                 interaction,
                 interaction,
                 update,
@@ -686,14 +708,24 @@ impl Transformer {
         )?);
 
         // The rotation and the attention, both over this rank's heads.
-        let sections = nn::layers::Sections::new(&rotated_axes(config))
-            .map_err(Error::from)?
-            .interleaved();
+        //
+        // **The factors are built contiguous and the rotation applies them interleaved**, and the two
+        // are separate keys for that reason: one spectrum over the three axes is written as three
+        // blocks (`188b8b1d5`), while the per-head rotation pairs the halves of a block. Stating the
+        // factors as `interleaved` named a key no launcher binds - the deployment list's contiguous row
+        // was the launch's, and this statement was the one that disagreed.
+        //
+        // The positions are the **integer** table: `position_ids` is declared `i32` beside the tables
+        // it is indexed with (`denoiser.rs`), a coordinate being an index rather than a measured value,
+        // so a statement typing them F32 named a key no launch binds - and the failure that produced
+        // says so in its own words (`generation 1 has no kernel for rotary_factors descriptor
+        // dtype_f32_positions_f32_columns_48`). The row the file holds is `positions_i32`.
+        let sections = nn::layers::Sections::new(&rotated_axes(config)).map_err(Error::from)?;
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
             rotated,
             1.0,
             Some(sections),
-            nn::DType::F32,
+            nn::DType::I32,
         ));
         programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
             head,
@@ -727,12 +759,21 @@ impl Transformer {
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
+        //
+        // **Both row strides are twice the width, because the two halves come from one packed
+        // projection.** `forward` reads them through `projection_halves`, which keeps the packed
+        // tensor's strides: a `[rows, 2 * intermediate]` buffer gives each half a row stride of
+        // `2 * intermediate`, and that is the number the kernel's descriptor carries - so this
+        // statement, the launch, and the deployment list's row are one value, not three. Stating the
+        // width here instead would have been a second, wrong answer to a question the launch already
+        // answers, and the walk that records the launch is what a store is built from.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
         programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
             dtype,
             u64::from(config.intermediate_size),
             nn::layers::Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
+            packed_stride,
+            packed_stride,
             u64::from(rows) * u64::from(config.intermediate_size),
             true,
         )?);
@@ -1279,6 +1320,79 @@ mod tests {
                 .iter()
                 .any(|(name, key)| name == "act_and_mul" && key.contains("stepwise_true")),
             "the block's activation is the stepwise recipe: {programs:?}"
+        );
+
+        // **The stated keys are the keys a launch binds**, and each of the four below is a defect this
+        // test would have caught: a `programs` statement that drifted from the `forward` beside it, so
+        // that a store built from the statement either held a program nothing launches or missed the
+        // one that runs.
+        //
+        // The activation reads the two halves of one packed `[rows, 2 * 14336]` projection, so both row
+        // strides are twice the width - `projection_halves` keeps the packed tensor's strides, and the
+        // launch passes `gate.strides[0]`.
+        assert!(
+            programs.iter().any(|(name, key)| name == "act_and_mul"
+                && key.contains("gate_stride_28672_value_stride_28672")),
+            "the block's activation reads a packed projection at twice the width: {programs:?}"
+        );
+        // The attention's normalization has **no gate** - `forward` builds it with `None` - so its
+        // gate stride is `0` while the feed-forward's reads the modulation cache. Stating the cache's
+        // stride for both named a key no launch binds.
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm" && key.contains("gate_stride_0_")),
+            "the attention's normalization carries no gate: {programs:?}"
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "modulated_rms_norm"
+                    && key.contains("gate_stride_32256_")),
+            "the feed-forward's normalization is gated: {programs:?}"
+        );
+        // Of the three row gathers, only the per-token **group tag** is i32; the two modulation tables
+        // are gathered at the stack's own type, so a statement that typed them i32 named two keys no
+        // launch binds - and the element type is the one field a row is written with.
+        let gathers = programs
+            .iter()
+            .filter(|(name, _)| name == "logits_gather")
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gathers
+                .iter()
+                .filter(|key| key.contains("dtype_i32"))
+                .count(),
+            1,
+            "only the group tag is i32: {gathers:?}"
+        );
+        assert!(
+            gathers
+                .iter()
+                .any(|key| key.contains("dtype_bf16_columns_96768"))
+                && gathers
+                    .iter()
+                    .any(|key| key.contains("dtype_bf16_columns_10752")),
+            "the modulation tables are gathered at the stack's type: {gathers:?}"
+        );
+
+        // The rotation's factor table: **contiguous** sections over the three axes (one spectrum
+        // written in blocks) and **integer** positions, because `position_ids` is an `i32` table - a
+        // coordinate is an index, not a measured value. Stating either the other way named a key no
+        // launch binds, and the store had the launch's row both times.
+        let factors = programs
+            .iter()
+            .find(|(name, _)| name == "rotary_factors")
+            .map(|(_, key)| key.clone())
+            .expect("the stack states one factor table");
+        assert!(
+            factors.contains("positions_i32"),
+            "the factor table reads the integer position table: {factors}"
+        );
+        assert!(
+            factors.contains("sections_32-32-32") && !factors.contains("interleaved_true"),
+            "the factor table is contiguous over three equal axes: {factors}"
         );
 
         // A conditioned deployment's modulation cache has four groups where a text-only one has two,
