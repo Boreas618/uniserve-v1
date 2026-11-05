@@ -1680,11 +1680,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
-                // A captured launch's bounds are the pose it was captured with, and a batch's span
-                // is its own: when the captured bound is larger, the kernel is told to run work this
-                // batch does not hold. That is a fact about the two numbers, so it is stated on
-                // every batch and not only under the dump - a bound taken from the wrong pose is
-                // invisible in every figure the batch itself computes.
                 // The captured launch's token bound is the pose the bucket was captured with, which
                 // `stage_warm` states as the bucket's whole extent; the batch's span is its own. When
                 // they differ the kernel is told to run work this batch does not hold, and that is a
