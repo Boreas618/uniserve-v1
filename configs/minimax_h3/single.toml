@@ -2,7 +2,12 @@
 # encoder. This is the smallest deployment that serves a `t2va` request whole -
 # one denoiser rank, one decoder, one encoder - and it is what a first end-to-end
 # run uses, because nothing about it depends on a second device.
-
+#
+# Every component is placed on this rank, the media ones included: `video_codec`, `muxer` and
+# `media_reader` encode and assemble on the host inside the main process (the executor's `Media`
+# lane, `MediaStage`), and a main process serves CUDA devices only - a rank on `cpu` is refused
+# when the node is launched. So a media component is a component of this group; what it runs on
+# is the host, and where it is placed is this rank.
 [[worker_groups]]
 id = "model"
 ranks = ["cuda:0"]
@@ -21,16 +26,8 @@ distribution = "temporal_units"
 [worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[worker_groups]]
-id = "media"
-ranks = ["cpu*4"]
-queue_depth = 6
-
 [worker_groups.components.video_codec]
-ranks = [0, 1]
 
 [worker_groups.components.muxer]
-ranks = [2]
 
 [worker_groups.components.media_reader]
-ranks = [3]
