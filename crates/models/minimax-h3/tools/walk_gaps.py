@@ -135,6 +135,30 @@ def clips(path):
     return []
 
 
+LADDER = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
+
+
+def ladder(path):
+    """The clip lengths a file states it serves, from its own `axes:` line.
+
+    A row set is stated for a set of clips. A walk at a clip outside that set produces
+    audio rows for a length no row set covers - so the difference between the sides is a
+    difference of deployment, and the comparison cannot separate it from a gap.
+    """
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            found = LADDER.search(line)
+            if found:
+                return [
+                    int(value)
+                    for value in found["list"].split(",")
+                    if value.strip()
+                ]
+    return []
+
+
 def statements(path):
     """What a file says about the raster it describes: `(rasters, text)`.
 
@@ -356,6 +380,17 @@ def wellformed(args):
     return 0
 
 
+def require_rows(walks):
+    """Refuse a walk with no rows: every comparison here passes if a side is empty."""
+    empty = [path for path in walks if not read_lines(path)]
+    if empty:
+        raise SystemExit(
+            f"{', '.join(empty)}: a walk with no rows proves nothing - every"
+            " comparison here passes when one side is empty, so the run that"
+            " produced this file failed before it printed a row"
+        )
+
+
 def phantom(args):
     """Operators the list holds and no walk in the set launches, with their row counts.
 
@@ -364,6 +399,7 @@ def phantom(args):
     written from the checkpoint's module names drifts from what the model builds: `snake_beta` is
     seven such rows, and the walk's own activation row is the fused `audio_activation`.
     """
+    require_rows(args.walk)
     walked = set()
     for path in args.walk:
         walked.update(operator for operator, _ in read_lines(path))
@@ -401,6 +437,29 @@ def by_shape(args):
             shapes.setdefault(shape_of(operator, key), {}).setdefault(
                 path, set()
             ).update(types_of(key))
+    # An empty walk is not a walk. Every lane below compares the two sides, and a
+    # side with no rows makes all of them pass on any list - the same vacuity the
+    # canvas union check refuses when its parts stop differing.
+    require_rows(args.walk)
+    # A walk at a clip the file does not serve is a different deployment, not a set of
+    # gaps: its audio rows are for a length no row set covers, and their widths would
+    # read as missing rows. Refused rather than classified.
+    served = ladder(args.fixture)
+    outside = sorted(
+        {
+            clip
+            for path in args.walk
+            for clip in clips(path)
+            if served and clip not in served
+        }
+    )
+    if outside:
+        raise SystemExit(
+            f"the walks state clip(s) {outside} and the file states {served}: a walk "
+            "at a clip the file does not serve produces audio rows for a length no row "
+            "set covers, so this comparison cannot separate a gap from a different "
+            "deployment of the same model"
+        )
     fixture = read_lines(args.fixture)
     held = {shape_of(operator, key) for operator, key in fixture}
 
@@ -590,6 +649,28 @@ def self_test() -> int:
     # states a count it does not hold, a repeated line, and an operator `crates/ops` does not
     # define. Each is a failure of the file rather than a missing row, so no walk comparison sees
     # it - the count is quoted by every reader after it.
+    # A walk with no rows must be refused rather than compared: every comparison
+    # below passes when one side is empty, which is what this checks.
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        blank = root / "empty.txt"
+        blank.write_text("")
+        held = root / "held.txt"
+        held.write_text(
+            "# 1 data row\nrms_norm\tdtype_bf16_columns_5376_block_1024\n"
+        )
+        for compare in (by_shape, phantom):
+            try:
+                compare(
+                    argparse.Namespace(walk=[str(blank)], fixture=str(held))
+                )
+            except SystemExit as refused:
+                assert "a walk with no rows proves nothing" in str(refused), refused
+            else:
+                raise AssertionError(
+                    f"an empty walk was compared by {compare.__name__}"
+                )
+
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         good = root / "good.txt"
