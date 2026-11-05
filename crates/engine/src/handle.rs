@@ -48,7 +48,7 @@ where
     }
 }
 
-/// The meeting point of the schedulers that run one worker hook together
+/// The meeting point of the schedulers that run one executor hook together
 /// ([`Command::Hook`]).
 ///
 /// The schedulers of one engine serve ranks of one expert union, and a rank
@@ -177,13 +177,13 @@ impl std::fmt::Debug for CommandWaker {
 /// one request's event channel.
 type Handoff = Arc<Mutex<VecDeque<Event>>>;
 
-/// Pollable command ingress whose lifetime is independent of Worker membership.
+/// Pollable command ingress whose lifetime is independent of Executor membership.
 ///
 /// A nonblocking Unix socket pair: the `CommandWaker` from [`Self::waker`]
 /// owns the write end and writes a byte per wake (a full socket already holds
 /// a pending notification), and the owner polls [`Self::descriptor`] for
 /// readability and consumes the bytes with [`Self::drain`]. `Dispatcher`
-/// owns one beside its worker groups and polls it with their progress
+/// owns one beside its executor groups and polls it with their progress
 /// descriptors.
 pub(crate) struct WakeSignal {
     reader: std::os::unix::net::UnixStream,
@@ -278,8 +278,8 @@ pub enum SubmitError {
     #[error("engine command channel is closed")]
     /// The scheduler command channel is closed to submissions.
     Closed,
-    #[error("engine is unavailable after a worker failure")]
-    /// A terminal worker failure made the engine unavailable.
+    #[error("engine is unavailable after an executor failure")]
+    /// A terminal executor failure made the engine unavailable.
     Dead,
 }
 
@@ -671,28 +671,28 @@ pub enum Command {
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Commits a successor scheduler (`Scheduler::commit`), and answers
-    /// with what each worker reported.
+    /// with what each executor reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Publishes the committed world's immutable pages on every claimed node.
     PublishWorld(crossbeam_channel::Sender<Result<(), String>>),
     /// Ends the storage of other worlds on the nodes of the scheduler's
-    /// workers (`Executor::retire`), and answers whether it did.
+    /// executors (`Executor::retire`), and answers whether it did.
     Retire {
         worlds: Vec<u64>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Reads the storage ledgers of the nodes of the scheduler's workers
+    /// Reads the storage ledgers of the nodes of the scheduler's executors
     /// (`Executor::ledgers`), and answers with each node's.
     Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use on the nodes of the scheduler's
-    /// workers (`Executor::throttle`), and answers with those nodes' hosts.
+    /// executors (`Executor::throttle`), and answers with those nodes' hosts.
     Throttle {
         halve: bool,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Keeps the weights alone of other worlds on the nodes of the
-    /// scheduler's workers, in host storage when `to_host`
+    /// scheduler's executors, in host storage when `to_host`
     /// (`Executor::keep_weights`), and answers with each node's report.
     KeepWeights {
         worlds: Vec<u64>,
@@ -700,7 +700,7 @@ pub enum Command {
         cache_keys: Vec<Vec<u8>>,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
-    /// Reports the KV cache each worker group holds now
+    /// Reports the KV cache each executor group holds now
     /// (`Scheduler::describe_cache`).
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
@@ -783,8 +783,8 @@ pub enum Command {
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
-    /// Runs the worker hook `name` with `payload` on every worker once the
-    /// batches in flight complete, and answers with each worker's result.
+    /// Runs the executor hook `name` with `payload` on every executor once the
+    /// batches in flight complete, and answers with each executor's result.
     /// Every scheduler `together` names runs it at once: none runs it
     /// before all have no batch in flight, and none schedules again before
     /// all ran it.
@@ -801,14 +801,14 @@ pub enum Command {
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Gives back or restores KV cache storage (`Scheduler::resize_cache`),
-    /// and answers with what each worker reported.
+    /// and answers with what each executor reported.
     ResizeCache {
         change: CacheChange,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Rewrites the weights in place from the checkpoint at `model_path`
     /// (`Scheduler::update_weights`), the requests in flight continuing as
-    /// `in_flight` says, and answers with what each worker reported.
+    /// `in_flight` says, and answers with what each executor reported.
     UpdateWeights {
         model_path: String,
         in_flight: WeightsInFlight,
@@ -1083,7 +1083,7 @@ impl CommandSender {
         published
     }
 
-    /// Ends the storage of `worlds` on the nodes of the scheduler's workers
+    /// Ends the storage of `worlds` on the nodes of the scheduler's executors
     /// (`Command::Retire`); the receiver gets whether it did.
     pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, retired) = crossbeam_channel::bounded(1);
@@ -1092,7 +1092,7 @@ impl CommandSender {
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// workers, in host storage when `to_host` (`Command::KeepWeights`); the
+    /// executors, in host storage when `to_host` (`Command::KeepWeights`); the
     /// receiver gets each node's report.
     pub fn keep_weights(
         &self,
@@ -1110,7 +1110,7 @@ impl CommandSender {
         kept
     }
 
-    /// Reads the storage ledgers of the nodes of the scheduler's workers
+    /// Reads the storage ledgers of the nodes of the scheduler's executors
     /// (`Command::Ledgers`); the receiver gets each node's.
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, read) = crossbeam_channel::bounded(1);
@@ -1130,7 +1130,7 @@ impl CommandSender {
         throttled
     }
 
-    /// Reports the KV cache each worker group holds now
+    /// Reports the KV cache each executor group holds now
     /// (`Command::DescribeCache`).
     pub fn describe_cache(
         &self,
@@ -1372,7 +1372,7 @@ impl CommandSender {
     }
 
     /// Commits a successor scheduler's world (`Command::Commit`); the
-    /// receiver gets what each worker reported.
+    /// receiver gets what each executor reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, committed) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Commit(answer));
@@ -1384,8 +1384,8 @@ impl CommandSender {
         let _ = self.send(Command::FlushCache);
     }
 
-    /// Runs the worker hook `name` (`Command::Hook`) together with the
-    /// other schedulers of `together`; the receiver gets each worker's
+    /// Runs the executor hook `name` (`Command::Hook`) together with the
+    /// other schedulers of `together`; the receiver gets each executor's
     /// result, or why the hook failed.
     pub fn hook(
         &self,
@@ -1427,7 +1427,7 @@ impl CommandSender {
     }
 
     /// Gives back or restores KV cache storage (`Command::ResizeCache`); the
-    /// receiver gets what each worker reported, or why the change failed.
+    /// receiver gets what each executor reported, or why the change failed.
     pub fn resize_cache(
         &self,
         change: CacheChange,
@@ -1443,7 +1443,7 @@ impl CommandSender {
 
     /// Rewrites the weights in place from the checkpoint at `model_path`,
     /// the requests in flight continuing as `in_flight` says
-    /// (`Command::UpdateWeights`); the receiver gets what each worker
+    /// (`Command::UpdateWeights`); the receiver gets what each executor
     /// reported, or why the update failed.
     pub fn update_weights(
         &self,

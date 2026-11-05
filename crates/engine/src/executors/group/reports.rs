@@ -9,7 +9,7 @@ use anyhow::Context;
 use ipc::Batch;
 
 use super::{CallIdentity, call_identity};
-use crate::executor::{CallResult, WorkerResult};
+use crate::executor::{CallResult, ExecutorResult};
 
 /// Consume selected calls while retaining the rank results that hold the
 /// rest. A rank result's aggregate statistics are emitted once, when its final
@@ -21,12 +21,12 @@ use crate::executor::{CallResult, WorkerResult};
 /// keeps a product, and, with `retain_forward_stats`, when the selection
 /// drains more than one result carrying forward statistics.
 pub(super) fn take_rank_calls(
-    buffer: &mut VecDeque<WorkerResult>,
+    buffer: &mut VecDeque<ExecutorResult>,
     batch: &Batch,
     identities: &[CallIdentity],
     retain_forward_stats: bool,
-) -> anyhow::Result<WorkerResult> {
-    let mut output = WorkerResult {
+) -> anyhow::Result<ExecutorResult> {
+    let mut output = ExecutorResult {
         batch_id: batch.batch_id,
         done: false,
         results: Vec::with_capacity(identities.len()),
@@ -93,7 +93,7 @@ pub(super) fn take_rank_calls(
 }
 
 /// Returns the call identifiers carried by a rank report.
-pub(super) fn report_call_ids(report: &WorkerResult) -> Vec<CallIdentity> {
+pub(super) fn report_call_ids(report: &ExecutorResult) -> Vec<CallIdentity> {
     let mut ids = report
         .results
         .iter()
@@ -108,8 +108,8 @@ pub(super) fn report_call_ids(report: &WorkerResult) -> Vec<CallIdentity> {
 /// publishes host products.
 pub(super) fn merge_rank_report(
     batch: &Batch,
-    canonical_report: &mut WorkerResult,
-    participant_report: &WorkerResult,
+    canonical_report: &mut ExecutorResult,
+    participant_report: &ExecutorResult,
     rank: usize,
 ) -> anyhow::Result<()> {
     let batch_id = batch.batch_id;
@@ -171,7 +171,7 @@ pub(super) fn merge_rank_report(
 /// Validates a rank report and orders completions to match the submitted call sequence.
 pub(super) fn validate_and_order_rank_report(
     batch: &Batch,
-    report: &mut WorkerResult,
+    report: &mut ExecutorResult,
     rank: usize,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(

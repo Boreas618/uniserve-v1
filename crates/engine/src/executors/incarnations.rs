@@ -5,7 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use ipc::WorkerEndpoint;
 
-use crate::WorkerGroupId;
+use crate::ExecutorGroupId;
 
 /// The executor and rank each live rank incarnation was launched as.
 ///
@@ -20,7 +20,7 @@ use crate::WorkerGroupId;
 /// Clones share one table.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IncarnationRegistry {
-    positions: Arc<RwLock<HashMap<String, (WorkerGroupId, u32)>>>,
+    positions: Arc<RwLock<HashMap<String, (ExecutorGroupId, u32)>>>,
 }
 
 impl IncarnationRegistry {
@@ -29,7 +29,7 @@ impl IncarnationRegistry {
     /// Every incarnation `executor` held before is retired.
     pub(crate) fn assign<'a>(
         &self,
-        worker: &WorkerGroupId,
+        worker: &ExecutorGroupId,
         endpoints: impl IntoIterator<Item = &'a WorkerEndpoint>,
     ) {
         let mut positions = self
@@ -44,7 +44,7 @@ impl IncarnationRegistry {
 
     /// Returns the executor and rank `endpoint`'s incarnation serves, or `None`
     /// when it is not a live incarnation of this deployment.
-    pub(crate) fn position(&self, endpoint: &WorkerEndpoint) -> Option<(WorkerGroupId, u32)> {
+    pub(crate) fn position(&self, endpoint: &WorkerEndpoint) -> Option<(ExecutorGroupId, u32)> {
         self.positions
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -70,8 +70,8 @@ mod tests {
     #[test]
     fn replacement_retires_the_replaced_incarnations_of_that_worker_only() {
         let incarnations = IncarnationRegistry::default();
-        let text = WorkerGroupId("text".to_owned());
-        let decoder = WorkerGroupId("decoder".to_owned());
+        let text = ExecutorGroupId("text".to_owned());
+        let decoder = ExecutorGroupId("decoder".to_owned());
         let before = [endpoint("text-0"), endpoint("text-1")];
         let other = endpoint("decoder-0");
         incarnations.assign(&text, &before);

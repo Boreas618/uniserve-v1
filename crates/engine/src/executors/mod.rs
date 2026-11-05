@@ -3,7 +3,7 @@
 //! The engine drives GPU and host work through executor processes. An
 //! `ExecutorGroup` (in `group`) is one group's cooperating executor processes: it projects
 //! each submitted `Batch` onto the ranks whose components own its calls, joins
-//! their agreeing results into `WorkerResult`s, and replaces the whole group
+//! their agreeing results into `ExecutorResult`s, and replaces the whole group
 //! when a rank is lost. `Dispatcher` (in `dispatch`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
 //! channel, `registry` the listener ranks connect to and register at, and
@@ -102,13 +102,13 @@ pub struct ExecutorProcessArgs {
     /// checkpoint's tensors in place of its files; `None` reads the files.
     pub weights: Option<String>,
     /// Ordered physical members of this executor group.
-    pub ranks: Vec<crate::WorkerRank>,
+    pub ranks: Vec<crate::ExecutorRank>,
     /// This process's own host identity. The engine owns exactly the ranks
     /// whose placement host matches it, so a placement may name its host
     /// explicitly instead of relying on a reserved local name.
     pub host: String,
     /// Whether this group owns model capabilities or shared routed experts.
-    pub role: crate::WorkerGroupRole,
+    pub role: crate::ExecutorGroupRole,
     /// Component membership and parallel geometry.
     pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
     /// Every executor's component membership, keyed by executor identity, this
@@ -177,7 +177,7 @@ pub struct ExecutorProcessArgs {
     pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
     /// Each rank's share of its device's total storage, which bounds the
     /// process's static allocations, weights and KV cache;
-    /// `WorkerGroupConfig::validate_mem_fraction_static` states its range.
+    /// `ExecutorGroupConfig::validate_mem_fraction_static` states its range.
     pub mem_fraction_static: f64,
     /// Generation-tower placement, `tower=gen:<device>`: the tower's modules
     /// on a device other than the rank's; the rank parses it.
