@@ -514,7 +514,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     // 5. The arena: `video_arena` is the plan the runner reserves by, and this harness uses it rather
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
-    let plan = video_arena(&config.video_vae, &canvas)?;
+    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
     let mut planned = 0_u64;
     for buffer in &plan {
         planned += buffer.elements * buffer.width()?;
@@ -535,9 +535,10 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {}, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
+        minimax_h3::text_encoder::element_of(dtype),
         arena_bytes >> 20,
         if arena_bytes > planned {
             " (the flag raised it; the plan alone is what the decode needs)"
