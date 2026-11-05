@@ -504,6 +504,21 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
 
     let (after, terminal) = drain(&mut events);
     tokens.extend(after);
+    // A refused input is injected in two halves: the refusing batch, and the
+    // batch that was in flight behind it, whose report the fixture holds until
+    // the scheduler asks for it. That ask is the scheduler's next poll, and
+    // with the request already failed it comes when the scheduler parks, not
+    // when it plans. The case reads how many halves the engine took, so the
+    // wait is for the injection to finish and not for the engine to do more:
+    // a scheduler that stops polling keeps the count at one and the case says
+    // so.
+    let expected_batches = usize::from(fault == Fault::Refused) * 2;
+    let inject = Instant::now() + Duration::from_secs(5);
+    while refused_batches.load(std::sync::atomic::Ordering::SeqCst) < expected_batches
+        && Instant::now() < inject
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
     // A scheduler on trial that a fault stopped has ended its loop.
     if !(trial && failure.get().is_some()) {
         handle.shutdown();
