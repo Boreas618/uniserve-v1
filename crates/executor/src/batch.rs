@@ -477,12 +477,10 @@ impl Job {
                 batch.0, bucket.tokens, bucket.rows
             ),
             Self::Capture { bucket, generation, .. } => format!(
-                "capturing the bucket of {} tokens and {} rows of generation {generation}",
-                bucket.tokens, bucket.rows
+                "capturing bucket {bucket} of generation {generation}"
             ),
             Self::Rebind { bucket, generation, .. } => format!(
-                "rebinding the bucket of {} tokens and {} rows of generation {generation}",
-                bucket.tokens, bucket.rows
+                "rebinding bucket {bucket} of generation {generation}"
             ),
             Self::Shadow {
                 operator,
