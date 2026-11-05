@@ -509,9 +509,9 @@ pub struct VideoDecoder {
     /// its rows by spatiotemporal tile, so the table differs from the dense one and is the model's own
     /// constant, published at load by [`pack_voxel_rows`].
     voxel_rows: Weight,
-    /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of the canvas rather than
+    /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of a **tile** rather than
     /// a checkpoint tensor. The dense attention's flash backend serves the packed form only — it hands
-    /// the vendor's `cu_seqlens` path its offsets and refuses a null table — so one clip is the packed
+    /// the vendor's `cu_seqlens` path its offsets and refuses a null table — so one tile is the packed
     /// form of one sequence and states its offsets.
     offsets: Weight,
     config: VideoVaeConfig,
@@ -1125,15 +1125,22 @@ impl VideoDecoder {
                 largest_tile(config, canvas.height, canvas.width)?,
             )?,
             offsets: {
-                // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
-                // created once with the weights and read by every clip's attention launch.
-                let rows = i32::try_from(canvas.rows()).map_err(|_| {
-                    Error::config("a clip's rows exceed a sequence offset".to_owned())
+                // `[0, rows]`: one sequence starting at row zero, **of one tile** - the same subject as
+                // `voxel_rows` and for the same reason. `decode` hands the attention a tile's rows and
+                // this table bounds the sequence it describes, so a clip-sized total made the kernel read
+                // a sequence the buffer does not hold: past the tile's rows for every tile but the first
+                // on a served canvas. Where the flash form is not served the table is unused, and the
+                // tile's rows are still the right constant.
+                let tile = largest_tile(config, canvas.height, canvas.width)?;
+                let rows = i32::try_from(tile.rows()).map_err(|_| {
+                    Error::config("a tile's rows exceed a sequence offset".to_owned())
                 })?;
                 let mut bytes = Vec::with_capacity(8);
                 for offset in [0i32, rows] {
                     bytes.extend_from_slice(&offset.to_le_bytes());
                 }
+                let declared_sizes = constants(config, canvas, u64::from(width), dtype)?;
+                declared(&declared_sizes, "video_vae.sequence_offsets", bytes.len())?;
                 loader.constant(
                     "video_vae.sequence_offsets",
                     DType::I32,
@@ -1200,6 +1207,10 @@ pub fn constants(
             "video_vae.voxel_rows".to_owned(),
             largest_tile(config, canvas.height, canvas.width)?.voxels() * 4,
         ),
+        // `[0, rows]`: two `i32`s, and the one constant `load` publishes that this list did not state -
+        // so a caller reserving by the list was short of it by a rounding step, and a check that every
+        // published constant is declared could not see it.
+        ("video_vae.sequence_offsets".to_owned(), 8),
     ])
 }
 
