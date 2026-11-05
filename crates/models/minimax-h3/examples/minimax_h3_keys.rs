@@ -341,14 +341,11 @@ fn main() {
         )
         .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
         let partition = minimax_h3::Partition::single();
+        let Some(dies) = config.denoisers.values().next() else {
+            panic!("the checkpoint states no DiT, so its arrangement is not statable")
+        };
         let arrangement = partition
-            .arrangement(
-                config
-                    .denoisers
-                    .values()
-                    .next()
-                    .expect("the checkpoint states a DiT"),
-            )
+            .arrangement(dies)
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
         match deployment.denoiser_rows(
             &partition,
