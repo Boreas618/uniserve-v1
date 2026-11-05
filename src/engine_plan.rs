@@ -577,13 +577,21 @@ impl EpochPlan {
                 ));
             }
         }
-        let decode_buckets: Vec<executor::plan::Bucket> = candidates
-            .iter()
-            .map(|candidate| {
-                executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
-            })
-            .collect();
         let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+        // **A decode bucket is one decode unit, not the timeline.** The video decoder decodes a clip
+        // of the checkpoint's own window - `decode_latents` latent frames, `frames_out` native ones -
+        // and a timeline longer than one is spliced from its units. A bucket naming the deployment's
+        // whole clip asked one decode call for a raster no decoder produces.
+        let window = minimax_h3::video_vae::decode_latents(&config.video_vae)
+            * config.video_vae.temporal_compression();
+        let mut decode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        for candidate in &candidates {
+            let bucket =
+                executor::plan::Bucket::clip(window, candidate.height, candidate.width);
+            if !decode_buckets.contains(&bucket) {
+                decode_buckets.push(bucket);
+            }
+        }
         let hidden = config.text_encoder.hidden_size;
         let text = pipeline.text_encoder().context(
             "the checkpoint holds no text encoder, so a media request's prompt could not be \
@@ -957,9 +965,9 @@ impl EpochPlan {
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
                     proto::request::ModelDtype::Float32 => DType::F32,
                 };
-                let canvas = deployment_canvas(&self.build.video)?;
+                let canvases = deployment_canvases(&self.build.video)?;
                 let model =
-                    minimax_h3::load(&opened, partition, Some(dtype), canvas, &mut loader)?;
+                    minimax_h3::load(&opened, partition, Some(dtype), &canvases, &mut loader)?;
                 let served = Served::Media(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))
@@ -1563,6 +1571,27 @@ fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Resul
         .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
 }
 
+/// The least legal timeline of at least `frames` frames (`17 * n + 5`).
+///
+/// A timeline is one 17-frame body per clip plus a 5-frame tail (`VideoPostprocessor::splices_of`),
+/// so the legal counts are 22, 39, 56, … A deployment states a duration in seconds and the model
+/// admits the least of those covering it: 4 s is 96 frames and snaps to 107, 15 s is 360 and snaps
+/// to 362.
+fn snap_frames(frames: u32) -> Result<u32> {
+    use minimax_h3::config::CLIP_FRAMES;
+    // The tail is the timeline's own: `Ref2Va`'s overlap frames, the same five the splice fades.
+    let tail = minimax_h3::output::Rgb::OVERLAP_FRAMES;
+    if frames < CLIP_FRAMES + tail {
+        bail!(
+            "this deployment's longest clip is {frames} frame(s) and a timeline is at least {} \
+             ({CLIP_FRAMES} body frames and a {tail}-frame tail)",
+            CLIP_FRAMES + tail
+        );
+    }
+    let beyond = frames - tail;
+    Ok(tail + beyond.div_ceil(CLIP_FRAMES) * CLIP_FRAMES)
+}
+
 /// The warm candidates a media deployment binds its denoiser with.
 ///
 /// **One candidate per (task, canvas, prompt capacity) the deployment serves.** A denoiser bucket is
@@ -1594,7 +1623,10 @@ fn media_candidates(
             video.max_seconds
         );
     }
-    let frames = frames as u32;
+    // **The timeline rule is the checkpoint's** (`17 * n + 5`): a deployment states a duration, and
+    // the frames it admits are the least legal timeline covering it. An unsnapped count captured a
+    // layout the splice could not write and the decoder could not decode.
+    let frames = snap_frames(frames as u32)?;
     for edge in &video.resolutions {
         let short_edge: u32 = edge
             .strip_suffix('p')
@@ -1650,16 +1682,16 @@ fn media_candidates(
     Ok(candidates)
 }
 
-/// The one raster this deployment's video decoder is built for, in pixels.
+/// The rasters this deployment's video decoder serves, in pixels, in the order it names them.
 ///
 /// **A canvas is the deployment's statement, not the checkpoint's**: `video_config.resolutions` and
 /// `video_config.aspect_ratios` name it, and the checkpoint is asked which raster that pair is
-/// (`NAMED_CANVASES`). **A rank serves one raster**, because the decoder's register rows, its
-/// voxel-row table and its sequence offsets are that raster's constants rather than a request's -
-/// they are published at load, so a second canvas needs a second decoder, which this build does not
-/// yet bind. A deployment that names more than one is therefore refused here, by both rasters
-/// named, rather than at the first clip that arrives with the other one.
-fn deployment_canvas(video: &daemon::options::VideoOptions) -> Result<(u32, u32)> {
+/// (`NAMED_CANVASES`). **One decoder serves the whole set**, because the constants a decode reads
+/// are a tile's (its voxel permutation, its register and zero-row offsets) or a width's (the zero
+/// row, the rotary frequencies) - the same for every canvas, so a canvas of the set is a lookup and
+/// costs no device storage. The one per-canvas figure is the attention block's row bound, taken as
+/// the largest.
+fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32, u32)>> {
     use minimax_h3::config::NAMED_CANVASES;
     let mut canvases: Vec<(u32, u32)> = Vec::new();
     for edge in &video.resolutions {
@@ -1696,20 +1728,10 @@ fn deployment_canvas(video: &daemon::options::VideoOptions) -> Result<(u32, u32)
             }
         }
     }
-    match canvases.as_slice() {
-        [one] => Ok(*one),
-        [] => bail!("this deployment prepares no resolution class, so no raster could be decoded"),
-        many => bail!(
-            "this deployment prepares {} rasters ({}), and a video decoder is built for one: its \
-             register rows, voxel rows and sequence offsets are that raster's constants. State one \
-             resolution class and one aspect ratio",
-            many.len(),
-            many.iter()
-                .map(|(width, height)| format!("{width}x{height}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    if canvases.is_empty() {
+        bail!("this deployment prepares no resolution class, so no raster could be decoded");
     }
+    Ok(canvases)
 }
 
 /// The model class a checkpoint declares, as the checkpoint itself states it.
