@@ -1301,6 +1301,16 @@ fn stage_encode(args: &Args) -> Result<()> {
         code_of(dtype),
         &payload,
     )?;
+    // The same numbers in the container the guild's comparison reads. `.h3t` keeps the checkpoint's
+    // own type; `.npy` is FP32 because that is what `numpy.save` writes, and widening BF16 or F16 to
+    // it is exact - so the twin is a second container for one computation, not a second computation.
+    let widened = minimax_h3::diagnosis::f32_bytes_of(dtype, &payload).map_err(Failure::message)?;
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("prompt_hidden.npy"),
+        &[rows, hidden],
+        &widened,
+    )
+    .map_err(Failure::message)?;
     let ids_json = ids
         .iter()
         .map(u32::to_string)

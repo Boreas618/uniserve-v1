@@ -347,6 +347,21 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         } else {
             Dit::Base
         };
+        // The table is one export's - `MiniMax-H3` - and this tool runs against any checkpoint it is
+        // pointed at. A row whose partition this checkpoint does not hold is **not bounded here**:
+        // the figures are for another export, and calling that an overstatement would make the tool
+        // refuse to run on the FastH3 students, which are exactly what a diagnosis reads.
+        let required = match placed {
+            Dit::Base => "transformer",
+            Dit::Reference => "transformer_ref",
+        };
+        if !component_bytes.contains_key(required) {
+            println!(
+                "weights {deployment}: not bounded here - this checkpoint holds no {required}/, so \
+                 the table's row describes another export"
+            );
+            continue;
+        }
         let unplaced = match placed {
             Dit::Base => "transformer_ref",
             Dit::Reference => "transformer",
@@ -586,7 +601,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         );
         let still = minimax_h3::video_vae::Canvas {
             frames: 1,
-            ..latent.clone()
+            ..latent
         };
         let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?
             .iter()
