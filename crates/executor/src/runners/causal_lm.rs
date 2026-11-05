@@ -2879,6 +2879,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let live = self.staging.live_tokens().max(1);
         let held = page_size.min(live);
         let mut out = String::from(" cache:");
+        let first_elements = planes
+            .first()
+            .map(|plane| plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3)))
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "(page {page}, {held} token(s), {} bytes each)",
+            held.saturating_mul(first_elements).saturating_mul(element)
+        ));
         for (layer, plane) in planes.iter().enumerate() {
             let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
             let page_elements = page_size.saturating_mul(token_elements);
