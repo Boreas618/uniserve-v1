@@ -348,7 +348,12 @@ impl Lifecycle {
             applied += prepared.rebind_launch(operator, ordinal, &params)?;
         }
         self.graphs.insert(bucket, generation, prepared);
-        tracing::debug!(bucket = %bucket, applied, "rebound a bucket for a new generation");
+        // At `info`, because a run's log is where the delivery test's two mechanisms are told apart:
+        // a recapture states itself at `info` a page below, and a rebind that stated itself at
+        // `debug` would be indistinguishable from a bucket the update never prepared at all. `applied`
+        // is the number of node tables set on the executable the serving graph's own template built,
+        // which is the strongest statement this layer can make about what happened (7.3).
+        tracing::info!(bucket = %bucket, generation, applied, "rebound a bucket for a new generation");
         Ok(())
     }
 
