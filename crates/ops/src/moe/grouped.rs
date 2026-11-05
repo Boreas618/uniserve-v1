@@ -1074,7 +1074,6 @@ impl GatherGemmNvfp4 {
         // refuse every launch whose sort pads anything. Neither artifact launch reads a per-route
         // expert id: the routing is the sort's, and the product takes the tile maps the sort
         // computed.
-        let tokens = args.hidden.rows();
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
         if args.permuted_to_expanded.dtype != DType::I32 {
@@ -1086,10 +1085,10 @@ impl GatherGemmNvfp4 {
                 ),
             ));
         }
-        args.hidden
-            .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
-        args.hidden
-            .require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // The activation's width is the packed one stated above - `hidden / 2` bytes over the
+        // contraction - and this product has no other: a second statement of `[tokens, hidden]` here
+        // is the *dense* product's and refused every encoded launch by naming the width the caller
+        // had already correctly halved.
         if top == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1401,10 +1400,6 @@ impl Op for RouteGemmNvfp4 {
         let experts = u64::from(descriptor.experts);
         let routes = args.out.rows();
 
-        args.hidden
-            .require_shape(Self::NAME, Shape::new(&[routes, intermediate]))?;
-        args.hidden
-            .require_row(Self::NAME, descriptor.dtype, intermediate)?;
         args.out
             .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
