@@ -3002,6 +3002,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // Attention outputs, by layer: the one tensor this runner can name without a layout guess,
         // because the node's own argument is the struct that holds the pointer.
         let mut layer = 0_usize;
+        let mut layer0_out = 0_u64;
         for (operator, _, launches) in captured.nodes() {
             if *operator != "paged_attention" {
                 continue;
@@ -3049,8 +3050,50 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 } else {
                     String::new()
                 };
+                if layer == 0 && address != 0 {
+                    layer0_out = address;
+                }
                 out.push_str(&format!(" attn{layer}={named}@{grid}{counted}"));
                 layer += 1;
+            }
+        }
+
+        // The projection out of the attention block: the slice's `attended` cut is the attention
+        // block's output *projected out and before the residual add*, so the tensor to compare
+        // against is not the one the FMHA kernel wrote but the one the gemm after it wrote. The gemm
+        // is named by its own call layout's `input` holding attention's output address, not by its
+        // position, so a graph that reorders its layers still pairs correctly.
+        if layer0_out != 0 {
+            use ops::gemm::GEMM_CALL_LAYOUT;
+            let word = |blob: &[u8], at: usize| -> u64 {
+                blob.get(at..at + 8)
+                    .map(|w| u64::from_ne_bytes(w.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0)
+            };
+            let projection = captured.nodes().iter().find_map(|(operator, _, launches)| {
+                if *operator != "gemm" {
+                    return None;
+                }
+                launches.iter().find_map(|launch| {
+                    let params = captured.template().kernel_node_params(&launch.node).ok()?;
+                    let blob = params.parameters.first()?;
+                    if word(blob, GEMM_CALL_LAYOUT.input) != layer0_out {
+                        return None;
+                    }
+                    Some(word(blob, GEMM_CALL_LAYOUT.out))
+                })
+            });
+            match projection {
+                Some(address) if inside(address) => match self.read_device(address, width) {
+                    Some(raw) => out.push_str(&format!(
+                        " proj0={:016x} from={:#x}",
+                        platform::fnv1a(&raw),
+                        layer0_out
+                    )),
+                    None => out.push_str(" proj0=unreadable"),
+                },
+                Some(_) => out.push_str(" proj0=outside"),
+                None => out.push_str(" proj0=no-gemm-names-attention-output"),
             }
         }
 
