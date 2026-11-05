@@ -215,18 +215,14 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        // Padding **tokens** belong to a prefill: a chunk of host tokens shorter than the bucket has
-        // the rest of the bucket's token axis to fill, and the last row's range extends over it
-        // (those tokens write no cache page). A decode bucket has no padding tokens - it has padding
-        // *rows*, each evaluating one token with a commit slot below zero - so extending the last
-        // row's range there would make a one-token row own the rest of the bucket's token axis: a
-        // row attending to tokens it never carried and a pack whose end is not the batch's.
-        if !bucket.variant.is_decode()
-            && tokens < bucket_tokens
-            && let Some(last) = self.rows.query_offsets.last_mut()
-        {
-            *last = bucket_tokens as i32;
-        }
+        // A call's span is its **real** tokens and padding is inside no span: the offsets end where
+        // the batch's own tokens end, and the rest of the bucket's token axis belongs to no call.
+        // Widening the last row's span over the padding fixed one reader - a gather that wanted the
+        // last real token - and broke every other: a reader that takes a row's query length from the
+        // span was told a twenty-four-token prompt is five hundred and twelve tokens of query, and
+        // the token axis's operators were asked to work on four hundred and eighty-eight tokens no
+        // call owns. What bounds those operators is the batch's own count (`live_tokens`), which is
+        // staged beside these columns; what a span says is what the batch has.
         while self.rows.query_offsets.len() <= bucket_rows {
             let end = self
                 .rows
@@ -1124,6 +1120,17 @@ pub struct CausalLmRunner<M: CausalLm> {
     kv: Box<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
     seed: std::cell::Cell<u64>,
+    /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
+    /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
+    /// by the device thread, which is the only thread that may issue to this runner's stream.
+    pending_dump: Option<(u32, String)>,
+    /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
+    /// read beside the write that should have fed it.
+    last_prefill: Option<String>,
+    /// How long the last `cuGraphLaunch` took to return, which is the host's enqueue cost and not
+    /// the device's work: a replay that is slow in its enqueue is a graph the driver cannot hand
+    /// over quickly, and one that is slow after it is the kernels.
+    enqueue_ms: f64,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1229,6 +1236,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            pending_dump: None,
+            last_prefill: None,
+            enqueue_ms: 0.0,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1330,6 +1340,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
+        let entered = std::time::Instant::now();
         let shape = batch.shape;
         // What a refusal is about, said before it happens: the classes the rows carry are the fact
         // no other owner of this batch can report, and a batch that mixes them is refused for them.
@@ -1367,7 +1378,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // asks for it: the addresses a prefill wrote and a decode reads are compared from these
         // numbers rather than guessed from a continuation's text.
         if runner_dump() {
-            Self::dump_batch(self, bucket, &batch, &shape);
+            // The host figures are the submitting thread's; the page readback is the device
+            // thread's, because a copy issued from here would put a second thread on this
+            // runner's stream (2.4).
+            Self::dump_batch(self, bucket, &batch, &shape, entered.elapsed());
         }
         // The columns are staged here, on the submitting thread; everything that touches the
         // device is the replay job, which this executor's device thread performs in `serve`: the
@@ -1587,9 +1601,74 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 let launched = Instant::now();
+                let enqueue = Instant::now();
                 captured.launch(&stream)?;
+                self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
+                }
+                if runner_dump() {
+                    // What a replay launches, by node kind, and how many launches the recording
+                    // saw. A forward of forty-eight layers holds hundreds of kernel nodes; a graph
+                    // that reports one node while the model has hundreds means the launches did not
+                    // land in the template - they ran during the capture - and a replay is then a
+                    // graph replaying work that is not the forward.
+                    let mut histogram: Vec<(String, u64)> = Vec::new();
+                    let mut launches = 0_u64;
+                    for (_, _, launch) in captured.nodes() {
+                        launches += 1;
+                        for walked in launch {
+                            let kind = walked
+                                .node
+                                .kind()
+                                .map(|kind| format!("{kind:?}"))
+                                .unwrap_or_else(|_| "unknown".to_owned());
+                            match histogram.iter_mut().find(|(name, _)| *name == kind) {
+                                Some((_, count)) => *count += 1,
+                                None => histogram.push((kind, 1)),
+                            }
+                        }
+                    }
+                    let kinds = histogram
+                        .iter()
+                        .map(|(name, count)| format!("{name}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    // The template's own node table, straight from the driver: what a replay
+                    // actually launches, which the recording's table can only claim.
+                    let (template_nodes, template_kinds) = match captured.template().nodes() {
+                        Ok(nodes) => {
+                            let mut counted: Vec<(String, u64)> = Vec::new();
+                            for node in &nodes {
+                                let kind = node
+                                    .kind()
+                                    .map(|kind| format!("{kind:?}"))
+                                    .unwrap_or_else(|_| "unknown".to_owned());
+                                match counted.iter_mut().find(|(name, _)| *name == kind) {
+                                    Some((_, count)) => *count += 1,
+                                    None => counted.push((kind, 1)),
+                                }
+                            }
+                            let spelled = counted
+                                .iter()
+                                .map(|(name, count)| format!("{name}:{count}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            (nodes.len(), spelled)
+                        }
+                        Err(error) => (0, format!("unreadable({error})")),
+                    };
+                    tracing::info!(
+                        bucket = %bucket,
+                        kernels = captured.kernel_nodes(),
+                        walks = launches,
+                        recorded_kinds = %kinds,
+                        template_nodes,
+                        template_kinds = %template_kinds,
+                        kernels_held = captured.kernels().len(),
+                        launch_ms = launched.elapsed().as_secs_f64() * 1e3,
+                        "a replay issued its graph"
+                    );
                 }
                 // The sampled tokens are read back now, before the submission completes: the
                 // mechanism builds the next step's input ids from them (4.4). The wait covers the
@@ -1903,6 +1982,27 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
+        // The dump's readback, on the thread that owns this runner's stream and after the launch
+        // that wrote the page: the batch's own line, the page's first bytes, and - when this batch
+        // is a decode - the prefill's line and bytes beside them, so one reading compares what was
+        // written with what is read.
+        if let Some((page, line)) = self.pending_dump.take() {
+            let bytes = self.dump_page_bytes(page);
+            let prefill = self.last_prefill.clone().unwrap_or_else(|| "none".to_owned());
+            tracing::info!(
+                %line,
+                page,
+                key_page = %bytes,
+                prefill = %prefill,
+                enqueue_ms = self.enqueue_ms,
+                replay_ms = launched.elapsed().as_secs_f64() * 1e3,
+                wait_ms = (launched.elapsed().as_secs_f64() * 1e3 - self.enqueue_ms).max(0.0),
+                "a batch states the cache addresses it read and wrote"
+            );
+            if !bucket.variant.is_decode() {
+                self.last_prefill = Some(format!("{line} page={page} key_page={bytes}"));
+            }
+        }
         let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
             return Ok(BatchOutput::default());
         };
@@ -2006,17 +2106,24 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
     /// bucket, and the host-side encode indices and draw buffers are the runner's own: a step
     /// writes fixed addresses and allocates nothing (4.5).
-    /// One line per batch naming the cache addresses it will read and write.
+    /// What a batch states about where its tokens read and write the cache, for `UNISERVE_RUNNER_DUMP`.
     ///
-    /// A prefill writes the pages its `slot_mapping` names and a decode reads them through its block
-    /// table; when a continuation ignores its context those two disagree, and every figure that
-    /// tells them apart is on the host before the replay: the positions, the row lengths, how many
-    /// tokens the batch holds, the pages each row states, and the sampler slot that carries the
-    /// sequence's own state. Printed at `info` because it is opt-in (`UNISERVE_RUNNER_DUMP`) and a
-    /// run that sets it is a run that wants the line.
-    fn dump_batch(&self, bucket: Bucket, batch: &Batch, shape: &Shape) {
+    /// A prefill writes the pages its slot mapping names and a decode reads them through its block
+    /// table. When a continuation ignores its context those two disagree, and the figures that tell
+    /// them apart are all on the host before the replay: the positions, the row lengths, the packed
+    /// token ranges, the pages each token's slot lands in, and the pages the table installs. The one
+    /// figure that is not host-side is the page's bytes, which the device thread reads back after
+    /// the launch (`read_sampled`) - the addressing can be right while the values are not.
+    ///
+    /// The line is a string and the readback a page number, because the two are written on
+    /// different threads: this runs at submit, on the scheduler's.
+    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape, submit_ms: std::time::Duration) {
         let rows = shape.rows as usize;
         let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+        let page_of_slot = |slot: i32| -> Option<u32> {
+            let slot = u32::try_from(slot).ok()?;
+            (self.geometry.page_size > 0).then(|| slot / self.geometry.page_size)
+        };
         let spelled = |values: &[i32], count: usize| -> String {
             let take = values.len().min(count);
             let mut out = String::new();
@@ -2028,36 +2135,71 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
             out
         };
-        // One row's pages, as this batch installed them: the row the batch serves first, because a
-        // second row's table only repeats the same statement for another sequence.
-        let (first, units, allocated) = batch.block_tables.first().map_or((0, String::new(), 0), |table| {
-            let take = table.unit_ids.len().min(8);
-            let mut out = String::new();
-            for (index, unit) in table.unit_ids[..take].iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str(&unit.0.to_string());
+        // The pages the batch's own tokens write: a slot is flat over the plane's pages, so the
+        // page a token lands in is its slot divided by the page size - the write side of the pair a
+        // decode's table must agree with.
+        let mut written = String::new();
+        for (index, slot) in self.staging.batch_rows().slot_mapping[..tokens]
+            .iter()
+            .take(8)
+            .enumerate()
+        {
+            if index > 0 {
+                written.push(',');
             }
-            (table.start_page, out, table.allocated_tokens)
-        });
-        tracing::info!(
-            bucket = %bucket,
-            variant = ?bucket.variant,
-            batch = batch.id.0,
-            rows,
+            match page_of_slot(*slot) {
+                Some(page) => written.push_str(&page.to_string()),
+                None => written.push_str("-"),
+            }
+        }
+        let (start_page, units, allocated) =
+            batch
+                .block_tables
+                .first()
+                .map_or((0, String::new(), 0), |table| {
+                    let take = table.unit_ids.len().min(8);
+                    let mut out = String::new();
+                    for (index, unit) in table.unit_ids[..take].iter().enumerate() {
+                        if index > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&unit.0.to_string());
+                    }
+                    (table.start_page, out, table.allocated_tokens)
+                });
+        // The indices the sampler will gather, computed the same way `upload` computes them, so a
+        // reading of the line does not have to derive them by hand.
+        let mut gather: Vec<i32> = Vec::new();
+        let _ = gather_indices(
+            &self.staging.batch_rows().logits_rows,
+            &self.staging.batch_rows().query_offsets,
             tokens,
-            positions = %spelled(&self.staging.batch_rows().positions, 8),
-            seq_lens = %spelled(&self.staging.batch_rows().seq_lens, rows),
-            query_offsets = %spelled(&self.staging.batch_rows().query_offsets, rows + 1),
-            logits_rows = %spelled(&self.staging.batch_rows().logits_rows, rows),
-            slots = %spelled(self.staging.slots(rows), rows),
-            start_page = first,
-            units = %units,
-            allocated_tokens = allocated,
-            key_page = %self.dump_page_bytes(first, batch),
-            "a batch states where its tokens read and write the cache"
+            rows,
+            &mut gather,
         );
+        let gather = spelled(&gather, rows);
+        let line = format!(
+            "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
+             positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
+             slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
+            bucket.variant,
+            spelled(&self.staging.batch_rows().positions, 8),
+            spelled(&self.staging.batch_rows().seq_lens, rows),
+            spelled(&self.staging.batch_rows().query_offsets, rows + 1),
+            spelled(&self.staging.batch_rows().logits_rows, rows),
+            spelled(self.staging.slots(rows), rows),
+        );
+        // The page the readback names: the first live row's first page, which is the page a decode
+        // must find the prefill's keys in.
+        let line = format!("{line} submit_ms={:.3}", submit_ms.as_secs_f64() * 1e3);
+        let page = self
+            .staging
+            .batch_rows()
+            .slot_mapping
+            .first()
+            .and_then(|slot| page_of_slot(*slot))
+            .unwrap_or(start_page);
+        self.pending_dump = Some((page, line));
     }
 
     /// The first bytes of one page of the cache's key plane, as a device read sees them.
@@ -2071,7 +2213,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// The copy is issued on the batch's stream and waited for: this runs once per batch, only when
     /// a deployment asked for the dump, and a dump that read memory a launch had not finished with
     /// would be a guess.
-    fn dump_page_bytes(&self, unit: u32, _batch: &Batch) -> String {
+    fn dump_page_bytes(&self, unit: u32) -> String {
         let Some(cache) = self.kv.cache() else {
             return "no-cache".to_owned();
         };
@@ -2084,9 +2226,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         let Some((_, view)) = planes
             .iter()
-            .find(|(name, _)| name == "prefix_cache.key.values")
+            .find(|(name, _)| name == "key.values")
         else {
-            return "no-key-plane".to_owned();
+            let mut names = String::new();
+            for (name, _) in &planes {
+                if !names.is_empty() {
+                    names.push(',');
+                }
+                names.push_str(name);
+            }
+            return format!("no-key-plane({names})");
         };
         let shape = view.shape().to_vec();
         let (Some(&_columns), Some(&units), Some(&plane_bytes)) =
@@ -2120,6 +2269,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut out = String::new();
         for byte in host {
             out.push_str(&format!("{byte:02x}"));
+        }
+        // The page's `initialized` flag, which decides whether a reader of this page sees its keys
+        // at all: a page whose values are right and whose flag is zero masks every key it holds,
+        // and a decode that attends to nothing is a continuation driven by its own last token.
+        match planes
+            .iter()
+            .find(|(name, _)| name == "key.initialized")
+        {
+            Some((_, flags)) => {
+                let mut flag = [0_u8; 1];
+                // SAFETY: the destination is this function's own one-byte host buffer and the
+                // source is the flag of a unit the view above states.
+                let copied = unsafe {
+                    platform::memcpy_async(
+                        flag.as_mut_ptr() as u64,
+                        flags.address() + unit as u64,
+                        1,
+                        &self.stream,
+                    )
+                };
+                if copied.is_ok() && self.stream.synchronize().is_ok() {
+                    out.push_str(&format!(" init={}", flag[0]));
+                } else {
+                    out.push_str(" init=unread");
+                }
+            }
+            None => out.push_str(" init=no-flags"),
         }
         out
     }
@@ -2737,10 +2913,10 @@ fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> R
 /// token - a decode - so a batch whose rows carry several tokens reads its prefill from the wrong
 /// row without this mapping.
 ///
-/// A prefilling bucket's padding tokens belong to the **last** row: `Staging::stage` extends that
-/// row's range to the bucket's token axis, because the pack the attention kernel reads ends there.
-/// So the range's end is the last token of the *bucket*, not of the batch, and the count that tells
-/// them apart is the batch's own live token count. A row that samples nothing gathers the stack's
+/// A row's range ends at its own last real token, and padding is inside no span, so the range's end
+/// is the token to read. The clamp to the batch's live token count is a belt around that rule rather
+/// than a second rule: a span that ever reached past the batch's tokens would read the bucket's
+/// padding, which is what a widened span used to do. A row that samples nothing gathers the stack's
 /// first token, whose id the sampler discards.
 fn gather_indices(
     logits_rows: &[i32],
@@ -3123,6 +3299,12 @@ mod tests {
                 "padded token {token} writes no cache page"
             );
         }
+        // The call's span is its three real tokens: padding is inside no span, so a reader that
+        // takes a row's query length from these offsets is told three and not the bucket's sixty
+        // four. Everything that must work over the bucket's token axis is bounded by the batch's
+        // live count instead (`staging.live_tokens()`), which is one bound with one meaning.
+        assert_eq!(&staging.batch_rows().query_offsets[..], &[0, 3]);
+        assert_eq!(staging.live_tokens(), 3);
         Ok(())
     }
 
