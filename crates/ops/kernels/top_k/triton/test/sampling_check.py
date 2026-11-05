@@ -611,6 +611,21 @@ def run_top_k(case):
             )
             id_failures = int((ids[row].cpu() != wanted_ids).sum())
         failures += value_failures + id_failures
+        # The destinations were filled with the operator's own sentinels, which no candidate can be:
+        # `nan` for a value and `-1` for an id. A row's width slots are the operator's whole output -
+        # it keeps the `width` largest and writes every one of them - so a sentinel that survives
+        # anywhere in the row is a slot nothing wrote, and it is a defect whether or not the narrower
+        # comparison above would have caught the value. This is the one reading the comparison cannot
+        # give: a hole and a candidate are both "not the reference value" but only one of them means
+        # the plane the sampler orders was left partly unwritten.
+        holes = int((ids[row] < 0).sum()) + int(torch.isnan(values[row]).sum())
+        if holes:
+            columns = (ids[row] < 0).nonzero().flatten().tolist()[:6]
+            print(
+                f"  row {row}: {holes} slots still hold the pre-fill "
+                f"(ids below 0 or values nan); first id columns {columns}"
+            )
+            failures += holes
         if value_failures or id_failures:
             print(
                 f"  row {row}: {value_failures} values and {id_failures} ids differ; "
