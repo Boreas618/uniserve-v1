@@ -78,6 +78,8 @@ pub enum Stage {
         /// Raster columns of a frame.
         width: u32,
     },
+    /// A trajectory's opening, which has nothing to encode: the call is answered as it arrives.
+    Open,
     /// The track's `[samples, 2]` integers into AAC.
     ///
     /// The count is the buffer's - `bytes / (2 * size_of::<i16>())` - rather than a number the
@@ -152,6 +154,7 @@ impl HostAction for MediaWork {
                 Ok(None)
             }
             Stage::Mux => Ok(Some(self.output.finish(self.request)?)),
+            Stage::Open => Ok(None),
         };
         if outcome.is_err() {
             // A stage that fails ends its request short of an artifact, so the assembly this
@@ -511,6 +514,14 @@ impl MediaStage {
                 ))
             })?;
         let prepared = self.pending.remove(position);
+        // A trajectory's opening has no bytes to encode: the mechanism's call is answered here, so
+        // the request's first denoising step follows it as the graph states.
+        if matches!(prepared.stage, Stage::Open) {
+            return Ok(BatchOutput {
+                calls: vec![CallOutput::completed(call, Vec::new(), RowState::default())],
+                timing: ipc::TimingCounters::default(),
+            });
+        }
         let work = MediaWork::new(
             Arc::clone(&self.output),
             prepared.request,
@@ -649,6 +660,7 @@ fn staged(
         }
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
         Variant::Mux => Ok((Stage::Mux, None)),
+        Variant::LatentPrepare => Ok((Stage::Open, None)),
         other => Err(crate::Error::Invalid(format!(
             "the media stage serves the artifact's three calls and was asked for a {other:?} batch"
         ))),
@@ -728,7 +740,12 @@ impl Runner for MediaStage {
     /// the plan's buckets, and a device that listed none would refuse every encode of the artifact
     /// with "the executor does not serve this computation".
     fn media_plan(&self) -> Vec<crate::plan::Bucket> {
-        [Variant::VideoEncode, Variant::AudioEncode, Variant::Mux]
+        [
+            Variant::VideoEncode,
+            Variant::AudioEncode,
+            Variant::Mux,
+            Variant::LatentPrepare,
+        ]
             .into_iter()
             .map(crate::plan::Bucket::host)
             .collect()

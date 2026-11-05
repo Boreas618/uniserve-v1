@@ -303,3 +303,58 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     );
     handle.shutdown();
 }
+
+/// The reported distribution is the model's, whatever nucleus the request
+/// samples under: a request cut at half the mass reports the same five
+/// candidates with the same log probabilities as one sampling the whole
+/// distribution.
+///
+/// The two runs share the request identity and the prompt, so the simulated
+/// head scores them alike; only the nucleus differs.
+#[test]
+fn logprobs_report_the_model_distribution_under_a_cutoff() {
+    use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
+    use std::thread;
+
+    let candidates = |top_p: f32| -> Vec<ipc::TokenLogprob> {
+        let mut sim = SimEngine::new();
+        sim.set_text_len(8);
+        let executor = SimExecutor::new(sim);
+        let rank = executor.info().runtime_info().expect("the sim states its rank");
+        let engine = SchedulerHandle::with_executor(EngineConfig::sim("logprobs"), Box::new(executor))
+            .expect("the simulated executor serves");
+        crate::support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
+
+        let mut request = text_request(1, 2, 7);
+        request.sampling = SamplingParams {
+            temperature: 0.0,
+            top_p,
+            return_logprobs: true,
+            n_logprobs: 5,
+            ..Default::default()
+        };
+        let mut events = engine.submit(request).expect("the engine takes the submission");
+        let deadline = Instant::now() + ANSWER;
+        let mut reported = None;
+        while Instant::now() < deadline && reported.is_none() {
+            match events.try_recv() {
+                Ok(Event::TokenLogprobs { candidates, .. }) if reported.is_none() => {
+                    reported = Some(candidates);
+                }
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        engine.shutdown();
+        reported.expect("the request reports the distribution of its first token")
+    };
+
+    let cut = candidates(0.5);
+    let whole = candidates(1.0);
+    assert_eq!(cut.len(), 5, "five candidates were asked for: {cut:?}");
+    assert!(
+        cut.iter().all(|entry| entry.logprob.is_finite()),
+        "a reported log probability is not finite: {cut:?}"
+    );
+    assert_eq!(cut, whole, "the nucleus changed the reported distribution");
+}

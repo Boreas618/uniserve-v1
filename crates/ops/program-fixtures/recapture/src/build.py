@@ -2,8 +2,8 @@
 
 The module is a `gemm` that launches two kernels (the product into FP32 scratch,
 then the epilogue) where the serving `cublas_lt` program launches one. Its
-descriptor's element types, weight order, epilogue and contraction length are
-known when it is compiled, so the script passes them as defines; the launch
+descriptor's element types, weight order and epilogue are known when it is
+compiled, so the script passes them as defines; the launch
 form itself is read from the package's manifest, so the symbol the module
 exports and the symbol the package declares cannot disagree.
 
@@ -151,7 +151,6 @@ def main():
         f"-DUNISERVE_GEMM_OUTPUT={output_type}",
         f"-DUNISERVE_GEMM_ORDER={ORDERS[order]}",
         f"-DUNISERVE_GEMM_EPILOGUE={EPILOGUES[epilogue]}",
-        f"-DUNISERVE_GEMM_K={field(descriptor, 'k')}",
         *[str(package / source) for source in SOURCES],
         "-lcudart",
         "-o",
