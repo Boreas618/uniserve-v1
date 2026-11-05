@@ -622,7 +622,7 @@ impl Qwen3Moe {
     /// 48-layer model is a caller error, and clamping it would answer a different question.
     ///
     /// The answer is the **state** after layer `last` — the reference's `hidden_{last + 1}` — and
-    /// not the block's update, which is one fold short of it (see [`Self::fold`]).
+    /// not the block's update, which is one fold short of it (see `fold`).
     ///
     /// **Each call reserves the plan's step from `f`'s arena and leaves it reserved**, because the
     /// answer lives in it: the rows a caller compares are the arena's own. A caller that runs two
