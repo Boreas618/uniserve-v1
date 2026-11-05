@@ -44,8 +44,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
+use minimax_h3::denoiser::{Arrangement, Denoiser};
 use minimax_h3::AttentionKind;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
+use minimax_h3::Partition;
 use nn::layers::{Linear, WeightOrder};
 use nn::weights::WeightRequest;
 use nn::forward::Arena;
@@ -149,10 +151,12 @@ fn run() -> Result<(), String> {
             ("audio-encoder", audio_encoder as Harness),
             ("video-encoder", video_encoder as Harness),
             ("video-decoder", video_decoder as Harness),
+            ("denoiser", denoiser as Harness),
         ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
+        "denoiser" => vec![("denoiser", denoiser as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -417,6 +421,40 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
+}
+
+/// The denoiser's own load, and so the one question a harness can answer before it drives a step:
+/// does the network's arithmetic need a byte of the checkpoint, or does its statement suffice?
+fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+    let network = config
+        .denoisers
+        .get(&minimax_h3::Dit::Base)
+        .ok_or("this checkpoint holds no base network")?
+        .clone();
+    let arrangement =
+        Arrangement::new(&network, request.rows, request.rows, 1).map_err(|error| error.to_string())?;
+    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
+    let loaded = Denoiser::load(
+        network,
+        arrangement,
+        request.rows,
+        &Partition {
+            tensor_parallel: 1,
+            tensor_rank: 0,
+            ulysses_degree: 1,
+            ..Partition::single()
+        },
+        &mut loader,
+        None,
+    );
+    match loaded {
+        Ok(_) => {
+            eprintln!("# denoiser: loaded from shapes alone, no checkpoint byte");
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
