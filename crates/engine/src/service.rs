@@ -362,10 +362,25 @@ impl Routing {
         })?;
         let ranks = self.ranks();
         let Some(state) = self.policy_state(&ranks) else {
-            return Err(
-                "no live scheduler answered the state the route policy is instantiated on"
-                    .to_owned(),
-            );
+            // Why no scheduler answered is the whole of this refusal's use: a scheduler that
+            // stopped fatally holds the error that stopped it, and a reader told only that none
+            // answered cannot tell a worker failure from a scheduler that never started.
+            let stopped: Vec<String> = self
+                .slots
+                .iter()
+                .filter_map(|slot| slot.handle.failure())
+                .collect();
+            return Err(if stopped.is_empty() {
+                "no live scheduler answered the state the route policy is instantiated on: every \
+                 scheduler handle is dead and none states a failure"
+                    .to_owned()
+            } else {
+                format!(
+                    "no live scheduler answered the state the route policy is instantiated on: \
+                     every scheduler handle is dead, and the first failure is {}",
+                    stopped[0]
+                )
+            });
         };
         let candidate =
             RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)
