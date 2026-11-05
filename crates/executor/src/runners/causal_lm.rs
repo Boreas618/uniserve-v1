@@ -2223,6 +2223,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
         for byte in host {
             out.push_str(&format!("{byte:02x}"));
         }
+        // The page's `initialized` flag, which decides whether a reader of this page sees its keys
+        // at all: a page whose values are right and whose flag is zero masks every key it holds,
+        // and a decode that attends to nothing is a continuation driven by its own last token.
+        match planes
+            .iter()
+            .find(|(name, _)| name == "key.initialized")
+        {
+            Some((_, flags)) => {
+                let mut flag = [0_u8; 1];
+                // SAFETY: the destination is this function's own one-byte host buffer and the
+                // source is the flag of a unit the view above states.
+                let copied = unsafe {
+                    platform::memcpy_async(
+                        flag.as_mut_ptr() as u64,
+                        flags.address() + unit as u64,
+                        1,
+                        &self.stream,
+                    )
+                };
+                if copied.is_ok() && self.stream.synchronize().is_ok() {
+                    out.push_str(&format!(" init={}", flag[0]));
+                } else {
+                    out.push_str(" init=unread");
+                }
+            }
+            None => out.push_str(" init=no-flags"),
+        }
         out
     }
 
