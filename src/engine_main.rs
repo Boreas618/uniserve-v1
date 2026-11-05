@@ -1088,6 +1088,13 @@ impl MainProcess {
             device_command(&self.watchdog, device, "the wake", submission)?;
         }
         self.slept = false;
+        // The description this process answers a cache query from is refreshed here, and this is the
+        // one place it can go stale: a wake maps the segments again, and a segment that came back at
+        // a new offset is a different answer for a successor. Every scheduler answers it here - the
+        // streams are not paused - where asking from the handover's own control pass would wait.
+        if let Ok(info) = self.engine_info() {
+            self.announced = Some(info);
+        }
         let kept = self.memory.as_ref().map(Memory::mapped_resident);
         if let (Some(before), Some(after)) = (kept_before, kept) {
             tracing::info!(
