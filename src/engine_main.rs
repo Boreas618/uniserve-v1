@@ -1711,9 +1711,15 @@ impl MainProcess {
     fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
         // §7.3's steps are answered here. A run that stops between two of them needs to know which
         // one was answered last, and the daemon's own log of its commands is not this side's.
+        // The reason travels with the status, and a run that reads only this log needs it too.
+        let failure = match &status {
+            ProgramStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
+            _ => String::new(),
+        };
         tracing::info!(
             status = status_name(&status),
             to_peer = reply.is_some(),
+            failure,
             "answering the epoch's program layer"
         );
         if let Some(rank) = reply {

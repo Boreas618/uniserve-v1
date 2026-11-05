@@ -381,6 +381,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.seq_lens.write(&buffer)?;
         encode_i32(&mut buffer, &vec![0i32; rows + 1]);
         self.columns.query_offsets.write(&buffer)?;
+        encode_i32(&mut buffer, &vec![0i32; rows]);
         self.columns.logits_rows.write(&buffer)?;
         self.staged = Some(bucket);
         // A warm capture serves no request, so its launch publishes nothing: a row left here would
