@@ -1,41 +1,46 @@
 //! A model's programs, recorded from the model's own `forward`.
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example record -- --root /opt/uv/models/MiniMax-H3 --component audio-encoder
+//! cargo run -p minimax-h3 --example record -- --root /opt/uv/models/MiniMax-H3 --component all \
+//!     --dtype f16 --clip 256 --raster 480x832 --rows 32000 --extents h3-audio-extents.json \
+//!     --against notes/programs/minimax-h3-keys.txt
 //! ```
 //!
 //! ## Why this exists beside `examples/programs.rs`
 //!
-//! `programs.rs` enumerates a model's programs in a traversal written by hand beside each `forward`, and on
-//! one day that traversal was wrong twice and incomplete once (`silu`'s element type, `act_and_mul`'s packed
+//! `programs.rs` enumerates a model's programs in a traversal written by hand beside each `forward`, and on one
+//! day that traversal was wrong twice and incomplete once (`silu`'s element type, `act_and_mul`'s packed
 //! stride, and four `scaled_add` crossings of the sample/FP32 boundary that no row stated). Each was found by
 //! comparing it with a second implementation, none by a test, and the missing four were invisible to
-//! `key_coverage` — a row neither the fixture nor the store holds answers "every key is covered".
+//! `key_coverage`: a row neither the fixture nor the store holds answers "every key is covered".
 //!
-//! This drives the model's **own** code: `WeightLoader::shapes` states every weight's extents without reading
-//! a byte, `Forward::recording` reports each launch to the capture sink instead of launching it, and the
-//! component's `forward` runs unchanged. No shard, no device. So the row set is what the model launches, by
+//! This drives the model's **own** code instead: `WeightLoader::shapes` states every weight's extents without
+//! reading a byte, `Forward::recording` reports each launch to the capture sink instead of launching it, and the
+//! component's `forward` runs unchanged. No shard, no device. The row set is what the model launches, by
 //! construction, and the hand-written walk becomes the thing being checked rather than the source.
 //!
-//! ## What a harness must supply
+//! ## What a refusal is
 //!
-//! Shape-correct operands, which is exactly the model's interface: the component's `forward` takes views, so
-//! the harness makes them from the config and the request's own numbers. The comparison is the point —
-//! `--against <walk print>` reports the rows recorded and not stated, and the rows stated and not recorded,
-//! in that order of severity.
+//! A harness that cannot run prints its name and its reason and the recorder **keeps going**: a recorder that
+//! stops at the first refusal reports a small number that looks exactly like agreement, which is the failure
+//! this file exists to remove. The summary line names every refusal.
 //!
-//! ## What the first harness found, and what it needs next
+//! ## What the output is
 //!
-//! The audio VAE's encoder loads until its first **weight-normalized** convolution, then the shapes-only
-//! loader refuses: `weight_norm` reduces `v · g / ‖v‖` and the extents of `v` are a fact of the checkpoint's
-//! header, which a metadata-only deployment does not have. Every weight elsewhere is stated by the module that
-//! reads it, so the fix is not a loader trick: **the model's load states the extents a weight-normalized
-//! convolution expects**, from the configuration it already parses (`[out, in / groups, kernel]`), and the live
-//! loader then checks the checkpoint's shape against that declaration instead of deriving it. `Binder` already
-//! names every parameter, so it is a table change and a checker, and it strengthens the live load in the same
-//! stroke. Until it lands, this harness covers the components whose weights are stored plainly, and refuses the
-//! rest by name rather than reporting a row set that reads as served.
+//! The header states the **deployment** it recorded — element type, clip length, raster, packed rows, and the
+//! attention backend the checkpoint selects — before any row, because a recording that does not say what it is a
+//! recording of is the same object as a fixture that carries more than the walk.
+//!
+//! ## The extents table
+//!
+//! A weight a module merely reads takes its extents from the request it asks with. A weight **computed at
+//! load** does not: the folded form of a weight-normalized convolution is `v · g / ‖v‖`, and `v`'s extents are a
+//! fact of the checkpoint's shard header. `--extents` supplies them as `{"tensor": {"dtype": "F32", "shape":
+//! [..]}}`, produced where the weights are (`--list` prints the names the load asks for) and used where they are
+//! not.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::encoding::AudioEncoder;
@@ -54,6 +59,19 @@ fn main() -> ExitCode {
     }
 }
 
+/// One component's harness: its rows, or the reason it could not run.
+type Harness = fn(&Request) -> Result<Vec<(String, String)>, String>;
+
+/// What the recorder was asked to record — the deployment, stated so the output can say what it is.
+struct Request {
+    root: PathBuf,
+    dtype: DType,
+    clip: u32,
+    raster: (u32, u32),
+    rows: u32,
+    extents: BTreeMap<String, (DType, Shape)>,
+}
+
 /// The rows a recording pass collected, in the order the model launched them.
 #[derive(Default)]
 struct Recorded(Vec<(String, String)>);
@@ -66,97 +84,171 @@ impl ops::capture::Sink for Recorded {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
-    let mut component = String::from("audio-encoder");
-    let mut against: Option<std::path::PathBuf> = None;
-    let mut extents: Option<std::path::PathBuf> = None;
+    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut component = String::from("all");
+    let mut dtype = DType::F16;
+    let mut clip = 256u32;
+    let mut raster = (480u32, 832u32);
+    let mut rows = 32_000u32;
+    let mut against: Option<PathBuf> = None;
+    let mut extents: Option<PathBuf> = None;
     let mut list = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or_else(|| format!("{argument} needs a value"));
         match argument.as_str() {
-            "--root" => root = std::path::PathBuf::from(value()?),
+            "--root" => root = PathBuf::from(value()?),
             "--component" => component = value()?,
-            "--against" => against = Some(std::path::PathBuf::from(value()?)),
-            "--extents" => extents = Some(std::path::PathBuf::from(value()?)),
+            "--dtype" => {
+                dtype = match value()?.as_str() {
+                    "f16" => DType::F16,
+                    "bf16" => DType::BF16,
+                    "f32" => DType::F32,
+                    other => return Err(format!("unknown dtype {other}")),
+                }
+            }
+            "--clip" => clip = value()?.parse().map_err(|_| "clip is a count of frames")?,
+            "--raster" => {
+                let stated = value()?;
+                let (w, h) = stated.split_once('x').ok_or("--raster is <width>x<height>")?;
+                raster = (
+                    w.parse().map_err(|_| "--raster's width is a count")?,
+                    h.parse().map_err(|_| "--raster's height is a count")?,
+                );
+            }
+            "--rows" => rows = value()?.parse().map_err(|_| "--rows is a count")?,
+            "--against" => against = Some(PathBuf::from(value()?)),
+            "--extents" => extents = Some(PathBuf::from(value()?)),
             "--list" => list = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
 
-    let table = match extents.as_deref() {
-        Some(path) => read_extents(path)?,
-        None => std::collections::BTreeMap::new(),
-    };
     if list {
         return list_extents(&root, &component);
     }
 
-    let rows = match component.as_str() {
-        "audio-encoder" => audio_encoder(&root, &table)?,
+    let table = match extents.as_deref() {
+        Some(path) => read_extents(path)?,
+        None => BTreeMap::new(),
+    };
+    let request = Request {
+        root,
+        dtype,
+        clip,
+        raster,
+        rows,
+        extents: table,
+    };
+
+    let harnesses: Vec<(&str, Harness)> = match component.as_str() {
+        "all" => vec![("audio-encoder", audio_encoder as Harness)],
+        "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
-    if let Some(walk) = against {
-        let stated = std::fs::read_to_string(&walk)
-            .map_err(|error| format!("{}: {error}", walk.display()))?;
-        let stated: std::collections::BTreeSet<(String, String)> = stated
-            .lines()
-            .filter(|line| !line.starts_with('#') && line.contains('\t'))
-            .map(|line| {
-                let (operator, key) = line.split_once('\t').unwrap_or((line, ""));
-                (operator.to_owned(), key.to_owned())
-            })
-            .collect();
-        let recorded: std::collections::BTreeSet<(String, String)> =
-            rows.iter().cloned().collect();
-        let only_recorded: Vec<_> = recorded.difference(&stated).collect();
-        let only_stated: Vec<_> = stated.difference(&recorded).collect();
-        for (operator, key) in &only_recorded {
-            println!("recorded, not stated:\t{operator}\t{key}");
+    println!(
+        "# recorded from the model's own forward, at {}: dtype {}, clip {}, raster {}x{}, packed rows {}",
+        request.root.display(),
+        request.dtype,
+        request.clip,
+        request.raster.0,
+        request.raster.1,
+        request.rows
+    );
+    let mut all: Vec<(String, String)> = Vec::new();
+    let mut refusals: Vec<(&str, String)> = Vec::new();
+    for (name, harness) in &harnesses {
+        match harness(&request) {
+            Ok(rows) => {
+                eprintln!("# {name}: {} rows", rows.len());
+                for row in rows {
+                    println!("{}\t{}", row.0, row.1);
+                    all.push(row);
+                }
+            }
+            Err(reason) => {
+                // A refusal is a row of the output, not an exit.
+                println!("# refused: {name}: {reason}");
+                eprintln!("# refused: {name}: {reason}");
+                refusals.push((name, reason));
+            }
         }
-        for (operator, key) in &only_stated {
-            println!("stated, not recorded:\t{operator}\t{key}");
-        }
-        eprintln!(
-            "# {} recorded, {} stated, {} only recorded, {} only stated",
-            recorded.len(),
-            stated.len(),
-            only_recorded.len(),
-            only_stated.len()
-        );
-        return Ok(());
     }
-
-    let mut rows = rows;
-    rows.sort();
-    rows.dedup();
-    let mut operators: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+    all.sort();
+    all.dedup();
+    let mut operators: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
     operators.sort_unstable();
     operators.dedup();
-    for (operator, key) in &rows {
-        println!("{operator}\t{key}");
+    eprintln!(
+        "# {} data rows, {} operators, {} of {} components refused{}",
+        all.len(),
+        operators.len(),
+        refusals.len(),
+        harnesses.len(),
+        if refusals.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {}",
+                refusals
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    );
+
+    if let Some(walk) = against {
+        compare(&all, &walk)?;
     }
-    eprintln!("# {} data rows, {} operators", rows.len(), operators.len());
+    Ok(())
+}
+
+/// The rows recorded and the rows a walk states, in both directions.
+///
+/// `recorded, not stated` is the severe one: the walk is missing a program the model launches, which is the
+/// failure that cost a caller run and four rows in one day. `stated, not recorded` is the other direction and is
+/// its own defect, because a store then holds a cell nothing reads.
+fn compare(recorded: &[(String, String)], walk: &Path) -> Result<(), String> {
+    let stated = std::fs::read_to_string(walk).map_err(|error| format!("{}: {error}", walk.display()))?;
+    let stated: std::collections::BTreeSet<(String, String)> = stated
+        .lines()
+        .filter(|line| !line.starts_with('#') && line.contains('\t'))
+        .map(|line| {
+            let (operator, key) = line.split_once('\t').unwrap_or((line, ""));
+            (operator.to_owned(), key.to_owned())
+        })
+        .collect();
+    let recorded: std::collections::BTreeSet<(String, String)> = recorded.iter().cloned().collect();
+    let only_recorded: Vec<_> = recorded.difference(&stated).collect();
+    let only_stated: Vec<_> = stated.difference(&recorded).collect();
+    for (operator, key) in &only_recorded {
+        println!("recorded, not stated:\t{operator}\t{key}");
+    }
+    for (operator, key) in &only_stated {
+        println!("stated, not recorded:\t{operator}\t{key}");
+    }
+    eprintln!(
+        "# {} recorded, {} stated, {} only recorded, {} only stated",
+        recorded.len(),
+        stated.len(),
+        only_recorded.len(),
+        only_stated.len()
+    );
     Ok(())
 }
 
 /// The audio VAE's encoder, as one request: a track of whole latent frames in FP32.
 ///
-/// The component is the first harness because its `forward` takes two views and nothing else — the track and
-/// the rows it writes — so the operand construction that a harness owes is visible here in full.
-fn audio_encoder(
-    root: &std::path::Path,
-    extents: &std::collections::BTreeMap<String, (DType, Shape)>,
-) -> Result<Vec<(String, String)>, String> {
-    let path = root.join("audio_vae/config.json");
-    let values: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-    )
-    .map_err(|error| format!("{}: {error}", path.display()))?;
-    let config = minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())?;
+/// It is the first harness because its `forward` takes two views and nothing else — the track and the rows it
+/// writes — so the operand construction a harness owes is visible here in full.
+fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = audio_config(&request.root)?;
 
-    // The shapes-only loader: no checkpoint, no shard, no device. A load that reads bytes refuses by name.
-    let mut loader = WeightLoader::stated(DType::F32, Some(extents));
+    // The shapes-only loader: no checkpoint, no shard, no device. A load that reads bytes refuses by name,
+    // and a computed weight is answered from the extents table.
+    let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
     let encoder = AudioEncoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
 
     // The arena is a null-backed region of a size no reservation will reach; nothing reads it.
@@ -182,20 +274,26 @@ fn audio_encoder(
     Ok(recorded.0)
 }
 
+fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
+    let path = root.join("audio_vae/config.json");
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let values: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())
+}
+
 /// The checkpoint tensors' extents, as the walk states them: `{"name": {"dtype": "F32", "shape": [...]}}`.
 ///
-/// This is the checkpoint's header content, not a model fact: it is produced where the weights are
-/// (`--discover` names every tensor a load asks for) and used where they are not.
-fn read_extents(
-    path: &std::path::Path,
-) -> Result<std::collections::BTreeMap<String, (DType, Shape)>, String> {
+/// This is the checkpoint's shard-header content, not a model fact: it is produced where the weights are and
+/// used where they are not.
+fn read_extents(path: &Path) -> Result<BTreeMap<String, (DType, Shape)>, String> {
     let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let values: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     let object = values
         .as_object()
         .ok_or_else(|| format!("{} is not an object", path.display()))?;
-    let mut extents = std::collections::BTreeMap::new();
+    let mut extents = BTreeMap::new();
     for (name, entry) in object {
         let dtype = entry
             .get("dtype")
@@ -224,27 +322,31 @@ fn dtype_of(name: &str) -> Option<DType> {
     }
 }
 
-/// Print the checkpoint tensors this component reads, as a skeleton of the extents table.
+/// Print the tensors whose extents a request cannot state, as a skeleton of the extents table.
 ///
-/// The names are the model's own (`AudioEncoder::keys` is the checkpoint signature the load binds
-/// against), so the skeleton cannot drift from what the load asks for. The extents are the
-/// checkpoint's, filled where the weights are: `safetensors` headers state each tensor's element type
-/// and shape, and a metadata-only host has neither.
-fn list_extents(root: &std::path::Path, component: &str) -> Result<(), String> {
-    let path = root.join("audio_vae/config.json");
-    let values: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-    )
-    .map_err(|error| format!("{}: {error}", path.display()))?;
-    let config = minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())?;
+/// Only the weight-normalized tensors: a weight a module merely reads takes its extents from the request it
+/// asks with, so listing those too would hand the host a file larger than the recorder reads — the same defect
+/// as a fixture that carries more than the walk. The names come from the component's own signature
+/// (`AudioEncoder::keys`), so the skeleton cannot drift from what the load binds against.
+fn list_extents(root: &Path, component: &str) -> Result<(), String> {
     let names = match component {
-        "audio-encoder" => AudioEncoder::keys(&config),
+        "all" | "audio-encoder" => AudioEncoder::keys(&audio_config(root)?),
         other => return Err(format!("unknown component {other}")),
     }
     .map_err(|error| error.to_string())?;
-    for name in &names {
+    let normalized: Vec<&String> = names
+        .iter()
+        .filter(|name| name.ends_with("weight_v") || name.ends_with("weight_g"))
+        .collect();
+    for name in &normalized {
         println!("{name:?}: {{\"dtype\": \"F32\", \"shape\": []}}");
     }
-    eprintln!("# {} tensor extents the load binds against", names.len());
+    // The components this file does not ask for are named, so a listing cannot read as complete.
+    eprintln!(
+        "# {} of {} tensors need an extents entry: the weight-normalized pairs, whose folded form takes \
+         nothing from a request",
+        normalized.len(),
+        names.len()
+    );
     Ok(())
 }
