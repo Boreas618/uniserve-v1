@@ -1586,6 +1586,13 @@ mod tests {
             self.stream.write_all(bytes).await.expect("a request");
         }
 
+        /// Sends `bytes` and lets the caller judge a failed write: a connection
+        /// that ended before this write answers `EPIPE`, which is what some
+        /// tests are about rather than a failure to reach the connection.
+        async fn try_send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.stream.write_all(bytes).await
+        }
+
         /// Reads once from the connection into the buffer, failing the test
         /// rather than hanging.
         async fn fill(&mut self) -> usize {
@@ -2004,8 +2011,12 @@ mod tests {
         ));
 
         let mut client = TestClient::new(client);
-        client
-            .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
+        // The connection is closed before it reads anything, so the peer may
+        // already be gone when this write arrives: that is the behaviour under
+        // test, and a closed peer answers `EPIPE` rather than taking the
+        // request. What the test then asserts is that no response was written.
+        let _ = client
+            .try_send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
             .await;
         tokio::time::timeout(std::time::Duration::from_secs(10), serving)
             .await
