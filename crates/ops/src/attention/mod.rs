@@ -26,6 +26,14 @@
 //! read device memory to say anything. `max_pages` bounds the *columns* a row may use, not the
 //! values in them.
 //!
+//! `seq_lens` is the second half of the same statement, and it is the one a length carries: a row's
+//! `seq_lens` entry is at most `max_pages · page_size`, which is the descriptor's
+//! [`Descriptor::max_kv_len`]. The program derives the pages it walks from that entry
+//! (`ceil(len / page_size)`), so a longer length reads table columns past the row's width — another
+//! row's entries, or past the table — and then dereferences whatever they hold as page ids. A caller
+//! that states a longer length has also voided the tolerance this operator declares, because
+//! [`Descriptor::max_kv_len`] is the reduction length that bound is derived from.
+//!
 //! # The mathematics
 //!
 //! For query row `t` with head `h`, with `s_j = scale · q_t,h · k_{j,h}` over the visible keys `j`:
