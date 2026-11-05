@@ -22,7 +22,9 @@
 //! around the attention (design 4.3). With one rank the exchange is absent and every view is the
 //! rank's own.
 
-use nn::layers::{Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange};
+use nn::layers::{
+    Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -179,8 +181,23 @@ impl RefinerBlock {
         self.query.forward(f, rows.normed, rows.query)?;
         self.key.forward(f, rows.normed, rows.key)?;
         self.value.forward(f, rows.normed, rows.value)?;
-        self.query_norm.forward(f, rows.query, rows.query_normed)?;
-        self.key_norm.forward(f, rows.key, rows.key_normed)?;
+        // The query and key norms are per head: the checkpoint's weight is `head_dim` wide, and the
+        // reference reshapes the projection to `[batch, tokens, heads, head_dim]` before applying
+        // them (`conditioning.py:94-99`). A row's heads are contiguous, so flattening the head axis
+        // gives the same tensor - `[rows * heads, head_dim]` - and both the input and the output of
+        // the norm take that view. The head count is the model's rather than this rank's: the
+        // exchange has not happened yet, so every head of the row is here.
+        let head = u64::from(self.head_dim);
+        let per_head = |view: TensorView| {
+            view.reshape(Shape::new(&[
+                u64::from(local_rows) * u64::from(self.heads),
+                head,
+            ]))
+        };
+        self.query_norm
+            .forward(f, per_head(rows.query), per_head(rows.query_normed))?;
+        self.key_norm
+            .forward(f, per_head(rows.key), per_head(rows.key_normed))?;
 
         let (query, key, value) = self.exchange(f, &rows)?;
         self.attention.attend_dense(
@@ -303,13 +320,9 @@ impl TokenRefiner {
             1.0 / (head as f32).sqrt(),
         )
         .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype,
-            dtype,
-            dtype,
-            hidden,
-            true,
-        ));
+        programs.launch::<DenseAttention>(
+            &attention.dense_descriptor(dtype, dtype, dtype, hidden, true),
+        );
         // The halves of one packed projection: the stride they carry is twice their width.
         programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
             dtype,
