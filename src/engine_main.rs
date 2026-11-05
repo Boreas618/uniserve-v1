@@ -4901,9 +4901,46 @@ impl Install {
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
         // daemon, so both sides state it.
+        // The packages are named, not counted: an operator the store splits across two backends is
+        // asked in two requests, and a log that says only `programs=1` twice leaves the reader to
+        // guess which package carries which phase's keys.
+        let asking: Vec<String> = request
+            .descriptors
+            .iter()
+            .map(|descriptors| {
+                // One request may carry several of one package's operators, and a split operator's
+                // slot states the phase its keys belong to - so both come from the entry whose
+                // operator these descriptors are for.
+                let entry = request
+                    .programs
+                    .iter()
+                    .find(|entry| entry.slot.op == descriptors.op);
+                let phase = entry
+                    .and_then(|entry| entry.slot.phase)
+                    .map(|phase| format!(" phase={}", phase.as_str()))
+                    .unwrap_or_default();
+                match entry.map(|entry| &entry.selector) {
+                    Some(program_server::Selector::Fixed(program)) => format!(
+                        "{}/{}@{}{} keys={}",
+                        descriptors.op,
+                        program.backend,
+                        program.revision,
+                        phase,
+                        descriptors.keys.len()
+                    ),
+                    _ => format!(
+                        "{}{} keys={}",
+                        descriptors.op,
+                        phase,
+                        descriptors.keys.len()
+                    ),
+                }
+            })
+            .collect();
         tracing::info!(
             programs = request.programs.len(),
             descriptors = request.descriptors.len(),
+            packages = ?asking,
             target = %self.target,
             "asking the Program Server to prepare this generation's modules"
         );
