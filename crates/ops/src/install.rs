@@ -4,7 +4,7 @@
 //! 5.3), and the executor's precopy has to turn each one into a kernel of a generation without
 //! knowing any operator's type. This is that entry: it takes the operator's name, the descriptor
 //! key the module was compiled for, and the module's image or path, and hands back the loaded
-//! kernel inside a [`KernelEntry`] for the caller to put in a [`Generation`].
+//! kernel inside a [`KernelEntry`] for the caller to put in a [`crate::Generation`].
 //!
 //! Nothing here allocates device memory or launches anything, so it is safe at precopy time and
 //! outside any capture.
