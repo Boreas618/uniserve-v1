@@ -272,6 +272,20 @@ fn header(lines: &[(String, String)]) {
          config, so one set of rows serves the base network and the reference DiT."
     );
     println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    // The second category of a row that varies with the request, distinct from a deployment's type.
+    // A store built from this file serves the canvases and lengths its rows describe; a key derived
+    // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
+    // a layout is not a program key but a table the executor uploads - the distinction matters,
+    // because only one of the two belongs in a list of programs.
+    println!(
+        "# request-derived: a key computed from the request's own numbers cannot be a row here. \
+         `frame_pad`'s tile and the `scaled_add` latent widths follow the canvas, and \
+         `scaled_residual ... columns_<elements>` follows the trajectory's element count, so a store \
+         built from this file serves the canvases and lengths its rows describe \
+         (`tools/walk_gaps.py --by-shape` prints both sides' statements). A value that varies with a \
+         layout and is *not* a program key - the vision tower's position tables - is uploaded per \
+         request and appears in no list of programs."
+    );
     println!(
         "# sparse: the `vsa_*` and `sparse_attention` rows belong to the video-sparse deployment and \
          are the only group no device run has exercised; their tile fields name the class the \
