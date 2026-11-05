@@ -835,7 +835,7 @@ impl Service<'_> {
                             planes,
                             Some(&stream),
                         )?;
-                        column.mark_initialized(planes, &units, &stream)?;
+                        column.mark_initialized(&units, &stream)?;
                         stream.synchronize()?;
                     }
                 }
@@ -1004,7 +1004,8 @@ impl Service<'_> {
                 let head_bytes = match (planes.as_ref(), device) {
                     (Some(planes), Some(device)) => {
                         let plan = planes.plan();
-                        let granularity = platform::HandleType::Descriptor.granularity(device)? as u64;
+                        let granularity =
+                            platform::HandleType::Descriptor.granularity(device)? as u64;
                         u64::from(crate::storage::PlaneLayout::whole_granules(
                             1 + scratch + plan.progress_units(),
                             plan.plane_bytes,

@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
-use platform::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
 use ipc::{PageCopy, PagePoolInfo};
+use platform::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
 use sha2::{Digest, Sha256};
 
 use super::plan::{CacheGroupPlan, CachePlan};
@@ -370,7 +370,7 @@ impl HostKvCache {
                 .iter()
                 .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
                 .collect();
-            column.mark_initialized(planes, &units, stream)?;
+            column.mark_initialized(&units, stream)?;
         }
         Ok(())
     }
