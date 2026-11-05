@@ -1,6 +1,7 @@
 # FastH3 on eight GPUs of one host: eight one-GPU denoiser replicas whose layer
 # projections stay in host storage, sharing one TP8 text encoder. Serve it with
-# --graph-policy off.
+# `--set cuda_graph_config.policy=off`: there is no --graph-policy flag, and the graph
+# policy is an option in the serving tree.
 
 [[worker_groups]]
 id = "text"
