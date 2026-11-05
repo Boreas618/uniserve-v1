@@ -642,9 +642,13 @@ impl Transformer {
 
         // The timestep embedding's activation: `Linear → SiLU → Linear` over one row per group at the
         // modulation's hidden width. The projections are the shared `gemm` row, whose key is the element
-        // types and the epilogue, not the width.
+        // types and the epilogue, not the width — and the activation's element type is **FP32**, because
+        // the AdaLN pair is pinned there at every deployment (`modulation.rs` refuses any other type).
+        // Stating the deployment's `dtype` here asked for a program the launch cannot make: the store
+        // held `silu f16/bf16 at 5376` while the model launches `silu f32 at 5376`, and the run stopped
+        // on the key it could not find.
         programs.launch::<SiluOp>(&Silu::descriptor_of(
-            dtype,
+            nn::DType::F32,
             config.time_hidden_dim,
         ));
 
@@ -1284,6 +1288,22 @@ mod tests {
                 .iter()
                 .any(|(name, key)| name == "act_and_mul" && key.contains("stepwise_true")),
             "the block's activation is the stepwise recipe: {programs:?}"
+        );
+
+        // The AdaLN activation is FP32 `(`modulation.rs` refuses a timestep pair in any other type),
+        // so its key states FP32 at the modulation's hidden width and **not** the deployment's dtype:
+        // a row keyed from the deployment names a program the launch cannot make, and a store built
+        // from it lacks the cell the model asks for. The width is the hidden one, not the timestep
+        // pair's output width — the activation sits between the two projections.
+        let silu: Vec<&str> = programs
+            .iter()
+            .filter(|(name, _)| name == "silu")
+            .map(|(_, key)| key.as_str())
+            .collect();
+        assert_eq!(
+            silu,
+            vec!["dtype_f32_columns_5376_block_1024_pdl_false"],
+            "the AdaLN activation is one f32 program at 5376 columns"
         );
 
         // A conditioned deployment's modulation cache has four groups where a text-only one has two,
