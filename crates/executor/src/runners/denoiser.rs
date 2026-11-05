@@ -289,18 +289,25 @@ pub struct Prepared {
 
 /// The products one denoising step reads, in the order a refusal names them.
 ///
-/// **This is the list the runner places into `Conditioning`, and nothing else.** A step here reads
-/// the encoded conditioning rows (`text`, and `source`, the encoder's own features that
-/// `Denoiser::prepare_conditioning` folds into `text` before the first evaluation) and the
-/// trajectory it advances (`latents`). `images` and `audio` are `Conditioning` fields another model
-/// fills; this runner passes `None` for both, so requiring them would refuse every step of a model
-/// that does not use them - which is what a list written from the capability's fields rather than
-/// from this file's own assembly would do.
+/// **This is the list the runner reads from the store, and nothing else.** A step here reads the
+/// encoded conditioning rows (`text`) and the encoder's own features (`source`), which
+/// `Denoiser::prepare_conditioning` folds into `text` before the first evaluation.
+///
+/// **The trajectory is not on the list although the model's `Layout` states it**, because this
+/// runner *owns* it: the latents are its own columns, which the captured graph updates in place, so
+/// asking a store for them would be asking for a second name for memory the runner already holds.
+/// The runner is what *publishes* them, as `VideoLatents`/`AudioLatents`, for the decode that reads
+/// them next.
+///
+/// `images` and `audio` are `Conditioning` fields another model fills; this runner passes `None`
+/// for both, so requiring them would refuse every step of a model that does not use them - the
+/// defect of a list written from the capability's fields rather than from this file's own
+/// assembly.
 ///
 /// The request's raw condition media is not here either: it is an input to the conditioning rather
 /// than a row of it, it is per condition, and the scheduler names it
 /// (`crate::runners::products`).
-const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source, Product::Latents];
+const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
 
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
@@ -1298,26 +1305,25 @@ mod product_tests {
         ipc::RequestKey::new(1, ipc::RequestId(41), 0)
     }
 
-    /// The rule a step depends on: the kind it refuses names the first product no call produced, in
-    /// the model's own order, so a failure says whether the encoder ran or the trajectory is missing.
+    /// The rule a step depends on: the refusal names **the first kind the store lacks, in the
+    /// runner's own order**, so a failure says which call never ran rather than that something did.
     #[test]
     fn the_first_absent_kind_is_the_one_a_step_refuses() {
         let store = Store {
-            held: vec![Product::Text, Product::Source],
+            held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
         let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
             .expect("a store answers");
         assert_eq!(
             missing,
-            Some(Product::Latents),
-            "the trajectory is the first kind this store lacks"
+            Some(Product::Source),
+            "the encoder's features are the first kind this store lacks"
         );
+        let refusal = products::absent(request(), Product::Source).to_string();
         assert!(
-            products::absent(request(), Product::Latents)
-                .to_string()
-                .contains("latents"),
-            "the refusal names the kind"
+            refusal.contains("source"),
+            "the refusal names the kind: {refusal}"
         );
     }
 
@@ -1348,8 +1354,8 @@ mod product_tests {
             "the refusal names the attached store: {refusal}"
         );
         assert_eq!(
-            Product::Latents.name(),
-            "latents",
+            Product::VideoLatents.name(),
+            "video latents",
             "a kind is named as the design names it"
         );
     }
