@@ -174,7 +174,21 @@ def statements(path):
                 break
             stripped = line.strip()
             if "raster sizes:" in stripped:
-                inner = stripped.split("raster sizes:", 1)[1].split("]", 1)[0]
+                # Two forms are written today: a bracketed list of tuples,
+                # `[(672, 1536), (768, 1344)]`, and the same list quoted as one string,
+                # `"(672, 1536), (768, 1344)`. The quoted form is the writer's defect, but a
+                # reader that crashes on it reports a broken harness rather than a broken
+                # header, so both are read and the difference is left to the writer's check.
+                inner = stripped.split("raster sizes:", 1)[1].lstrip()
+                # The list is the rest of the field, so it ends where the next one begins: at
+                # the closing quote of the quoted form, at `]` of the bracketed form, or at
+                # the `, packed rows:` that follows it in the header's one-line field list.
+                if inner.startswith(('"', "'")):
+                    quote = inner[0]
+                    inner = inner[1:].split(quote, 1)[0]
+                else:
+                    inner = inner.split("]", 1)[0]
+                inner = inner.split(", packed rows:", 1)[0].replace('"', "").replace("'", "")
                 rasters = [
                     tuple(int(part) for part in pair.strip(" ()").split(","))
                     for pair in inner.strip(" [").split("),")

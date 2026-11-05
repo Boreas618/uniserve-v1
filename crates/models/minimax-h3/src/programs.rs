@@ -67,6 +67,11 @@ pub struct Types {
     pub text_encoder: nn::DType,
     /// The denoiser's two stacks.
     pub transformer: nn::DType,
+    /// The type the transformer's **boundary tensors** are stored in, where the checkpoint stores
+    /// two: the four boundary projections and the timestep embedder's pair. Equal to
+    /// `transformer` on a checkpoint that stores one type, which is what
+    /// [`crate::load::boundary_dtype`] returning `None` means.
+    pub transformer_boundary: nn::DType,
     /// The video VAE, decoder and encoder.
     pub video: nn::DType,
     /// The audio VAE, decoder and encoder.
@@ -313,12 +318,35 @@ impl Deployment {
                     &config.transformer,
                     config.attention,
                     self.types.transformer,
+                    self.types.transformer_boundary,
                     rows,
                     groups,
                     partition,
                     &[],
                     tiles,
                 )?);
+            }
+
+            // The solver's start coefficient. A grid that scales its draw publishes `sigma_0 - 1` as
+            // one FP32 value and the first step applies it as a one-column residual over the sample
+            // (`solver.rs`, `Solver::new`); a released or distilled grid starts from unit noise and
+            // launches nothing at all, so this row exists per schedule rather than per deployment.
+            let schedule = crate::schedule::Schedule::new(&config.schedule)?;
+            let mut scales = false;
+            for modality in [
+                crate::schedule::Modality::Video,
+                crate::schedule::Modality::Audio,
+            ] {
+                scales |= schedule.start_sigma(modality)?.is_some();
+            }
+            if scales {
+                programs.launch::<ops::residual::ScaledResidual>(
+                    &nn::layers::ScaledResidual::descriptor_of(
+                        crate::denoiser::SAMPLE_DTYPE,
+                        1,
+                        false,
+                    )?,
+                );
             }
         }
         Ok(programs.finish())

@@ -2087,6 +2087,7 @@ impl Denoiser {
         config: &crate::config::TransformerConfig,
         attention: crate::config::AttentionKind,
         dtype: nn::DType,
+        boundary: nn::DType,
         rows: u32,
         groups: Groups,
         partition: &Partition,
@@ -2103,9 +2104,16 @@ impl Denoiser {
 
         let mut programs = Programs::default();
         programs.extend(Transformer::programs(
-            config, attention, dtype, rows, groups, partition, tiles,
+            config, attention, dtype, boundary, rows, groups, partition, tiles,
         )?);
-        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
+        // The refiner's stream is the boundary's type, not the stack's: it is handed the prompt's
+        // features where they are widened into the network, and every row it launches is keyed from
+        // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
+        // its per-head norms, its two modulation gathers and its attention - and lacks the four it
+        // does.
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config, dtype, boundary,
+        )?);
 
         let video = config.video_channels;
 
@@ -3323,6 +3331,7 @@ mod tests {
             &denoiser.transformer,
             denoiser.attention,
             nn::DType::BF16,
+            nn::DType::F32,
             32_000,
             Groups::of(true),
             &crate::partition::Partition::single(),

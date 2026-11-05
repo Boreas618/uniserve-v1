@@ -216,38 +216,24 @@ fn run() -> Result<(), String> {
             // The caller's `component-tensors.json`: the four components' stored element types, which
             // no shardless host can read for itself.
             "--types" => types = Some(PathBuf::from(value()?)),
-            // `tile,sparsity[,reference_keep]`: the bound the compression reduces over is the
-            // deployment's own, computed from its layouts at load, so it is not a flag here.
+            // `tile,sparsity[,reference_keep]`: read by the model's own rule, so a string either
+            // H3 tool is handed is accepted or refused by one sentence. The tile bound the
+            // compression reduces over is the deployment's own, computed from its layouts at load,
+            // and no flag states it.
             "--sparse" => {
                 let stated = value()?;
-                let parts: Vec<&str> = stated.split(',').collect();
-                if parts.len() != 2 && parts.len() != 3 {
-                    return Err(
-                        "--sparse is `tile,sparsity[,reference_keep]` here: the recorder derives the \
-                         tile bound (`Layouts::tiles_bound`) as the deployment's own, so unlike the \
-                         walk's `tile,sparsity,tiles[,reference_keep]` there is no tile count to \
-                         state - and a third value is the keep rate, which must lie in (0, 1]"
-                            .to_owned(),
-                    );
+                match minimax_h3::config::AttentionKind::sparse_of(&stated)
+                    .map_err(|error| error.to_string())?
+                {
+                    minimax_h3::config::AttentionKind::Sparse {
+                        tile,
+                        sparsity,
+                        reference_keep,
+                    } => sparse = Some((tile, sparsity, reference_keep)),
+                    minimax_h3::config::AttentionKind::Dense => {
+                        return Err("--sparse states a sparse deployment".to_string());
+                    }
                 }
-                sparse = Some((
-                    parts[0]
-                        .trim()
-                        .parse()
-                        .map_err(|_| "--sparse's tile is a row count")?,
-                    parts[1]
-                        .trim()
-                        .parse()
-                        .map_err(|_| "--sparse's sparsity is a fraction")?,
-                    match parts.get(2) {
-                        Some(keep) => Some(
-                            keep.trim()
-                                .parse()
-                                .map_err(|_| "--sparse's keep rate is a fraction")?,
-                        ),
-                        None => None,
-                    },
-                ));
             }
             "--list" => list = true,
             "--names" => names = true,
@@ -373,7 +359,8 @@ fn run() -> Result<(), String> {
     // conditioned stream's offsets are both keyed by it, and the two enumerations are only comparable
     // when they were invoked identically. The rule is called here rather than restated.
     {
-        let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+        let config =
+            minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
         let latents = minimax_h3::packing::audio_latent_frames(request.clip);
         let implied = minimax_h3::audio_vae::track_samples(&config.audio_vae, latents);
         if u64::from(request.track) != implied {
@@ -402,6 +389,24 @@ fn run() -> Result<(), String> {
         };
         for (name, harness) in &harnesses {
             match harness(&per) {
+                Ok(rows) if rows.is_empty() => {
+                    // An empty record is not a pass: `0 only recorded` over a harness that drove
+                    // nothing reads exactly like a deployment that launches nothing. A harness
+                    // that needs an argument it was not given refuses by name above; one that
+                    // returns no rows at all is refusing silently, and this is where it is named.
+                    let why = format!(
+                        "recorded no launch: nothing was driven for this harness, and an empty \
+                         record cannot be read as a deployment that launches nothing{}",
+                        if many {
+                            format!(" (at {width}x{height})")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    println!("# refused: {name}: {why}");
+                    eprintln!("# refused: {name}: {why}");
+                    refusals.push((name.to_string(), why));
+                }
                 Ok(rows) => {
                     eprintln!("# {name} at {width}x{height}: {} rows", rows.len());
                     all.extend(rows);
@@ -469,10 +474,7 @@ fn run() -> Result<(), String> {
         if refused_names.is_empty() {
             String::new()
         } else {
-            format!(
-                ": {}",
-                refused_names.join(", ")
-            )
+            format!(": {}", refused_names.join(", "))
         }
     );
 
@@ -544,7 +546,10 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // One row encodes half a track of latent frames and every count downstream accepts it, so the
     // shape is stated here rather than left to the caller's convenience.
     let samples = arena
-        .tensor(DType::F32, Shape::new(&[u64::from(minimax_h3::config::AUDIO_CHANNELS), 1, length]))
+        .tensor(
+            DType::F32,
+            Shape::new(&[u64::from(minimax_h3::config::AUDIO_CHANNELS), 1, length]),
+        )
         .map_err(|error| error.to_string())?;
     let frames = encoder.frames(length).map_err(|error| error.to_string())?;
     let channels = u64::from(config.latent_channels);
@@ -1234,7 +1239,10 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
     // the request that reaches the audio condition is a `ref2va` one whose reference is decoded to a
     // latent frame or more - one encoder clip, which is the shortest reference the model serves.
     let piece_frames = 17u32;
-    let piece_latent = network.clip.latent_frames(piece_frames).map_err(|error| error.to_string())?;
+    let piece_latent = network
+        .clip
+        .latent_frames(piece_frames)
+        .map_err(|error| error.to_string())?;
     // The capacity this request needs is the packing's own count for its condition - the reference's
     // visual rows **and its soundtrack's** - so it is asked of the packing rather than restated: a
     // capacity that held only the visual rows refused the load by 80 rows on the first canvas.
@@ -1269,7 +1277,11 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         .map_err(|error| error.to_string())?;
     let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
     let mut loader = WeightLoader::stated(
-        component_type(request, "audio_vae")?,
+        // The network's own element type. The VAE encoders beside it compute in FP32 at every
+        // deployment and get their own statement below; loading the DiT through this one made a
+        // conditioned harness read every DiT weight as FP32, so its attended rows were written FP32
+        // and two launch keys stated a type the checkpoint does not hold.
+        dit_type,
         Some(&request.extents),
     );
     // `ConditionEncoders` reads its weights from the VAE directories, as the decoder halves do, and
@@ -1717,9 +1729,11 @@ fn check_extents(root: &Path) -> Result<(), String> {
     if differ.is_empty() {
         Ok(())
     } else {
-        Err("the extents table and the checkpoint disagree; a fixture cut from it keys rows the \
+        Err(
+            "the extents table and the checkpoint disagree; a fixture cut from it keys rows the \
              model does not launch"
-            .to_owned())
+                .to_owned(),
+        )
     }
 }
 

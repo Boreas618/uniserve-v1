@@ -665,7 +665,14 @@ impl Scheduler {
                 batch.commands.extend(commands.iter().cloned());
             }
             let mut batch = self.finish_generation_batch(batch, submit_at);
-            self.attach_columns(&mut batch);
+            // One batch is one computation, and the two families stage differently: a token batch
+            // is typed columns the mechanism writes, and a media batch is the request's own stated
+            // parameters beside the computation its kernels were captured for.
+            if media_batch(&batch) {
+                self.attach_media(&mut batch);
+            } else {
+                self.attach_columns(&mut batch);
+            }
             batches.push(batch);
         }
         batches
@@ -804,6 +811,107 @@ impl Scheduler {
         }
     }
 
+    /// Stamps a media batch with its computation and the facts the mechanism states per request
+    /// (2.4, 4.5).
+    ///
+    /// The call kind is the plan's - the phases this pass selected - and the extent is the
+    /// executor's own answer: `Batches::media` names the bucket its runner planned the computation
+    /// into, and a batch captured for one canvas serves no other, so the mechanism asks instead of
+    /// deriving. A computation the executor states no bucket for, or a request whose state this
+    /// scheduler no longer holds, leaves the batch without columns; it is then refused at
+    /// submission by name rather than served at a canvas nothing captured.
+    ///
+    /// The per-request record is `executor::batch::StagedRequest`: the request's conditioning
+    /// exactly as the model family planned it, and the step, seed and canvas the request states.
+    /// What the model prepares on the device - the encoded conditioning rows, the latent
+    /// trajectory - is not here, because the mechanism cannot read it and a placeholder for it
+    /// would be an invented tensor.
+    fn attach_media(&self, batch: &mut ExecutionBatch) {
+        let Some((first, _)) = batch.requests.first() else {
+            return;
+        };
+        let ipc::CallKind::Media(media_call) = first.kind else {
+            tracing::debug!(
+                "a media batch is dropped: batch {} carries no media call",
+                batch.id
+            );
+            return;
+        };
+        let Some(phase) = super::submission::wire_phase(first.kind) else {
+            tracing::debug!(
+                "a media batch is dropped: {:?} names no device phase",
+                first.kind
+            );
+            return;
+        };
+        // The per-request record is a denoising step's: the request's conditioning and the step,
+        // seed and canvas a draw is addressed by. Every other media family stages buffers this
+        // mechanism cannot state - a decode reads the clip's latents and the tables the model's
+        // `layout_tables` names, an encode reads the tokens its call carries - so a batch of one of
+        // those is refused here by name rather than stamped with a record shaped for another family
+        // (a decoder reads `inputs[0]` as a clip's latents, and two buffers for it would be a
+        // refusal about counts rather than about the fact that nobody stated them).
+        if media_call != ipc::MediaCall::Denoising {
+            tracing::debug!(
+                "a media batch is dropped: a {:?} batch's per-request buffers are the model's own \
+                 and the mechanism states no spelling for them yet",
+                media_call
+            );
+            return;
+        }
+        let Ok(rows) = u32::try_from(batch.requests.len()) else {
+            return;
+        };
+        let tokens = batch
+            .requests
+            .iter()
+            .map(|(call, _)| call.input_token_ids.len())
+            .sum::<usize>();
+        let Ok(tokens) = u32::try_from(tokens) else {
+            return;
+        };
+        let mut stated = executor::plan::Computation {
+            call: media_call,
+            rows,
+            tokens,
+            extent: executor::plan::Extent::None,
+        };
+        // The executor's answer is the authority on the extent: it is the bucket its own runner
+        // planned the computation into, and a batch captured for one canvas serves no other.
+        let Some(bucket) = self.executor.media(phase, &stated) else {
+            tracing::debug!(
+                "a media batch is dropped: no device of this rank serves a {:?} computation of \
+                 {rows} row(s) and {tokens} token(s) at phase {}",
+                media_call,
+                phase.0
+            );
+            return;
+        };
+        let extent = bucket.extent;
+        stated.extent = extent;
+        let mut requests = Vec::with_capacity(batch.requests.len());
+        for (call, _) in &batch.requests {
+            let Some(state) = self.running_media.get(&call.request_key.request_id) else {
+                tracing::debug!(
+                    "a media batch is dropped: {:?} names a request this scheduler is not running",
+                    call.request_key.request_id
+                );
+                return;
+            };
+            requests.push(executor::batch::StagedRequest {
+                request: call.request_key,
+                conditioning: state.request.conditioning.clone(),
+                step: state.denoising.completed(),
+                steps: state.denoising.steps(),
+                seed: state.request.sampling.seed,
+                width: state.request.sampling.width,
+                height: state.request.sampling.height,
+                frames: state.request.sampling.num_frames,
+            });
+        }
+        batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));
+    }
+
     /// Determines the next call kind without mutating request or resource state.
     ///
     /// A call chained onto the request's in-flight calls takes precedence.
@@ -884,6 +992,18 @@ impl Scheduler {
             Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
         })
     }
+}
+
+/// Whether `batch` carries a media computation (2.4).
+///
+/// One batch is one computation, so the family is the first call's and every call of a media batch
+/// is a media call: a batch that mixed them is refused at submission, and deciding the family
+/// before staging is what keeps a media battery out of the token layout.
+fn media_batch(batch: &ExecutionBatch) -> bool {
+    batch
+        .requests
+        .first()
+        .is_some_and(|(call, _)| matches!(call.kind, CallKind::Media(_)))
 }
 
 impl Scheduler {
