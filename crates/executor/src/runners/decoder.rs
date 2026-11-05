@@ -21,6 +21,13 @@
 //! interpreting one of them. The order is stated once, by the model, in `prepare_layout`'s doc and in
 //! the capability's: the first buffer is the clip's latents, and the rest are the tables
 //! `layout_tables` names, in that order.
+//!
+//! **The tables are the model's and the clip is the denoiser's.** A layout's tables are prepared
+//! here, from `prepare_layout`, because a batch that carried them would state the model's layout
+//! arithmetic a second time. The trajectory is not this runner's to compute either: a denoise step
+//! publishes it under the request's name, so `stage` copies it from the product store - ordered on
+//! this runner's stream, which also works when the denoiser ran on another device - and reads a
+//! batch buffer as the clip only when the store holds none.
 
 use std::sync::{Arc, Mutex};
 
@@ -358,8 +365,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     ///
     /// A warm capture passes no latents, so the graph reads the model's own clip
     /// (`prepare_layout`'s first buffer) rather than whatever the column held. A replay passes the
-    /// batch's: a staged row is the request's conditioning blob and its parameter record, and for a
-    /// decode the blob is the clip's latents.
+    /// batch's buffer - a staged row is the request's conditioning blob and its parameter record -
+    /// but `stage` reaches this only when the product store holds no trajectory for the request, and
+    /// a blob of another length is then refused rather than copied over a prefix.
     fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
         self.size_raster(bucket)?;
         let layout = self.layout(bucket)?;
@@ -397,7 +405,20 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         })?;
         // The batch names its requests, and a decode bucket serves one clip, so the name kept here
         // is the one the replay's publish uses.
-        self.staged_request = Some(media.request(0)?.request);
+        let request = media.request(0)?.request;
+        self.staged_request = Some(request);
+        // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
+        // is the request's conditioning blob and its parameter record; the latent trajectory is
+        // explicitly not the batch's (`MediaColumns::staged`: "It does not own what the model
+        // prepares on the device - the encoded conditioning rows, the latent trajectory"), and a
+        // denoise step publishes it under this request's name at every step. So the clip is copied
+        // from there, ordered on this runner's stream, which is the only path that also works when
+        // the denoiser ran on another device.
+        if let Some(products) = self.products.clone() {
+            if products.holds(request, Product::VideoLatents) {
+                return self.stage_product(bucket, request, products.as_ref());
+            }
+        }
         let row = Self::clip_of(media)?;
         let Some(latents) = row.first() else {
             return Err(Error::Invalid(
@@ -407,6 +428,31 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             ));
         };
         self.stage_columns(bucket, Some(latents))
+    }
+
+    /// Stages the clip the denoiser published for `request` into the column `bucket`'s graph reads.
+    ///
+    /// The column is sized from the layout first - `prepare_layout`'s own clip - so the destination's
+    /// extent is the model's rather than a length this runner recomputes, and `copy_into` refuses a
+    /// product whose bytes disagree with it instead of copying a prefix. The copy is on this
+    /// runner's stream and the store orders it after the producing step's write, which is what makes
+    /// it correct when the denoiser ran on another stream or another device.
+    fn stage_product(
+        &mut self,
+        bucket: Bucket,
+        request: ipc::RequestKey,
+        store: &dyn Products,
+    ) -> Result<()> {
+        self.stage_columns(bucket, None)?;
+        let layout = self.layout(bucket)?;
+        let latents = self.latents(&layout);
+        if !store.copy_into(request, Product::VideoLatents, &latents, &self.stream)? {
+            return Err(crate::runners::products::absent(
+                request,
+                Product::VideoLatents,
+            ));
+        }
+        Ok(())
     }
 
     /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
@@ -885,9 +931,10 @@ mod tests {
     #[test]
     fn a_staged_row_is_the_conditioning_blob_the_batch_was_built_with() {
         // The row's shape is the engine's, not this file's: `MediaColumns::staged` writes the
-        // request's conditioning blob and its parameter record, one row per request. The blob is the
-        // clip's latents and the record is read by `media.request`, so the first buffer is the only
-        // one this runner stages from a batch.
+        // request's conditioning blob and its parameter record, one row per request, and the record is
+        // read by `media.request`. The blob is the clip only as a fallback: `stage` takes the
+        // trajectory from the product store first, so this ordering is what a batch without a
+        // published product has to satisfy.
         let media = crate::batch::MediaColumns {
             computation: crate::plan::Computation {
                 call: ipc::MediaCall::VideoDecoding,
