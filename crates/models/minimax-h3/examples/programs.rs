@@ -241,7 +241,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio = root.join("audio_vae/config.json");
     if audio.exists() {
         let config = AudioVaeConfig::parse(&read(&audio)?)?;
-        rows.extend(AudioDecoder::programs(&config, &samples)?);
+        // `--samples` is the deployment's clip lengths in **frames**; a decode starts from the
+        // track's **latent frames** and `AudioDecoder::programs` takes that quantity. Passing the
+        // frames stated every stage's width a factor too wide - at `--samples 5` the seven residual
+        // rows landed at `5 x {5,25,50,100,200,400,800}` instead of `8 x {...}`, where 8 is the
+        // clip's latent frames - and the rows matched no store the list builds.
+        let latents: Vec<u32> = samples
+            .iter()
+            .map(|frames| minimax_h3::packing::audio_latent_frames(*frames))
+            .collect();
+        rows.extend(AudioDecoder::programs(&config, &latents)?);
         // The audio encoder runs FP32 by the design's own rows, so it takes no dtype.
         rows.extend(AudioEncoder::programs(&config, &track)?);
     } else {
