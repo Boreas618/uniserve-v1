@@ -669,15 +669,15 @@ fn dense_projection(
     bias: bool,
 ) -> Result<Linear> {
     let start = as_u64(partition.tensor_rank, "the tensor rank")? * rows * columns;
+    // A dense projection is a matrix that multiplies the hidden state, so an all-zero one is a
+    // missing export and not a value: the packed path refuses the same defect from its codes and
+    // scales (`WeightLoader::nvfp4`), and this is the dense export's way to it.
     let request = WeightRequest::region(
         checkpoint_name(sources, &format!("{parameter}.weight"))?,
         start,
         Shape::new(&[rows, columns]),
-    );
-    // A dense projection is a matrix that multiplies the hidden state, so an all-zero one is a
-    // missing export and not a value: the packed path refuses the same defect from its codes and
-    // scales (`WeightLoader::nvfp4`), and this is the dense export's way to it.
-    loader.refuse_zeros(&request).map_err(Error::from)?;
+    )
+    .nonzero();
     let weight = loader.load(&request).map_err(Error::from)?;
     let bias = if bias {
         Some(region(
@@ -732,13 +732,15 @@ fn dense_output_projection(
     reduction: u64,
     bias: bool,
 ) -> Result<Linear> {
+    // The same refusal as the row-sharded form: this matrix multiplies the hidden state, so an
+    // all-zero region is a missing export.
     let request = row_parallel_region(
         partition,
         checkpoint_name(sources, &format!("{parameter}.weight"))?,
         hidden,
         reduction,
-    )?;
-    loader.refuse_zeros(&request).map_err(Error::from)?;
+    )?
+    .nonzero();
     let weight = loader.load(&request).map_err(Error::from)?;
     let bias = if bias {
         Some(region(
