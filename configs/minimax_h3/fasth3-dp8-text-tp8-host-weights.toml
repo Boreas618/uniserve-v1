@@ -1,8 +1,3 @@
-# FastH3 on eight GPUs of one host: eight one-GPU denoiser replicas whose layer
-# projections stay in host storage, sharing one TP8 text encoder. Serve it with
-# `--set cuda_graph_config.policy=off`: there is no --graph-policy flag, and the graph
-# policy is an option in the serving tree.
-
 [[worker_groups]]
 id = "text"
 ranks = ["cuda:0-7"]
@@ -11,7 +6,6 @@ mem_fraction_static = 0.18
 
 [worker_groups.components.text_encoder]
 tensor_parallel_size = 8
-
 [[worker_groups]]
 id = "flow"
 replicas = 8
@@ -30,24 +24,15 @@ distribution = "temporal_units"
 [worker_groups.components.latent_encoder]
 distribution = "temporal_units"
 
-[[worker_groups]]
-id = "encoder"
-replicas = 8
-ranks = ["cpu*8"]
-queue_depth = 6
-
+# The media components are placed on this group's CUDA ranks, one set per replica: a request's
+# encode, mux and read are host calls the main process of the rank that serves it runs (the
+# executor's `Media` lane), and a main process serves CUDA devices only - a rank on `cpu` is
+# refused when the node is launched. `video_codec` takes one unit per rank (the resolver inserts
+# its temporal distribution); the muxer and the reader serve on one rank.
 [worker_groups.components.video_codec]
 
-[[worker_groups]]
-id = "reader"
-ranks = ["cpu"]
-queue_depth = 24
+[worker_groups.components.muxer]
+ranks = [0]
 
 [worker_groups.components.media_reader]
-
-[[worker_groups]]
-id = "muxer"
-ranks = ["cpu"]
-queue_depth = 24
-
-[worker_groups.components.muxer]
+ranks = [0]
