@@ -211,7 +211,11 @@ fn text_is_served_before_any_rejection() {
     let mut served_any = false;
     while Instant::now() < deadline && !served_any {
         match served.try_recv() {
-            Ok(Event::TextToken { .. }) => served_any = true,
+            // The engine publishes generated tokens as `TextTokens` carrying
+            // the ids a step produced (`scheduler/output.rs`), and a single
+            // `TextToken` is the one-id form of the same event. A wait that
+            // matched only the second read a served request as a starved one.
+            Ok(Event::TextToken { .. }) | Ok(Event::TextTokens { .. }) => served_any = true,
             Ok(event) if event.is_terminal() => break,
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(1)),
