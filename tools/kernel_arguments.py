@@ -105,6 +105,17 @@ def load_spec(build: pathlib.Path):
                 found.loader.exec_module(module)
         except BaseException as error:  # noqa: BLE001 - an unimportable package is a gap
             raise RuntimeError(f"{type(error).__name__}: {error}") from None
+        # The purge above is the repair; this is the statement that it held. A package that bound
+        # another package's `_compile` would compare a key against a parser its own operator never
+        # used, and the symptom is a refusal, not a wrong number - so the invariant is checked where
+        # the binding happens rather than trusted to the purge being repeated correctly.
+        bound = sys.modules.get(_COMPILE)
+        origin = getattr(bound, "__file__", None)
+        if origin and source not in pathlib.Path(origin).parents:
+            raise RuntimeError(
+                f"{build} bound `_compile` from {origin}, which is not this package's; two "
+                f"packages in one process share a bare module name unless each is loaded fresh"
+            )
         return module.spec
     finally:
         sys.path.remove(str(source))
