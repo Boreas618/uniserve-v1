@@ -302,10 +302,13 @@ impl TokenRefiner {
             programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, dtype));
         }
 
-        // The identity residual each block folds both of its updates through.
+        // The identity residual each block folds both of its updates through. Its scale is one
+        // value (`identity()`, `[1]` F32), so the launch's descriptor is one column wide and the
+        // operator broadcasts it across the row: declaring the row's width here states a key the
+        // block never launches.
         programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
             dtype,
-            u64::from(hidden),
+            IDENTITY_COLUMNS,
             false,
         )?);
 
@@ -519,13 +522,20 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
     }
 }
 
+/// The width of the identity residual's scale: one value, broadcast across the row.
+///
+/// The residual's descriptor is its scale's element count, so this is both the buffer the block
+/// loads and the `columns` its launch is keyed by; the two are written from one constant because a
+/// declared width that disagrees with the loaded buffer states a key nothing launches.
+const IDENTITY_COLUMNS: u64 = 1;
+
 /// The identity residual: every channel's update added unchanged.
 fn identity(loader: &mut WeightLoader<'_>) -> Result<ScaledResidual> {
     let one = 1.0f32.to_le_bytes();
     let scale = loader.constant(
         "refiner.identity_scale",
         nn::DType::F32,
-        Shape::new(&[1]),
+        Shape::new(&[IDENTITY_COLUMNS]),
         &one,
         "minimax-h3",
     )?;
