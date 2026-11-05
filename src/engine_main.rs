@@ -1774,6 +1774,15 @@ impl MainProcess {
             .generations
             .iter()
             .all(|generation| generation.is_empty());
+        // An update names the epoch's whole set, and only what differs from what serves is
+        // installed: a kernel that stays keeps its `Arc`, so its buckets and its graphs stay too.
+        let updated;
+        let programs = if never_installed {
+            programs
+        } else {
+            updated = updated_programs(programs, &self.serving_programs);
+            &updated
+        };
         let mut precopy = Precopy {
             generation,
             reply,
@@ -2853,7 +2862,9 @@ impl MainProcess {
         // and 3). They wait here, so a descriptor lookup still reads the serving generation and a
         // revert has nothing to undo.
         self.prepared = std::mem::take(&mut precopy.next);
-        self.prepared_programs = precopy.programs.clone();
+        // What serves after the switchover: what serves now, with what this precopy installed.
+        self.prepared_programs = self.serving_programs.clone();
+        self.prepared_programs.extend(precopy.programs.clone());
         if let Err(error) = self.update.precopied(generation) {
             // The generation this precopy built is not the one the machine waits for - a revert or a
             // later precopy took its place while the builds ran. The revert path discards what was
@@ -5721,6 +5732,29 @@ fn promote_refusal(standby: bool, prepared: usize) -> Option<String> {
     })
 }
 
+/// The programs of an update that differ from what serves.
+///
+/// The update names every operator the store holds, and an operator this process does not serve is
+/// no part of it. A program is compared by its backend and revision: its arguments are the package's
+/// defaults, which the two sides state in different words.
+fn updated_programs(named: &Programs, serving: &Programs) -> Programs {
+    named
+        .iter()
+        .filter(|(slot, program)| {
+            serving
+                .iter()
+                .filter(|(held, _)| {
+                    held.op == slot.op
+                        && (held.phase == slot.phase || held.phase.is_none() || slot.phase.is_none())
+                })
+                .any(|(_, held)| {
+                    held.backend != program.backend || held.revision != program.revision
+                })
+        })
+        .map(|(slot, program)| (slot.clone(), program.clone()))
+        .collect()
+}
+
 /// The operators whose programs differ between what serves and what a precopy prepared (§7.3).
 ///
 /// `changed` is not `new`. An operator the prepared generation holds and the serving one does not
@@ -6743,6 +6777,37 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An update names the whole set, and what it installs is what differs from what serves.
+    ///
+    /// The operator that stayed keeps its kernel, and with it every bucket it launches in: loading it
+    /// again read as a changed program, so an update of `rms_norm` compared `paged_attention` instead.
+    #[test]
+    fn an_update_installs_only_the_programs_that_changed() {
+        let program = |backend: &str, revision| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+        let slot = |op: &str| program_server::program::ProgramSlot::all(op);
+        let serving: Programs = [
+            (slot("rms_norm"), program("triton", 1)),
+            (slot("paged_attention"), program("trtllm", 1)),
+        ]
+        .into_iter()
+        .collect();
+        let named: Programs = [
+            (slot("rms_norm"), program("triton", 2)),
+            (slot("paged_attention"), program("trtllm", 1)),
+            (slot("gelu"), program("triton", 1)),
+        ]
+        .into_iter()
+        .collect();
+        let updated = updated_programs(&named, &serving);
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert_eq!(updated[&slot("rms_norm")].revision, 2);
+    }
+
     use super::*;
     /// A takeover replays what the predecessor produced past the position the successor's consumer
     /// states, and nothing else (§7.5.1 step 4).

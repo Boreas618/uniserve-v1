@@ -1559,10 +1559,15 @@ impl Leader {
             let leader_host = leader_host.clone();
             let filled = filled.clone();
             let preparing = tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(
+                let complete = crate::engine::control::with_store_programs(
                     &servers,
                     &leader_host,
                     &filled,
+                )?;
+                crate::engine::control::prepare_epoch(
+                    &servers,
+                    &leader_host,
+                    &complete,
                     &[],
                     &recorded,
                 )
