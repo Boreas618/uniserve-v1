@@ -679,6 +679,21 @@ impl CommitColumns {
         self.slots as usize
     }
 
+    /// The token slot `slot` feeds its next decode, as `slot_commit` last wrote it.
+    ///
+    /// The column is one mapped allocation, and the device thread reads this between batches, after
+    /// the batch that wrote it has completed.
+    fn next_input(&self, slot: usize) -> i32 {
+        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) }
+    }
+
+    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
+    fn set_next_input(&self, slot: usize, token: i32) {
+        // SAFETY: as in `next_input`, and no launch that reads this column is in flight.
+        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) = token };
+    }
+
     /// The device address of the per-slot trajectory positions.
     fn sampling_ptr(&self) -> ops::DevicePtr {
         self.sampling.device.ptr
@@ -1456,6 +1471,14 @@ pub trait KvProvider: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<TensorView>;
 
+    /// The same table's view over `slots`' rows, with no copy issued.
+    ///
+    /// A capture records every copy with the addresses it had, so a gather inside a recording bakes
+    /// the pose's pool rows into the graph, and each replay would then overwrite the batch's table
+    /// with them. A recording addresses the table through this view, and `block_table` fills it
+    /// before each launch.
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView>;
+
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
 
@@ -2091,6 +2114,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
+                // The graph holds no gather: the table it reads is filled here, on the stream the
+                // launch follows, from this batch's own slots.
+                let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
+                for group in 0..self.kv.groups() {
+                    self.kv.block_table(group, &slots, &self.stream)?;
+                }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -2399,8 +2428,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        self.lifecycle.rebind(bucket, generation, walked?, &kernels)
     }
 
     /// The pool stream this runner's graphs are planned and replayed on.
@@ -2657,6 +2688,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             unsafe {
                 *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
             }
+            // The graph committed its own draw as this slot's next input, and the next decode
+            // embeds what the client was told.
+            if let Ok(slot) = usize::try_from(slot) {
+                self.commit.set_next_input(slot, best as i32);
+            }
         }
         Ok(())
     }
@@ -2884,9 +2920,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let gather = spelled(&gather, rows);
         let line = format!(
             "bucket={bucket} variant={:?} rows={rows} tokens={tokens} gather={gather} \
-             positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
+             ids={} positions={} seq_lens={} query_offsets={} logits_rows={} slots={} \
              slot_pages={written} start_page={start_page} units={units} allocated_tokens={allocated}",
             bucket.variant,
+            spelled(self.staging.input_ids(tokens.min(8)), 8),
             spelled(&self.staging.batch_rows().positions, 8),
             spelled(&self.staging.batch_rows().seq_lens, rows),
             spelled(&self.staging.batch_rows().query_offsets, rows + 1),
@@ -4061,7 +4098,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.max_kv_len,
         );
         // The page table's row, from the column the kernel addresses.
-        match self.kv.block_table(0, &slots, &self.stream) {
+        match self.kv.block_table_view(0, &slots) {
             Ok(table) => {
                 let mut entries = [0_i32; 8];
                 let bytes = entries.len() * std::mem::size_of::<i32>();
@@ -4131,7 +4168,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.columns.positions.write(&self.encoded)?;
         // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
         // the model already holds, so embedding them is the runner's step, not the model's.
-        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
+        // A decode row's token is the slot's next input, which the step before it wrote. The
+        // mechanism plans a step ahead of its results, so the token it states lags by one: it is a
+        // stale value on every step and nothing at all on the first.
+        let mut ids = self.staging.input_ids(tokens).to_vec();
+        if bucket.variant.is_decode() {
+            let slots = self.staging.slots(rows);
+            for (row, id) in ids.iter_mut().enumerate().take(rows) {
+                if let Ok(slot) = usize::try_from(slots[row]) {
+                    *id = self.commit.next_input(slot);
+                }
+            }
+        }
+        encode_i32(&mut self.encoded, &ids);
         self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
@@ -4271,7 +4320,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             match scratch_pages {
                 None => {
                     layers.push(self.kv.planes(group)?);
-                    tables.push(self.kv.block_table(group, slots, &self.stream)?);
+                    tables.push(if self.capturing {
+                        self.kv.block_table_view(group, slots)?
+                    } else {
+                        self.kv.block_table(group, slots, &self.stream)?
+                    });
                 }
                 Some(pages) => {
                     let (table, planes) = self.kv.scratch(group, slots, pages, &self.stream)?;
