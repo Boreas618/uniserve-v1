@@ -1131,6 +1131,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
     /// read beside the write that should have fed it.
     last_prefill: Option<String>,
+    /// How long the last `cuGraphLaunch` took to return, which is the host's enqueue cost and not
+    /// the device's work: a replay that is slow in its enqueue is a graph the driver cannot hand
+    /// over quickly, and one that is slow after it is the kernels.
+    enqueue_ms: f64,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1238,6 +1242,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             pending_dump: None,
             last_prefill: None,
+            enqueue_ms: 0.0,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1600,7 +1605,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 let launched = Instant::now();
+                let enqueue = Instant::now();
                 captured.launch(&stream)?;
+                self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
@@ -1940,7 +1947,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
+                enqueue_ms = self.enqueue_ms,
                 replay_ms = launched.elapsed().as_secs_f64() * 1e3,
+                wait_ms = (launched.elapsed().as_secs_f64() * 1e3 - self.enqueue_ms).max(0.0),
                 "a batch states the cache addresses it read and wrote"
             );
             if !bucket.variant.is_decode() {
@@ -2213,6 +2222,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut out = String::new();
         for byte in host {
             out.push_str(&format!("{byte:02x}"));
+        }
+        // The page's `initialized` flag, which decides whether a reader of this page sees its keys
+        // at all: a page whose values are right and whose flag is zero masks every key it holds,
+        // and a decode that attends to nothing is a continuation driven by its own last token.
+        match planes
+            .iter()
+            .find(|(name, _)| name == "key.initialized")
+        {
+            Some((_, flags)) => {
+                let mut flag = [0_u8; 1];
+                // SAFETY: the destination is this function's own one-byte host buffer and the
+                // source is the flag of a unit the view above states.
+                let copied = unsafe {
+                    platform::memcpy_async(
+                        flag.as_mut_ptr() as u64,
+                        flags.address() + unit as u64,
+                        1,
+                        &self.stream,
+                    )
+                };
+                if copied.is_ok() && self.stream.synchronize().is_ok() {
+                    out.push_str(&format!(" init={}", flag[0]));
+                } else {
+                    out.push_str(" init=unread");
+                }
+            }
+            None => out.push_str(" init=no-flags"),
         }
         out
     }
