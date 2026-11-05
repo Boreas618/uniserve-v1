@@ -842,6 +842,77 @@ fn runner_dump() -> bool {
 /// launched? Both are answered by the same run, because the walk uses the same columns, the same arena
 /// and the same programs. It is never a serving path: an eager walk is what capture does, and a
 /// deployment that ran it would launch every operator again on every batch.
+/// Every layer's attention output, digested at the launch that wrote it.
+///
+/// The buffer a layer is attended into is the forward's and the next layer overwrites it, so a digest
+/// read after the graph has run answers for the last layer whichever name it carries. This reads one
+/// layer's bytes while they exist, which is the only reading that can say whether a layer's own
+/// attention program wrote anything.
+#[derive(Default)]
+struct AttentionOutputs {
+    written: std::cell::RefCell<Vec<(usize, String, usize)>>,
+}
+
+impl AttentionOutputs {
+    /// One digest of a view, read on the launching stream: `None` when the copy cannot be made.
+    fn digest(view: nn::TensorView, stream: &platform::Stream) -> Option<(String, usize)> {
+        let bytes = usize::try_from(view.shape.numel())
+            .ok()
+            .zip(view.dtype.bytes())
+            .map(|(elements, width)| elements.saturating_mul(width as usize))?;
+        if bytes == 0 {
+            return None;
+        }
+        let mut raw = vec![0_u8; bytes];
+        // SAFETY: the buffer is this call's own and of `bytes`, and the source is an address a launch
+        // was just given. The copy is issued on the launching stream, so it is ordered after the write.
+        let copied = unsafe {
+            platform::memcpy_async(raw.as_mut_ptr() as u64, view.ptr.address(), bytes, stream)
+        };
+        if copied.is_err() || stream.synchronize().is_err() {
+            return None;
+        }
+        let nonzero = raw.iter().filter(|byte| **byte != 0).count();
+        Some((format!("{:016x}", platform::fnv1a(&raw)), nonzero))
+    }
+}
+
+impl nn::AttentionProbe for AttentionOutputs {
+    fn attention(
+        &self,
+        layer: usize,
+        query: nn::TensorView,
+        out: nn::TensorView,
+        stream: &platform::Stream,
+    ) {
+        let (Some((query_digest, query_nz)), Some((out_digest, out_nz))) =
+            (Self::digest(query, stream), Self::digest(out, stream))
+        else {
+            return;
+        };
+        self.written.borrow_mut().push((
+            layer,
+            format!("{query_digest} qnz={query_nz} o={out_digest} onz={out_nz}"),
+            0,
+        ));
+    }
+}
+
+impl AttentionOutputs {
+    /// `l<n>=<digest> nz=<bytes>` per layer, in the order the layers ran.
+    fn spelled(&self) -> String {
+        let written = self.written.borrow();
+        if written.is_empty() {
+            return "none".to_owned();
+        }
+        written
+            .iter()
+            .map(|(layer, digest, _)| format!("l{layer}:{digest}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 fn eager_replay() -> bool {
     static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EAGER.get_or_init(|| {
@@ -3821,8 +3892,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.pool()?.reserved(),
         );
         let batch = self.token_batch(bucket)?;
-        let forward = Forward::new(&stream, generation, &arena)
+        // Under the dump, every layer's attended output is read at its own launch: the buffer is
+        // reused by the next layer, so any later reading is the last layer's whichever name it has.
+        let probe = AttentionOutputs::default();
+        let mut forward = Forward::new(&stream, generation, &arena)
             .with_live_tokens(self.columns.live_tokens.device);
+        if runner_dump() {
+            forward = forward.with_attention_probe(&probe);
+        }
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -3841,6 +3918,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
             Ok(())
         })?;
+        if runner_dump() {
+            tracing::info!(
+                bucket = %bucket,
+                outputs = %probe.spelled(),
+                "attention outputs, each read at its own layer's launch"
+            );
+        }
         if first {
             self.pool()?.record(self.stream_id(), bucket, arena.used())?;
         }
