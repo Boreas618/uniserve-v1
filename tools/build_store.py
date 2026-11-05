@@ -274,7 +274,14 @@ def main():
             f"{args.python}\n  first failure: {skipped[0][0]} {skipped[0][1]}: {first}"
             if skipped else f"the store is empty: no package covers a key of {args.fixture}"
         )
-    print(f"# built {len(built)} of {len(rows)} keys into {root} (revision {args.revision}, {args.target})")
+    print(
+        f"# built {len(built)} of {len(rows)} keys into {root} "
+        f"(revision {args.revision}, {args.target})"
+    )
+    # The fixture is named in the summary because a build is evidence of exactly one file: two
+    # fixtures built into one log read as one count, and a row of one fixture's failures then looks
+    # like a failure of the other's deployment.
+    print(f"# fixture: {args.fixture} ({len(rows)} rows)")
 
     # How many of those cells hold the same program. A key field that reaches no compiled word
     # writes an identical module under its own name (tools/key_field_audit.py proves which), so the
