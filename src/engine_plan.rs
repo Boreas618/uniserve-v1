@@ -509,10 +509,10 @@ impl EpochPlan {
             // against the ids themselves.
             bos: Some(control.bos),
             eos: Some(control.eos),
-            // A causal LM encodes no image, so no token closes encoded image content. `0` is the
-            // daemon's own value for a profile that states no generation controls:
-            // `crates/daemon/src/leader.rs:2400`, `let end_of_image = controls.map_or(0, |value|
-            // value.end_of_image);`. It is the absence of a token, not an invented one.
+            // A causal LM encodes no image, so no token closes encoded image content. The wire
+            // field carries no presence bit: it is a plain `uint32`, and the daemon writes `0`
+            // for a profile that states no generation controls. So `0` stands for the absence of
+            // a token rather than for an invented one, and a reader must not take it as an id.
             end_of_image: Some(0),
             // What one request may be given to generate on this model; see `understanding_limits`.
             generation_limits: Some(understanding_limits()),
