@@ -954,6 +954,19 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
     ))
 }
 
+/// A 64-bit digest of `bytes`, so two ends of a comparison can state one number per page.
+///
+/// FNV-1a: it costs nothing, needs no table and is stable across processes, which is what makes it
+/// quotable between the slice's run and the runner's.
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Whether a block table view holds `bytes` readable bytes of page indices.
 ///
 /// The table is read back from the column the kernel addresses, so a view that is not `i32` or is
@@ -1178,6 +1191,13 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
     /// Submit therefore states which batch the rows belong to, and a replay of another batch
     /// refuses rather than installing the wrong request's pages.
+    /// What the captured attention launch was given, read from the device after the replay and
+    /// printed on the device thread (`UNISERVE_RUNNER_DUMP`).
+    ///
+    /// The batch's own line states the host side; this states the *call*: the scalars a captured
+    /// launch carries and the pointers the kernel dereferences. A kernel handed a table of zeros or
+    /// a bound of one reads nothing, and no host-side figure says which.
+    pending_attention: Option<String>,
     pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
@@ -1295,6 +1315,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            pending_attention: None,
             pending_install: None,
             pending_dump: None,
             last_prefill: None,
@@ -1671,6 +1692,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
+                }
+                if runner_dump() {
+                    self.pending_attention =
+                        Some(self.dump_attention_call(captured));
                 }
                 if runner_dump() {
                     // What a replay launches, by node kind, and how many launches the recording
@@ -2072,9 +2097,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let bytes = self.dump_page_bytes(page);
             let prefill = self.last_prefill.clone().unwrap_or_else(|| "none".to_owned());
             let arguments = self.dump_kernel_arguments(bucket);
+            let call = self.pending_attention.take().unwrap_or_else(|| "none".to_owned());
             tracing::info!(
                 %line,
                 %arguments,
+                %call,
                 page,
                 key_page = %bytes,
                 prefill = %prefill,
@@ -2416,6 +2443,197 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         self.kv.install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)
+    }
+
+    /// What the captured attention launch is given: its grid, and the call its kernel dereferences.
+    ///
+    /// A paged attention kernel reads everything it knows from one argument: the call, a struct the
+    /// operator writes into the bucket's arena before the capture. Its scalars are the graph's
+    /// constants (a bound of one token or a table of zeros is invisible from the host side), and its
+    /// pointers are what make the launch read the vector this runner filled or another one
+    /// entirely. This reads the struct back from device memory and compares each pointer it holds
+    /// with the column this runner's batch wrote, so a launch reading somewhere else says so.
+    ///
+    /// It runs on the device thread, after the replay that wrote the pages, and every failure is
+    /// text: a diagnosis never fails the batch it describes.
+    fn dump_attention_call(&self, captured: &crate::captured::Captured) -> String {
+        use ops::attention::PAGED_ATTENTION_CALL_LAYOUT as LAYOUT;
+        let Some((operator, key, launch)) = captured
+            .nodes()
+            .iter()
+            .find(|(operator, _, launch)| *operator == "paged_attention" && !launch.is_empty())
+        else {
+            return "no-attention-launch".to_owned();
+        };
+        let Some(first) = launch.first() else {
+            return "no-attention-node".to_owned();
+        };
+        let params = match captured.template().kernel_node_params(&first.node) {
+            Ok(params) => params,
+            Err(error) => return format!("params-refused({error})"),
+        };
+        // The kernel's one argument is the pointer to its call struct.
+        let Some(bytes) = params.parameters.first() else {
+            return "no-parameters".to_owned();
+        };
+        let address = match bytes.as_slice() {
+            [a, b, c, d, e, f, g, h] => u64::from_ne_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
+            _ => return "odd-parameter".to_owned(),
+        };
+        let Some(call) = self.read_device(address, LAYOUT.size) else {
+            return format!("call-unreadable({address:#x})");
+        };
+        let word = |offset: usize| -> u64 {
+            let mut eight = [0_u8; 8];
+            eight.copy_from_slice(&call[offset..offset + 8]);
+            u64::from_ne_bytes(eight)
+        };
+        let signed = |offset: usize| -> i64 { word(offset) as i64 };
+        let mut out = format!(
+            "attention {operator} {key} grid={:?} block={:?} shared={} call={address:#x} \
+             phase={} batch={} tokens={} max_q_len={} max_kv_len={} num_pages={} page_size={} \
+             kv_stride_page={} kv_stride_tokens={} kv_stride_heads={}",
+            params.grid,
+            params.block,
+            params.shared_memory,
+            signed(LAYOUT.phase),
+            signed(LAYOUT.batch),
+            signed(LAYOUT.tokens),
+            signed(LAYOUT.max_q_len),
+            signed(LAYOUT.max_kv_len),
+            signed(LAYOUT.num_pages),
+            signed(LAYOUT.page_size),
+            signed(LAYOUT.kv_stride_page),
+            signed(LAYOUT.kv_stride_tokens),
+            signed(LAYOUT.kv_stride_heads),
+        );
+        // Every pointer the call holds, beside the address this runner's own column has: a launch
+        // that reads another vector is invisible in every host-side figure, and this is where it
+        // shows.
+        let mut verdicts = String::new();
+        for (name, offset, own) in [
+            (
+                "seq_lens",
+                LAYOUT.seq_lens,
+                self.columns.seq_lens.device.ptr.address(),
+            ),
+            (
+                "cum_seq_lens_q",
+                LAYOUT.cum_seq_lens_q,
+                self.columns.query_offsets.device.ptr.address(),
+            ),
+        ] {
+            let pointer = word(offset);
+            let agrees = if pointer == own { "own" } else { "OTHER" };
+            verdicts.push_str(&format!(" {name}={pointer:#x}({agrees})"));
+        }
+        // The attention's own output buffer: the address `o_proj` reads, and the first bytes it
+        // holds after the launch. An output of zeros is a row that attends to nothing, and every
+        // layer above it then computes from zeros without any error anywhere.
+        let out_pointer = word(LAYOUT.out);
+        let out_digest = match self.read_device(out_pointer, 64) {
+            Some(raw) => format!("{:016x}", fnv(&raw)),
+            None => "unreadable".to_owned(),
+        };
+        out.push_str(&format!(" out={out_pointer:#x}/{out_digest}"));
+        out.push_str(&verdicts);
+        // The first entries of the two vectors the kernel reads, from the addresses the call names -
+        // not from the host's copy of the column, which would agree with itself either way.
+        for (name, offset, count) in [
+            ("seq_lens", LAYOUT.seq_lens, 8usize),
+            ("cum_seq_lens_q", LAYOUT.cum_seq_lens_q, 8),
+        ] {
+            let pointer = word(offset);
+            if pointer == 0 {
+                out.push_str(&format!(" {name}=[null]"));
+                continue;
+            }
+            let Some(raw) = self.read_device(pointer, count * 4) else {
+                out.push_str(&format!(" {name}=unreadable"));
+                continue;
+            };
+            let values: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|four| i32::from_ne_bytes([four[0], four[1], four[2], four[3]]))
+                .collect();
+            out.push_str(&format!(" {name}={values:?}"));
+        }
+        // Per layer: where its keys and values are, and a digest of the page the table names. The
+        // slice prints the same digest for the same tokens, so a first layer that differs says the
+        // hidden state entering it differed, and a later one says that layer's attention or MoE.
+        let pages = {
+            let first = word(LAYOUT.page_table);
+            if first == 0 {
+                0
+            } else {
+                self.read_device(first, 4).map_or(0, |raw| {
+                    u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]])
+                }) as usize
+            }
+        };
+        for (layer, (_, _, launch)) in captured
+            .nodes()
+            .iter()
+            .filter(|(operator, _, _)| *operator == "paged_attention")
+            .take(4)
+            .enumerate()
+        {
+            let Some(node) = launch.first() else {
+                continue;
+            };
+            let Ok(params) = captured.template().kernel_node_params(&node.node) else {
+                continue;
+            };
+            let Some(bytes) = params.parameters.first() else {
+                continue;
+            };
+            let Some(call) = self.read_device(
+                u64::from_ne_bytes(bytes.as_slice().try_into().unwrap_or([0; 8])),
+                LAYOUT.size,
+            ) else {
+                continue;
+            };
+            let at = |offset: usize| -> u64 {
+                let mut eight = [0_u8; 8];
+                eight.copy_from_slice(&call[offset..offset + 8]);
+                u64::from_ne_bytes(eight)
+            };
+            let page_size = at(LAYOUT.page_size).max(1);
+            let page_bytes = at(LAYOUT.kv_stride_page).max(1);
+            let mut digests = String::new();
+            for (plane, offset) in [("k", LAYOUT.key), ("v", LAYOUT.value)] {
+                let base = at(offset);
+                let bytes = (page_size * page_bytes) as usize;
+                let digest = match self.read_device(base + pages as u64 * page_bytes as u64, bytes)
+                {
+                    Some(raw) => format!("{:016x}", fnv(&raw)),
+                    None => "unreadable".to_owned(),
+                };
+                digests.push_str(&format!(" {plane}={base:#x}/{digest}"));
+            }
+            out.push_str(&format!(" layer{layer}={digests}"));
+        }
+        out
+    }
+
+    /// `bytes` of device memory at `address`, read on this runner's stream, or `None`.
+    ///
+    /// The copy is issued only under the dump and only from the device thread, and it synchronizes
+    /// the stream before the host reads the buffer.
+    fn read_device(&self, address: u64, bytes: usize) -> Option<Vec<u8>> {
+        if address == 0 || bytes == 0 {
+            return None;
+        }
+        let mut raw = vec![0_u8; bytes];
+        // SAFETY: the destination is this function's own buffer of `bytes`, and the source is an
+        // address the caller read out of a launch's own arguments.
+        let copied = unsafe {
+            platform::memcpy_async(raw.as_mut_ptr() as u64, address, bytes, &self.stream)
+        };
+        if copied.is_err() || self.stream.synchronize().is_err() {
+            return None;
+        }
+        Some(raw)
     }
 
     /// The cache description the attention kernel is handed, read from the device (2.4, 4.5).
