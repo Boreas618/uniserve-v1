@@ -166,9 +166,14 @@ def build(package, key, target, out_dir, python):
         # model defect. `RTLD_NOW` resolves the whole object at load, so an undefined reference
         # is a build failure with the symbol in it.
         for library in sorted(out_dir.glob("*.so")):
-            failure = loads(library)
+            failure, unresolved = inspect_module(library)
             if failure:
                 return failure
+            if unresolved:
+                # Loadable, and one call away from failing. Named rather than merged into the
+                # failure count: a store that cannot be built is a run that cannot start, and
+                # these are cells the engine loads today.
+                print(f"# warning: {library.name} loads lazily and references {unresolved}")
         # The link inputs are not part of the module: an object file beside the library is build
         # scratch, and a store is what a host loads rather than what a compiler read.
         for scratch in out_dir.glob("*.o"):
@@ -183,19 +188,45 @@ def build(package, key, target, out_dir, python):
     return None
 
 
-def loads(library: Path):
-    """Whether the loader resolves every symbol `library` references, or the reason it does not.
+def inspect_module(library: Path):
+    """Whether the runtime could load `library`, and which symbols it would leave unresolved.
 
-    `RTLD_NOW` is the whole point: `ctypes`' default mode is `RTLD_LOCAL` alone, which defers
-    binding, so an unresolvable reference
-    survive until a call reached it, which is a run-time failure in a different place than the
-    defect.
+    Two questions, kept apart because they have different answers and different cures.
+
+    The first is what the runtime does: `platform::native` opens with `libloading::Library::new`,
+    which is `dlopen(RTLD_LAZY | RTLD_LOCAL)` in `libloading` 0.8.9. A module that fails THAT
+    fails for the engine too, and it is a build failure.
+
+    The second is `RTLD_NOW`: every reference resolved at load. A module can pass the first and
+    fail the second, and then it works until the unresolved path is taken. That is worth a
+    warning naming the symbol, and it is not worth failing a store the engine can load.
+
+    Each probe runs in its own process. A second `dlopen` of a file already loaded returns the
+    existing handle without re-resolving, so two modes measured in one process report the first
+    mode twice - a mistake that reads as "both load".
     """
-    try:
-        ctypes.CDLL(str(library), mode=os.RTLD_NOW | os.RTLD_LOCAL)
-    except OSError as error:
-        return f"{library.name} does not load, so a host could not use it: {error}"
-    return None
+    probe = (
+        "import ctypes, os, sys\n"
+        "ctypes.CDLL(sys.argv[1], mode=int(sys.argv[2]))\n"
+    )
+    def run(mode):
+        finished = subprocess.run(
+            [sys.executable, "-c", probe, str(library), str(mode)],
+            capture_output=True,
+            text=True,
+        )
+        if finished.returncode == 0:
+            return None
+        tail = (finished.stderr or finished.stdout).strip().splitlines()[-1:]
+        return tail[0] if tail else "the probe failed"
+
+    # `RTLD_LAZY` is named, not implied: `ctypes` forces `RTLD_NOW` when the mode carries no
+    # binding flag, so `RTLD_LOCAL` alone is an eager load wearing a lazy load's name.
+    fatal = run(os.RTLD_LAZY | os.RTLD_LOCAL)
+    if fatal:
+        return f"{library.name} does not load under the runtime's own mode: {fatal}", None
+    eager = run(os.RTLD_NOW | os.RTLD_LOCAL)
+    return None, eager
 
 
 def module_digest(directory):
