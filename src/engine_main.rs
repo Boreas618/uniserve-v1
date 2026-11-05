@@ -591,6 +591,13 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
+    /// One statistics reporter per scheduler, in the schedulers' order.
+    ///
+    /// A reporter keeps the cumulative baselines of the counters it has already
+    /// reported, so each increment appears in exactly one snapshot: the same
+    /// reporter must see every pass (§2.3's `/metrics`, `uniserve:num_requests_running`
+    /// and its kind).
+    stats_reporters: Vec<engine::SchedulerStatsReporter>,
     /// This node's device executors, shared with the schedulers that submit through them: one
     /// executor thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
@@ -910,9 +917,13 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
 
+        let stats_reporters = (0..schedulers.len())
+            .map(|_| engine::SchedulerStatsReporter::default())
+            .collect();
         let mut process = Self {
             control,
             schedulers,
+            stats_reporters,
             executors,
             memory: Some(memory),
             storage: Some(retained),
@@ -4053,14 +4064,65 @@ impl MainProcess {
             policy_calls,
             memory,
         };
-        if let Err(error) = self
-            .control
-            .daemon_mut()
-            .send(&proto::request::wire::FromEngine {
-                kind: Some(proto::request::wire::from_engine::Kind::Metrics(metrics)),
-            })
+        // The scheduler statistics travel beside the counters: a daemon records
+        // `uniserve:num_requests_running` and its kind from this snapshot, so a process that
+        // sent only the allocator's figures would report an idle deployment forever.
+        let mut snapshots = Vec::with_capacity(self.schedulers.len());
+        for (index, (scheduler, reporter)) in self
+            .schedulers
+            .iter()
+            .zip(&mut self.stats_reporters)
+            .enumerate()
         {
-            tracing::warn!(%error, "reporting the engine's metrics failed");
+            let snapshot = reporter.snapshot(scheduler.stats());
+            if let Ok(snapshot) = snapshot.encode() {
+                snapshots.push(proto::request::wire::Stats {
+                    scheduler: index as u32,
+                    snapshot,
+                });
+            }
+        }
+        // Every live front is told: the daemon that launched this process, and each daemon
+        // that attached to it (§7.5.1 step 2). A handover closes the launching daemon's front
+        // and leaves the successor's serving, so a report aimed at index 0 alone would stop
+        // exactly when the successor owns the engine - and the successor's `/metrics` would
+        // hold no figure of what it inherited. Each daemon keeps its own registry, so a report
+        // on each front is one figure per registry.
+        let fronts = self.control.report_fronts();
+        let mut delivered = 0;
+        let mut failure = None;
+        for front in fronts {
+            let Some(connection) = self.control.front_mut(front) else {
+                continue;
+            };
+            let sent = connection
+                .send(&proto::request::wire::FromEngine {
+                    kind: Some(proto::request::wire::from_engine::Kind::Metrics(
+                        metrics.clone(),
+                    )),
+                })
+                .and_then(|()| {
+                    for stats in &snapshots {
+                        connection.send(&proto::request::wire::FromEngine {
+                            kind: Some(proto::request::wire::from_engine::Kind::Stats(
+                                stats.clone(),
+                            )),
+                        })?;
+                    }
+                    Ok(())
+                });
+            match sent {
+                Ok(()) => delivered += 1,
+                Err(error) => failure = Some(error),
+            }
+        }
+        if delivered == 0 {
+            if let Some(error) = failure {
+                tracing::warn!(
+                    %error,
+                    "reporting the engine's metrics failed: no front of this process is live"
+                );
+            }
         }
     }
 
