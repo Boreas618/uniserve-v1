@@ -528,6 +528,17 @@ pub(crate) fn run(
     let mut main = MainProcess::start(&launch, &build)?;
     let ending = main.serve();
     main.close();
+    // Why this process ends is the daemon's own diagnostic: the supervisor reports
+    // "the engine process ended" and nothing more, so a handover that loses its engine
+    // has no line to read unless this one says which way it went. A commanded end and a
+    // failed epoch both stop the process, and only the second is a fault.
+    match &ending {
+        Ok(None) => tracing::warn!("the main process ends: a shutdown was commanded"),
+        Ok(Some(failure)) => {
+            tracing::warn!(reason = failure.reason(), "the main process ends: the epoch failed")
+        }
+        Err(error) => tracing::warn!(%error, "the main process ends: the control thread failed"),
+    }
     if let Some(failure) = ending? {
         bail!("the main process ended: {}", failure.reason());
     }

@@ -587,6 +587,7 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "panicked",
             "the engine was lost",
             "a daemon attached",
+            "the main process ends",
             "attaching a daemon failed",
             "a request was taken over",
             "the successor took the responses in flight over",
