@@ -256,6 +256,12 @@ fn main() {
     // collapse to one per add - so the ladder ships complete now and gets smaller later, and a
     // request naming a length outside it is refused by name at its first audio row program.
     let mut clip_frames: Vec<u32> = Vec::new();
+    // `--derived` prints the rows the model's own `programs` functions state, for the components
+    // whose arguments this generator already holds, and nothing else. It is the comparison the typed
+    // tables answer to: a row here that the list lacks is a launch the list forgot, and a row the
+    // list has that is absent here is typed drift. It exits before the header, so a diff of its
+    // output against the file is the review artifact.
+    let mut derived = false;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -275,6 +281,7 @@ fn main() {
                     ));
                 }
             }
+            "--derived" => derived = true,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -291,6 +298,50 @@ fn main() {
             root.display()
         ),
     };
+    if derived {
+        // Only the components whose whole argument is a config and an element type. A component
+        // that also needs a request extent (packed rows, tokens, a track, a trajectory length) is
+        // not asked here: its rows depend on a deployment dimension this tool has no flag for, and
+        // a guessed extent would produce a diff that reads as drift and is a different request.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        // The refiner is the stack's and takes the stack's element type; the decoder and the
+        // postprocessor are the video VAE's and take the VAE's. Handing either the other's type is
+        // how a row set grows a family no launch asks for - the first run of this mode did exactly
+        // that and produced 36 `cross_fade` rows at the stack's type.
+        let Some(base) = config.denoisers.values().next() else {
+            panic!("the checkpoint states no DiT, so no component's rows are derivable")
+        };
+        for deployment in DEPLOYMENTS {
+            rows.extend(
+                minimax_h3::conditioning::TokenRefiner::programs(&base.transformer, deployment)
+                    .unwrap_or_else(|error| {
+                        panic!("the token refiner states no rows at {deployment:?}: {error}")
+                    }),
+            );
+        }
+        for vae in VAES {
+            rows.extend(
+                minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, vae)
+                    .unwrap_or_else(|error| {
+                        panic!("the video decoder states no rows at {vae:?}: {error}")
+                    }),
+            );
+            rows.extend(minimax_h3::output::VideoPostprocessor::programs(
+                vae, &rasters,
+            ));
+        }
+        rows.sort();
+        rows.dedup();
+        eprintln!(
+            "{} derived row(s) from the token refiner, the video decoder and the postprocessor",
+            rows.len()
+        );
+        for (operator, key) in rows {
+            println!("{operator}\t{key}");
+        }
+        return;
+    }
+
     // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
