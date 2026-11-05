@@ -1898,6 +1898,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             calls = warm_calls(bucket).len(),
             seq_lens = ?lengths,
             query_offsets = ?offsets,
+            // The third statement of the same partition: the count the kernels bound by. It must
+            // equal the last of `query_offsets` and the tokens the calls own, and a capture where
+            // those three disagree is an operand no descriptor can match.
+            live_tokens = self.staging.live_tokens(),
             page_size = self.geometry.page_size,
             max_kv_len = self.geometry.max_kv_len,
             "a bucket's warm pose"
