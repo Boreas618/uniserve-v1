@@ -719,6 +719,19 @@ fn stage_weights(args: &Args) -> Result<()> {
             "plan(1 token): hidden {}, query {}, key/value {}, factors {}, workspace {} bytes",
             plan.hidden, plan.query, plan.key_value, plan.factors, plan.workspace,
         );
+        // Which representation each projection took, tensor by tensor: the loading boundary decides
+        // per tensor, a checkpoint can mix them, and a dense projection read from packed bytes
+        // answers zeros rather than refusing — which is a cache of zeros one stage later.
+        if let Some(encoded) = model.attention_encoded(0) {
+            let word = |packed: bool| if packed { "packed" } else { "dense" };
+            println!(
+                "layer 0 attention: q {} k {} v {} o {}",
+                word(encoded[0]),
+                word(encoded[1]),
+                word(encoded[2]),
+                word(encoded[3]),
+            );
+        }
         drop(model);
     }
     println!(

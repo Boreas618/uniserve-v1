@@ -974,6 +974,23 @@ impl Qwen3Moe {
         self.options.experts_encoded
     }
 
+    /// Which of a layer's four attention projections the checkpoint stored packed, in `q, k, v, o`
+    /// order.
+    ///
+    /// The loading boundary decides each projection on its own, per tensor, so a checkpoint can hold
+    /// three packed and one dense. A cache whose values are wrong is bisected here first: a dense
+    /// projection is read from a BF16 matrix and a packed one from E2M1 bytes, and a checkpoint whose
+    /// bytes and whose index disagree about which is which answers zeros rather than refusing.
+    pub fn attention_encoded(&self, layer: usize) -> Option<[bool; 4]> {
+        let layer = self.layers.get(layer)?;
+        Some([
+            layer.attention.q_proj.is_encoded(),
+            layer.attention.k_proj.is_encoded(),
+            layer.attention.v_proj.is_encoded(),
+            layer.attention.o_proj.is_encoded(),
+        ])
+    }
+
     pub const fn page_tokens(&self) -> u32 {
         self.options.page_tokens
     }
