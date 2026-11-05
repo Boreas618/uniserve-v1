@@ -124,6 +124,14 @@ pub trait Products: Send + Sync {
         device: DeviceId,
         stream: StreamId,
     ) -> Result<Option<TensorView>>;
+
+    /// Drops every product of `request`, answering how many there were.
+    ///
+    /// **The executor calls this when a request's last call has been served**, and it is the other
+    /// half of `publish`: a product that outlives its request is a region a later request of the
+    /// same identity could read, and an identity is reused across epochs. A store that kept every
+    /// request's products would grow with the epoch while its regions belong to nobody.
+    fn forget(&self, request: RequestKey) -> usize;
 }
 
 /// The answer to a `borrow` that names a product no call produced, as the caller reports it.
@@ -205,18 +213,6 @@ impl Held {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Drops every product of `request`, answering how many there were.
-    ///
-    /// The executor calls this when a request's last call has been served: a product outliving its
-    /// request is a region a later request of the same identity could read, and a request identity
-    /// is reused across epochs.
-    pub fn forget(&self, request: RequestKey) -> usize {
-        let mut entries = self.entries.lock().expect("the product store");
-        let before = entries.len();
-        entries.retain(|(key, _), _| *key != request);
-        before - entries.len()
-    }
 }
 
 impl Products for Held {
@@ -279,6 +275,13 @@ impl Products for Held {
             )));
         }
         Ok(Some(placed.view))
+    }
+
+    fn forget(&self, request: RequestKey) -> usize {
+        let mut entries = self.entries.lock().expect("the product store");
+        let before = entries.len();
+        entries.retain(|(key, _), _| *key != request);
+        before - entries.len()
     }
 }
 
