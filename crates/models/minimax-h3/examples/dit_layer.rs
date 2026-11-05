@@ -1947,10 +1947,24 @@ struct DeviceWeights {
 }
 
 impl DeviceWeights {
+    /// The weights' home: a **virtual** range sized from the device's own free storage.
+    ///
+    /// `Allocator::reserve` maps and books nothing until the first allocation, so this range takes no
+    /// storage from the arena the stage reserves beside it - it only caps how much the loaded weights
+    /// may ever occupy. Sizing that cap by a figure of this harness's was the defect: a `requested`
+    /// of zero fell back to an 8 GiB floor, and the sparse deployment's weights are 8.49 GiB, so the
+    /// pool refused a load the device could hold with the message `cannot give out 522190848 more` -
+    /// a whole point of the run spent reading a device limit that was this file's. The device is
+    /// asked instead, and the halving below still covers a driver that refuses the whole range.
     fn new(device: &platform::Device, requested: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget)?;
-        let mut wanted = requested.max(8 << 30);
+        // `memory_info` answers in this device's primary context; a driver that cannot answer is no
+        // reason to refuse, so the floor stands as the fallback rather than the default.
+        let free = device.memory_info().map(|info| info.free).unwrap_or(0);
+        // Never less than it was before: the 8 GiB floor stays as the fallback for a driver that
+        // cannot answer, and the device's own free storage raises the cap above it when it can.
+        let mut wanted = requested.max(free.max(8 << 30));
         let mut reserved = None;
         while wanted >= (1 << 30) {
             if pools
@@ -1971,7 +1985,11 @@ impl DeviceWeights {
                  weights cannot be held on this device",
             )
         })?;
-        println!("resident pool: {} GiB reserved", reserved >> 30);
+        println!(
+            "resident pool: {} GiB reserved of {} GiB free on the device",
+            reserved >> 30,
+            free >> 30
+        );
         Ok(Self {
             pools,
             buffers: Vec::new(),
