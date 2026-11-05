@@ -44,7 +44,7 @@ use nn::layers::{Nvfp4Linear,
 };
 use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
-use nn::{Arena, DType, Forward, Shape, TensorView};
+use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
 use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
@@ -132,9 +132,27 @@ impl Projection {
     fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
         match self {
             Self::Dense(linear) => linear.forward(f, input, out).map_err(Error::from),
-            Self::Encoded { linear, alpha } => linear
-                .forward(f, input, alpha.view(), out)
-                .map_err(Error::from),
+            Self::Encoded { linear, alpha } => {
+                // The packed product's grid is a compiled row class, so it writes whole tiles: the
+                // buffer holds the class (the plan reserved it so) and the request's rows are its
+                // prefix, which is what every later op reads. Passing the request's height here is
+                // how a 128-row launch would write past the region.
+                let counted = u32::try_from(out.rows()).map_err(|_| {
+                    Error::Config(format!("{} activation rows", out.rows()))
+                })?;
+                let class = u64::from(nn::layers::packed_rows(counted)?);
+                let width = out.last();
+                let shape = Shape::new(&[class, width]);
+                let product = TensorView::with_strides(
+                    out.ptr,
+                    out.dtype,
+                    shape,
+                    Strides::row_major(shape),
+                );
+                linear
+                    .forward(f, input, alpha.view(), product)
+                    .map_err(Error::from)
+            }
         }
     }
 
@@ -195,6 +213,13 @@ pub(crate) struct DenseMlp {
 pub struct Plan {
     /// Tokens this forward processes.
     pub tokens: u64,
+    /// The row class the activation buffers are reserved at ([`nn::layers::packed_rows`]).
+    ///
+    /// `tokens` unless a projection is packed: the packed product is compiled per row class, so it
+    /// writes whole tiles and every buffer it writes must hold the class. The request's rows are a
+    /// prefix of each, and every op that reads such a buffer reads the prefix, which is why the
+    /// buffers are padded here and not re-shaped downstream.
+    pub padded: u64,
     /// The hidden width.
     pub hidden: u64,
     /// The fused output width of the query projection (this rank's heads).
@@ -278,8 +303,20 @@ impl Plan {
             experts: element(config.num_experts, "num_experts")?,
             tile: u64::from(TILE_ROWS),
         };
+        // The packed product is compiled per row class, so a deployment whose projections are
+        // packed reserves its buffers at the class that holds this request. The encoded scratch is
+        // positive exactly when a projection is packed, and zero for a dense one, so the plan does
+        // not need a second statement of the representation.
+        let padded = if encoded > 0 {
+            let counted = u32::try_from(tokens)
+                .map_err(|_| Error::Config(format!("{tokens} activation rows")))?;
+            u64::from(nn::layers::packed_rows(counted)?)
+        } else {
+            tokens
+        };
         Ok(Self {
             tokens,
+            padded,
             hidden: element(config.hidden_size, "hidden_size")?,
             query: element(
                 partition.local_attention_heads(config) * config.head_dim,
@@ -356,16 +393,16 @@ impl Plan {
             (self.workspace, DType::U8),              // attention workspace
             (self.encoded, DType::U8),                // the encoded projections' own scratch
             (self.tokens * self.hidden, dtype),       // normalized values
-            (self.tokens * self.hidden, dtype),       // the layer's output
+            (self.padded * self.hidden, dtype),       // the layer's output
             (self.tokens * self.hidden, dtype),       // the residual stream
-            (self.tokens * self.query, dtype),        // query
+            (self.padded * self.query, dtype),        // query
             (self.tokens * self.query, dtype),        // rotated query
-            (self.tokens * self.key_value, dtype),    // key
+            (self.padded * self.key_value, dtype),    // key
             (self.tokens * self.key_value, dtype),    // rotated key
-            (self.tokens * self.key_value, dtype),    // value
-            (self.tokens * self.query, dtype),        // attended output
-            (self.tokens * self.feed_forward, dtype), // dense gate
-            (self.tokens * self.feed_forward, dtype), // dense up
+            (self.padded * self.key_value, dtype),    // value
+            (self.padded * self.query, dtype),        // attended output
+            (self.padded * self.feed_forward, dtype), // dense gate
+            (self.padded * self.feed_forward, dtype), // dense up
             (self.moe, DType::U8),                    // the encoded expert step
             (self.tokens * self.vocabulary, dtype),   // the vocabulary shard's logits
             (self.tokens * self.gathered, dtype),     // the gathered logits, absent on one rank
@@ -381,6 +418,15 @@ impl Plan {
         }
         Ok(total)
     }
+}
+
+/// The first `rows` rows of a row-major `buffer` whose rows are `width` elements wide.
+///
+/// The pointer is the buffer's: a shorter view of a larger region is what lets one reservation hold
+/// the row class a packed product writes and the request's prefix every other op reads.
+fn prefix_rows(buffer: TensorView, rows: u64, width: u64) -> TensorView {
+    let shape = Shape::new(&[rows, width]);
+    TensorView::with_strides(buffer.ptr, buffer.dtype, shape, Strides::row_major(shape))
 }
 
 /// `bytes` rounded up to the arena's alignment.
@@ -425,7 +471,16 @@ impl Buffers {
     /// Reserve the plan's regions from `arena`, in the plan's order, after the two factor tables
     /// the caller already reserved.
     fn reserve(arena: &Arena, plan: &Plan, dtype: DType) -> Result<Self> {
+        // Two heights, and both are needed: the region is the row class an encoded projection
+        // writes whole tiles into, while the view every other op reads is the request's prefix of
+        // it. A buffer reserved at the request's rows is one a 128-row launch writes past.
         let rows = |width: u64| Shape::new(&[plan.tokens, width]);
+        let padded = |width: u64| -> Result<TensorView> {
+            let capacity = arena
+                .tensor(dtype, Shape::new(&[plan.padded, width]))
+                .map_err(Error::from)?;
+            Ok(prefix_rows(capacity, plan.tokens, width))
+        };
         Ok(Self {
             workspace: arena
                 .tensor(DType::U8, Shape::new(&[plan.workspace.max(1)]))
@@ -436,34 +491,24 @@ impl Buffers {
             normalized: arena
                 .tensor(dtype, rows(plan.hidden))
                 .map_err(Error::from)?,
-            update: arena
-                .tensor(dtype, rows(plan.hidden))
-                .map_err(Error::from)?,
+            update: padded(plan.hidden)?,
             residual: arena
                 .tensor(dtype, rows(plan.hidden))
                 .map_err(Error::from)?,
-            query: arena.tensor(dtype, rows(plan.query)).map_err(Error::from)?,
+            query: padded(plan.query)?,
             query_rotated: arena.tensor(dtype, rows(plan.query)).map_err(Error::from)?,
-            key: arena
-                .tensor(dtype, rows(plan.key_value))
-                .map_err(Error::from)?,
+            key: padded(plan.key_value)?,
             key_rotated: arena
                 .tensor(dtype, rows(plan.key_value))
                 .map_err(Error::from)?,
-            value: arena
-                .tensor(dtype, rows(plan.key_value))
-                .map_err(Error::from)?,
-            attended: arena.tensor(dtype, rows(plan.query)).map_err(Error::from)?,
+            value: padded(plan.key_value)?,
+            attended: padded(plan.query)?,
             dense: if plan.feed_forward == 0 {
                 None
             } else {
                 Some(DenseBuffers {
-                    gate: arena
-                        .tensor(dtype, rows(plan.feed_forward))
-                        .map_err(Error::from)?,
-                    up: arena
-                        .tensor(dtype, rows(plan.feed_forward))
-                        .map_err(Error::from)?,
+                    gate: padded(plan.feed_forward)?,
+                    up: padded(plan.feed_forward)?,
                 })
             },
         })
@@ -1112,7 +1157,7 @@ impl AttentionLayer {
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
         // Row parallel: each rank's partial output is summed over the query-head split.
         if let Some(group) = f.group {
-            group.all_reduce_sum(out, f.stream).map_err(Error::from)?;
+            group.all_reduce_sum(out, f.stream()?).map_err(Error::from)?;
         }
         Ok(())
     }
@@ -1474,6 +1519,53 @@ mod tests {
         assert_eq!(plan.gathered, 0);
     }
 
+    /// A packed deployment's buffers are reserved at the row class its product launches, and a
+    /// dense one's at the request's own rows.
+    ///
+    /// The product writes whole tiles of a compiled class, so a plan reserved for fifteen rows is
+    /// an arena a 128-row launch writes past — and every other check agrees while it happens: the
+    /// store has the cell, the descriptor matches it, the launch runs.
+    #[test]
+    fn a_packed_plan_reserves_the_row_class_it_launches() {
+        let config = config();
+        let partition = Partition::single();
+        let packed = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions::default(),
+            DType::BF16,
+            1024,
+        )
+        .unwrap();
+        let dense = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions::default(),
+            DType::BF16,
+            0,
+        )
+        .unwrap();
+        assert_eq!(packed.padded, 128, "fifteen rows are the 128-row class");
+        assert_eq!(dense.padded, 15, "a dense deployment launches the rows it has");
+        assert!(
+            packed.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap(),
+            "the class's rows are reserved, not the request's"
+        );
+        // And the plan is the only statement of it: 129 rows is the next class.
+        let next = Plan::new(
+            &config,
+            &partition,
+            129,
+            &LoadOptions::default(),
+            DType::BF16,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(next.padded, 256);
+    }
+
     #[test]
     fn a_dense_layer_is_planned() {
         let mut config = config();
@@ -1495,7 +1587,8 @@ mod tests {
     fn tensor_parallel_heads_divide_the_projection() {
         let config = config();
         let partition = Partition::new(&config, 4, 1, 1, 0).unwrap();
-        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16, 0).unwrap();
+        let plan =
+            Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16, 0).unwrap();
         assert_eq!(plan.query, 8 * 128);
         assert_eq!(plan.key_value, 128);
     }
