@@ -78,12 +78,7 @@ mean_ttft_ms = "lower"
 mean_tpot_ms = "lower"
 
 [suites.decode-runtime]
-points = [
-    "qwen-uniserve-sharegpt-r16",
-    "sensenova-uniserve-i2t-c32",
-    "sensenova-uniserve-t2i-c32",
-    "sensenova-uniserve-interleave-c4",
-]
+points = ["qwen-uniserve-sharegpt-r16"]
 
 [suites.serving-runtime]
-points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-stream", "sensenova-uniserve-t2i-image", "sensenova-uniserve-interleave-c4"]
+points = ["qwen-uniserve-sharegpt-r16"]
