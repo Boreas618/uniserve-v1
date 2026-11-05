@@ -911,6 +911,13 @@ fn words(phase: Phase) -> Vec<PagedWord> {
         PagedWord::PageTable,
         PagedWord::SeqLens,
     ];
+    // The program's own order: a packed prefill's row offsets come straight after the sequence
+    // lengths, before any stride. Pushing them at the end packed every later value one slot early -
+    // `q_stride_tokens` received `q_stride_heads`, and the program dereferenced a stride as the
+    // `cum_seq_lens_q` pointer, which is a device fault rather than a wrong number.
+    if phase == Phase::Prefill {
+        words.push(PagedWord::CumSeqLensQ);
+    }
     words.extend([
         PagedWord::QueryRow,
         PagedWord::QueryHead,
@@ -935,7 +942,6 @@ fn words(phase: Phase) -> Vec<PagedWord> {
         // (`triton/src/build.py`'s prefill signature: the strides, the three extents, the scale, then
         // this pointer, the row bound and the pack flag). Word 8 decides the rest: a launch whose
         // ninth word is a pointer where the program's is a stride is refused by name before it runs.
-        words.push(PagedWord::CumSeqLensQ);
         words.push(PagedWord::MaxQueryRow);
         words.push(PagedWord::Packed);
     }
