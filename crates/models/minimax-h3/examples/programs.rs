@@ -47,6 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The video decoder's precision is the checkpoint's, not the config's: the design converts
     // nothing at load, so the deployment states the element type its weights are in.
     let mut dtype: Option<ops::DType> = None;
+    // The VAE container's element type is the checkpoint's, not the deployment's: the export stores its
+    // VAE weights in one type (`dtype = "auto"` converts nothing), and both VAE halves compute in it.
+    // FP32 is what this export's VAE is stored in; another export is another value, stated here.
+    let mut vae_dtype = ops::DType::F32;
     // The prompt lengths the deployment serves, and its tensor-parallel degree: both are the
     // deployment's, and the degree decides the shard widths the store must hold.
     let mut tokens: Vec<u32> = Vec::new();
@@ -138,6 +142,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The denoiser's Ulysses degree, which `--tp` does not touch: the text encoder's tensor
             // shard and the denoiser's sequence shard are independent groups.
             "--ulysses" => ulysses = Some(value.parse()?),
+            "--vae-dtype" => {
+                vae_dtype = match value.as_str() {
+                    "f16" => ops::DType::F16,
+                    "bf16" => ops::DType::BF16,
+                    "f32" => ops::DType::F32,
+                    other => return Err(format!("{other} is not a float type").into()),
+                };
+            }
             "--dtype" => {
                 dtype = Some(match value.as_str() {
                     "f16" => ops::DType::F16,
@@ -228,7 +240,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        rows.extend(VideoDecoder::programs(&config, dtype)?);
+        // The container's type, not the deployment's: the decoder's tensor space is the checkpoint's
+        // and the recorder measures it at that type (M5319).
+        rows.extend(VideoDecoder::programs(&config, vae_dtype)?);
         rows.extend(VideoPostprocessor::programs(dtype, &rasters));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
@@ -323,6 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         names.len()
     };
     println!("# {} data rows, {operators} operators", rows.len());
+    println!("# the VAE container runs {vae_dtype}");
     println!(
         "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, audio tracks: {track:?}, sparse attention: {sparse:?}, tensor-parallel degree {degree}, ulysses degree {}", partition.ulysses_degree
     );
