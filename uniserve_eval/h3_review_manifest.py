@@ -131,8 +131,15 @@ def manifest(config: Path, baseline: Path, candidate: Path | None) -> str:
     for name in points:
         cell = benchmarks[name]
         server = servers[cell["server"]]
+        # The cell's own provenance names the checkpoint it confirms; the
+        # server states one only when it is a fixed local path. A server name
+        # alone would tell the reviewer which deployment ran, not which
+        # checkpoint the cell confirms.
         checkpoint = (
-            server.get("checkpoint") or server.get("model") or cell["server"]
+            (cell.get("provenance") or {}).get("checkpoint")
+            or server.get("checkpoint")
+            or server.get("model")
+            or cell["server"]
         )
         row = measured_row(config.parent.parent / cell["dataset_path"])
         task = cell.get("video", {}).get("task", "")

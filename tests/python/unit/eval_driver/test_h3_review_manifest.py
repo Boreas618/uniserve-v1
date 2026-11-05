@@ -49,7 +49,10 @@ def profile(tmp_path: Path) -> Path:
     for filename, row in rows.items():
         (tmp_path / filename).write_text(json.dumps(row) + "\n")
 
-    config = tmp_path / "profile.toml"
+    # The tool resolves the profile's dataset paths against the repository
+    # root, which is one level above the directory the profile lives in.
+    (tmp_path / "uniserve_eval").mkdir()
+    config = tmp_path / "uniserve_eval" / "profile.toml"
     config.write_text(
         """
 [root]
@@ -92,6 +95,33 @@ def test_every_cell_has_a_task_a_checkpoint_a_seed_and_its_inputs(
     assert "a starship bridge" in text
     assert "image: `media/ref.png` (reference)" in text
     assert "audio: `media/ref.mp3` (reference)" in text
+
+
+def test_the_shipped_profile_names_the_three_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """The page names checkpoints, not the deployment that served them."""
+    shipped = (
+        Path(__file__).resolve().parents[4] / "uniserve_eval" / "check_h3.toml"
+    )
+    baseline = tmp_path / "run"
+    for cell in (
+        "check-base-ref2va",
+        "check-fasth3-dmd-t2va",
+        "check-fasth3-dmd-fl2va",
+        "check-fasth3-omniref-ref2va",
+        "check-base-t2va",
+        "check-base-fl2va",
+    ):
+        write_cell(baseline, cell, f"{cell}.mp4")
+
+    text = manifest(shipped, baseline, None)
+
+    assert "`MiniMaxAI/MiniMax-H3`" in text
+    assert "`FastVideo/FastVideo-FastH3-8-Step-V2`" in text
+    assert "`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`" in text
+    for server in ("base-reference", "base-transformer", "fasth3-dmd"):
+        assert f"| `{server}` |" not in text
 
 
 def test_the_candidate_column_is_empty_until_a_candidate_has_run(
