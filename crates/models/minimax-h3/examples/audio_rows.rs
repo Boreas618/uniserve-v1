@@ -123,16 +123,20 @@ fn run() -> Result<(), String> {
             AudioEncoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
         let length = minimax_h3::encoding::padded_samples(u64::from(track), encoder.hop())
             .map_err(|error| error.to_string())?;
+        // The encoder reads the stereo pair the wire carries - two identical rows for a mono track,
+        // as the reference's `unpack_samples` writes it - and its latent is `[batch * frames,
+        // latent_channels]` rows, channel-major. A single row encodes half a track and every count
+        // downstream accepts the result, so the shape is checked here rather than discovered.
         let samples = f
             .arena()
-            .tensor(DType::F32, Shape::new(&[1, 1, length]))
+            .tensor(DType::F32, Shape::new(&[2, 1, length]))
             .map_err(|error| error.to_string())?;
         let frames = encoder.frames(length).map_err(|error| error.to_string())?;
         let out = f
             .arena()
             .tensor(
                 DType::F32,
-                Shape::new(&[frames, u64::from(config.latent_channels)]),
+                Shape::new(&[2 * frames, u64::from(config.latent_channels)]),
             )
             .map_err(|error| error.to_string())?;
         let mut recorded = Recorded::default();
