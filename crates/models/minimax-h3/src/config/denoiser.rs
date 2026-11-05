@@ -201,6 +201,44 @@ impl AttentionKind {
     /// Dense attention, as the base release attends.
     pub const DENSE: Self = Self::Dense;
 
+    /// Reads the sparse deployment both H3 walk tools take: `tile,sparsity[,reference_keep]`.
+    ///
+    /// Every field goes through [`AttentionKind::sparse`], so one string is refused by the same
+    /// sentence whichever tool is handed it. A third field that is a whole number is refused there
+    /// as well: the tile bound a compression reduces over is the deployment's own, derived from its
+    /// layouts at load, and no flag states it - a value stated here and discarded in one tool while
+    /// refused in the other is the disagreement this function removes.
+    pub fn sparse_of(stated: &str) -> Result<Self> {
+        let mut fields = stated.split(',');
+        let tile = fields.next().map(str::trim).unwrap_or_default();
+        let sparsity = fields.next().map(str::trim);
+        let reference_keep = fields.next().map(str::trim);
+        if fields.next().is_some() || sparsity.is_none() {
+            return Err(Error::config(format!(
+                "an H3 sparse deployment is `tile,sparsity[,reference_keep]`, got `{stated}`"
+            )));
+        }
+        let tile = tile.parse::<u32>().map_err(|_| {
+            Error::config(format!("an H3 sparse tile is a row count, got `{tile}`"))
+        })?;
+        let sparsity = sparsity
+            .and_then(|value| value.parse::<f64>().ok())
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "an H3 sparse sparsity is a fraction, got `{stated}`"
+                ))
+            })?;
+        let reference_keep = match reference_keep {
+            None => None,
+            Some(value) => Some(value.parse::<f64>().map_err(|_| {
+                Error::config(format!(
+                    "an H3 sparse keep rate is a fraction, got `{value}`"
+                ))
+            })?),
+        };
+        Self::sparse(tile, sparsity, reference_keep)
+    }
+
     /// Sparse attention over `tile`-row tiles.
     pub fn sparse(tile: u32, sparsity: f64, reference_keep: Option<f64>) -> Result<Self> {
         if !SPARSE_TILE_ROWS.iter().any(|(rows, _)| *rows == tile) {
@@ -642,5 +680,37 @@ mod tests {
                 .capacity_rows(),
             128
         );
+    }
+
+    #[test]
+    fn a_sparse_deployment_is_read_by_one_rule_from_one_string() {
+        // The two forms a tool is handed, and the second field's range still applies.
+        assert!(matches!(
+            AttentionKind::sparse_of("64,0.9"),
+            Ok(AttentionKind::Sparse {
+                tile: 64,
+                reference_keep: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            AttentionKind::sparse_of("128, 0.9, 0.5"),
+            Ok(AttentionKind::Sparse {
+                tile: 128,
+                reference_keep: Some(0.5),
+                ..
+            })
+        ));
+        // A whole-number third field is the tile bound, which the deployment derives and no flag
+        // states: it is refused here, by the same sentence, whichever tool reads the string.
+        let refused = AttentionKind::sparse_of("64,0.9,8192").expect_err("a tile bound is no flag");
+        assert!(
+            matches!(refused, Error::Config(ref problem) if problem.contains("reference keep rate")),
+            "{refused:?}"
+        );
+        // A field count and a tile shape are refused by name rather than defaulted.
+        assert!(AttentionKind::sparse_of("64").is_err());
+        assert!(AttentionKind::sparse_of("64,0.9,0.5,7").is_err());
+        assert!(AttentionKind::sparse_of("96,0.9").is_err());
     }
 }
