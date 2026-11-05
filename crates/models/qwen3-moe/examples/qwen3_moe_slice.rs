@@ -852,6 +852,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         Representation::Nvfp4 {
             excluded,
             also_excluded,
+            ..
         } => format!(
             "nvfp4, {} + {} module(s) kept in their own dtype",
             excluded.len(),
