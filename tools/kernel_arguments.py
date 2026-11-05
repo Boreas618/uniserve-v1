@@ -323,7 +323,23 @@ def read_shape(spec, fields, declared, target, op, backend, gaps):
         return None
 
 
-def rust_calls(op: str) -> tuple[pathlib.Path, list[tuple[str, list[str]]]] | None:
+def _resolve_length(kind: str, constants: dict[str, str]) -> str:
+    """One field type with a named array length replaced by the number the file gives it.
+
+    An array whose length is a constant is the same field width as a literal, so both sides' names
+    are resolved before the comparison: a constant compared by its name reports a difference
+    wherever the two files spell one number differently.
+    """
+    return re.sub(
+        r"\[([\w:<>, ]+);\s*(\w+)\]",
+        lambda found: (
+            f"[{found.group(1)}; {constants.get(found.group(2), found.group(2))}]"
+        ),
+        kind,
+    )
+
+
+def rust_calls(op: str) -> tuple[pathlib.Path, list[tuple[str, list[tuple[str, str]]]]] | None:
     """The Rust file that impls `op`, and every call structure it declares, in declaration order.
 
     A native module's arguments are not packed into an `Arguments` chain: the operator fills a
@@ -338,11 +354,16 @@ def rust_calls(op: str) -> tuple[pathlib.Path, list[tuple[str, list[str]]]] | No
     if found is None:
         return None
     path = found[0]
+    text = path.read_text()
+    constants = dict(re.findall(r"const (\w+):\s*usize\s*=\s*(\d+);", text))
     structures = []
-    for match in re.finditer(r"pub struct (\w*Call) \{(.*?)\n\}", path.read_text(), re.S):
+    for match in re.finditer(r"pub struct (\w*Call) \{(.*?)\n\}", text, re.S):
         if match.group(1).endswith("Layout"):
             continue
-        fields = re.findall(r"^\s*pub (\w+): ([^,\n]+),", match.group(2), re.M)
+        fields = [
+            (name, _resolve_length(kind, constants))
+            for name, kind in re.findall(r"^\s*pub (\w+): ([^,\n]+),", match.group(2), re.M)
+        ]
         structures.append((match.group(1), fields))
     return (path, structures) if structures else None
 
@@ -402,104 +423,140 @@ def _differences(
     return wrong, abs(len(rust) - len(declared))
 
 
-def header_call(header: pathlib.Path) -> tuple[str, list[tuple[str, str]]] | None:
-    """The call structure a header declares: its name, and its fields with their types, in order.
+def header_structs(header: pathlib.Path) -> list[tuple[str, list[tuple[str, str]]]]:
+    """Every field-carrying structure a header declares, named after its tag or its typedef.
+
+    A package spells the same thing four ways - `struct uniserve_conv_call {`, a `struct ..._call`
+    in `src/entry.h`, `typedef struct UniserveGemmCall { ... } UniserveGemmCall;`, and
+    `typedef struct { ... } SomeParams;` - so the reader takes them all and lets the comparison
+    decide which one the module receives.
 
     Read line by line rather than by one pattern: a pointer field (`void* out;`) and an array field
     (`int64_t input_shape[5];`) differ in where the name sits, and a single pattern that spans lines
     loses the pointer fields and then reports every later field one position early.
     """
     text = re.sub(r"//[^\n]*", "", header.read_text())
-    body = re.search(r"struct (\w*_call) \{(.*?)\n\};", text, re.S)
-    if body is None:
-        return None
-    fields = []
-    for line in body.group(2).splitlines():
-        line = line.strip()
-        if not line.endswith(";"):
-            continue
-        name = re.search(r"(?:^|\s)((?:\w+[\s*]+)*?)(\w+)(\[[^\]]*\])?;$", line)
-        if name:
-            fields.append((name.group(2), f"{name.group(1).strip()}{name.group(3) or ''}"))
-    return body.group(1), fields
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    defines = dict(re.findall(r"#define\s+(\w+)\s+(\d+)", text))
+    found = []
+    for block in re.finditer(
+        r"(?:typedef\s+)?struct\s*(\w*)\s*\{(.*?)\n\}", text, re.S
+    ):
+        typedef = re.match(r"\s*(\w+)\s*;", text[block.end() :])
+        name = block.group(1) or (typedef.group(1) if typedef else "")
+        fields = []
+        for line in block.group(2).splitlines():
+            line = line.strip()
+            if not line.endswith(";"):
+                continue
+            field = re.search(
+                r"(?:^|\s)((?:\w+[\s*]+)*?)(\w+)(\[[^\]]*\])?;$", line
+            )
+            if field:
+                length = field.group(3) or ""
+                if length:
+                    symbol = length.strip("[]")
+                    length = f"[{defines.get(symbol, symbol)}]"
+                fields.append((field.group(2), f"{field.group(1).strip()}{length}"))
+        if name and fields:
+            found.append((name, fields))
+    return found
 
 
 def native(verbose: bool) -> tuple[list[str], list[str]]:
     """Every native package's call structure, compared with the Rust structure it mirrors.
 
-    The comparison is positional and by name, which is what a layout disagreement looks like: a
-    field read on one side and not filled on the other is uninitialised memory inside the module,
-    where a Triton disagreement is only a wrong argument.
+    The comparison is positional, by name and by storage type, which is what a layout disagreement
+    looks like: a field read on one side and not filled on the other is uninitialised memory inside
+    the module, where a Triton disagreement is only a wrong argument.
 
-    A header is compared with **the best of the file's structures**, and the choice is printed:
-    picking one by name would be a second guess about which structure a package mirrors, and a
-    wrong pick reads exactly like a layout defect. Types are not compared yet, so a header that
-    widened a field keeps this report silent.
+    **Which structure on each side is the one the module receives is decided by comparison, and the
+    choice is printed.** A file may declare several (dispatch and combine passes; a package's params
+    and its call), and a wrong pick reads exactly like a layout defect - which is how the first
+    version of this reader reported a disagreement that was its own.
     """
     problems: list[str] = []
     gaps: list[str] = []
     compared = 0
     for package in sorted(KERNELS.glob("*/*")):
-        headers = sorted(package.glob("include/*.h"))
+        # A Triton package's arguments are its `spec()` and the recorded signature its cell carries,
+        # which the sweep compares; this mode is the native package, whose arguments are a C struct.
+        if not _native_package(package):
+            continue
+        headers = sorted(package.rglob("*.h"))
         if not headers:
+            gaps.append(
+                f"{package.parent.name}/{package.name}: no header, so no call structure to "
+                f"compare - the module states its arguments somewhere this reader has not found"
+            )
             continue
         op = package.parent.name
         where = rust_calls(op)
-        for header in headers:
-            declared = header_call(header)
-            if declared is None:
-                continue
-            name, fields = declared
-            if where is None:
-                gaps.append(
-                    f"{op}/{package.name} {header.name}: {len(fields)} field(s) declared, and no "
-                    f"Rust call structure found from the operator's name - the reader's reach, "
-                    f"not a disagreement"
-                )
-                continue
-            path, structures = where
-            scored = sorted(
-                (
-                    (_differences(rust, fields), structure, rust)
-                    for structure, rust in structures
-                ),
-                key=lambda entry: entry[0],
+        structures = [
+            (header, name, fields)
+            for header in headers
+            for name, fields in header_structs(header)
+        ]
+        if not structures:
+            gaps.append(
+                f"{op}/{package.name}: {len(headers)} header(s) and no field-carrying structure"
             )
-            best, structure, rust = scored[0]
-            compared += 1
-            if best == (0, 0):
-                if verbose:
-                    print(
-                        f"  {op}/{package.name}: {structure} = {len(rust)} field(s), "
-                        f"{header.name} agrees"
-                    )
-                continue
-            wrong, missing = best
-            first = next(
-                (
-                    f"position {index}: {left_name} {left} in {path.name}, "
-                    f"{right_name} {right} in {header.name}"
-                    for index, ((left_name, left), (right_name, right)) in enumerate(
-                        zip(rust, fields)
-                    )
-                    if left_name != right_name
-                    or _storage(left, True) != _storage(right, False)
-                ),
-                "no position differs; the two lists differ in length",
-            )
-            problems.append(
-                f"{op}/{package.name} {name}: {structure} in {path.name} differs from "
-                f"{header.name} at {wrong} position(s), {missing} field(s) unpaired - {first}"
+            continue
+        if where is None:
+            # Name what the Rust side does declare instead of only reporting that nothing was
+            # found: a structure called `GemmArgs` is a different statement about a module's
+            # arguments, not a missing one, and the difference is what a reader needs.
+            declared = []
+            source = rust_launch(op)
+            if source is not None:
+                declared = re.findall(r"pub struct (\w+)", source[0].read_text())
+            gaps.append(
+                f"{op}/{package.name}: {len(structures)} structure(s) in the header, and no Rust "
+                f"call structure from the operator's name"
                 + (
-                    "; other structures: "
-                    + ", ".join(
-                        f"{other} {count} position(s) {gap} unpaired"
-                        for (count, gap), other, _ in scored[1:]
-                    )
-                    if len(scored) > 1
+                    f" - {source[0].name} declares {', '.join(declared)} and no `*Call`"
+                    if declared
                     else ""
                 )
+                + " - the reader's reach, not a disagreement"
             )
+            continue
+        path, rusts = where
+        scored = sorted(
+            (
+                (_differences(rust, fields), structure, header, rust, fields)
+                for header, structure, fields in structures
+                for structure, rust in rusts
+            ),
+            key=lambda entry: entry[0],
+        )
+        best, structure, header, rust, fields = scored[0]
+        compared += 1
+        if best == (0, 0):
+            if verbose:
+                print(
+                    f"  {op}/{package.name}: {structure} = {len(rust)} field(s), "
+                    f"{header.relative_to(KERNELS)} agrees"
+                )
+            continue
+        wrong, missing = best
+        first = next(
+            (
+                f"position {index}: {left_name} {left} in {path.name}, "
+                f"{right_name} {right} in {header.name}"
+                for index, ((left_name, left), (right_name, right)) in enumerate(
+                    zip(rust, fields)
+                )
+                if left_name != right_name
+                or _storage(left, True) != _storage(right, False)
+            ),
+            "no position differs; the two lists differ in length",
+        )
+        problems.append(
+            f"{op}/{package.name} {structure} vs {header.relative_to(KERNELS)}: "
+            f"{wrong} position(s) differ, {missing} field(s) unpaired, from {path.name}; "
+            f"best of {len(scored)} pairing(s) - {first}"
+        )
     print(
         f"{compared} call structure(s) compared, {len(problems)} disagreement(s), "
         f"{len(gaps)} not compared"
