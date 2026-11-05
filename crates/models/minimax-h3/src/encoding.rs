@@ -175,6 +175,16 @@ impl Clip {
 }
 
 impl Stack {
+    /// Whether stage `index` ends in a downsampler, which is whether it halves space or strides time.
+    ///
+    /// The load builds the convolution from this answer and [`VideoEncoder::programs`] states the pad
+    /// its call reads from the same one: a stage with both factors one has no convolution, so it has
+    /// no padded frame either, and an enumeration that padded every stage would state a class no
+    /// launch asks for.
+    pub fn downsamples(&self, index: usize) -> bool {
+        self.temporal_strides[index] * self.spatial_strides[index] > 1
+    }
+
     /// The stack the config states.
     pub fn of(config: &VideoVaeConfig) -> Result<Self> {
         let stages = config.block_out_channels.len();
@@ -1066,16 +1076,19 @@ impl VideoEncoder {
                     shortcut,
                 });
             }
-            let temporal = stack.temporal_strides[index];
-            let spatial = stack.spatial_strides[index];
-            let downsample = if temporal * spatial > 1 {
+            let stride = [
+                stack.temporal_strides[index],
+                stack.spatial_strides[index],
+                stack.spatial_strides[index],
+            ];
+            let downsample = if stack.downsamples(index) {
                 Some(convolution(
                     loader,
                     &format!("{stage}.downsamplers.0.conv"),
                     *out,
                     *out,
                     3,
-                    [temporal, spatial, spatial],
+                    stride,
                 )?)
             } else {
                 None
@@ -1348,8 +1361,11 @@ impl VideoEncoder {
                     };
                     let pixels = u64::from(extent.height) * u64::from(extent.width);
                     let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
-                    // The level's downsampler reads a padded frame of its own.
-                    pad(&mut programs, u64::from(extent.width) + 2);
+                    // The level's downsampler reads a padded frame of its own - the stages that end in
+                    // one, which is every stage but the last of this checkpoint's ladder.
+                    if stack.downsamples(index) {
+                        pad(&mut programs, u64::from(extent.width) + 2);
+                    }
                     // Each block takes the statistics of its input and then the fused normalize-pad of the
                     // same frame; the classes follow from the frame and are deduplicated by `finish`.
                     for _ in 0..stack.blocks {
@@ -2929,6 +2945,63 @@ mod tests {
             distinct.len(),
             "one residual row per distinct level width: {:?}",
             residuals(&programs)
+        );
+    }
+
+    /// A stage that neither strides time nor halves space has no downsampler, so it reads no padded
+    /// frame: the encoder's enumeration states one pad per frame it pads and no more.
+    ///
+    /// The pads are the input's and each downsampling stage's own columns, so the stated classes must
+    /// be exactly those - a class for the deepest stage, which no convolution reads, is a program no
+    /// launch asks for, and it is invisible to every check that compares one enumeration with another.
+    #[test]
+    fn the_video_encoder_states_a_pad_for_each_frame_it_pads() {
+        use ops::frame::FramePadDescriptor;
+
+        let config = crate::video_vae::tests::video_config();
+        let stack = Stack::of(&config).expect("the checkpoint's stack");
+        let (height, width) = (768u32, 768);
+        let programs = VideoEncoder::programs(&config, &[(height, width)])
+            .expect("the video encoder's programs");
+        let stated: Vec<String> = programs
+            .iter()
+            .filter(|(name, _)| name == "frame_pad")
+            .map(|(_, key)| key.clone())
+            .collect();
+
+        // The padded frames the network reads: the input's own columns, and each stage's that ends in
+        // a downsampler.
+        let extents = stack.extents(Extent {
+            frames: 1,
+            height,
+            width,
+        });
+        let mut columns = vec![width + 2];
+        for index in 0..stack.widths.len() {
+            if stack.downsamples(index) {
+                columns.push(extents[index].width + 2);
+            }
+        }
+        let reflect = matches!(
+            config.spatial_padding_mode,
+            crate::config::SpatialPadding::Reflect
+        );
+        let mut expected: Vec<String> = columns
+            .iter()
+            .map(|columns| {
+                let (pixels, channels) =
+                    FramePadDescriptor::tiles_of(true, true, u64::from(*columns));
+                FramePad::descriptor_of(DType::F32, reflect, pixels, channels).to_string()
+            })
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut stated = stated;
+        stated.sort_unstable();
+
+        assert_eq!(
+            stated, expected,
+            "the pads stated are the frames padded, and no stage without a downsampler has one"
         );
     }
 
