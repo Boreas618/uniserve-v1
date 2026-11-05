@@ -725,8 +725,8 @@ impl Transformer {
         // i32 for all three named two keys no launch binds.
         for (dtype, columns) in [
             (nn::DType::I32, u64::from(groups.count())),
-            (dtype, 18 * u64::from(hidden)),
-            (dtype, 2 * u64::from(hidden)),
+            (boundary, 18 * u64::from(hidden)),
+            (boundary, 2 * u64::from(hidden)),
         ] {
             programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
         }
@@ -821,15 +821,22 @@ impl Transformer {
         // width here instead would have been a second, wrong answer to a question the launch already
         // answers, and the walk that records the launch is what a store is built from.
         let packed_stride = 2 * u64::from(config.intermediate_size);
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-            dtype,
-            u64::from(config.intermediate_size),
-            nn::layers::Activation::Silu,
-            packed_stride,
-            packed_stride,
-            u64::from(rows) * u64::from(config.intermediate_size),
-            true,
-        )?);
+        // **Two rows, because `wide` is chosen by the launch's own element count and both classes
+        // are reachable.** The bound crosses `u32::MAX` at this stride (304,976 rows x 14,336), so
+        // the widest request a store serves launches the wide form - and every request below
+        // 299,593 packed rows launches the narrow one. A store that states only the bound is short
+        // the cell every ordinary request asks for, which is what the launch record reported.
+        for elements in [u64::from(rows) * u64::from(config.intermediate_size), 1] {
+            programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+                dtype,
+                u64::from(config.intermediate_size),
+                nn::layers::Activation::Silu,
+                packed_stride,
+                packed_stride,
+                elements,
+                true,
+            )?);
+        }
 
         Ok(programs.finish())
     }
