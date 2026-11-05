@@ -2133,13 +2133,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // after serving depends on - the launches build the plans for exactly the pose the capture
         // records, and an operator whose plan was never built cannot be captured at all (a cuBLASLt
         // plan allocates its workspace, which a capture cannot carry).
-        if self
-            .staging
-            .staged()
-            .is_some_and(|staged| staged != bucket)
-        {
-            return Ok(());
-        }
+        // No gate on having served: a capture is its own job on this thread, dispatched between
+        // batches rather than inside one (`Job::Capture`), so no batch is ever mid-serve here and the
+        // warm walk of one bucket can never replace another's. Skipping the walk for a bucket
+        // captured after serving left the plan of every later bucket to be built *inside* its own
+        // recording - which no capture can carry, because a cuBLASLt plan allocates its workspace.
+
         let began = std::time::Instant::now();
         // The pose, stated before the walk that can fault on it: a warm launch that dies names the
         // numbers it was given, and the table it read, rather than leaving them to be inferred from
