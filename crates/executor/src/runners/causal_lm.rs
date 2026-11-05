@@ -1435,6 +1435,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// eager walk; one captured afterwards may not, because the walk would run a forward over an
     /// arena a serving bucket owns.
     served: bool,
+    /// Whether a capture is in flight: a probe that copies and synchronises is legal between
+    /// launches and **not** inside a recording, where a synchronise is refused by the driver and a
+    /// failed one can leave the recording in a state it never recovers from.
+    capturing: bool,
     pending_install: Option<PendingInstall>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
@@ -1590,6 +1594,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             cache_page: None,
             pending_attention: None,
             served: false,
+            capturing: false,
             pending_install: None,
             pending_dump: None,
             last_prefill: None,
@@ -2167,7 +2172,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         self.warm(bucket, &kernels)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        // The recording's own window: nothing that synchronises may run inside it.
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        let walked = walked?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 
@@ -4122,7 +4131,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let probe = AttentionOutputs::default();
         let mut forward = Forward::new(&stream, generation, &arena)
             .with_live_tokens(self.columns.live_tokens.device);
-        if runner_dump() {
+        // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
+        // inside a capture is refused by the driver - which is a measurement that breaks what it
+        // measures, and one that no line of its own would ever explain.
+        if runner_dump() && !self.capturing {
             forward = forward.with_attention_probe(&probe);
         }
         let hidden = arena.tensor(
