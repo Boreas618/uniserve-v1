@@ -978,7 +978,10 @@ impl PagedAttention {
                     .to_owned(),
             ));
         };
-        if args.window_left != 0 {
+        // `-1` is the encoding for "no window", which is what a program compiled without one
+        // needs; a window is set when the value is not negative. A check against zero refuses the
+        // no-window call, which is every causal deployment's.
+        if args.window_left >= 0 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
