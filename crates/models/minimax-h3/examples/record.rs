@@ -1291,7 +1291,11 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         .map_err(|error| error.to_string())?;
     let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
     let mut loader = WeightLoader::stated(
-        component_type(request, "audio_vae")?,
+        // The network's own element type. The VAE encoders beside it compute in FP32 at every
+        // deployment and get their own statement below; loading the DiT through this one made a
+        // conditioned harness read every DiT weight as FP32, so its attended rows were written FP32
+        // and two launch keys stated a type the checkpoint does not hold.
+        dit_type,
         Some(&request.extents),
     );
     // `ConditionEncoders` reads its weights from the VAE directories, as the decoder halves do, and
