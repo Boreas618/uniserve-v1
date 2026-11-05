@@ -75,7 +75,11 @@ task=${TASK:-ref2va}
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
 # by name.
-sparse=64,0.9,8192
+# The deployment's sparse attention, in the one grammar both halves take:
+# `tile_rows,sparsity[,reference_keep]`. The tile **bound** is not an argument - the layout derives
+# it (351 232 packed rows at this deployment), and a third field here was a second statement of it
+# that only one of the two parsers accepted.
+sparse=64,0.9
 
 # The deployment's packed bound, restated here only because the walk still takes `--rows` as a flag.
 # **This is the value `rows_bound()` computes**: a bound the model can exceed belongs in the
