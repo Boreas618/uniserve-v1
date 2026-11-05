@@ -1758,6 +1758,21 @@ impl Decoder for VideoDecoder {
                 clip.frames
             )));
         }
+        // The trajectory a denoiser publishes is FP32 (`denoiser::SAMPLE`, the reference keeps its
+        // trajectory there and refuses any other type at its own entry) while this decoder reads the
+        // checkpoint's own type. The reference spans the two with `torch.autocast`, which casts each
+        // operator's operands; replacing autocast with declared per-layer precision leaves exactly one
+        // conversion at this boundary, and whoever hands the view over performs it. Reading the bytes
+        // in another type would be a silent reinterpretation of the trajectory, so the mismatch is
+        // refused here by name and both types.
+        if latents.dtype != self.dtype {
+            return Err(refuse(format!(
+                "the decoder reads its latents as {:?} (`element_type`), and this trajectory is {:?}: \
+                 a denoiser publishes FP32 and the conversion to the decoder's own type belongs to \
+                 whoever hands the view over",
+                self.dtype, latents.dtype
+            )));
+        }
         let tiles = Tiles::of(&self.config, &clip)
             .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
             .tiles(&self.config, &clip);
@@ -1944,6 +1959,61 @@ pub(crate) mod tests {
         decoder
             .scratch(&forward)
             .expect("one clip's transformer scratch fits the plan its decoder states");
+    }
+
+    /// A denoiser publishes its trajectory in FP32 and this decoder reads the checkpoint's own type.
+    /// Reading the bytes in the other type would reinterpret the trajectory silently, so the mismatch
+    /// is refused and both types are named - the conversion is the caller's, at the copy that hands
+    /// the view over.
+    #[test]
+    fn a_trajectory_of_another_type_is_refused_and_both_types_are_named() {
+        let config = video_config();
+        let canvas = Canvas::clip(&config, 48, 48);
+        let decoder = stated_decoder(&config, canvas);
+        let clip = clip_of(&config, canvas);
+        let plan = crate::decoding::video_arena(&config, &canvas, DType::F32).expect("a plan");
+        let arena = nn::Arena::new(
+            nn::DevicePtr::new(0),
+            crate::decoding::arena_reservation(&plan),
+        );
+        let forward = nn::Forward::recording(&arena);
+        let latents = arena
+            .tensor(
+                DType::F16,
+                Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
+            )
+            .expect("a latent column");
+        let video = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[
+                    3,
+                    u64::from(clip.frames),
+                    u64::from(clip.height),
+                    u64::from(clip.width),
+                ]),
+            )
+            .expect("a raster");
+        let positions = arena
+            .tensor(DType::F32, Shape::new(&[3, 1]))
+            .expect("a table");
+        // The capability's `decode`, not the inherent tile decoder of the same name.
+        let error = nn::capability::Decoder::decode(
+            &decoder,
+            &forward,
+            latents,
+            &[positions],
+            nn::capability::DecodedMedia {
+                video: Some(video),
+                audio: None,
+            },
+        )
+        .expect_err("the decoder reads its own element type");
+        assert!(
+            matches!(&error, nn::Error::Shape { problem, .. }
+                if problem.contains("F16") && problem.contains("F32")),
+            "the refusal names both types: {error}"
+        );
     }
 
     /// A decoder of one canvas, built from stated weights: the geometry is the subject, so neither a
