@@ -281,7 +281,30 @@ impl DenoiseColumns {
 /// The request's raw condition media is not here either: it is an input to the conditioning rather
 /// than a row of it, it is per condition, and the scheduler names it
 /// (`crate::runners::products`).
-const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
+const STEP_PRODUCTS: &[Product] = &[Product::Text];
+
+/// The products a step of a *conditioned* layout reads: the two above, and the conditioning
+/// sequence's encoded states.
+///
+/// `condition_elements` is the per-request fact that decides between this list and
+/// [`STEP_PRODUCTS`]: it counts the elements a request's conditions cover, and a task whose request
+/// carries none - a prompt alone, or a first and last frame the latents already hold - has no
+/// conditioning sequence for an encoder to encode. Requiring a source product there would refuse a
+/// task for something no call can produce, which is the same defect as requiring the raw condition
+/// media (`crate::runners::products`).
+const CONDITIONED_STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
+
+/// The products a step of `layout` reads, in the order a refusal names them.
+///
+/// The text rows are the prompt's encoded states and every task reads them; a layout with
+/// conditioning elements reads its conditioning rows as well.
+fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
+    if layout.condition_elements > 0 {
+        CONDITIONED_STEP_PRODUCTS
+    } else {
+        STEP_PRODUCTS
+    }
+}
 
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
@@ -290,10 +313,11 @@ const STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
 fn missing_product(
     products: &dyn Products,
     request: ipc::RequestKey,
+    kinds: &[Product],
     device: platform::DeviceId,
     stream: StreamId,
 ) -> Result<Option<Product>> {
-    for kind in STEP_PRODUCTS {
+    for kind in kinds {
         if products.borrow(request, *kind, device, stream)?.is_none() {
             return Ok(Some(*kind));
         }
@@ -762,11 +786,18 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// The kinds are [`STEP_PRODUCTS`], and they are what this file places into a `Conditioning`.
     /// A store that answers `None` for one of them is refused by name - which is the difference
     /// between a step that fails because nobody ran the encoder and one that runs on zeros.
-    fn require_products(&self, request: ipc::RequestKey) -> Result<()> {
+    fn require_products(&self, request: ipc::RequestKey, bucket: Bucket) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Err(products::no_store(request));
         };
-        match missing_product(products.as_ref(), request, self.device, self.stream_id())? {
+        let kinds = step_products(&layout_of(bucket)?);
+        match missing_product(
+            products.as_ref(),
+            request,
+            kinds,
+            self.device,
+            self.stream_id(),
+        )? {
             Some(kind) => Err(products::absent(request, kind)),
             None => Ok(()),
         }
@@ -988,7 +1019,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             // What a step also reads is produced by other calls of the same request - the text
             // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
             // and never derived here.
-            self.require_products(stated_request.request)?;
+            self.require_products(stated_request.request, bucket)?;
             // A request's first step has no trajectory yet: its values are the model's own draw
             // and fold, which the replay issues before its graph launches (`first_step`). The seed
             // travels with the row, because the draw is addressed by it and by the element's index.
@@ -1400,8 +1431,14 @@ mod product_tests {
             held: vec![Product::Text],
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
-            .expect("a store answers");
+        let missing = missing_product(
+            &store,
+            request(),
+            CONDITIONED_STEP_PRODUCTS,
+            platform::DeviceId(0),
+            StreamId(0),
+        )
+        .expect("a store answers");
         assert_eq!(
             missing,
             Some(Product::Source),
@@ -1418,16 +1455,67 @@ mod product_tests {
     #[test]
     fn a_store_holding_every_kind_leaves_nothing_missing() {
         let store = Store {
-            held: STEP_PRODUCTS.to_vec(),
+            held: CONDITIONED_STEP_PRODUCTS.to_vec(),
             asked: Mutex::new(Vec::new()),
         };
-        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
-            .expect("a store answers");
+        let missing = missing_product(
+            &store,
+            request(),
+            CONDITIONED_STEP_PRODUCTS,
+            platform::DeviceId(0),
+            StreamId(0),
+        )
+        .expect("a store answers");
         assert_eq!(missing, None);
         assert_eq!(
             store.asked.lock().unwrap().len(),
-            STEP_PRODUCTS.len(),
+            CONDITIONED_STEP_PRODUCTS.len(),
             "each kind is asked once"
+        );
+    }
+
+    /// A task whose request carries no condition element reads no source rows, so a store holding
+    /// the prompt's states serves it: a layout with no conditioning elements asks for one kind, and a
+    /// layout with them asks for two.
+    ///
+    /// The rule is what keeps a prompt-only task from being refused for a product no call can
+    /// produce, so it is asserted from the layout side rather than from the store side.
+    #[test]
+    fn a_layout_without_conditioning_elements_reads_only_the_prompts_states() {
+        let mut layout = Layout {
+            video: nn::capability::LatentShape {
+                channels: 16,
+                frames: 2,
+                height: 2,
+                width: 2,
+            },
+            audio: None,
+            text_rows: 64,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        assert_eq!(step_products(&layout), STEP_PRODUCTS);
+        assert_eq!(step_products(&layout).len(), 1);
+
+        layout.condition_elements = 3;
+        assert_eq!(step_products(&layout), CONDITIONED_STEP_PRODUCTS);
+
+        let store = Store {
+            held: vec![Product::Text],
+            asked: Mutex::new(Vec::new()),
+        };
+        let missing = missing_product(
+            &store,
+            request(),
+            CONDITIONED_STEP_PRODUCTS,
+            platform::DeviceId(0),
+            StreamId(0),
+        )
+        .expect("a store answers");
+        assert_eq!(
+            missing,
+            Some(Product::Source),
+            "a conditioned layout asks a store holding only the prompt's states for the source"
         );
     }
 
