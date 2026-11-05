@@ -54,10 +54,33 @@ import pytest
 from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
+    server_process,
     start_server,
     stop_server,
     wait_health,
+    worker_executable,
 )
+
+#: Options every deployment this file serves with. They are the live-update file's, deliberately:
+#: the two files serve the same model on the same host, and a deployment that stated a different
+#: attention backend, graph catalogue or token budget would be a second deployment whose numbers
+#: nobody could compare with the first's.
+#:
+#: `attention_backend` in particular is not optional: a program is selected by its backend's name,
+#: so a deployment left at `auto` states no package and its epoch cannot be prepared at all.
+DEPLOYMENT_OPTIONS = (
+    "dtype=bfloat16",
+    "attention_backend=trtllm",
+    "kv_cache_config.max_tokens=32768",
+    "chat_config.reasoning_parser=none",
+    "cuda_graph_config.prefill_token_sizes=[512]",
+    "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
+    "max_num_batched_tokens=512",
+)
+
+#: Host KV cache this deployment holds, in GiB. The live-update file serves the same model
+#: with the same figure, so the two files' deployments size their host memory alike.
+HOST_GIB = 8
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -153,31 +176,47 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
 def server(
     model: Path, program_server, tmp_path_factory: pytest.TempPathFactory
 ):
+    """Serve one Qwen3-MoE deployment against the test's own Program Server.
+
+    The deployment is started through the shared `server_process` helper, which is what every
+    other e2e deployment uses: it gives the server a runtime directory of its own (and with it
+    a Storage Server that lives exactly as long as the deployment), the GPUs the GPU locks
+    granted, and its log to the health wait. A server started by hand gets none of the three -
+    it looks for a Storage Server in the ambient runtime directory and dies with a return code
+    that says nothing.
+    """
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("deployment")
+    runtime = work / "runtime"
+    runtime.mkdir()
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    process = start_server(
-        [
-            str(binary),
-            "serve",
-            str(model),
-            "--served-model-name",
-            "qwen3-moe",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--program-server",
-            str(program_server["socket"]),
-        ],
-        work / "server.log",
-    )
-    wait_health(base_url, process, 900.0)
-    try:
+    log = work / "server.log"
+    command = [
+        str(binary),
+        "serve",
+        str(model),
+        "--served-model-name",
+        "qwen3-moe",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--worker-executable",
+        str(worker_executable()),
+        "--set",
+        f"kv_cache_config.host_gib={HOST_GIB}",
+        "--program-server",
+        str(program_server["socket"]),
+    ]
+    for option in DEPLOYMENT_OPTIONS:
+        command += ["--set", option]
+    environment = {
+        "CUDA_VISIBLE_DEVICES": os.environ.get("UNISERVE_LIVE_DEVICE", "0"),
+        "XDG_RUNTIME_DIR": str(runtime),
+    }
+    with server_process(command, base_url, log, timeout_s=900, env=environment):
         yield base_url
-    finally:
-        stop_server(process)
 
 
 RESIDENT_TOKENS = 512
