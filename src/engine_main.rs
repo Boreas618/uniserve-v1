@@ -3680,8 +3680,13 @@ impl MainProcess {
                     .iter_mut()
                     .find(|served| served.request == command.request)
                 else {
-                    tracing::debug!(
+                    // A handover's takeover names a request this process kept running for it:
+                    // one it does not hold is either a request that ended first or a front that
+                    // named the wrong identity, and only the log can say which.
+                    tracing::warn!(
                         request = command.request,
+                        front,
+                        from = takeover.events,
                         "a takeover names a request this epoch no longer serves"
                     );
                     return Ok(());
