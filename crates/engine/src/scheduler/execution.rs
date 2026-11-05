@@ -500,6 +500,7 @@ impl Scheduler {
         self.reclaim_shortage();
         self.execute_plan_pages(&plan);
         let batches = self.assemble_plan(&plan);
+        self.log_step(&plan, &batches);
         self.end_step(started.elapsed());
         batches
     }
@@ -724,10 +725,41 @@ impl Scheduler {
         // step states those views and not a view of every resident.
         let live = views::watching(self, self.recorder.recorded());
         // A resident request that has not advanced within the policy's timeout
-        // is the policy's failure, not the request's (design §4.4).
+        // is the policy's failure, not the request's (design §4.4) - but one
+        // request's silence is not the deployment's (§4.4's liveness rule is
+        // per request): the request fails by name and the others are served.
+        // The epoch ends only when nothing else could have been served, which
+        // is the case a reader must be able to see from the log.
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
         if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
-            return self.policy_failed(policy, PolicyError::Starved { request });
+            let report = self.starvation_report(&live, now);
+            // What could have been served instead: another resident, or a queued request. The
+            // watchdog's own view names only the requests it tracks, so this is read from the
+            // mechanism's queues rather than from that view.
+            let others = self.running.len() + self.running_media.len() > 1
+                || !self.waiting.is_empty()
+                || !self.waiting_media.is_empty();
+            if others {
+                tracing::warn!(
+                    request = request.0,
+                    reason = %report,
+                    "a request starved past the policy's timeout: failing that request, not the epoch"
+                );
+                self.finish_with(RequestId(request.0), FinishReason::Error, None);
+            } else {
+                tracing::error!(
+                    request = request.0,
+                    reason = %report,
+                    "no batch was formed for anything resident"
+                );
+                self.fail(format!(
+                    "no batch formed for {} resident request(s) at step {}: {report}",
+                    self.running.len() + self.running_media.len(),
+                    self.step,
+                ));
+                self.policy = Some(policy);
+                return None;
+            }
         }
         let events = self.recorder.take();
         if let Err(error) = policy.observe(&events) {
@@ -873,6 +905,91 @@ impl Scheduler {
             }
         }
         None
+    }
+
+    /// One line per step: what it planned and what became a batch.
+    ///
+    /// A step that serves nothing is the interesting one - a starvation is
+    /// otherwise unfalsifiable - so the line names what was resident, what the
+    /// plan asked for, and how much of it became calls. The rows' classes are
+    /// the calls' own kinds, which is what a refusal is about (a mixed phase or
+    /// a mixed sampling class).
+    fn log_step(&self, plan: &Plan, batches: &[ExecutionBatch]) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let calls: usize = batches.iter().map(|batch| batch.requests.len()).sum();
+        if calls == 0 {
+            tracing::debug!(
+                step = self.step,
+                resident = self.running.len() + self.running_media.len(),
+                queued = self.waiting.len() + self.waiting_media.len(),
+                planned = plan.work.len() + plan.refill.len(),
+                admitted = plan.admit.len(),
+                in_flight = self.inflight.pending_batches.len()
+                    + self.inflight.pending_submissions.len(),
+                "a scheduler step formed no batch"
+            );
+            return;
+        }
+        // Only when the line is enabled: a step is the hot path, and the sums and the kinds vector
+        // exist for the log line and nowhere else.
+        let tokens: usize = batches
+            .iter()
+            .flat_map(|batch| batch.requests.iter())
+            .map(|(call, _)| call.input_token_ids.len())
+            .sum();
+        let kinds: Vec<ipc::CallKind> = batches
+            .iter()
+            .flat_map(|batch| batch.requests.iter())
+            .map(|(call, _)| call.kind)
+            .collect();
+        tracing::debug!(
+            step = self.step,
+            batches = batches.len(),
+            calls,
+            tokens,
+            ?kinds,
+            "a scheduler step formed its batches"
+        );
+    }
+
+    /// The starvation rule's report: what was resident, in which state, and how
+    /// long each request has gone without advancing.
+    ///
+    /// A starvation with a healthy device must never end a process without
+    /// saying what was resident (§4.4), so the report is read by the failure
+    /// itself and by the log line above it.
+    fn starvation_report(&self, live: &mechanism::Live<'_>, now: scheduling::guest::Nanos) -> String {
+        let mut text = format!(
+            "{} resident, {} queued, {} in flight, {} waiting to be submitted",
+            self.running.len() + self.running_media.len(),
+            self.waiting.len() + self.waiting_media.len(),
+            self.inflight.pending_batches.len(),
+            self.inflight.pending_submissions.len(),
+        );
+        for (id, since) in self.watchdog.advancing() {
+            let age_ms = now.0.saturating_sub(since.0) / 1_000_000;
+            let guest = scheduling::guest::RequestId(id.0);
+            match live.requests.get(&guest) {
+                Some(view) => text.push_str(&format!(
+                    "; request {} is {:?}{} and last advanced {} ms ago",
+                    id.0,
+                    view.state,
+                    if view.waiting_transfer {
+                        ", waiting for a transfer"
+                    } else {
+                        ""
+                    },
+                    age_ms,
+                )),
+                None => text.push_str(&format!(
+                    "; request {} is not in the live set and last advanced {} ms ago",
+                    id.0, age_ms,
+                )),
+            }
+        }
+        text
     }
 
     /// This step's room.
