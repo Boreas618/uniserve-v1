@@ -131,8 +131,20 @@ impl ModuleSpec {
     /// package that carries one metadata JSON per descriptor names one file
     /// per descriptor.
     pub fn metadata_name(&self, descriptor: &str) -> Option<String> {
-        self.metadata
-            .as_ref()
+        Self::substituted(&self.metadata, descriptor)
+    }
+
+    /// The shared object a native module names, with `{descriptor}` replaced
+    /// as [`Self::metadata_name`] does: a package carrying one library per
+    /// descriptor names them `lib/{descriptor}.so`.
+    pub fn library_name(&self, descriptor: &str) -> Option<String> {
+        Self::substituted(&self.library, descriptor)
+    }
+
+    /// A module file name with the descriptor's placeholder replaced by this
+    /// module's descriptor key.
+    fn substituted(name: &Option<String>, descriptor: &str) -> Option<String> {
+        name.as_ref()
             .map(|name| name.replace(DESCRIPTOR_PLACEHOLDER, descriptor))
     }
 }
@@ -194,6 +206,13 @@ pub struct ModuleSpec {
     /// its mode, names it; `[module.entries]` stays the package's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries_file: Option<String>,
+    /// The shared object a native module loads, as a path inside the module
+    /// directory. A native module names the library it is; the engine loads
+    /// what the module names rather than guessing by position among its files,
+    /// so a package that carries a library beside its metadata is not read by
+    /// directory order. A package declares it when its `form` is native.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
 }
 
 /// The entry role every native module has: the one that launches the kernel.
