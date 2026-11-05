@@ -116,7 +116,7 @@ An image batch is prepared the same way (`crates/executor/src/runners/products.r
 
 ### Attention
 
-An attention kernel is chosen from the device and the installed kernel libraries by the executor's plan (`crates/executor/src/plan.rs`), which names the kernel package of `crates/ops/kernels/attention` a step launches. `attention_backend` passes its value to the executor unchanged, and a deployment that names a backend the build does not provide fails at startup with that name. A host-planned kernel's plan is shared by every layer of one execution context that has the same layer shape and batch signature, so a forward plans once, before the replay of its graph.
+An attention kernel is chosen from the device and the installed kernel libraries by the executor's plan (`crates/executor/src/plan.rs`), which names the operator a step launches and the implementation of it. Three attention operators are built from `crates/ops/kernels`, one package per implementation under `<operator>/<implementation>`: `paged_attention` (`triton`, `trtllm`), `dense_attention` (`f32`, `fa4`) and `sparse_attention` (`sm90`, `sm100`, `sm120`, one package per compute capability). `attention_backend` is the attention provider name of the rank's model (`crates/ipc/src/launch.rs:167`), which the executor receives unchanged; a deployment that names a backend the build does not provide fails at startup with that name. A host-planned kernel's plan is shared by every layer of one execution context that has the same layer shape and batch signature, so a forward plans once, before the replay of its graph.
 
 ## CUDA graphs
 
