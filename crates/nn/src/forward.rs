@@ -190,10 +190,20 @@ impl<'a> Shadow<'a> {
 
 /// The borrowed execution resources of one forward (specs/worker.md 4.3).
 pub struct Forward<'a> {
-    /// The stream this forward's work is issued on.
-    pub stream: &'a Stream,
-    /// The generation of loaded kernels the operators resolve their programs from.
-    pub kernels: &'a Generation,
+    /// The stream this forward's work is issued on and the generation of loaded kernels the
+    /// operators resolve their programs from, or `None` for a **recording** forward: one that states
+    /// the programs a graph launches instead of launching them.
+    ///
+    /// A recording forward exists so that the enumeration of a model's programs can be the model's own
+    /// `forward` rather than a second traversal written beside it. It needs no device: the arena is a
+    /// null-backed region, `operate` formats the descriptor and hands it to the capture sink, and no
+    /// kernel is resolved. That is the difference between "the walk runs the model" (which would need
+    /// a GPU and the checkpoint's shards) and this: the walk runs the model's *shape arithmetic*.
+    /// The stream this forward's work is issued on, or `None` for a recording forward.
+    stream: Option<&'a Stream>,
+    /// The generation of loaded kernels the operators resolve their programs from, or `None` for a
+    /// recording forward.
+    pub kernels: Option<&'a Generation>,
     /// The activation region of this captured bucket.
     pub arena: &'a Arena,
     /// The communicator of this rank's parallel group, when the block is partitioned.
@@ -208,13 +218,49 @@ impl<'a> Forward<'a> {
     /// A forward with the resources every block needs and no partitioning.
     pub fn new(stream: &'a Stream, kernels: &'a Generation, arena: &'a Arena) -> Self {
         Self {
-            stream,
-            kernels,
+            stream: Some(stream),
+            kernels: Some(kernels),
             arena,
             group: None,
             exchange: None,
             shadow: None,
         }
+    }
+
+    /// A forward that records the programs a graph launches instead of launching them.
+    ///
+    /// The arena is the caller's: a null-backed region is enough, because no kernel reads it. Every
+    /// `operate` then formats the descriptor and reports it to the installed capture sink
+    /// ([`ops::capture::Sink`]), so running a model's `forward` against this collects the exact set of
+    /// programs it launches — the same set a device would launch, from the same code.
+    pub fn recording(arena: &'a Arena) -> Self {
+        Self {
+            stream: None,
+            kernels: None,
+            arena,
+            group: None,
+            exchange: None,
+            shadow: None,
+        }
+    }
+
+    /// Whether this forward launches, rather than only recording what it would launch.
+    pub const fn is_recording(&self) -> bool {
+        self.stream.is_none()
+    }
+
+    /// The stream this forward's launches and collectives are issued on.
+    ///
+    /// A recording forward has none: every `operate` returns before a kernel is resolved, and a
+    /// collective — which has to reach other ranks — refuses here by name rather than pretending.
+    pub fn stream(&self) -> Result<&'a Stream> {
+        self.stream.ok_or_else(|| {
+            Error::Unsupported(
+                "this forward records the programs a graph launches and has no stream, so it cannot \
+                 collect across ranks"
+                    .to_owned(),
+            )
+        })
     }
 
     /// The same forward over a parallel group.
@@ -245,6 +291,14 @@ impl<'a> Forward<'a> {
     where
         O::Args<'t>: Copy,
     {
+        // A recording forward states the program and stops: no kernel to resolve, no launch to make,
+        // and the descriptor key formatted only when a sink will read it.
+        let (Some(stream), Some(kernels)) = (self.stream, self.kernels) else {
+            if ops::capture::installed() {
+                ops::capture::launched(O::NAME, &ops::descriptor::key(descriptor));
+            }
+            return Ok(());
+        };
         // Paired by operator: a program replaced by another compilation of the same mathematics
         // may carry a different descriptor text, and that is the update 7.3 step 2 exists for.
         let shadow = self
@@ -252,8 +306,8 @@ impl<'a> Forward<'a> {
             .as_ref()
             .filter(|shadow| shadow.operator == O::NAME);
         let Some(shadow) = shadow else {
-            let kernel = self.kernels.op::<O>(descriptor)?;
-            O::launch(kernel, descriptor, args, self.stream)
+            let kernel = kernels.op::<O>(descriptor)?;
+            O::launch(kernel, descriptor, args, stream)
                 .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
             Self::record::<O>(descriptor);
             return Ok(());
@@ -262,7 +316,7 @@ impl<'a> Forward<'a> {
         // reads it even when one of the two generations lacks this descriptor.
         let mut twins = shadow.twins.borrow_mut();
         twins.set_tolerance(O::tolerance(descriptor));
-        let current = self.kernels.op::<O>(descriptor)?;
+        let current = kernels.op::<O>(descriptor)?;
         // The previous program is resolved by the key its generation stored it under, and by the
         // launch's own key when that generation still has one: an operator served under several
         // descriptors is compared program for program, never against a neighbour's compilation.
@@ -274,12 +328,12 @@ impl<'a> Forward<'a> {
         };
         // Redirect the call's outputs into the twins and let the new program write them; the
         // previous program then writes the real outputs, which the forward continues on.
-        let redirected = O::shadow(args, &mut twins, self.stream);
-        O::launch(current, descriptor, redirected, self.stream)
+        let redirected = O::shadow(args, &mut twins, stream);
+        O::launch(current, descriptor, redirected, stream)
             .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
         Self::record::<O>(descriptor);
         drop(twins);
-        O::launch(previous, descriptor, args, self.stream)
+        O::launch(previous, descriptor, args, stream)
             .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
         Self::record::<O>(descriptor);
         Ok(())
@@ -297,8 +351,8 @@ impl<'a> Forward<'a> {
         }
     }
 
-    /// The kernels generation this forward launches against.
-    pub fn kernels(&self) -> &Generation {
+    /// The kernels generation this forward launches against, or `None` for a recording forward.
+    pub fn kernels(&self) -> Option<&'a Generation> {
         self.kernels
     }
 
@@ -311,6 +365,43 @@ impl<'a> Forward<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording forward states the program its graph would launch and launches nothing: no stream,
+    /// no kernel generation, no device. That is what lets a model's own `forward` be the enumeration of
+    /// its programs — a traversal that cannot miss a launch, on a machine that has no GPU and no shards.
+    #[test]
+    fn a_recording_forward_reports_the_program_it_would_launch() {
+        struct Rows(Vec<(String, String)>);
+
+        impl ops::capture::Sink for Rows {
+            fn launched(&mut self, operator: &'static str, key: &str) {
+                self.0.push((operator.to_owned(), key.to_owned()));
+            }
+        }
+
+        let arena = Arena::new(DevicePtr::new(0), 1 << 20);
+        let forward = Forward::recording(&arena);
+        assert!(forward.is_recording());
+
+        let descriptor = crate::layers::Silu::descriptor_of(DType::BF16, 1024);
+        let extent = Shape::new(&[4, 1024]);
+        let args = ops::activation::SiluArgs {
+            x: arena.tensor(DType::BF16, extent).unwrap(),
+            out: arena.tensor(DType::BF16, extent).unwrap(),
+        };
+
+        let mut rows = Rows(Vec::new());
+        ops::capture::set_sink(Some(&mut rows));
+        forward
+            .operate::<ops::activation::Silu>(&descriptor, args)
+            .expect("a recording forward launches nothing");
+        ops::capture::set_sink(None);
+
+        assert_eq!(
+            rows.0,
+            vec![("silu".to_owned(), ops::descriptor::key(&descriptor))]
+        );
+    }
 
     #[test]
     fn reservations_are_aligned_and_do_not_overlap() {
