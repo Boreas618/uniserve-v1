@@ -19,7 +19,6 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
-use proto::request::ModelDtype;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -72,26 +71,11 @@ pub(crate) fn router_with(engine: Leader, server: &ServerOptions) -> Router {
 /// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
-/// API's longest duration capacity, as a default video deployment does, and a
-/// DiffusionGemma model runs under its own generation limits, as
-/// `Leader::start` starts it.
+/// API's longest duration capacity, as a default video deployment does.
 pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
-    sim_readout_engine(parameters, None)
-}
-
-/// Builds an engine like [`sim_engine`] that serves the System One readout
-/// with `readout`.
-pub(crate) fn sim_readout_engine(
-    parameters: ModelParameters,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
-) -> Leader {
     let model = sim_model(parameters);
-    let mut config = EngineConfig::sim(SERVED_MODEL);
-    if let ModelParameters::DiffusionGemma(_) = model.parameters {
-        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-    }
-    let core = sim_core(config, SimEngine::new());
-    engine_over(model, configured_tokenizer(), vec![core], readout)
+    let core = sim_core(EngineConfig::sim(SERVED_MODEL), SimEngine::new());
+    engine_over(model, configured_tokenizer(), vec![core])
 }
 
 /// Starts a scheduler under `config` that drives `worker` in process, with the
@@ -119,23 +103,62 @@ pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHand
 /// states the command that builds the module.
 pub(crate) fn policy_on(core: &SchedulerHandle) {
     let capacity = engine::BatchCapacity::of(core.info());
-    let (program, module) = engine::packaged_policy(capacity);
+    let (program, module) = packaged_policy(capacity);
     let source: std::sync::Arc<dyn engine::PolicySource + Send + Sync> =
         std::sync::Arc::new(engine::PolicyBytes::new(module));
     core.precopy_policy(program, source)
-        .recv()
-        .expect("the policy precopy is answered")
+        .recv_timeout(POLICY_ANSWER)
+        .expect("the policy precopy is answered within the bound")
         .expect("the packaged policy's limits fit the scheduler's capacity");
     core.switchover_policy()
-        .recv()
-        .expect("the switchover is answered")
+        .recv_timeout(POLICY_ANSWER)
+        .expect("the switchover is answered within the bound")
         .expect("the switchover applies at the next batch boundary");
+    // A scheduler that fatal-stops leaves its handle dead, and a dead handle is what
+    // an engine reports as "no live scheduler answered the state the route policy is
+    // instantiated on" - a sentence about the wrong subject. Its own reason is here,
+    // and standard error is where a test run carries it.
+    if let Some(reason) = core.failure() {
+        eprintln!("the simulated scheduler stopped after its policy was installed: {reason}");
+    }
+}
+
+/// How long a fixture waits for an answer it cannot proceed without.
+///
+/// A scheduler that does not answer must state that, not hang: an unbounded
+/// `recv` in a fixture is a suite that stops with no line saying which answer it
+/// never got, which is exactly how a 53-second run became a 42-minute one.
+pub(crate) const POLICY_ANSWER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the packaged policy module may take to be built on first use.
+///
+/// The build runs `cargo` inside the test process, so it can wait on a package
+/// cache another cargo holds. Its own name is what says so: without a bound the
+/// fixture looks like a deadlock in the daemon.
+pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`engine::packaged_policy`] under a bound, so a stalled build names itself.
+///
+/// The build is blocking and its thread cannot be cancelled; the thread is left
+/// to finish rather than joined, which is what a test fixture can do and a
+/// service cannot.
+pub(crate) fn packaged_policy(capacity: engine::BatchCapacity) -> (engine::PolicyProgram, Vec<u8>) {
+    let (answered, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answered.send(engine::packaged_policy(capacity));
+    });
+    answer.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
+        panic!(
+            "the fcfs policy module was not built within {} s: a cargo build inside this              process is waiting on a package cache or a wasm32 toolchain another process holds.              Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs              --target wasm32-unknown-unknown --release` to run without the build.",
+            POLICY_BUILD.as_secs()
+        )
+    })
 }
 
 /// Builds an engine for a model with `parameters` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
 pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Leader {
-    engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
+    engine_over(sim_model(parameters), configured_tokenizer(), cores)
 }
 
 /// A client of `cores`, which serve the request interface on a thread of
@@ -171,7 +194,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     // the engine installs it here for the route. Without one the engine has no
     // policy to route a request with and refuses every submission.
     let policy = {
-        let (program, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
+        let (program, module) = packaged_policy(engine::BatchCapacity::of(first.info()));
         engine::EpochPolicy {
             program,
             module: std::sync::Arc::new(engine::PolicyBytes::new(module)),
@@ -180,7 +203,16 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || engine::serve_requests(engine, cores, Some(policy)))
+        .spawn(move || {
+            if let Err(error) = engine::serve_requests(engine, cores, Some(policy)) {
+                // A simulated engine that ends is the whole of a test's failure and
+                // otherwise leaves no line: the client reports only that its process
+                // ended, and the reason - a frame the engine refused, a scheduler that
+                // did not answer - is lost with the thread. Standard error, so a test
+                // run with `--nocapture` carries it beside the assertion.
+                eprintln!("the simulated engine ended: {error:#}");
+            }
+        })
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
@@ -213,11 +245,10 @@ pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
     cores: Vec<SchedulerHandle>,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
 ) -> Leader {
     let model_name = cores[0].model_name().to_owned();
     let client = std::sync::Arc::new(sim_client(cores));
-    leader_over(model, tokenizer, model_name, vec![client], readout)
+    leader_over(model, tokenizer, model_name, vec![client])
 }
 
 /// Binds the public leader to independent engine connections.
@@ -226,7 +257,6 @@ pub(crate) fn leader_over(
     tokenizer: DynTokenizer,
     model_name: String,
     clients: Vec<std::sync::Arc<EngineClient>>,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
 ) -> Leader {
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
@@ -261,7 +291,6 @@ pub(crate) fn leader_over(
         clients,
         processor,
         images,
-        readout,
         &options,
         test_updates(),
     )

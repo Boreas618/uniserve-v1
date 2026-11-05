@@ -549,7 +549,6 @@ impl<S: ResponseSink> GenerationRun<S> {
             .map(decode_options)
             .unwrap_or_default();
         let parser = lowering.parser.clone().unwrap_or_default();
-        let mut decode_options = options.clone();
         let kind = handoff::parser::Kind::try_from(parser.kind)
             .unwrap_or(handoff::parser::Kind::ParserKindNone);
         let mut processor = match kind {
@@ -558,15 +557,7 @@ impl<S: ResponseSink> GenerationRun<S> {
                 tokenizer.clone(),
                 parser.parse_reasoning,
             )?,
-            handoff::parser::Kind::ParserKindGemma4 => ChatOutputProcessor::gemma4(
-                parser.parse_tools,
-                &mut decode_options,
-                tokenizer.clone(),
-                parser.parse_reasoning,
-            )?,
-            handoff::parser::Kind::ParserKindSenseNova | handoff::parser::Kind::ParserKindNone => {
-                ChatOutputProcessor::new(None, None)
-            }
+            handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
         };
         if let Some(parsers) = state.processor {
             processor.resume(parsers);

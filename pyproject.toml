@@ -109,12 +109,6 @@ uniserve = ["backends/moe/tactics.json"]
 # runs these native targets, so they build with Cargo's release profile even
 # for an editable install, where setuptools-rust would otherwise choose a
 # debug build.
-[[tool.setuptools-rust.ext-modules]]
-target = "uniserve._worker"
-path = "crates/worker/Cargo.toml"
-binding = "NoBinding"
-debug = false
-
 # The one executable of every UniServe process, installed onto PATH as
 # `uniserve`: `serve` (a node's daemon), `engine` (the engine process), `worker`
 # (one worker, in this environment) and `storage` (a host's Storage Server).
@@ -133,8 +127,7 @@ markers = [
     "e2e: black-box server or worker tests",
     "gpu: requires a CUDA device; orthogonal to the unit, integration and e2e layers",
     "slow: excluded from the fast local and presubmit suites",
-    "model(name): selects a concrete model backend such as sensenova or bagel",
-    "sensenova: SenseNova-U1-specific test",
+    "model(name): selects a concrete model backend such as qwen3 or minimax_h3",
     "missing_state: a serving path without an optional derived state (weights, KV pages and recurrent checkpoints, draft cache, encoder outputs, latents); runs under compute-sanitizer in the sanitizer workflow",
 ]
 

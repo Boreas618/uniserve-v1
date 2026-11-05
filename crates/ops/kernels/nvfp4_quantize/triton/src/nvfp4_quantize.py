@@ -164,6 +164,11 @@ def _nvfp4_quantize_kernel(
         row_amax = tl.maximum(row_amax, tl.max(tl.abs(values).reshape([BLOCK])))
 
     token_scale = row_amax * global_scale
+    ## A row whose values are all zero has no magnitude to scale by, and the reciprocal of a zero
+    ## factor is infinite: the row would encode to NaN rather than to zeros, and the product that
+    ## reads the factor would divide by zero. The factor is floored at a value whose reciprocal is
+    ## finite, so a zero row encodes as zeros with a finite factor and its product is zero.
+    token_scale = tl.maximum(token_scale, 1.0e-30)
     tl.store(token_scale_ptr + row + tl.arange(0, 1), token_scale)
     ## The encode multiplier is the approximate reciprocal of the row's factor, as the reference
     ## encoder's `reciprocal_approximate_ftz` is: the bytes agree with it, not merely the values.

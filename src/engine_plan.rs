@@ -386,8 +386,8 @@ impl EpochPlan {
         // What a rank must be able to map to serve at all, which is every pool the allocator
         // books at its first capture: the graph range in full and the scratch. The graph range is
         // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
-        // streams and `Pools::pool` allocates a stream's share in one buffer, with one stream
-        // here - so a rank that holds room for one of the two pools and not both is refused here
+        // streams and `Pools::pool` allocates a stream's share in one buffer - so a rank that
+        // holds room for one of the two pools and not both is refused here
         // rather than at its first capture, after the model load. The resident pool is a
         // reservation of addresses and not of storage: its bytes are the KV cache the capacity
         // plan fitted into the same free bytes below, and they map through the Storage Server's
@@ -406,9 +406,12 @@ impl EpochPlan {
         Ok(GraphStorage {
             bytes,
             budget,
-            // One stream per device in this epoch: one causal-language runner serves every bucket
-            // of it, so the graph reservation is not divided among streams.
-            streams: 1,
+            // Two ranges, because two streams walk this device's graphs: the serving generation's
+            // runner and the preparation's beside it - `graph.bytes` is already `pool * 2` for
+            // exactly that reason, and `Pools::pool` allocates ONE stream's share of it whole.
+            // With one range the first walk takes the reservation entire and the preparation's
+            // range has nothing to take, which is an update that cannot map its own capture.
+            streams: 2,
             scratch,
             // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
             // the reservation that also holds the state group's snapshot (7.3, 4.5).
@@ -509,10 +512,10 @@ impl EpochPlan {
             // against the ids themselves.
             bos: Some(control.bos),
             eos: Some(control.eos),
-            // A causal LM encodes no image, so no token closes encoded image content. `0` is the
-            // daemon's own value for a profile that states no generation controls:
-            // `crates/daemon/src/leader.rs:2400`, `let end_of_image = controls.map_or(0, |value|
-            // value.end_of_image);`. It is the absence of a token, not an invented one.
+            // A causal LM encodes no image, so no token closes encoded image content. The wire
+            // field carries no presence bit: it is a plain `uint32`, and the daemon writes `0`
+            // for a profile that states no generation controls. So `0` stands for the absence of
+            // a token rather than for an invented one, and a reader must not take it as an id.
             end_of_image: Some(0),
             // What one request may be given to generate on this model; see `understanding_limits`.
             generation_limits: Some(understanding_limits()),

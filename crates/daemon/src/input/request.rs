@@ -174,9 +174,9 @@ pub struct ImageSamplingParams {
     pub cfg_renorm_min: Option<f32>,
     /// Diffusion timestep shift.
     pub timestep_shift: Option<f32>,
-    /// Optional deterministic seed. For SenseNova and Bagel requests it
-    /// replaces `SamplingParams::seed` as the sampler seed; Qwen3
-    /// preprocessing resolves its seed from `SamplingParams::seed` alone.
+    /// Optional deterministic seed stated by the request itself, where a
+    /// request carries its own sampler state; `Qwen3` preprocessing resolves
+    /// its seed from `SamplingParams::seed` alone.
     pub seed: Option<u64>,
     /// Maximum number of generated images.
     pub max_images: Option<u16>,

@@ -192,6 +192,13 @@ pub(crate) struct Restarter {
     /// closes it under the successor, which then reports `the peer closed the
     /// connection` (run `bdf651928`).
     decided: tokio::sync::watch::Sender<Option<bool>>,
+    /// Whether a restart is running now.
+    ///
+    /// `decided` starts at `None`, which is also its state before any restart
+    /// was asked for: a waiter that read `None` alone would wait out the whole
+    /// grace on every ordinary shutdown, so what says "wait" is this flag, set
+    /// when a restart starts and cleared when it concludes.
+    in_flight: Arc<AtomicBool>,
     /// The responses in flight, which a restart pauses at an engine event
     /// boundary and hands to the successor (design §7.5.1), attached once
     /// the HTTP server serves.
@@ -222,6 +229,7 @@ impl Restarter {
             accepting,
             handed_over: Arc::new(AtomicBool::new(false)),
             decided: tokio::sync::watch::channel(None).0,
+            in_flight: Arc::new(AtomicBool::new(false)),
             handoff: std::sync::Mutex::new(None),
         })
     }
@@ -256,13 +264,17 @@ impl Restarter {
         admin: &Arc<Admin>,
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
+        self.in_flight.store(true, Ordering::Release);
         let outcome = self
             .hand_over(executable, config, then, leader, admin, jobs)
             .await;
         // The restart is concluded however it ended: a daemon waiting to exit
         // stops waiting here, and a successor that adopted the deployment is the
-        // only case in which this one may let go of it.
+        // only case in which this one may let go of it. The decision is stated
+        // before the flag clears, so a waiter that sees the flag still set also
+        // sees the decision.
         let _ = self.decided.send(Some(outcome.is_ok()));
+        self.in_flight.store(false, Ordering::Release);
         outcome
     }
 
@@ -270,6 +282,12 @@ impl Restarter {
     /// subscribes before the restart starts.
     pub(crate) fn decide(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
         self.decided.subscribe()
+    }
+
+    /// Whether a restart runs now: a daemon ending its service waits for one
+    /// that is in flight, and for nothing else.
+    pub(crate) fn restarting(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.in_flight)
     }
 
     /// The restart itself, up to the successor serving.

@@ -53,6 +53,38 @@ impl Function {
         &self.device
     }
 
+    /// The name this kernel was loaded under.
+    ///
+    /// A captured graph's nodes are only as readable as the kernels they name: the operator says
+    /// what asked for the launch, and this says what ran. A protocol that is two launches then shows
+    /// as two names under one operator, and a launch filed under the wrong operator cannot hide.
+    ///
+    /// Reading it needs the context that loaded the function, which is entered and released here the
+    /// way a launch enters its stream's.
+    pub fn name(&self) -> Result<String> {
+        let driver = driver::driver()?;
+        let context = crate::context::PrimaryContext::retain(self.device.id())?;
+        let _guard = context.enter()?;
+        let mut text: *const std::ffi::c_char = std::ptr::null();
+        // A driver that does not export the entry point answers no name: the name is a diagnostic
+        // for the dump, and a dump that cannot read one kernel's name must not end the process.
+        let get_name = match driver.func_get_name {
+            Ok(get_name) => get_name,
+            Err(_) => return Ok(String::new()),
+        };
+        driver.check(
+            // SAFETY: the function is live and belongs to the context entered above, and the driver
+            // writes a pointer to a NUL-terminated string the function owns.
+            unsafe { get_name(&mut text, self.raw) },
+            "cuFuncGetName",
+        )?;
+        if text.is_null() {
+            return Ok(String::new());
+        }
+        // SAFETY: the string is NUL-terminated and lives as long as the function does.
+        Ok(unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned())
+    }
+
     /// Launches the kernel on `stream` with `config` and `parameters`, which
     /// points at each kernel parameter's value in declaration order, and
     /// returns without waiting for the kernel. A launch on a capturing stream

@@ -494,6 +494,7 @@ impl Connection {
         body: &mut RequestBody,
     ) -> anyhow::Result<Outcome> {
         let head_only = body.head_request;
+        let frames_before = self.frames;
         let mut handed = response
             .extensions()
             .get::<HandedBody>()
@@ -560,6 +561,7 @@ impl Connection {
             self.write_head(&parts, chunked, content_length, closing)
                 .await?;
         }
+        let handed_is_some = handed.is_some();
         if !head_only && !status_without_body(parts.status) {
             let complete = match handed {
                 Some(handed) => match self
@@ -580,6 +582,22 @@ impl Connection {
             if chunked {
                 self.write(b"0\r\n\r\n", None).await?;
             }
+        }
+        // A success with no body byte is never a success the client asked for:
+        // a client reading it has an empty document where an answer belongs.
+        // The heads that could still be replaced are already answered by the
+        // failure above; this names the one that could not be, so the run that
+        // reads an empty body says which response produced it (design §7.4).
+        if self.frames == frames_before
+            && parts.status.is_success()
+            && !status_without_body(parts.status)
+            && !head_only
+        {
+            warn!(
+                status = parts.status.as_u16(),
+                handed = handed_is_some,
+                "a response answered success and wrote no byte of body"
+            );
         }
         if closing {
             return Ok(Outcome::Close);
@@ -1568,6 +1586,13 @@ mod tests {
             self.stream.write_all(bytes).await.expect("a request");
         }
 
+        /// Sends `bytes` and lets the caller judge a failed write: a connection
+        /// that ended before this write answers `EPIPE`, which is what some
+        /// tests are about rather than a failure to reach the connection.
+        async fn try_send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.stream.write_all(bytes).await
+        }
+
         /// Reads once from the connection into the buffer, failing the test
         /// rather than hanging.
         async fn fill(&mut self) -> usize {
@@ -1986,8 +2011,12 @@ mod tests {
         ));
 
         let mut client = TestClient::new(client);
-        client
-            .send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
+        // The connection is closed before it reads anything, so the peer may
+        // already be gone when this write arrives: that is the behaviour under
+        // test, and a closed peer answers `EPIPE` rather than taking the
+        // request. What the test then asserts is that no response was written.
+        let _ = client
+            .try_send(b"GET /health HTTP/1.1\r\nhost: test\r\n\r\n")
             .await;
         tokio::time::timeout(std::time::Duration::from_secs(10), serving)
             .await
@@ -2267,7 +2296,12 @@ mod tests {
             .expect("the pause is answered");
         assert_eq!(frozen.len(), 1);
         let frozen = frozen.into_iter().next().expect("one frozen response");
+        // The successor's copy of the socket is this record's descriptor, and
+        // nothing here shuts it: the response ends for the client when that copy
+        // is gone too, not when this process stops writing.
+        let successor = std::os::unix::net::UnixStream::from(frozen.descriptor);
         frozen.decision.send(Decision::Adopt).unwrap();
+        drop(successor);
         // The successor writes the carried bytes; this process stops here.
         frames.send(Bytes::from_static(b"data: b\n\n")).unwrap();
 
@@ -2324,7 +2358,13 @@ mod tests {
         drop(successor);
 
         let raw = client.read_to_end().await;
-        assert!(raw.contains("data: a"), "{raw}");
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        // The frame the predecessor still held at the pause travels as the
+        // response's `unwritten` bytes, which this test's successor does not
+        // write: what is asserted here is the socket, not the carrying. The
+        // successor's bytes go on the wire unframed because a writer that is not
+        // the connection does not chunk them, and that is the point — they
+        // arrive.
         assert!(
             raw.contains("data: b"),
             "the successor's frame reached the client: {raw}"
@@ -2490,7 +2530,12 @@ mod tests {
             http.written,
             big.len()
         );
+        // The successor's copy of the socket is this record's descriptor, and
+        // nothing here shuts it: the response ends for the client when that copy
+        // is gone.
+        let successor = std::os::unix::net::UnixStream::from(frozen.descriptor);
         frozen.decision.send(Decision::Adopt).unwrap();
+        drop(successor);
 
         // The client reads what the socket holds, and the connection ends
         // without writing the rest.

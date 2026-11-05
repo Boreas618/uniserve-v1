@@ -273,6 +273,15 @@ fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
                 anyhow!("invalid option `{path}`: {cause}")
             }
         })?;
+    // A retired option's name is refused here, with the configuration, rather
+    // than left unknown: an unknown field names the mistake but not the way
+    // out, and a table nothing reads would be silent. The field that parses it
+    // is never serialized, so a dump cannot carry it back.
+    anyhow::ensure!(
+        config.retired_quantization_config.is_none(),
+        "`quantization_config` is retired: state the precision policy as `quantization` \
+         (`--set quantization.mode=...`, or `[quantization]` in --config)"
+    );
     // The environment supplies the key the configuration leaves unset or
     // blank.
     config.server_config.api_key =
@@ -520,15 +529,13 @@ mod tests {
             "--set",
             "video_config.aspect_ratios=[\"16:9\"]",
             "--set",
-            "quantization_config={\"mode\":\"balanced\"}",
+            "quantization={\"mode\":\"balanced\"}",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"deepep\" }",
             "--set",
             "server_config.request_timeout=2m",
             "--set",
             "flashinfer_config.workspace_size=1GiB",
-            "--set",
-            "readout_config.canvas=64",
             "--set",
             "server_config.host=0.0.0.0",
         ])
@@ -541,7 +548,7 @@ mod tests {
             Some(vec![1024, 10240])
         );
         assert_eq!(config.video_config.aspect_ratios, ["16:9"]);
-        assert_eq!(config.quantization_config["mode"], "balanced");
+        assert_eq!(config.quantization["mode"], "balanced");
         assert!(config.moe_config.expert_parallel);
         assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
         assert_eq!(
@@ -549,10 +556,6 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(config.flashinfer_config.workspace_size, 1 << 30);
-        assert_eq!(
-            config.readout_config.canvas,
-            crate::options::CanvasMode::Fixed(64)
-        );
         assert_eq!(config.server_config.host, "0.0.0.0");
     }
 
@@ -591,6 +594,31 @@ mod tests {
             let error = resolved(&args).unwrap_err();
             assert!(format!("{error:#}").contains(named), "{args:?}: {error:#}");
         }
+    }
+
+    /// The precision policy's retired name is refused with the name to state
+    /// instead, whether it arrives as a table, as a path into one, or in the
+    /// configuration file.
+    #[test]
+    fn the_retired_quantization_option_is_refused_by_name() {
+        for args in [
+            vec!["m", "--set", "quantization_config.mode=performance"],
+            vec!["m", "--set", "quantization_config={ mode = \"performance\" }"],
+        ] {
+            let error = resolved(&args).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("`quantization_config` is retired"),
+                "{args:?}: {message}"
+            );
+            assert!(message.contains("`quantization.mode=...`"), "{args:?}: {message}");
+        }
+        let error = resolve_text("[quantization_config]\nmode = \"performance\"\n", &[])
+            .expect_err("the retired name is refused in a configuration file too");
+        assert!(
+            format!("{error:#}").contains("`quantization_config` is retired"),
+            "{error:#}"
+        );
     }
 
     /// The stated paths are what the invocation named, tables and options
@@ -663,12 +691,11 @@ mod tests {
 
     #[test]
     fn exported_options_remain_valid_for_their_model_family() {
-        use models::ModelDescription::{DiffusionGemma, MiniMaxH3, Qwen3};
+        use models::ModelDescription::{MiniMaxH3, Qwen3};
 
         for (description, setting) in [
             (Qwen3, "chat_config.reasoning_parser=none"),
             (MiniMaxH3, "video_config.max_seconds=5"),
-            (DiffusionGemma, "readout_config.canvas=compact"),
         ] {
             let (config, stated) = resolved(&["m", "--set", setting]).unwrap();
             config.validate(&stated).unwrap();
@@ -955,7 +982,7 @@ mod tests {
         let (_, engine) = lowered(&[
             "m",
             "--set",
-            "quantization_config.mode=performance",
+            "quantization.mode=performance",
             "--set",
             "moe_config={ expert_parallel = true, exchange = \"dwdp\" }",
             "--set",
@@ -965,7 +992,7 @@ mod tests {
         ])
         .unwrap();
         let worker = &engine.worker_process;
-        assert_eq!(worker.quantization_config["mode"], "performance");
+        assert_eq!(worker.quantization["mode"], "performance");
         assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
         assert_eq!(engine.chunked_prefill_size, 512);
@@ -997,10 +1024,10 @@ mod tests {
     /// rather than ignored; unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use models::ModelDescription::{Bagel, DiffusionGemma, MiniMaxH3, Qwen3};
+        use models::ModelDescription::{MiniMaxH3, Qwen3};
 
         let (_, defaults) = resolved(&["m"]).unwrap();
-        for description in [Qwen3, Bagel, MiniMaxH3, DiffusionGemma] {
+        for description in [Qwen3, MiniMaxH3] {
             assert!(defaults.refuse_foreign_options(description).is_ok());
         }
 
@@ -1008,10 +1035,10 @@ mod tests {
             let (_, stated) = resolved(&["m", "--set", set]).unwrap();
             stated.refuse_foreign_options(description).is_err()
         };
-        assert!(refused("readout_config.canvas=compact", Qwen3));
-        assert!(!refused("readout_config.canvas=compact", DiffusionGemma));
-        assert!(refused("video_config.max_seconds=5", DiffusionGemma));
+        assert!(refused("video_config.max_seconds=5", Qwen3));
         assert!(!refused("video_config.max_seconds=5", MiniMaxH3));
+        assert!(refused("chat_config.reasoning_parser=none", MiniMaxH3));
+        assert!(!refused("chat_config.reasoning_parser=none", Qwen3));
         // A video pipeline schedules no token batches and renders no chat.
         for token_option in [
             "max_num_batched_tokens=2048",

@@ -555,7 +555,7 @@ impl Scheduler {
     ///   the worker's device order puts the write first: the worker runs the
     ///   forwards over the prefix cache in submission order on the device's
     ///   primary stream, and work on another stream orders behind their
-    ///   batches (`crates/worker/src/executor/pages.rs`).
+    ///   batches (the retired worker's page executor).
     /// - A stopped block's commit queued behind the block's steps still in
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the

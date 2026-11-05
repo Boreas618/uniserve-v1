@@ -747,7 +747,7 @@ def test_automatic_long_packed_attention_preserves_causal_prefixes_on_replay():
 
 @torch.inference_mode()
 def test_automatic_vision_attention_preserves_non_power_of_two_heads_on_replay():  # noqa: E501
-    """BAGEL's SigLIP head width is 72.
+    """A vision tower's SigLIP head width is 72.
 
     Its packed image boundaries remain live.
     """

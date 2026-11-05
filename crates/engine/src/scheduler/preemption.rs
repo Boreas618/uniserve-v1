@@ -1,6 +1,5 @@
 //! Preempting and resuming requests at denoising-step boundaries: video
-//! requests, and the image a token request is generating (BAGEL,
-//! SenseNova).
+//! requests, and the image a token request is generating.
 //!
 //! A request's trajectory is derived state: the samples of its committed
 //! step, which the request's facts and the step count determine. Whatever

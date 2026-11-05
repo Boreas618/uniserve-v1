@@ -10,6 +10,13 @@ The output is a store a reader can use: `program_server::store::Store::open([roo
 `qwen3_moe_slice` example's `--store`. It is a stopgap for a host where the Program Server has not
 run; the published layout and the environment are the Program Server's own, so the two cannot
 disagree about what a module looks like.
+
+Every cell states the digest of the source it was built from, every build ends by verifying what it
+wrote, and `--verify` answers whether the
+cells a fixture needs were built from the source this tree holds. A store outlives the tree it was
+built from, and a cell that says nothing about its source cannot be told from one built yesterday
+against a package that has changed since - which is how two runs stopped inside kernels whose
+constants and argument order had moved.
 """
 
 import argparse
@@ -244,6 +251,143 @@ def module_digest(directory):
     return digest.hexdigest(), total
 
 
+def source_files(package):
+    """Every source file of a package, by relative path, with the digest of its content.
+
+    A package's own directory is its source: the manifest that declares it, the compile script that
+    runs, and whatever that script compiles. A store outlives the tree it was built from, and a cell
+    said nothing about which source produced it - so a store older than the source answered a changed
+    package with the module its older source built, and two runs in a row stopped inside kernels for
+    exactly that (`bf16 = 3` in an entry header, a word order in a signature).
+
+    The files are recorded one by one, not only as one digest: a reader that refuses a stale cell has
+    to name what changed, and "this package changed" leaves the reader to diff it.
+
+    Build scratch is excluded: the compile script runs inside the package directory, so an import
+    leaves `__pycache__` behind and its bytes shift with nothing the module depends on.
+    """
+    files = {}
+    root = package["root"]
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix == ".pyc" or "__pycache__" in path.parts:
+            continue
+        files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def source_digest(files):
+    """One digest over a package's files, for a line that has room for one number."""
+    digest = hashlib.sha256()
+    for name, content in sorted(files.items()):
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(content.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def changed_files(stated, current):
+    """The files that make a cell stale: what changed, what appeared and what went."""
+    changed = [name for name, digest in sorted(stated.items())
+               if name in current and current[name] != digest]
+    appeared = sorted(set(current) - set(stated))
+    went = sorted(set(stated) - set(current))
+    return changed, appeared, went
+
+
+def write_source_record(directory: Path, package, target: str) -> None:
+    """State, in the cell, which source built it and which files that source was."""
+    files = source_files(package)
+    (directory / "source.json").write_text(
+        json.dumps(
+            {
+                "package": package["root"].as_posix(),
+                "target": target,
+                "digest": source_digest(files),
+                "files": files,
+            },
+            indent=1,
+        )
+        + "\n"
+    )
+
+
+def verify(root: Path, rows, packages, target, revision, fixture, refuse_absent: bool = True) -> int:
+    """Answer whether every cell this fixture needs was built from the source this tree holds.
+
+    This is where a stale store is refused by name. The install cannot ask the question - a
+    deployment host holds the store and not the package trees it was built from - and the build
+    cannot either, because a build that finds a cell already there is not the tree's statement about
+    it. The fixture holds both: it names the rows, and it runs in the tree.
+    """
+    print(f"# verify: {root} (revision {revision}, {target})")
+    print(f"# fixture: {fixture} ({len(rows)} rows)")
+    # A store that states no source anywhere is a store nobody stated - a Program Server's, or one
+    # built before this instrument - and it installs as it always did. What is worth refusing is a
+    # store that states sources for some cells and not others: that is a store part of which was
+    # rebuilt, and the part that was not cannot be told from stale.
+    states_sources = next(root.rglob("source.json"), None) is not None
+    if not states_sources:
+        print("# this store states no source digest, so no cell can be told from a stale one")
+    stale, absent, fresh = [], [], 0
+    for op, key, stated_backend in rows:
+        candidates = [
+            package for package in packages.get(op, [])
+            if covers(package, key)
+            and target in package["manifest"]["kernel"]["architectures"]
+            and (stated_backend is None or package["backend"] == stated_backend)
+        ]
+        if not candidates:
+            absent.append((op, "-", key, "no package covers this key for the target"))
+            continue
+        verdict, found = None, False
+        for package in candidates:
+            directory = root / op / package["backend"] / str(revision) / target / key
+            if not (directory / ".committed").is_file():
+                continue
+            found = True
+            record = directory / "source.json"
+            if not record.is_file():
+                if not states_sources:
+                    break
+                verdict = (op, package["backend"], key,
+                           "the cell states no source digest, so it cannot be told from a stale one")
+                break
+            stated = json.loads(record.read_text())
+            current = source_files(package)
+            changed, appeared, went = changed_files(stated.get("files") or {}, current)
+            if changed or appeared or went:
+                named = ", ".join(
+                    [f"{name} changed" for name in changed]
+                    + [f"{name} appeared" for name in appeared]
+                    + [f"{name} went" for name in went]
+                )
+                verdict = (op, package["backend"], key,
+                           f"built from {str(stated.get('digest'))[:12]} and this tree's source is "
+                           f"{source_digest(current)[:12]}: {named}")
+                break
+        if verdict is not None:
+            stale.append(verdict)
+        elif found:
+            fresh += 1
+        else:
+            absent.append((op, "-", key, "the store holds no cell for this key"))
+    for op, backend, key, reason in stale:
+        print(f"stale\t{op}\t{backend}\t{key}: {reason}")
+    for op, backend, key, reason in absent:
+        print(f"absent\t{op}\t{backend}\t{key}: {reason}")
+    print(
+        f"# {fresh} of {len(rows)} cells were built from this tree's source; "
+        f"{len(stale)} are stale, {len(absent)} absent"
+    )
+    # Two callers ask two questions. A build is asked whether the store it just wrote is this tree's,
+    # and a row it could not build was already named as SKIPPED there. A check is asked whether this
+    # store can serve this fixture, and a store short of a row cannot.
+    if stale:
+        return 1
+    return 1 if absent and refuse_absent else 0
+
+
 def read_rows(fixture):
     """The fixture's rows, as `(operator, key, backend-or-None)`.
 
@@ -282,6 +426,12 @@ def main():
              "than assumed to be this one",
     )
     parser.add_argument("--revision", type=int, default=1)
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="answer whether every cell this fixture needs was built from the source this tree "
+             "holds, and exit non-zero naming the stale and absent ones; builds nothing",
+    )
     args = parser.parse_args()
 
     if args.target not in TARGETS:
@@ -334,6 +484,9 @@ def main():
             + "\n".join(report)
         )
 
+    if args.verify:
+        sys.exit(verify(root, rows, packages, args.target, args.revision, args.fixture))
+
     built, skipped = [], []
     for op, key, stated_backend in rows:
         candidates = [
@@ -371,6 +524,7 @@ def main():
                 failures.append(f"{package['backend']}: {failure}")
                 continue
             (directory / ".committed").write_text("")
+            write_source_record(directory, package, args.target)
             built.append((op, package["backend"], key))
             break
         else:
@@ -426,6 +580,12 @@ def main():
         print(f"built\t{op}\t{backend}\t{key}")
     for op, key, reason in skipped:
         print(f"SKIPPED\t{op}\t{reason}\t{key}")
+    # Every build ends by stating the store's age, so a cell that another source built cannot be read
+    # as this one's: the check has a caller by default rather than only when someone remembers it.
+    verdict = verify(root, rows, packages, args.target, args.revision, args.fixture,
+                     refuse_absent=False)
+    if verdict:
+        sys.exit(verdict)
     # A skipped key may have left an empty chain behind; the store holds cells, not the shape of an
     # attempt.
     prune_empty_directories(root)

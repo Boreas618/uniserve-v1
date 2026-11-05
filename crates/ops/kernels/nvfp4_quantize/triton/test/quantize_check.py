@@ -276,6 +276,26 @@ class GemmModule:
 # ---------------------------------------------------------------------------
 
 
+def encoded_buffers(rows, columns, layout, fill=0xCD):
+    """The output buffers a launch writes into.
+
+    Both are filled with `0xCD`: a value the module never writes must read as
+    neither a plausible code nor a plausible E4M3 factor, so an untouched
+    element shows up as a mismatch rather than as a zero that agrees with a zero.
+    """
+    values = torch.full(
+        (rows, columns // 2), fill, dtype=torch.uint8, device="cuda"
+    )
+    scale_columns = columns // BLOCK_ELEMENTS
+    if layout == "linear":
+        scale_count = rows * scale_columns
+    else:
+        padded_rows, padded_columns = scale_layout(layout, rows, scale_columns)
+        scale_count = padded_rows * padded_columns
+    scales = torch.full((scale_count,), fill, dtype=torch.uint8, device="cuda")
+    return values, scales
+
+
 def stage_producer(module, rows, columns, block, layout, global_scale, seed):
     """Stage 1: the module's own bytes against its input. Returns them for stage 2."""
     torch.manual_seed(seed)
@@ -283,14 +303,7 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
         torch.bfloat16
     )
 
-    values = torch.full((rows, columns // 2), 0xCD, dtype=torch.uint8, device="cuda")
-    scale_columns = columns // BLOCK_ELEMENTS
-    if layout == "linear":
-        scale_count = rows * scale_columns
-    else:
-        padded_rows, padded_columns = scale_layout(layout, rows, scale_columns)
-        scale_count = padded_rows * padded_columns
-    scales = torch.full((scale_count,), 0xCD, dtype=torch.uint8, device="cuda")
+    values, scales = encoded_buffers(rows, columns, layout)
 
     # The global scale is a device operand: one FP32 element, as the operator passes it.
     scale = torch.tensor([global_scale], dtype=torch.float32, device="cuda")
@@ -343,6 +356,51 @@ def _scale_per_element(values, scales, rows, columns, layout):
         offset = swizzled_offsets(rows, scale_columns).to(scales.device)
         block_scales = table[scales.view(torch.uint8).long()[offset]][:rows, :scale_columns]
     return block_scales.repeat_interleave(BLOCK_ELEMENTS, dim=1)
+
+
+def stage_zero_row(module, rows, columns, block, layout, global_scale, seed):
+    """A row whose values are all zero encodes to zeros with a finite factor.
+
+    Not a rounding case, and the rest of the check cannot see it: every other stage
+    feeds `randn`, and a zero row's amax is 0, so its factor is 0 and the encoder's
+    reciprocal of it is infinite — the block scale becomes a NaN-E4M3 byte and the
+    codes NaN. A deployment reaches it wherever a bucket carries padded rows (a
+    prefill's tail), and a NaN row in the cache poisons every later attention step,
+    which is how it reaches a logits row that is not a number.
+    """
+    torch.manual_seed(seed)
+    source = (
+        torch.randn(rows, columns, device="cuda", dtype=torch.float32) * 0.05
+    ).to(torch.bfloat16)
+    source[-1] = 0.0
+
+    values, scales = encoded_buffers(rows, columns, layout)
+    scale = torch.tensor([global_scale], dtype=torch.float32, device="cuda")
+    token_scale = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    module.launch(
+        (rows, 1, 1), source, values, scales, rows, scale, token_scale
+    )
+
+    decoded = decode(values, scales, token_scale, rows, columns, layout)
+    # The factor is what the reciprocal divides: an infinite or NaN one is the
+    # defect itself, whatever the codes came out as.
+    bad_factors = int((~torch.isfinite(token_scale)).sum().item())
+    bad_decoded = int((~torch.isfinite(decoded)).sum().item())
+    zero_row_worst = decoded[-1].abs().max().item()
+    print(
+        f"stage zero row (row {rows - 1} of {rows}x{columns} {layout}): "
+        f"{bad_factors} of {rows} factors not finite, {bad_decoded} of "
+        f"{rows * columns} decoded elements not finite, the zero row's largest "
+        f"value {zero_row_worst:.3e}"
+    )
+    failures = bad_factors + bad_decoded
+    if zero_row_worst != 0.0:
+        print(
+            "  the zero row did not decode to zero: a zero input is zero, "
+            "not a small value"
+        )
+        failures += 1
+    return failures
 
 
 def stage_consumer(module, values, scales, token_scale, rows, columns, layout, seed):
@@ -482,7 +540,15 @@ def main():
         arguments.global_scale, arguments.seed,
     )
 
-    failures = outside
+    failures = outside + stage_zero_row(
+        module,
+        arguments.rows,
+        arguments.columns,
+        arguments.block,
+        layout,
+        arguments.global_scale,
+        arguments.seed,
+    )
     if arguments.gemm:
         key = pathlib.Path(arguments.gemm).name
         for field in (f"m_{arguments.rows}", f"n_{arguments.columns}", f"k_{arguments.columns}"):

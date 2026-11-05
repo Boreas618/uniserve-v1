@@ -2693,6 +2693,7 @@ fn a_latent_image_block_is_written_by_its_own_call() {
 /// refused. A block that fits the budget on its own and not beside its prompt
 /// (sixteen, against this prompt) is refused too, and the reason names the
 /// context.
+#[test]
 fn a_vision_block_beyond_the_step_budget_is_refused() {
     const STEP_BUDGET: u32 = 16;
 

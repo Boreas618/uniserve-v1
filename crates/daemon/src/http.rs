@@ -24,13 +24,12 @@ use std::time::Duration;
 use crate::metrics::METRICS;
 use crate::supervision::Daemon;
 use anyhow::{Context as _, Result};
-use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use thiserror_ext::AsReport as _;
@@ -40,10 +39,9 @@ use tracing::{info, warn};
 
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
-use crate::input::readout::SystemOneError;
 use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
-use crate::openai::{self, ApiError, chat_completions, images, videos};
+use crate::openai::{self, ApiError, chat_completions, videos};
 use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
@@ -222,6 +220,7 @@ pub(crate) async fn serve_leader(
         accepting.clone(),
     )?);
     let handed_over = Arc::clone(&restarter.handed_over);
+    let restarting = restarter.restarting();
     let mut decided = restarter.decide();
     serve_on(
         &engine,
@@ -237,7 +236,9 @@ pub(crate) async fn serve_leader(
     // A restart in flight speaks for the deployment. Exiting here would close the handoff
     // channel under the successor while it is still adopting the engines, and the successor
     // would report that close as its own failure (`bdf651928`).
-    if decided.borrow().is_none() {
+    // Only a restart that is still running can be waited for: the channel starts
+    // at `None`, so its state alone cannot tell "nothing asked" from "in flight".
+    if restarting.load(std::sync::atomic::Ordering::Acquire) && decided.borrow().is_none() {
         let waited = tokio::time::timeout(
             crate::restart::RESTART_GRACE,
             decided.wait_for(Option::is_some),
@@ -476,7 +477,6 @@ pub(crate) fn router(
     };
 
     let mut generation = Router::new();
-    let mut readout = None;
     let mut api = openai::models_router(Arc::clone(&engine));
     for task in engine.supported_tasks() {
         match task {
@@ -485,9 +485,6 @@ pub(crate) fn router(
                     Arc::clone(&engine),
                     Arc::clone(&handoff),
                 ));
-            }
-            Task::ImageGeneration => {
-                generation = generation.merge(images::router(Arc::clone(&engine)));
             }
             Task::VideoGeneration => {
                 generation = generation.merge(videos::generation_router(
@@ -501,27 +498,13 @@ pub(crate) fn router(
                     Arc::clone(&handoff),
                 ));
             }
-            Task::Readout => {
-                readout = Some(
-                    Router::new()
-                        .route("/v1/systemone", post(systemone))
-                        .with_state(Arc::clone(&engine)),
-                );
-            }
         }
     }
     let generation = limited(timeout(generation), |message| {
         ApiError::service_unavailable("server_overloaded", message).into_response()
     });
-    // The readout answers a shed request in its own FastAPI error shape.
-    let readout = readout.map(|readout| {
-        limited(timeout(readout), |message| {
-            SystemOneError::Overloaded(message).into_response()
-        })
-    });
     let api = timeout(api)
         .merge(generation)
-        .merge(readout.unwrap_or_default())
         .layer(from_fn(middleware::track_http_metrics));
 
     // A world change runs for as long as the successor world takes to
@@ -586,17 +569,6 @@ async fn scrape_metrics() -> Response {
 /// fixed at compile time.
 async fn version() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
-}
-
-/// Answers one System One request (`POST /v1/systemone`).
-///
-/// The body is read as bytes so that malformed JSON is reported in the
-/// endpoint's own `422` shape.
-async fn systemone(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
-    match engine.systemone(&body).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => error.into_response(),
-    }
 }
 
 /// Answers a path no route serves as FastAPI does.

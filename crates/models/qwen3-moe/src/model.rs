@@ -347,16 +347,17 @@ impl Plan {
                     // encoded planes when the checkpoint stores them encoded. Sized from the same
                     // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree.
                     //
-                    // The activation encoding's block scales are the 128x4 swizzled form, which is
-                    // what every E2M1 artifact serves on the activation side
-                    // (`gather_gemm_nvfp4`'s `build.py` states it): the encoder is launched per
-                    // descriptor, so a plain layout here asks the store for a program no deployment
-                    // builds, which is a missing kernel rather than a wrong number.
+                    // The two activation encodings, stated here exactly as the forward states them:
+                    // the gated product's operand is read in the linear form and the plain product's
+                    // in the 128x4 swizzled form, which is what the artifact's two kernel families
+                    // declare (`flashinferMetaInfo.h`). The plan and the forward must name the same
+                    // pair, or the arena is short by the difference.
                     if config.num_experts > 0 {
                         nn::layers::step_bytes(
                             tokens,
                             geometry,
-                            ops::fp4::ScaleLayout::Swizzled128X4,
+                            Moe::GATED_TOKEN_SCALE_LAYOUT,
+                            Moe::ACTIVATION_SCALE_LAYOUT,
                             dtype,
                             options.experts_encoded,
                         )?
