@@ -30,6 +30,7 @@ use std::fmt;
 
 use ops::fp4::ScaleLayout;
 use ops::{DType, Shape, TensorView};
+use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{Checkpoint, FileIdentity};
 use crate::error::{Error, Result};
@@ -347,6 +348,45 @@ impl fmt::Display for WeightRegion {
     }
 }
 
+/// What produced a weight that no checkpoint file names.
+///
+/// A checkpoint weight is named by the files it was read from and its region in them. A computed
+/// one — a rotary frequency table, fused output heads, a modulation table — has no file, so the only
+/// thing that can name it is the computation: the class that ran it, and the numbers it produced.
+/// A label is not an identity: two models that name their own fused heads
+/// `denoiser.video.student_heads.weight` are two producers, and a key holding only the name lets the
+/// second one map the first one's bytes, silently, under an identical extent.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Provenance {
+    /// The class that computed the weight, as the crate that placed it names itself.
+    pub producer: &'static str,
+    /// A digest of the bytes it produced: the same numbers are one weight under any name, and
+    /// different numbers are two.
+    pub content: [u8; 32],
+}
+
+impl Provenance {
+    /// The provenance of a weight a class computed from `bytes`, the numbers it produced.
+    pub fn computed(producer: &'static str, bytes: &[u8]) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        Self {
+            producer,
+            content: digest.finalize().into(),
+        }
+    }
+}
+
+impl fmt::Display for Provenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "computed:{}:", self.producer)?;
+        for byte in self.content {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// What retained storage files a weight under (specs/worker.md 8).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct WeightKey {
@@ -358,6 +398,12 @@ pub struct WeightKey {
     pub layout: WeightLayout,
     /// The region of the logical tensor.
     pub region: WeightRegion,
+    /// What produced the bytes, for a weight no checkpoint file names.
+    ///
+    /// `None` for a weight read from a checkpoint, whose files and region are its provenance; a
+    /// computed weight states the class that computed it and a digest of the numbers it produced,
+    /// so two producers that compute different tables under one name cannot share retained bytes.
+    pub provenance: Option<Provenance>,
 }
 
 impl fmt::Display for WeightKey {
@@ -372,7 +418,11 @@ impl fmt::Display for WeightKey {
             formatter,
             "{files}|{}|{}|{}",
             self.dtype, self.layout, self.region
-        )
+        )?;
+        if let Some(provenance) = &self.provenance {
+            write!(formatter, "|{provenance}")?;
+        }
+        Ok(())
     }
 }
 
@@ -832,6 +882,8 @@ impl<'a> WeightLoader<'a> {
             dtype,
             layout: request.layout,
             region,
+
+            provenance: None,
         };
 
         if let Some(backing) = self.store.retained(&key)? {
@@ -931,6 +983,8 @@ impl<'a> WeightLoader<'a> {
                 shape: value.shape,
                 stride: None,
             },
+
+            provenance: None,
         };
         if let Some(backing) = self.store.retained(&key)? {
             return Ok(Weight {
@@ -1121,7 +1175,8 @@ impl<'a> WeightLoader<'a> {
                 WeightSource::Parts { .. } => {
                     return Err(Error::weight(
                         &scales.tensor,
-                        "block scales gathered from fused parts have no single row stride".to_owned(),
+                        "block scales gathered from fused parts have no single row stride"
+                            .to_owned(),
                     ));
                 }
             };
@@ -1148,11 +1203,14 @@ impl<'a> WeightLoader<'a> {
                     dtype,
                     layout: product_layout,
                     region: WeightRegion {
-                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor)).collect(),
+                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor))
+                            .collect(),
                         start: 0,
                         shape,
                         stride: None,
                     },
+
+                    provenance: None,
                 },
                 shape,
                 &arranged,
@@ -1189,6 +1247,8 @@ impl<'a> WeightLoader<'a> {
                                 shape,
                                 stride: None,
                             },
+
+                            provenance: None,
                         },
                         shape,
                         &bytes,
@@ -1511,6 +1571,8 @@ impl<'a> WeightLoader<'a> {
                     shape: values_shape,
                     stride: None,
                 },
+
+                provenance: None,
             },
             values_shape,
             &values_bytes,
@@ -1551,6 +1613,8 @@ impl<'a> WeightLoader<'a> {
                     shape: scales_shape,
                     stride: None,
                 },
+
+                provenance: None,
             },
             scales_shape,
             &scales_bytes,
@@ -1568,6 +1632,8 @@ impl<'a> WeightLoader<'a> {
                     shape: projections_shape,
                     stride: None,
                 },
+
+                provenance: None,
             },
             projections_shape,
             &scale_bytes,
@@ -1593,6 +1659,8 @@ impl<'a> WeightLoader<'a> {
                         shape,
                         stride: None,
                     },
+
+                    provenance: None,
                 },
                 shape,
                 &bytes,
@@ -1608,6 +1676,7 @@ impl<'a> WeightLoader<'a> {
             DType::F32,
             Shape::new(&[1]),
             &1.0_f32.to_ne_bytes(),
+            "nn",
         )?;
         Ok(QuantizedStack {
             values,
@@ -1639,15 +1708,18 @@ impl<'a> WeightLoader<'a> {
     /// The rotary frequency table is the first such weight: `inv_freq` is computed once at loading
     /// from `rope_theta` and `rope_scaling` (specs/worker.md 9), and the `rotary_factors` operator
     /// reads it as a device weight, so it takes the same retained-storage path as a checkpoint
-    /// weight. The key carries no file identity — there is no file — and `name` identifies the
-    /// constant, so two calls with the same name, element type, extents and bytes reuse one
-    /// retained region and a different constant needs a different name.
+    /// weight. There is no file to name it, so the key states the **provenance**: the class that
+    /// computed it, `producer`, and a digest of the bytes it produced. Two computations of the same
+    /// numbers share one retained region; two that compute different numbers under one name never
+    /// do. A name alone is not an identity — it is a label the caller chose, and two models that
+    /// choose the same label for their own constants are exactly the collision this prevents.
     pub fn constant(
         &mut self,
         name: &str,
         dtype: DType,
         shape: Shape,
         bytes: &[u8],
+        producer: &'static str,
     ) -> Result<Weight> {
         let element = dtype.bytes().ok_or_else(|| {
             Error::weight(name, format!("{dtype} has no whole-byte element size"))
@@ -1676,6 +1748,7 @@ impl<'a> WeightLoader<'a> {
                 shape,
                 stride: None,
             },
+            provenance: Some(Provenance::computed(producer, bytes)),
         };
         let backing = match self.store.retained(&key)? {
             Some(backing) => backing,
@@ -2128,7 +2201,11 @@ mod tests {
                 "the table is padded to 128 rows and 4 columns"
             );
 
-            let mut present: Vec<u8> = swizzled.iter().copied().filter(|value| *value != 0).collect();
+            let mut present: Vec<u8> = swizzled
+                .iter()
+                .copied()
+                .filter(|value| *value != 0)
+                .collect();
             let mut expected = linear.clone();
             present.sort_unstable();
             expected.sort_unstable();
@@ -2225,6 +2302,8 @@ mod tests {
                 shape: Shape::new(&[128, 1536, 2048]),
                 stride: None,
             },
+
+            provenance: None,
         };
         let text = key.to_string();
         assert!(text.contains("bf16"));
