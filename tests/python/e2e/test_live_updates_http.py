@@ -1420,7 +1420,9 @@ def _restart_while_streaming(
         zip(reads, dones, HANDED_STREAMS, strict=True)
     ):
         assert len(read) > before_restart[index], (
-            f"stream {index} ended at the restart"
+            f"stream {index} ended at the restart (reads={len(read)} of "
+            f"{before_restart[index]} before it, done={done.is_set()}, "
+            f"last={last}){_log_trouble(log)}"
         )
         # Every stream carries its count whole: a frame lost, repeated or
         # reordered at the boundary — the one thing the handoff must not do —
