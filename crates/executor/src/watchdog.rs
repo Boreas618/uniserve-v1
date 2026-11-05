@@ -228,7 +228,10 @@ mod tests {
         let now = Instant::now();
         let first = never_shadowed(0, 1, now - Duration::from_secs(16));
         assert_eq!(watchdog.stalls(now, &[first]).len(), 1);
-        let next = never_shadowed(0, 2, now - Duration::from_secs(16));
+        // A job the thread was given later is a different job, and its stall is a second report:
+        // the map keys a report by the rank and the instant the job started, so a "new job" that
+        // started at the same instant would be the same job and is not what this states.
+        let next = never_shadowed(0, 2, now - Duration::from_secs(15));
         assert_eq!(watchdog.stalls(now, &[next]).len(), 1);
     }
 
@@ -252,8 +255,21 @@ mod tests {
             Some(now + Duration::from_millis(800))
         );
         watchdog.probed(now);
-        // A fresh probe leaves the stall bound.
-        assert_eq!(watchdog.deadline(Some(job)), Some(job.since + Duration::from_secs(15)));
+        // A fresh probe is one second away and the stall bound is five: the sooner is the probe,
+        // because the rule is a deadline the control thread must look at, not a bound it must wait
+        // out.
+        assert_eq!(
+            watchdog.deadline(Some(job)),
+            Some(now + CONTEXT_PROBE),
+            "the probe is sooner than the stall bound"
+        );
+        // And the other order: a job about to reach its bound is looked at then, probe or not.
+        let almost = never_shadowed(0, 1, now - Duration::from_millis(14_500));
+        assert_eq!(
+            watchdog.deadline(Some(almost)),
+            Some(almost.since + watchdog.stall_bound()),
+            "the stall bound is sooner than the probe"
+        );
     }
 
     #[test]
