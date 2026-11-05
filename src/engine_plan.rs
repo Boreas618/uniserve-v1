@@ -1035,7 +1035,10 @@ impl EpochPlan {
                 // condition capacity, so two tasks are two partitions and one deployment holds one.
                 // A construction stating their union would serve both; the model offers none, and
                 // this does not invent one.
-                let task = served_task(&config.tasks(), &self.checkpoint)?;
+                // **What a deployment of this checkpoint serves, not everything its architecture
+                // can express**: a distilled export serves the one task its contract states, and a
+                // partition carries one task's block set and condition capacity.
+                let task = served_task(&config.serving(), &self.checkpoint)?;
                 // **The postprocessor is placed here, though `serving` names only what holds
                 // weights.** Its arithmetic is the clip splice and it names no checkpoint
                 // directory, so it is not a component a task's weights place - but the decode

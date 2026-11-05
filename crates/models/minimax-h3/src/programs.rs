@@ -182,19 +182,20 @@ impl Deployment {
         Self::new(Config::read(root, None)?, types, rungs, tasks)
     }
 
-    /// The tasks the checkpoint's own `fastvideo_inference.json` states it serves.
+    /// The tasks the checkpoint at `root` states it serves.
     ///
     /// A deployment's served set is its checkpoint's unless a caller names a subset; reading it here
     /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
     /// [`Self::new`] refuses a task the checkpoint does not.
+    ///
+    /// The statement is the checkpoint's own, read from `root` - and it is the statement about
+    /// **deployments**, not about architecture: a release serves every task its partitions serve,
+    /// while a distilled export serves the single task its contract states, because its student
+    /// replaces one partition's weights for one task. **A table in this file would answer for every
+    /// checkpoint** - a base checkpoint holding no `transformer_ref` would be reported as serving
+    /// `ref2va`, and the deployment that believed it would load no such partition.
     pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
-        // The table is `checkpoint`'s, not this file's, and it is read from the checkpoint's own
-        // metadata when `root` is walked - `root` is the path that walk will take.
-        let _ = root;
-        Ok(crate::checkpoint::TASK_DITS
-            .iter()
-            .map(|(task, _)| *task)
-            .collect())
+        Ok(Config::read(root, None)?.serving())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
@@ -244,7 +245,7 @@ impl Deployment {
     ///
     /// The tower's own statement is scoped: it keys its learned position table on the sequence it is
     /// handed, while the table's compiled grid is a second dimension. A deployment therefore states
-    /// the table itself ([`Deployment::tower_table`]) until the tower takes the grid.
+    /// the table itself (`Deployment::tower_table`) until the tower takes the grid.
     /// The prompt lengths a walk states.
     ///
     /// The tower is stated **at the longest of them**, because its learned position table is compiled
