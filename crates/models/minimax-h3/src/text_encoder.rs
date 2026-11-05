@@ -747,6 +747,121 @@ impl TextEncoder {
         keys
     }
 
+    /// The programs the retained layers and the prompt splice of this encoder launch.
+    ///
+    /// Stated from the configuration and the tensor-parallel position alone, because a deployment
+    /// compiles its store before it opens the checkpoint: the shard widths are `Rank`'s, the geometry is
+    /// the config's, and the element type is the deployment's. `tokens` is the largest prompt the
+    /// deployment serves, which states the two things a key carries from it — the dense attention's key
+    /// bound and whether the gated activation's `wide` form is the program.
+    ///
+    /// The vision tower is [`VisionTower::programs`]: it launches programs of its own.
+    pub fn programs(
+        config: &TextEncoderConfig,
+        partition: &Partition,
+        dtype: nn::DType,
+        tokens: u32,
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::gemm::Gemm;
+        use ops::norm::{AddRmsNorm, RmsNorm as RmsNormOp};
+        use ops::residual::ScaledResidual as ResidualOp;
+        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
+        use ops::rows::{self, Rows as RowsOp};
+
+        let rank = Rank::new(config, partition)?;
+        let hidden = config.hidden_size;
+        let head = config.head_dim;
+        let sections = sections_of(config)?;
+        let mut programs = Programs::default();
+
+        // The prompt's embedding: this rank's vocabulary shard, gathered by I32 ids.
+        programs.launch::<ops::embedding::Embedding>(&Embedding::descriptor_of(
+            rank.vocabulary.1 - rank.vocabulary.0,
+            hidden,
+            rank.vocabulary.0,
+            dtype,
+            nn::DType::I32,
+        ));
+
+        // One dense product for the whole stack: no projection carries a bias, and the contraction
+        // length, the row count and the width are launch values.
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            hidden,
+            dtype,
+            WeightOrder::NxK,
+            false,
+            dtype,
+            dtype,
+        ));
+
+        // The two normalizations: the first layer's plain one and the residual-folding one every layer
+        // after it uses.
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
+        programs.launch::<AddRmsNorm>(&RmsNorm::add_descriptor_of(hidden, dtype));
+
+        // The M-RoPE table once, then the per-layer application with its learned per-head gains.
+        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
+            head,
+            1.0,
+            Some(sections),
+            nn::DType::I32,
+        ));
+        programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
+            head,
+            rank.query_heads,
+            rank.key_value_heads,
+            Rotation::Half,
+            config.rms_norm_eps,
+            head,
+            dtype,
+            dtype,
+            // The checkpoint stores `q_norm.weight` and `k_norm.weight`.
+            true,
+        ));
+
+        // The prompt attends within its own sequence: the offsets select the varlen program.
+        let attention = Attention::dense(
+            head,
+            rank.query_heads,
+            rank.key_value_heads,
+            tokens,
+            true,
+            None,
+            (head as f32).sqrt().recip(),
+        )
+        .map_err(Error::from)?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, tokens, true,
+        ));
+
+        // The gated feed-forward over two separate projections, and the residual that folds each
+        // layer's output back into the stream.
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(rank.intermediate),
+            ACTIVATION,
+            u64::from(rank.intermediate),
+            u64::from(rank.intermediate),
+            u64::from(tokens) * u64::from(rank.intermediate),
+            false,
+        )?);
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
+            dtype,
+            u64::from(hidden),
+            false,
+        )?);
+
+        // The prompt's rows: the vision features replace the placeholders, and each DeepStack table
+        // adds into the rows the layout names.
+        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, hidden));
+        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Add, hidden));
+
+        Ok(programs.finish())
+    }
+
     /// The encoder of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose. The stack is built for
@@ -1808,6 +1923,59 @@ mod tests {
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
         crate::config::tests_support::released_config().text_encoder
+    }
+
+    /// The encoder states its own programs from its configuration and the deployment's partition: the
+    /// shard widths are the rank's, and neither a prompt length nor a raster can add a row.
+    #[test]
+    fn the_encoder_states_its_programs_from_its_config_and_partition() {
+        let config = config();
+        let programs = TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 4096)
+            .expect("the encoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        assert_eq!(count("embedding"), 1);
+        // One dense product whatever the contraction, one normalization pair, one rotation, one
+        // attention, one gated activation and one residual: the stack's geometry is the config's.
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("rms_norm"), 1);
+        assert_eq!(count("add_rms_norm"), 1);
+        assert_eq!(count("rotary_factors"), 1);
+        assert_eq!(count("qk_norm_rope"), 1);
+        assert_eq!(count("dense_attention"), 1);
+        assert_eq!(count("act_and_mul"), 1);
+        assert_eq!(count("scaled_residual"), 1);
+        // The prompt's rows: the vision features replace placeholders and the DeepStack taps add.
+        assert_eq!(count("rows"), 2);
+
+        // A second prompt length states the same programs: the key bound is a launch value, and the
+        // gated activation's `wide` form is nowhere near its threshold at these sizes.
+        let wider =
+            TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 8192)
+                .expect("the encoder's programs");
+        assert_eq!(wider, programs);
+
+        // A sharded rank states a different rotation, because the head count is the shard's.
+        let sharded = Partition {
+            tensor_parallel: 8,
+            tensor_rank: 0,
+            ..Partition::single()
+        };
+        let rank = TextEncoder::programs(&config, &sharded, nn::DType::BF16, 4096)
+            .expect("a sharded rank's programs");
+        let rotation = |set: &[(String, String)]| {
+            set.iter()
+                .find(|(name, _)| name == "qk_norm_rope")
+                .map(|(_, key)| key.clone())
+                .expect("a rotation")
+        };
+        assert_ne!(rotation(&rank), rotation(&programs));
+        assert!(rotation(&rank).contains(&format!("q_heads_{}", config.num_attention_heads / 8)));
     }
 
     #[test]

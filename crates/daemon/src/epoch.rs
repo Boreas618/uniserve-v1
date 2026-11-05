@@ -1412,7 +1412,7 @@ mod tests {
 
     use super::*;
     use crate::engine::stand_in::Seen;
-    use crate::options::{SchedulerOptions, SpeculativeOptions};
+    use crate::options::SchedulerOptions;
 
     /// A program of backend `backend` at revision 1 with no parameters.
     fn program(backend: &str) -> Program {

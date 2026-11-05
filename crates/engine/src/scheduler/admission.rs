@@ -1414,17 +1414,25 @@ impl Scheduler {
         }
     }
 
-    /// Orders both queues by the plan's admission order: the requests it names
-    /// first and in its order, then the rest in the order they arrived, which is
-    /// the order a later plan's own naming or the mechanism's fallback sees.
-    fn order_queues_by(&mut self, order: &[ipc::RequestId]) {
-        let rank = |id: ipc::RequestId| order.iter().position(|named| *named == id);
+    /// Moves the requests the plan names ahead of the rest, each group staying
+    /// in the mechanism's own order.
+    ///
+    /// The plan names a *set*: which of the requests it names the mechanism
+    /// spends its resources on first is the mechanism's decision, and the
+    /// queue's order carries rules a policy cannot see. `queue_media` puts a
+    /// request that resumes a stored trajectory ahead of one that starts one,
+    /// so a world restores at most the trajectories of its latest preemption —
+    /// a host latent pool is sized by that. Re-ordering the queue by the plan
+    /// would discard it (the policy learns of arrivals, not of the mechanism's
+    /// queue), so this is a stable partition, never a re-sort.
+    fn order_queues_by(&mut self, named: &[ipc::RequestId]) {
+        let is_named = |id: ipc::RequestId| named.contains(&id);
         self.waiting
             .make_contiguous()
-            .sort_by_key(|state| rank(state.req.request_id).unwrap_or(usize::MAX));
+            .sort_by_key(|state| !is_named(state.req.request_id));
         self.waiting_media
             .make_contiguous()
-            .sort_by_key(|pending| rank(pending.request.request_id).unwrap_or(usize::MAX));
+            .sort_by_key(|pending| !is_named(pending.request.request_id));
     }
 
     /// The token half of the plan's admission: at most `named` requests, the

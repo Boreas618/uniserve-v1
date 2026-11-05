@@ -21,7 +21,6 @@ use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::model::{ModelConfig, ModelParameters};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use models::ModelDescription;
-use models::omni::bagel::BagelProfile;
 use models::video::plan::ProcessorConfig;
 use proto::request::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,

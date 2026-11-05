@@ -367,9 +367,23 @@ impl Nvfp4Linear {
             input,
             columns,
             layout,
-            block,
+            block: Self::encode_block(columns, block),
             pdl: false,
         }
+    }
+
+    /// The tile one encoding of a `columns`-wide row runs in.
+    ///
+    /// The package refuses a tile that does not divide the row (`nvfp4_quantize`'s `build.py`
+    /// raises on `columns % block != 0`), so the requested tile is halved until it divides. A row
+    /// narrower than the largest tile — the mixture-of-experts' 768-element second encode — gets
+    /// the largest tile that fits it rather than a key no package can build.
+    pub fn encode_block(columns: u32, requested: u32) -> u32 {
+        let mut block = requested.max(1);
+        while block > 1 && !columns.is_multiple_of(block) {
+            block /= 2;
+        }
+        block
     }
 
     pub fn encode_descriptor(&self) -> QuantizeDescriptor {
@@ -377,7 +391,7 @@ impl Nvfp4Linear {
             input: self.input,
             columns: self.k,
             layout: self.layout,
-            block: self.block,
+            block: Self::encode_block(self.k, self.block),
             pdl: false,
         }
     }
@@ -441,7 +455,8 @@ impl Nvfp4Linear {
     /// activation row. A plan that does not reserve them is an arena the launch writes past, so the
     /// model's plan asks this rather than estimating.
     pub fn scratch_bytes(&self, rows: u64) -> u64 {
-        let align = |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
+        let align =
+            |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
         let values = align(rows * u64::from(self.k) / 2);
         let scales = {
             let shape = self.layout.shape(rows, u64::from(self.k));
@@ -686,5 +701,31 @@ mod tests {
         .err()
         .expect("a seven-element bias cannot be added to eight channels");
         assert!(error.to_string().contains("8 output channels"), "{error}");
+    }
+
+    /// The encoder's tile divides the row it encodes.
+    ///
+    /// The package refuses a tile that does not divide the row, so this is not a preference: a row
+    /// of 768 against a requested 1024 must state 256, which is the cell `nvfp4_quantize` declares.
+    /// Both halves are asserted — the tile divides, and it is the largest power of two that does —
+    /// because a smaller tile than necessary is a different key and a different program.
+    #[test]
+    fn the_encode_block_divides_the_row_it_encodes() {
+        for (columns, requested, expected) in [
+            (4096u32, 1024u32, 1024u32),
+            (2048, 1024, 1024),
+            (768, 1024, 256),
+            (768, 512, 256),
+            (768, 256, 256),
+            (96, 1024, 32),
+            (64, 1024, 64),
+        ] {
+            let block = Nvfp4Linear::encode_block(columns, requested);
+            assert_eq!(block, expected, "columns {columns}, requested {requested}");
+            assert!(
+                columns.is_multiple_of(block),
+                "{block} does not divide a row of {columns}"
+            );
+        }
     }
 }

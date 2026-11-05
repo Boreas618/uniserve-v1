@@ -166,6 +166,71 @@ def check(case, device):
     return deciding
 
 
+#: A hand-computed case: two rows of four with fixed operands and the expected values written
+#: out as decimals. The randomized cases compare a launch against a reference this same file
+#: computes, so a mistake both share — a row read as a column, a dropped `eps`, a `columns` of
+#: the wrong length — is invisible to them. These numbers were computed once by hand from
+#: `(x − mean)·rsqrt(var + eps)·weight + bias` (mean `2.5`, `0.375`; variance `1.25`,
+#: `1.171875`) and are literals here for that reason.
+HAND = {
+    "x": [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 0.0]],
+    "weight": [1.0, 0.5, -1.0, 2.0],
+    "bias": [0.0, 1.0, 0.0, -1.0],
+    "eps": 1e-5,
+    "expect": [
+        [
+            -1.3416354199689269,
+            0.7763940966718454,
+            -0.447211806656309,
+            1.6832708399378538,
+        ],
+        [
+            0.11546956116884853,
+            0.3649174135713331,
+            -1.5011042951950309,
+            -1.6928173670130913,
+        ],
+    ],
+}
+
+
+def check_hand(tile):
+    """Normalize the hand-computed rows and compare every element with its literal."""
+    import layer_norm as kernels
+
+    rows, columns = len(HAND["x"]), len(HAND["x"][0])
+    if tile < columns:
+        print(f"hand: skipped, a tile of {tile} cannot cover {columns} columns")
+        return 0
+    x = torch.tensor(HAND["x"], dtype=torch.float32)
+    weight = torch.tensor(HAND["weight"], dtype=torch.float32)
+    bias = torch.tensor(HAND["bias"], dtype=torch.float32)
+    out = torch.full((rows, columns), float("nan"), dtype=torch.float32)
+    kernels._layer_norm_kernel[(rows,)](
+        x,
+        weight,
+        bias,
+        out,
+        columns,
+        HAND["eps"],
+        1,
+        0,
+        BLOCK=tile,
+        HAS_BIAS=True,
+        PDL=False,
+    )
+    expect = torch.tensor(HAND["expect"], dtype=torch.float32).double()
+    difference = (out.double() - expect).abs()
+    relative = bound(columns, "f32") * expect.abs()
+    outside = (~(difference <= relative)).sum().item()
+    print(
+        f"{'exact' if outside == 0 else 'FAIL'}: hand-computed {rows} x {columns} of tile "
+        f"{tile}, f32 — max absolute {difference.max().item():.3e}, bound "
+        f"{bound(columns, 'f32'):.3e} ({outside} outside)"
+    )
+    return outside
+
+
 def cases(flags, interpreter):
     """The cases one run checks, cheapest and most diverse first."""
     return [
@@ -266,7 +331,7 @@ def main() -> int:
         parser.error(f"the flags name {key}, not {arguments.expect_key}")
 
     device = "cpu" if arguments.interpreter else "cuda"
-    outside = 0
+    outside = check_hand(arguments.tile)
     for case in cases(arguments, arguments.interpreter):
         # The interpreter's narrow store truncates; simulate it only where it is known.
         case["truncate"] = arguments.interpreter and arguments.dtype == "bf16"

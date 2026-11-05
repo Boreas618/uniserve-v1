@@ -516,8 +516,14 @@ mod tests {
         // The page is the block the scale covers, so a different page size is a different program:
         // an implementation that derived one scale over another geometry would store a plausible
         // wrong number everywhere, which is the failure this key exists to prevent.
-        let wider = ScaledWriteDescriptor { page: 32, ..scaled() };
-        assert_ne!(crate::descriptor::key(&scaled()), crate::descriptor::key(&wider));
+        let wider = ScaledWriteDescriptor {
+            page: 32,
+            ..scaled()
+        };
+        assert_ne!(
+            crate::descriptor::key(&scaled()),
+            crate::descriptor::key(&wider)
+        );
     }
 
     #[test]
@@ -528,5 +534,4 @@ mod tests {
         assert!(tolerance.allows(0.0, 2f32.powi(-6)));
         assert!(!tolerance.allows(0.0, 2f32.powi(-5)));
     }
-
 }
