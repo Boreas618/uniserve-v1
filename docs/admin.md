@@ -68,10 +68,6 @@ A target that fails before the switchover never reaches the frontend: its childr
 
 Beside every node's serving main process the daemon keeps a parked standby child of the same group, rank and epoch at the next generation, with its own CUDA contexts: a sticky error of the serving process cannot touch it. A process-fatal fault promotes the whole failure domain — every member's parked child, every promote issued before an answer is awaited — and each node then starts a new standby at the generation after. A device that needs a reset takes the standby with it; only migration to another node or replica helps. A standby exists only while its epoch serves: an epoch in precopy or on probation keeps none, and a fault there reverts the update. `worker_config.standby` and `worker_config.standby_storage` are the options (`docs/configuration.md`).
 
-### The Program Server
-
-The Program Server is not on the serving path and restarts directly (`crates/program-server/src/restart.rs`): a `prepare` or `resolve` issued during the restart waits for it with a fresh connection, and everything the server decides — a refused descriptor, an unknown revision, a build that failed — comes back at once. A restart is not a `PrecopyFailed`.
-
 ### Plans and status
 
 A dry run reports the layer, the target's build identity and programs, and for an epoch change the epoch it claims and the generations it uses; it changes nothing. `GET /admin/config` reports each epoch's record — build identity, programs, policy, status and the serving generation — and this daemon's main processes, one row each: role, pid, epoch, generation, build and state (`Starting`, `Parked`, `Serving`, `Stopped`, `Failed`), the frontend included. The rows are written by the layer that owns the children, from the reports they send, never composed from assumptions about progress.
