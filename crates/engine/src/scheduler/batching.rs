@@ -854,13 +854,25 @@ impl Scheduler {
             return;
         };
         // The per-request record is a denoising step's: the request's conditioning and the step,
-        // seed and canvas a draw is addressed by. Every other media family stages buffers this
-        // mechanism cannot state - a decode reads the clip's latents and the tables the model's
-        // `layout_tables` names, an encode reads the tokens its call carries - so a batch of one of
-        // those is refused here by name rather than stamped with a record shaped for another family
-        // (a decoder reads `inputs[0]` as a clip's latents, and two buffers for it would be a
-        // refusal about counts rather than about the fact that nobody stated them).
-        if media_call != ipc::MediaCall::Denoising {
+        // seed and canvas a draw is addressed by. **The artifact's three host calls state that same
+        // record and nothing more** - an encode of a video unit works at the request's canvas and
+        // frame count, an encode of its track reads the window the audio decoder published, and the
+        // mux reads what the two encodes wrote - so a batch of one of them is stamped here like a
+        // denoising step's.
+        //
+        // The other families stage buffers this mechanism cannot state: a decode reads the clip's
+        // latents and the tables the model's `layout_tables` names, and a conditioning encode reads
+        // the tokens its call carries. A batch of one of those is refused here by name rather than
+        // stamped with a record shaped for another family (a decoder reads `inputs[0]` as a clip's
+        // latents, and two buffers for it would be a refusal about counts rather than about the
+        // fact that nobody stated them).
+        let host = matches!(
+            media_call,
+            ipc::MediaCall::VideoEncoding
+                | ipc::MediaCall::AudioEncoding
+                | ipc::MediaCall::Muxing
+        );
+        if media_call != ipc::MediaCall::Denoising && !host {
             tracing::debug!(
                 "a media batch is dropped: a {:?} batch's per-request buffers are the model's own \
                  and the mechanism states no spelling for them yet",
