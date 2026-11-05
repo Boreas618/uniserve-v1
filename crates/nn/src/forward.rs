@@ -295,6 +295,17 @@ impl<'a> Forward<'a> {
         })
     }
 
+    /// Fills the first `bytes` of `view` with zero, in stream order with this forward's launches.
+    ///
+    /// A recording forward has no stream and issues nothing, as it issues no launch.
+    pub fn zero(&self, view: TensorView, bytes: u64) -> Result<()> {
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        // SAFETY: `view` is a live tensor of this forward's arena and the caller's `bytes` lie in it.
+        unsafe { ops::zero_bytes(view.ptr, bytes, stream) }.map_err(Error::from)
+    }
+
     /// The same forward over a parallel group.
     pub fn with_group(mut self, group: &'a Group) -> Self {
         self.group = Some(group);
