@@ -788,11 +788,20 @@ def sweep(
                     f"compares that declaration with the Rust structure it mirrors"
                 )
             elif backend is None:
-                # The row names no backend and the operator states none a cell could be read from,
-                # so the honest report is that the row is unattributable rather than unbuilt.
+                # The row names no backend and the operator states no single one a cell could be
+                # read from - every backend it states is native, or several Triton ones exist. The
+                # store may well hold cells under some of them, so the report names what it holds
+                # rather than claiming it holds nothing: "no cell under any backend" was a claim
+                # this reader could not make, and a reader who checked found two (`f32` and `fa4`).
+                holding = (
+                    sorted(p.name for p in (store / op).iterdir() if p.is_dir())
+                    if (store / op).is_dir()
+                    else []
+                )
                 gaps.append(
-                    f"{finding} {descriptor}: the row names no backend, and the store holds no "
-                    f"cell for it under any backend the operator states"
+                    f"{finding} {descriptor}: the row names no backend and none can be attributed "
+                    f"to it; the store holds cell(s) under "
+                    f"{', '.join(holding) if holding else 'no backend'}"
                 )
             elif _native_package(package):
                 # A native package is not a Triton cell, so no build produces a `metadata.json` for
