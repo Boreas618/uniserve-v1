@@ -204,6 +204,18 @@ fn emit_from_walk(
         "# The program rows the H3 deployment launches, one `operator<TAB>key` line each: the model's \
          walk, copied, plus the rows no model can state."
     );
+    // The fixture states its own size, from the rows it just wrote: a reader comparing two fixtures sees
+    // the count without counting, and the number cannot disagree with the rows beneath it.
+    println!(
+        "# {} data rows, {} operators",
+        rows.len(),
+        {
+            let mut names: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            names.len()
+        }
+    );
     println!("# walk deployment: {deployment}");
     // Which tree the walk was printed from: a row set is evidence only of the commit that produced it,
     // and a store built from a fixture without it cannot say what it was built from.
