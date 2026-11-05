@@ -2044,9 +2044,9 @@ impl Denoiser {
     /// The two stacks are their own functions ([`Transformer::programs`],
     /// [`crate::conditioning::TokenRefiner::programs`]); this adds the orchestration around them — the
     /// pack and its inverse, the draw, the strided copies, the coefficient gather, and the blends the
-    /// solver and the conditioner issue. `elements` is the element count of the largest trajectory a
-    /// modality steps: the solver's residual is one operator over the whole sample, so its width is a
-    /// deployment statement and not a constant.
+    /// solver and the conditioner issue. The trajectory's element count states no key: the solver's
+    /// residual carries one column gathered per evaluation, so a row keyed by the sample's elements is
+    /// a row no launch asks for.
     #[allow(clippy::too_many_arguments)]
     pub fn programs(
         config: &crate::config::TransformerConfig,
@@ -2055,7 +2055,6 @@ impl Denoiser {
         rows: u32,
         groups: Groups,
         partition: &Partition,
-        elements: &[u64],
         tiles: u32,
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
@@ -2154,22 +2153,17 @@ impl Denoiser {
         }
 
         // The solver's step: one gated residual over the whole trajectory of each modality. Its
-        // coefficient is one FP32 column, gathered per evaluation rather than per buffer.
+        // coefficient is one column gathered per evaluation rather than per buffer, so the key names
+        // the scale's width and not the trajectory's: a row keyed by the element count is a row no
+        // launch ever asks for, which is how five of them were carried here.
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
             nn::DType::F32,
             1,
             false,
         )?);
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-            dtype,
-            u64::from(video) * 4,
-            false,
+            dtype, 1, false,
         )?);
-        for count in elements {
-            programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-                dtype, *count, false,
-            )?);
-        }
         Ok(programs.finish())
     }
 
@@ -3334,7 +3328,6 @@ mod tests {
             32_000,
             Groups::of(true),
             &crate::partition::Partition::single(),
-            &[1_000_000],
             0,
         )
         .expect("the denoiser's programs");
@@ -3351,17 +3344,24 @@ mod tests {
         ] {
             assert!(has(operator), "{operator} is missing: {programs:?}");
         }
-        // The solver's residual over the whole trajectory is a second program from the patch-column
-        // one, because the width is in the key.
+        // The solver's residual reads one coefficient per evaluation, so every residual the denoiser
+        // states is one column wide: a key carrying the sample's element count is a row no launch
+        // asks for, and two of them were carried here until the recorder named them.
         let residuals = programs
             .iter()
             .filter(|(name, _)| name == "scaled_residual")
             .map(|(_, key)| key.clone())
             .collect::<Vec<_>>();
         assert!(
-            residuals.iter().any(|key| key.contains("columns_1000000")),
-            "{residuals:?}"
+            !residuals.is_empty(),
+            "the denoiser states no residual: {programs:?}"
         );
+        for key in &residuals {
+            assert!(
+                key.contains("columns_1_"),
+                "a residual is keyed by the scale's width: {residuals:?}"
+            );
+        }
     }
 
     /// The four crossings between the sample's element type and FP32 are programs of their own:
@@ -3385,7 +3385,6 @@ mod tests {
             32_000,
             Groups::of(true),
             &crate::partition::Partition::single(),
-            &[1_000_000],
             0,
         )
         .expect("the denoiser's programs");

@@ -317,7 +317,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max,
             Groups::of(conditioned),
             &partition,
-            &elements,
             tiles,
         )?);
     }
