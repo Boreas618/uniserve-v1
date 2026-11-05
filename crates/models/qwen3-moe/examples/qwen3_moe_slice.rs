@@ -1883,7 +1883,7 @@ fn check_continuation(
 mod tests {
     use std::path::Path;
 
-    use super::{KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
+    use super::{Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
 
     /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
     /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
@@ -1948,6 +1948,64 @@ mod tests {
     fn a_short_sequence_length_is_refused() {
         let refused = check_continuation(15, 0, 15, 15, 15, 64).expect_err("seq_len 15 for 16");
         assert!(refused.to_string().contains("seq_len"), "{refused}");
+    }
+
+    /// The page type selects the cache's own rows and no others.
+    ///
+    /// `needed_keys` is the whole list a run installs, so a filter that applied the page type to
+    /// every row would leave an fp8 deployment with the three cache rows and no embedding, no
+    /// projections and no MoE - a list that loads and then refuses at the first operator it left
+    /// out, one stage away from the cause.
+    #[test]
+    fn a_page_type_selects_the_cache_rows_and_no_others() {
+        let store = Path::new("a store root the pre-flight never reads");
+        let encoded = Encoded {
+            declared: false,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let bf16 = needed_keys(store, Stage::Decode, true, KvPages::Bf16, encoded)
+            .expect("the deployment's list");
+        let fp8 = needed_keys(store, Stage::Decode, true, KvPages::Fp8, encoded)
+            .expect("the deployment's list");
+
+        assert_eq!(
+            bf16.len(),
+            fp8.len(),
+            "the two pages launch the same number of programs"
+        );
+        // Every operator that is not the cache's appears in both lists.
+        for (operator, _) in &bf16 {
+            if matches!(
+                operator.as_str(),
+                "kv_write" | "kv_write_scaled" | "paged_attention"
+            ) {
+                continue;
+            }
+            assert!(
+                fp8.iter().any(|(other, _)| other == operator),
+                "`{operator}` left the fp8 list"
+            );
+        }
+        // And the cache's rows swapped: the scaled write and the f8e4m3 planes in, the bf16 out.
+        assert!(
+            fp8.iter()
+                .any(|(operator, _)| operator == "kv_write_scaled"),
+            "the fp8 list has no scaled cache write"
+        );
+        assert!(
+            !bf16
+                .iter()
+                .any(|(operator, _)| operator == "kv_write_scaled"),
+            "the bf16 list has an fp8 cache write"
+        );
+        assert!(
+            fp8.iter()
+                .filter(|(operator, key)| operator == "paged_attention" && key.contains("kv_f8e4m3"))
+                .count()
+                == 2,
+            "both attention phases read an fp8 plane"
+        );
     }
 
     /// A position past the page table has no page to write, which is a refusal and not a launch.
