@@ -23,11 +23,12 @@
 //! cuDNN reads. The two products are separate variants because their results differ in the last bit
 //! of a few elements — a difference of the product, not of the encoding.
 
+use std::ffi::c_void;
 use std::fmt;
 
 use crate::descriptor::Key;
-use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
+use crate::platform::{self, Stream};
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -327,6 +328,43 @@ pub struct GemmArgs {
     pub out: TensorView,
 }
 
+/// The call structure `nvfp4_gemm/cute_dsl`'s entry takes, as its header declares it.
+///
+/// The header asserts the two offsets this structure must match — `error` at byte 80 and a size
+/// of 592 — because the entry reads seven device addresses, then `m`, `n` and `k`, and writes its
+/// message into the tail. `bias` is never null: an epilogue that adds none passes `alpha`, which
+/// the entry does not read in that case.
+#[repr(C)]
+pub struct Call {
+    pub input: *const c_void,
+    pub weight: *const c_void,
+    pub input_scales: *const c_void,
+    pub weight_scales: *const c_void,
+    pub alpha: *const c_void,
+    pub bias: *const c_void,
+    pub out: *mut c_void,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub error: [u8; 512],
+}
+
+impl NativeCall for Call {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
+}
+
+const _: () = assert!(
+    std::mem::offset_of!(Call, error) == 80,
+    "the call's message moved without the package's header"
+);
+const _: () = assert!(
+    std::mem::size_of::<Call>() == 592,
+    "the call's size moved without the package's header"
+);
+
 /// A dense product over NVFP4 operands.
 pub struct Nvfp4Gemm;
 
@@ -413,23 +451,22 @@ impl Op for Nvfp4Gemm {
             (Epilogue::None, None) => args.alpha,
         };
 
-        let mut arguments = Arguments::new();
-        arguments
-            .view(args.input)
-            .view(args.weight)
-            .view(args.input_scales)
-            .view(args.weight_scales)
-            .view(args.alpha)
-            .view(bias)
-            .view(args.out)
-            .u64(m)
-            .u64(n)
-            .u64(u64::from(descriptor.k));
-        kernel.launch(
-            LaunchGrid::new([u64::from(descriptor.m), u64::from(descriptor.n), 1])?,
-            &mut arguments,
-            stream,
-        )
+        let mut call = Call {
+            input: platform::address(args.input.ptr) as usize as *const c_void,
+            weight: platform::address(args.weight.ptr) as usize as *const c_void,
+            input_scales: platform::address(args.input_scales.ptr) as usize as *const c_void,
+            weight_scales: platform::address(args.weight_scales.ptr) as usize as *const c_void,
+            alpha: platform::address(args.alpha.ptr) as usize as *const c_void,
+            bias: platform::address(bias.ptr) as usize as *const c_void,
+            out: platform::address(args.out.ptr) as usize as *mut c_void,
+            m: m as i64,
+            n: n as i64,
+            k: i64::from(descriptor.k),
+            error: [0; 512],
+        };
+        // SAFETY: `Call` is the structure this package's entry declares, with the layout its
+        // header asserts, and the entry the package resolved is `uniserve_nvfp4_gemm`.
+        unsafe { kernel.native(&mut call, stream) }
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
