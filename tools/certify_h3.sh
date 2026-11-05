@@ -79,7 +79,11 @@ ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     echo "exit: $status"
     echo "command: sh tools/check_h3_deployment.sh $root $types"
     echo "checkpoint root: $root"
+    # The element-types table is an input the eight questions read and this lane does not own:
+    # every `dtype` answer moves together if it drifts, so a record that pinned only the tip would
+    # call two runs with different tables identical. Pinned by content, like the rows.
     echo "element types: $types"
+    echo "element-types bytes: $(wc -c <"$types" | tr -d ' ') sha256: $(digest "$types")"
     echo
     echo "## the two files, as this run read them"
     echo
