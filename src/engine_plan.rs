@@ -673,6 +673,11 @@ impl EpochPlan {
             Arc::clone(decoder),
             decode_set,
             Arc::clone(generation),
+            // The `video_decoder` component's second entry point. A checkpoint that holds none
+            // serves a clip rather than a timeline, and the runner then publishes the clip.
+            pipeline
+                .video_postprocessor()
+                .map(|block| Arc::clone(block) as Arc<dyn nn::capability::Decoder + Send + Sync>),
         )?;
         let mut runners = vec![
             NamedRunner::new(RunnerId(0), Box::new(encoder)),

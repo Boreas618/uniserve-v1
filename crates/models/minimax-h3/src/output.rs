@@ -483,6 +483,51 @@ impl nn::capability::Decoder for VideoPostprocessor {
         self.forward(f, previous, clip, &internal, view)
             .map_err(|error| refuse(format!("{error}")))
     }
+
+    /// The splices a timeline of `frames` frames is written in (`output.py:21-40`).
+    ///
+    /// A timeline is `17 * n + 5` frames: `n` clips of a 17-frame body and a 5-frame tail, which the
+    /// last clip keeps. Clip `i` writes the timeline's frames from `17 * i`, and every clip but the
+    /// timeline's first fades its first five kept frames against its predecessor's tail, which is
+    /// why a splice states both the keep and the overlap count.
+    fn splices(&self, frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
+        Self::splices_of(frames)
+    }
+}
+
+impl VideoPostprocessor {
+    /// The checkpoint's clip schedule for a timeline of `frames` frames.
+    ///
+    /// This is the one home of `17 * n + 5`: the decoder's clip count, the encoder's unit count and
+    /// the splice a runner passes all read it from here, so a timeline the checkpoint cannot decode
+    /// is refused once, by name, rather than recomputed by each of them.
+    pub fn splices_of(frames: u32) -> nn::Result<Vec<nn::capability::Splice>> {
+        let body = CLIP_FRAMES;
+        let tail = OVERLAP_FRAMES;
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem,
+        };
+        if frames < body + tail {
+            return Err(refuse(format!(
+                "a timeline is {body} * n + {tail} frames and {frames} is shorter than one clip"
+            )));
+        }
+        if (frames - tail) % body != 0 {
+            return Err(refuse(format!(
+                "a timeline is {body} * n + {tail} frames and {frames} has {} frame(s) over",
+                (frames - tail) % body
+            )));
+        }
+        let count = (frames - tail) / body;
+        Ok((0..count)
+            .map(|index| nn::capability::Splice {
+                keep: body + if index + 1 == count { tail } else { 0 },
+                overlap: if index == 0 { 0 } else { tail },
+                first: index * body,
+            })
+            .collect())
+    }
 }
 
 /// The extents of one clip's decoded raster, read off the view.
@@ -1047,5 +1092,57 @@ mod tests {
                 .any(|(_, key)| key.contains("dtype_f16_channels_3")),
             "the packing states its element type and channel count: {programs:?}"
         );
+    }
+
+    /// A timeline's clips, where they start and how many frames each writes.
+    ///
+    /// The reference's rule is `17 * n + 5`: `n` clips of a 17-frame body, and the last clip keeps the
+    /// 5-frame tail. The three numbers this asserts are what a runner passes to a splice - where the
+    /// clip's frames go, how many it keeps and how many fade against its predecessor - so a change
+    /// here is a change in what a decoded video looks like.
+    #[test]
+    fn a_timeline_is_split_into_bodies_and_one_kept_tail() {
+        let splices = VideoPostprocessor::splices_of(3 * CLIP_FRAMES + OVERLAP_FRAMES)
+            .expect("a timeline of three clips");
+        assert_eq!(splices.len(), 3);
+        assert_eq!(
+            splices
+                .iter()
+                .map(|splice| (splice.first, splice.keep, splice.overlap))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, CLIP_FRAMES, 0),
+                (CLIP_FRAMES, CLIP_FRAMES, OVERLAP_FRAMES),
+                (
+                    2 * CLIP_FRAMES,
+                    CLIP_FRAMES + OVERLAP_FRAMES,
+                    OVERLAP_FRAMES
+                ),
+            ]
+        );
+        // One clip is the shortest timeline, and it is also its last: it keeps its tail.
+        let single = VideoPostprocessor::splices_of(CLIP_FRAMES + OVERLAP_FRAMES)
+            .expect("a one-clip timeline");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].keep, CLIP_FRAMES + OVERLAP_FRAMES);
+        assert_eq!(single[0].overlap, 0);
+    }
+
+    /// A frame count the checkpoint's decoding cannot state is refused, and the refusal says which.
+    ///
+    /// The rule is arithmetic rather than a bound: a timeline of the wrong residue is not a shorter
+    /// timeline, it is a count nothing in the checkpoint produces, and a runner that accepted one
+    /// would write frames no encoder's unit covers.
+    #[test]
+    fn a_timeline_the_checkpoint_cannot_state_is_refused() {
+        for frames in [0, CLIP_FRAMES, CLIP_FRAMES + OVERLAP_FRAMES + 1] {
+            let error = VideoPostprocessor::splices_of(frames)
+                .expect_err("a frame count outside 17 * n + 5");
+            let message = format!("{error}");
+            assert!(
+                message.contains("17") && message.contains(&frames.to_string()),
+                "the refusal states the rule and the count for {frames}: {message}"
+            );
+        }
     }
 }

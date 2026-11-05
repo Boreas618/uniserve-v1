@@ -29,31 +29,16 @@ use crate::Result;
 pub struct Rates {
     /// Frames per second of the artifact: `24` for MiniMax-H3.
     pub frame_rate: u32,
-    /// Frames one media unit covers: `17` for MiniMax-H3, the video decoder's clip length.
-    pub unit_frames: u32,
     /// Samples per second of the track: `32000` for MiniMax-H3's BigVGAN.
     pub audio_rate: u32,
 }
 
 impl Rates {
-    /// The frame count of every unit of a request of `frames` frames, in request order.
+    /// The samples one request's soundtrack covers, from the unit list the request was opened with.
     ///
-    /// The units are the decoder's clips, so every unit is one clip and the last one carries the
-    /// remainder. A request of no frames states no unit, which the muxer refuses by name rather
-    /// than assembling an empty container.
-    pub fn units(&self, frames: u32) -> Vec<u32> {
-        let clip = self.unit_frames.max(1);
-        let mut left = frames;
-        let mut units = Vec::new();
-        while left > 0 {
-            let unit = left.min(clip);
-            units.push(unit);
-            left -= unit;
-        }
-        units
-    }
-
-    /// The samples one request's soundtrack covers, from the same unit count.
+    /// **The unit list is the timeline's own** - `VideoPostprocessor::splices_of` is its one home -
+    /// so this reads it rather than recomputing a schedule: a units function here would be a second
+    /// statement of the checkpoint's `17 * n + 5`, and the muxer is assembled from the first one.
     ///
     /// The artifact's timeline is frames at the frame rate and samples at the audio rate, so the
     /// two counts are one number read twice: a track shorter than this leaves the last frames
@@ -96,20 +81,20 @@ impl Output {
 
     /// Encodes one clip of `request` into the unit it covers.
     ///
-    /// `frames` is the request's whole frame count, which fixes the timeline the assembly covers;
-    /// the first call opens it. `clip` is the bytes the `video_decoder` component published -
+    /// `units` is the request's timeline as the model's schedule states it - the kept frame count
+    /// of each clip, in order - which fixes the assembly the first call opens. `clip` is the bytes
+    /// the `video_decoder` component published -
     /// `[frames, height, width, 3]` uint8, the postprocessor's own order - and `shape` is
     /// `(frames, height, width)` of this unit. Nothing is converted here: a postprocessor that
     /// de-normalised the raster and an encoder that takes RGB24 agree on the bytes.
     pub fn encode_clip(
         &self,
         request: RequestKey,
-        frames: u32,
+        units: &[u32],
         shape: (u32, u32, u32),
         clip: &[u8],
     ) -> Result<()> {
         let (unit_frames, height, width) = shape;
-        let units = self.rates.units(frames);
         if !units.contains(&unit_frames) {
             return Err(crate::Error::Invalid(format!(
                 "a clip of {unit_frames} frames is not one of the request's units {units:?}: the \
@@ -130,7 +115,7 @@ impl Output {
                 height,
                 self.rates.frame_rate,
                 self.rates.audio_rate,
-                &units,
+                units,
             )?;
         }
         let decoded = unit_frames as usize * height as usize * width as usize * 3;
@@ -142,7 +127,7 @@ impl Output {
                 clip.len()
             )));
         }
-        let row = self.rates.encoded_unit_bytes(unit_frames, height, width);
+        let row = Rates::encoded_unit_bytes(unit_frames, height, width);
         let mut framed = vec![0_u8; row];
         let written = self.media.encode_unit(
             media::Rgb24Frames {
@@ -200,8 +185,8 @@ impl Output {
 
 impl Rates {
     /// Bytes of one encoded unit's framed row at this raster.
-    fn encoded_unit_bytes(&self, frames: u32, height: u32, width: u32) -> usize {
-        media::encoded_unit_bytes(frames.min(self.unit_frames), height, width)
+    fn encoded_unit_bytes(frames: u32, height: u32, width: u32) -> usize {
+        media::encoded_unit_bytes(frames, height, width)
     }
 }
 
@@ -217,24 +202,19 @@ fn request_id(request: RequestKey) -> u64 {
 mod tests {
     use super::*;
 
-    /// The units of a request are its decoder's clips, and the last one carries the remainder.
+    /// The soundtrack covers every frame of every unit at the artifact's rate.
     ///
-    /// This is the timeline every artifact is checked against: a unit count that disagreed with the
-    /// clips the decoder publishes would mux a request with frames missing or with a unit the
-    /// encoder never made.
+    /// The two counts are one number read twice - the timeline is frames at the frame rate and
+    /// samples at the audio rate - so a track shorter than this leaves the last frames silent and a
+    /// longer one is samples the container has no place for.
     #[test]
-    fn the_units_of_a_request_are_its_clips() {
+    fn the_track_covers_every_frame_of_every_unit() {
         let rates = Rates {
             frame_rate: 24,
-            unit_frames: 17,
             audio_rate: 32_000,
         };
-        assert_eq!(rates.units(17), vec![17]);
-        assert_eq!(rates.units(34), vec![17, 17]);
-        assert_eq!(rates.units(96), vec![17, 17, 17, 17, 17, 11]);
-        assert_eq!(rates.units(0), Vec::<u32>::new());
-        // The soundtrack covers every frame of every unit at the artifact's rate.
-        assert_eq!(rates.samples(&rates.units(96)), 96 * 32_000 / 24);
+        assert_eq!(rates.samples(&[17, 17, 22]), 56 * 32_000 / 24);
+        assert_eq!(rates.samples(&[]), 0);
     }
 
     /// A clip that is not `frames * height * width * 3` bytes is refused before an encoder sees it.
@@ -248,13 +228,12 @@ mod tests {
             std::sync::Arc::new(media::MediaRunner::new(media::MediaConfig::default())),
             Rates {
                 frame_rate: 24,
-                unit_frames: 17,
                 audio_rate: 32_000,
             },
         );
         let request = RequestKey::new(0, ipc::RequestId(1), 0);
         let error = output
-            .encode_clip(request, 17, (17, 2, 2), &[0_u8; 16])
+            .encode_clip(request, &[17, 22], (17, 2, 2), &[0_u8; 16])
             .expect_err("a short clip");
         let message = format!("{error}");
         assert!(
