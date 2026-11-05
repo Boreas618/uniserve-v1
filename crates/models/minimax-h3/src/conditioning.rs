@@ -271,7 +271,15 @@ impl TokenRefiner {
     /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
     /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
     /// gated activation, and the residual each block folds its two updates through.
-    pub fn programs(config: &TransformerConfig, dtype: nn::DType) -> Result<Vec<(String, String)>> {
+    ///
+    /// **Two element types, because the refiner has two.** Its working buffer is as wide as the
+    /// prompt features it is handed, so the block norms and the per-head ones key that type; its
+    /// final norm writes the stack's rows, and that write is keyed by the type it writes.
+    pub fn programs(
+        config: &TransformerConfig,
+        working: nn::DType,
+        output: nn::DType,
+    ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::activation::ActAndMul as ActAndMulOp;
         use ops::attention::dense::DenseAttention;
@@ -289,17 +297,17 @@ impl TokenRefiner {
         // pair. None carries a bias.
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
-            dtype,
+            working,
             WeightOrder::NxK,
             false,
-            dtype,
-            dtype,
+            working,
+            working,
         ));
 
         // Two normalization widths: the hidden state's and one head's, which the query and the key
         // normalize over.
         for columns in [hidden, head] {
-            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, dtype));
+            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, working));
         }
 
         // The identity residual each block folds both of its updates through. Its scale is one
@@ -307,7 +315,7 @@ impl TokenRefiner {
         // operator broadcasts it across the row: declaring the row's width here states a key the
         // block never launches.
         programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            dtype,
+            working,
             IDENTITY_COLUMNS,
             false,
         )?);
@@ -324,16 +332,21 @@ impl TokenRefiner {
         )
         .map_err(Error::from)?;
         programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(dtype, dtype, dtype, hidden, true),
+            &attention.dense_descriptor(working, working, working, hidden, true),
         );
         // The halves of one packed projection: the stride they carry is twice their width.
         programs.launch::<ActAndMulOp>(&GatedActivation::packed_descriptor_of(
-            dtype,
+            working,
             u64::from(config.intermediate_size),
             Activation::Silu,
             u64::from(inner),
             true,
         )?);
+
+        // The refinement's last write, at the output's type: `forward` ends with
+        // `self.norm.forward(f, working, out)`, so FP32 working rows are narrowed into the
+        // stack's own. A single type here stated `rms_norm f32 5376`, which no launch makes.
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, output));
 
         Ok(programs.finish())
     }
