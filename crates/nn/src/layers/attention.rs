@@ -880,7 +880,7 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
 /// The bytes the trtllm-gen attention program needs as its workspace.
 ///
 /// The program's `workspace_size` argument (specs/worker.md 9); the executor carves it from its
-/// scratch pool and zeroes it once (specs/worker.md 5.4, [D4]).
+/// scratch pool and zeroes it once (specs/worker.md 5.4, `D4`).
 pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
 
 #[cfg(test)]
