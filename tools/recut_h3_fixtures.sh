@@ -132,7 +132,48 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
-# 2. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
+# 2. The recorder, against the same walk print. **This is the only check that can see a walk which
+#    forgets a launch.** `keys_delta` compares the fixture with its walk and `key_coverage` asks
+#    whether a package declares a key; both are green on a walk that states 139 rows while the model
+#    launches 175, because the walk is what they take as given. The recorder asks the model instead:
+#    every launch it records must be a row the walk states, or the fixture describes a model that does
+#    not exist. A non-zero count is a walk defect, not a tool fault, so the rows are printed.
+echo 'recorder:'
+recorder() {
+    name=$1
+    walk=$2
+    shift 2
+    if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example record -- --component all \
+        --conditioned "$conditioned" --tokens "$tokens" --elements "$elements" \
+        --track "$track" --extents "$extents" --types "$types" --against "$walk" \
+        "$@" >"$staging/record-$name.txt" 2>&1; then
+        printf '  %-8sFAILED\n' "$name"
+        tail -5 "$staging/record-$name.txt"
+        exit 1
+    fi
+    line=$(grep -E '^# [0-9]+ recorded' "$staging/record-$name.txt" || true)
+    if [ -z "$line" ]; then
+        printf '  %-8sthe recorder printed no summary, which reads exactly like a pass\n' "$name"
+        tail -5 "$staging/record-$name.txt"
+        exit 1
+    fi
+    unstated=$(printf '%s' "$line" | sed -n 's/.*\([0-9][0-9]*\) only recorded.*/\1/p')
+    printf '  %-8s%s\n' "$name" "$line"
+    if [ -z "$unstated" ] || [ "$unstated" != "0" ]; then
+        echo "the model launches rows this walk does not state (${unstated:-unparsed}):" >&2
+        grep '^recorded, not stated:' "$staging/record-$name.txt" >&2 || true
+        echo "a fixture cut here is short of launches the model makes; fix the walk, not the fixture" >&2
+        exit 1
+    fi
+}
+
+# `--extents` is the recorder's own fixture of tensor shapes; it is committed beside the fixtures.
+extents=${extents:-notes/programs/h3-extents.json}
+recorder dense "$walk_dense"
+recorder sparse "$walk_sparse" --sparse 64,0.9
+
+# 3. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
 #    file that exempts what nothing fails on.
 echo 'declared blocked:'
@@ -147,7 +188,7 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
 printf '  dense %s, sparse %s\n' \
     "$(wc -l <"$staging/blocked-dense.txt")" "$(wc -l <"$staging/blocked-sparse.txt")"
 
-# 3. The fixtures: the header, the block and the rows, from the walk's own print.
+# 4. The fixtures: the header, the block and the rows, from the walk's own print.
 echo 'fixtures:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
@@ -156,7 +197,7 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
     --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
 
-# 4. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
+# 5. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
 echo 'certify:'
 status=0
