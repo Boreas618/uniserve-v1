@@ -966,10 +966,10 @@ def _change_world(base_url: str, *assignments: str) -> dict:
     returns the change's report.
     """  # noqa: D205
     result = _apply(base_url, *assignments)
-    assert result["change"] == "world", result
+    assert result["change"] == "epoch", result
     committed = _admin(base_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    return result["world"]
+    return result["epoch"]
 
 
 def test_a_serving_deployment_answers_its_admin_api(
@@ -1590,7 +1590,7 @@ def _restart_while_streaming(
     port = find_free_port()
     both = _apply(moved_url, f"server_config.port={port}", CHANGE)
     assert both["change"] == "daemon", both
-    assert both["then"] == "world", both
+    assert both["then"] == "epoch", both
     successors.append(both["pid"])
     both_url = f"http://127.0.0.1:{port}"
 
@@ -1604,7 +1604,7 @@ def _restart_while_streaming(
     _wait_until(lambda: changed() is not None, 900, "the world did not change")
     last = changed()
     assert last["state"] == "succeeded", last
-    assert last["result"]["change"] == "world", last
+    assert last["result"]["change"] == "epoch", last
     committed = _admin(both_url, "config/commit")
     assert committed.status_code == 200, committed.text
     status = httpx.get(f"{both_url}/admin/config", timeout=10).json()

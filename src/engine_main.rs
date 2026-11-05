@@ -3280,7 +3280,15 @@ impl MainProcess {
         // and it is refused here, by name, before admission opens: `Promoted` followed
         // by a first request that finds no graph would tell the daemon the promotion
         // succeeded and move the frontend onto a process with no kernels.
-        if let Some(reason) = promote_refusal(self.standby, self.prepared.len()) {
+        // A standby that took the epoch's programs serves them already: its precopy, switchover
+        // and commit ran when the daemon handed them over, so its generation is the serving one.
+        let held = self.prepared.len()
+            + self
+                .generations
+                .iter()
+                .filter(|generation| !generation.is_empty())
+                .count();
+        if let Some(reason) = promote_refusal(self.standby, held) {
             tracing::warn!(%reason, "a promotion this process cannot serve is refused");
             self.send_report(proto::process::Report {
                 kind: Some(proto::process::report::Kind::Fault(

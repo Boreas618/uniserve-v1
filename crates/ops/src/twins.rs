@@ -48,6 +48,8 @@ pub struct Twins {
     buffer: Buffer,
     cursor: u64,
     pairs: Vec<Twin>,
+    /// The pairs whose real side has been copied out (`Self::freeze`).
+    frozen: usize,
     tolerance: Option<Tolerance>,
     failure: Option<Error>,
 }
@@ -66,6 +68,7 @@ impl Twins {
             buffer,
             cursor: 0,
             pairs: Vec::new(),
+            frozen: 0,
             tolerance: None,
             failure: None,
         })
@@ -155,6 +158,31 @@ impl Twins {
         &self.pairs
     }
 
+    /// Copies the real side of every pair recorded since the last call into this region.
+    ///
+    /// The comparison runs after the walk, and a real output lives in the bucket's arena, where a
+    /// later layer writes over it. So the old kernel's output is copied here the moment it is
+    /// written, on `stream`, and the pair compares that copy: both sides then hold what the two
+    /// kernels produced from one input, which is the comparison 7.3 asks for.
+    pub fn freeze(&mut self, stream: &Stream) {
+        for index in self.frozen..self.pairs.len() {
+            let real = self.pairs[index].real;
+            let copied = self.carve(real.shape, real.dtype).and_then(|address| {
+                let bytes = real.byte_len()?;
+                platform::copy_bytes(stream, address, real.ptr, bytes)?;
+                Ok(address)
+            });
+            match copied {
+                Ok(address) => {
+                    self.pairs[index].real =
+                        TensorView::with_strides(address, real.dtype, real.shape, real.strides);
+                }
+                Err(error) => self.fail(error),
+            }
+        }
+        self.frozen = self.pairs.len();
+    }
+
     /// The first carving that did not fit, if any; the harness fails the precopy with it.
     pub fn failure(&self) -> Option<&Error> {
         self.failure.as_ref()
@@ -164,6 +192,7 @@ impl Twins {
     pub fn reset(&mut self) {
         self.cursor = 0;
         self.pairs.clear();
+        self.frozen = 0;
         self.tolerance = None;
         self.failure = None;
     }
