@@ -246,6 +246,29 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 "the decoder runner loaded before its device's pools were attached",
             ));
         }
+        // **The plan is the floor of the device's share, checked here rather than discovered by a
+        // capture that has to be thrown away.** The pool is the runtime's policy - a share of the
+        // device per stream - and the model states what one decode of a layout reserves, so a share
+        // below the plan is refused while the deployment is being assembled, naming the bucket and
+        // both numbers, rather than at the first frame that reaches the arena.
+        let offered = self.pool()?.reserved();
+        for bucket in self.capture_order() {
+            let layout = Self::layout_of(&self.model, bucket)?;
+            let needed = match self.model.arena_bytes(&layout) {
+                Ok(bytes) => bytes,
+                // A decoder that states no plan is not a shortfall: the pool is then the only figure
+                // there is, and a decode that outgrows it refuses at its own launch by name. The
+                // refusal is not turned into a pass, which would be the same value as "it fits".
+                Err(_) => continue,
+            };
+            if needed > offered {
+                return Err(Error::Invalid(format!(
+                    "bucket {bucket} needs {needed} B of arena for one decode and this device's share \
+                     is {offered} B: the model's plan is the floor, so a share below it serves nothing \
+                     - raise the device's graph share or drop a canvas from the deployment",
+                )));
+            }
+        }
         for bucket in self.capture_order() {
             self.fill(bucket)?;
         }
