@@ -1947,6 +1947,7 @@ mod tests {
             6,
             report(process::report::Kind::Promoted(process::Promoted {
                 generation: 6,
+                program_generation: 0,
             })),
         )];
         switch.advance(&mut roster);
@@ -1964,6 +1965,7 @@ mod tests {
                 7,
                 report(process::report::Kind::Promoted(process::Promoted {
                     generation: 7,
+                    program_generation: 0,
                 })),
             ),
             report_event(
@@ -1971,6 +1973,7 @@ mod tests {
                 7,
                 report(process::report::Kind::Promoted(process::Promoted {
                     generation: 7,
+                    program_generation: 0,
                 })),
             ),
         ];
