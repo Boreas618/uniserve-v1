@@ -1847,7 +1847,7 @@ impl MainProcess {
                 );
             }
         }
-        resolve_slots(named, &chosen, &built).map_err(invalid)
+        resolve_slots(named, &chosen, &built, &listing.packages).map_err(invalid)
     }
 
     /// One operator's program from this host's store, for a walk that named an operator the
@@ -5842,6 +5842,7 @@ fn resolve_slots(
     named: &Programs,
     chosen: &BTreeMap<String, Vec<(String, u32)>>,
     built: &BTreeMap<(String, String, u32), Vec<String>>,
+    packages: &[program_server::protocol::ListedPackage],
 ) -> std::result::Result<(Programs, Candidates), String> {
     let keys_of = |op: &str, program: &Program| -> Vec<String> {
         built
@@ -5880,24 +5881,48 @@ fn resolve_slots(
             .iter()
             .find(|(_, program)| keys_of(&op, program).is_empty())
         {
+            // What the store has built for the operator, and what it holds without a module: the
+            // two are different facts and the message states both, because a package that is
+            // declared and unbuilt is a store build away from serving, while a package that is not
+            // there at all is a deployment question.
             let held: Vec<String> = chosen
                 .get(&op)
                 .into_iter()
                 .flatten()
                 .map(|(backend, revision)| format!("{backend} revision {revision}"))
                 .collect();
-            return Err(format!(
+            let built_here = |backend: &str, revision: u32| {
+                chosen
+                    .get(&op)
+                    .is_some_and(|held| held.iter().any(|(b, r)| b == backend && *r == revision))
+            };
+            let declared: Vec<String> = packages
+                .iter()
+                .filter(|package| package.op == op && !built_here(&package.backend, package.revision))
+                .map(|package| format!("{} revision {}", package.backend, package.revision))
+                .collect();
+            let mut answer = format!(
                 "the deployment names {op}/{} revision {} and this host has built no module of it \
-                 for its targets: the store holds {} - build the named package for this host's \
-                 targets, or name a backend the store holds",
+                 for its targets: the store holds {}",
                 program.backend,
                 program.revision,
                 if held.is_empty() {
-                    format!("no package of {op}")
+                    format!("no built package of {op}")
                 } else {
                     held.join(", ")
                 }
-            ));
+            );
+            if !declared.is_empty() {
+                answer.push_str(&format!(
+                    " and declares {} without a module for this host's targets",
+                    declared.join(", ")
+                ));
+            }
+            answer.push_str(
+                " - build the named package for this host's targets, or name a backend the store \
+                 holds",
+            );
+            return Err(answer);
         }
         // A deployment that states a backend per phase - a prefill attention backend and a decode
         // one - has already said which keys each of them covers, so nothing here is decided from
@@ -6449,7 +6474,7 @@ mod tests {
         );
 
         let (programs, candidates) =
-            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6520,7 +6545,7 @@ mod tests {
         );
 
         let (programs, _) =
-            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6982,10 +7007,10 @@ mod tests {
             },
         );
 
-        let (unnamed, _) = resolve_slots(&Programs::new(), &chosen, &built)
+        let (unnamed, _) = resolve_slots(&Programs::new(), &chosen, &built, &[])
             .expect("the store decides when nothing is named");
         let (with_name, _) =
-            resolve_slots(&named, &chosen, &built).expect("the named package is built here");
+            resolve_slots(&named, &chosen, &built, &[]).expect("the named package is built here");
 
         let slots = |programs: &Programs| {
             let mut held: Vec<(String, Option<PhaseKind>, String)> = programs
@@ -7045,7 +7070,15 @@ mod tests {
             },
         );
 
-        let error = resolve_slots(&named, &chosen, &built)
+        // The store holds the named package and has never built it: that is a store build away
+        // from serving, and the refusal says so rather than naming a substitution.
+        let packages = vec![program_server::protocol::ListedPackage {
+            op: "paged_attention".to_owned(),
+            backend: "trtllm".to_owned(),
+            revision: 1,
+            modules: Vec::new(),
+        }];
+        let error = resolve_slots(&named, &chosen, &built, &packages)
             .expect_err("nothing of the named package was built here");
         assert!(
             error.contains("paged_attention/trtllm revision 1"),
@@ -7054,6 +7087,10 @@ mod tests {
         assert!(
             error.contains("fa4 revision 1"),
             "the refusal does not name what the store holds instead: {error}"
+        );
+        assert!(
+            error.contains("declares trtllm revision 1 without a module"),
+            "the refusal does not tell a declared-but-unbuilt package from a missing one: {error}"
         );
     }
 
