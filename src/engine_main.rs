@@ -635,6 +635,10 @@ pub(crate) struct MainProcess {
     /// daemon is told the same state on the connection it gives (§7.5.1 step 2): a successor that
     /// is not told what this engine is never counts it as serving.
     reported_state: i32,
+    /// What this process last announced it is, kept so that a daemon attaching mid-epoch is
+    /// told it without asking the schedulers anything: the attach is a handover's step and a
+    /// control thread blocked in a cache description cannot serve one.
+    announced: Option<proto::request::wire::EngineInfo>,
     /// Whether the closing of the daemon's process interface has been reported: the interface
     /// stays closed, and the line is worth stating once.
     noted_process_closed: bool,
@@ -917,6 +921,7 @@ impl MainProcess {
             switchovers: 0,
             announced_at: None,
             reported_state: proto::request::wire::EngineState::Starting as i32,
+            announced: None,
             noted_process_closed: false,
             commands_seen: 0,
             command_wait: Wait::default(),
@@ -4115,6 +4120,7 @@ impl MainProcess {
             | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
             _ => None,
         };
+        self.announced = info.clone();
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
@@ -4133,11 +4139,11 @@ impl MainProcess {
     /// What an attaching daemon is told this process is: the info it announced, for a state that
     /// carries one, and nothing otherwise.
     fn announced_info(&mut self) -> Option<proto::request::wire::EngineInfo> {
-        match proto::request::wire::EngineState::try_from(self.reported_state).ok()? {
-            proto::request::wire::EngineState::Ready
-            | proto::request::wire::EngineState::Standby => self.engine_info().ok(),
-            _ => None,
-        }
+        // The value announced, not a fresh one: describing the cache asks every scheduler for
+        // what it holds, and a scheduler that is busy does not answer for as long as the stall
+        // bound - which is a control thread that cannot serve the handover's own attach
+        // (`501fa5e6f`: the engine read the attach and then said nothing for sixty seconds).
+        self.announced.clone()
     }
 
     /// What the daemon records of this process: the limits every request is checked against, the
