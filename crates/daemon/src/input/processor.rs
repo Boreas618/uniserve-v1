@@ -307,15 +307,6 @@ impl InputProcessor {
             })
     }
 
-    /// Returns whether the model supports image output.
-    ///
-    /// No model this daemon serves generates images; the families that did
-    /// are not served, and a request that asks for image output is refused by
-    /// [`Self::validate_generation_features`].
-    pub fn supports_image_output(&self) -> bool {
-        false
-    }
-
     /// Returns whether the model supports image input.
     ///
     /// No model this daemon serves accepts image input, for the same reason:
@@ -358,7 +349,7 @@ impl InputProcessor {
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if constraint != GenerationConstraint::UndOnly && !self.supports_image_output() {
+        if constraint != GenerationConstraint::UndOnly {
             return Err(reject("image_output"));
         }
         if let Prompt::Chat(chat) = prompt {
