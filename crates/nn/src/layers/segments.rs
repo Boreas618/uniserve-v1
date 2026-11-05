@@ -453,12 +453,18 @@ impl VsaTiles {
                 ),
             ));
         }
-        let width = u32::try_from(pooled_query.shape.dim(2)).map_err(|_| {
-            Error::shape(
+        // The pooled features are the layer's own width: the program sums that many per head, and a
+        // wider query would be read through a stride the descriptor never declared.
+        if pooled_query.shape.dim(2) != u64::from(self.width) {
+            return Err(Error::shape(
                 "VsaTiles",
-                format!("{} features per head", pooled_query.shape.dim(2)),
-            )
-        })?;
+                format!(
+                    "the pooled query holds {} features per head, the layer {}",
+                    pooled_query.shape.dim(2),
+                    self.width
+                ),
+            ));
+        }
         let descriptor = self.scores_descriptor();
         let args = segments::ScoresArgs {
             pooled_query,
