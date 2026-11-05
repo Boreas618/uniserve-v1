@@ -943,9 +943,10 @@ impl MainProcess {
 
     /// The program generation this process holds and would serve from now on (§7.3).
     ///
-    /// A prepared generation is the one a switchover takes, so it is what a promotion is about; a
-    /// process with none prepared holds the generation it was launched at, and a process that holds
-    /// neither states `0`, which is "unstated" on the wire.
+    /// A prepared generation is the one a switchover takes, so it is what a promotion is about. With
+    /// none prepared this is `HotUpdate`'s current generation, which is the daemon's own number from
+    /// the last `Precopy` or switchover and `0` before any - never the launch number, which is what
+    /// `Promoted.generation` states and a different question entirely.
     fn served_generation(&self) -> u64 {
         self.prepared
             .first()
