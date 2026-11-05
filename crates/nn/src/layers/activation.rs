@@ -86,6 +86,24 @@ impl GatedActivation {
         })
     }
 
+    /// The descriptor of a gated activation over the two halves of **one packed projection**.
+    ///
+    /// A walk states the keys a launch will make but cannot see the views a launch will build, and the
+    /// packed form is where stating a stride by hand goes wrong: the halves of a `[rows, 2 · width]`
+    /// projection keep the packed row stride, so each one's stride between rows is **twice its width**.
+    /// `descriptor_of(.., width, .., 2 · width, 2 · width, ..)` is what `forward` derives from those
+    /// views; this is that arithmetic, stated once, next to the contract and proved against a packed
+    /// view in the tests below.
+    pub fn packed_descriptor_of(
+        dtype: DType,
+        width: u64,
+        activation: Activation,
+        elements: u64,
+        stepwise: bool,
+    ) -> Result<activation::ActAndMulDescriptor> {
+        Self::descriptor_of(dtype, width, activation, 2 * width, 2 * width, elements, stepwise)
+    }
+
     /// `out = act(gate) · value`.
     ///
     /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
@@ -531,5 +549,48 @@ impl Silu {
             .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
         let descriptor = Self::descriptor_of(x.dtype, columns);
         f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ops::Shape;
+
+    /// The packed descriptor is the one a launch derives from the two halves of one packed projection:
+    /// the halves keep the packed row stride, so each one's stride between rows is twice its width.
+    ///
+    /// This is stated as a test because getting it wrong is silent: a walk that writes the half's width
+    /// instead names a program no launch makes, and a store built from that key holds a cell nothing
+    /// reads while the launch's own key is missing — the failure surfaces at a run, not at a build.
+    #[test]
+    fn a_packed_projection_states_the_stride_its_halves_carry() {
+        let width = 14_336u64;
+        let rows = 3u64;
+        let packed = TensorView::new(
+            ops::DevicePtr::new(0),
+            DType::BF16,
+            Shape::new(&[rows, 2 * width]),
+        );
+        let half = Shape::new(&[rows, width]);
+        let value = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
+        let gate = TensorView::with_strides(packed.ptr, packed.dtype, half, packed.strides);
+
+        assert_eq!(gate.strides.get(0), 2 * width, "the half keeps the packed stride");
+
+        let derived = GatedActivation::descriptor_of(
+            DType::BF16,
+            width,
+            Activation::Silu,
+            gate.strides.get(0),
+            value.strides.get(0),
+            rows * width,
+            true,
+        )
+        .expect("the halves' descriptor");
+        let stated =
+            GatedActivation::packed_descriptor_of(DType::BF16, width, Activation::Silu, rows * width, true)
+                .expect("the packed descriptor");
+        assert_eq!(derived, stated);
     }
 }
