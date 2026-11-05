@@ -273,6 +273,15 @@ fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
                 anyhow!("invalid option `{path}`: {cause}")
             }
         })?;
+    // A retired option's name is refused here, with the configuration, rather
+    // than left unknown: an unknown field names the mistake but not the way
+    // out, and a table nothing reads would be silent. The field that parses it
+    // is never serialized, so a dump cannot carry it back.
+    anyhow::ensure!(
+        config.retired_quantization_config.is_none(),
+        "`quantization_config` is retired: state the precision policy as `quantization` \
+         (`--set quantization.mode=...`, or `[quantization]` in --config)"
+    );
     // The environment supplies the key the configuration leaves unset or
     // blank.
     config.server_config.api_key =
