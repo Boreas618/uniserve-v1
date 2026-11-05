@@ -1999,6 +1999,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         gather_indices(
             &batch.logits_rows,
             &batch.query_offsets,
+            usize::try_from(self.staging.live_tokens()).unwrap_or(usize::MAX),
             rows,
             &mut self.indices,
         )?;
@@ -2576,11 +2577,17 @@ fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> R
 /// sampled; the token whose logits that row samples is the **last token of the row's own query
 /// range**, which `query_offsets` states. The two indices agree only when every row holds one
 /// token - a decode - so a batch whose rows carry several tokens reads its prefill from the wrong
-/// row without this mapping. A row that samples nothing gathers the stack's first token, whose id
-/// the sampler discards.
+/// row without this mapping.
+///
+/// A prefilling bucket's padding tokens belong to the **last** row: `Staging::stage` extends that
+/// row's range to the bucket's token axis, because the pack the attention kernel reads ends there.
+/// So the range's end is the last token of the *bucket*, not of the batch, and the count that tells
+/// them apart is the batch's own live token count. A row that samples nothing gathers the stack's
+/// first token, whose id the sampler discards.
 fn gather_indices(
     logits_rows: &[i32],
     query_offsets: &[i32],
+    live_tokens: usize,
     rows: usize,
     out: &mut Vec<i32>,
 ) -> Result<()> {
@@ -2591,12 +2598,16 @@ fn gather_indices(
             query_offsets.len()
         )));
     }
+    let live = i32::try_from(live_tokens)
+        .map_err(|_| Error::Invalid("a batch of more tokens than an i32 counts".into()))?;
     out.clear();
     for row in 0..rows {
         out.push(if logits_rows[row] < 0 {
             0
         } else {
-            query_offsets[row + 1].saturating_sub(1).max(0)
+            // The batch's own tokens end at `live_tokens`, and only the last row's range was
+            // extended past them.
+            query_offsets[row + 1].min(live).saturating_sub(1).max(0)
         });
     }
     Ok(())
@@ -2613,25 +2624,28 @@ mod tests {
         use super::gather_indices;
 
         let mut indices = Vec::new();
-        // One call of three prompt tokens, ending its prompt.
-        gather_indices(&[0], &[0, 3], 1, &mut indices).expect("a prefill");
-        assert_eq!(indices, vec![2], "the prefill samples its last token");
+        // One call of three prompt tokens, ending its prompt, in a bucket whose token axis holds
+        // eight: `stage` extends the row's range over the five padding tokens, so the row's range
+        // ends at the bucket and the batch's own count is what names the last real token.
+        gather_indices(&[0], &[0, 8], 3, 1, &mut indices).expect("a prefill");
+        assert_eq!(indices, vec![2], "the prefill samples its last real token");
 
-        // Two calls, one of three prompt tokens and one of a single token.
-        gather_indices(&[0, 1], &[0, 3, 4], 2, &mut indices).expect("two prefills");
+        // Two calls, one of three prompt tokens and one of a single token, the last padded.
+        gather_indices(&[0, 1], &[0, 3, 8], 4, 2, &mut indices).expect("two prefills");
         assert_eq!(indices, vec![2, 3]);
 
-        // A decode of three one-token rows: the row index is the token index.
-        gather_indices(&[0, 1, 2], &[0, 1, 2, 3], 3, &mut indices).expect("a decode");
+        // A decode of three one-token rows: the row index is the token index, and a decode bucket
+        // extends no row's range over padding rows.
+        gather_indices(&[0, 1, 2], &[0, 1, 2, 3], 3, 3, &mut indices).expect("a decode");
         assert_eq!(indices, vec![0, 1, 2]);
 
         // A chunked prefill that ends no prompt samples nothing, and its row gathers an in-range
         // token the sampler discards, so the row after it still reads its own last token.
-        gather_indices(&[-1, 1], &[0, 2, 3], 2, &mut indices).expect("a chunk and a row");
+        gather_indices(&[-1, 1], &[0, 2, 8], 3, 2, &mut indices).expect("a chunk and a row");
         assert_eq!(indices, vec![0, 2]);
 
         // Fewer columns than rows is refused rather than read past.
-        assert!(gather_indices(&[0], &[0, 3], 2, &mut indices).is_err());
+        assert!(gather_indices(&[0], &[0, 3], 3, 2, &mut indices).is_err());
     }
 
     use super::*;
