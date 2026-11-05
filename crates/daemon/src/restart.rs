@@ -183,6 +183,15 @@ pub(crate) struct Restarter {
     /// the engine instead of shutting it down, and leaves the service and
     /// the storage to the successor.
     pub(crate) handed_over: Arc<AtomicBool>,
+    /// Whether the restart in flight has concluded, and how: `None` while one
+    /// runs, `Some(true)` once a successor adopted the deployment, `Some(false)`
+    /// when it gave up.
+    ///
+    /// The process must not exit while a successor is still adopting: the
+    /// handoff channel is a socket pair held by the restarting task, so exiting
+    /// closes it under the successor, which then reports `the peer closed the
+    /// connection` (run `bdf651928`).
+    decided: tokio::sync::watch::Sender<Option<bool>>,
     /// The responses in flight, which a restart pauses at an engine event
     /// boundary and hands to the successor (design §7.5.1), attached once
     /// the HTTP server serves.
@@ -212,6 +221,7 @@ impl Restarter {
             stated,
             accepting,
             handed_over: Arc::new(AtomicBool::new(false)),
+            decided: tokio::sync::watch::channel(None).0,
             handoff: std::sync::Mutex::new(None),
         })
     }
@@ -238,6 +248,32 @@ impl Restarter {
     /// Fails when the successor does not start or gives up; before the
     /// service was handed over, this daemon serves on.
     pub(crate) async fn restart(
+        &self,
+        executable: Option<String>,
+        config: Option<crate::options::ServeConfig>,
+        then: Option<Box<crate::updates::change::ApplyRequest>>,
+        leader: &Arc<Leader>,
+        admin: &Arc<Admin>,
+        jobs: &Arc<VideoJobs>,
+    ) -> anyhow::Result<u32> {
+        let outcome = self
+            .hand_over(executable, config, then, leader, admin, jobs)
+            .await;
+        // The restart is concluded however it ended: a daemon waiting to exit
+        // stops waiting here, and a successor that adopted the deployment is the
+        // only case in which this one may let go of it.
+        let _ = self.decided.send(Some(outcome.is_ok()));
+        outcome
+    }
+
+    /// The restarter's channel receiver: whoever must wait for the decision
+    /// subscribes before the restart starts.
+    pub(crate) fn decide(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
+        self.decided.subscribe()
+    }
+
+    /// The restart itself, up to the successor serving.
+    async fn hand_over(
         &self,
         executable: Option<String>,
         config: Option<crate::options::ServeConfig>,
@@ -1000,6 +1036,11 @@ fn adopted_epoch(
     };
     (record, process)
 }
+
+/// How long a daemon that stopped serving waits for a restart in flight to
+/// conclude before it exits anyway: the successor's own bounds are its connect
+/// timeout and the prepare deadline, both shorter than this.
+pub(crate) const RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[cfg(test)]
 mod tests {
