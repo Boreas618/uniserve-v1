@@ -344,23 +344,36 @@ impl MediaColumns {
 ///
 /// The record is the mechanism-to-model seam for one request of a media computation, and it holds
 /// what the mechanism owns and nothing else: the request's conditioning exactly as the model family
-/// planned it, the diffusion step the batch is, and the seed and canvas the request states. The
-/// model's own device-side preparation (the encoded conditioning rows, the latent trajectory) is the
-/// model's and is not carried here, because a mechanism that filled it would be inventing either a
-/// tensor it cannot read or a shape the model never stated.
+/// planned it, the diffusion step the batch is, the seed and canvas the request states, and the
+/// request's identity. The model's own device-side preparation (the encoded conditioning rows, the
+/// latent trajectory) is the model's and is not carried here, because a mechanism that filled it
+/// would be inventing either a tensor it cannot read or a shape the model never stated.
 ///
 /// # The bytes
 ///
 /// A staged request is two buffers, in this order:
 ///
 /// - **0**, the conditioning blob, byte for byte as `DiffusionRequest::conditioning` holds it;
-/// - **1**, twenty-eight bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
-///   `height: u32`, `frames: u32`.
+/// - **1**, fifty-two bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
+///   `height: u32`, `frames: u32`, then the identity - `engine_id: u64`, `request_id: u64`,
+///   `request_epoch: u64`.
 ///
 /// Little-endian and fixed width so that a worker and an engine of different architectures read one
 /// record, and so that a runner reads offsets rather than a parser.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// # Why the identity travels with the row
+///
+/// An in-process batch numbers its calls by their position (`Batch::calls` is a list of indices), so
+/// a row tells a runner *where* a request is and never *which* request it is. A step that must find
+/// what the previous step of the same request left behind - a latent trajectory, an encoded
+/// conditioning - has nothing to key on without this, and a request whose row moved between two
+/// batches would take another request's state. The mechanism owns the key, so the mechanism states
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedRequest {
+    /// The request this row's state belongs to: the only name a step has for what it must find
+    /// again, since a batch numbers its calls by position.
+    pub request: ipc::RequestKey,
     /// The request's conditioning, as the model family planned it.
     pub conditioning: Vec<u8>,
     /// The zero-based diffusion step this batch is.
@@ -387,6 +400,9 @@ impl StagedRequest {
         record.extend_from_slice(&self.width.to_le_bytes());
         record.extend_from_slice(&self.height.to_le_bytes());
         record.extend_from_slice(&self.frames.to_le_bytes());
+        record.extend_from_slice(&self.request.engine_id.to_le_bytes());
+        record.extend_from_slice(&self.request.request_id.0.to_le_bytes());
+        record.extend_from_slice(&self.request.request_epoch.to_le_bytes());
         vec![self.conditioning.clone(), record]
     }
 
@@ -408,14 +424,24 @@ impl StagedRequest {
         let word = |at: usize| {
             u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
         };
+        let word64 = |at: usize| {
+            u64::from_le_bytes([
+                record[at],
+                record[at + 1],
+                record[at + 2],
+                record[at + 3],
+                record[at + 4],
+                record[at + 5],
+                record[at + 6],
+                record[at + 7],
+            ])
+        };
         Ok(Self {
+            request: ipc::RequestKey::new(word64(28), ipc::RequestId(word64(36)), word64(44)),
             conditioning: conditioning.clone(),
             step: word(0),
             steps: word(4),
-            seed: u64::from_le_bytes([
-                record[8], record[9], record[10], record[11], record[12], record[13], record[14],
-                record[15],
-            ]),
+            seed: word64(8),
             width: word(16),
             height: word(20),
             frames: word(24),
@@ -423,9 +449,9 @@ impl StagedRequest {
     }
 }
 
-/// The width of a staged request's parameter record: four `u32` words, one `u64`, and three
-/// `u32` words over `step`, `steps`, `seed`, `width`, `height` and `frames`.
-const PARAMETER_BYTES: usize = 4 + 4 + 8 + 4 + 4 + 4;
+/// The width of a staged request's parameter record: `step`, `steps`, `seed`, `width`, `height` and
+/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`).
+const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8);
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
@@ -1203,6 +1229,7 @@ mod media_tests {
     #[test]
     fn a_staged_request_is_the_conditioning_blob_and_its_parameter_record() {
         let staged = StagedRequest {
+            request: ipc::RequestKey::new(7, ipc::RequestId(41), 3),
             conditioning: vec![9, 8, 7],
             step: 3,
             steps: 12,
@@ -1226,9 +1253,12 @@ mod media_tests {
             &0x0102_0304_0506_0708u64.to_le_bytes(),
             "seed"
         );
+        let decoded = StagedRequest::decode(&row).expect("the record round-trips");
+        assert_eq!(decoded, staged);
         assert_eq!(
-            StagedRequest::decode(&row).expect("the record round-trips"),
-            staged
+            decoded.request,
+            ipc::RequestKey::new(7, ipc::RequestId(41), 3),
+            "the identity is the row's name for what a step must find again"
         );
 
         let columns = MediaColumns::staged(
