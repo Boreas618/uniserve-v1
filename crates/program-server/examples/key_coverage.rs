@@ -35,6 +35,13 @@ use program_server::source::PackageSource;
 /// What a manifest knows about one fixture key.
 struct Covering {
     backend: String,
+    /// Every backend that covers this key for the target, in package order.
+    ///
+    /// More than one is a defect rather than a choice: two packages claiming one key means two hosts
+    /// can build different modules under one name, and a store built here would publish whichever the
+    /// directory walk offered first. `build_store.py` refuses such a fixture before it compiles; this
+    /// example states it before a fixture is written, which is the cheaper end to catch it at.
+    claimants: Vec<String>,
     form: ModuleForm,
     /// The metadata JSON's name in the module directory, for this descriptor.
     metadata: Option<String>,
@@ -105,12 +112,17 @@ fn main() -> ExitCode {
     }
 
     let mut uncovered = 0;
+    let mut double_claimed: Vec<(&str, &str, Vec<String>)> = Vec::new();
     for (op, key) in &rows {
         match cover(&packages, op, key, &target) {
             Ok(covering) if declared_blocked => {
                 let _ = covering;
             }
-            Ok(covering) => println!(
+            Ok(covering) => {
+                if covering.claimants.len() > 1 {
+                    double_claimed.push((op, key, covering.claimants.clone()));
+                }
+                println!(
                 "covered\t{op}\t{}\t{}\t{}\t{key}",
                 covering.backend,
                 match covering.form {
@@ -120,7 +132,8 @@ fn main() -> ExitCode {
                     ModuleForm::Executable => "executable",
                 },
                 covering.metadata.as_deref().unwrap_or("-"),
-            ),
+            )
+            }
             Err(reason) => {
                 uncovered += 1;
                 if declared_blocked {
@@ -163,14 +176,31 @@ fn main() -> ExitCode {
         );
     }
 
-    if uncovered == 0 {
+    if !double_claimed.is_empty() {
+        println!(
+            "\n# {} key(s) are covered by more than one package for {target}:",
+            double_claimed.len()
+        );
+        for (op, key, claimants) in &double_claimed {
+            println!("#   {op}\t{key}\tclaimed by {}", claimants.join(" "));
+        }
+    }
+
+    if uncovered == 0 && double_claimed.is_empty() {
         println!("\n# every key is covered for {target}");
+        // A key two packages claim is covered, and cannot be installed deterministically, so the
+        // second line says which of the two facts this run established.
+        println!("# every key is covered by exactly one package");
         ExitCode::SUCCESS
     } else {
-        println!(
-            "\n# {uncovered} of {} keys are not covered for {target}",
-            rows.len()
-        );
+        if uncovered > 0 {
+            println!(
+                "\n# {uncovered} of {} keys are not covered for {target}",
+                rows.len()
+            );
+        } else {
+            println!("\n# every key is covered for {target}, but not once");
+        }
         ExitCode::FAILURE
     }
 }
@@ -279,6 +309,10 @@ fn cover(
     let source = PackageSource::new(chosen.root.clone(), chosen.manifest.clone());
     Ok(Covering {
         backend: chosen.manifest.backend.clone(),
+        claimants: built
+            .iter()
+            .map(|candidate| candidate.manifest.backend.clone())
+            .collect(),
         form: chosen.manifest.module.form,
         metadata: match chosen.manifest.module.form {
             // A native module's C entry builds its own launches, so there is no metadata to read.
