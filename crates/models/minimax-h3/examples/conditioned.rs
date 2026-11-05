@@ -921,7 +921,7 @@ fn encode(args: &Args) -> Result<(), String> {
             &checkpoint,
             partition,
             deployment,
-            (tile, tile),
+            &[(tile, tile)],
             &mut loader,
         )
         .map_err(show)?

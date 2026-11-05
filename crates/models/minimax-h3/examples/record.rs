@@ -763,9 +763,11 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         .map_err(|error| error.to_string())?;
     let input =
         Linear::new(projection, Some(bias), WeightOrder::NxK).map_err(|error| error.to_string())?;
+    let spatial = config.spatial_compression();
+    let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
     let decoder = VideoDecoder::load(
         &config,
-        clip_canvas,
+        &[raster],
         AttentionKind::Dense,
         DType::F32,
         input,
@@ -776,7 +778,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
     let scratch = decoder
-        .scratch(&forward)
+        .scratch(&forward, &clip_canvas)
         .map_err(|error| error.to_string())?;
     let latents = arena
         .tensor(
@@ -801,7 +803,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
-    let run = decoder.decode(&forward, latents, positions, out, &scratch);
+    let run = decoder.decode(&forward, &clip_canvas, latents, positions, out, &scratch);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
 
