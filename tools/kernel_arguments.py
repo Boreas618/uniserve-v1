@@ -925,41 +925,42 @@ def main() -> int:
 
 
 
-    if arguments.native:
-        problems, gaps, compared = native(arguments.verbose)
-        if arguments.json:
-            record("native", compared, problems, gaps)
-            return 1 if (arguments.check and problems) else 0
-        for problem in problems:
-            print(f"  problem: {problem}")
-        for gap in gaps:
-            print(f"  gap:     {gap}")
-        return 1 if (arguments.check and problems) else 0
-
-    if arguments.fixture:
-        if not arguments.store:
-            print(
-                "--fixture needs --store: the cells are what the comparison reads"
+    # A run may ask for both comparisons, and the harness asks for both in one check: the artifact
+    # sweep is what a built storeanswers and the native comparison needs no store at all, so one
+    # invocation is one line in the count and neither mode is a second entry in a table keyed by name.
+    if arguments.native or arguments.fixture:
+        problems: list[str] = []
+        gaps: list[str] = []
+        if arguments.native:
+            found, missing, compared = native(arguments.verbose)
+            problems.extend(found)
+            gaps.extend(missing)
+            if arguments.json:
+                record("native", compared, found, missing)
+        if arguments.fixture:
+            if not arguments.store:
+                print("--fixture needs --store: the cells are what the comparison reads")
+                return 2
+            found, missing, compared = sweep(
+                pathlib.Path(arguments.fixture),
+                pathlib.Path(arguments.store),
+                arguments.target,
             )
-            return 2
-        problems, gaps, compared = sweep(
-            pathlib.Path(arguments.fixture),
-            pathlib.Path(arguments.store),
-            arguments.target,
-        )
-        if arguments.json:
-            record(
-                f"cells {arguments.fixture} against {arguments.store}",
-                compared,
-                problems,
-                gaps,
-            )
-            return 1 if (arguments.check and problems) else 0
-        print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
-        for problem in problems:
-            print(f"  problem: {problem}")
-        for gap in gaps:
-            print(f"  gap:     {gap}")
+            problems.extend(found)
+            gaps.extend(missing)
+            if arguments.json:
+                record(
+                    f"cells {arguments.fixture} against {arguments.store}",
+                    compared,
+                    found,
+                    missing,
+                )
+        if not arguments.json:
+            print(f"{len(problems)} problem(s), {len(gaps)} gap(s)")
+            for problem in problems:
+                print(f"  problem: {problem}")
+            for gap in gaps:
+                print(f"  gap:     {gap}")
         return 1 if (arguments.check and problems) else 0
 
     operators = arguments.operator or sorted(
