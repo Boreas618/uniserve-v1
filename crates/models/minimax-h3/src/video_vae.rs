@@ -588,7 +588,7 @@ fn pack_voxel_rows(
     let rows = voxel_rows(config, attention, canvas.height, canvas.width)?;
     if rows.len() as u64 != canvas.voxels() {
         return Err(Error::config(format!(
-            "the decoder's voxel table names {} rows for a clip of {} voxels",
+            "the decoder's voxel table names {} rows for a tile of {} voxels",
             rows.len(),
             canvas.voxels()
         )));
@@ -1113,7 +1113,17 @@ impl VideoDecoder {
             output,
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
-            voxel_rows: pack_voxel_rows(loader, config, attention, canvas)?,
+            // **A tile's permutation, not the clip's.** `decode` scatters a tile's rows with
+            // `place.replace(stream, projected, voxel_rows)` and `stream` is the tile's, so a clip-built
+            // table indexes a 1,797-row buffer with positions up to the clip's 16,127 - a write past the
+            // buffer for every tile after the first. The grid's tiles are uniform (`decode_clip` refuses
+            // a grid of two sizes), so one tile's table serves the clip.
+            voxel_rows: pack_voxel_rows(
+                loader,
+                config,
+                attention,
+                largest_tile(config, canvas.height, canvas.width)?,
+            )?,
             offsets: {
                 // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
                 // created once with the weights and read by every clip's attention launch.
@@ -1185,7 +1195,11 @@ pub fn constants(
             format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta),
             u64::from(rotated / 2) * 4,
         ),
-        ("video_vae.voxel_rows".to_owned(), canvas.voxels() * 4),
+        // One tile's, for the same reason `load` publishes a tile's: see the note there.
+        (
+            "video_vae.voxel_rows".to_owned(),
+            largest_tile(config, canvas.height, canvas.width)?.voxels() * 4,
+        ),
     ])
 }
 
@@ -1340,6 +1354,15 @@ impl VideoDecoder {
     /// tiles share one set: they are used sequentially, and the arena never rewinds, so a per-tile
     /// reservation would grow the clip's footprint by the tile count. The plan states these once
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
+    /// The canvas this decoder was built for: the clip one tiled decode is its grid of.
+    ///
+    /// [`crate::decoding::ClipDecoder::decode_clip`] compares the grid it is handed against this, because
+    /// a decoder built for another canvas scatters a tile's rows with that canvas's permutation - the
+    /// table is a constant of the canvas ([`Self::decode`]), and past its buffer when the two differ.
+    pub fn canvas(&self) -> &Canvas {
+        &self.canvas
+    }
+
     /// The largest of this clip's decode tiles: what one tile's buffers are sized by.
     ///
     /// [`Tiles`] splits the clip's canvas into tiles of at most the configured tile size, so a tile at
@@ -1835,6 +1858,46 @@ pub fn fold_input_affine(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The voxel-row table is **one tile's**, not the clip's. It is the destination index of the
+    /// decode's scatter into a tile-sized stream, so a clip-sized table writes past that stream for
+    /// every tile after the first - and the declaration a runner reserves by has to say the same
+    /// length the published table has.
+    #[test]
+    fn a_multi_tile_canvass_voxel_table_is_a_tiles_not_the_clips() {
+        let config = video_config();
+        let canvas = Canvas::clip(&config, 3 * config.spatial_compression(), 17);
+        let grid = Tiles::of(&config, &canvas)
+            .expect("a grid")
+            .tiles(&config, &canvas);
+        assert!(
+            grid.len() > 1,
+            "the canvas must need more than one tile, or the two lengths agree: {} tile(s)",
+            grid.len()
+        );
+
+        let tile = largest_tile(&config, canvas.height, canvas.width).expect("a tile");
+        assert!(
+            tile.voxels() < canvas.voxels(),
+            "a tile must be smaller than the clip: {} against {}",
+            tile.voxels(),
+            canvas.voxels()
+        );
+
+        let declared = constants(&config, canvas, 64, DType::F32).expect("the declaration");
+        let bytes = declared
+            .iter()
+            .find(|(name, _)| name == "video_vae.voxel_rows")
+            .map(|(_, bytes)| *bytes)
+            .expect("the voxel-row declaration");
+        assert_eq!(
+            bytes,
+            tile.voxels() * 4,
+            "the declared table is one tile's {} voxels of i32, not the clip's",
+            tile.voxels()
+        );
+        assert!(bytes < canvas.voxels() * 4, "and it is short of the clip's");
+    }
 
     /// A clip's transformer scratch is **one tile's**, and the plan states one tile's: the two must
     /// agree, or a device run stops inside the arena naming a buffer while the plan is the thing that
