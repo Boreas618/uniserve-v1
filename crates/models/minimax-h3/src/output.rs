@@ -1023,22 +1023,14 @@ mod tests {
 
         let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
         assert_eq!(count("rgb_bytes"), 1);
-        assert_eq!(count("scaled_add"), 2, "{programs:?}");
+        // One blend row whatever the raster: the width is the operand's, and two rasters of
+        // different sizes state one row.
+        assert_eq!(count("scaled_add"), 1, "{programs:?}");
         assert!(
             programs
                 .iter()
                 .any(|(_, key)| key.contains("dtype_f16_channels_3")),
             "the packing states its element type and channel count: {programs:?}"
         );
-        for (height, width) in [(480_u64, 832_u64), (720, 1280)] {
-            let pixels = height * width;
-            assert!(
-                programs
-                    .iter()
-                    .any(|(operator, key)| operator == "scaled_add"
-                        && key.contains(&format!("columns_{pixels}_"))),
-                "a row program per pixel count: {programs:?}"
-            );
-        }
     }
 }
