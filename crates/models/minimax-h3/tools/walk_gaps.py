@@ -787,7 +787,15 @@ def generator_rows(root: str, extra: list[str]) -> set[tuple[str, str]]:
         root,
         *extra,
     ]
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        # The generator is another builder's tree: it compiles, it refuses, or it
+        # panics. All three are answers about that tree, and a traceback here would
+        # read as a broken instrument instead of the state of the tree.
+        raise SystemExit(
+            "the generator did not produce rows (exit "
+            f"{result.returncode}):\n" + (result.stderr or result.stdout).strip()[-800:]
+        )
     rows = set()
     for line in result.stdout.splitlines():
         if line.startswith("#") or "\t" not in line:
@@ -910,9 +918,13 @@ def main(argv=None):
         )
     if unbound:
         print(
-            f"fixture lines no launch bound ({len(unbound)}; normal for one deployment):"
+            f"rows the list holds and no walk in this set binds ({len(unbound)}):"
         )
         shown = unbound if args.unbound else unbound[:8]
+        # A row no walk in this set binds is not excused by the set being narrow: it is
+        # either a construction's row (name the construction that launches it) or a cell
+        # nothing asks for. The walk prints which axes it bound, so a reader can tell
+        # whether the set covers the deployment.
         for operator, key in shown:
             print(f"  unbound: {operator}\t{key}")
         if len(shown) < len(unbound):
