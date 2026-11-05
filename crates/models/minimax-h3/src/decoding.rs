@@ -307,6 +307,17 @@ pub fn video_arena(
             elements: raster * channels,
         },
         Buffer {
+            // The stitch's seam block: one tile's pixels, contiguous, which every blend copies its
+            // neighbour into. It is reserved with the clip's other buffers because one block serves
+            // every seam, and the grid's tiles are all the same size.
+            name: "seam".to_owned(),
+            element,
+            elements: channels
+                * u64::from(frames)
+                * (u64::from(tile.canvas.height) * u64::from(config.spatial_compression()))
+                * (u64::from(tile.canvas.width) * u64::from(config.spatial_compression())),
+        },
+        Buffer {
             name: "tokens".to_owned(),
             element,
             elements: rows * patch,
@@ -1118,6 +1129,17 @@ mod tests {
                 * u64::from(crate::video_vae::TILE_PIXELS / 16)
                 * 3
         );
+        // The seam block: one tile's pixels at the raster's frame count, contiguous - the buffer every
+        // blend copies its neighbour into, reserved once because every tile of a grid is the same size.
+        assert_eq!(
+            buffer("seam").elements,
+            u64::from(grid[0].canvas.height)
+                * u64::from(config.spatial_compression())
+                * u64::from(grid[0].canvas.width)
+                * u64::from(config.spatial_compression())
+                * u64::from(canvas.frames_out(&config))
+                * 3
+        );
         assert_eq!(buffer("stream").elements, tile_rows * columns);
         assert_eq!(buffer("projected").elements, tile_voxels * columns);
         assert_eq!(buffer("gate_up").elements, tile_rows * 2 * columns * 4);
@@ -1148,10 +1170,10 @@ mod tests {
         // follow.
         let clip_level: Vec<&str> = arena
             .iter()
-            .take(2)
+            .take(3)
             .map(|buffer| buffer.name.as_str())
             .collect();
-        assert_eq!(clip_level, ["decoded", "tokens"]);
+        assert_eq!(clip_level, ["decoded", "seam", "tokens"]);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
