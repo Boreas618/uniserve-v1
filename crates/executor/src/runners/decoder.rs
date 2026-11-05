@@ -363,19 +363,22 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// `MediaColumns::staged` already rules out: "It does not own what the model prepares on the
     /// device - the encoded conditioning rows, the latent trajectory".
     ///
-    /// A warm capture passes no latents, so the graph reads the model's own clip
-    /// (`prepare_layout`'s first buffer) rather than whatever the column held. A replay passes the
-    /// batch's buffer - a staged row is the request's conditioning blob and its parameter record -
-    /// but `stage` reaches this only when the product store holds no trajectory for the request, and
-    /// a blob of another length is then refused rather than copied over a prefix.
+    /// A warm capture passes no latents, and **the model supplies no clip for one**: `prepare_layout`
+    /// stages this decoder's *tables* (`video_vae`'s is one `video_positions` table), not a latent
+    /// trajectory, so the column is zeroed - defined values in its own element type, which is what a
+    /// capture needs and all it needs. Reading `prepare_layout`'s first buffer as a clip was wrong in
+    /// the direction that does not fail: a table's bytes are shorter than the clip, so they were
+    /// written over the front of the column and the capture read a clip made of rotary positions.
+    ///
+    /// A replay passes the batch's buffer - a staged row is the request's conditioning blob and its
+    /// parameter record - but `stage` reaches this only when the product store holds no trajectory
+    /// for the request, and a blob of another length is then refused rather than copied over a prefix.
     fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
         self.size_raster(bucket)?;
-        let layout = self.layout(bucket)?;
+        self.layout(bucket)?;
+        // The tables the graph addresses, in the cache they are keyed in. `prepare_layout` is asked
+        // exactly once per layout, here, and its bytes never touch the latents column.
         self.fill(bucket)?;
-        let mut host = vec![Vec::new(); 1];
-        self.model
-            .prepare_layout(&layout, &mut host)
-            .map_err(Error::from)?;
         match latents {
             Some(bytes) => {
                 // The column is the model's extent for this layout, so a blob of another length is
@@ -390,7 +393,18 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 }
                 self.columns.latents.write(bytes)?;
             }
-            None => self.columns.latents.write(&host[0])?,
+            None => {
+                // The clip is this runner's own column, empty until a request publishes one: zeros
+                // are defined, hold no clip's arithmetic and cost no copy.
+                //
+                // SAFETY: the column is this runner's own pinned storage, sized for the largest
+                // bucket it was bound with, and nothing else writes it here: the capture this stages
+                // is the next job on the stream, and a replay of this bucket is not concurrent with
+                // a stage (a batch is staged once, before its jobs are issued).
+                unsafe {
+                    self.columns.latents.host.as_mut_slice().fill(0);
+                }
+            }
         }
         self.staged = Some(bucket);
         Ok(())
