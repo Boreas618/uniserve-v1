@@ -2634,6 +2634,30 @@ mod tests {
         );
     }
 
+    /// A one-document response whose first frame is itself empty is a failure
+    /// too: the head is held for the document, and a zero-length document is
+    /// what a client reads as an empty success.
+    #[tokio::test]
+    async fn a_one_body_response_that_opens_with_an_empty_frame_states_a_server_error() {
+        let mut client = serve_document(Some(Step::Frames(vec![Bytes::new()])));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert!(
+            response.body.contains("the response's document was empty"),
+            "the failure names the empty document: {}",
+            response.body
+        );
+    }
+
     /// A successor that takes over a response whose head its predecessor held
     /// and never wrote states the outcome itself: the bytes it inherits are a
     /// status the predecessor had not committed to (§7.5.1 step 4).
