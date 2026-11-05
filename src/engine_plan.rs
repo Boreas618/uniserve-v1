@@ -540,6 +540,7 @@ impl EpochPlan {
         use executor::runners::decoder as media_decoder;
         use executor::runners::denoiser as media_denoiser;
         use executor::runners::encoder as media_encoder;
+        use nn::capability::Denoiser as _;
 
         if Some(&device) != self.devices.first() {
             bail!(
