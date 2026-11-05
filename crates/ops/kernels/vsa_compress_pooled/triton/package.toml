@@ -39,6 +39,6 @@ architectures = ["sm_100a", "sm_90a"]
 # `max_tiles` is a **class**, not a count: the package compiles the reduction to the bound's next
 # power of two, so 640 and 1024 are one module and the key names 1024. The declared values are the
 # powers of two a deployment can land in, not the tile counts it may state.
-dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56"], width = ["128"], max_tiles = ["1024", "2048", "4096"], block = ["128"], pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56"], width = ["128"], max_tiles = ["1024", "2048", "4096", "512"], block = ["128"], pdl = ["false", "true"] }
 
 [parameters]
