@@ -6,8 +6,15 @@
 //! cargo run -p minimax-h3 --example minimax_h3_keys
 //! ```
 //!
-//! The output is `notes/programs/minimax-h3-keys.txt`: what a kernel program must package for
-//! `crates/models/minimax-h3`, so no package has to guess a variant.
+//! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
+//! every component this build loads states, over both element types - so no package has to guess a
+//! variant.
+//!
+//! It is not the fixture. `notes/programs/minimax-h3-keys.txt` is **one deployment's** rows, copied
+//! from that deployment's walk (`examples/programs.rs` then `examples/h3_fixture.rs`), and it is a
+//! subset in the sense that matters: a store built from this file serves a deployment, and a fixture
+//! is what a walk bound. Two lists, two questions - `notes/h3/fixture-delta.md` is the two-way check
+//! between them, and the difference between them is the finding rather than the error.
 //!
 //! ## Regenerating the list, and its second opinion
 //!
@@ -15,9 +22,9 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-deployment-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-//!     --against notes/programs/minimax-h3-keys.txt
+//!     --against notes/programs/minimax-h3-deployment-keys.txt
 //! ```
 //!
 //! The second command is a host-side set difference in one direction only: it asks whether every key
@@ -147,8 +154,21 @@ const VSA_TILE_ROWS: u32 = 64;
 /// kernel's own tiling inside a tile, compiled in.
 const VSA_BLOCK_ROWS: u32 = 16;
 
-/// The key tiles of the deployment's longest sparse reduction: 40960 keys at `VSA_TILE_ROWS`.
-const VSA_MAX_TILES: u32 = 640;
+/// The **class** of the deployment's longest sparse reduction: the key field, not the live bound.
+///
+/// The bound itself is the model's, computed once at load from the canvas rule
+/// (`denoiser.rs::Layouts::tiles_bound`): the maximum of `segment_packing(...).extent.video_tiles`
+/// over every canvas the deployment offers and every clip length it serves, which is **5400** tiles
+/// for the released base network at `VSA_TILE_ROWS` (printed by `examples/deployment_sizes.rs
+/// --root <checkpoint>`). Both descriptors that read it key
+/// `next_power_of_two()` of it - `CompressPooledDescriptor`'s `max_tiles` and
+/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` states from the score matrix's own
+/// key extent) - because the package compiles the reduction to a power of two, so two bounds inside
+/// one class are one module and a key that told them apart would demand a compilation per tile count
+/// a deployment happens to request. **So this constant is 8192 while the launch passes 5400**: a
+/// reader who assumes the key field holds the number they can compute is the reader this comment is
+/// for.
+const VSA_MAX_TILES: u32 = 8192;
 
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
@@ -509,19 +529,24 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         .to_string(),
     );
     // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
-    // residual's width there is one column and the kernel's `WIDTH` is one.
-    for dtype in [deployment, DType::F32] {
-        push(
-            "scaled_residual",
-            ScaledResidualDescriptor {
-                dtype,
-                columns: 1,
-                block: ops::residual::RESIDUAL_BLOCK,
-                update_bias: false,
-            }
-            .to_string(),
-        );
-    }
+    // residual's width there is one column and the kernel's `WIDTH` is one. **The step is the
+    // sample's, not the stack's**: `Denoiser::programs` keys it from `SAMPLE_DTYPE`, and the forward
+    // refuses a sample that is not that type - so FP32 is the only type at which a one-column
+    // residual is launched, and a deployment-typed row here would be a cell nothing reads.
+    //
+    // The refiner's identity residual is the model's other one-column launcher, and it has its own
+    // owner: `TokenRefiner::programs` states it from the scale it loads, so this file does not
+    // restate a width the refiner already states (`specs/worker.md`: one object states a key).
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: DType::F32,
+            columns: 1,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
@@ -819,11 +844,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width.
+    // The timestep embedding's activation, over the transformer's hidden width. Its element type is
+    // FP32 at every deployment: the AdaLN pair this activation feeds is FP32 whatever the stack's
+    // weights are (`crates/ops/src/modulation.rs` refuses any other type), so a row at the
+    // deployment's dtype would build a cell no launch can reach.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: deployment,
+            dtype: DType::F32,
             columns: HIDDEN,
             block: ELEMENTWISE_BLOCK,
             pdl: PDL,
