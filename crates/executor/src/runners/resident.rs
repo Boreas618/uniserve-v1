@@ -36,9 +36,11 @@ pub struct ResidentCache {
     /// The device's pools, attached by the executor before the first gather: the scratch page set
     /// is mapped through them, so the mapping is inside the device's one book (4.1).
     pools: Mutex<Option<Arc<Mutex<Pools>>>>,
-    /// The paired forward's page set, mapped on the first shadow walk. One set serves every group:
-    /// its rows are the batch's rows and its pages are the largest page set a row needs.
+    /// The paired forward's page set, mapped on the first shadow walk. One set serves every group
+    /// and every bucket: a walk reads its numbering at the width its rows need.
     scratch: Mutex<Option<Scratch>>,
+    /// The bytes the device gives this runner's page set.
+    scratch_bytes: u64,
     /// One gather column per attention group, `[rows, width]` i32, carved when the device's pools
     /// are attached (the executor creates them, so they cannot be had at construction).
     tables: Vec<Table>,
@@ -69,7 +71,7 @@ impl Table {
     /// and never on a step: a paired forward reads the ids, it does not build them.
     fn fill(&self, indices: &[i32], stream: &Stream) -> Result<()> {
         let bytes = std::mem::size_of_val(indices);
-        if bytes != self.buffer.len() {
+        if bytes > self.buffer.len() {
             return Err(Error::Invariant(format!(
                 "a block table of {} bytes cannot hold {bytes} of indices",
                 self.buffer.len()
@@ -90,6 +92,11 @@ impl Table {
 
     /// Allocates `rows x width` i32 for one group from the device's pools.
     fn new(pools: &mut Pools, rows: u32, width: u32) -> Result<Self> {
+        Self::in_pool(pools, PoolKind::Resident, rows, width)
+    }
+
+    /// A table carved from `pool`.
+    fn in_pool(pools: &mut Pools, pool: PoolKind, rows: u32, width: u32) -> Result<Self> {
         if rows == 0 || width == 0 {
             return Err(Error::Invalid(
                 "a block table needs at least one row and one page".into(),
@@ -98,7 +105,7 @@ impl Table {
         let bytes = usize::try_from(u64::from(rows) * u64::from(width) * 4)
             .map_err(|_| Error::Resource("a block table is larger than memory".into()))?;
         Ok(Self {
-            buffer: pools.allocate(PoolKind::Resident, bytes as u64)?,
+            buffer: pools.allocate(pool, bytes as u64)?,
             rows,
             width,
         })
@@ -160,6 +167,7 @@ impl ResidentCache {
             device,
             pools: Mutex::new(None),
             scratch: Mutex::new(None),
+            scratch_bytes: 0,
             tables: Vec::new(),
             rows,
             width,
@@ -175,10 +183,66 @@ impl ResidentCache {
     }
 
     /// The paired forward's view: its group's table and the layer planes over the scratch pages.
+    /// Copies what `group`'s rows have cached into their scratch pages.
+    ///
+    /// A paired forward reads the keys a served row reads, and it may write only scratch pages, so
+    /// a row's pages are copied here first: the page set then holds the row's whole context, the
+    /// attention of the paired forward reads it through the set's own table, and its writes land
+    /// over the copy. `lengths` are the batch's key counts, and a row of no keys copies nothing.
+    fn copy_history(
+        &self,
+        group: usize,
+        slots: &[i32],
+        lengths: &[i32],
+        pages: u32,
+        scratch: &Scratch,
+        stream: &Stream,
+    ) -> Result<()> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut held = Vec::with_capacity(slots.len());
+        for (row, (slot, length)) in slots.iter().zip(lengths).enumerate() {
+            let (Ok(slot), Ok(length)) = (u32::try_from(*slot), u32::try_from(*length)) else {
+                continue;
+            };
+            if length == 0 {
+                continue;
+            }
+            let units = cache.slot_pages(slot, group as u32)?;
+            let count = length.div_ceil(self.page_size.max(1)) as usize;
+            held.push((row as u32, units.into_iter().take(count).collect::<Vec<_>>()));
+        }
+        for layer in 0..cache.layers(group) {
+            let resident = cache.layer_planes(group, layer)?;
+            let shadow = scratch.cache.layer_planes(group, layer)?;
+            let width = resident.key.shape()[1..].iter().product::<i64>() as usize
+                * resident.key.dtype().bytes();
+            for (row, units) in &held {
+                for (page, unit) in units.iter().enumerate() {
+                    let target = row * pages + page as u32;
+                    copy_page(&resident.key, &shadow.key, *unit, target, width, stream)?;
+                    copy_page(&resident.value, &shadow.value, *unit, target, width, stream)?;
+                    for (from, to) in [
+                        (&resident.key_scale, &shadow.key_scale),
+                        (&resident.value_scale, &shadow.value_scale),
+                    ] {
+                        if let (Some(from), Some(to)) = (from, to) {
+                            copy_page(from, to, *unit, target, from.dtype().bytes(), stream)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn scratch_view(
         &self,
         group: usize,
         slots: &[i32],
+        pages: u32,
         scratch: &Scratch,
     ) -> (TensorView, Vec<KvPlanes>) {
         let layers = self
@@ -207,7 +271,7 @@ impl ResidentCache {
                 TensorView::new(
                     DevicePtr::new(table.buffer.address()),
                     DType::I32,
-                    Shape::new(&[u64::from(rows), u64::from(table.width)]),
+                    Shape::new(&[u64::from(rows), u64::from(pages)]),
                 ),
                 planes,
             ),
@@ -357,12 +421,34 @@ fn view_of(view: &crate::memory::allocation::StorageView) -> Result<TensorView> 
     ))
 }
 
-/// The paired forward's scratch page set: the region and one `[rows, pages]` i32 block table per
-/// group over it.
+/// Copies `bytes` of page `unit` of the resident `from` into page `page` of the scratch `to`.
+fn copy_page(
+    from: &crate::memory::allocation::StorageView,
+    to: &crate::memory::allocation::StorageView,
+    unit: u32,
+    page: u32,
+    bytes: usize,
+    stream: &Stream,
+) -> Result<()> {
+    let stride = |view: &crate::memory::allocation::StorageView| {
+        view.strides()[0] as u64 * view.dtype().bytes() as u64
+    };
+    let source = from.address() + u64::from(unit) * stride(from);
+    let destination = to.address() + u64::from(page) * stride(to);
+    // SAFETY: both pages lie inside their plane's storage: `unit` is a page the slot's table holds
+    // and `page` is inside the set, which the caller checked, and `bytes` is at most one page.
+    unsafe {
+        platform::memcpy_async(destination, source, bytes, stream)?;
+    }
+    Ok(())
+}
+
+/// The paired forward's scratch page set: the region and one block table per group over it.
 ///
 /// The set is the shadow's own - its pages are never a serving request's (7.3) - so the table's
-/// page ids are this set's own numbering: page `k` of row `r` is `r * pages + k`, which is what the
-/// pool's per-row tables say and what the attention kernel reads.
+/// page ids are this set's own numbering. A table holds that numbering once, in order, so a walk
+/// whose rows need `pages` pages reads it as `[rows, pages]`: page `k` of row `r` is
+/// `r * pages + k`, whatever the bucket.
 struct Scratch {
     cache: ScratchCache,
     tables: Vec<Table>,
@@ -508,6 +594,14 @@ impl KvProvider for ResidentCache {
         self.gather(group, slots, stream)
     }
 
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView> {
+        let table = self
+            .tables
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))?;
+        Ok(table.view_rows(row_count(group, table.rows, slots)?))
+    }
+
     fn planes(&self, group: usize) -> Result<Vec<KvPlanes>> {
         let cache = self
             .cache
@@ -526,10 +620,22 @@ impl KvProvider for ResidentCache {
         Ok(planes)
     }
 
+    fn attach_scratch_bytes(&mut self, bytes: u64) {
+        self.scratch_bytes = bytes;
+    }
+
+    fn scratch_capacity(&self) -> u32 {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .scratch_pages_within(self.scratch_bytes, self.groups as u64)
+    }
+
     fn scratch(
         &self,
         group: usize,
         slots: &[i32],
+        lengths: &[i32],
         pages: u32,
         stream: &Stream,
     ) -> Result<(TensorView, Vec<KvPlanes>)> {
@@ -539,9 +645,8 @@ impl KvProvider for ResidentCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_none() {
-            // One set serves every paired forward of this runner: its rows are the largest
-            // bucket's and its pages are the walk's, so no shadow step of a later bucket allocates.
-            let rows = self.rows.max(rows);
+            // One set serves every paired forward of this runner: it is as large as the device's
+            // share allows, so no shadow step of a later bucket allocates.
             let pools = self
                 .pools
                 .lock()
@@ -561,18 +666,20 @@ impl KvProvider for ResidentCache {
             let mut pools = pools
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // `ScratchCache` states the set's total page count: every row owns `pages` of them,
-            // so the set is `rows * pages` pages wide and page `k` of row `r` is `r * pages + k`.
-            let total = rows
-                .checked_mul(pages)
-                .ok_or_else(|| Error::Invalid("a scratch page set overflows pages".into()))?;
-            let set = cache.scratch(rows, total, self.device, &mut pools)?;
-            // One `[rows, pages]` block table per group, stating the set's own page ids, so two
-            // rows of one walk never share a page.
+            let total = cache.scratch_pages_within(self.scratch_bytes, self.groups as u64);
+            if total == 0 {
+                return Err(Error::Invalid(format!(
+                    "a scratch page set of {} bytes holds no page of this cache",
+                    self.scratch_bytes
+                )));
+            }
+            let set = cache.scratch(total, self.device, &mut pools)?;
+            // One table per group, stating the set's own page ids in order, so two rows of one
+            // walk never share a page at any width.
             let mut tables = Vec::with_capacity(self.groups);
             let indices: Vec<i32> = (0..total).map(|page| page as i32).collect();
             for _ in 0..self.groups {
-                let table = Table::new(&mut pools, rows, pages)?;
+                let table = Table::in_pool(&mut pools, PoolKind::Scratch, 1, total)?;
                 table.fill(&indices, stream)?;
                 tables.push(table);
             }
@@ -585,15 +692,15 @@ impl KvProvider for ResidentCache {
             Error::Invariant("the scratch page set was allocated and is not held".into())
         })?;
         let asked = rows.saturating_mul(pages);
-        if rows > self.rows || asked > scratch.cache.pages() {
+        if asked > scratch.cache.pages() {
             return Err(Error::Invalid(format!(
                 "a paired forward asks for {rows} rows of {pages} pages; the scratch set holds {} \
-                 rows of {} pages, so the walk would write outside its own pages",
-                self.rows,
-                scratch.cache.pages() / pages.max(1)
+                 pages, so the walk would write outside its own pages",
+                scratch.cache.pages()
             )));
         }
-        Ok(self.scratch_view(group, slots, scratch))
+        self.copy_history(group, slots, lengths, pages, scratch, stream)?;
+        Ok(self.scratch_view(group, slots, pages, scratch))
     }
 }
 

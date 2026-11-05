@@ -550,7 +550,12 @@ impl Leader {
         control
             .write_build_config(target_epoch, &next.build_config)
             .map_err(UpdateError::Failed)?;
-        let mut spec = target.engine_spec().map_err(UpdateError::Failed)?;
+        // The target's spec is resolved as a deployment's start resolves it: the options state the
+        // scheduler and the placement, and the model's files complete what they determine.
+        let mut spec = Leader::prepare(&target, &crate::options::Stated::from_paths(Vec::new()))
+            .await
+            .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
+            .spec;
         spec.world = target_epoch;
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
