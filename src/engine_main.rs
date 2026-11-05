@@ -5684,23 +5684,58 @@ fn operator_slots(
         .iter()
         .all(|(_, keys)| keys.iter().all(|key| key_phase(key).is_some()));
     let mut claims: Vec<(PhaseKind, usize)> = Vec::new();
-    let mut clash = false;
+    // Which two packages claimed one phase, when two did: the refusal to split names them, because
+    // "one program fills the operator" is not an answer a reader can act on without them.
+    let mut clash: Option<(PhaseKind, usize, usize)> = None;
     if phaseful && holders.len() > 1 {
         for (index, (_, keys)) in holders.iter().enumerate() {
             let mut phases: Vec<PhaseKind> = keys.iter().filter_map(|key| key_phase(key)).collect();
             phases.sort_unstable();
             phases.dedup();
             for phase in phases {
-                clash |= claims.iter().any(|(held, _)| *held == phase);
+                if let Some((_, held)) = claims.iter().find(|(claimed, _)| *claimed == phase) {
+                    clash = clash.or(Some((phase, *held, index)));
+                }
                 claims.push((phase, index));
             }
         }
     }
-    if !clash && claims.len() > 1 {
+    if clash.is_none() && claims.len() > 1 {
         return claims
             .into_iter()
             .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
             .collect();
+    }
+    // The fallback is right - a wrong split would have a package asked for a key it cannot build -
+    // and it used to be silent, which is what made a run's `no kernel for operator X descriptor
+    // phase_...` read as a fresh mystery instead of the consequence of a decision. So the decision
+    // says itself here, with the reason and the packages that brought it about.
+    if holders.len() > 1 {
+        let packages: Vec<&str> = holders
+            .iter()
+            .map(|(program, _)| program.backend.as_str())
+            .collect();
+        let reason = match clash {
+            Some((phase, first, second)) => format!(
+                "two packages build the {} phase: {} and {}",
+                phase, holders[first].0.backend, holders[second].0.backend
+            ),
+            None => {
+                let unphased = holders
+                    .iter()
+                    .find(|(_, keys)| keys.iter().any(|key| key_phase(key).is_none()))
+                    .map(|(program, _)| program.backend.as_str())
+                    .unwrap_or("one of them");
+                format!("a key {} built states no phase", unphased)
+            }
+        };
+        tracing::warn!(
+            op = %op,
+            %reason,
+            packages = ?packages,
+            "this operator's phases are not split across packages, so one program fills it: a key \
+             of another phase will fail at its capture unless every package covers it"
+        );
     }
     match holders.first().map(|(program, _)| program).or(fallback) {
         Some(program) => vec![(slot(None), program.clone())],
