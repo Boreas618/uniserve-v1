@@ -88,9 +88,8 @@ fn run_with(options: Options) -> Result<(), String> {
             model: Target::new("b200"),
         }],
     };
-    let server = std::sync::Arc::new(
-        ProgramServer::open(&config).map_err(|error| error.to_string())?,
-    );
+    let server =
+        std::sync::Arc::new(ProgramServer::open(&config).map_err(|error| error.to_string())?);
     // The build queue is driven while the server answers, so the server runs as
     // its own process would: one thread serving, the rest of this program
     // asking it for modules.
@@ -283,7 +282,14 @@ impl Options {
                         .map_err(|error| format!("--jobs: {error}"))?
                 }
                 "-h" | "--help" => {
-                    println!("{}", include_str!("build_fixtures.rs").lines().take(20).collect::<Vec<_>>().join("\n"));
+                    println!(
+                        "{}",
+                        include_str!("build_fixtures.rs")
+                            .lines()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown flag {other}")),

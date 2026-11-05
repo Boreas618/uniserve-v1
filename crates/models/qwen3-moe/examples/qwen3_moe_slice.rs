@@ -852,6 +852,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         Representation::Nvfp4 {
             excluded,
             also_excluded,
+            ..
         } => format!(
             "nvfp4, {} + {} module(s) kept in their own dtype",
             excluded.len(),
@@ -1872,7 +1873,7 @@ fn check_continuation(
 mod tests {
     use std::path::Path;
 
-    use super::{argmax_over, check_continuation, needed_keys, slot_for, KvPages, Stage};
+    use super::{KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
 
     /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
     /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither

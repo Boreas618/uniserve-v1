@@ -54,7 +54,7 @@ CONSTANT = re.compile(
 # The ladder the generator states when no `--frames` is given:
 # `const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, .., MAX_FRAMES];`. A rung written
 # as a constant's name is resolved from `config/mod.rs`, never typed here.
-FIXTURE = pathlib.Path("notes/programs/minimax-h3-deployment-keys.txt")
+FIXTURE = pathlib.Path("notes/programs/minimax-h3-keys.txt")
 AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
 
 # The deployment's own ladder is `Deployment::generated`, in the crate: the
@@ -280,12 +280,19 @@ def main(argv: list[str] | None = None) -> int:
             "the generator produced no rows: an empty list is a build failure, "
             "not a ladder"
         )
-    if LADDER.search(header) and ladder(header) != clause:
-        raise SystemExit(
-            f"the header states the ladder {ladder(header)} and the rule gives "
-            f"{clause}: a stated ladder that is not the rule is a second "
-            "statement of one truth"
-        )
+    # The generator's header states the ladder this cut serves, and the delivery drives a
+    # subset of the rule on purpose (`undriven`, below). Requiring equality here would
+    # demand the file hold a rung per clip the rule admits - inventory no request asks
+    # for - so the question is whether every stated rung is one the rule admits. That the
+    # two runs produce one row set is the next check, and it is the one that catches a
+    # default that drifts from the stated ladder.
+    if LADDER.search(header):
+        outside = [rung for rung in ladder(header) if rung not in set(clause)]
+        if outside:
+            raise SystemExit(
+                f"the header states the ladder {ladder(header)} and the rule "
+                f"admits {clause}: {outside} are rungs no request can name"
+            )
 
     # A rule rung the delivery does not drive is a scheduling choice and not a
     # shortfall: inventory nobody asks for is what a store should not hold.

@@ -6,7 +6,7 @@
 //! cargo run -p minimax-h3 --example minimax_h3_keys [-- --root <checkpoint>] [--rasters HxW,...]
 //! ```
 //!
-//! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
+//! The output is `notes/programs/minimax-h3-keys.txt`: **the store's list** - every row
 //! every component this build loads states, over both element types - so no package has to guess a
 //! variant.
 //!
@@ -35,9 +35,10 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-deployment-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys -- \
+//!     --commit "$(git rev-parse --short HEAD)" > notes/programs/minimax-h3-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-//!     --against notes/programs/minimax-h3-deployment-keys.txt
+//!     --against notes/programs/minimax-h3-keys.txt
 //! ```
 //!
 //! The second command is a host-side set difference in one direction only: it asks whether every key
@@ -170,12 +171,12 @@ const VSA_BLOCK_ROWS: u32 = 16;
 /// for the released base network at `VSA_TILE_ROWS` (printed by `examples/deployment_sizes.rs
 /// --root <checkpoint>`). Both descriptors that read it key
 /// `next_power_of_two()` of it - `CompressPooledDescriptor`'s `max_tiles` and
-/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` states from the score matrix's own
-/// key extent) - because the package compiles the reduction to a power of two, so two bounds inside
-/// one class are one module and a key that told them apart would demand a compilation per tile count
-/// a deployment happens to request. **So this constant is 8192 while the launch passes 5400**: a
-/// reader who assumes the key field holds the number they can compute is the reader this comment is
-/// for.
+/// `SelectTilesDescriptor`'s `block` (which `VsaTiles::select` takes from the layer's declared
+/// bound, the same value this constant holds) - because the package compiles the reduction to a
+/// power of two, so two bounds inside one class are one module and a key that told them apart would
+/// demand a compilation per tile count a deployment happens to request. **So this constant is 8192
+/// while the launch passes 5400**: a reader who assumes the key field holds the number they can
+/// compute is the reader this comment is for.
 const VSA_MAX_TILES: u32 = 8192;
 
 /// The transformer's feed-forward width (`ffn_dim`).
@@ -306,7 +307,12 @@ fn main() {
     // Which attention backend the deployment runs. **One deployment runs one**, so this is what the
     // file is a deployment of, not a filter over a union: without it the sparse selection's rows are
     // absent, and a store built from the file serves the dense deployment and only that.
+    // The flag decides *which* row set is enumerated; the tuple decides the deployment the bound is
+    // derived from. A walk that had only the flag could not state the bound its tile derives, and it
+    // stated the dense one - which the recorder refuses.
+    let mut commit: Option<String> = None;
     let mut sparse = false;
+    let mut sparse_deployment: Option<minimax_h3::config::AttentionKind> = None;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -327,11 +333,23 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            // The revision the rows are enumerated from. The generator cannot read it - it reads a
+            // checkpoint, not a tree - so the caller states it, and a fixture that omits it is a
+            // row set with no way back to the code that produced it.
+            "--commit" => commit = Some(value(&mut arguments, "--commit")),
             "--sparse" => {
-                // The value the walk takes (`tile_rows,sparsity,max_tiles`) is what the sparse
-                // deployment is; the generator only needs to know it is that deployment.
-                let _ = value(&mut arguments, "--sparse");
+                // **One rule reads a sparse deployment from one string** (`AttentionKind::sparse_of`),
+                // and it is the same rule the recorder takes: the tile bound a compression reduces
+                // over is the deployment's own, derived from its layouts at load, so no flag states
+                // it and a third field that is not a keep rate is refused by the same sentence in
+                // whichever tool is handed it. A walk with its own parser accepted strings the
+                // recorder refused, and the accepting side is the one that wins silently.
+                let stated = value(&mut arguments, "--sparse");
                 sparse = true;
+                sparse_deployment = Some(
+                    minimax_h3::config::AttentionKind::sparse_of(&stated)
+                        .unwrap_or_else(|error| panic!("{error}")),
+                );
             }
             other => panic!("unknown flag {other}"),
         }
@@ -364,10 +382,14 @@ fn main() {
         };
         for deployment in DEPLOYMENTS {
             rows.extend(
-                minimax_h3::conditioning::TokenRefiner::programs(&base.transformer, deployment)
-                    .unwrap_or_else(|error| {
-                        panic!("the token refiner states no rows at {deployment:?}: {error}")
-                    }),
+                minimax_h3::conditioning::TokenRefiner::programs(
+                    &base.transformer,
+                    deployment,
+                    deployment,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("the token refiner states no rows at {deployment:?}: {error}")
+                }),
             );
         }
         for vae in VAES {
@@ -397,6 +419,10 @@ fn main() {
                 // `dtype: query_dtype`). A second type here states rows for launches that ask BF16 -
                 // cells nothing selects, in a file that reads as covering both.
                 transformer: DType::BF16,
+                // The twelve tensors the checkpoint stores at F32: the four boundary projections and
+                // the timestep embedder's pair. The walk reads these from the checkpoint's own index
+                // (`load::boundary_dtype`); this generator emits one deployment and states it here.
+                transformer_boundary: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },
@@ -460,21 +486,7 @@ fn main() {
             .unwrap_or_else(|error| {
                 panic!("the deployment's serving partition is not statable: {error}")
             });
-    let bound = {
-        let dies = config
-            .denoisers
-            .get(&minimax_h3::checkpoint::Dit::Base)
-            .unwrap_or_else(|| {
-                panic!("the checkpoint holds no base DiT, so its bound is not statable")
-            });
-        serving
-            .arrangement(dies)
-            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement))
-            .and_then(|rules| rules.rows_bound())
-            .unwrap_or_else(|error| {
-                panic!("the deployment's packed bound is not statable: {error}")
-            })
-    };
+    let bound = deployment_bound(&config, sparse_deployment);
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment, bound, sparse));
@@ -582,6 +594,10 @@ fn main() {
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
                 transformer: DType::BF16,
+                // The twelve tensors the checkpoint stores at F32: the four boundary projections and
+                // the timestep embedder's pair. Read from the checkpoint's own index by the walk
+                // (`load::boundary_dtype`); stated here because this generator emits one deployment.
+                transformer_boundary: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },
@@ -642,7 +658,16 @@ fn main() {
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines, &config.video_vae, &rasters, &clip_frames, bound);
+    header(
+        &lines,
+        &config.video_vae,
+        &rasters,
+        &clip_frames,
+        bound,
+        serving.tensor_parallel,
+        serving.ulysses_degree,
+        commit.as_deref(),
+    );
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -660,6 +685,9 @@ fn header(
     rasters: &[(u32, u32)],
     clip_frames: &[u32],
     bound: u32,
+    tensor_parallel: usize,
+    ulysses_degree: usize,
+    commit: Option<&str>,
 ) {
     let operators = lines
         .iter()
@@ -668,6 +696,45 @@ fn header(
         .len();
     // The deployments the two loops above build: the stack's stated type, the checkpoint's own, and
     // the video VAE's container type, which the checkpoint states rather than the deployment.
+    // **The deployment line**, in the form every tool in this lane reads: `examples/h3_fixture.rs`
+    // copies the header line that starts `MiniMax-H3 programs for` verbatim into the fixture, so a
+    // walk that omits it cannot be cut into one. It states the axes the row set is a statement over -
+    // the clips, the canvases, the bound it was cut at - so a reader of the fixture learns which
+    // deployment it serves without consulting the generator that made it.
+    println!(
+        "# MiniMax-H3 programs for these clip lengths: {:?}, raster sizes: {:?}, packed rows: {}, \
+         element types: [{} stack, {} VAE], sparse attention: {}, tensor-parallel degree {}, \
+         ulysses degree {} - enumerated by the model's own `programs` from `--root`'s checkpoint",
+        clip_frames,
+        rasters
+            .iter()
+            .map(|(height, width)| format!("({height}, {width})"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        bound,
+        DEPLOYMENTS
+            .iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        VAES.iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        // The deployment's own rows decide it: the `vsa_*` group and the fine attention are the
+        // only operators a sparse deployment launches that a dense one does not, so the line
+        // states what the rows say rather than a flag the printer would have to be handed.
+        if lines
+            .iter()
+            .any(|(operator, _)| operator == "sparse_attention")
+        {
+            "Some(64, 0.9)"
+        } else {
+            "None"
+        },
+        tensor_parallel,
+        ulysses_degree,
+    );
     println!(
         "# The program rows a MiniMax-H3 deployment launches, one `operator<TAB>key` line each."
     );
@@ -724,7 +791,21 @@ fn header(
         "# checkpoint: MiniMax-H3. Its two DiTs (`transformer`, `transformer_ref`) are the same \
          config, so one set of rows serves the base network and the reference DiT."
     );
-    println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    println!(
+        "# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys -- --commit <revision>"
+    );
+    // **The provenance line.** A row set is the code that enumerated it at one commit; without the
+    // revision a reader cannot tell a fixture from a re-cut of itself, and a comparison between two
+    // files cannot say whether they differ by a row or by a week. The generator cannot read the
+    // revision (it reads a checkpoint), so it states the one it was given and says so when it was
+    // given none, rather than leaving the absence to look like a clean file.
+    match commit {
+        Some(revision) => println!("# commit: {revision}"),
+        None => println!(
+            "# commit: unstated - pass `--commit $(git rev-parse --short HEAD)` so this row set \
+             names the code that enumerated it"
+        ),
+    }
     // The four fields that decide the derived rows, printed from the checkpoint that decided them. A
     // reader asking "which canvas is this file for" gets the answer beside the count, and the answer
     // cannot drift from the rows: both come from one read of `--root`.
@@ -766,6 +847,39 @@ fn header(
 /// Every row the DiT, the text encoder and the orchestration around them state at `deployment`'s
 /// element type. `bound` is the deployment's packed row bound: the gated activation's `wide` form is a
 /// property of `bound · width`, so a walk cannot state it without the bound it serves.
+/// The deployment's packed-row bound: **the largest layout any task it serves reaches**, with the
+/// sparse attention applied first when the deployment is the sparse one.
+///
+/// The bound is not a constant of the config. A task's arrangement states its two prefix capacities
+/// (two latent frames' worth between `t2va` and the reference tasks), and a sparse deployment's tile
+/// bound reshapes the layout again, so the count serving reads is the maximum over the tasks. Stating
+/// it for one network - which this walk did - named a bound the recorder refuses, and every sparse
+/// row set was cut at the dense one because `--sparse` never reached here.
+fn deployment_bound(
+    config: &minimax_h3::config::Config,
+    sparse: Option<minimax_h3::config::AttentionKind>,
+) -> u32 {
+    let mut bound = 0u32;
+    for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
+        let Some(dies) = config.denoisers.get(&dit) else {
+            panic!("this checkpoint holds no {} network", dit.directory());
+        };
+        let mut network = dies.clone();
+        if let Some(kind) = &sparse {
+            network.attention = kind.clone();
+        }
+        let reached = minimax_h3::Partition::serving(config, task, 1, 1, 0, 0)
+            .and_then(|partition| partition.arrangement(&network))
+            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(network, arrangement))
+            .and_then(|rules| rules.rows_bound())
+            .unwrap_or_else(|error| {
+                panic!("the {task:?} deployment's packed bound is not statable: {error}")
+            });
+        bound = bound.max(reached);
+    }
+    bound
+}
+
 fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
@@ -1292,23 +1406,11 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width, at **FP32 - the
-    // checkpoint's own type for `time_embedder`**, which is one of the twelve F32 tensors the
-    // component stores. The model's own forward says so and it says it one-sidedly: the recorder
-    // states `silu dtype_f32_columns_5376` and **no BF16 `silu` at all** - so a row at the stack's
-    // type was this file's defect in the direction that stops a run, and the caller's run stopped on
-    // it by name. `transformer.rs` derives the activation's type from the embedder's weights, not
-    // from the stack's.
-    push(
-        "silu",
-        ops::activation::SiluDescriptor {
-            dtype: DType::F32,
-            columns: HIDDEN,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The timestep embedding's activation is **no longer stated here**: `Transformer::programs` reads
+    // the transformer's boundary type (`Types::transformer_boundary`, read from the checkpoint) and
+    // states the activation there, at the type the embedder's pair is stored in. A row typed here
+    // was a second statement of one activation, and the second one was the BF16 row the forward never
+    // launched - so the derivation states it once and this file states nothing.
     // The solver's Euler step: an FP32 source added into a BF16 running sample.
     push(
         "scaled_add",

@@ -87,8 +87,8 @@ fn run() -> Result<(), String> {
     }
 
     let image_path = module.join(&recipe.cubin);
-    let image = std::fs::read(&image_path)
-        .map_err(|error| format!("{}: {error}", image_path.display()))?;
+    let image =
+        std::fs::read(&image_path).map_err(|error| format!("{}: {error}", image_path.display()))?;
     let library = Library::load(&device, &image)
         .map_err(|error| format!("{}: {error}", image_path.display()))?;
     let function = library
@@ -180,8 +180,13 @@ fn arguments() -> Result<Option<Flags>, String> {
 }
 
 /// The flag's value, or the error that names the flag.
-fn next_value(arguments: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<String, String> {
-    arguments.next().ok_or_else(|| format!("{flag} needs a value"))
+fn next_value(
+    arguments: &mut std::iter::Skip<std::env::Args>,
+    flag: &str,
+) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 const HELP: &str = "\
@@ -231,15 +236,8 @@ fn allocate(
             }
             // SAFETY: both ranges are live until the copy completes, which the synchronize below
             // waits for; the destination is this buffer's storage on the stream's device.
-            unsafe {
-                memcpy_async(
-                    buffer.address(),
-                    staged.address(),
-                    bytes.len(),
-                    stream,
-                )
-            }
-            .map_err(|error| format!("filling {name}: {error}"))?;
+            unsafe { memcpy_async(buffer.address(), staged.address(), bytes.len(), stream) }
+                .map_err(|error| format!("filling {name}: {error}"))?;
             stream
                 .synchronize()
                 .map_err(|error| format!("filling {name}: {error}"))?;
@@ -271,15 +269,8 @@ fn dump_buffers(
             .map_err(|error| format!("staging {name}: {error}"))?;
         // SAFETY: the device range is the buffer's storage and the host range the staged buffer's,
         // both live until the synchronized copy completes.
-        unsafe {
-            memcpy_async(
-                staged.address(),
-                buffer.address(),
-                plan.bytes,
-                stream,
-            )
-        }
-        .map_err(|error| format!("reading {name}: {error}"))?;
+        unsafe { memcpy_async(staged.address(), buffer.address(), plan.bytes, stream) }
+            .map_err(|error| format!("reading {name}: {error}"))?;
         stream
             .synchronize()
             .map_err(|error| format!("reading {name}: {error}"))?;
