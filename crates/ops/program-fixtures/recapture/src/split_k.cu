@@ -16,8 +16,7 @@
 // The cell types are the descriptor's, known when the module is compiled:
 // `UNISERVE_GEMM_INPUT`, `_WEIGHT`, `_ACCUMULATE`, `_OUTPUT` carry the operator
 // crate's `DType` numbers, `UNISERVE_GEMM_ORDER` is 0 for `[k, n]` and 1 for
-// `[n, k]`, `UNISERVE_GEMM_EPILOGUE` is 1 when a bias is added, and
-// `UNISERVE_GEMM_K` is the contraction length the module was compiled for.
+// `[n, k]`, and `UNISERVE_GEMM_EPILOGUE` is 1 when a bias is added.
 
 #include "uniserve_gemm.h"
 
@@ -44,9 +43,6 @@
 #endif
 #ifndef UNISERVE_GEMM_EPILOGUE
 #error "the package's build script defines UNISERVE_GEMM_EPILOGUE"
-#endif
-#ifndef UNISERVE_GEMM_K
-#error "the package's build script defines UNISERVE_GEMM_K"
 #endif
 #ifndef UNISERVE_GEMM_ENTRY
 #error "the package's build script defines UNISERVE_GEMM_ENTRY: the package's launch entry"
@@ -160,9 +156,6 @@ extern "C" int32_t UNISERVE_GEMM_ENTRY(UniserveGemmCall* call, void* stream) {
   }
   if (call->m <= 0 || call->n <= 0 || call->k <= 0) {
     return refuse(call, "a product needs positive rows, columns and contraction length");
-  }
-  if (call->k != UNISERVE_GEMM_K) {
-    return refuse(call, "this module was compiled for another contraction length");
   }
   if (UNISERVE_GEMM_EPILOGUE == 1 && call->bias == nullptr) {
     return refuse(call, "this descriptor adds a bias and the call passed none");
