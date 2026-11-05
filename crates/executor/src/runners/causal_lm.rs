@@ -1206,6 +1206,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A batch is homogeneous in its sampling path, and the check is about this batch's own
+        // rows: a warm pose has no request rows, so it is made here rather than in the capture.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
         // pooled table, so the row must state the request's own pages before the replay, and the
         // table states where the row begins (`start_page`) and how far it runs.
@@ -1234,6 +1237,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
         let next = self.lifecycle.generation_named(batch.generation)?;
@@ -2048,7 +2053,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
+        // The batch is checked where a real one is staged (`submit`, `shadow`): a capture has no
+        // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
+        // row - so the check here would refuse a sampled bucket its own capture.
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
@@ -2212,7 +2219,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             },
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
-            parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
+            // A warm pose of a sampled bucket must state a valid *draw*: the sampler's forward
+            // divides by the row's temperature, so a zeroed row asks it to divide by zero - and a
+            // capture that does so is a device nobody can tell from a hung one. The permissive
+            // pose keeps every candidate (`top_k` 0), takes all of the nucleus (`top_p` 1) and
+            // applies no penalty, which is a request the sampler answers and whose token is
+            // discarded. A greedy bucket's pose is not read through this path at all: the launch
+            // sequence follows the bucket's variant.
+            parameters: warm_parameters(rows),
             // An inert table, not an empty one, with one row per call: a row whose slot and task
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
@@ -2360,6 +2374,24 @@ pub fn calls_output(
 /// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
 /// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
 /// host argmax of the row's kept logits (`greedy_first_tokens`).
+
+/// The sampling parameters a warm pose states: one valid, permissive draw per row.
+///
+/// `TEMPERATURE` is 1 rather than 0 because the sampler's forward divides by it - a zeroed row
+/// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
+/// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
+/// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
+fn warm_parameters(rows: usize) -> Vec<f32> {
+    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let mut parameters = vec![0.0; rows * columns];
+    for row in 0..rows {
+        let row = &mut parameters[row * columns..(row + 1) * columns];
+        row[ops::sampler::TEMPERATURE as usize] = 1.0;
+        row[ops::sampler::TOP_P as usize] = 1.0;
+    }
+    parameters
+}
+
 fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());
@@ -2432,6 +2464,10 @@ mod tests {
             text.contains("decode_sampled") && text.contains("row 1"),
             "the refusal names neither the bucket nor the row: {text}"
         );
+        assert!(
+            text.contains("temperature 0"),
+            "the refusal does not name the temperature the row stated: {text}"
+        );
 
         let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
             .expect_err("a sampled row was argmaxed in a greedy bucket");
@@ -2439,6 +2475,47 @@ mod tests {
             error.to_string().contains("decode_greedy"),
             "the refusal does not name the bucket: {error}"
         );
+    }
+
+    /// The homogeneity check reads the **batch's** rows, and the rows the bucket pads around them
+    /// are not rows of the batch: a padded row's parameters are zero, and zero reads as a greedy
+    /// row, so a check handed the bucket's rows would refuse a perfectly homogeneous sampled batch
+    /// for the rows nobody sent.
+    ///
+    /// This is the same boundary the capture's failure was on, with a boolean instead of a count:
+    /// the figure the check reads is the batch's, the figure the graph is built from is the bucket's.
+    #[test]
+    fn the_rows_a_bucket_pads_are_not_rows_of_the_batch() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(2, Variant::DecodeSampled),
+            Bucket::decode(4, Variant::DecodeSampled),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let mut columns = decode_columns();
+        let stated = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..2 {
+            columns.parameters[row * stated + ops::sampler::TEMPERATURE as usize] = 0.7;
+        }
+        let shape = Shape::decode(2, Variant::DecodeSampled);
+        staging.stage(&columns, &[CallId(0), CallId(1)], &shape, bucket)?;
+
+        // The batch's own rows: both sampled, so the bucket takes them.
+        assert!(
+            refuse_mixed_sampling(bucket.variant, staging.parameters(shape.rows as usize)).is_ok(),
+            "a homogeneous sampled batch was refused for rows it did not send"
+        );
+        // The bucket's rows: the two the staging padded state temperature 0, so they read as greedy
+        // rows of a sampling bucket. That is what the capture used to be refused by.
+        let error = refuse_mixed_sampling(bucket.variant, staging.parameters(bucket.rows as usize))
+            .expect_err("a padded row read as a row of the batch");
+        let text = error.to_string();
+        assert!(
+            text.contains("row 2") && text.contains("temperature 0"),
+            "the refusal does not name the first padded row: {text}"
+        );
+        Ok(())
     }
 
     /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
@@ -3031,6 +3108,34 @@ mod sampled_output_tests {
         let gather = indices.shaped(&[narrow]);
         assert_eq!(gather.shape.dims(), &[narrow]);
         assert_eq!(gather.numel(), narrow, "the count the gather reads");
+    }
+
+
+    /// The warm pose of a sampled bucket states a draw the sampler can make: temperature 1, every
+    /// candidate kept. A zeroed pose asks the forward to divide by a zero temperature - and it is
+    /// the very input `refuse_mixed_sampling` refuses in a real batch, which is why a capture that
+    /// ran on it was a bucket the batch check would have rejected.
+    #[test]
+    fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = warm_parameters(2);
+        assert_eq!(parameters.len(), 2 * columns, "a row per row");
+        for row in 0..2 {
+            let row = &parameters[row * columns..(row + 1) * columns];
+            assert_eq!(row[ops::sampler::TEMPERATURE as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_P as usize], 1.0);
+            assert_eq!(row[ops::sampler::TOP_K as usize], 0.0);
+        }
+        refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &parameters)
+            .expect("the pose of a sampled bucket is not a greedy row");
+        assert!(
+            refuse_mixed_sampling(
+                crate::plan::Variant::DecodeSampled,
+                &vec![0.0; 2 * columns]
+            )
+            .is_err(),
+            "the zeroed pose the capture used to state is not a draw"
+        );
     }
 
 }

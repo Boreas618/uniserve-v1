@@ -480,10 +480,15 @@ pub(crate) fn walk_capture(
         // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
         // handle is shared across threads, which it is not, and the allocator is right to warn
         // about a non-`Send` handle in an `Arc`.
+        let started = std::time::Instant::now();
         let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
             stream,
             platform::CaptureMode::Relaxed,
         )?));
+        // The phases of one capture, at `debug`: a cold epoch's first capture may legitimately pay
+        // minutes, and which phase pays them is the difference between a slow device and a walk
+        // that is waiting on something. Descriptor resolution and the launches are inside the walk.
+        let begun = started.elapsed().as_micros() as u64;
         let mut recording = Recording::new(std::rc::Rc::clone(&capture));
         // The forward runs with the generation being walked and the bucket's arena, so every
         // operator launch becomes a node of the template and is reported to `recording`.
@@ -505,11 +510,19 @@ pub(crate) fn walk_capture(
             return Err(failure.into());
         }
         walked?;
+        let walked_us = started.elapsed().as_micros() as u64;
         let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
             Error::Invariant("the capture is still shared by its recorder".into())
         })?;
         let capture = capture.into_inner();
         let template = capture.end()?;
+        tracing::debug!(
+            begin_us = begun,
+            walk_us = walked_us.saturating_sub(begun),
+            end_us = started.elapsed().as_micros() as u64 - walked_us,
+            nodes = nodes.len(),
+            "the phases of one capture"
+        );
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
         // reported no node table serves batches correctly but cannot be rebound, because there is
