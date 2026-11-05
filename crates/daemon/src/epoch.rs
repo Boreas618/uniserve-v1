@@ -143,8 +143,7 @@ pub struct BuildConfig {
     pub mem_fraction_static: f64,
     /// Element type of parameters and activations.
     pub dtype: ModelDtype,
-    /// The checkpoint's quantization (§1). The configuration field is
-    /// `quantization_config` until §7.7 replaces it with `quantization`.
+    /// The checkpoint's quantization (§1).
     pub quantization: Map<String, Value>,
     /// Tensor-parallel workers of each scheduler.
     pub tensor_parallel_size: NonZeroUsize,
@@ -193,7 +192,7 @@ impl BuildConfig {
             max_running_requests: config.max_running_requests,
             mem_fraction_static: config.mem_fraction_static,
             dtype: config.dtype,
-            quantization: config.quantization_config.clone(),
+            quantization: config.quantization.clone(),
             tensor_parallel_size: config.tensor_parallel_size,
             data_parallel_size: config.data_parallel_size,
             worker_groups: config.worker_groups.clone(),

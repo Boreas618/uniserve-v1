@@ -149,16 +149,13 @@ impl EngineConfig {
                 .parse::<TransferConfig>()
                 .context("invalid `placement_config.transfer`")?
         };
-        let quantization_config: serde_json::Value = if workers.quantization_config.is_empty() {
+        let quantization: serde_json::Value = if workers.quantization.is_empty() {
             serde_json::Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(&workers.quantization_config)
-                .context("invalid `quantization_config`")?
+            serde_json::from_str(&workers.quantization)
+                .context("invalid `quantization`")?
         };
-        anyhow::ensure!(
-            quantization_config.is_object(),
-            "`quantization_config` must be a table"
-        );
+        anyhow::ensure!(quantization.is_object(), "`quantization` must be a table");
 
         let max_num_batched_tokens = scheduling
             .max_num_batched_tokens
@@ -227,13 +224,12 @@ impl EngineConfig {
             load_threads: workers.load_threads,
             parallel_degrees: workers.parallel_degrees.clone(),
             dtype: named(&workers.dtype, "dtype")?,
-            quantization_config,
+            quantization,
             kv_cache_dtype: stated(&kv_cache.dtype)
                 .map(|dtype| named(&dtype, "kv_cache_config.dtype"))
                 .transpose()?,
             mem_fraction_static: placement.mem_fraction_static,
             worker_mesh: stated(&workers.mesh),
-            distributed_backend: stated(&workers.distributed_backend),
             max_model_len: facts.max_model_len,
             canvas_sampling: facts
                 .canvas_sampling

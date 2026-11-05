@@ -109,12 +109,6 @@ uniserve = ["backends/moe/tactics.json"]
 # runs these native targets, so they build with Cargo's release profile even
 # for an editable install, where setuptools-rust would otherwise choose a
 # debug build.
-[[tool.setuptools-rust.ext-modules]]
-target = "uniserve._worker"
-path = "crates/worker/Cargo.toml"
-binding = "NoBinding"
-debug = false
-
 # The one executable of every UniServe process, installed onto PATH as
 # `uniserve`: `serve` (a node's daemon), `engine` (the engine process), `worker`
 # (one worker, in this environment) and `storage` (a host's Storage Server).
