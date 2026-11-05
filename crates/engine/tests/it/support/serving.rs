@@ -154,7 +154,12 @@ pub(crate) fn rank(host: &str) -> WorkerInfo {
         request_slots: 8,
         max_batch_calls: 16,
         max_batch_tokens: 512,
-        prefix_cache: None,
+        // No `prefix_cache` here on purpose: `WorkerInfo::default` states the
+        // paged KV pool every token-serving rank advertises, and setting it to
+        // `None` makes the engine refuse every generation request with
+        // "generation request requires worker KV resources"
+        // (`scheduler/admission.rs`). A media-only rank is the one that states
+        // none, and that is not this pool.
         buffer_pool_bytes: 1 << 20,
         ..WorkerInfo::default()
     }
