@@ -325,8 +325,13 @@ for pair in "dense:$fixture_dense:$walk_dense" "sparse:$fixture_sparse:$walk_spa
     # A key the fixture names, that no package declares, and that the blocked block does not excuse,
     # is the one state a store must not be built from. The blocked block is pasted from
     # `--declared-blocked` above, so an excused key never reaches this test.
+    # `key_coverage` states a clean set two ways and only one of them counts: the clean run prints
+    # `# every key is covered for <target>` and a short one prints `# N of M keys are not covered`.
+    # Accepting only the second form's `0` made every clean fixture fail this gate - the branch
+    # below then looked for a `missing-` list, found the empty file a clean run leaves, and reported
+    # `uncovered keys and no block to excuse them` on a set with nothing uncovered.
     case "$coverage" in
-        *" 0 of "*) ;;
+        *"every key is covered"*|*" 0 of "*) ;;
         *)
             if [ ! -s "$staging/missing-$name.txt" ]; then
                 echo "  $name has uncovered keys and no block to excuse them" >&2
