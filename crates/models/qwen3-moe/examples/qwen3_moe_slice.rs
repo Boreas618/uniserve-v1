@@ -1263,6 +1263,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // scores ask a different question of the same layer, so their runs pay for one forward.
         if args.substage.is_none() && !args.routing && !args.scores {
             let mut digests = Vec::new();
+            stage("the block digests");
             for run in 0..2 {
                 let rows = measure(None)?;
                 stream.synchronize()?;
@@ -1515,10 +1516,6 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         &stream,
         &planes,
         &block_table,
-        page_size,
-        kv_heads,
-        head_dim,
-        page_dtype,
         usize::try_from(count).unwrap_or(0),
     )?;
     arena.release(prefill);
@@ -1815,6 +1812,7 @@ fn generate(
         next.check()?;
         let hidden = arena.tensor(DType::BF16, Shape::new(&[1, hidden_width]))?;
         model.embed_input_ids(forward, ids, hidden)?;
+        stage("a generated step's forward");
         model.forward(forward, &next, cache, hidden)?;
         model.logits(forward, hidden, logits)?;
         stream.synchronize()?;
@@ -3660,18 +3658,23 @@ fn print_kv_digests(
     stream: &platform::Stream,
     planes: &[KvPlanes],
     block_table: &[i32],
-    page_size: u64,
-    kv_heads: u64,
-    head_dim: u64,
-    page_dtype: ops::DType,
     tokens: usize,
 ) -> Result<()> {
+    // The plane's own shape is the geometry. A caller that states it again can state another one,
+    // and the digest would then cover a byte range its plane does not have.
+    let Some(first) = planes.first() else {
+        return Ok(());
+    };
+    let page_dtype = first.key.dtype;
+    let page_size = first.key.shape.dim(1);
+    let kv_heads = first.key.shape.dim(2);
+    let head_dim = first.key.shape.dim(3);
     let element = page_dtype.bytes().unwrap_or(1).max(1);
     let token_elements = kv_heads.saturating_mul(head_dim);
     let page_elements = page_size.saturating_mul(token_elements);
     let held = (tokens as u64).min(page_size);
-    let bytes = usize::try_from(held.saturating_mul(token_elements).saturating_mul(element))
-        .unwrap_or(0);
+    let bytes =
+        usize::try_from(held.saturating_mul(token_elements).saturating_mul(element)).unwrap_or(0);
     if bytes == 0 {
         return Ok(());
     }
@@ -3682,7 +3685,8 @@ fn print_kv_digests(
     for (layer, plane) in planes.iter().enumerate() {
         let mut digests = String::new();
         for (name, view) in [("k", plane.key), ("v", plane.value)] {
-            let base = view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
+            let base =
+                view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
             let mut raw = vec![0_u8; bytes];
             // SAFETY: `raw` is this function's own buffer of `bytes`, and the source is the plane's
             // first page, which holds at least `held` tokens of the prompt the prefill wrote.
