@@ -137,7 +137,6 @@ fn trapping() -> Vec<u8> {
 /// A scheduler thread serving with no request.
 struct World {
     handle: CommandSender,
-    thread: thread::JoinHandle<()>,
 }
 
 impl World {
@@ -151,12 +150,13 @@ impl World {
         )
         .expect("the simulated scheduler starts");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let thread = thread::spawn(move || {
+        // The thread detaches when its handle is dropped, which is what this
+        // fixture wants: the scheduler ends when `handle` closes the channel.
+        thread::spawn(move || {
             let _ = scheduler.run(rx);
         });
         Self {
             handle: CommandSender::new(tx),
-            thread,
         }
     }
 
