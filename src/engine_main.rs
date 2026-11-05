@@ -4915,7 +4915,7 @@ impl Install {
         &self,
         client: &mut Client,
         request: &PrepareRequest,
-    ) -> executor::Result<(Vec<KernelEntry>, usize)> {
+    ) -> executor::Result<PackageInstall> {
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
         // daemon, so both sides state it.
@@ -5015,38 +5015,51 @@ impl Install {
                 }
             }
         }
-        // A prepare that answered and produced nothing is a failure of the store's build, not a
-        // generation with fewer kernels: the walk would then find every operator missing and the
-        // update would stand in its device stage until a bound ended it. The key counts are what
-        // separates the two causes - a program given no descriptor key at all was never asked for
-        // a module, and one given keys whose build answered nothing is the store's own refusal.
-        if entries.is_empty() && !prepared.programs.is_empty() {
-            let asked = asked
-                .iter()
-                .map(|(program, keys)| format!("{program} with {keys} key(s)"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
+        // A package that installed nothing is not yet a failed generation: another package of the
+        // same generation may have installed every kernel this device needs, and a program this
+        // store has built no module of is the walk's business - it names the key it was expected to
+        // serve, one capture at a time. The generation-wide refusal is `run`'s, where the answer of
+        // every package is known.
+        if !prepared.programs.is_empty() {
+            if entries.is_empty() {
+                let asked_here = asked
+                    .iter()
+                    .map(|(program, keys)| format!("{program} with {keys} key(s)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    target = %self.target,
+                    asked = %asked_here,
+                    "the Program Server prepared this package's programs and this device installed \
+                     no module of any of them"
+                );
+            }
+            tracing::info!(
+                modules = entries.len(),
+                copies,
                 target = %self.target,
-                "the Program Server prepared this generation's programs and this device installed no module \
-                 of any of them"
+                "this package's modules are installed for the new generation"
             );
-            return Err(executor::Error::Invalid(format!(
-                "the Program Server prepared {} program(s) for target {} and this device installed no module \
-                 of any of them ({asked}): a program given no key was never asked for a module, and \
-                 one given keys built nothing",
-                prepared.programs.len(),
-                self.target
-            )));
         }
-        tracing::info!(
-            modules = entries.len(),
+        Ok(PackageInstall {
+            entries,
             copies,
-            target = %self.target,
-            "this package's modules are installed for the new generation"
-        );
-        Ok((entries, copies))
+            prepared: asked,
+        })
     }
+}
+
+/// What one package's request answered for this device, before the generation's kernels are gathered.
+struct PackageInstall {
+    /// The kernels this package installed into this device's context.
+    entries: Vec<KernelEntry>,
+    /// How many of them were copied out of the store rather than loaded where they lie.
+    copies: usize,
+    /// Each program the store selected for this package's request, and how many keys it was given.
+    /// Read by the generation-wide refusal, which needs the key counts to say which of the two
+    /// causes it met: a program given no key was never asked for a module, and one given keys whose
+    /// build answered nothing is the store's own refusal.
+    prepared: Vec<(String, usize)>,
 }
 
 impl HostAction for Install {
@@ -5064,10 +5077,38 @@ impl HostAction for Install {
             .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
         let mut entries = Vec::new();
         let mut copies = 0_usize;
+        let mut prepared: Vec<(String, usize)> = Vec::new();
         for request in &self.requests {
-            let (mut group, group_copies) = self.install_group(&mut client, request)?;
-            entries.append(&mut group);
-            copies += group_copies;
+            let mut package = self.install_group(&mut client, request)?;
+            entries.append(&mut package.entries);
+            copies += package.copies;
+            prepared.append(&mut package.prepared);
+        }
+        // A generation whose every package prepared its programs and installed no module of any of
+        // them is a failure of the store's build, not a generation with fewer kernels: the walk
+        // would find every operator missing and the update would stand in its device stage until a
+        // bound ended it. One package with nothing is not this: the generation's other packages are
+        // asked in their own requests, and a package this store has built nothing for leaves its
+        // key to the walk, which names it.
+        if entries.is_empty() && !prepared.is_empty() {
+            let asked = prepared
+                .iter()
+                .map(|(program, keys)| format!("{program} with {keys} key(s)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target = %self.target,
+                packages = self.requests.len(),
+                "the Program Server prepared this generation's programs and this device installed \
+                 no module of any of them"
+            );
+            return Err(executor::Error::Invalid(format!(
+                "the Program Server prepared {} program(s) for target {} and this device installed \
+                 no module of any of them ({asked}): a program given no key was never asked for a \
+                 module, and one given keys built nothing",
+                prepared.len(),
+                self.target
+            )));
         }
         // A generation's kernels are named once each: two packages of one operator cover disjoint
         // phases, and the same key twice would be the same kernel installed twice.
