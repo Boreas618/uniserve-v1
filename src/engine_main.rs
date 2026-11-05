@@ -395,7 +395,10 @@ impl ProcessInterface {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(proto::Error::Closed) => {
-                    tracing::info!("the daemon closed the process interface, so this process ends");
+                    tracing::warn!(
+                        "the daemon closed this process's interface; whether this epoch ends \
+                         depends on whether another daemon holds it"
+                    );
                     self.closed = true;
                     return Ok(None);
                 }
@@ -632,6 +635,9 @@ pub(crate) struct MainProcess {
     /// daemon is told the same state on the connection it gives (§7.5.1 step 2): a successor that
     /// is not told what this engine is never counts it as serving.
     reported_state: i32,
+    /// Whether the closing of the daemon's process interface has been reported: the interface
+    /// stays closed, and the line is worth stating once.
+    noted_process_closed: bool,
     commands_seen: u64,
     /// The two waits of the epoch's start that no event ends: the daemon's first command, and this
     /// node's warmup.
@@ -911,6 +917,7 @@ impl MainProcess {
             switchovers: 0,
             announced_at: None,
             reported_state: proto::request::wire::EngineState::Starting as i32,
+            noted_process_closed: false,
             commands_seen: 0,
             command_wait: Wait::default(),
             warmup_wait: Wait::default(),
@@ -1152,10 +1159,23 @@ impl MainProcess {
                     return Ok(Some(failure));
                 }
             }
-            // The daemon owns this process's life: an interface it closed is the end of the epoch,
-            // not a failure to report to it, so the pass stops by name and the process exits cleanly.
+            // A daemon owns this process's life: an interface it closed is the end of the epoch,
+            // not a failure to report to it, so the pass stops by name and the process exits
+            // cleanly. At a hot restart the interface that closes is the predecessor's, and the
+            // successor holds the deployment: this process is still serving it, and ending here
+            // would leave the successor with a front into nothing (§7.5.1).
             if self.process.closed() {
-                self.stopping = true;
+                let serving = self.control.live_attached();
+                if serving == 0 {
+                    self.stopping = true;
+                } else if !self.noted_process_closed {
+                    self.noted_process_closed = true;
+                    tracing::warn!(
+                        serving,
+                        "a daemon closed this process's interface; the attached daemons still \
+                         hold this engine, so it serves on"
+                    );
+                }
             }
 
             // A precopy in flight advances one stage per pass, never waiting on

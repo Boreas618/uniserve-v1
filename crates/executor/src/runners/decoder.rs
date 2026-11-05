@@ -21,6 +21,13 @@
 //! interpreting one of them. The order is stated once, by the model, in `prepare_layout`'s doc and in
 //! the capability's: the first buffer is the clip's latents, and the rest are the tables
 //! `layout_tables` names, in that order.
+//!
+//! **The tables are the model's and the clip is the denoiser's.** A layout's tables are prepared
+//! here, from `prepare_layout`, because a batch that carried them would state the model's layout
+//! arithmetic a second time. The trajectory is not this runner's to compute either: a denoise step
+//! publishes it under the request's name, so `stage` copies it from the product store - ordered on
+//! this runner's stream, which also works when the denoiser ran on another device - and reads a
+//! batch buffer as the clip only when the store holds none.
 
 use std::sync::{Arc, Mutex};
 
@@ -47,32 +54,20 @@ struct DecoderColumns {
     latents: Column,
     /// The clip's raster, `[channels, frames, rows, columns]`, in the decoder's own element type.
     raster: Column,
-    /// One column per table the largest layout declares, in `layout_tables` order.
-    ///
-    /// Each column takes its element type and length from the table it stages, because a decoder's
-    /// tables are not one type: the rotary tables and the copy offsets are the shapes the model
-    /// states and this file only copies them.
-    state: Vec<Column>,
 }
 
 impl DecoderColumns {
-    fn new(
-        device: DeviceId,
-        layout: &Layout,
-        dtype: DType,
-        tables: &[nn::capability::StateTable],
-    ) -> Result<Self> {
+    /// The clip's own two columns. **The tables are not here:** `Tables` holds them by
+    /// `(layout, name)` and `fill` puts the model's bytes in the cache the graph addresses
+    /// (`walk` reads `self.tables.views`), so a host column per table would be a second copy that
+    /// nothing reads — and the second copy is what let a staged buffer land in a table's place.
+    fn new(device: DeviceId, layout: &Layout, dtype: DType) -> Result<Self> {
         let video = layout.video;
         let voxels = u64::from(video.frames) * u64::from(video.height) * u64::from(video.width);
         let elements = voxels
             .checked_mul(u64::from(video.channels))
             .ok_or_else(|| Error::Invalid("a clip's latent extent overflows".into()))?;
         let latents = Column::new(device, dtype, elements)?;
-        let mut state = Vec::with_capacity(tables.len());
-        for table in tables {
-            let numel = table.shape.numel();
-            state.push(Column::new(device, table.dtype, numel)?);
-        }
         Ok(Self {
             latents,
             // Sized by `size_raster` when a bucket is first staged: the raster's frame count is the
@@ -80,7 +75,6 @@ impl DecoderColumns {
             // clip writes the decoded ones. One element until then, because a column of a length
             // this constructor cannot know must not pretend to a length it can.
             raster: Column::new(device, dtype, 1)?,
-            state,
         })
     }
 }
@@ -132,6 +126,46 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// so one name covers a batch, and a later decode of the same request replaces it — which is
     /// what a reader that copied in time expects.
     staged_request: Option<ipc::RequestKey>,
+    /// The pinned host scratch a trajectory of another element type lands in, allocated the first
+    /// time one is staged and reused after: the denoiser accumulates in FP32 and this decoder reads
+    /// the checkpoint's type, so the crossing is one conversion per clip, on the host.
+    crossing: Option<platform::PinnedBuffer>,
+    /// The request whose clip the raster column last held, so a decode of another can be refused
+    /// while the first is unread ([`clip_is_releasable`]).
+    published_for: Option<ipc::RequestKey>,
+}
+
+/// Whether a decode of `request` may start while a clip published under `published` is still held.
+///
+/// **One raster column, and a clip nobody has read yet.** A decode writes this runner's raster
+/// column, so decoding a second clip would overwrite the first before its artifact exists — silently,
+/// after the step that produced it, with no event that could order the read (the transport reads
+/// after the step, where a stream wait cannot reach). The first clip's life ends at
+/// `Products::forget`, which the transport calls once it has the bytes, so this asks the store and
+/// refuses by name: what a refusal means is *this request must wait for one read*, not *this
+/// deployment cannot serve two*.
+///
+/// A re-decode of the **same** request is allowed: its clip is its own, and the transport has either
+/// read it or not, in which case it is about to.
+fn clip_is_releasable(
+    request: ipc::RequestKey,
+    published: Option<ipc::RequestKey>,
+    still_held: bool,
+) -> Result<()> {
+    let Some(published) = published else {
+        return Ok(());
+    };
+    if published == request || !still_held {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "request {} asks for a decode and this runner's raster column still holds request {}'s \
+         clip: a decode writes the one column, so the second clip would replace the first before \
+         its artifact was read. The clip's life ends at `forget`, which the reader calls once it \
+         has the bytes; a second decode before that is a request that must wait, not a canvas this \
+         device cannot serve",
+        request.request_id.0, published.request_id.0
+    )))
 }
 
 impl<M: Decoder + Send + Sync> DecoderRunner<M> {
@@ -170,8 +204,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )
         })?;
         let dtype = model.element_type();
-        let tables = model.layout_tables(layout).map_err(Error::from)?;
-        let columns = DecoderColumns::new(binding.device, layout, dtype, &tables)?;
+        let columns = DecoderColumns::new(binding.device, layout, dtype)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -191,6 +224,8 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             raster_elements: 0,
             products: None,
             staged_request: None,
+            crossing: None,
+            published_for: None,
         })
     }
 
@@ -361,49 +396,206 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(buffers)
     }
 
-    /// One clip's buffers, refused unless their count is the model's: one latents column and one per
-    /// table, in [`Decoder::layout_tables`]' order.
+    /// Stages `bucket`'s latents, and the model's own tables where the cache does not hold them.
     ///
-    /// The count is the model's statement, not the runner's - a decode whose batch carried two
-    /// latents columns, or one table short, would write a column from another's bytes and read the
-    /// missing table as whatever the previous clip left there.
-    fn buffers_of<'a>(buffers: &'a Vec<Vec<u8>>, tables: usize) -> Result<&'a [Vec<u8>]> {
-        let expected = tables + 1;
-        if buffers.len() != expected {
-            return Err(Error::Invalid(format!(
-                "the decoder states {expected} buffer(s) for a clip - one latents and {tables} \
-                 table(s) - and the batch carries {}",
-                buffers.len()
-            )));
+    /// **Every table is the model's and every table lives in `Tables`.** `prepare_layout` writes the
+    /// bytes from the layout and `fill` puts them in the cache the captured graph addresses, keyed
+    /// by `(layout, name)` - so this function stages the clip's latents and nothing else. A batch
+    /// that carried tables would state the model's layout arithmetic a second time, which
+    /// `MediaColumns::staged` already rules out: "It does not own what the model prepares on the
+    /// device - the encoded conditioning rows, the latent trajectory".
+    ///
+    /// A warm capture passes no latents, and **the model supplies no clip for one**: `prepare_layout`
+    /// stages this decoder's *tables* (`video_vae`'s is one `video_positions` table), not a latent
+    /// trajectory, so the column is zeroed - defined values in its own element type, which is what a
+    /// capture needs and all it needs. Reading `prepare_layout`'s first buffer as a clip was wrong in
+    /// the direction that does not fail: a table's bytes are shorter than the clip, so they were
+    /// written over the front of the column and the capture read a clip made of rotary positions.
+    ///
+    /// A replay passes the batch's buffer - a staged row is the request's conditioning blob and its
+    /// parameter record - but `stage` reaches this only when the product store holds no trajectory
+    /// for the request, and a blob of another length is then refused rather than copied over a prefix.
+    fn stage_columns(&mut self, bucket: Bucket, latents: Option<&[u8]>) -> Result<()> {
+        self.size_raster(bucket)?;
+        self.layout(bucket)?;
+        // The tables the graph addresses, in the cache they are keyed in. `prepare_layout` is asked
+        // exactly once per layout, here, and its bytes never touch the latents column.
+        self.fill(bucket)?;
+        match latents {
+            Some(bytes) => {
+                // The column is the model's extent for this layout, so a blob of another length is
+                // a request for another clip: refused by name rather than copied over a prefix.
+                let expected = self.columns.latents.host.len();
+                if bytes.len() != expected {
+                    return Err(Error::Invalid(format!(
+                        "a decode of bucket {bucket} states {expected} byte(s) of latents and the \
+                         batch carries {}: the clip is not this bucket's",
+                        bytes.len()
+                    )));
+                }
+                self.columns.latents.write(bytes)?;
+            }
+            None => {
+                // The clip is this runner's own column, empty until a request publishes one: zeros
+                // are defined, hold no clip's arithmetic and cost no copy.
+                //
+                // SAFETY: the column is this runner's own pinned storage, sized for the largest
+                // bucket it was bound with, and nothing else writes it here: the capture this stages
+                // is the next job on the stream, and a replay of this bucket is not concurrent with
+                // a stage (a batch is staged once, before its jobs are issued).
+                unsafe {
+                    self.columns.latents.host.as_mut_slice().fill(0);
+                }
+            }
         }
-        Ok(buffers)
+        self.staged = Some(bucket);
+        Ok(())
     }
 
-    /// Stages a batch's buffers into the columns `bucket`'s graph reads.
-    ///
-    /// The buffers are the model's own: `prepare_layout` states the first as the clip's latents and
-    /// the rest as the tables `layout_tables` names, in order. This function checks their count and
-    /// their byte lengths against what the model declared and copies them; it reads no header and
-    /// interprets no value, which is what keeps a decoder's input format out of the executor.
+    /// Stages a batch's clip into the columns `bucket`'s graph reads.
     fn stage(&mut self, batch: &Batch, bucket: Bucket) -> Result<()> {
         let media = batch.media.as_ref().ok_or_else(|| {
             Error::Invalid(
                 "a decoder runner serves a media batch; this one states no computation".into(),
             )
         })?;
-        self.size_raster(bucket)?;
-        let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
         // The batch names its requests, and a decode bucket serves one clip, so the name kept here
         // is the one the replay's publish uses.
-        self.staged_request = Some(media.request(0)?.request);
-        let buffers = Self::buffers_of(Self::clip_of(media)?, tables.len())?;
-        self.columns.latents.write(&buffers[0])?;
-        for (column, bytes) in self.columns.state.iter_mut().zip(&buffers[1..]) {
-            column.write(bytes)?;
+        let request = media.request(0)?.request;
+        // The column may still hold another request's clip: the store is where that clip's life
+        // ends, so the store is asked.
+        let still_held = match (self.products.as_deref(), self.published_for) {
+            (Some(store), Some(last)) if last != request => store.holds(last, Product::Video),
+            _ => false,
+        };
+        clip_is_releasable(request, self.published_for, still_held)?;
+        self.staged_request = Some(request);
+        // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
+        // is the request's conditioning blob and its parameter record; the latent trajectory is
+        // explicitly not the batch's (`MediaColumns::staged`: "It does not own what the model
+        // prepares on the device - the encoded conditioning rows, the latent trajectory"), and a
+        // denoise step publishes it under this request's name at every step. So the clip is copied
+        // from there, ordered on this runner's stream, which is the only path that also works when
+        // the denoiser ran on another device.
+        if let Some(products) = self.products.clone() {
+            if products.holds(request, Product::VideoLatents) {
+                return self.stage_product(bucket, request, products.as_ref());
+            }
         }
-        self.staged = Some(bucket);
+        let row = Self::clip_of(media)?;
+        let Some(latents) = row.first() else {
+            return Err(Error::Invalid(
+                "a staged decode row carries no buffer: a media row is the request's conditioning \
+                 blob and its parameter record"
+                    .into(),
+            ));
+        };
+        self.stage_columns(bucket, Some(latents))
+    }
+
+    /// Stages the clip the denoiser published for `request` into the column `bucket`'s graph reads.
+    ///
+    /// The column is sized from the layout first - `prepare_layout`'s own clip - so the destination's
+    /// extent is the model's rather than a length this runner recomputes, and `copy_into` refuses a
+    /// product whose bytes disagree with it instead of copying a prefix. The copy is on this
+    /// runner's stream and the store orders it after the producing step's write, which is what makes
+    /// it correct when the denoiser ran on another stream or another device.
+    fn stage_product(
+        &mut self,
+        bucket: Bucket,
+        request: ipc::RequestKey,
+        store: &dyn Products,
+    ) -> Result<()> {
+        self.stage_columns(bucket, None)?;
+        let layout = self.layout(bucket)?;
+        let Some(published) = store.product(request, Product::VideoLatents)? else {
+            return Err(crate::runners::products::absent(
+                request,
+                Product::VideoLatents,
+            ));
+        };
+        if published.dtype == self.dtype {
+            let latents = self.latents(&layout);
+            if !store.copy_into(request, Product::VideoLatents, &latents, &self.stream)? {
+                return Err(crate::runners::products::absent(
+                    request,
+                    Product::VideoLatents,
+                ));
+            }
+            return Ok(());
+        }
+        // **The boundary's one conversion.** The denoiser accumulates in FP32 (`SAMPLE_DTYPE`) and
+        // this decoder reads the checkpoint's own type; the reference spans the two with
+        // `torch.autocast`, which design 9 replaced with declared per-layer precision, so exactly
+        // one conversion happens here - once per clip, on the host, not per step and not in a loop.
+        let source = self.trajectory_scratch(published)?;
+        if !store.copy_into(request, Product::VideoLatents, &source, &self.stream)? {
+            return Err(crate::runners::products::absent(
+                request,
+                Product::VideoLatents,
+            ));
+        }
+        // The copy is ordered on this stream, so the host may read the bytes once the stream reaches
+        // it. This is the one place in the media seam that waits on the device rather than ordering
+        // more work after it, and it waits once per clip.
+        //
+        // **It waits on the decode stream, so it also waits for whatever that stream still holds** -
+        // and what it holds is one clip's launch, which is what the media path's one-in-flight
+        // admission rule guarantees is nothing. A deployment that ever admits two media requests at
+        // once makes this the place the second one queues, and the fix then is a stream of the
+        // runner's own for the crossing rather than a narrower wait.
+        self.stream.synchronize()?;
+        let crossing = self
+            .crossing
+            .as_ref()
+            .ok_or_else(|| Error::Invariant("the trajectory scratch was just staged".into()))?;
+        // SAFETY: the buffer is this runner's own pinned storage, sized for exactly the trajectory
+        // and written by the copy above, which the synchronize has completed; nothing else holds a
+        // reference to it while the conversion reads it.
+        let bytes = unsafe { crossing.as_slice() };
+        let converted = nn::weights::convert(
+            published.dtype,
+            self.dtype,
+            bytes,
+            "the denoiser's trajectory",
+        )
+        .map_err(Error::from)?;
+        self.columns.latents.write(&converted)?;
         Ok(())
+    }
+
+    /// The pinned host scratch a trajectory of another element type lands in, sized to it once.
+    ///
+    /// The conversion is a host conversion, so the product's bytes must come back to the host first -
+    /// and a product of another type cannot be copied into this runner's column at all, which the
+    /// store refuses by both types. Reusing one buffer keeps the crossing to one allocation per
+    /// runner rather than one per clip.
+    fn trajectory_scratch(
+        &mut self,
+        published: crate::runners::products::Published,
+    ) -> Result<TensorView> {
+        let element = published
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", published.dtype)))?;
+        let bytes = usize::try_from(published.bytes)
+            .map_err(|_| Error::Invalid("a trajectory is larger than memory".into()))?;
+        if self
+            .crossing
+            .as_ref()
+            .is_none_or(|buffer| buffer.len() < bytes)
+        {
+            self.crossing = Some(platform::PinnedBuffer::new(self.device, bytes)?);
+        }
+        let buffer = self
+            .crossing
+            .as_ref()
+            .ok_or_else(|| Error::Invariant("the trajectory scratch was just allocated".into()))?;
+        Ok(TensorView::new(
+            ops::DevicePtr::new(buffer.address()),
+            published.dtype,
+            Shape::new(&[published.bytes / u64::from(element)]),
+        ))
     }
 
     /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
@@ -411,29 +603,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         if self.staged == Some(bucket) {
             return Ok(());
         }
-        self.size_raster(bucket)?;
-        let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        let mut host = vec![Vec::new(); tables.len() + 1];
-        self.model
-            .prepare_layout(&layout, &mut host)
-            .map_err(Error::from)?;
-        self.columns.latents.write(&host[0])?;
-        for (column, bytes) in self.columns.state.iter_mut().zip(&host[1..]) {
-            column.write(bytes)?;
-        }
-        self.staged = Some(bucket);
-        Ok(())
+        self.stage_columns(bucket, None)
     }
 
     /// Uploads the staged columns, in one place, so a capture and a replay agree on what the graph
     /// reads.
     fn upload(&self) -> Result<()> {
-        self.columns.latents.upload(&self.stream)?;
-        for column in &self.columns.state {
-            column.upload(&self.stream)?;
-        }
-        Ok(())
+        self.columns.latents.upload(&self.stream)
     }
 
     /// The clip's latents, `[voxels, channels]`, as the model reads them.
@@ -486,7 +662,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// runner's next decode of the bucket, and the copy is issued on the reader's stream. Publishing
     /// nothing when no store was attached is deliberate — the consumer's read refuses by name, and a
     /// decode that refused here would fail a step whose own work succeeded.
-    fn publish(&self, bucket: Bucket) -> Result<()> {
+    fn publish(&mut self, bucket: Bucket) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             return Ok(());
         };
@@ -498,13 +674,19 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         };
         let layout = self.layout(bucket)?;
         let raster = self.raster(bucket, &layout)?;
+        let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
             request,
             Product::Video,
             self.device,
             self.stream_id(),
+            Some(written),
             &raster,
-        )
+        )?;
+        // The column now holds this request's clip until a reader forgets it: that is what a second
+        // decode of another request is refused against.
+        self.published_for = Some(request);
+        Ok(())
     }
 
     /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
@@ -744,6 +926,44 @@ mod tests {
     //! Nothing here needs a device: each behaviour is a function of the bucket and the model, which is
     //! why a model that refuses a canvas can be driven without one.
 
+    /// A clip still held under another request refuses a second decode, by both requests' names.
+    ///
+    /// The rule is one raster column's: a decode of another request would replace the clip before its
+    /// artifact was read, and nothing orders that read against the step that writes the column. What
+    /// the refusal must therefore carry is the pair — who holds the column, and who is asking — because
+    /// the reader that has to act on it is the holder's transport.
+    #[test]
+    fn a_second_clip_is_refused_while_the_first_is_unread() {
+        let first = ipc::RequestKey::new(0, ipc::RequestId(1), 0);
+        let second = ipc::RequestKey::new(0, ipc::RequestId(2), 0);
+
+        assert!(
+            clip_is_releasable(second, None, false).is_ok(),
+            "a runner that has published no clip decodes any request"
+        );
+        assert!(
+            clip_is_releasable(second, Some(first), false).is_ok(),
+            "a clip the reader forgot no longer holds the column"
+        );
+        assert!(
+            clip_is_releasable(first, Some(first), true).is_ok(),
+            "the holder decoding again reads its own clip, which the transport is about to take"
+        );
+
+        let error = clip_is_releasable(second, Some(first), true)
+            .expect_err("the column still holds the first request's clip");
+        let message = format!("{error}");
+        for expected in [
+            "request 2 asks for a decode",
+            "still holds request 1's clip",
+            "`forget`",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must name {expected:?}: {message}"
+            );
+        }
+    }
     use super::*;
     use nn::capability::StateTable;
 
@@ -894,25 +1114,31 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_carries_one_latents_buffer_and_one_per_table() {
-        // The count is the model's: the stub declares two tables, so a clip is three buffers, and a
-        // batch carrying one fewer would read the missing table as whatever the last clip left.
-        let buffers = vec![vec![0_u8; 8], vec![0_u8; 4], vec![0_u8; 4]];
+    fn a_staged_row_is_the_conditioning_blob_the_batch_was_built_with() {
+        // The row's shape is the engine's, not this file's: `MediaColumns::staged` writes the
+        // request's conditioning blob and its parameter record, one row per request, and the record is
+        // read by `media.request`. The blob is the clip only as a fallback: `stage` takes the
+        // trajectory from the product store first, so this ordering is what a batch without a
+        // published product has to satisfy.
+        let media = crate::batch::MediaColumns {
+            computation: crate::plan::Computation {
+                call: ipc::MediaCall::VideoDecoding,
+                rows: 1,
+                tokens: 0,
+                extent: crate::plan::Extent::Clip {
+                    frames: SERVED.0,
+                    height: SERVED.1,
+                    width: SERVED.2,
+                },
+            },
+            inputs: vec![vec![vec![7_u8; 32], vec![0_u8; 40]]],
+        };
+        let row = DecoderRunner::<Fixed>::clip_of(&media).expect("one clip");
+        assert_eq!(row.len(), 2, "a staged row is the blob and the record");
         assert_eq!(
-            DecoderRunner::<Fixed>::buffers_of(&buffers, 2)
-                .expect("one latents and two tables")
-                .len(),
-            3
-        );
-
-        let short = vec![vec![0_u8; 8], vec![0_u8; 4]];
-        let error =
-            DecoderRunner::<Fixed>::buffers_of(&short, 2).expect_err("one table is missing");
-        let message = format!("{error}");
-        assert!(
-            message.contains("states 3 buffer(s) for a clip")
-                && message.contains("the batch carries 2"),
-            "the refusal names both counts: {message}"
+            row.first().map(Vec::len),
+            Some(32),
+            "the first buffer is the clip's latents"
         );
     }
 
