@@ -990,6 +990,7 @@ time.sleep(600)
                     host: "host".to_owned(),
                     group: "model".to_owned(),
                     routable: false,
+                    engine: 7,
                 },
                 None,
             )
