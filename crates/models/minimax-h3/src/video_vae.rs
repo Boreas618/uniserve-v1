@@ -1836,6 +1836,42 @@ pub fn fold_input_affine(
 pub(crate) mod tests {
     use super::*;
 
+    /// A clip's transformer scratch is **one tile's**, and the plan states one tile's: the two must
+    /// agree, or a device run stops inside the arena naming a buffer while the plan is the thing that
+    /// is wrong. The clip's own canvas is not the unit - the clip is decoded tile by tile.
+    #[test]
+    fn a_clips_scratch_fits_the_plan_its_canvas_states() {
+        let config = video_config();
+        // A canvas one tile wide and two tall, so a tile's row count and the clip's differ: on a
+        // single-tile canvas the two are the same number and this test would see nothing.
+        let canvas = Canvas::clip(&config, 3 * config.spatial_compression(), 17);
+        let grid = Tiles::of(&config, &canvas)
+            .expect("a grid")
+            .tiles(&config, &canvas);
+        assert!(
+            grid.len() > 1,
+            "the canvas must need more than one tile, or this test proves nothing: {} tile(s)",
+            grid.len()
+        );
+        assert!(
+            grid[0].canvas.voxels() < canvas.voxels(),
+            "and a tile must be smaller than the clip: {} against {}",
+            grid[0].canvas.voxels(),
+            canvas.voxels()
+        );
+
+        let decoder = stated_decoder(&config, canvas);
+        let plan = crate::decoding::video_arena(&config, &canvas, DType::F32).expect("a plan");
+        let need = crate::decoding::arena_reservation(&plan);
+        // Exactly the plan and not one byte more: the scratch a clip reserves has to fit inside the
+        // number its decoder states to the runner.
+        let arena = nn::Arena::new(nn::DevicePtr::new(0), need);
+        let forward = nn::Forward::recording(&arena);
+        decoder
+            .scratch(&forward)
+            .expect("one clip's transformer scratch fits the plan its decoder states");
+    }
+
     /// A decoder of one canvas, built from stated weights: the geometry is the subject, so neither a
     /// checkpoint nor a device is needed.
     fn stated_decoder(config: &VideoVaeConfig, canvas: Canvas) -> VideoDecoder {
