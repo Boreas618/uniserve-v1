@@ -1494,12 +1494,19 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-        args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[experts]))?;
-        if args.global_scale.strides.last() != 1 {
+        // The table is one packed f32 per expert, and the loader states it as a row of `experts`
+        // (`[1, experts]`, stride `experts`), which is the form the gather product beside this one
+        // reads. A rank-one `[experts]` has stride 1 there, so demanding that shape refuses the
+        // table the model actually holds: this product reads the row, and the two agree.
+        if args.global_scale.strides.get(0) != experts || args.global_scale.strides.last() != 1 {
             return Err(Error::argument(
                 Self::NAME,
-                "the tensor scales must be one packed f32 per expert",
+                format!(
+                    "the tensor scales must be one packed f32 per expert, addressed by a row \
+                     stride of {experts}; the table's strides are {} and {}",
+                    args.global_scale.strides.get(0),
+                    args.global_scale.strides.last()
+                ),
             ));
         }
         if args.global_scale.dtype != DType::F32 {
