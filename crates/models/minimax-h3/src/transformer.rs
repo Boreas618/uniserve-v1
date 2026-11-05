@@ -666,11 +666,10 @@ impl Transformer {
         // (the `silu f32` row) and every projection matrix feeding it are the checkpoint's twelve FP32
         // tensors, so a gather keyed by the deployment's type names a module the launch never asks for
         // - which is how two of them read as unlaunched to the recorder while this walk stated them.
-        for columns in [
-            18 * u64::from(hidden),
-            2 * u64::from(hidden),
-            u64::from(hidden),
-        ] {
+        // The cache's own tables. The hidden-width table is **not** one of them: the model gathers
+        // that one at the stack's type (stated below), so a third entry here states a program the
+        // launch never asks for - the recorder made `logits_gather bf16 5376` and never `f32 5376`.
+        for columns in [18 * u64::from(hidden), 2 * u64::from(hidden)] {
             programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
                 nn::DType::F32,
                 columns,
@@ -1318,10 +1317,10 @@ mod tests {
 
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("rms_norm"), 1);
-        // Four tables of the FP32 modulation cache (18·hidden, 2·hidden, hidden and the step's group
-        // index) plus the stack's own table at the hidden width in the deployment's type: the same
-        // gather at two element types is two programs.
-        assert_eq!(count("logits_gather"), 5);
+        // Two tables of the FP32 modulation cache (18·hidden and 2·hidden), the step's group index at
+        // I32, and the stack's own table at the hidden width in the deployment's type: the
+        // hidden-width table is **not** a cache table, which is one row the walk used to invent.
+        assert_eq!(count("logits_gather"), 4);
         // Three forms: the video stack's two (no gate, at the attention's and the feed-forward's
         // modulation widths) and the audio's one (gated, retaining the normalized row).
         assert_eq!(count("modulated_rms_norm"), 3);
