@@ -2,9 +2,9 @@
 //!
 //! `PendingWorker::spawn` derives the rank's launch descriptor and has the
 //! daemon of the rank's node start the rank process (`processes`). The rank
-//! connects to the engine and registers (`registry::WorkerRegistry`);
+//! connects to the engine and registers (`registry::ExecutorRegistry`);
 //! `PendingWorker::adopt` answers on that connection with the descriptor and
-//! yields a `WorkerProcess`, which `WorkerGroup` (in `group`) drives:
+//! yields a `ExecutorProcess`, which `ExecutorGroup` (in `group`) drives:
 //! `finish_startup` validates the ranks' startup reports, `submit_batch` and
 //! `poll_batch` exchange batches and results, and `close_workers` or
 //! `terminate` retires the rank.
@@ -18,9 +18,9 @@
 //! the CUDA driver storage a rank that did not end in order left behind.
 //!
 //! The engine exchanges batch descriptors and bounded result values while
-//! tensors, cache pages, and latent storage remain worker-resident.
+//! tensors, cache pages, and latent storage remain executor-resident.
 //!
-//! The defaults of the launch settings `WorkerProcessArgs` carries and the
+//! The defaults of the launch settings `ExecutorProcessArgs` carries and the
 //! launch descriptor built from them are defined in `descriptor`.
 
 mod descriptor;
@@ -35,12 +35,12 @@ use anyhow::{Context, bail};
 use ipc::Channel;
 use ipc::{Batch, LaunchDescriptor, WorkerInfo, WorkerRequest, WorkerResponse};
 
-use crate::worker::WorkerProcessArgs;
-use crate::worker::processes::Processes;
+use crate::executors::ExecutorProcessArgs;
+use crate::executors::processes::Processes;
 
 /// Maximum time `request_close` spends draining in-flight responses from a
-/// still-alive worker before it sends the shutdown request. A hung (alive but
-/// unresponsive) worker must not be able to block shutdown forever.
+/// still-alive executor before it sends the shutdown request. A hung (alive but
+/// unresponsive) executor must not be able to block shutdown forever.
 const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the ranks closed together by `close_workers` have, from the last
 /// shutdown request, to acknowledge it, finish their teardown and exit. A
@@ -52,7 +52,7 @@ const WORKER_EXIT_GRACE: Duration = Duration::from_secs(30);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Interval between progress logs while a rank prepares during startup.
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
-/// Longest wait between liveness checks (`WorkerProcess::check_worker`) while
+/// Longest wait between liveness checks (`ExecutorProcess::check_worker`) while
 /// waiting on a rank, which bounds how late a local rank's exit status is
 /// read once its connection has closed.
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -61,13 +61,13 @@ const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// requests outstanding on it.
 ///
 /// Dropping it closes the rank alone through `close_workers`.
-pub(super) struct WorkerProcess {
+pub(super) struct ExecutorProcess {
     client: Channel,
     /// The rank's validated startup report; the default value until
     /// `finish_startup` stores it.
     info: WorkerInfo,
     /// The startup cancellation flag shared by the ranks launched together,
-    /// which the teardown of any of them sets. `WorkerGroup` detaches it
+    /// which the teardown of any of them sets. `ExecutorGroup` detaches it
     /// with `set_startup_cancel(None)` once the group is ready.
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The rank's process, which its node's daemon supervises.
@@ -131,14 +131,14 @@ pub(super) struct ExitWatch {
 impl ExitWatch {
     /// The rank's exit status, once its daemon reported it.
     fn exited(&self) -> Option<String> {
-        crate::worker::processes::lock(&self.processes)
+        crate::executors::processes::lock(&self.processes)
             .ok()?
             .exited(&self.group, self.generation, self.rank)
     }
 }
 
 /// What an outstanding request was sent for; only batch submissions are
-/// tracked in `WorkerProcess::pending`.
+/// tracked in `ExecutorProcess::pending`.
 enum OutstandingKind {
     Batch { batch_id: u64 },
 }
@@ -146,7 +146,7 @@ enum OutstandingKind {
 /// Sockets a rank inherits from its daemon and serves collective stores on,
 /// as reservations of its node.
 #[derive(Default)]
-pub(crate) struct WorkerSockets {
+pub(crate) struct ExecutorSockets {
     /// The group's rendezvous store, served by the group's first rank.
     pub(crate) group: Option<(u64, i32)>,
     /// The expert-parallel world's store, served by that world's rank 0.
@@ -172,11 +172,11 @@ impl PendingWorker {
         reason = "one rank's launch: its arguments, sockets, daemons and generation"
     )]
     pub(crate) fn spawn(
-        args: &WorkerProcessArgs,
+        args: &ExecutorProcessArgs,
         rank: u32,
         storage: ipc::StorageLaunch,
         rendezvous: Option<&str>,
-        sockets: WorkerSockets,
+        sockets: ExecutorSockets,
         processes: &Processes,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         engine_address: &str,
@@ -184,16 +184,16 @@ impl PendingWorker {
     ) -> anyhow::Result<Self> {
         let depth = args.queue_depth.max(1);
 
-        // argv carries the address of the engine the worker connects to and
-        // what its registration states: its worker group and its rank, and
+        // argv carries the address of the engine the executor connects to and
+        // what its registration states: its executor group and its rank, and
         // the generation of the group's launch it belongs to. They are the
-        // worker's only statement of its identity; the launch descriptor
+        // executor's only statement of its identity; the launch descriptor
         // repeats none of them.
         let arguments = vec![
-            "worker".to_owned(),
+            "executor".to_owned(),
             "--engine".to_owned(),
             engine_address.to_owned(),
-            "--worker-id".to_owned(),
+            "--executor-id".to_owned(),
             args.worker_id.clone(),
             "--rank".to_owned(),
             rank.to_string(),
@@ -213,15 +213,15 @@ impl PendingWorker {
             sockets.experts.map(|(_, descriptor)| descriptor),
         )?;
 
-        // The worker runs the engine's build: the executable imports the
+        // The executor runs the engine's build: the executable imports the
         // `uniserve` package of the Python environment it is installed in,
-        // which holds the worker library of that build.
+        // which holds the executor library of that build.
         let executable = args
             .executable
             .to_str()
-            .context("the worker executable's path is not valid text")?
+            .context("the executor executable's path is not valid text")?
             .to_owned();
-        crate::worker::processes::lock(processes)?.spawn(proto::process::Spawn {
+        crate::executors::processes::lock(processes)?.spawn(proto::process::Spawn {
             host: args.ranks[rank as usize].host.clone(),
             group: args.worker_id.clone(),
             rank,
@@ -275,9 +275,9 @@ impl PendingWorker {
     /// Answers the rank's registration on `channel` with its launch
     /// descriptor and takes the connection as the rank's channel.
     ///
-    /// The returned `WorkerProcess`'s `info` stays the default until
+    /// The returned `ExecutorProcess`'s `info` stays the default until
     /// `finish_startup` runs.
-    pub(crate) fn adopt(self, mut channel: Channel) -> anyhow::Result<WorkerProcess> {
+    pub(crate) fn adopt(self, mut channel: Channel) -> anyhow::Result<ExecutorProcess> {
         let PendingWorker {
             process,
             rank,
@@ -292,7 +292,7 @@ impl PendingWorker {
             .with_context(|| format!("sending rank {rank} its launch descriptor"))?;
         tracing::info!(rank, "a rank registered and received its launch descriptor");
 
-        Ok(WorkerProcess {
+        Ok(ExecutorProcess {
             client: channel,
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
@@ -338,7 +338,7 @@ pub(crate) fn stall_failure(stall: &ipc::Stall) -> anyhow::Error {
     )
 }
 
-impl WorkerProcess {
+impl ExecutorProcess {
     /// Asks the rank for its startup report.
     ///
     /// The rank answers only once its model is built and warmed up;
@@ -397,7 +397,7 @@ impl WorkerProcess {
         self.check_worker("Worker startup")?;
         self.info = info;
         self.starting = false;
-        tracing::info!(?self.info, "worker ready");
+        tracing::info!(?self.info, "executor ready");
         Ok(true)
     }
 
@@ -459,7 +459,7 @@ impl WorkerProcess {
         }
     }
 
-    /// Asks the rank to run the worker hook `name` with `payload`
+    /// Asks the rank to run the executor hook `name` with `payload`
     /// (`WorkerRequest::Hook`). Returns the request's message, whose answer
     /// [`Self::await_hook`] waits for. The engine asks only while the rank
     /// runs no batch, so no other answer is outstanding.
@@ -499,7 +499,7 @@ impl WorkerProcess {
                 Some(other) => bail!("unexpected hook response: {:?}", other.kind()),
                 None => {}
             }
-            self.check_worker("a worker hook")?;
+            self.check_worker("an executor hook")?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             anyhow::ensure!(
                 !remaining.is_zero(),
@@ -515,7 +515,7 @@ impl WorkerProcess {
         self.process.generation
     }
 
-    /// Allocates the next worker message identifier.
+    /// Allocates the next executor message identifier.
     fn alloc_call_id(&mut self) -> u64 {
         let id = self.next_message_id;
         self.next_message_id += 1;
@@ -524,7 +524,7 @@ impl WorkerProcess {
 
     /// Replaces the startup cancellation flag `check_worker` consults.
     ///
-    /// `WorkerGroup` passes `None` once the group is ready, so a later exit
+    /// `ExecutorGroup` passes `None` once the group is ready, so a later exit
     /// no longer reads as a cancelled startup on the surviving ranks.
     pub(crate) fn set_startup_cancel(
         &mut self,
@@ -544,7 +544,7 @@ impl WorkerProcess {
     /// Terminates a failed or cancelled rank.
     ///
     /// Sends no shutdown request and discards outstanding and routed results.
-    /// The rank's channel closes, which ends the rank; `WorkerGroup` also
+    /// The rank's channel closes, which ends the rank; `ExecutorGroup` also
     /// stops the group's processes through their daemons
     /// (`ProcessClient::stop`), which kill a rank that did not end.
     pub(crate) fn terminate(&mut self) {
@@ -564,10 +564,10 @@ impl WorkerProcess {
             .as_ref()
             .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
         {
-            bail!("worker startup cancelled during {context}");
+            bail!("executor startup cancelled during {context}");
         }
         if let Some(status) = self.process.exited() {
-            bail!("worker process exited during {context}: {status}");
+            bail!("executor process exited during {context}: {status}");
         }
         Ok(())
     }
@@ -600,9 +600,9 @@ impl WorkerProcess {
             // A response answers the request whose identity it states.
             let message_id = response
                 .message_id()
-                .context("worker response states no message identity")?;
+                .context("executor response states no message identity")?;
             let kind = self.pending.remove(&message_id).with_context(|| {
-                format!("worker response {message_id} answers no outstanding request")
+                format!("executor response {message_id} answers no outstanding request")
             })?;
             self.route(kind, response)?;
             drained += 1;
@@ -614,7 +614,7 @@ impl WorkerProcess {
     ///
     /// The result is received, which claims any media it published
     /// (`WorkerResult::receive`). Returns an error and appends nothing when
-    /// the worker answered with an
+    /// the executor answered with an
     /// execution error (as a `WorkerExecError`) or an unexpected response
     /// kind, a product locator names an endpoint other than this rank's
     /// reported one, or the result's batch identity differs from the
@@ -648,12 +648,12 @@ impl WorkerProcess {
                     .value
                     .locators()
                     .all(|locator| locator.source == self.info.endpoint),
-                "worker published a product from an unbound rank incarnation"
+                "executor published a product from an unbound rank incarnation"
             );
         }
         anyhow::ensure!(
             report.batch_id == batch_id,
-            "worker result batch id mismatch: expected {batch_id}, got {}",
+            "executor result batch id mismatch: expected {batch_id}, got {}",
             report.batch_id
         );
         self.ready.push_back(Ok(report));
@@ -692,8 +692,8 @@ impl WorkerProcess {
     }
 }
 
-impl WorkerProcess {
-    /// Returns metadata for the physical worker.
+impl ExecutorProcess {
+    /// Returns metadata for the physical executor.
     pub(super) fn info(&self) -> &WorkerInfo {
         &self.info
     }
@@ -786,7 +786,7 @@ impl WorkerProcess {
                 if Instant::now() >= drain_deadline {
                     tracing::warn!(
                         pending = self.pending.len(),
-                        "worker did not drain in-flight responses before shutdown deadline"
+                        "executor did not drain in-flight responses before shutdown deadline"
                     );
                     break;
                 }
@@ -848,7 +848,7 @@ impl WorkerProcess {
             if remaining.is_zero() {
                 tracing::warn!(
                     rank = self.rank,
-                    "worker did not exit before the shutdown deadline; stopping it"
+                    "executor did not exit before the shutdown deadline; stopping it"
                 );
                 return false;
             }
@@ -873,7 +873,7 @@ impl WorkerProcess {
 /// rank's failure. A rank that dies while starting closes its connection,
 /// which fails the startup of all of them by that rank's name instead of
 /// leaving its peers waiting for it.
-pub(super) fn finish_startup(ranks: &mut [&mut WorkerProcess]) -> anyhow::Result<()> {
+pub(super) fn finish_startup(ranks: &mut [&mut ExecutorProcess]) -> anyhow::Result<()> {
     for rank in ranks.iter_mut() {
         rank.request_startup()?;
     }
@@ -909,20 +909,20 @@ pub(super) fn finish_startup(ranks: &mut [&mut WorkerProcess]) -> anyhow::Result
         if last_log.elapsed() >= STARTUP_LOG_INTERVAL {
             tracing::info!(
                 elapsed_secs = started.elapsed().as_secs(),
-                "workers still busy during startup"
+                "executors still busy during startup"
             );
             last_log = Instant::now();
         }
         let until_check = WORKER_CHECK_INTERVAL.saturating_sub(last_worker_check.elapsed());
         let until_log = STARTUP_LOG_INTERVAL.saturating_sub(last_log.elapsed());
-        crate::worker::park_descriptors(&descriptors, until_check.min(until_log))?;
+        crate::executors::park_descriptors(&descriptors, until_check.min(until_log))?;
     }
 }
 
-/// Retires the ranks of one worker group together, absorbing every failure.
+/// Retires the ranks of one executor group together, absorbing every failure.
 ///
 /// A rank's orderly teardown retires the communicators and process groups it
-/// shares with the group's other ranks (`Worker.close` on the Python side),
+/// shares with the group's other ranks (`Executor.close` on the Python side),
 /// and that retirement completes on any rank only once every rank has
 /// reached it. Every rank is therefore asked to shut down, after draining its
 /// outstanding calls, before any is waited for, and all of them then share
@@ -931,7 +931,7 @@ pub(super) fn finish_startup(ranks: &mut [&mut WorkerProcess]) -> anyhow::Result
 /// teardown had not yet released. Asking one rank at a time would leave the
 /// first one waiting on peers that have not been asked, until it is killed
 /// with its communicators unreleased.
-pub(super) fn close_workers(ranks: &mut [WorkerProcess], stop: impl FnOnce()) {
+pub(super) fn close_workers(ranks: &mut [ExecutorProcess], stop: impl FnOnce()) {
     for rank in ranks.iter_mut() {
         rank.request_close();
     }
@@ -945,7 +945,7 @@ pub(super) fn close_workers(ranks: &mut [WorkerProcess], stop: impl FnOnce()) {
     }
 }
 
-impl Drop for WorkerProcess {
+impl Drop for ExecutorProcess {
     /// Closes the rank as `close_workers` would close it alone; a rank still
     /// running at the deadline ends with its channel's close.
     fn drop(&mut self) {
@@ -954,18 +954,18 @@ impl Drop for WorkerProcess {
     }
 }
 
-/// Promotes the parked standby ranks `workers`: asks every rank, then waits
+/// Promotes the parked standby ranks `executors`: asks every rank, then waits
 /// at most `timeout` for each answer, so that ranks restoring their world's
 /// communication together are all promoting at once.
 ///
 /// # Errors
 ///
 /// Fails at the first rank that refuses, dies, or does not answer in time.
-/// Runs the worker hook `name` on every rank in `workers`, asking each
+/// Runs the executor hook `name` on every rank in `executors`, asking each
 /// before awaiting any (a hook may communicate between the ranks), and
 /// returns each rank's result in order.
-pub(in crate::worker) fn hook_all(
-    workers: &mut [WorkerProcess],
+pub(in crate::executors) fn hook_all(
+    workers: &mut [ExecutorProcess],
     name: &str,
     payload: &str,
     timeout: Duration,
@@ -981,13 +981,13 @@ pub(in crate::worker) fn hook_all(
         .collect()
 }
 
-pub(in crate::worker) fn promote_all(
-    workers: &mut [WorkerProcess],
+pub(in crate::executors) fn promote_all(
+    workers: &mut [ExecutorProcess],
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let requests = workers
         .iter_mut()
-        .map(WorkerProcess::request_promotion)
+        .map(ExecutorProcess::request_promotion)
         .collect::<anyhow::Result<Vec<_>>>()?;
     for (worker, message_id) in workers.iter_mut().zip(requests) {
         worker.await_promotion(message_id, timeout)?;

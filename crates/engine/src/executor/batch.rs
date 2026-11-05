@@ -2,7 +2,7 @@
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
 //! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to an
-//! `Executor`. `WorkerExecutor` splits it into one `ExecutionBatch` per target
+//! `Executor`. `Dispatcher` splits it into one `ExecutionBatch` per target
 //! worker and lowers each with `ExecutionBatch::into_protocol`, which gathers
 //! the per-call placement fields into the flat, call-indexed arrays of the
 //! wire `Batch` and the persistent spans of each rank's own buffer pool.
@@ -53,7 +53,7 @@ pub struct RequestPlacement {
     pub worker: WorkerGroupId,
     /// Worker-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
-    /// `WorkerExecutor` applies the override to the `Start` it sends the worker.
+    /// `Dispatcher` applies the override to the `Start` it sends the worker.
     pub request_pool_idx: Option<u32>,
     /// Cache tables and newly acquired units used by this call.
     pub block_tables: Vec<BlockTable>,
@@ -83,7 +83,7 @@ pub struct RequestPlacement {
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
 ///
-/// `WorkerExecutor` also uses this type for the part of a logical batch routed
+/// `Dispatcher` also uses this type for the part of a logical batch routed
 /// to one worker; that part keeps the logical `id`, so completions from every
 /// worker correlate to the same batch.
 #[derive(Debug, Clone)]
@@ -98,7 +98,7 @@ pub struct ExecutionBatch {
     pub input_transfers: Vec<TensorExport>,
     /// External cache exports consumed by explicit cache installation.
     ///
-    /// `ExecutionBatch::new` leaves this empty; `WorkerExecutor` fills it on
+    /// `ExecutionBatch::new` leaves this empty; `Dispatcher` fills it on
     /// the worker-local batches it builds.
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
@@ -306,7 +306,7 @@ impl ExecutionBatch {
     /// buffer spans, because they address each rank's own pool: they are
     /// returned beside it, in call order, for the worker group to project
     /// onto its ranks. `collective_seq` is the worker's next collective
-    /// sequence, which `WorkerExecutor` commits only after the worker
+    /// sequence, which `Dispatcher` commits only after the worker
     /// accepts the batch. Fails when adding the call's position to a forward
     /// row's call index overflows `u32` or `Batch::validate_unplaced`
     /// rejects the result.

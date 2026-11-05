@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use anyhow::Context;
 use ipc::Batch;
 
-use super::WorkerGroup;
+use super::ExecutorGroup;
 use crate::executor::RankBuffer;
-use crate::worker::IncarnationRegistry;
+use crate::executors::IncarnationRegistry;
 
 /// Refuses a placement whose muxer or media reader is not on the engine's host.
 ///
@@ -78,14 +78,14 @@ pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Opti
 }
 
 /// Acknowledgment slots of the ranks reading a media product produced on
-/// `rank` of `worker`, where `members` are the ranks executing the call.
+/// `rank` of `executor`, where `members` are the ranks executing the call.
 ///
-/// The consuming component may belong to another worker, whose ranks all
-/// read the product; on the producing worker the ranks producing their own
-/// copy read that copy instead of another rank's. `routed` names the worker
+/// The consuming component may belong to another executor, whose ranks all
+/// read the product; on the producing executor the ranks producing their own
+/// copy read that copy instead of another rank's. `routed` names the executor
 /// the request was routed to for a consuming component; only that replica
 /// reads the product. A component absent from `routed` is read by whichever
-/// replica serves it when its call is placed, so every worker holding it is
+/// replica serves it when its call is placed, so every executor holding it is
 /// named.
 ///
 /// Naming a replica the request was not routed to is not only wasted: a
@@ -93,7 +93,7 @@ pub(super) fn output_owner(component_ranks: &[usize], members: &[usize]) -> Opti
 /// replica on another host would make each product cross hosts unread.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the consuming worker's routing, components, peers and transfer placement"
+    reason = "the consuming executor's routing, components, peers and transfer placement"
 )]
 pub(crate) fn media_consumer_slots(
     consuming: &[ipc::MediaCall],
@@ -159,7 +159,7 @@ pub(crate) fn media_consumer_slots(
     slots.into_iter().collect()
 }
 
-impl WorkerGroup {
+impl ExecutorGroup {
     /// Acknowledgment slots of the ranks that read the products a call
     /// produces on `rank`, where `members` are the ranks executing the call.
     ///
@@ -167,7 +167,7 @@ impl WorkerGroup {
     /// calls that consume it, less the ranks that produce their own copy: a
     /// consumer reads the copy it holds before any other. For a video
     /// request's call, `routed` names each component its request's graph
-    /// reads the products with, and the worker the request was routed to for
+    /// reads the products with, and the executor the request was routed to for
     /// it. An image generation call's readers follow from its kind
     /// (`generation_consuming_calls`). Other work is read by the destinations
     /// of the rank's transfer edges.
@@ -249,7 +249,7 @@ impl WorkerGroup {
         self.incarnations = incarnations;
     }
 
-    /// States the deployment-wide media routing once every worker reported.
+    /// States the deployment-wide media routing once every executor reported.
     pub fn set_media_routing(&mut self, routing: BTreeMap<ipc::MediaCall, String>) {
         self.media_routing = routing;
     }

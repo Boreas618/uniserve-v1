@@ -1,5 +1,5 @@
-//! Launching worker groups: the ranks of a group started by the daemons of
-//! their nodes, each from the launch its `WorkerProcessArgs` derive, and the
+//! Launching executor groups: the ranks of a group started by the daemons of
+//! their nodes, each from the launch its `ExecutorProcessArgs` derive, and the
 //! group formed from those ranks once they registered and reported their
 //! startup capabilities. `spawn_all` starts every group's ranks before any
 //! group waits for its own.
@@ -11,18 +11,18 @@ use std::time::Instant;
 
 use anyhow::Context;
 
-use super::WorkerGroup;
+use super::ExecutorGroup;
 use super::relaunch::Relaunch;
 use super::routing::refuse_shared_storage_off_engine_host;
-use crate::worker::WorkerProcessArgs;
-use crate::worker::claims::{Claims, StorageClaims};
-use crate::worker::process::WorkerSockets;
-use crate::worker::processes::{ProcessClient, Processes, Reservation};
-use crate::worker::registry::Registry;
-use crate::worker::{IncarnationRegistry, PendingWorker, WorkerProcess};
+use crate::executors::ExecutorProcessArgs;
+use crate::executors::claims::{Claims, StorageClaims};
+use crate::executors::process::ExecutorSockets;
+use crate::executors::processes::{ProcessClient, Processes, Reservation};
+use crate::executors::registry::Registry;
+use crate::executors::{IncarnationRegistry, PendingWorker, ExecutorProcess};
 use ipc::StorageLaunch;
 
-/// One worker group's spawned ranks and the launch they register for.
+/// One executor group's spawned ranks and the launch they register for.
 pub(crate) struct LaunchedWorkers {
     /// The registry the ranks register with.
     registry: Registry,
@@ -38,14 +38,14 @@ impl Drop for LaunchedWorkers {
     /// that never registered has no channel whose close would end it.
     fn drop(&mut self) {
         if !self.ranks.is_empty()
-            && let Ok(mut processes) = crate::worker::processes::lock(&self.processes)
+            && let Ok(mut processes) = crate::executors::processes::lock(&self.processes)
         {
             let _ = processes.stop(&self.worker_id);
         }
     }
 }
 
-impl WorkerProcessArgs {
+impl ExecutorProcessArgs {
     /// Has the daemons start every rank of one group without waiting for it
     /// to register.
     ///
@@ -53,7 +53,7 @@ impl WorkerProcessArgs {
     /// processes concurrently and then wait for all of their registrations
     /// together.
     ///
-    /// `claims` names the Storage Server and claim each worker's node holds
+    /// `claims` names the Storage Server and claim each executor's node holds
     /// for the deployment. `expert_store` is the reservation of the socket
     /// the group's first rank serves its expert-parallel world's store on,
     /// when that rank is the world's rank 0.
@@ -69,14 +69,14 @@ impl WorkerProcessArgs {
         crate::WorkerGroupConfig::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
             self.components.is_empty() != self.role.serves_requests(),
-            "worker role disagrees with request component placement"
+            "executor role disagrees with request component placement"
         );
         if self.role == crate::WorkerGroupRole::Experts {
             anyhow::ensure!(
                 self.expert_parallel.as_ref().is_some_and(|placement| {
                     placement.attention_ranks > 0 && placement.rank >= placement.attention_ranks
                 }),
-                "expert workers must belong to a disaggregated expert union"
+                "expert executors must belong to a disaggregated expert union"
             );
         }
 
@@ -89,7 +89,7 @@ impl WorkerProcessArgs {
         let spans_nodes = |host: &str| self.ranks.iter().any(|rank| rank.host != host);
         let rendezvous = if self.ranks.len() > 1 && self.expert_parallel.is_none() {
             let first = &self.ranks[0].host;
-            Some(crate::worker::processes::lock(processes)?.reserve(
+            Some(crate::executors::processes::lock(processes)?.reserve(
                 first,
                 &self.worker_id,
                 spans_nodes(first),
@@ -104,12 +104,12 @@ impl WorkerProcessArgs {
         // node at, from any other. Beginning the launch ends the group's
         // earlier one, whose ranks the engine refuses from here on.
         let reachable = if self.ranks.iter().any(|rank| rank.host != self.host) {
-            crate::worker::processes::lock(processes)?.address(&self.host)?
+            crate::executors::processes::lock(processes)?.address(&self.host)?
         } else {
             None
         };
         let (generation, local_address, remote_address) = {
-            let mut registry = crate::worker::registry::lock(registry)?;
+            let mut registry = crate::executors::registry::lock(registry)?;
             (
                 registry.begin_launch(&self.worker_id),
                 registry.address(None)?,
@@ -127,7 +127,7 @@ impl WorkerProcessArgs {
         for rank in 0..self.ranks.len() {
             // Only the first rank serves the stores; the others are their
             // clients and inherit nothing.
-            let sockets = WorkerSockets {
+            let sockets = ExecutorSockets {
                 group: rendezvous
                     .as_ref()
                     .filter(|_| rank == 0)
@@ -171,7 +171,7 @@ impl WorkerProcessArgs {
     pub(super) fn adopt_workers(
         &self,
         mut launched: LaunchedWorkers,
-    ) -> anyhow::Result<Vec<WorkerProcess>> {
+    ) -> anyhow::Result<Vec<ExecutorProcess>> {
         let expected = launched.ranks.len();
         let registry = Arc::clone(&launched.registry);
         let ranks = &mut launched.ranks;
@@ -184,7 +184,7 @@ impl WorkerProcessArgs {
                 .try_for_each(|pending| pending.check_alive())
         };
         let channels =
-            crate::worker::registry::collect(&registry, &self.worker_id, expected, alive)?;
+            crate::executors::registry::collect(&registry, &self.worker_id, expected, alive)?;
 
         // `collect` orders the connections by rank, as `ranks` is.
         std::mem::take(&mut launched.ranks)
@@ -195,30 +195,30 @@ impl WorkerProcessArgs {
     }
 }
 
-/// Starts every group of `arguments` and waits until each of their workers
+/// Starts every group of `arguments` and waits until each of their executors
 /// is ready: for a deployment's first launch, and for the relaunch of a
 /// failure domain, whose groups form their communicators again together.
 ///
 /// Groups that share an expert world meet at a new rendezvous, which the
 /// world's rank 0 serves on a socket its node's daemon reserves, routable
-/// when some worker runs on another node, and which that rank inherits, so
+/// when some executor runs on another node, and which that rank inherits, so
 /// the port is held from the reservation until it serves on it. `arguments`
 /// take the rendezvous's address. Every group's processes start before any
 /// group waits for registrations, so their interpreters and library imports
 /// overlap, and they are awaited together, so the loss of any one ends the
-/// wait of all. Returns each group's workers, in argument order.
+/// wait of all. Returns each group's executors, in argument order.
 ///
 /// `startup_cancel` is the startup cancellation every launched rank shares
 /// until the launch is ready: the teardown of any rank sets it, and so may
 /// the caller from another thread, which ends the launch at its next
 /// liveness check and stops its ranks.
 pub(super) fn launch_all(
-    arguments: &mut [WorkerProcessArgs],
+    arguments: &mut [ExecutorProcessArgs],
     registry: &Registry,
     processes: &Processes,
     claims: &StorageClaims,
     startup_cancel: Arc<AtomicBool>,
-) -> anyhow::Result<Vec<Vec<WorkerProcess>>> {
+) -> anyhow::Result<Vec<Vec<ExecutorProcess>>> {
     let mut expert_store = None;
     if arguments.iter().any(|args| args.expert_parallel.is_some()) {
         // The world's rank 0 is the first rank of the group whose placement
@@ -230,12 +230,12 @@ pub(super) fn launch_all(
                     .as_ref()
                     .is_some_and(|placement| placement.rank == 0)
             })
-            .context("no worker group holds the expert-parallel world's rank 0")?;
+            .context("no executor group holds the expert-parallel world's rank 0")?;
         let host = first.ranks[0].host.clone();
         let routable = arguments
             .iter()
             .any(|args| args.ranks.iter().any(|rank| rank.host != host));
-        let reservation = crate::worker::processes::lock(processes)?.reserve(
+        let reservation = crate::executors::processes::lock(processes)?.reserve(
             &host,
             &first.worker_id,
             routable,
@@ -243,7 +243,7 @@ pub(super) fn launch_all(
         for args in arguments.iter_mut() {
             let placement = args.expert_parallel.as_mut().with_context(|| {
                 format!(
-                    "worker {} does not join the deployment's expert-parallel world",
+                    "executor {} does not join the deployment's expert-parallel world",
                     args.worker_id
                 )
             })?;
@@ -274,8 +274,8 @@ pub(super) fn launch_all(
         .map(|(args, ranks)| args.adopt_workers(ranks))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let mut starting: Vec<&mut WorkerProcess> = groups.iter_mut().flatten().collect();
-    crate::worker::process::finish_startup(&mut starting)?;
+    let mut starting: Vec<&mut ExecutorProcess> = groups.iter_mut().flatten().collect();
+    crate::executors::process::finish_startup(&mut starting)?;
     // Detach cancellation only after every group is ready. A later startup
     // failure must still terminate already prepared peers.
     for worker in groups.iter_mut().flatten() {
@@ -287,12 +287,12 @@ pub(super) fn launch_all(
     Ok(groups)
 }
 
-impl WorkerGroup {
-    /// Launches every configured worker and exposes the group after capability agreement.
-    pub fn spawn(process_args: WorkerProcessArgs) -> anyhow::Result<Self> {
+impl ExecutorGroup {
+    /// Launches every configured executor and exposes the group after capability agreement.
+    pub fn spawn(process_args: ExecutorProcessArgs) -> anyhow::Result<Self> {
         Self::spawn_all(vec![process_args])?
             .pop()
-            .context("the worker group launch produced no group")
+            .context("the executor group launch produced no group")
     }
 
     /// Launches the configured static rank groups and waits for loaded capabilities.
@@ -302,10 +302,10 @@ impl WorkerGroup {
     /// returned in argument order. A failure of any group fails the whole
     /// launch; ranks already spawned are shut down as the values that own
     /// them drop.
-    pub fn spawn_all(mut arguments: Vec<WorkerProcessArgs>) -> anyhow::Result<Vec<Self>> {
+    pub fn spawn_all(mut arguments: Vec<ExecutorProcessArgs>) -> anyhow::Result<Vec<Self>> {
         let first = arguments
             .first()
-            .context("a launch places a worker group")?;
+            .context("a launch places an executor group")?;
         // A spawner is not a main process: it states no engine number, and no program-layer command
         // is ever addressed to this connection.
         let processes = ProcessClient::connect(&first.daemon, &first.deployment, 0)?;
@@ -314,9 +314,9 @@ impl WorkerGroup {
         let remote = arguments
             .iter()
             .any(|args| args.ranks.iter().any(|rank| rank.host != args.host));
-        let registry = crate::worker::registry::WorkerRegistry::bind(remote)?;
+        let registry = crate::executors::registry::ExecutorRegistry::bind(remote)?;
         // Every node's Storage Server holds the deployment's claim before a
-        // worker starts there, so the workers find their retained storage
+        // executor starts there, so the executors find their retained storage
         // and the server shoots down processes of a previous claim first.
         let claims = Claims::claim(&arguments, &processes)?;
         let groups = launch_all(
@@ -386,15 +386,15 @@ impl WorkerGroup {
     /// gap (`pool_info` refuses a gap). Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
     fn from_ranks(
-        process_args: WorkerProcessArgs,
-        mut workers: Vec<WorkerProcess>,
+        process_args: ExecutorProcessArgs,
+        mut workers: Vec<ExecutorProcess>,
         processes: Processes,
         registry: Registry,
         claims: StorageClaims,
         relaunch: (Arc<Relaunch>, usize),
         failure_wake: crate::handle::WakeSignal,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
+        anyhow::ensure!(!workers.is_empty(), "need >= 1 executor");
         let n = workers.len();
 
         // The pool's agreed report is one derivation for both ways of serving
@@ -421,7 +421,7 @@ impl WorkerGroup {
         // layers, which bounds exports.
         // is ready; expert peers may still be preparing their resources.
         for worker in &mut workers {
-            worker.check_worker("WorkerGroup readiness")?;
+            worker.check_worker("ExecutorGroup readiness")?;
         }
 
         // The group admits the batches it launched its ranks to hold.

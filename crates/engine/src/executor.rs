@@ -3,7 +3,7 @@
 //! The scheduler submits logical calls through [`Executor`]. Physical
 //! executors lower those calls into worker protocol batches while retaining
 //! the request and product identities needed to correlate completions. The
-//! implementations are `WorkerExecutor` (`crate::worker::executor`), which
+//! implementations are `Dispatcher` (`crate::executors::executor`), which
 //! drives worker processes, and `SimExecutor` (`crate::sim`).
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
@@ -64,14 +64,14 @@ pub struct ExecutorInfo {
     /// For each pool, what the engine launched it with. A pool absent from
     /// the map is placed with no components and a queue depth of one.
     ///
-    /// `WorkerExecutor::try_new` and `SimExecutor` fill this from their
+    /// `Dispatcher::try_new` and `SimExecutor` fill this from their
     /// launch; `from_workers` leaves it empty.
     pub placements: BTreeMap<WorkerGroupId, PoolPlacement>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `WorkerExecutor::try_new` fills this from the placement;
+    /// `Dispatcher::try_new` fills this from the placement;
     /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
@@ -81,7 +81,7 @@ pub struct ExecutorInfo {
     /// of the components that read them, so the engine places a pool's
     /// media buffers rank by rank.
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; a pool absent
+    /// `Dispatcher::try_new` fills this from its ranks; a pool absent
     /// from it, as `from_workers` and `SimExecutor` leave every pool, has
     /// its launched ranks (`PoolPlacement::ranks`, one when it has no
     /// placement), each backing its reported `buffer_pool_bytes`.
@@ -89,7 +89,7 @@ pub struct ExecutorInfo {
     /// For each pool, each rank's prefix cache as the rank reported it, with
     /// the host page pools it maps, and the rank's host, in rank order.
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// and `SimExecutor` leave it empty, which serves no pool through the
     /// host KV cache.
     pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
@@ -97,7 +97,7 @@ pub struct ExecutorInfo {
     /// and the rank's host, in rank order: the video denoising ranks report
     /// one, every other rank none (`ipc::WorkerInfo::latent_pool`).
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no preempted trajectory, and a
     /// simulated executor states its own (`SimEngine::set_latent_pools`).
     pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
@@ -106,7 +106,7 @@ pub struct ExecutorInfo {
     /// encoder calls report one, every other rank none
     /// (`ipc::WorkerInfo::encoder_pool`).
     ///
-    /// `WorkerExecutor::try_new` fills this from its ranks; `from_workers`
+    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
     /// leaves it empty, which stores no encoder output, and a simulated
     /// executor states its own (`SimEngine::set_encoder_pools`).
     pub rank_encoders: BTreeMap<WorkerGroupId, RankEncoderPools>,
@@ -387,7 +387,7 @@ impl ExecutorInfo {
             .unwrap_or(0);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
-            // every WorkerGroup. End-to-end concurrency is the narrowest sum
+            // every ExecutorGroup. End-to-end concurrency is the narrowest sum
             // of replica capacities among the graph's components. Each
             // component is keyed to the first call it serves; its replicas are
             // the pools that support that call and bind the component.
@@ -560,7 +560,7 @@ impl WorkerResult {
     /// Claims all media before any fallible correlation or aggregation step.
     /// Acquisition failure belongs to the call; independent results remain usable.
     ///
-    /// The returned value always sets `done`; `WorkerGroup::try_join`, which
+    /// The returned value always sets `done`; `ExecutorGroup::try_join`, which
     /// joins rank reports, decides `done` for the joined result itself.
     pub(crate) fn receive(report: BatchOutput) -> Self {
         let results = report
@@ -641,7 +641,7 @@ pub struct BatchResult {
 /// or without them; callers that track other outcomes overwrite the receipts.
 /// A partial result carries no receipts. `report.products` is not carried
 /// into the result: exports stay with the executor, and
-/// `WorkerExecutor` records them before converting.
+/// `Dispatcher` records them before converting.
 pub(crate) fn logical_result(
     report: WorkerResult,
     done: bool,
@@ -790,7 +790,7 @@ impl FromStr for TransferBackend {
 /// the edge's device mechanism, a host product on its host mechanism. An edge
 /// may name only one of the two, in which case products of the other
 /// location have no way across it: `TransferConfig::bind_inputs` refuses them
-/// where they are bound, and `WorkerExecutor` fails the requests reading them.
+/// where they are bound, and `Dispatcher` fails the requests reading them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
@@ -883,7 +883,7 @@ impl TransferConfig {
     /// devices export a fabric handle; host products move over shared storage
     /// on one host and over the rank channel across hosts, because a
     /// shared-memory segment is named in one host's namespace. Explicit
-    /// bindings take precedence. `WorkerExecutor::try_new` validates each
+    /// bindings take precedence. `Dispatcher::try_new` validates each
     /// edge against the initialized endpoints and backends before the
     /// executor accepts work, and refuses by name an edge that would have to
     /// cross hosts without fabric handles.
@@ -1105,7 +1105,7 @@ impl TransferConfig {
     /// worker. A producing rank cannot derive them: it knows which component
     /// it belongs to, not which component reads what it publishes, and a
     /// product is consumed in a later batch than the one that produced it.
-    /// `WorkerGroup::consumer_slots` uses this for calls outside the video
+    /// `ExecutorGroup::consumer_slots` uses this for calls outside the video
     /// graph and states the slots on each producing call.
     ///
     /// The result is sorted and excludes this rank's own slot.
@@ -1150,7 +1150,7 @@ impl TransferConfig {
     /// with no matching edge, when it is a local location on `destination`
     /// itself. An endpoint's worker and rank are the ones `incarnations`
     /// holds for its incarnation; a location whose source is not a live
-    /// incarnation matches no edge. `WorkerGroup` calls this for each rank's
+    /// incarnation matches no edge. `ExecutorGroup` calls this for each rank's
     /// projected batch.
     ///
     /// # Errors
@@ -1162,7 +1162,7 @@ impl TransferConfig {
     /// tensor keeps its filtered locations.
     pub(crate) fn bind_inputs(
         &self,
-        incarnations: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::executors::IncarnationRegistry,
         products: &mut [ipc::TensorExport],
         cache_inputs: &mut [ipc::CacheTransfer],
         destination: &ipc::WorkerEndpoint,
@@ -1204,7 +1204,7 @@ impl TransferConfig {
     /// `bind_inputs` selects them, and reports whether any remain.
     fn bind_locations(
         &self,
-        incarnations: &crate::worker::IncarnationRegistry,
+        incarnations: &crate::executors::IncarnationRegistry,
         tensor: &mut ipc::TensorTransfer,
         destination: &ipc::WorkerEndpoint,
         destination_position: Option<&(WorkerGroupId, u32)>,
@@ -1377,7 +1377,7 @@ impl FromStr for TransferConfig {
 ///
 /// Every published location of these products travels on a mechanism that no
 /// configured edge to the consumer carries, so the requests reading them can
-/// never run there. `WorkerExecutor` fails those requests alone: the refusal
+/// never run there. `Dispatcher` fails those requests alone: the refusal
 /// says nothing about the rest of the batch or the health of either group.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("input products have no location on a configured transfer edge to {destination}")]
@@ -2052,7 +2052,7 @@ mod tests {
             },
         }];
 
-        let incarnations = crate::worker::IncarnationRegistry::default();
+        let incarnations = crate::executors::IncarnationRegistry::default();
         let decoder = endpoint("decoder");
         incarnations.assign(&WorkerGroupId("denoiser".to_owned()), [&producer]);
         incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
@@ -2085,7 +2085,7 @@ mod tests {
         };
         let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
         let decoder = endpoint("decoder-0");
-        let incarnations = crate::worker::IncarnationRegistry::default();
+        let incarnations = crate::executors::IncarnationRegistry::default();
         incarnations.assign(&WorkerGroupId("denoiser".to_owned()), &denoiser);
         incarnations.assign(&WorkerGroupId("decoder".to_owned()), [&decoder]);
 

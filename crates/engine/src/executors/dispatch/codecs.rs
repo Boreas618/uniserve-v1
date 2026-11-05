@@ -1,13 +1,13 @@
-//! The encoders that may read each video worker's decoded media units
+//! The encoders that may read each video executor's decoded media units
 //! ([`video_unit_codecs`]): a decoded unit is a host product named in one
 //! host's namespace, so a decoder pairs with an encoder replica only when, at
 //! every position of a round, the ranks that decode and encode the unit share a
-//! host. Requests are routed only to admissible pairings, and a decoding worker
+//! host. Requests are routed only to admissible pairings, and a decoding executor
 //! without one is refused at startup.
 
 use crate::executor::WorkerGroupId;
 
-/// Returns, for each worker that decodes video, the encoder replicas that
+/// Returns, for each executor that decodes video, the encoder replicas that
 /// keep every media unit it decodes on the host that decoded it.
 ///
 /// A decoded media unit is a host product that its encoder reads in place
@@ -17,7 +17,7 @@ use crate::executor::WorkerGroupId;
 /// `p / per_decoder` and encoded by the encoder's rank `p / per_encoder`. A
 /// pairing is admissible when the encoder covers a whole round and those two
 /// ranks share a host at every position. Requests are routed only to
-/// admissible pairings, and a decoding worker without one is refused at
+/// admissible pairings, and a decoding executor without one is refused at
 /// startup, naming the unit and the hosts it would cross.
 ///
 /// Returns an empty map when the routing lacks a video decoding or a video
@@ -137,12 +137,12 @@ mod tests {
     #[test]
     fn a_decoded_unit_names_the_cpu_workers_that_read_it() {
         // The decoder's product is read by the video codec on the host
-        // worker: the encoder rank dealt this decoder rank's position is
-        // named, none of the decoder's own ranks, and the host worker's
-        // slots follow the model worker's run. A consumer that is not
+        // executor: the encoder rank dealt this decoder rank's position is
+        // named, none of the decoder's own ranks, and the host executor's
+        // slots follow the model executor's run. A consumer that is not
         // distributed reads the whole product on every rank.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let model_components =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
@@ -167,7 +167,7 @@ mod tests {
             2,
             model_components.get("video_decoder"),
         );
-        // Position 2 of the round, two units per CPU worker: CPU worker 1.
+        // Position 2 of the round, two units per CPU executor: CPU executor 1.
         assert_eq!(slots, [transfer.acknowledgment_slot("host", 1)]);
 
         let routing = BTreeMap::from([
@@ -207,13 +207,13 @@ mod tests {
 
     #[test]
     fn a_shared_producer_names_only_the_replica_its_request_was_routed_to() {
-        // A text encoder on its own worker feeds latent preparation on two
+        // A text encoder on its own executor feeds latent preparation on two
         // denoiser replicas. A request routed to flow-1 is read there alone,
         // so its product names flow-1's reading rank and not flow-0's. A
         // component with no route yet (a call placed only when it runs) is
         // read by whichever replica serves it, so each one is named.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let text = BTreeMap::from([(
             "text_encoder".to_owned(),
@@ -264,12 +264,12 @@ mod tests {
 
     #[test]
     fn a_decoded_unit_names_only_the_encoder_on_its_route() {
-        // Two hosts each hold a video codec worker. A request decoded on
-        // host 0's model worker is routed to host 0's encoder, so the unit
+        // Two hosts each hold a video codec executor. A request decoded on
+        // host 0's model executor is routed to host 0's encoder, so the unit
         // names that encoder's reading rank; host 1's encoder rank at the
         // same position never reads it.
         use crate::executor::TransferConfig;
-        use crate::worker::group::routing::media_consumer_slots;
+        use crate::executors::group::routing::media_consumer_slots;
 
         let model = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1], 1))]);
         let encoder = || BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1], 1))]);
@@ -399,7 +399,7 @@ mod tests {
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
         // Every video deployment file shipped in `configs/minimax_h3/` must
         // pass the placement checks the engine applies at startup, including
-        // the pairing of every decoding worker with an encoder on its host.
+        // the pairing of every decoding executor with an encoder on its host.
         check_shipped_deployments("minimax_h3");
     }
 
@@ -480,7 +480,7 @@ mod tests {
         // even though another replica pairs.
         let error = pairing(&placements[..3]).expect_err("host b has no encoder");
         let message = error.to_string();
-        assert!(message.contains("worker flow-b"), "{message}");
+        assert!(message.contains("executor flow-b"), "{message}");
         assert!(
             message.contains("host b") && message.contains("host a"),
             "{message}"

@@ -2587,7 +2587,7 @@ fn handle_process_commands(
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
     stop: &AtomicBool,
 ) {
-    let Some(commands) = crate::worker::processes::take_commands() else {
+    let Some(commands) = crate::executors::processes::take_commands() else {
         // One reader per process: a `ProcessLink` of this process already
         // hands the daemon's commands out, and two readers would split them.
         tracing::info!(
@@ -2617,7 +2617,7 @@ fn handle_process_commands(
 
 /// Reports one answer or report of the epoch's policy to the daemons (§7.3).
 fn report_policy(report: proto::process::Report) {
-    if let Err(error) = crate::worker::processes::report(report) {
+    if let Err(error) = crate::executors::processes::report(report) {
         tracing::error!(%error, "a report of the epoch's policy did not reach the daemons");
     }
 }

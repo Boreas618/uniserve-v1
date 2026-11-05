@@ -10,7 +10,7 @@
 //! its `EventRx` (`handle`). On its thread, the `Scheduler` admits requests,
 //! assigns cache pages (`kv_cache`) and other worker storage (`allocation`),
 //! and submits calls through the `Executor` trait (`executor`);
-//! `WorkerExecutor` (`worker`) splits each batch into per-worker submissions
+//! `Dispatcher` (`worker`) splits each batch into per-worker submissions
 //! to the worker processes.
 //!
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
@@ -36,7 +36,7 @@ mod sim;
 mod spec;
 mod trajectories;
 mod warmup;
-mod worker;
+mod executors;
 
 pub use crate::core::{
     EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
@@ -83,9 +83,9 @@ pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
-pub use crate::worker::{
-    BatchSubmitError, CallReaders, ExpertParallelPlacement, WorkerExecutor, WorkerGroup,
-    WorkerProcessArgs,
+pub use crate::executors::{
+    BatchSubmitError, CallReaders, ExpertParallelPlacement, Dispatcher, ExecutorGroup,
+    ExecutorProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
 /// Serializable scheduler, cache, and worker performance snapshots.

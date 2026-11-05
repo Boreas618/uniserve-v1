@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerProcessArgs};
+use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig, ExecutorProcessArgs};
 use engine::{
     Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
@@ -81,7 +81,7 @@ fn engine() -> anyhow::Result<SchedulerHandle> {
         2,
         components.clone(),
     )];
-    config.worker_process = WorkerProcessArgs {
+    config.worker_process = ExecutorProcessArgs {
         executable: worker_executable(),
         daemon: crate::support::daemon(),
         model: String::new(),

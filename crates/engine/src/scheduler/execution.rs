@@ -1186,7 +1186,7 @@ impl Scheduler {
 ///
 /// Image generation chains its state calls on one denoising component: text
 /// features feed latent preparation, which feeds the denoising steps.
-/// `WorkerGroup::consumer_slots` reads this for a media call whose placement
+/// `ExecutorGroup::consumer_slots` reads this for a media call whose placement
 /// names no readers; a video request's calls name theirs from the request's
 /// graph (`plan_media_call`).
 pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {

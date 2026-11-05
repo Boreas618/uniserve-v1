@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-use crate::worker::processes::{self, Processes};
+use crate::executors::processes::{self, Processes};
 
 /// How long the reader waits for one message before it looks again at its stop
 /// flag. Short, because a report needs the same connection.

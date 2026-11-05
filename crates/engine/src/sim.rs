@@ -2,7 +2,7 @@
 //!
 //! [`SimExecutor`] implements the `Executor` trait the scheduler drives, over
 //! a background thread that runs a [`SimEngine`]. It consumes the same typed
-//! admissions, lifecycle commands, and calls as `WorkerExecutor`, bounds the
+//! admissions, lifecycle commands, and calls as `Dispatcher`, bounds the
 //! batches in flight by a queue depth, and tracks admitted requests and live
 //! products for `command_has_capacity`.
 //!
@@ -154,7 +154,7 @@ impl SimLoss {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *pending = Some((
                 group,
-                crate::worker::stall_failure(stall).to_string(),
+                crate::executors::stall_failure(stall).to_string(),
                 requests,
             ));
         }
@@ -352,7 +352,7 @@ impl SimExecutor {
                         .iter()
                         .map(|group| (group.clone(), placement.clone()))
                         .collect(),
-                    // The pool's own launch fact, as `WorkerExecutor` reads it
+                    // The pool's own launch fact, as `Dispatcher` reads it
                     // from the ranks' launch arguments: the mechanism shapes a
                     // KV view to it, and refuses to shape one without it.
                     max_model_len,
@@ -488,7 +488,7 @@ impl SimExecutor {
         self.loss.clone()
     }
 
-    /// The failure a result's failed calls amount to, as `WorkerExecutor`
+    /// The failure a result's failed calls amount to, as `Dispatcher`
     /// reports it: their requests, the buffers those calls would have
     /// produced, and the reason of each request the simulated model refused.
     /// `None` when every call of the result succeeded.
@@ -1152,11 +1152,11 @@ pub struct SimEngine {
     info: WorkerInfo,
     /// What the simulated pool is launched with: its queue depth and its
     /// components' placement, which `SimExecutor` states to the scheduler as
-    /// the engine's own launch, as `WorkerExecutor` does.
+    /// the engine's own launch, as `Dispatcher` does.
     placement: PoolPlacement,
     /// The longest sequence the simulated pool was launched for: the model's
     /// context length, which a real rank reads from its launch arguments
-    /// (`WorkerProcessArgs::max_model_len`) and `SimExecutor` states to the
+    /// (`ExecutorProcessArgs::max_model_len`) and `SimExecutor` states to the
     /// scheduler as `ExecutorInfo::max_model_len`.
     ///
     /// The mechanism bounds every attention row by it, so a pool that states
