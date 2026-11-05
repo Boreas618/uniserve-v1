@@ -210,9 +210,54 @@ fn main() {
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
+    header(&lines);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
+}
+
+/// What the rows below are: which deployment, which checkpoint, and which program produced them.
+///
+/// A file of bare descriptors cannot be traced when a row is questioned, and tonight every row was
+/// questioned at least once. Every number here is computed from the rows themselves, so the header
+/// cannot disagree with them; `build_fixtures` reads only the rows, so a line starting `#` is a
+/// reader's and never a cell.
+fn header(lines: &[(String, String)]) {
+    let operators = lines
+        .iter()
+        .map(|(operator, _)| operator.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    // The deployments the two loops above build: the stack's stated type, the checkpoint's own, and
+    // the video VAE's container type, which the checkpoint states rather than the deployment.
+    println!(
+        "# The program rows a MiniMax-H3 deployment launches, one `operator<TAB>key` line each."
+    );
+    println!("# {} data rows, {operators} operators", lines.len());
+    println!(
+        "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
+         {}; a run states which deployment it serves and a store built from this file serves all of \
+         them, which is why one operator appears at more than one element type.",
+        DEPLOYMENTS
+            .iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        VAES.iter()
+            .map(|dtype| format!("{dtype:?}"))
+            .collect::<Vec<_>>()
+            .join(" and "),
+    );
+    println!(
+        "# checkpoint: MiniMax-H3. Its two DiTs (`transformer`, `transformer_ref`) are the same \
+         config, so one set of rows serves the base network and the reference DiT."
+    );
+    println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    println!(
+        "# sparse: the `vsa_*` and `sparse_attention` rows belong to the video-sparse deployment and \
+         are the only group no device run has exercised; their tile fields name the class the \
+         deployment's own tile bound lands in, never a request's count."
+    );
 }
 
 /// Every row one deployment's dtype asks for.
