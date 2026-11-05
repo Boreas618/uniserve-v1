@@ -640,7 +640,14 @@ pub struct Step {
 /// What a decoder writes: the decoded video frames and audio samples.
 #[derive(Clone, Copy)]
 pub struct DecodedMedia {
-    /// `[frames, channels, height, width]` decoded frames.
+    /// `[channels, frames, height, width]` decoded frames, in the decoder's own channel order and
+    /// element type.
+    ///
+    /// Channels first, as the media this boundary carries is stated everywhere else: the latents, the
+    /// conditioning's pixels and its anchoring draw are all `[channels, frames, height, width]`, and
+    /// the layers that place a decoded tile - the unpatchify, the seam blends and the byte step - read
+    /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
+    /// `[frames, height, width, channels]` for a file converts once, where it writes.
     pub video: Option<TensorView>,
     /// `[samples]` decoded audio.
     pub audio: Option<TensorView>,
