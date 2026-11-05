@@ -1249,6 +1249,22 @@ mod tests {
                 u64::from(extent),
                 "the band is the seam's width along axis {axis}"
             );
+            // The band spans the **tile's** block on the other spatial axis, not the canvas's: a
+            // blend then writes only positions this tile owns, so the stitch does not depend on a
+            // later tile overwriting what an earlier blend wrote in its columns. Narrowing or
+            // widening this is a design change, and it is asserted here so that it cannot happen
+            // silently.
+            let across = if axis == 2 { 3 } else { 2 };
+            let span = if axis == 2 {
+                u64::from(tile.canvas.width) * ratio
+            } else {
+                u64::from(tile.canvas.height) * ratio
+            };
+            assert_eq!(
+                previous.shape.dim(across),
+                span,
+                "the band spans the tile's own block across the seam along axis {axis}"
+            );
             assert_eq!(
                 previous.strides, raster.strides,
                 "a band keeps the raster's own strides along axis {axis}"
