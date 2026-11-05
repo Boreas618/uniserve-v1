@@ -41,7 +41,13 @@ fi
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
 samples=256
-rasters=480x832
+# The six canvases the model serves, in the walk's own `HxW` order. **The authority is
+# `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
+# statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
+# canvas added to the model reaches every fixture without anyone editing this file. Until then, a
+# raster that is not in the model must not appear here: 480x832 was in this line for days and every
+# fixture it produced named a canvas no request asks for.
+rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
 elements=123456
