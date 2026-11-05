@@ -44,54 +44,6 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
     }
 }
 
-/// One rank of a text pool: prefill and decode, eight request rows, and the
-/// batch bounds the launch stated.
-fn rank(host: &str) -> WorkerInfo {
-    WorkerInfo {
-        endpoint: WorkerEndpoint {
-            host: host.to_owned(),
-            address_space: format!("{host}-space"),
-            incarnation: format!("{host}-rank"),
-        },
-        supported_calls: vec![
-            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
-            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
-        ],
-        request_slots: 8,
-        max_batch_calls: 16,
-        max_batch_tokens: 512,
-        // A text pool serves token generation, so it advertises the paged KV
-        // pool every such worker has (`WorkerInfo::default`): a worker with no
-        // prefix cache is refused a token request at submission, which is the
-        // rule for a media-only rank and not for this one.
-        buffer_pool_bytes: 1 << 20,
-        ..WorkerInfo::default()
-    }
-}
-
-/// A text pool of one rank named `model`.
-fn pool() -> Inventory {
-    Inventory {
-        group: "model".to_owned(),
-        ranks: vec![rank("gpu-a")],
-        placement: Placement {
-            queue_depth: 1,
-            ranks: 1,
-            components: std::collections::BTreeMap::from([(
-                ipc::DEFAULT_COMPONENT.to_owned(),
-                ComponentConfig {
-                    ranks: vec![0],
-                    parallel_config: Default::default(),
-                    units_per_rank: 1,
-                    weights: Default::default(),
-                    distribution: None,
-                },
-            )]),
-        },
-        max_model_len: 4096,
-    }
-}
-
 /// The configuration a main process holds: the simulation's facts, since this
 /// test runs no device.
 fn config() -> EngineConfig {
@@ -165,7 +117,7 @@ fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
 
 #[test]
 fn a_request_is_served_through_the_executors_own_batch_path() {
-    let serving = Arc::new(crate::support::Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
     install(&handle, &serving);
@@ -249,7 +201,7 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
 /// world that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
-    let serving = Arc::new(crate::support::Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
     let mut config = config();
     config.max_running_requests = 1;
@@ -300,7 +252,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// a batch handed to the executor with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
-    let serving = Arc::new(crate::support::Serving::new(vec![pool()]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
     install(&handle, &serving);
