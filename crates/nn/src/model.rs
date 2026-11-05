@@ -1,13 +1,20 @@
-//! A loaded model as the executor sees it: named blocks, each implementing one capability.
+//! A loaded model as the executor is to see it: named blocks, each implementing one capability.
 //!
-//! `uniserve engine` loads a checkpoint, hands the [`Model`] to the executor, and the executor
-//! serves each block by the capability it implements and the phases the deployment gives it
-//! (specs/worker.md 4.3). Nothing here names a concrete model: a block is a trait object, and the
-//! one place a model class is named is the loader in `uniserve engine`.
+//! This is the **producer half** of the seam `specs/worker.md` 4.3 states — a block per capability,
+//! addressed by a name and a phase — and the consumer half is not wired yet. A model builds one of
+//! these with its own loader (`qwen3_moe::Qwen3Moe::into_model`,
+//! `minimax_h3::MinimaxH3::into_model`) and nothing in the tree hands it on: the engine's plan
+//! (`src/engine_plan.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the executor's runners
+//! (`crates/executor/src/runners/`) address work by `ipc::PhaseId` with no block registry. **The
+//! consumer is `exec`'s to land**; until it does, this is a stated contract whose other half is owed
+//! rather than a path a run exercises.
 //!
-//! [`BlockName`] names a block of a deployment (`backbone`, `text_encoder`). The pair of a block
-//! name and an [`ops::PhaseKind`] is the engine's addressing unit, carried there as its own opaque
-//! `PhaseId`; this crate keeps only the name and re-exports the phase kind.
+//! Nothing here names a concrete model: a block is a trait object, and the one place a model class is
+//! named is the loader in `uniserve engine`, which is also where the consumer half belongs.
+//!
+//! [`BlockName`] names a block of a deployment (`backbone`, `text_encoder`). The pair of a block name
+//! and an [`ops::PhaseKind`] is the engine's addressing unit, carried there as its own opaque
+//! `ipc::PhaseId`; this crate keeps only the name and re-exports the phase kind.
 
 use std::fmt;
 use std::sync::Arc;
