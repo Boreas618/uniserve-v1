@@ -175,12 +175,17 @@ pub trait Products: Send + Sync {
     /// otherwise refuse every denoising step with "nothing produced it".
     fn holds(&self, request: RequestKey, kind: Product) -> bool;
 
-    /// The bytes `request`'s `kind` product holds, or `None` when no call produced it.
+    /// What `request`'s `kind` product states to a reader that must place its bytes, or `None` when
+    /// no call produced it.
     ///
-    /// A reader that must place the bytes rather than read them where they lie needs the length
-    /// before it copies - the conditioning row sizes its copy from the product and pads the rest -
-    /// and it must come from the store rather than from a view the reader has already crossed to.
-    fn product_bytes(&self, request: RequestKey, kind: Product) -> Result<Option<u64>>;
+    /// A reader needs both facts before it copies. The **length** sizes the copy and the padding
+    /// around it - the conditioning row takes the product's rows and pads the rest of its own. The
+    /// **element type** decides whether that copy is a copy at all: a product of another type is a
+    /// conversion, and the conversion a boundary performs is one explicit step rather than a byte
+    /// copy (`copy_into` refuses it by name). The type has to come from the store because it is the
+    /// writer that stated it, and a reader that had to borrow the region to learn it would have
+    /// already crossed the boundary it is checking.
+    fn product(&self, request: RequestKey, kind: Product) -> Result<Option<Published>>;
 
     /// Copies `request`'s `kind` product into `destination`, ordered on `stream`.
     ///
@@ -225,6 +230,15 @@ pub fn no_store(request: RequestKey) -> crate::Error {
          products are attached by the executor before the first batch",
         request.request_id.0
     ))
+}
+
+/// What a published product states to a reader that must place its bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Published {
+    /// The product's length, in bytes.
+    pub bytes: u64,
+    /// The element type its producer wrote, which is the only type a copy of it can land in.
+    pub dtype: ops::DType,
 }
 
 /// The write a producer is about to publish, as an event a crossing reader waits on.
@@ -297,6 +311,26 @@ enum Route {
     Ordered,
     /// Another stream or another device: the reader waits on the writer's event first.
     AfterTheWriter,
+}
+
+/// Whether a product's elements may be written into a destination of another type.
+///
+/// Only the same type is a copy. A different type is a **conversion**, and a conversion is a
+/// computation: the design replaced `torch.autocast` with each layer declaring its precision, which
+/// leaves exactly the conversions a stated handover performs - and this store's handover copies. The
+/// check is over types and not over byte counts because `f16` and `bf16` are the same width, so an
+/// agreeing byte count is precisely the case that would copy one type's bits as another's.
+fn copyable(from: ops::DType, to: ops::DType, request: RequestKey, kind: Product) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    Err(crate::Error::Invalid(format!(
+        "request {} copies {} of {from:?} into a buffer of {to:?}: elements of another type are a \
+         conversion and not a copy, and the conversion at a product's boundary is one explicit step \
+         that the handover performs",
+        request.request_id.0,
+        kind.name()
+    )))
 }
 
 /// Which route a read of a product takes from the placement it was written on to the reader's.
@@ -402,10 +436,13 @@ impl Products for Held {
         crate::lock(&self.entries).contains_key(&(request, kind))
     }
 
-    fn product_bytes(&self, request: RequestKey, kind: Product) -> Result<Option<u64>> {
+    fn product(&self, request: RequestKey, kind: Product) -> Result<Option<Published>> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         match placed {
-            Some(placed) => Ok(Some(placed.view.byte_len()?)),
+            Some(placed) => Ok(Some(Published {
+                bytes: placed.view.byte_len()?,
+                dtype: placed.view.dtype,
+            })),
             None => Ok(None),
         }
     }
@@ -421,6 +458,13 @@ impl Products for Held {
         let Some(placed) = placed else {
             return Ok(false);
         };
+        // **The element type first, and on types rather than on byte counts.** Two types can be the
+        // same width - `f16` and `bf16` are both two bytes - so a byte count that agrees is exactly
+        // the case that would copy a reinterpretation silently. A different type is a conversion, not
+        // a copy, and the design names the boundary's conversion as one explicit step its handover
+        // performs (specs/worker.md 9 replaced `torch.autocast` with declared per-layer precision);
+        // this store copies bytes and does not pretend to convert them.
+        copyable(placed.view.dtype, destination.dtype, request, kind)?;
         let product = placed.view.byte_len()?;
         let wanted = destination.byte_len()?;
         if product != wanted {
@@ -480,6 +524,36 @@ mod tests {
 
     use ops::{DType, DevicePtr, Shape};
     use platform::DeviceId;
+
+    /// A copy is bytes of one type; another type is a conversion, and the store says so by name.
+    ///
+    /// The row that matters is `f16` into `bf16`: both are two bytes, so a store that compared byte
+    /// counts would copy it and every reader would read a reinterpretation. On a device that is a
+    /// wrong image rather than an error, and nothing downstream can tell.
+    #[test]
+    fn a_product_of_another_element_type_is_refused_by_both_types() {
+        assert!(
+            copyable(DType::F16, DType::F16, request(1), Product::VideoLatents).is_ok(),
+            "one type is the copy this store performs"
+        );
+        for (from, to) in [
+            (DType::BF16, DType::F16),
+            (DType::F32, DType::F16),
+            (DType::F16, DType::BF16),
+        ] {
+            let error = copyable(from, to, request(1), Product::VideoLatents)
+                .expect_err("another type is a conversion");
+            let message = format!("{error}");
+            assert!(
+                message.contains(&format!("{from:?}")) && message.contains(&format!("{to:?}")),
+                "the refusal names both types: {message}"
+            );
+            assert!(
+                message.contains("video latents"),
+                "and the product it is about: {message}"
+            );
+        }
+    }
 
     /// The crossing table: only the writer's own stream on the writer's own device is the plain copy.
     ///
@@ -629,15 +703,16 @@ mod tests {
         );
     }
 
-    /// A reader that must place a product's bytes asks the store its length: the conditioning row
-    /// sizes its copy from it and pads the rest, and the length it sees is the **current** write's,
-    /// because a trajectory is published step by step and the latest is the one a reader wants.
+    /// A reader that must place a product's bytes asks the store for both facts: the conditioning row
+    /// sizes its copy from the length and pads the rest, and the length it sees is the **current**
+    /// write's, because a trajectory is published step by step and the latest is the one a reader
+    /// wants.
     #[test]
     fn the_length_is_the_latest_writes_and_the_request_that_wrote_it() {
         let store = Held::new();
         assert_eq!(
             store
-                .product_bytes(request(1), Product::Text)
+                .product(request(1), Product::Text)
                 .expect("an absent product is not an error"),
             None,
             "nothing wrote this request's kind"
@@ -656,14 +731,17 @@ mod tests {
         }
         assert_eq!(
             store
-                .product_bytes(request(1), Product::Text)
-                .expect("a published product has a length"),
-            Some(8192 * 2),
-            "the second write is the one a reader places"
+                .product(request(1), Product::Text)
+                .expect("a published product states its bytes and its type"),
+            Some(Published {
+                bytes: 8192 * 2,
+                dtype: DType::BF16,
+            }),
+            "the second write is the one a reader places, in the type its producer wrote"
         );
         assert_eq!(
             store
-                .product_bytes(request(2), Product::Text)
+                .product(request(2), Product::Text)
                 .expect("another request's absence is not an error"),
             None,
             "a product belongs to the request that wrote it"
