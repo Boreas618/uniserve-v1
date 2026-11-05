@@ -39,6 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use minimax_h3::audio_vae::BigVgan;
 use minimax_h3::config::AttentionKind;
 use minimax_h3::config::offered_canvases;
 use minimax_h3::decoding::{ClipDecoder, video_arena};
@@ -53,6 +54,9 @@ const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
 
 /// The `vae/` checkpoint directory inside the export.
 const VAE: &str = "vae";
+/// The audio VAE's directory in the checkpoint, which is also its component name: the video VAE and
+/// the audio VAE are two components of one export, each with its own configuration and shards.
+const AUDIO: &str = "audio_vae";
 
 /// The `.h3t` element-type codes this harness reads and writes, from `tools/dump_tables.py`'s table:
 /// `0` f64, `1` f32, `2` i64, `3` i32, `4` bf16, `5` f16.
@@ -108,6 +112,7 @@ enum Stage {
     Decode,
     Raster,
     Plan,
+    Audio,
 }
 
 #[derive(Clone)]
@@ -139,6 +144,10 @@ struct Args {
     /// asserting the clip's. Absent, the clip's own number is used, which is what every decode of a
     /// generated trajectory wants.
     frames: Option<u32>,
+    /// The latent frames `--stage audio` decodes: one row per stereo channel, `frames` steps of the
+    /// decoder's own hop. The reference probe's own default is twenty, so a comparison that does not
+    /// name one agrees with the tool's catalogue.
+    audio_frames: u32,
     /// An explicit arena size in GiB. Zero - the default - means the plan's own number, which is what
     /// a correct run needs; a stated size may only grow the reservation and the line says it did.
     arena_gib: u64,
@@ -158,6 +167,7 @@ impl Args {
             pixels: None,
             pattern: false,
             frames: None,
+            audio_frames: 20,
             arena_gib: 0,
             out: PathBuf::from("artifacts/h3-vae-decode"),
         };
@@ -181,9 +191,11 @@ impl Args {
                         "decode" => Stage::Decode,
                         "raster" => Stage::Raster,
                         "plan" => Stage::Plan,
+                        "audio" => Stage::Audio,
                         other => {
                             return Err(Failure::message(format!(
-                                "unknown stage `{other}`; expected weights, decode, raster or plan"
+                                "unknown stage `{other}`; expected weights, decode, raster, plan or \
+                                 audio"
                             )));
                         }
                     };
@@ -202,15 +214,17 @@ impl Args {
                 "--pixels" => args.pixels = Some(PathBuf::from(value("--pixels")?)),
                 "--pattern" => args.pattern = true,
                 "--frames" => args.frames = Some(number("--frames")?),
+                "--audio-frames" => args.audio_frames = number("--audio-frames")?,
                 "--arena-gib" => {
                     args.arena_gib = u64::from(number("--arena-gib")?);
                 }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
-                        "vae_decode --stage weights|decode|raster [--root PATH] [--store PATH] \
+                        "vae_decode --stage weights|decode|raster|audio [--root PATH] [--store PATH] \
                          [--device N] [--latent-height N] [--latent-width N] [--latents FILE] \
-                         [--pixels FILE | --pattern] [--frames N] [--arena-gib N] [--out DIR]",
+                         [--pixels FILE | --pattern] [--frames N] [--audio-frames N] \
+                         [--arena-gib N] [--out DIR]",
                     ));
                 }
                 other => {
@@ -278,6 +292,7 @@ fn run() -> Result<()> {
         Stage::Decode => stage_decode(&args),
         Stage::Raster => stage_raster(&args),
         Stage::Plan => stage_plan(&args),
+        Stage::Audio => stage_audio(&args),
     }
 }
 
@@ -1110,6 +1125,223 @@ fn stage_raster(args: &Args) -> Result<()> {
     stage_decode(&decoded)
 }
 
+/// Stage 5: one audio track's decode on a device, for the reference's block comparison.
+///
+/// The audio decoder's contract differs from the video one in three ways this stage states rather than
+/// inherits, and each is a place a second implementation would drift: its latents are
+/// `[2, channels, frames]` - one row per stereo channel - its output is interleaved `i16` PCM rather
+/// than a raster, and it reads no layout table, so `state` is empty and the plan is the whole of what
+/// it needs besides the caller's two buffers.
+///
+/// **It writes the latent it decoded as well as the PCM.** A stage comparison pairs two trees on one
+/// input; the input the reference gets is this draw and not a second one, so the draw is a file rather
+/// than a habit - `latents.h3t` is what `tools/dump_vae_blocks.py --probe decode_audio` reads.
+fn stage_audio(args: &Args) -> Result<()> {
+    use nn::capability::{DecodedMedia, Decoder as _, LatentShape, Layout};
+
+    let store_root = args.store.clone().ok_or_else(|| {
+        Failure::message(
+            "stage `audio` needs a program store: pass --store <path> or set UNISERVE_STORE",
+        )
+    })?;
+    // The audio VAE is its own component of the export: its configuration is a file of its own, and
+    // the decoder's plan is a function of the track's latent frames and nothing else.
+    let config = {
+        let path = args.root.join(AUDIO).join("config.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+        let values: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+        minimax_h3::AudioVaeConfig::parse(&values)
+            .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?
+    };
+    let frames = u64::from(args.audio_frames);
+    let channels = u64::from(config.latent_channels);
+    let samples = minimax_h3::audio_vae::track_samples(&config, args.audio_frames);
+    let checkpoint = Checkpoint::open(&args.root)?;
+
+    // 1. The device and the stream, before any weight is allocated.
+    let device = platform::Device::new(platform::DeviceId(args.device))?;
+    let _guard = device.enter()?;
+    let stream = device.stream()?;
+
+    // 2. The kernels: every committed module the store holds, so a store that lacks a package is
+    //    coverage rather than the first launch's failure.
+    let generation = load_generation(&device, &store_root)?;
+
+    // 3. The weights, from the component's own key list before a byte is mapped: the pool reserves once,
+    //    and a reservation short of the weights fails inside a publish naming a buffer rather than the
+    //    list.
+    let component = checkpoint.component(AUDIO)?;
+    let granularity =
+        u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    let needed = resident_bytes(component, BigVgan::keys(&config)?, granularity)?;
+    let mut weights = DeviceWeights::new(&device, needed, granularity)?;
+    let decoder = {
+        let mut loader = WeightLoader::new(component, &mut weights, None, None);
+        BigVgan::load(&config, &mut loader)?
+    };
+    println!(
+        "weights: {} MiB published of {} MiB reserved, {} MiB mapped",
+        weights.bytes >> 20,
+        weights.reserved >> 20,
+        weights.pools.mapped_bytes(platform::PoolKind::Resident) >> 20
+    );
+
+    // 4. The arena: the plan the capability states for this track, plus this harness's own two
+    //    buffers. The latents it uploads and the PCM window the decode writes are the caller's in
+    //    service - the runner allocates them and the plan deliberately does not count them - so they
+    //    are counted here and the line says which is which.
+    let layout = Layout {
+        video: LatentShape {
+            channels: 0,
+            frames: 0,
+            height: 0,
+            width: 0,
+        },
+        audio: Some(LatentShape {
+            channels: config.latent_channels,
+            frames: args.audio_frames,
+            height: 0,
+            width: 0,
+        }),
+        text_rows: 0,
+        condition_rows: 0,
+        condition_elements: 0,
+    };
+    let planned = decoder.arena_bytes(&layout)?;
+    let held = 4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames
+        + 2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples);
+    let arena_bytes = (planned + held).max(args.arena_gib << 30);
+    let allocator = weights.allocator();
+    allocator.reserve(
+        platform::PoolKind::Graph,
+        usize::try_from(arena_bytes).unwrap_or(usize::MAX),
+    )?;
+    let region = allocator.allocate(
+        platform::PoolKind::Graph,
+        usize::try_from(arena_bytes).unwrap_or(usize::MAX),
+    )?;
+    let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
+    println!(
+        "arena: {} MiB planned, {} KiB held by this harness, {} MiB reserved",
+        planned >> 20,
+        held >> 10,
+        arena_bytes >> 20
+    );
+
+    // 5. The latents, drawn by the device's Philox at the posterior's seed - the same habit the raster
+    //    stage has, so the track is reproducible - and then written out, because the reference decodes
+    //    *this* draw rather than one of its own.
+    let latents = arena.tensor(
+        DType::F32,
+        Shape::new(&[u64::from(minimax_h3::audio_vae::PCM_CHANNELS), channels, frames]),
+    )?;
+    nn::Noise::new().draw(
+        &forward,
+        latents.reshape(Shape::new(&[
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels,
+            frames,
+        ])),
+        nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
+        0,
+        0,
+        0,
+    )?;
+    // The window's own shape: `[samples, 2]`, interleaved, which is what `DecodedMedia.audio` is.
+    let out = arena.tensor(
+        DType::I16,
+        Shape::new(&[u64::from(samples), u64::from(minimax_h3::audio_vae::PCM_CHANNELS)]),
+    )?;
+
+    // 6. The decode, with the recorder installed for its duration: the walk is what says which programs
+    //    the audio half binds, and it is the first time anything has asked.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let decoded = decoder.decode(
+        &forward,
+        latents,
+        &[],
+        DecodedMedia {
+            video: None,
+            audio: Some(out),
+        },
+    );
+    ops::capture::set_sink(None);
+    stream.synchronize()?;
+
+    let directory = args.out.join("audio_decoder");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let walk_path = directory.join("walk.txt");
+    std::fs::write(&walk_path, walk.text())
+        .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    println!(
+        "walk: {} launches of {} distinct programs -> {}",
+        walk.0.len(),
+        walk.distinct(),
+        walk_path.display()
+    );
+    decoded?;
+    if walk.0.is_empty() {
+        return Err(Failure::message(
+            "the walk recorded no launches: the audio decode replayed a captured graph, or no sink \
+             was installed, and either way this stage has not measured the decoder",
+        ));
+    }
+
+    // 7. The two files a comparison needs: the draw and the PCM. The latent is FP32 because the
+    //    decoder computes in it, and the PCM is `i16` because the wire format is what the deployment
+    //    ships - a comparison at another type would be a comparison of a second quantizer.
+    let latent_bytes = download(
+        &stream,
+        latents,
+        usize::try_from(4 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels * frames).unwrap_or(0),
+    )?;
+    write_h3t(
+        &directory.join("latents.h3t"),
+        &[u64::from(minimax_h3::audio_vae::PCM_CHANNELS), channels, frames],
+        CONTAINER_F32,
+        &latent_bytes,
+    )?;
+    let pcm = download(
+        &stream,
+        out,
+        usize::try_from(2 * u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * u64::from(samples)).unwrap_or(0),
+    )?;
+    write_h3t(
+        &directory.join("pcm.h3t"),
+        &[u64::from(samples), u64::from(minimax_h3::audio_vae::PCM_CHANNELS)],
+        CONTAINER_I16,
+        &pcm,
+    )?;
+    let case = format!(
+        "{{\"component\": \"audio_decoder\", \"dtype\": \"f32\", \"latent_frames\": \
+         {frames}, \"latent_channels\": {channels}, \"samples\": {samples}, \"latents\": \
+         \"latents.h3t\", \"pcm\": \"pcm.h3t\", \"checkpoint\": \"{}\"}}\n",
+        args.root.display(),
+    );
+    std::fs::write(directory.join("case.json"), case)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    println!(
+        "audio: {frames} latent frames of {channels} channel(s) -> {samples} interleaved i16 sample \
+         pairs, written to {}",
+        directory.display()
+    );
+    println!(
+        "arena used: {} MiB of {} MiB reserved{}",
+        arena.used() >> 20,
+        arena_bytes >> 20,
+        if arena.used() > arena_bytes {
+            " - THE RESERVATION IS SHORT BY THE DIFFERENCE"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
 /// The encode half of [`stage_raster`]: pixels to a latent, written where `--stage decode` reads one.
 ///
 /// The device is opened, used and closed inside this function, because the decode that follows
@@ -1466,9 +1698,8 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
     // Written before the outcome is read, as the decode half's is: a stop has no other record of how
     // far it got, and the launch after the last line is the one that stopped.
     let encode_walk_path = args.out.join("walk.encode.txt");
-    std::fs::write(&encode_walk_path, encode_walk.text()).map_err(|error| {
-        Failure::message(format!("{}: {error}", encode_walk_path.display()))
-    })?;
+    std::fs::write(&encode_walk_path, encode_walk.text())
+        .map_err(|error| Failure::message(format!("{}: {error}", encode_walk_path.display())))?;
     println!(
         "encode walk: {} launches of {} distinct programs -> {}",
         encode_walk.0.len(),
@@ -2150,6 +2381,9 @@ fn latent_form(
 
 /// The container's element code for FP32, which is what a denoiser's trajectory holds.
 const CONTAINER_F32: u8 = 1;
+/// Interleaved `i16` PCM: the audio decoder's output, which is the wire format rather than a dtype the
+/// decode computes in.
+const CONTAINER_I16: u8 = 2;
 
 /// Re-encode a latent payload from element type `held` to the decode's `dtype`.
 ///
