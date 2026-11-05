@@ -188,13 +188,14 @@ impl Deployment {
     /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
     /// [`Self::new`] refuses a task the checkpoint does not.
     ///
-    /// The statement is the checkpoint's own, read from `root`: each DiT's task list in the
-    /// architecture config, which a FastH3 export narrows to the single task its student was
-    /// distilled for. **A table in this file would answer for every checkpoint** - a base checkpoint
-    /// holding no `transformer_ref` would be reported as serving `ref2va`, and the deployment that
-    /// believed it would load no such partition.
+    /// The statement is the checkpoint's own, read from `root` - and it is the statement about
+    /// **deployments**, not about architecture: a release serves every task its partitions serve,
+    /// while a distilled export serves the single task its contract states, because its student
+    /// replaces one partition's weights for one task. **A table in this file would answer for every
+    /// checkpoint** - a base checkpoint holding no `transformer_ref` would be reported as serving
+    /// `ref2va`, and the deployment that believed it would load no such partition.
     pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
-        Ok(Config::read(root, None)?.tasks())
+        Ok(Config::read(root, None)?.serving())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
