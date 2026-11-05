@@ -3626,6 +3626,9 @@ fn print_kv_digests(
         return Ok(());
     }
     let page = u64::try_from(block_table.first().copied().unwrap_or(0).max(0)).unwrap_or(0);
+    // The quantity, stated once: the served side prints the same three numbers, so a reader can
+    // tell two digests apart from two different byte ranges rather than from two different answers.
+    println!("kv digests: page {page}, {held} token(s), {bytes} bytes each");
     for (layer, plane) in planes.iter().enumerate() {
         let mut digests = String::new();
         for (name, view) in [("k", plane.key), ("v", plane.value)] {
