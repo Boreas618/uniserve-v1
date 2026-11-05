@@ -12,7 +12,6 @@
 mod assembly;
 pub mod chat;
 mod events;
-pub(crate) mod omni;
 pub mod reasoning;
 pub(crate) mod run;
 pub mod text;
@@ -250,68 +249,6 @@ mod tests {
                 ..
             }))
         ));
-    }
-
-    /// SenseNova's parser holds back a trailing fragment that could begin a
-    /// `<think>`, `</think>`, `<answer>` or `</answer>` delimiter. At the end
-    /// of the stream no delimiter can complete, so the held fragment is
-    /// visible text, whether the engine finished the request or a stop string
-    /// did.
-    #[tokio::test]
-    async fn sensenova_releases_a_trailing_delimiter_prefix_at_the_end() {
-        let policy = models::omni::OutputFilterPolicy {
-            reasoning: Some(models::omni::DelimitedTextPolicy {
-                start: "<think>".to_string(),
-                end: "</think>".to_string(),
-            }),
-            visible_wrappers: vec![models::omni::DelimitedTextPolicy {
-                start: "<answer>".to_string(),
-                end: "</answer>".to_string(),
-            }],
-        };
-        let cases = [
-            (
-                vec![
-                    text_token(b'x'),
-                    text_token(b' '),
-                    text_token(b'<'),
-                    finished(proto::request::FinishReason::MaxTokens, 3),
-                ],
-                None,
-                "x <",
-            ),
-            (
-                vec![text_token(b'x'), text_token(b'<'), text_token(b'!')],
-                Some(vec!["!".to_string()]),
-                "x<",
-            ),
-        ];
-
-        for (events, stop_strings, expected) in cases {
-            let parser = crate::output::omni::SenseNovaReasoningParser::new(
-                policy.clone(),
-                crate::test_support::configured_tokenizer(),
-            )
-            .unwrap();
-            let outputs = output(
-                ChatOutputProcessor::new(Some(Box::new(parser)), None),
-                TextDecodeOptions {
-                    stop_strings,
-                    ..TextDecodeOptions::default()
-                },
-                false,
-                engine_events(events),
-            )
-            .collect::<Vec<_>>()
-            .await;
-
-            assert!(outputs.iter().all(std::result::Result::is_ok), "{expected}");
-            assert_eq!(text(&outputs), expected);
-            assert!(matches!(
-                outputs.last(),
-                Some(Ok(RequestOutput::Finished { .. }))
-            ));
-        }
     }
 
     /// An engine failure of a running request (`Error`, or
