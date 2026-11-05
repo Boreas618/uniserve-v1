@@ -662,16 +662,22 @@ impl Transformer {
             )?);
         }
 
-        // The block's two modulated normalizations: the attention's (no update, no gate) and the
+        // The block's two modulated normalizations: the attention's (no update, **no gate**) and the
         // feed-forward's (both, retaining the normalized row for the projection).
-        for (update, retain) in [(false, false), (true, true)] {
+        //
+        // The gate stride is `0` for the first because `forward` builds that norm with `None` for its
+        // gate - there is no gate projection on the attention's normalization, which is what the
+        // reference's `modulation` omits. Stating the cache row's stride there named a key no launch
+        // binds while the key the launch binds had no row: one wrong number on each side of the same
+        // defect, and a store built from the statement would have missed the row a run needs.
+        for (update, retain, gate) in [(false, false, 0), (true, true, interaction)] {
             programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
                 dtype,
                 dtype,
                 nn::DType::I32,
                 hidden,
                 config.norm_eps,
-                interaction,
+                gate,
                 interaction,
                 interaction,
                 update,
