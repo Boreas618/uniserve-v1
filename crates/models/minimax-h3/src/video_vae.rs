@@ -772,6 +772,7 @@ impl VideoDecoder {
     /// residual its projection's, as the checkpoint's mapping states.
     pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
+        use nn::layers::UnpatchifyVideo;
         use ops::activation::ValueFirstSwiglu as SwigluOp;
         use ops::attention::dense::DenseAttention;
         use ops::cross_fade::CrossFade as CrossFadeOp;
@@ -779,9 +780,8 @@ impl VideoDecoder {
         use ops::norm::LayerNorm as LayerNormOp;
         use ops::norm::RmsNorm as RmsNormOp;
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
+        use ops::rope::{QkNormRope, RotaryFactors, Rotation};
         use ops::rows::{self, Rows as RowsOp};
-        use nn::layers::UnpatchifyVideo;
         use ops::unpatchify::Unpatchify;
 
         let (head, heads) = (
@@ -836,7 +836,11 @@ impl VideoDecoder {
         // The layer's two halves: their normalization, the residual each projection folds into, and
         // the gated feed-forward's packed activation.
         programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(width, dtype));
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(width), bias)?);
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
+            dtype,
+            u64::from(width),
+            bias,
+        )?);
         programs.launch::<SwigluOp>(&PackedSwiGlu::descriptor_of(
             dtype,
             u64::from(ffn),
@@ -848,13 +852,15 @@ impl VideoDecoder {
         // The output path: the final normalization, the projection to pixels, and the stitch's
         // unpatchify and its blends.
         programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, width, bias));
-        programs.launch::<Unpatchify>(&UnpatchifyVideo::new(
-            dtype,
-            u64::from(config.out_channels),
-            config.temporal_compression(),
-            spatial,
-        )?
-        .descriptor());
+        programs.launch::<Unpatchify>(
+            &UnpatchifyVideo::new(
+                dtype,
+                u64::from(config.out_channels),
+                config.temporal_compression(),
+                spatial,
+            )?
+            .descriptor(),
+        );
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
@@ -872,9 +878,9 @@ impl VideoDecoder {
         )?;
         // The packed form of one sequence: the flash backend refuses a null offsets table, so the
         // launch states the offsets and the key is the one fa4 declares.
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, width, true,
-        ));
+        programs.launch::<DenseAttention>(
+            &attention.dense_descriptor(dtype, dtype, dtype, width, true),
+        );
 
         Ok(programs.finish())
     }
@@ -1056,8 +1062,9 @@ impl VideoDecoder {
             offsets: {
                 // `[0, rows]`: one sequence starting at row zero. A constant of this canvas, so it is
                 // created once with the weights and read by every clip's attention launch.
-                let rows = i32::try_from(canvas.rows())
-                    .map_err(|_| Error::config("a clip's rows exceed a sequence offset".to_owned()))?;
+                let rows = i32::try_from(canvas.rows()).map_err(|_| {
+                    Error::config("a clip's rows exceed a sequence offset".to_owned())
+                })?;
                 let mut bytes = Vec::with_capacity(8);
                 for offset in [0i32, rows] {
                     bytes.extend_from_slice(&offset.to_le_bytes());
@@ -1702,7 +1709,8 @@ pub(crate) mod tests {
         // decoder built for one packing cannot be read through the other's.
         let dense = voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width)
             .expect("the dense table");
-        let tiled = voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
+        let tiled =
+            voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
         assert_ne!(dense, tiled, "{dense:?}");
     }
 
@@ -2164,13 +2172,9 @@ pub(crate) mod tests {
     #[test]
     fn the_decoder_states_its_programs_from_its_own_config() {
         let config = video_config();
-        let programs = VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let programs =
+            VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         // Every projection this decoder has, whatever its contraction: the key carries the element
         // types and the order, and the contraction length is a descriptor field of one program.
@@ -2196,5 +2200,4 @@ pub(crate) mod tests {
         // programs do not depend on the raster a request asks for.
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
     }
-
 }
