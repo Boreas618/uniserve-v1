@@ -33,7 +33,7 @@ use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
-use nn::weights::WeightRequest;
+use nn::weights::{WeightLayout, WeightRequest};
 use nn::{
     DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader,
 };
@@ -478,9 +478,11 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         }
     };
 
-    sources.push(normalized(
+    // The input projection is the one convolution the checkpoint stores **plain**: every other filter in this
+    // decoder is a `weight_v`/`weight_g` pair, and `dec_in_proj.weight` is a single tensor.
+    sources.push(region(
         "input.weight".to_owned(),
-        "dec_in_proj".to_owned(),
+        "dec_in_proj.weight".to_owned(),
     ));
     sources.push(region(
         "input.bias".to_owned(),
@@ -905,7 +907,10 @@ impl AudioDecoder {
         )?;
         let mut binder = Binder::new(loader, table);
         let input = Conv1d::new(
-            binder.normalized("input.weight")?,
+            binder.region(
+                "input.weight",
+                &[u64::from(config.latent_dim), u64::from(config.latent_channels), 1],
+            )?,
             Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
             geometry(1, 1, 0)?,
             false,
@@ -994,9 +999,15 @@ impl AudioDecoder {
 
     /// Decode `latents [2, latent_channels, frames]` into interleaved PCM `[samples, 2]`.
     ///
-    /// The two rows of the latent are the stereo pair the reference decodes; both hold the same latent,
-    /// so the network's two output rows are equal and [`PcmInterleave`] writes them interleaved. Every
-    /// intermediate is FP32 — `specs/worker.md` 9's audio rows keep no reduced precision — and the
+    /// The two rows of the latent are the stereo pair the reference decodes. **Preferred is measured in
+    /// channels, not in batch**: every operator in the audio network takes one plane, `[channels, length]`,
+    /// and the alias-free activation's `alpha`/`beta` carry one frequency per channel of that plane - so the
+    /// pair is two decodes of the same network into two rows of the output, not one decode of a batched
+    /// `[2, channels, length]` view. The pair holds the same latent, so the two rows are equal, but the
+    /// network is run for each rather than one row being copied into the other: a copy would be the place a
+    /// later difference between the rows silently disappeared.
+    ///
+    /// Every intermediate is FP32 — `specs/worker.md` 9's audio rows keep no reduced precision — and the
     /// length grows only through the stages' transposed convolutions, so `samples` is `frames · Π rates`.
     pub fn forward(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
         let shape = latents.shape;
@@ -1010,7 +1021,44 @@ impl AudioDecoder {
                 self.config.latent_channels
             )));
         }
-        let mut length = shape.dim(2);
+        let frames = shape.dim(2);
+        let mut length = frames;
+        for stage in &self.stages {
+            length = length
+                .checked_mul(u64::from(stage.rate))
+                .ok_or_else(|| Error::config("the audio track's length overflows".to_owned()))?;
+        }
+        if out.shape.rank() != 2 || out.shape.dim(0) != length || out.shape.dim(1) != u64::from(PCM_CHANNELS)
+        {
+            return Err(Error::config(format!(
+                "{:?} is not [{length}, {PCM_CHANNELS}] PCM",
+                out.shape.dims()
+            )));
+        }
+        let channels = shape.dim(1);
+        let planes = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[u64::from(PCM_CHANNELS), length]))?;
+        for plane in 0..u64::from(PCM_CHANNELS) {
+            let latent = TensorView::new(
+                latents.offset_elements(plane * channels * frames),
+                latents.dtype,
+                Shape::new(&[channels, frames]),
+            );
+            let row = TensorView::new(
+                planes.offset_elements(plane * length),
+                DType::F32,
+                Shape::new(&[1, length]),
+            );
+            self.plane(f, latent, row)?;
+        }
+        self.pcm.forward(f, planes, out)?;
+        Ok(())
+    }
+
+    /// One plane of the stereo pair: `[latent_channels, frames]` latents to `[1, samples]` PCM.
+    fn plane(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
+        let mut length = latents.shape.dim(1);
         // The reference restores each latent channel (`value · std + mean`) before the decoder's first
         // convolution, and this decoder's first convolution is weight-normalized, so its values exist
         // only after the fold: the statistics are one one-by-one convolution of constants instead of a
@@ -1031,13 +1079,7 @@ impl AudioDecoder {
         }
         let activated = self.buffer(f, self.last_channels()?, length)?;
         self.post.forward(f, current, activated)?;
-        let mono = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[u64::from(PCM_CHANNELS), 1, length]),
-        )?;
-        self.output.forward(f, activated, mono)?;
-        let planes = mono.reshape(Shape::new(&[u64::from(PCM_CHANNELS), length]));
-        self.pcm.forward(f, planes, out)?;
+        self.output.forward(f, activated, out)?;
         Ok(())
     }
 
@@ -1224,10 +1266,11 @@ impl AudioDecoder {
 
     /// A FP32 buffer of the audio network's layout.
     fn buffer(&self, f: &Forward, channels: u32, length: u64) -> Result<TensorView> {
-        Ok(f.arena().tensor(
-            DType::F32,
-            Shape::new(&[u64::from(PCM_CHANNELS), u64::from(channels), length]),
-        )?)
+        // One plane, `[channels, length]`: the operators in this network take a plane, and the stereo pair
+        // is two decodes (see `forward`), so no buffer carries a batch axis.
+        Ok(f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[u64::from(channels), length]))?)
     }
 }
 
@@ -1407,7 +1450,16 @@ impl<'a, 'b> Binder<'a, 'b> {
     }
 
     /// The table entry of `parameter`, marked used.
+    ///
+    /// A **sliced** parameter is read once per piece by design - the fused query-key-value projection
+    /// is one tensor in the table and three linear layers in the model - so `slice` passes `sliced` and
+    /// the table's completeness check still sees the parameter used rather than bound twice.
     fn entry(&mut self, parameter: &str) -> Result<Tensor> {
+        self.entry_sliced(parameter, false)
+    }
+
+    /// Whether a parameter may be read more than once: only a fused matrix's row slices are.
+    fn entry_sliced(&mut self, parameter: &str, sliced: bool) -> Result<Tensor> {
         let index = self
             .table
             .iter()
@@ -1419,7 +1471,7 @@ impl<'a, 'b> Binder<'a, 'b> {
                     "the checkpoint's audio decoder has no such parameter".to_owned()
                 ))
             })?;
-        if self.used[index] {
+        if self.used[index] && !sliced {
             return Err(Error::checkpoint(format!(
                 "{}: {}",
                 parameter.to_owned(),
@@ -1462,12 +1514,26 @@ impl<'a, 'b> Binder<'a, 'b> {
     }
 
     /// One tensor, read at `shape`.
+    ///
+    /// The checkpoint stores the fused query-key-value **bias** as three tensors
+    /// (`pre_block.attn.{q_bias,zero_k_bias,v_bias}`), and the layer below reads one vector, so the
+    /// request carries the parts rather than the parameter's own name: a shapes-only loader ignores the
+    /// source and a real one gathers the three in order.
     pub(crate) fn region(&mut self, parameter: &str, shape: &[u64]) -> Result<Weight> {
         match self.entry(parameter)? {
             Tensor::Region(tensor) => {
                 let weight =
                     self.loader
                         .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?;
+                self.declared(weight, parameter)
+            }
+            Tensor::Parts(parts) => {
+                let weight = self.loader.load(&WeightRequest::parts(
+                    parameter,
+                    parts,
+                    Shape::new(shape),
+                    WeightLayout::ROW_MAJOR,
+                ))?;
                 self.declared(weight, parameter)
             }
             other => Err(Error::checkpoint(format!(
@@ -1482,11 +1548,32 @@ impl<'a, 'b> Binder<'a, 'b> {
     /// value projection into three matrices: the checkpoint stores them fused by rows, and each one is
     /// then read on its own by its own linear layer.
     pub(crate) fn slice(&mut self, parameter: &str, offset: u64, shape: &[u64]) -> Result<Weight> {
-        match self.entry(parameter)? {
+        let extents = Shape::new(shape);
+        match self.entry_sliced(parameter, true)? {
             Tensor::Region(tensor) => {
-                let weight =
-                    self.loader
-                        .load(&WeightRequest::region(tensor, offset, Shape::new(shape)))?;
+                let weight = self
+                    .loader
+                    .load(&WeightRequest::region(tensor, offset, extents))?;
+                self.declared(weight, parameter)
+            }
+            // A parameter stored as several tensors is sliced **by part**: the fused bias is three
+            // vectors in the checkpoint and the three linear layers read one each, so the offset names
+            // the part rather than a position inside one tensor.
+            Tensor::Parts(parts) => {
+                let per = extents.numel();
+                if per == 0 || !offset.is_multiple_of(per) {
+                    return Err(Error::checkpoint(format!(
+                        "{parameter}: offset {offset} is not a whole part of {per} elements"
+                    )));
+                }
+                let index = (offset / per) as usize;
+                let part = parts.get(index).cloned().ok_or_else(|| {
+                    Error::checkpoint(format!(
+                        "{parameter}: part {index} of {} is past the end of {parts:?}",
+                        parts.len()
+                    ))
+                })?;
+                let weight = self.loader.load(&WeightRequest::region(part, 0, extents))?;
                 self.declared(weight, parameter)
             }
             other => Err(Error::checkpoint(format!(
@@ -1543,15 +1630,17 @@ pub(crate) mod tests {
         assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
         // A weight-normalized convolution reads a direction and a magnitude, and the load needs both:
         // a list that named only the direction would refuse a checkpoint that is complete.
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_v"));
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_g"));
         let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
         let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
         assert_eq!(magnitudes, directions, "every magnitude has its direction");
         assert_eq!(
-            magnitudes, 136,
+            magnitudes, 135,
             "the decoder's weight-normalized convolutions"
         );
+        // The input projection is the one filter the checkpoint stores plainly, and a list that named a
+        // pair for it would be asking for two tensors no shard holds.
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight"));
+        assert!(!keys.iter().any(|key| key.starts_with("dec_in_proj.weight_")));
         // The encoder reads a different half of a different directory; a shared name would be one
         // block binding the other's tensor.
         let encoder = crate::encoding::AudioEncoder::keys(&config).expect("the encoder's keys");
@@ -1919,14 +2008,15 @@ pub(crate) mod tests {
             .iter()
             .filter(|source| matches!(source.tensor, Tensor::Normalized { .. }))
             .count();
-        // 136 weighted convolutions: the input projection, the pre- and post-convolutions, seven
-        // upsamplers and the 126 anti-aliased multi-periodicity convolutions.
-        assert_eq!(normalized, 136);
+        // 135 weight-normalized convolutions: the pre- and post-convolutions, seven upsamplers and the
+        // 126 anti-aliased multi-periodicity convolutions. The input projection is the one filter stored
+        // plainly, so it is a region source and not a pair.
+        assert_eq!(normalized, 135);
         // 127 activations of four tensors each, plus the input projection's pair, the two
         // convolution biases, the seven upsampler biases and the 126 AMP biases.
         // 127 alias-free activations of four tensors each, their convolutions' own biases (126), the
         // upsamplers' and the two bias-carrying projections' — the post-convolution has none.
-        assert_eq!(table.len(), 136 + 127 * 4 + 126 + 7 + 2);
+        assert_eq!(table.len(), 135 + 1 + 127 * 4 + 126 + 7 + 2);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())

@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use minimax_h3::audio_vae::AudioDecoder;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
@@ -112,6 +113,7 @@ fn run() -> Result<(), String> {
     let mut extents: Option<PathBuf> = None;
     let mut sparse: Option<(u32, f64, Option<f64>)> = None;
     let mut list = false;
+    let mut names = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or_else(|| format!("{argument} needs a value"));
         match argument.as_str() {
@@ -159,10 +161,14 @@ fn run() -> Result<(), String> {
                 ));
             }
             "--list" => list = true,
+            "--names" => names = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
 
+    if names {
+        return list_names(&root, &component);
+    }
     if list {
         return list_extents(&root, &component);
     }
@@ -184,6 +190,7 @@ fn run() -> Result<(), String> {
     let harnesses: Vec<(&str, Harness)> = match component.as_str() {
         "all" => vec![
             ("audio-encoder", audio_encoder as Harness),
+            ("audio-decoder", audio_decoder as Harness),
             ("video-encoder", video_encoder as Harness),
             ("video-decoder", video_decoder as Harness),
             ("denoiser", denoiser as Harness),
@@ -195,6 +202,7 @@ fn run() -> Result<(), String> {
         // path. `all` is every harness this build can drive, and the audio halves answer by name while
         // their extents table is missing rather than silently leaving the run short.
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
+        "audio-decoder" => vec![("audio-decoder", audio_decoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
         "denoiser" => vec![("denoiser", denoiser as Harness)],
@@ -328,6 +336,46 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
     let run = encoder.encode(&forward, samples, out);
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
+}
+
+/// The audio VAE's decoder, as one request: 64 latent frames in FP32, decoded to interleaved PCM.
+///
+/// The decoder's `forward` takes the latents `[2, latent_channels, frames]` and writes `[samples, 2]`, and every
+/// intermediate is FP32 — the audio VAE's arithmetic is stated in that type whatever the deployment's sample
+/// type is. The frames are the bucket a decode of a 64-frame window serves, which is the one `AudioDecoder`'s
+/// own `programs` states its per-row launches at.
+fn audio_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = audio_config(&request.root)?;
+
+    // The same extents table the encoder needs: the decoder's stages carry weight-normalized convolutions too,
+    // and a fold reads its direction tensor's extents rather than its own.
+    let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
+    let decoder = AudioDecoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+
+    let frames = 64u32;
+    let latent_channels = u64::from(config.latent_channels);
+    let latents = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[2, latent_channels, u64::from(frames)]),
+        )
+        .map_err(|error| error.to_string())?;
+    let samples = minimax_h3::audio_vae::track_samples(&config, frames);
+    // The interleave is the one operator whose output is the wire format: the track is PCM, so the decode's
+    // last view is i16 rather than FP32 and the type is the op's own contract.
+    let out = arena
+        .tensor(DType::I16, Shape::new(&[samples, 2]))
+        .map_err(|error| error.to_string())?;
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = decoder.forward(&forward, latents, out);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
@@ -827,6 +875,42 @@ fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
     minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())
 }
 
+/// Every checkpoint tensor the chosen component's load asks for, in the load's order.
+///
+/// This is the other direction of the extents table and the **completeness check of a load**: a parameter the
+/// model never asks for is a tensor the checkpoint holds and no layer reads, and a parameter it asks for and the
+/// checkpoint does not hold fails the load. Neither shows up in a shape, a count or a launch, so the two lists
+/// are compared instead - here, on a host with no shard, because a name is not a weight.
+fn requested_names(root: &Path, component: &str) -> Result<Vec<String>, String> {
+    let config = audio_config(root)?;
+    let names = match component {
+        "all" => {
+            let mut names = AudioEncoder::keys(&config).map_err(|error| error.to_string())?;
+            names.extend(AudioDecoder::keys(&config).map_err(|error| error.to_string())?);
+            names
+        }
+        "audio-encoder" => AudioEncoder::keys(&config).map_err(|error| error.to_string())?,
+        "audio-decoder" => AudioDecoder::keys(&config).map_err(|error| error.to_string())?,
+        other => return Err(format!("component {other} asks for no names here")),
+    };
+    Ok(names)
+}
+
+/// Every name the chosen component's load asks for, one per line.
+///
+/// `--list` states the extents a **computed** weight needs; this states the parameter set itself, which is what a
+/// checkpoint's own key list is diffed against.
+fn list_names(root: &Path, component: &str) -> Result<(), String> {
+    let mut names = requested_names(root, component)?;
+    names.sort();
+    names.dedup();
+    for name in &names {
+        println!("{name}");
+    }
+    eprintln!("# {} checkpoint tensors asked for", names.len());
+    Ok(())
+}
+
 /// The checkpoint tensors' extents, as the walk states them: `{"name": {"dtype": "F32", "shape": [...]}}`.
 ///
 /// This is the checkpoint's shard-header content, not a model fact: it is produced where the weights are and
@@ -874,11 +958,7 @@ fn dtype_of(name: &str) -> Option<DType> {
 /// as a fixture that carries more than the walk. The names come from the component's own signature
 /// (`AudioEncoder::keys`), so the skeleton cannot drift from what the load binds against.
 fn list_extents(root: &Path, component: &str) -> Result<(), String> {
-    let names = match component {
-        "all" | "audio-encoder" => AudioEncoder::keys(&audio_config(root)?),
-        other => return Err(format!("unknown component {other}")),
-    }
-    .map_err(|error| error.to_string())?;
+    let names = requested_names(root, component)?;
     let normalized: Vec<&String> = names
         .iter()
         .filter(|name| name.ends_with("weight_v") || name.ends_with("weight_g"))
