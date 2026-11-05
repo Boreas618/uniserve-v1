@@ -372,14 +372,28 @@ fn main() {
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::F32,
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
             clip_frames.clone(),
         )
         .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
-        let partition = minimax_h3::Partition::single();
+        // The serving partition, not the released default: `Partition::serving` derives the capacity
+        // from the task, and the packed row bound - hence the gated activation's `wide` form and the
+        // sparse tile class - follows from it. `Partition::single()` states 128 text and 192 condition
+        // rows, which is a deployment no conditioned request asks for.
+        let partition = minimax_h3::Partition::serving(
+            &config,
+            nn::VideoTask::ReferenceToVideoAudio,
+            1,
+            1,
+            0,
+            0,
+        )
+        .unwrap_or_else(|error| {
+            panic!("the deployment's serving partition is not statable: {error}")
+        });
         let Some(dies) = config.denoisers.values().next() else {
             panic!("the checkpoint states no DiT, so its arrangement is not statable")
         };
@@ -410,9 +424,35 @@ fn main() {
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
     // twice, once per element type, which is the point.
+    // Once, before any row: `Layouts::rows_bound` derives the packed bound from the arrangement, and
+    // **the bound is the serving path's**, so the partition is too - `Partition::serving` derives the
+    // capacity from the task (two latent frames of difference between tasks), while `Partition::single()`
+    // states the released defaults and gives a bound no conditioned request asks for. Two rows are
+    // reachable only at the bound (the gated activation's `wide` form switches on the row count), and
+    // the header states it.
+    let serving =
+        minimax_h3::Partition::serving(&config, nn::VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
+            .unwrap_or_else(|error| {
+                panic!("the deployment's serving partition is not statable: {error}")
+            });
+    let bound = {
+        let dies = config
+            .denoisers
+            .get(&minimax_h3::checkpoint::Dit::Base)
+            .unwrap_or_else(|| {
+                panic!("the checkpoint holds no base DiT, so its bound is not statable")
+            });
+        serving
+            .arrangement(dies)
+            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement))
+            .and_then(|rules| rules.rows_bound())
+            .unwrap_or_else(|error| {
+                panic!("the deployment's packed bound is not statable: {error}")
+            })
+    };
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
-        lines.extend(rows(deployment));
+        lines.extend(rows(deployment, bound));
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -507,24 +547,15 @@ fn main() {
     // above are being replaced by one component at a time. Emitting it beside them is a no-op today
     // (a row is a set member) and is what makes the replacement checkable: the set must not move.
     // The partition the deployment states, and the packed bound the rows are cut at. Both are stated
-    // once, outside the VAE loop: `Layouts::rows_bound` derives the bound from the arrangement, and
-    // the header states it because two rows are reachable only at it.
-    let partition = minimax_h3::Partition::single();
     let Some(dies) = config.denoisers.values().next() else {
         panic!("the checkpoint states no DiT, so its arrangement is not statable")
     };
-    let arrangement = partition
-        .arrangement(dies)
-        .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-    let bound = minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement)
-        .and_then(|rules| rules.rows_bound())
-        .unwrap_or_else(|error| panic!("the deployment's packed bound is not statable: {error}"));
     for vae in VAES {
         let deployment = minimax_h3::programs::Deployment::new(
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::F32,
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
@@ -706,7 +737,10 @@ fn header(
 }
 
 /// Every row one deployment's dtype asks for.
-fn rows(deployment: DType) -> Vec<(String, String)> {
+/// Every row the DiT, the text encoder and the orchestration around them state at `deployment`'s
+/// element type. `bound` is the deployment's packed row bound: the gated activation's `wide` form is a
+/// property of `bound · width`, so a walk cannot state it without the bound it serves.
+fn rows(deployment: DType, bound: u32) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -1983,7 +2017,10 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             activation: ops::activation::Activation::Silu,
             gate_stride: 2 * 14336,
             value_stride: 2 * 14336,
-            wide: false,
+            // `wide` is the index-width class: the launch addresses `bound` rows of `width`, so at a
+            // deployment whose product passes `u32::MAX` the kernel takes 64-bit offsets. Stating it
+            // as `false` was a cell for a class the launch does take and none for the one it asks.
+            wide: u64::from(bound) * 14_336 > u64::from(u32::MAX),
             pdl: PDL,
             stepwise: true,
         }
