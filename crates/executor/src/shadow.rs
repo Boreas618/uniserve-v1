@@ -551,7 +551,7 @@ mod tests {
     /// into a page a served request reads (7.3).
     #[test]
     fn a_partial_buckets_scratch_tail_names_no_page() {
-        let mapping = scratch_column(&[0, 0, 1], &[0, 3], &[10, 11, 12], 3, 8, 2, 4)
+        let mapping = scratch_column(&[0, 1, 2], &[0, 3], &[10, 11, 12], 3, 8, 2, 4)
             .expect("three tokens of an eight-token bucket");
         assert_eq!(mapping.len(), 8);
         assert_eq!(&mapping[..3], &[0, 1, 2], "the batch's own tokens keep their pages");
