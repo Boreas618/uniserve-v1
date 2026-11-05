@@ -299,6 +299,32 @@ mod tests {
     use ops::{DType, DevicePtr, Shape};
     use platform::DeviceId;
 
+    /// Every kind's name is its own, so a refusal says which product is missing.
+    ///
+    /// The names are what a reader acts on: `absent` and `no_store` put `kind.name()` in the
+    /// sentence a request fails with, and a name two kinds share would report the wrong one of them —
+    /// a `video` missing when the trajectory is what never ran. The kinds are listed exhaustively so a
+    /// new one cannot arrive without a name of its own.
+    #[test]
+    fn every_kind_of_product_has_a_name_of_its_own() {
+        let kinds = [
+            Product::Text,
+            Product::Source,
+            Product::Images,
+            Product::Audio,
+            Product::VideoLatents,
+            Product::AudioLatents,
+            Product::Video,
+            Product::Track,
+        ];
+        let mut names: Vec<&'static str> = kinds.iter().map(|kind| kind.name()).collect();
+        assert!(names.iter().all(|name| !name.is_empty()), "{names:?}");
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "two kinds share a name: {names:?}");
+    }
+
     fn request(id: u64) -> RequestKey {
         RequestKey::new(1, ipc::RequestId(id), 0)
     }
