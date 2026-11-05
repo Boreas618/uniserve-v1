@@ -515,6 +515,21 @@ impl Partition {
             .iter()
             .find_map(|(served, dit)| (*served == task).then_some(*dit))
             .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {task:?}")))?;
+        // **The checkpoint is the authority on which tasks exist.** A deployment is one task: one DiT
+        // partition, one block set and one capacity, because the capacity is what every class-crossing
+        // key is sized from and a key that moved with the request would be a store row per request.
+        // A checkpoint that does not state this task cannot serve it, whatever a deployment asks for.
+        let stated = config.tasks();
+        if !stated.contains(&task) {
+            return Err(Error::config(format!(
+                "this checkpoint states {} and not {task:?}",
+                stated
+                    .iter()
+                    .map(|task| format!("{task:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         if !config.denoisers.contains_key(&dit) {
             return Err(Error::config(format!(
                 "the checkpoint holds no {} DiT, so it cannot serve {task:?} (it holds {})",
@@ -1005,6 +1020,44 @@ mod tests {
         let outside = first.at_sequence_rank(2);
         let refused = outside.validate(&config).expect_err("outside the degree");
         assert!(refused.to_string().contains("denoiser's rank"), "{refused}");
+    }
+
+    #[test]
+    fn a_task_the_checkpoint_does_not_state_is_refused_by_name() {
+        // The checkpoint is the authority on which tasks exist. A deployment asking for one its
+        // checkpoint does not state is refused at the partition, naming the tasks the checkpoint does
+        // state - rather than loading the other task's partition and serving it under this name.
+        let mut config = config();
+        let base = config
+            .denoisers
+            .get_mut(&crate::checkpoint::Dit::Base)
+            .expect("a base DiT");
+        base.tasks
+            .retain(|task| *task != VideoTask::FirstLastToVideoAudio);
+        let refused = Partition::serving(
+            &config,
+            VideoTask::FirstLastToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect_err("a task the checkpoint does not state");
+        let said = refused.to_string();
+        assert!(said.contains("states"), "{said}");
+        assert!(said.contains("FirstLastToVideoAudio"), "{said}");
+
+        // The task the base DiT still states is served, so the refusal is the statement and not the
+        // constructor refusing everything after one edit.
+        Partition::serving(
+            &config,
+            VideoTask::TextToVideoAudio,
+            Ulysses::single(),
+            1,
+            0,
+            0,
+        )
+        .expect("the task the checkpoint states");
     }
 
     #[test]
