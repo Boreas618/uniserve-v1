@@ -519,10 +519,13 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
     let plan = video_arena(&config.video_vae, &canvas, dtype)?;
-    let mut planned = 0_u64;
-    for buffer in &plan {
-        planned += buffer.elements * buffer.width()?;
-    }
+    // **Each buffer at the arena's alignment, not at its raw size.** The arena aligns every give-out
+    // to `nn::forward::ALIGNMENT`, so the raw sum is short by up to 255 bytes per buffer - and the
+    // first run to meet it was 64 bytes short of a 372 MiB region, which is the two rotary tables'
+    // padding and nothing else. `arena_reservation` is that sum, so a runner that reserves by the
+    // plan cannot be short by an alignment it did not know about.
+    let planned = minimax_h3::decoding::arena_reservation(&plan);
+    let raw: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
     // **The harness is also the runner.** The latents it uploads and the raster it decodes into are,
     // in service, the request's latent and `DecodedMedia.video` - the caller's buffers, which the
     // runner allocates and the plan deliberately does not count (`video_arena`'s note). Here they come
@@ -558,10 +561,12 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned at {}, {} KiB held by this harness, {} MiB reserved{}",
+        "arena: {} buffers, {} MiB planned at {} ({} KiB of alignment), {} KiB held by this \
+         harness, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
         minimax_h3::text_encoder::element_of(dtype),
+        (planned - raw) >> 10,
         held >> 10,
         arena_bytes >> 20,
         if arena_bytes > reserved {
@@ -570,6 +575,23 @@ fn stage_decode(args: &Args) -> Result<()> {
             ""
         }
     );
+
+    // **Where each buffer will land.** A stop inside the arena names a size and an offset, and an
+    // offset is only readable against the placement that produced it - the harness's two buffers
+    // first, then the plan's entries at the arena's alignment. Printing it costs sixteen lines and
+    // turns "an arena that cannot give out" into a name and a number the moment it happens.
+    {
+        let mut at = held;
+        for buffer in &plan {
+            at = at.next_multiple_of(nn::forward::ALIGNMENT);
+            println!(
+                "  arena {:<22} {:>12} B at {at}",
+                buffer.name,
+                buffer.bytes()
+            );
+            at += buffer.bytes();
+        }
+    }
 
     // 6. The latents: the file the reference's own decoder is called with, packed into the rows this
     //    decoder reads. A missing file is generated from a fixed pattern instead, so the stage can run
@@ -819,10 +841,48 @@ fn stage_decode(args: &Args) -> Result<()> {
         element_of(dtype)?,
         &transposed,
     )?;
+    // **The raster in numpy's own container, beside the crate's.** `tools/diagnosis/compare.py`
+    // pairs the two implementations' trees by relative path and reads `.npy`; a raster written only
+    // as `.h3t` would appear there as a file the reference has and this crate does not - a false
+    // absence in a delivery artifact, which is worse than a missing row because it reads as a defect
+    // in the decoder. The two files hold the same numbers: the payload is the tensor's bytes, and the
+    // widening to `f32` is this container's one requirement (`diagnosis::write_npy`).
+    let raster_shape = [frames, u64::from(height), u64::from(width_px), channels];
+    minimax_h3::diagnosis::write_npy(
+        &directory.join("raster.npy"),
+        &raster_shape,
+        &widen_to_f32(&transposed, dtype)?,
+    )
+    .map_err(Failure::message)?;
+    // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
+    // whole-raster residual: a seam that is faded with the wrong weight moves a band of a few dozen
+    // pixels, and the maximum over a 25-frame raster is somewhere else. The grid knows where every
+    // overlap is - each tile names the band it shares with the tile above and to its left, in output
+    // pixels - so the case states the bands and the comparator reports a row per band. The reference
+    // probe copies this `case.json` verbatim, so both sides are compared on the same bands rather
+    // than on two readings of the grid.
+    let ratio = config.video_vae.spatial_compression();
+    let mut seams = Vec::new();
+    for tile in &tiles {
+        for (axis, extent, start) in [
+            ("rows", tile.above, tile.latent_rows.0),
+            ("columns", tile.left, tile.latent_columns.0),
+        ] {
+            if extent == 0 {
+                continue;
+            }
+            let offset = start * ratio;
+            seams.push(format!(
+                "{{\"axis\": \"{axis}\", \"start\": {offset}, \"end\": {}}}",
+                offset + extent
+            ));
+        }
+    }
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
          \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
-         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}}}\n",
+         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}, \
+         \"seams\": [{}], \"checkpoint\": \"{}\"}}\n",
         height,
         width_px,
         canvas.frames,
@@ -832,6 +892,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         if generated { "generated" } else { "supplied" },
         tiles.len(),
         rows,
+        seams.join(", "),
+        args.root.display(),
     );
     std::fs::write(directory.join("case.json"), case).map_err(|error| {
         Failure::message(format!(
@@ -849,7 +911,8 @@ fn stage_decode(args: &Args) -> Result<()> {
         walk_path.display()
     );
     println!(
-        "wrote {}/raster.h3t: [{frames}, {height}, {width_px}, {channels}] from {} tiles, latents {}",
+        "wrote {}/raster.h3t and raster.npy: [{frames}, {height}, {width_px}, {channels}] from {} \
+         tiles, latents {}",
         directory.display(),
         tiles.len(),
         if generated {
@@ -1305,6 +1368,31 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// The `f32` bytes of a payload at `dtype`: the widening `diagnosis::write_npy` requires.
+///
+/// A decode at the checkpoint's own half precision writes its `.h3t` at that width, and the reference
+/// covers its `.npy` twin by widening on the reader's side. This crate writes both files from one
+/// payload, so the widening happens here: FP32 is copied, FP16 is widened exactly (every half is a
+/// value a `f32` holds), and any other width is refused by name rather than guessed at.
+fn widen_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<u8>> {
+    match dtype {
+        DType::F32 => Ok(bytes.to_vec()),
+        DType::F16 => {
+            let mut widened = Vec::with_capacity(bytes.len() * 2);
+            for half in bytes.as_chunks::<2>().0 {
+                widened.extend_from_slice(
+                    &nn::weights::half_to_f32(u16::from_le_bytes(*half)).to_le_bytes(),
+                );
+            }
+            Ok(widened)
+        }
+        other => Err(Failure::message(format!(
+            "a raster at {other} has no `f32` twin this stage writes: it widens FP16 and copies \
+             FP32, and another width would have to be guessed at"
+        ))),
+    }
+}
+
 /// The frames one clip keeps: its body, the frames the final clip drops and the tail that overlaps the
 /// next clip - the span the decoder trims to, which is fewer than the frames it decodes.
 fn kept_frames(config: &minimax_h3::VideoVaeConfig) -> u64 {
@@ -1415,7 +1503,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
     for element in bytes.chunks(from) {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
-            DType::F16 => out.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1453,7 +1541,7 @@ fn pattern_latents(
         // rounding and not in the pattern - which is what makes two pages comparable.
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
-            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
             DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -1476,30 +1564,6 @@ fn bf16_bits(value: f32) -> u16 {
     } else {
         upper
     }
-}
-
-/// The nearest float16 bit pattern of `value`, by the round-to-nearest-even rule `DType::F16` keeps.
-fn half_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00;
-    }
-    let shifted = exponent - 127 + 15;
-    if shifted >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if shifted <= 0 {
-        return sign;
-    }
-    let mut half = ((shifted as u32) << 10) | (mantissa >> 13);
-    let remainder = mantissa & 0x1fff;
-    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
-        half += 1;
-    }
-    sign | half as u16
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
