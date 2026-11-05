@@ -83,7 +83,7 @@ rows_sparse=353152
 rows_flag=()
 if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
-    --samples 256 --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
     --elements "$elements" --track "$track" >/dev/null 2>&1; then
     rows_flag=(--rows)
 fi
@@ -121,7 +121,7 @@ echo "re-cutting H3 fixtures at $commit"
 probe=$(mktemp)
 if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
-    --samples 256 --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
     --elements "$elements" --track "$track" >"$probe" 2>&1; then
     if grep -q 'unknown flag --types' "$probe"; then
         cat >&2 <<'EOF'
