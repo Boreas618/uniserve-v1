@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """What a forward binds and the store list does not hold - both directions.
 
-The store a caller builds comes from `notes/programs/minimax-h3-keys.txt`, which is generated from
-the code (`cargo run -p minimax-h3 --example minimax_h3_keys`). Three checks read that file, and they answer
-three different questions:
+The store a caller builds comes from a fixture under `notes/programs/`, one per deployment, and it is
+a **walk's rows**: `cargo run -p minimax-h3 --example programs -- <root> --dtype <t> ...` prints them
+from the model's own layers, and `h3_fixture --walk <print> --commit <rev>` writes the file with the
+tree it came from. Three checks read that file, and they answer three different questions:
 
 * `key_coverage` asks whether a **listed** key is buildable for a target;
 * `check_manifests.py` asks whether a **descriptor the code derives** has a manifest cell;
