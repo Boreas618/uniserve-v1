@@ -140,6 +140,44 @@ impl Graph {
     /// can execute, calls [`Capture::record`] after issuing that operation:
     /// the capture knows which nodes are new, and returns them in order. That
     /// is the record a rebind is issued against.
+    /// Every copy the capture recorded, with the operands the driver states for it.
+    ///
+    /// A copy node names **where it reads and writes**, and a capture bakes both addresses. A
+    /// recorded copy from a host buffer that the caller fills per batch is therefore a copy of the
+    /// values that buffer held when the recording happened, replayed at every launch: the batch's
+    /// own values never reach the device, and nothing about the graph's kernels or parameters says
+    /// so.
+    pub fn copies(&self) -> Result<Vec<Copy>> {
+        let _context = self.core.context.enter()?;
+        let driver = driver::driver()?;
+        let mut copies = Vec::new();
+        for node in self.nodes()? {
+            if node.kind()? != GraphNodeKind::Memcpy {
+                continue;
+            }
+            let get_params = match driver.graph_memcpy_node_get_params {
+                Ok(get_params) => get_params,
+                Err(_) => return Ok(copies),
+            };
+            let mut params = driver::Memcpy3D::default();
+            driver.check(
+                // SAFETY: the node belongs to this live graph, and the driver fills the struct.
+                unsafe { get_params(node.raw, &mut params) },
+                "cuGraphMemcpyNodeGetParams",
+            )?;
+            copies.push(Copy {
+                source: Space::from(params.src_memory_type, params.src_host as u64, params.src_device),
+                destination: Space::from(
+                    params.dst_memory_type,
+                    params.dst_host as u64,
+                    params.dst_device,
+                ),
+                bytes: params.width * params.height.max(1) * params.depth.max(1),
+            });
+        }
+        Ok(copies)
+    }
+
     /// The nodes that depend directly on `node`, in the driver's order
     /// (`cuGraphNodeGetDependentNodes`).
     ///
@@ -361,6 +399,48 @@ impl GraphNode {
             other => GraphNodeKind::Other(other),
         })
     }
+}
+
+/// Where one recorded copy reads from or writes to, as the driver states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space {
+    /// Host memory, at the address the driver gave.
+    Host(u64),
+    /// Device memory, at the address the driver gave.
+    Device(u64),
+    /// An array object, which a capture of this executor's work has not produced.
+    Array,
+    /// A spelling this binding does not name, as the driver's number.
+    Other(i32, u64),
+}
+
+impl Space {
+    /// The address, for the two spellings that name one.
+    pub const fn address(&self) -> Option<u64> {
+        match self {
+            Self::Host(address) | Self::Device(address) => Some(*address),
+            Self::Array | Self::Other(..) => None,
+        }
+    }
+
+    fn from(memory_type: i32, host: u64, device: u64) -> Self {
+        // `CU_MEMORYTYPE_*`: 1 is host, 2 is device, 3 is an array, 4 is a unified address.
+        match memory_type {
+            1 => Self::Host(host),
+            2 => Self::Device(device),
+            4 => Self::Device(device),
+            3 => Self::Array,
+            other => Self::Other(other, device),
+        }
+    }
+}
+
+/// One copy a capture recorded: what it reads, what it writes, and how many bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Copy {
+    pub source: Space,
+    pub destination: Space,
+    pub bytes: usize,
 }
 
 /// What one recorded edge says about when its consumer may start (`CUgraphEdgeData`).
