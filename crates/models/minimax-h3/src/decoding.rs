@@ -229,6 +229,52 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 /// and its normalization, the fused query-key-value projection with its rotary factors, the attention
 /// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
 /// overlap block carried between clips.
+/// The transformer's per-tile scratch: one tile's buffers, reserved once per clip and reused by
+/// every tile of the grid.
+///
+/// **This is the one statement of their names, shapes and element types.** [`video_arena`] publishes
+/// them to the executor, which sizes the arena from them, and
+/// [`crate::video_vae::VideoDecoder::scratch`] reserves them — so a plan and the reservation it sizes
+/// cannot disagree. They disagreed twice before this existed: the plan multiplied one tile's scratch
+/// by the grid's tile count, and it declared f16 over a reservation at the checkpoint's F32.
+///
+/// The order is the reservation order, and the shapes are the decoder's canvas — the tile the
+/// decoder is built for, not any one tile of a particular grid.
+pub fn tile_scratch(
+    config: &crate::VideoVaeConfig,
+    dtype: nn::DType,
+) -> Result<Vec<(&'static str, nn::DType, [u64; 2])>> {
+    let spatial = config.spatial_compression();
+    let tile = crate::video_vae::Canvas::clip(
+        config,
+        crate::video_vae::TILE_PIXELS / spatial,
+        crate::video_vae::TILE_PIXELS / spatial,
+    );
+    let rows = u64::from(tile.rows());
+    let voxels = u64::from(tile.voxels());
+    let width = u64::from(config.decoder_num_attention_heads)
+        * u64::from(config.decoder_attention_head_dim);
+    let ffn = width * u64::from(config.decoder_ffn_mult);
+    let half = u64::from(crate::video_vae::rotary(config)?.0 / 2);
+    let wide = [rows, 2 * ffn];
+    Ok(vec![
+        ("stream", dtype, [rows, width]),
+        ("projected", dtype, [voxels, width]),
+        ("cosine", nn::DType::F32, [rows, half]),
+        ("sine", nn::DType::F32, [rows, half]),
+        ("normalized", dtype, [rows, width]),
+        ("query", dtype, [rows, width]),
+        ("key", dtype, [rows, width]),
+        ("value", dtype, [rows, width]),
+        ("rotated_query", dtype, [rows, width]),
+        ("rotated_key", dtype, [rows, width]),
+        ("attended", dtype, [rows, width]),
+        ("update", dtype, [rows, width]),
+        ("gate_up", dtype, wide),
+        ("gated", dtype, [rows, ffn]),
+    ])
+}
+
 /// The plan's name for a float element type a decode holds.
 ///
 /// The names are [`Buffer::width`]'s own, so a plan cannot declare a type the arena cannot size.
@@ -254,43 +300,21 @@ pub fn video_arena(
     let element = element_name(dtype)?;
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
-    let ffn = u64::from(config.decoder_ffn_mult);
-    let (rotated, _) = crate::video_vae::rotary(config)?;
-    let columns = u64::from(config.decoder_num_attention_heads)
-        * u64::from(config.decoder_attention_head_dim);
     let (height, width_px) = canvas.pixels(config);
     let frames = canvas.frames_out(config);
-    // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
-    // because a tile at the canvas's edge can be narrower than the tile size.
-    let tokens_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    // The transformer's fourteen are reserved **once per clip and reused by every tile**
-    // (`VideoDecoder::scratch`), so their entries are one tile's: the canvas the decoder is built
-    // for, which is the tile size and not any one tile of this grid. Sizing them by the grid's sum
-    // multiplies the clip's footprint by the tile count — 28× on a served canvas — and the arena
-    // then cannot fit beside the weights even though no buffer it holds is that large.
-    let spatial = config.spatial_compression();
-    let tile = crate::video_vae::Canvas::clip(
-        config,
-        crate::video_vae::TILE_PIXELS / spatial,
-        crate::video_vae::TILE_PIXELS / spatial,
-    );
-    let rows = u64::from(tile.rows());
-    let voxels = u64::from(tile.voxels());
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
-    // **The order is the reservation order**: the clip-level buffers are reserved once, before the
-    // tile loop, and live across the whole clip; the transformer's fourteen are reserved there too, once
-    // (`VideoDecoder::scratch`), and reused by every tile - the arena never rewinds, so a per-tile
-    // reservation would grow the clip's footprint by the tile count. The token buffers *are* per tile,
-    // because each tile's decode owns its own, and their sum is the `tokens` entry. The executor sizes
-    // the arena by the sum. There is no entry for the clip's blended raster: the blend's destination is
-    // the caller's `DecodedMedia.video`, which is the runner's buffer and not the arena's.
     let patch = u64::from(config.out_channels)
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
         * u64::from(config.spatial_compression());
-    Ok(vec![
+    // The token buffer is the one entry that holds every tile at once, because each tile's decode
+    // owns its own and their reservations sum to it. The transformer's fourteen are one tile's and
+    // come from [`tile_scratch`], which is also what reserves them - so this plan and the
+    // reservation it sizes cannot disagree about a name, a shape or an element type.
+    let tokens_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
+    let mut buffers = vec![
         Buffer {
             name: "decoded".to_owned(),
             element,
@@ -301,77 +325,15 @@ pub fn video_arena(
             element,
             elements: tokens_rows * patch,
         },
-        Buffer {
-            name: "stream".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "projected".to_owned(),
-            element,
-            elements: voxels * columns,
-        },
-        Buffer {
-            name: "cosine".to_owned(),
-            element: "f32",
-            elements: rows * u64::from(rotated / 2),
-        },
-        Buffer {
-            name: "sine".to_owned(),
-            element: "f32",
-            elements: rows * u64::from(rotated / 2),
-        },
-        Buffer {
-            name: "normalized".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "query".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "key".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "value".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "rotated_query".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "rotated_key".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "attended".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "update".to_owned(),
-            element,
-            elements: rows * columns,
-        },
-        Buffer {
-            name: "gate_up".to_owned(),
-            element,
-            elements: rows * 2 * columns * ffn,
-        },
-        Buffer {
-            name: "gated".to_owned(),
-            element,
-            elements: rows * columns * ffn,
-        },
-    ])
+    ];
+    for (name, held, dims) in tile_scratch(config, dtype)? {
+        buffers.push(Buffer {
+            name: name.to_owned(),
+            element: element_name(held)?,
+            elements: dims[0] * dims[1],
+        });
+    }
+    Ok(buffers)
 }
 
 /// The video decoder's tiled output path: one tile's tokens become its pixels in the clip's raster.
