@@ -681,23 +681,26 @@ impl Capture {
         }
 
         let mut found: Vec<Handle> = Vec::new();
+        let mut fresh: HashSet<usize> = HashSet::new();
         let mut kinds: std::collections::HashMap<usize, Vec<EdgeKind>> =
             std::collections::HashMap::new();
+        // The frontier's own edge data is read and dropped: the driver refuses a
+        // frontier query that asks for its nodes without it, and what it describes is
+        // the edge the *next* operation will add - which the walk reads from that
+        // edge itself once it exists. Attributing it here would state a kind for an
+        // edge this operation did not create.
+        for (_, data) in &frontier {
+            EdgeKind::of(data)?;
+        }
         let mut queue: std::collections::VecDeque<Handle> =
             frontier.iter().map(|(node, _)| *node).collect();
-        // An edge of the frontier is a dependency of the nodes this operation adds,
-        // so its kind is recorded against them as well.
-        let mut pending: Vec<EdgeKind> = Vec::new();
-        for (_, data) in &frontier {
-            pending.push(EdgeKind::of(data)?);
-        }
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
         for root in root_handles(&self.core)? {
             if self.seen.insert(root as usize) {
                 found.push(root);
-                kinds.insert(root as usize, Vec::new());
+                fresh.insert(root as usize);
                 queue.push_back(root);
             }
         }
@@ -705,21 +708,21 @@ impl Capture {
             // Both edge kinds are dependencies: a programmatic edge lets the
             // downstream node start early, not become unrelated to it.
             for (dependent, data) in dependent_edges(node)? {
-                if self.seen.insert(dependent as usize) {
-                    found.push(dependent);
+                if fresh.contains(&(dependent as usize)) {
+                    // Every edge between the nodes this operation added is stated,
+                    // in the order the walk reaches their upstream ends, so the list
+                    // is the same for two captures of the same work.
                     let entry = kinds.entry(dependent as usize).or_default();
                     entry.push(EdgeKind::of(&data)?);
+                }
+                if self.seen.insert(dependent as usize) {
+                    found.push(dependent);
+                    fresh.insert(dependent as usize);
                     queue.push_back(dependent);
                 }
             }
         }
         self.frontier = frontier.into_iter().map(|(node, _)| node).collect();
-
-        // The frontier's edges reach the first nodes the operation added, which are
-        // the ones no other new node depends on.
-        if let Some(first) = found.first().copied() {
-            kinds.entry(first as usize).or_default().extend(pending);
-        }
 
         Ok(found
             .into_iter()
@@ -925,9 +928,12 @@ impl EdgeKind {
 /// The edges are stated **per node, in the walk's order**, rather than as pairs of
 /// driver handles. Two captures of the same work are compared position by position
 /// (design 4.5's rebind condition), and a handle belongs to one graph while a
-/// position belongs to the order both walks agree on. Every edge of the graph
-/// appears here exactly once: it is in the `incoming` list of the node it reaches,
-/// and the walk reaches every node.
+/// position belongs to the order both walks agree on.
+///
+/// `incoming` holds a kind for every edge that reaches this node from another node
+/// of the same walk, in the order their upstream ends are walked - so two captures of
+/// the same work state the same vectors. An edge into a node added by an earlier
+/// operation is not listed: it is that operation's, and it was stated then.
 #[derive(Clone, Debug)]
 pub struct WalkedNode {
     /// The node the operation added.
