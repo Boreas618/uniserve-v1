@@ -242,7 +242,13 @@ const NORM_EPSILON: f32 = 1e-5;
 /// representation (BF16 for the DiT, the text stack, the conditioner and the sampler), and a
 /// deployment that states FP32 makes every one of those programs a different key - the descriptor
 /// carries the element type, and a store holding one set cannot serve the other.
-const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
+/// The one deployment the checkpoint is: its text encoder and its DiT are BF16.
+///
+/// This was two element types, because the deployment's type *was* a parameter - and now the
+/// checkpoint's own storage decides each component's (`load::deployment_dtype`), so the second pass
+/// stated a deployment no invocation can select. **A crossing is not a second deployment**: the sites
+/// that widen into a head or narrow out of it state both types inside `rows()`, and those rows stay.
+const DEPLOYMENTS: [DType; 1] = [DType::BF16];
 
 /// The element types a video VAE may be stored and run in: FP16 at `dtype = "auto"`, FP32 where the
 /// deployment states it. Its programs are the ones the *checkpoint's* representation decides, which is
