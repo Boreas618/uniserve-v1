@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -99,7 +100,7 @@ CATALOGUE = {
             )
             for index in VIDEO_LAYERS
             for name, description in (
-                ("qkv", "fused query, key and value projection, before the rotary"),
+                ("qkv", "the merged query, key and value projection, before the rotary - one file per branch"),
                 ("attention", "attention output, after the rotary and the softmax"),
                 ("mlp", "gated feed-forward output, after the gate's product"),
                 ("output", "output projection, before the residual add"),
@@ -266,12 +267,32 @@ def component_source(name: str, checkpoint: Path):
 
 
 def capture(module: nn.Module, path: str) -> dict[str, torch.Tensor]:
-    """Hook one module and return the dict a forward run fills with its output."""
+    """Hook one module and return the dict a forward run fills with its output.
+
+    A module that returns one tensor fills the key `path`. A *merged* projection returns a mapping of
+    branch name to tensor, and one key per branch is filled: `f"{path}.{branch}"`. The reference's
+    fused Q/K/V is three projections in one container and never a concatenated tensor
+    (`uniserve/nn/linear.py:448`), so a branch per file is the form a comparison can read - each
+    branch against the Rust side's own projection of the same name.
+
+    A tuple is refused rather than indexed. Writing its first element under a name that claims all of
+    them would report agreement on a third of what the name says.
+    """
     captured: dict[str, torch.Tensor] = {}
 
     def hook(_module, _inputs, output):
-        value = output[0] if isinstance(output, tuple) else output
-        captured[path] = value.detach().to(torch.float32).cpu()
+        if isinstance(output, Mapping):
+            if not output:
+                raise SystemExit(f"{path} returned no branch to write")
+            for branch, value in output.items():
+                captured[f"{path}.{branch}"] = value.detach().to(torch.float32).cpu()
+            return
+        if isinstance(output, tuple):
+            raise SystemExit(
+                f"{path} returned a {len(output)}-tuple; a probe is one tensor or a merged projection's "
+                f"branches, and indexing here would write the first of them under a name that claims them all"
+            )
+        captured[path] = output.detach().to(torch.float32).cpu()
 
     module.get_submodule(path).register_forward_hook(hook)
     return captured
@@ -681,17 +702,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run     input {tuple(latents.shape)} -> {path}")
     with torch.no_grad():
         module(latents)
-    if path not in captured:
+    if not captured:
         print(f"NO VALUE: {path} did not run; the input may be too small for this probe")
         return 1
-    value = captured[path]
-    print(f"got     {tuple(value.shape)} {value.dtype} on the component's own path")
-    # The tree's convention is the Rust side's: one file per probe at `<block>/<name>.npy`, which is what
-    # `compare.py` matches on (`$UNISERVE_DIAG_DIR/<block>/<name>.npy`, notes/h3/diagnosis.md 3).
-    name = f"{component}/{path}"
+    # The tree's convention is the Rust side's: one file per probe at `<block>/<name>.npy`, which is
+    # what `compare.py` matches on (`$UNISERVE_DIAG_DIR/<block>/<name>.npy`, notes/h3/diagnosis.md 3).
+    # A merged projection fills one name per branch, and each is a probe of its own.
     (options.out / component).mkdir(parents=True, exist_ok=True)
-    dump(options.out, name, value)
-    print(f"wrote   {options.out / (name + '.h3t')}")
+    for name, value in captured.items():
+        print(f"got     {name} {tuple(value.shape)} {value.dtype} on the component's own path")
+        dump(options.out, f"{component}/{name}", value)
+        print(f"wrote   {options.out / (component + '/' + name + '.h3t')}")
     return 0
 
 

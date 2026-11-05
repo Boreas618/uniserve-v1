@@ -64,10 +64,46 @@ def check_shapes() -> None:
     print(f"shapes: video {video} and audio {audio}, channels saturated from the checkpoint")
 
 
+def check_branches() -> None:
+    """A merged projection writes one probe per branch, and a tuple output is refused."""
+    import torch
+
+    class Merged(torch.nn.Module):
+        def forward(self, x):
+            return {"q": x, "k": 2 * x, "v": 3 * x}
+
+    class Pair(torch.nn.Module):
+        def forward(self, x):
+            return (x, x)
+
+    module = torch.nn.Module()
+    module.merged = Merged()
+    module.pair = Pair()
+    x = torch.zeros(2, 3)
+
+    captured = dumper.capture(module, "merged")
+    module.merged(x)
+    assert sorted(captured) == ["merged.k", "merged.q", "merged.v"], sorted(captured)
+    assert tuple(captured["merged.v"].shape) == (2, 3), captured["merged.v"].shape
+    # Each branch is its own value: a hook that wrote the first of them under the merged name would
+    # pass a shape check and compare a third of the module.
+    assert torch.equal(captured["merged.k"], 2 * x) and torch.equal(captured["merged.v"], 3 * x)
+
+    dumper.capture(module, "pair")
+    try:
+        module.pair(x)
+    except SystemExit as stop:
+        assert "tuple" in str(stop), stop
+    else:
+        raise AssertionError("a tuple output was accepted")
+    print("branches: a merged projection writes one probe per branch, and a tuple output is refused")
+
+
 def main() -> int:
     check_catalogue()
     check_refusals()
     check_shapes()
+    check_branches()
     print("OK")
     return 0
 
