@@ -825,6 +825,17 @@ fn prompt_token(
     Ok(PromptToken::HostArgmax)
 }
 
+/// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
+fn runner_up(values: &[f32], best: usize) -> f32 {
+    let mut second = f32::NEG_INFINITY;
+    for (index, value) in values.iter().enumerate() {
+        if index != best && value.is_finite() && *value > second {
+            second = *value;
+        }
+    }
+    values.get(best).copied().unwrap_or(f32::NAN) - second
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best = 0_usize;
     for (index, value) in values.iter().enumerate() {
@@ -1846,12 +1857,24 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
             // buffer holds one i32 per row of this bucket.
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
-            let best = unsafe {
-                argmax(std::slice::from_raw_parts(
+            let row_logits = unsafe {
+                std::slice::from_raw_parts(
                     self.columns.logits_row.as_ptr().cast::<f32>(),
                     width as usize,
-                ))
+                )
             };
+            let best = argmax(row_logits);
+            // The first token of a prompt is the one value a serving run and a reference stack must
+            // agree on before anything downstream means anything, and a wrong token and a right one
+            // read the same in a completion. The margin says which it is: a near-tie is numerics,
+            // a wide one is a defect. Only on the host's greedy path, which is one call per prompt.
+            tracing::debug!(
+                row,
+                token = best,
+                logit = row_logits.get(best).copied().unwrap_or(f32::NAN),
+                runner_up = runner_up(row_logits, best),
+                "the prompt's first token was argmaxed on the host"
+            );
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
                 *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
