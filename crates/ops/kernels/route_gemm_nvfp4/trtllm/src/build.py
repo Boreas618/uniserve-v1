@@ -53,6 +53,11 @@ FAMILIES = {"sm_100a": ("Sm100a", "Sm100f"), "sm_100f": ("Sm100f",)}
 #: enumeration (`gemmGatedAct::ActType`).
 ACTIVATIONS = {"silu": 0, "gelu_tanh": 1, "none": 3}
 
+#: The eltwise activation each of the operator's activations is, in the artifact's own
+#: enumeration (`gemm::EltwiseActType`). This product is linear, so it is `none`; the
+#: `relu2` family beside it applies a squared ReLU and is a different kernel.
+ELTWISE_ACTIVATIONS = {"none": 0, "gelu": 1, "relu2": 2}
+
 #: The bias types (`gemm::BiasType`). A gated product's BF16-output kernels all take `M`: one f32
 #: per output column, which this operator has none of, so the entry hands them zeros.
 BIAS_TYPES = {"none": 0, "m": 1, "n": 2, "mn": 3}
@@ -283,6 +288,7 @@ RENDERINGS = {
     "mBiasType": lambda name: f"gemm::BiasType({BIAS_TYPES[name]})",
     "mPerTokenSfDtype": lambda name: f"trtllm::gen::Dtype({dtype_code(name)})",
     "mActType": lambda name: f"gemmGatedAct::ActType({ACTIVATIONS[name]})",
+    "mEltwiseActType": lambda name: f"gemm::EltwiseActType({ELTWISE_ACTIVATIONS[name]})",
 }
 
 

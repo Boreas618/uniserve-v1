@@ -41,7 +41,6 @@ use nn::layers::{
 };
 use ops::Op;
 use ops::attention::Phase;
-use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
 use ops::moe::exchange::Mode;
 use ops::moe::grouped::{GatherGemmNvfp4, RouteGemmNvfp4};
@@ -236,7 +235,7 @@ pub fn keys(
                             *rows,
                             n,
                             k,
-                            ScaleLayout::Swizzled128X4,
+                            Moe::ACTIVATION_SCALE_LAYOUT,
                             false,
                             dtype,
                         )
@@ -250,7 +249,7 @@ pub fn keys(
             for k in [hidden, query, hidden] {
                 push(
                     <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                    Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4).to_string(),
+                    Moe::quantize_descriptor_of(dtype, k, Moe::ACTIVATION_SCALE_LAYOUT).to_string(),
                 );
             }
         }
@@ -285,7 +284,7 @@ pub fn keys(
                 ] {
                     push(
                         <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                        Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4)
+                        Moe::quantize_descriptor_of(dtype, k, Moe::ACTIVATION_SCALE_LAYOUT)
                             .to_string(),
                     );
                 }
@@ -295,13 +294,13 @@ pub fn keys(
                         dtype,
                         activation(config.hidden_act)?,
                         DType::F8E4M3,
-                        ScaleLayout::Swizzled128X4,
+                        Moe::ACTIVATION_SCALE_LAYOUT,
                     )
                     .to_string(),
                 );
                 push(
                     <RouteGemmNvfp4 as Op>::NAME,
-                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, ScaleLayout::Swizzled128X4)
+                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, Moe::ACTIVATION_SCALE_LAYOUT)
                         .to_string(),
                 );
             } else {
@@ -337,7 +336,7 @@ pub fn keys(
                                 *rows,
                                 n,
                                 k,
-                                ScaleLayout::Swizzled128X4,
+                                Moe::ACTIVATION_SCALE_LAYOUT,
                                 false,
                                 dtype,
                             )
