@@ -5,6 +5,13 @@ driver learns it as a launch attribute from the module's metadata; it is not a r
 package whose kernel does take one and an operator that packs one are consistent with each other, and
 an operator that packs a word the module does not declare shifts the two scratch addresses the
 compiler's launcher appends after every kernel's parameters -- so this reports both sides.
+
+Each operator gets one of four lines, and the two non-answers are named rather than counted:
+`ok`, `MISMATCH` (the operator packs the word and the module does not declare it), `uncovered`
+(no declared table of the package parses the key -- a manifest's answer, not a flag's), and
+`unknown` (a package exists but its `spec` states no signature, so this checker cannot ask it).
+A package's key reader ends an unusable key with `SystemExit`, so the parse is guarded at that
+width: one table or one backend that cannot place the key must not end the run.
 """
 
 import importlib.util
@@ -65,19 +72,28 @@ def declares_pdl(operator, key):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             import _compile
+            placed = False
             for dimensions in tables:
                 try:
                     fields = _compile.parse_key(key, dimensions)
-                except Exception:
+                # A package's key reader ends a key it cannot place with `SystemExit`, which is
+                # not an `Exception`: without the wider catch the checker stops at the first
+                # table that does not fit and never reaches the one that does.
+                except BaseException:
                     continue
+                placed = True
                 described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')
                 return any(
                     name.lower() == 'pdl' and ty != 'constexpr'
                     for name, ty in described['signature'].items()
                 )
-            return None
-        except Exception:
-            return None
+            # No table of this package serves the key: that is a manifest's answer, not a flag's,
+            # and it is not the same as a package this checker could not ask at all.
+            return 'no-table' if not placed else None
+        except BaseException:
+            # One package that cannot be loaded or asked is not the run's answer: the key is
+            # served by whichever backend declares it, and this one simply is not that backend.
+            continue
         finally:
             sys.path.remove(str(source))
     return None
@@ -108,5 +124,14 @@ for operator, key in rows:
     seen.add(operator)
     packs = packs_pdl(operator)
     declares = declares_pdl(operator, key)
+    if declares == 'no-table':
+        # No package's tables cover this key: the manifest owes a declaration, not a flag.
+        print(f'uncovered {operator:22} op packs {str(packs):5} no declared table parses {key}')
+        continue
+    if declares is None:
+        # A package was found but could not be asked (its `spec` states no signature): the
+        # checker says so rather than reading it as a missing declaration.
+        print(f'unknown  {operator:22} op packs {str(packs):5} the package states no signature')
+        continue
     mark = 'MISMATCH' if packs and declares is False else 'ok      '
     print(f'{mark} {operator:22} op packs {str(packs):5} module declares {declares}')
