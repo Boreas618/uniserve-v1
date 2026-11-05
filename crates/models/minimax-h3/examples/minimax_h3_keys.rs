@@ -397,6 +397,10 @@ fn main() {
                 // `dtype: query_dtype`). A second type here states rows for launches that ask BF16 -
                 // cells nothing selects, in a file that reads as covering both.
                 transformer: DType::BF16,
+                // The twelve tensors the checkpoint stores at F32: the four boundary projections and
+                // the timestep embedder's pair. The walk reads these from the checkpoint's own index
+                // (`load::boundary_dtype`); this generator emits one deployment and states it here.
+                transformer_boundary: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },
@@ -582,6 +586,10 @@ fn main() {
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
                 transformer: DType::BF16,
+                // The twelve tensors the checkpoint stores at F32: the four boundary projections and
+                // the timestep embedder's pair. Read from the checkpoint's own index by the walk
+                // (`load::boundary_dtype`); stated here because this generator emits one deployment.
+                transformer_boundary: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },
@@ -1292,23 +1300,11 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The timestep embedding's activation, over the transformer's hidden width, at **FP32 - the
-    // checkpoint's own type for `time_embedder`**, which is one of the twelve F32 tensors the
-    // component stores. The model's own forward says so and it says it one-sidedly: the recorder
-    // states `silu dtype_f32_columns_5376` and **no BF16 `silu` at all** - so a row at the stack's
-    // type was this file's defect in the direction that stops a run, and the caller's run stopped on
-    // it by name. `transformer.rs` derives the activation's type from the embedder's weights, not
-    // from the stack's.
-    push(
-        "silu",
-        ops::activation::SiluDescriptor {
-            dtype: DType::F32,
-            columns: HIDDEN,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The timestep embedding's activation is **no longer stated here**: `Transformer::programs` reads
+    // the transformer's boundary type (`Types::transformer_boundary`, read from the checkpoint) and
+    // states the activation there, at the type the embedder's pair is stored in. A row typed here
+    // was a second statement of one activation, and the second one was the BF16 row the forward never
+    // launched - so the derivation states it once and this file states nothing.
     // The solver's Euler step: an FP32 source added into a BF16 running sample.
     push(
         "scaled_add",
