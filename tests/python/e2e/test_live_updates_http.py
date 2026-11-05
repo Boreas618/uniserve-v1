@@ -655,7 +655,16 @@ def _chat(
         timeout=timeout_s,
     )
     response.raise_for_status()
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as error:
+        # A body that is not JSON is either an empty success or a frame that
+        # belongs to a stream; the two have different owners, and the status
+        # and the first bytes are what tell them apart.
+        raise AssertionError(
+            f"the completion's body is not JSON: {response.status_code} "
+            f"{response.headers.get('content-type')!r} {response.text[:400]!r}"
+        ) from error
 
 
 def _stream_count(
