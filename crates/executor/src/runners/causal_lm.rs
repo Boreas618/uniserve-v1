@@ -3775,9 +3775,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let slots = self.staging.slots(rows).to_vec();
         let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
         let live = seq_lens.iter().filter(|&&length| length > 0).count();
+        // The three statements of one partition, beside the rows they describe: a query count, the
+        // partition it makes, and the count the kernels bound by. A batch where they disagree is an
+        // operand mismatch, and it is the reading a one-row and a three-row pose of one bucket differ
+        // in - which is where a fault that appears above one row has to be.
+        let query_offsets = self.staging.batch_rows().query_offsets.to_vec();
+        let calls = self.staging.batch_rows().calls.len();
         let mut out = format!(
-            "rows={rows} live_rows={live} seq_lens={seq_lens:?} slots={slots:?} page_size={} \
-             max_kv_len={}",
+            "rows={rows} live_rows={live} seq_lens={seq_lens:?} query_offsets={query_offsets:?} \
+             live_tokens={} calls={calls} slots={slots:?} page_size={} max_kv_len={}",
+            self.staging.live_tokens(),
             self.kv.page_size(),
             self.geometry.max_kv_len,
         );
