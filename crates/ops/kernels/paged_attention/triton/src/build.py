@@ -72,13 +72,32 @@ def spec(fields, parameters, target):
         "page_table_ptr": "*i32",
         "seq_lens_ptr": "*i32",
     }
+    if prefill:
+        # The prefill program reads a row's first query token and whether the batch is packed; the
+        # decode program has one query token per table row and needs neither. Both sit in the
+        # program's own parameter order, not at the end: the module's metadata reports this dict's
+        # order, and the operator's word list is held to it position by position.
+        parameters_of["cum_seq_lens_q_ptr"] = "*i32"
     parameters_of.update({name: "i32" for name in STRIDES})
     parameters_of.update({"max_pages": "i32", "page_size": "i32", "softmax_scale": "fp32"})
     if prefill:
-        # The prefill program reads a row's first query token and whether the batch is packed; the
-        # decode program has one query token per table row and needs neither.
-        parameters_of.update(
-            {"cum_seq_lens_q_ptr": "*i32", "max_q_len": "i32", "packed": "i32"}
+        parameters_of["max_q_len"] = "i32"
+        parameters_of["packed"] = "i32"
+    # The program's parameter list is the authority: its order is what a caller packs, and this
+    # dict's order is what the module's metadata reports. One order, stated twice, is a launch that
+    # dereferences a stride as a pointer - so a disagreement stops the build rather than a run.
+    kernel = (
+        kernels._paged_attention_prefill_kernel
+        if prefill
+        else kernels._paged_attention_decode_kernel
+    )
+    # The program's list continues with its constexprs, which are named separately and are not
+    # packed: compare the prefix, and refuse a signature that would land a constexpr among them.
+    names = list(kernel.arg_names)
+    if list(parameters_of) != names[: len(parameters_of)]:
+        raise SystemExit(
+            f"this signature's order {list(parameters_of)} is not the program's "
+            f"{names[: len(parameters_of)]}"
         )
     constexprs = {
         "HEAD_DIM": head_dim,
@@ -88,9 +107,7 @@ def spec(fields, parameters, target):
         "OUT_BF16": fields["out"] == "bf16",
     }
     return {
-        "kernel": kernels._paged_attention_prefill_kernel
-        if prefill
-        else kernels._paged_attention_decode_kernel,
+        "kernel": kernel,
         "signature": parameters_of,
         "constexprs": constexprs,
         # No `launch_pdl` option: this descriptor states no `pdl` field — the operator's key for the
