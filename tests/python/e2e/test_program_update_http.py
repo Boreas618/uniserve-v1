@@ -173,7 +173,10 @@ def server(
         ],
         work / "server.log",
     )
-    wait_health(base_url, process, 900.0)
+    # The log is handed over so an early exit carries its own reason: without it a
+    # server that died on a refusal reads as `exited early with code 1` and nothing
+    # else, which is indistinguishable from a crash in any component.
+    wait_health(base_url, process, 900.0, work / "server.log")
     try:
         yield base_url
     finally:
