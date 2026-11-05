@@ -35,7 +35,7 @@
 use nn::Shape;
 use nn::layers::gather_rows;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{Forward, TensorView};
+use nn::{DType, Forward, TensorView};
 
 use crate::{Error, Result};
 
@@ -91,6 +91,19 @@ pub struct AdaLnCache {
     entries: Weight,
     groups: Groups,
     hidden_size: u32,
+    /// The timestep activation's width, which is the one narrowing the cache's two halves meet at.
+    time_dim: u32,
+}
+
+/// A `[1, count]` index list as the flat `[count]` view the gather operator takes.
+///
+/// The operator's indices are one axis (`ops::logits::GatherArgs::rows`) while its output must be
+/// two - `[count, columns]` - because it derives the row count from `out`. `entries_of` writes
+/// `[1, groups]` to satisfy the output's shape, so the same bytes reach the layer and output
+/// gathers as a two-axis view: the stack's tenth launch refused exactly that (`expected 1 axes,
+/// found 2`). The arrangement is stated once, here, rather than at each of the three gathers.
+fn flat_rows(rows: TensorView) -> TensorView {
+    rows.reshape(Shape::new(&[rows.shape.numel()]))
 }
 
 impl AdaLnCache {
@@ -129,6 +142,7 @@ impl AdaLnCache {
         entries: Weight,
         groups: Groups,
         hidden_size: u32,
+        time_dim: u32,
     ) -> Result<Self> {
         if layers.is_empty() {
             return Err(Error::checkpoint(
@@ -164,6 +178,7 @@ impl AdaLnCache {
             entries,
             groups,
             hidden_size,
+            time_dim,
         })
     }
 
@@ -187,7 +202,7 @@ impl AdaLnCache {
         self.layers[0].dtype()
     }
 
-    /// The entry ids one step reads: `[groups]` i32, gathered from the entry table's `step` row.
+    /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
     /// `step` is `[1]` i32 - the step index, which the executor writes - and `out` a `[1, groups]`
     /// i32 scratch view it overwrites with the entries.
@@ -212,12 +227,20 @@ impl AdaLnCache {
                 self.layers.len()
             ))
         })?;
-        Ok(gather_rows(f, table.view(), entries, out)?)
+        Ok(gather_rows(f, table.view(), flat_rows(entries), out)?)
     }
 
     /// The final normalization's modulation rows at these entries: `[groups, 2 · hidden_size]`.
     pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        Ok(gather_rows(f, self.output.view(), entries, out)?)
+        Ok(gather_rows(f, self.output.view(), flat_rows(entries), out)?)
+    }
+
+    /// The columns one entry's modulation table holds: the three interval tags of six vectors.
+    ///
+    /// A gather's output is `[entries, this]` - the shape the operator derives from the table -
+    /// while a block cuts one interval at a time out of the same bytes.
+    pub fn layer_width(&self) -> u64 {
+        u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
     }
 
     /// Elements one layer's gathered modulation holds.
@@ -233,11 +256,13 @@ impl AdaLnCache {
         u64::from(self.groups.count()) * 2 * u64::from(self.hidden_size)
     }
 
-    /// Bytes the per-forward scratch needs: the entry ids and the largest gathered table.
+    /// Bytes the per-forward scratch needs: the entry ids, the largest gathered table, and the one
+    /// narrowing the cache's two halves meet at (an FP32 timestep activation of `time_dim`).
     pub fn scratch_bytes(&self) -> u64 {
         let elements = self.layer_elements().max(self.output_elements());
-        let width = elements * nn::DType::BF16.bytes().unwrap_or(2);
-        width + u64::from(self.groups.count()) * 4
+        let width = elements * self.dtype().bytes().unwrap_or(2);
+        let narrow = u64::from(self.groups.count()) * u64::from(self.time_dim) * 4;
+        width + narrow + u64::from(self.groups.count()) * 4
     }
 }
 
@@ -316,6 +341,20 @@ impl Projections {
         config: &crate::config::TransformerConfig,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
+        // **The element type of each tensor is pinned by the reference, not by the deployment.**
+        // Its loading table fixes the timestep pair at FP32 and the modulation projections at BF16
+        // whatever the preset (`weights.py:186-224`), and it casts the activation to the weight's
+        // type before each product (`adaln_cache.py:128`). Our product has one element type for both
+        // operands, so the activation and the tables must agree with the weights on both sides - and
+        // the run's first stop was exactly this: an FP32 activation against whatever type the
+        // deployment's loader happened to publish.
+        //
+        // So the timestep pair is pinned FP32 and the modulation projections take the deployment's
+        // type (`None`: the loader's own policy), which is the stack's - the pair differ exactly as
+        // the reference's do. `compute` then crosses between them **once**, narrowing the timestep
+        // activation into the modulation type; the tables follow the projections, so a block's
+        // modulation and its activation are one type, and at a deployment that states FP32 the two
+        // halves coincide and the crossing is skipped.
         let hidden = u64::from(config.hidden_size);
         let time_dim = u64::from(config.time_dim);
         let time_hidden = u64::from(config.time_hidden_dim);
@@ -329,11 +368,13 @@ impl Projections {
                         &format!("{prefix}.weight"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
                         time_dim,
+                        None,
                     )?,
                     vector(
                         loader,
                         &format!("{prefix}.bias"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
+                        None,
                     )?,
                 ))
             })
@@ -345,8 +386,14 @@ impl Projections {
                     "time_embedder.linear_1.weight",
                     time_hidden,
                     frequency,
+                    Some(DType::F32),
                 )?,
-                vector(loader, "time_embedder.linear_1.bias", time_hidden)?,
+                vector(
+                    loader,
+                    "time_embedder.linear_1.bias",
+                    time_hidden,
+                    Some(DType::F32),
+                )?,
             ),
             second: (
                 matrix(
@@ -354,13 +401,19 @@ impl Projections {
                     "time_embedder.linear_2.weight",
                     time_dim,
                     time_hidden,
+                    Some(DType::F32),
                 )?,
-                vector(loader, "time_embedder.linear_2.bias", time_dim)?,
+                vector(
+                    loader,
+                    "time_embedder.linear_2.bias",
+                    time_dim,
+                    Some(DType::F32),
+                )?,
             ),
             layers,
             output: (
-                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim)?,
-                vector(loader, "norm_out.linear.bias", 2 * hidden)?,
+                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim, None)?,
+                vector(loader, "norm_out.linear.bias", 2 * hidden, None)?,
             ),
             frequency_dim: config.frequency_dim,
             time_hidden_dim: config.time_hidden_dim,
@@ -400,31 +453,80 @@ impl Projections {
             )));
         }
         let arena = f.arena();
-        // The intermediates are the tables' own element type, not FP32: the reference casts each
-        // activation to the weight's type before every projection (`adaln_cache.py:128`), so a wider
-        // running value would hand the next projection a number the checkpoint never produced. The
-        // embedding stays FP32 - it is the one input the model computes rather than reads, and the
-        // reference leaves it so until the first projection reads it.
-        let dtype = output_out.dtype;
+        // **The activation is cast to the weight's type, and the tables take the projection's type.**
+        // The reference writes both halves of that in one line - `F.linear(activated_timesteps.to(
+        // weight.dtype), weight, bias)` with the tables allocated as `projected.new_empty(...)`
+        // (`adaln_cache.py:128, 141-145`) - so at the released BF16 stack the tables are BF16, and at
+        // a deployment whose weights are FP32 they are FP32. Reading the tables' type from `out`
+        // instead and leaving the weights at the checkpoint's type is what a device run found: the
+        // first projection of the forward asked cuBLASLt for an FP32 activation against a BF16
+        // weight, a pair no algorithm exists for (`input_f32_weight_bf16_...` refused at its plan).
+        //
+        // The two halves of the family have different types, and the reference says so: the timestep
+        // pair is FP32 at every preset (`weights.py:186-192`), the modulation projections take the
+        // deployment's. So the activation the second pair leaves is FP32 and the modulation
+        // projections read the deployment's type - **one narrowing between them**, which is the
+        // reference's `.to(weight.dtype)` and the only crossing in this cache. At an FP32
+        // deployment the two types coincide and the narrowing is skipped.
+        let time_type = self.first.0.dtype();
+        let dtype = self.layers[0].0.dtype();
+        if time_type != DType::F32 {
+            return Err(Error::config(format!(
+                "the AdaLN timestep pair is {time_type} and the reference pins it to FP32 at every \
+                 preset"
+            )));
+        }
+        if output_out.dtype != dtype {
+            return Err(Error::config(format!(
+                "the AdaLN tables are {} and the projections' weights are {dtype}: the reference \
+                 takes the tables' type from the projection, so a view of another type is a table \
+                 no launch of this cache can write",
+                output_out.dtype
+            )));
+        }
+        for table in layers_out {
+            if table.dtype != dtype {
+                return Err(Error::config(format!(
+                    "an AdaLN layer table is {} and the projections' weights are {dtype}",
+                    table.dtype
+                )));
+            }
+        }
+        if embedding.dtype != time_type {
+            return Err(Error::config(format!(
+                "the AdaLN embedding is {} and the timestep pair computes in {time_type}",
+                embedding.dtype
+            )));
+        }
         let hidden = arena.tensor(
-            dtype,
+            time_type,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
         let activated = arena.tensor(
-            dtype,
+            time_type,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
-        let time = arena.tensor(dtype, Shape::new(&[groups, u64::from(self.time_dim)]))?;
+        let time = arena.tensor(time_type, Shape::new(&[groups, u64::from(self.time_dim)]))?;
         let linear = |weights: &(Weight, Weight)| {
             nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
         };
         linear(&self.first)?.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
         linear(&self.second)?.forward(f, activated, time)?;
+        // The one crossing: the activation the timestep pair built, rounded into the type the
+        // modulation projections read. `target <- 1 * source + 0 * target` is the reference's
+        // `.to(weight.dtype)`, and the zero beta means the target is never read.
+        let narrow = if dtype == time_type {
+            time
+        } else {
+            let out = arena.tensor(dtype, time.shape)?;
+            nn::layers::ScaledAdd.forward(f, out, time, 1.0, 0.0)?;
+            out
+        };
         for (weights, out) in self.layers.iter().zip(layers_out) {
-            linear(weights)?.forward(f, time, *out)?;
+            linear(weights)?.forward(f, narrow, *out)?;
         }
-        Ok(linear(&self.output)?.forward(f, time, output_out)?)
+        Ok(linear(&self.output)?.forward(f, narrow, output_out)?)
     }
 
     /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
@@ -434,6 +536,11 @@ impl Projections {
     /// here because it is the only part of the cache that is arithmetic on a host value.
     pub fn frequencies(&self, times: &[f32]) -> Result<Vec<u8>> {
         embedding(times, self.frequency_dim)
+    }
+
+    /// The element type the modulation projections read: the tables' type, and the cache's.
+    pub fn dtype(&self) -> DType {
+        self.layers[0].0.dtype()
     }
 
     /// How many layers the projections cover.
@@ -494,17 +601,31 @@ fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
 }
 
 /// A `[rows, columns]` checkpoint weight.
-fn matrix(loader: &mut WeightLoader<'_>, name: &str, rows: u64, columns: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[rows, columns]),
-    ))?)
+fn matrix(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    rows: u64,
+    columns: u64,
+    dtype: Option<DType>,
+) -> Result<Weight> {
+    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows, columns]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    Ok(loader.load(&request)?)
 }
 
-/// A `[rows]` checkpoint weight.
-fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])))?)
+fn vector(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    rows: u64,
+    dtype: Option<DType>,
+) -> Result<Weight> {
+    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    Ok(loader.load(&request)?)
 }
 
 #[cfg(test)]

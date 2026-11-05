@@ -456,7 +456,6 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // ---------------------------------------------------------------------------------------------
 
 use nn::Forward;
-use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
@@ -750,6 +749,15 @@ pub fn folded_input(
 }
 
 impl VideoDecoder {
+    /// Every checkpoint tensor the video decoder reads, by name.
+    ///
+    /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
+    /// the checkpoint key that fills it), so this list is that mapping's other column rather than a
+    /// second spelling of it: the 585 names are the export's 583 `decoder.*` and the two
+    /// `post_quant_conv.*` the input affine is folded from. A checkpoint that lacks one is refused by
+    /// block and name before a byte is read.
+    pub fn keys(config: &VideoVaeConfig) -> crate::Result<Vec<String>> {
+        Ok(crate::audio_vae::tensor_keys(&sources(config)?))
     /// The programs one clip's decode of `config` launches.
     ///
     /// Stated from the configuration alone, because a deployment compiles its store before it opens
@@ -888,13 +896,22 @@ impl VideoDecoder {
             * config.spatial_compression()
             * config.spatial_compression();
         let epsilon = config.decoder_norm_eps;
+        // The constants this canvas publishes, declared once: a caller that reserves device storage
+        // before loading sizes its pool by this list, and every publish below is checked against it.
+        let declared_sizes = constants(config, canvas, u64::from(width), dtype)?;
 
         let registers = read(
             loader,
             "decoder.register_tokens",
             &[u64::from(canvas.registers), u64::from(width)],
         )?;
-        let zero_row = zeroes(loader, "video_vae.zero_row", dtype, u64::from(width))?;
+        let zero_row = zeroes(
+            loader,
+            &declared_sizes,
+            "video_vae.zero_row",
+            dtype,
+            u64::from(width),
+        )?;
         if canvas.tail == 0 {
             return Err(Error::config(
                 "the decoder canvas has the trailing zero row".to_owned(),
@@ -902,12 +919,14 @@ impl VideoDecoder {
         }
         let register_rows = indices(
             loader,
+            &declared_sizes,
             "video_vae.register_rows",
             canvas.voxels() as u32,
             canvas.registers,
         )?;
         let zero_rows = indices(
             loader,
+            &declared_sizes,
             "video_vae.zero_rows",
             (canvas.voxels() + u64::from(canvas.registers)) as u32,
             canvas.tail,
@@ -1003,14 +1022,14 @@ impl VideoDecoder {
             u64::from(out_channels),
             true,
         )?;
-        let frequencies = frequencies(loader, config)?;
+        let frequencies = frequencies(loader, &declared_sizes, config)?;
         let rotary = Rotary::new(
             frequencies,
             head,
             heads,
             heads,
             epsilon,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?
@@ -1076,6 +1095,37 @@ fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64, bias: bool)
     Ok(Linear::new(weight, bias, WeightOrder::NxK)?)
 }
 
+/// The constants a decoder of this canvas publishes, as `(name, bytes)`.
+///
+/// `load` builds five tensors the export does not hold - the zero row the token layout appends, the
+/// two index tables that address them, the rotary frequencies and the voxel rows - and a caller that
+/// reserves device storage before loading has to know what they cost: the pool charges a block per
+/// publish, so a reservation computed from the checkpoint's names alone is short by every one of
+/// these. The list is one statement of them, and `load` checks what it publishes against it, so the
+/// two cannot drift.
+pub fn constants(
+    config: &VideoVaeConfig,
+    canvas: Canvas,
+    width: u64,
+    dtype: DType,
+) -> Result<Vec<(String, u64)>> {
+    let (rotated, _) = rotary(config)?;
+    let element = dtype.bytes().unwrap_or(4);
+    Ok(vec![
+        ("video_vae.zero_row".to_owned(), width * element),
+        (
+            "video_vae.register_rows".to_owned(),
+            u64::from(canvas.registers) * 4,
+        ),
+        ("video_vae.zero_rows".to_owned(), u64::from(canvas.tail) * 4),
+        (
+            format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta),
+            u64::from(rotated / 2) * 4,
+        ),
+        ("video_vae.voxel_rows".to_owned(), canvas.voxels() * 4),
+    ])
+}
+
 /// Read one weight.
 fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(
@@ -1085,14 +1135,42 @@ fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> 
     ))?)
 }
 
+/// Check one published constant against [`constants`]' list, so the declaration a caller reserves by
+/// and the tensors the loader publishes are one statement rather than two that can drift.
+fn declared(declared: &[(String, u64)], name: &str, bytes: usize) -> Result<()> {
+    match declared.iter().find(|(entry, _)| entry == name) {
+        Some((_, expected)) if *expected == bytes as u64 => Ok(()),
+        Some((_, expected)) => Err(Error::config(format!(
+            "the constant `{name}` publishes {bytes} bytes where its declared size is {expected}"
+        ))),
+        None => Err(Error::config(format!(
+            "the constant `{name}` is published but not declared"
+        ))),
+    }
+}
+
 /// A constant row of `width` zeros, which the checkpoint's token layout appends.
-fn zeroes(loader: &mut WeightLoader, name: &str, dtype: DType, width: u64) -> Result<Weight> {
+fn zeroes(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    name: &str,
+    dtype: DType,
+    width: u64,
+) -> Result<Weight> {
     let bytes = vec![0u8; (width as usize) * dtype.bytes().unwrap_or(4) as usize];
+    declared(declared_sizes, name, bytes.len())?;
     Ok(loader.constant(name, dtype, Shape::new(&[1, width]), &bytes)?)
 }
 
 /// A constant index table: `count` rows starting at `start`.
-fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Result<Weight> {
+fn indices(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    name: &str,
+    start: u32,
+    count: u32,
+) -> Result<Weight> {
+    declared(declared_sizes, name, count as usize * 4)?;
     let mut bytes = Vec::with_capacity(count as usize * 4);
     for index in 0..count {
         bytes.extend_from_slice(&(start + index).to_le_bytes());
@@ -1101,11 +1179,19 @@ fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Res
 }
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
-fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Weight> {
+/// The decoder's inverse frequencies, in the order its factors are laid out.
+///
+/// One block per axis, each over that axis's own width: the reference builds its embedding with
+/// `head_dim · ratio / 3` and reuses those frequencies on all three axes (`video_vae.py:547-549`,
+/// `uniserve/nn/rope.py:355-380`), so axis `a` takes `theta^(-2k / sections[a])` rather than a slice
+/// of one wider spectrum.
+///
+/// This is the table the decoder publishes as `video_vae.rotary.{rotated}.{theta}` and the one a
+/// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
+/// element type or key check can see, so the numbers have to be comparable without a device
+/// (`examples/vae_rope.rs`, `tools/compare_rope_factors.py --vae`).
+pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
     let (rotated, sections) = rotary(config)?;
-    // One block per axis, each over that axis's own width: the reference builds its embedding with
-    // `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
-    // `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
     let mut table = Vec::new();
     for width in &sections {
         for pair in 0..width / 2 {
@@ -1120,11 +1206,22 @@ fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Wei
             rotated / 2
         )));
     }
+    Ok(table)
+}
+
+fn frequencies(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    config: &VideoVaeConfig,
+) -> Result<Weight> {
+    let (rotated, _) = rotary(config)?;
+    let table = inverse_frequencies(config)?;
     let mut bytes = Vec::with_capacity(table.len() * 4);
     for value in &table {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
+    declared(declared_sizes, &name, bytes.len())?;
     Ok(loader.constant(&name, DType::F32, Shape::new(&[table.len() as u64]), &bytes)?)
 }
 
@@ -1321,11 +1418,15 @@ pub struct TileScratch {
 }
 
 impl Decoder for VideoDecoder {
-    fn layout_tables(&self, layout: &nn::capability::Layout) -> Vec<StateTable> {
-        // A layout whose extents contradict the checkpoint has no tables; `prepare_layout` refuses
-        // it rather than this method answering a table of the wrong shape.
+    fn layout_tables(&self, layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
+        // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
+        // runner that made a mistake hears which one, where an empty answer would have reached the
+        // decode as a block with no tables and read nothing.
         self.tables(layout.video.height, layout.video.width)
-            .unwrap_or_default()
+            .map_err(|error| nn::Error::Shape {
+                owner: "VideoDecoder",
+                problem: error.to_string(),
+            })
     }
 
     fn prepare_layout(
@@ -1938,6 +2039,39 @@ pub(crate) mod tests {
         let table = positions(&clip).expect("positions");
         assert_eq!(clip.rows(), 7 * 256 + 5);
         assert_eq!(table.len() as u64, clip.rows() * 3);
+    }
+
+    #[test]
+    fn the_video_decoders_keys_ask_the_export_and_nothing_else() {
+        let config = video_config();
+        let keys = VideoDecoder::keys(&config).expect("the decoder's keys");
+        // The export's own number: `vae/` holds 703 names, the decoder's 585 are the 583 under
+        // `decoder.` plus the two `post_quant_conv.` tensors its input affine is folded from, and the
+        // encoder reads the remaining 118. A checkpoint that lacks one is refused by block and name.
+        assert_eq!(keys.len(), 585);
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        assert!(
+            keys.iter()
+                .any(|key| key == "decoder.transformer_blocks.35.ff.net.0.proj.weight"),
+            "the last layer's projection is asked for"
+        );
+        assert!(
+            keys.iter().any(|key| key == "post_quant_conv.weight"),
+            "the folded input affine's tensor is asked for"
+        );
+        let encoder = crate::encoding::VideoEncoder::keys(&config).expect("the encoder's keys");
+        assert!(
+            encoder.iter().all(|key| !keys.contains(key)),
+            "the two halves read disjoint tensors, or one block would be binding another's weight"
+        );
+        assert_eq!(
+            keys.len() + encoder.len(),
+            703,
+            "together they are every name in `vae/`, with none unread"
+        );
     }
 
     #[test]

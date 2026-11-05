@@ -2502,6 +2502,7 @@ version = "2.0.0"
 dependencies = [
  "nn",
  "ops",
+ "platform",
  "serde",
  "serde_json",
  "tempfile",

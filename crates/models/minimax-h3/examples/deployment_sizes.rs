@@ -6,6 +6,13 @@
 //!
 //! Runs host-only: no checkpoint, no GPU, no reference Python. `--root <checkpoint>` additionally
 //! recomputes the derived quantities from that checkpoint's sidecars.
+//!
+//! **What each figure is a number of:** the design's cost for the row's deployment shape, from the
+//! index's bytes, the block's once-at-load constants and the plan function of the row's request. It is
+//! not a run's reservation. A run sizes a stage by its own partition (no tensor or Ulysses flag means
+//! 1 and 1), so a line this program prints in a log is the note's row and must not be read as the
+//! partition the run stated; the measurement to check a row against is a harness's own reservation
+//! line (`conditioned --stage encode` prints one before it loads).
 
 use std::path::PathBuf;
 
@@ -25,32 +32,40 @@ struct Stage {
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10129, tables: 12 },
+    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10909, tables: 12 },
     Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 17041, tables: 12 },
+    // The encoder set and the conditioner's six buffers are a **bump released before the layout is
+    // captured**: the conditioner runs once per request, writes the condition rows, and its buffers
+    // are dead when the replays reserve. They never coexist with the captured plan, so the arena is
+    // the plan's own 10,129 MiB and not the sum - the runner's order is prepare -> condition in the
+    // bump -> release -> capture -> replay, and a runner that captures first holds 17,041.
+    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 12 },
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 17041, tables: 14 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10129, tables: 12 },
+    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10909, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
+    // The DiT's weights are not sliced by the Ulysses degree: every rank reads the whole 638-name
+    // set at the global head width (`Attention::load` projects `heads * head_dim`, and `projection`
+    // takes no rank), so this row is the one-rank row plus the four exchange entries' arena.
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
@@ -77,6 +92,24 @@ fn mib(bytes: u64) -> String {
         format!("{bytes} MiB")
     }
 }
+
+/// Report a plan that names one buffer twice, and remember to fail the run.
+///
+/// The executor keys the arena's storage by these names, so a repeated name aliases two regions: the
+/// plan stops saying what the block reserves while its arithmetic still adds up, which is a defect
+/// no size a reader checks can find. One plan carried it (`audio.wide`, a patch widening and a head
+/// widening, `f2e1ef10c`), so every plan this example builds is scanned.
+fn distinct_names(label: &str, plan: &[minimax_h3::decoding::Buffer]) {
+    let mut seen = std::collections::HashSet::new();
+    for buffer in plan {
+        if !seen.insert(buffer.name.as_str()) {
+            println!("  PLAN COLLISION: {label} names `{}` twice", buffer.name);
+            PLAN_COLLISIONS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static PLAN_COLLISIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root: Option<PathBuf> = None;
@@ -149,6 +182,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n(recomputed row bounds and decode plans need `--root <checkpoint>`; the stage table \
              above is the note's, and needs neither a checkpoint nor a GPU)"
         );
+    }
+    if PLAN_COLLISIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("a plan names one buffer twice, so two regions would alias".into());
     }
     Ok(())
 }
@@ -291,6 +327,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             Dit::Base => "transformer_ref",
             Dit::Reference => "transformer",
         };
+        let placed_directories = component_bytes
+            .iter()
+            .filter(|(directory, _)| directory.as_str() != unplaced)
+            .map(|(directory, _)| directory.as_str())
+            .collect::<Vec<_>>();
         let all: u64 = component_bytes
             .iter()
             .filter(|(directory, _)| directory.as_str() != unplaced)
@@ -309,7 +350,8 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         println!(
-            "weights {deployment}: table {table} MiB, under the {all} MiB its own components hold"
+            "weights {deployment}: table {table} MiB, under the {all} MiB that {} hold",
+            placed_directories.join(", ")
         );
     }
 
@@ -341,6 +383,13 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             nn::capability::VideoTask::TextToVideoAudio,
             2,
             2,
+        ),
+        (
+            "fl2va (conditioned), 1 rank",
+            Dit::Base,
+            nn::capability::VideoTask::FirstLastToVideoAudio,
+            1,
+            1,
         ),
         (
             "ref2va (OmniRef DiT), 1 rank",
@@ -383,6 +432,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 nn::DType::BF16,
                 &request,
             )?;
+            distinct_names(&format!("the DiT plan at {frames} frames"), &plan);
             let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
             println!(
                 "DiT plan {name}, {frames} frames: {} entries, {} = {} MiB ({} bytes)",
@@ -391,6 +441,20 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 bytes / (1 << 20),
                 bytes
             );
+            // The entries in the order the plan reserves them, which is the order the arena's
+            // offsets follow: the note describes this list by name and shape, so it must be
+            // printable from the same call that sizes it.
+            if std::env::var("H3_DIT_BUFFERS").is_ok() {
+                for buffer in &plan {
+                    println!(
+                        "    {:28} {:5} {:>12} elements {:>12} B",
+                        buffer.name,
+                        buffer.element,
+                        buffer.elements,
+                        buffer.bytes()
+                    );
+                }
+            }
         }
     }
 
@@ -399,6 +463,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for frames in [124_u32, 362] {
         let samples = u64::from(minimax_h3::packing::audio_latent_frames(frames)) * 800;
         let plan = minimax_h3::encoding::audio_encoder_arena(&config.audio_vae, 2, samples)?;
+        distinct_names("the audio encoder plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "audio encoder plan {frames} frames ({samples} samples): {} buffers, {}",
@@ -428,6 +493,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         ),
     ] {
         let plan = minimax_h3::encoding::conditioning_arena(&config.video_vae, frames, extent)?;
+        distinct_names("the conditioning plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "conditioning plan {frames} frames ({} latent): {} buffers, {} bytes = {} KiB",
@@ -447,6 +513,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.width / ratio,
         );
         let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, nn::DType::F16)?;
+        distinct_names("the splice plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "splice plan {}x{}: {} buffers, {} bytes = {} MiB",
@@ -463,10 +530,12 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let arena: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?
-            .iter()
-            .map(|buffer| buffer.bytes())
-            .sum();
+        let decode = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?;
+        distinct_names(
+            &format!("the decode plan at {}x{}", canvas.width, canvas.height),
+            &decode,
+        );
+        let arena: u64 = decode.iter().map(|buffer| buffer.bytes()).sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
             for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
                 let bytes = buffer.bytes();
@@ -480,72 +549,6 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             arena,
             arena / (1 << 20)
         );
-        if canvas.width == 1536 && false {
-            // The DiT's plan, from the crate's own function. `t2va` reads the generated groups and
-            // `fl2va`/`ref2va` read a condition's clean level too, so both are printed: they are
-            // different plans, and a deployment's task decides which one its rank sizes against.
-
-            for conditioned in [false, true] {
-                let groups = minimax_h3::modulation::Groups::of(conditioned);
-                let task = if conditioned {
-                    nn::capability::VideoTask::FirstLastToVideoAudio
-                } else {
-                    nn::capability::VideoTask::TextToVideoAudio
-                };
-                let arrangement =
-                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0, 0)?
-                        .arrangement(denoiser)?;
-                let request = nn::capability::Layout {
-                    video: nn::capability::LatentShape {
-                        channels: denoiser.transformer.video_channels,
-                        frames: minimax_h3::packing::video_latent_frames(124)?,
-                        height: canvas.height / ratio,
-                        width: canvas.width / ratio,
-                    },
-                    audio: Some(nn::capability::LatentShape {
-                        channels: minimax_h3::config::AUDIO_CHANNELS
-                            * denoiser.transformer.audio_channels,
-                        frames: minimax_h3::packing::audio_latent_frames(124),
-                        height: 1,
-                        width: 1,
-                    }),
-                    text_rows: arrangement.text_rows,
-                    condition_rows: arrangement.condition_rows,
-                    condition_elements: 0,
-                };
-                let plan = minimax_h3::denoiser::denoise_arena(
-                    denoiser,
-                    &arrangement,
-                    groups.count(),
-                    nn::DType::BF16,
-                    &request,
-                )?;
-                let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
-                if std::env::var("H3_DIT_BUFFERS").is_ok() {
-                    for buffer in &plan {
-                        println!(
-                            "      {:28} {:5} {:>12} elements {:>12} B",
-                            buffer.name,
-                            buffer.element,
-                            buffer.elements,
-                            buffer.bytes()
-                        );
-                    }
-                }
-                println!(
-                    "  DiT plan {} at {}x{}: {} entries, {}",
-                    if conditioned {
-                        "conditioned"
-                    } else {
-                        "generated"
-                    },
-                    canvas.width,
-                    canvas.height,
-                    plan.len(),
-                    mib(bytes / (1 << 20))
-                );
-            }
-        }
     }
     for frames in [124_u32, 362] {
         // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
@@ -554,6 +557,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             &config.audio_vae,
             minimax_h3::packing::audio_latent_frames(frames),
         )?;
+        distinct_names("the audio decoder plan", &plan);
         let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         println!(
             "audio plan {frames} frames ({} latent steps): {} buffers, {} bytes = {} MiB",
@@ -576,17 +580,14 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for (height, width) in [(768_u32, 1344_u32), (672, 1536)] {
         let encoder = minimax_h3::tiled_encode::ClipEncoder::new(height, width)?;
         let plan = encoder.plan();
-        let ratio = config.video_vae.spatial_compression();
+        // The extents are the driver's own - `VideoEncoder::reserve`'s input - so the plan below is
+        // the plan the run reserves, ratio and seam rule included.
+        let extents = plan.tile_extents(minimax_h3::decoding::CLIP_OUTPUT_FRAMES);
         let mut total = 0_u64;
         let mut largest = 0_u64;
-        for tile in &plan.tiles {
-            let extent = minimax_h3::encoding::Extent {
-                frames: minimax_h3::decoding::CLIP_OUTPUT_FRAMES,
-                height: tile.rows.1 * ratio,
-                width: tile.columns.1 * ratio,
-            };
+        for extent in &extents {
             let bytes: u64 =
-                minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
+                minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, *extent)?
                     .iter()
                     .map(|buffer| buffer.bytes())
                     .sum();
@@ -594,8 +595,8 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             if largest < bytes {
                 largest = bytes;
                 println!(
-                    "    largest tile: latent {}x{}, pixels {}x{}",
-                    tile.rows.1, tile.columns.1, extent.height, extent.width
+                    "    largest tile: pixels {}x{}, {} frames",
+                    extent.height, extent.width, extent.frames
                 );
             }
         }
@@ -646,20 +647,27 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
     // must hoist it or the arena is reserved once per tile.
-    for (width, height) in [(256_u32, 256_u32), (512, 128)] {
-        let raster = minimax_h3::encoding::Extent {
-            frames: 25,
-            height,
-            width,
-        };
-        let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
-        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
-        println!(
-            "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
-            plan.len(),
-            bytes,
-            bytes / (1 << 20)
-        );
+    // The encoder's ladder is per tile and scales with the condition's **frames**, not with the
+    // raster: a still (`fl2va`'s keyframe, `ref2va`'s image) is one frame, a reference clip is
+    // `CLIP_OUTPUT_FRAMES`. Both are printed because a deployment must bound what a request brings,
+    // and the still is what most conditioned requests actually cost.
+    for frames in [1_u32, minimax_h3::decoding::CLIP_OUTPUT_FRAMES] {
+        for (width, height) in [(256_u32, 256_u32), (512, 128)] {
+            let raster = minimax_h3::encoding::Extent {
+                frames,
+                height,
+                width,
+            };
+            let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
+            distinct_names("the video encoder tile plan", &plan);
+            let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+            println!(
+                "encoder tile {width}x{height} px, {frames} frames: {} buffers, {} bytes = {} MiB",
+                plan.len(),
+                bytes,
+                bytes / (1 << 20)
+            );
+        }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?

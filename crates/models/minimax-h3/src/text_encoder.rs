@@ -46,14 +46,14 @@ use nn::weights::{WeightLoader, WeightRequest};
 use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
-use ops::rope::Rotation;
 use std::sync::Arc;
 
 use crate::config::TextEncoderConfig;
+use crate::decoding::Buffer;
 use crate::load::Component;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
-use crate::vision::{Geometry, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
+use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
 use crate::{Error, Result};
 
 /// The language layers' gate: the checkpoint states `hidden_act: "silu"` and H3 fixes it.
@@ -118,12 +118,12 @@ impl Plan {
         let mut time = Vec::with_capacity(grids.len());
         let mut merged = 0_u32;
         for &grid in grids {
-            let geometry = Geometry::of(&config.vision, grid)?;
-            merged = merged.checked_add(geometry.merged).ok_or_else(|| {
+            let rows = BlockRows::of(&config.vision, grid)?;
+            merged = merged.checked_add(rows.merged).ok_or_else(|| {
                 Error::config("the images merge to more than a u32 of rows".to_owned())
             })?;
-            images.push(geometry.patches);
-            time.push(geometry.time);
+            images.push(rows.patches);
+            time.push(rows.time);
         }
         Ok(Self {
             rows: tokens,
@@ -191,6 +191,16 @@ impl Plan {
                 .ok_or_else(|| Error::config("an encoder plan larger than a u64".to_owned()))?;
         }
         Ok(bytes)
+    }
+}
+
+/// The plan names' element for `dtype`: the vocabulary `crate::decoding::Buffer` holds.
+pub(crate) fn element_of(dtype: nn::DType) -> &'static str {
+    match dtype {
+        nn::DType::BF16 => "bf16",
+        nn::DType::F16 => "f16",
+        nn::DType::F32 => "f32",
+        _ => "bf16",
     }
 }
 
@@ -361,6 +371,53 @@ impl Buffers {
         })
     }
 
+    /// The named plan of exactly the buffers [`Buffers::new`] reserves.
+    ///
+    /// Each reservation above has one line here, in the same order, so an executor's name-keyed
+    /// arena and a deployment row read the same object. The sum must equal [`Buffers::bytes`]: that
+    /// equality is what makes a name added twice - the class that aliased 8.9 MB with 52,992 B in
+    /// the audio plan - or a buffer this list forgot show up as two numbers that disagree instead of
+    /// as one number nobody can check.
+    fn plan(plan: &Plan, dtype: nn::DType) -> Vec<Buffer> {
+        let tokens = u64::from(plan.rows);
+        let hidden = u64::from(plan.hidden);
+        let query = u64::from(plan.query);
+        let key_value = u64::from(plan.key_value);
+        let intermediate = u64::from(plan.intermediate);
+        let factors = u64::from(plan.head_dim / 2);
+        let merged = u64::from(plan.merged);
+        let element = element_of(dtype);
+        let mut plan_out = Vec::with_capacity(16);
+        let mut push = |name: &str, element: &'static str, elements: u64| {
+            plan_out.push(Buffer {
+                name: name.to_owned(),
+                element,
+                elements,
+            });
+        };
+        push("prompt.normalized", element, tokens * hidden);
+        push("prompt.query", element, tokens * query);
+        push("prompt.rotated_query", element, tokens * query);
+        push("prompt.key", element, tokens * key_value);
+        push("prompt.rotated_key", element, tokens * key_value);
+        push("prompt.value", element, tokens * key_value);
+        push("prompt.attended", element, tokens * query);
+        push("prompt.projected", element, tokens * hidden);
+        push("prompt.gate", element, tokens * intermediate);
+        push("prompt.up", element, tokens * intermediate);
+        push("prompt.activated", element, tokens * intermediate);
+        push("prompt.down", element, tokens * hidden);
+        push("prompt.cosine", "f32", tokens * factors);
+        push("prompt.sine", "f32", tokens * factors);
+        push("prompt.features", element, merged * hidden);
+        push(
+            "prompt.deepstack",
+            element,
+            u64::from(plan.deepstack) * merged * hidden,
+        );
+        plan_out
+    }
+
     /// The bytes [`Buffers::new`] reserves.
     fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
@@ -375,6 +432,15 @@ impl Buffers {
         dtype: nn::DType,
     ) -> Result<u64> {
         crate::vision::Buffers::bytes(config, patches, dtype)
+    }
+
+    /// The tower's named reservations for one image, at the encoder's element type.
+    fn tower_plan(
+        config: &crate::config::VisionConfig,
+        patches: u32,
+        dtype: nn::DType,
+    ) -> Vec<Buffer> {
+        crate::vision::Buffers::plan(config, patches, dtype)
     }
 
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
@@ -488,7 +554,7 @@ impl Layer {
                 rank.query_heads,
                 rank.key_value_heads,
                 config.rms_norm_eps,
-                Rotation::Half,
+                crate::SPLIT_HALF,
                 1.0,
             )
             .map_err(Error::from)?
@@ -650,6 +716,35 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
+    /// Every checkpoint tensor the **language stack** reads, by name.
+    ///
+    /// The names are the sharded reads' own: a tensor-parallel degree splits a tensor's rows and
+    /// never renames it, so one list answers for every rank of a deployment and needs no partition.
+    /// `load` asks for these and only these, so a checkpoint that lacks one is refused by name
+    /// before a byte is read rather than surfacing as a read error inside a layer.
+    ///
+    /// This is not the whole component: `load` builds the vision tower inside the encoder
+    /// (`tower: VisionTower::load(...)`), unconditionally, because a prompt may carry images. A
+    /// caller checking a checkpoint for this block checks `VisionTower::keys(&config.vision)`
+    /// beside this list - the two halves fail for different reasons and are reported apart.
+    pub fn keys(config: &TextEncoderConfig) -> Vec<String> {
+        let mut keys = vec![format!("{PREFIX}.embed_tokens.weight")];
+        for index in 0..config.num_retained_layers {
+            let name = format!("{PREFIX}.layers.{index}");
+            let attention = format!("{name}.self_attn");
+            for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                keys.push(format!("{attention}.{projection}.weight"));
+            }
+            for norm in ["q_norm", "k_norm"] {
+                keys.push(format!("{attention}.{norm}.weight"));
+            }
+            keys.push(format!("{name}.input_layernorm.weight"));
+            keys.push(format!("{name}.post_attention_layernorm.weight"));
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                keys.push(format!("{name}.mlp.{projection}.weight"));
+            }
+        }
+        keys
     /// The programs the retained layers and the prompt splice of this encoder launch.
     ///
     /// Stated from the configuration and the tensor-parallel position alone, because a deployment
@@ -828,7 +923,7 @@ impl TextEncoder {
                 rank.query_heads,
                 rank.key_value_heads,
                 config.rms_norm_eps,
-                Rotation::Half,
+                crate::SPLIT_HALF,
                 1.0,
             )
             .map_err(Error::from)?
@@ -1077,7 +1172,7 @@ impl TextEncoder {
                     ))
                 })?;
             }
-            let rows = u64::from(image_tables.geometry.merged);
+            let rows = u64::from(image_tables.rows.merged);
             for table in 0..self.tower.deepstack_features() {
                 deepstack.push(Buffers::rows_of(
                     buffers.deepstack,
@@ -1173,6 +1268,35 @@ impl TextEncoder {
                 .map_err(Error::from)?;
         }
         Ok(())
+    }
+}
+
+impl TextEncoder {
+    /// The arena one encode of `layout` reserves, buffer by buffer.
+    ///
+    /// This is the same sum [`Plan::bytes`] returns, decomposed by name: the prompt's buffers once
+    /// (the stack reuses one set across all its layers), then one set per image the layout carries,
+    /// because the tower runs once per image. A deployment row reads the sum of these entries, and
+    /// the equality with `Plan::bytes` is what the module's test holds it to - the arena is what
+    /// every served request reserves before the denoiser runs, so a plan that disagreed with the
+    /// arithmetic would be a reservation nobody could check.
+    pub fn encode_arena(&self, layout: &EncoderLayout) -> Result<Vec<Buffer>> {
+        let grids = layout
+            .images
+            .iter()
+            .map(|image| image.grid)
+            .collect::<Vec<_>>();
+        let plan = self.plan(layout.tokens, &grids)?;
+        let mut buffers = Buffers::plan(&plan, self.dtype);
+        for (index, &patches) in plan.images.iter().enumerate() {
+            for buffer in Buffers::tower_plan(&self.config.vision, patches, self.dtype) {
+                buffers.push(Buffer {
+                    name: format!("image{index}.{}", buffer.name),
+                    ..buffer
+                });
+            }
+        }
+        Ok(buffers)
     }
 }
 
@@ -1318,8 +1442,8 @@ fn write_state(
         return Ok(());
     }
 
-    let side = Geometry::position_grid(vision)?;
-    let head_dim = Geometry::head_dim(vision)?;
+    let side = BlockRows::position_grid(vision)?;
+    let head_dim = BlockRows::head_dim(vision)?;
     let rotary = positions::VisionRotary::new(head_dim)?;
     let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
     let mut index = Vec::new();
@@ -1433,7 +1557,7 @@ fn table_specs(
     // states 1152 elements over 16 heads, so the factors carry 36 frequencies rather than the text
     // stack's 64. The division is total here (this function reports nothing) and any configuration
     // that does not divide is refused by `write_state`, which derives the same width through
-    // `Geometry::head_dim`.
+    // `BlockRows::head_dim`.
     let tower_columns = u64::from(config.vision.hidden_size / config.vision.num_heads.max(1) / 2);
     let table =
         |name: &'static str, dtype: nn::DType, shape: Shape| StateTable { name, dtype, shape };
@@ -1731,6 +1855,68 @@ mod tests {
     const IMAGE: u32 = 151_655;
     const VIDEO: u32 = 151_656;
 
+    /// Every tensor the encoder reads is named once, and under the language stack's prefix.
+    ///
+    /// A name asked twice is read twice and reported twice by a missing-name check; a name outside
+    /// the prefix would collide with the vision tower's tensors in the same export.
+    #[test]
+    fn keys_are_unique_and_inside_the_language_model() {
+        let config = crate::config::tests_support::released_config().text_encoder;
+        let keys = TextEncoder::keys(&config);
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
+        assert!(
+            keys.iter()
+                .all(|key| key.starts_with(&format!("{PREFIX}."))),
+            "a key lies outside {PREFIX}"
+        );
+        // One embedding, then eleven tensors per retained layer: four projections, two per-head
+        // norms, two layer norms and the gated MLP's three.
+        assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
+    }
+
+    /// The named plan is the byte plan: every reservation has one line, and no line twice.
+    ///
+    /// The two halves are checked against the totals they claim to decompose - `Buffers::bytes` for
+    /// the prompt and `vision::Buffers::bytes` for one image - because a name added twice or a
+    /// buffer left out is otherwise invisible: the arena would reserve the wrong region and the only
+    /// symptom would be a launch that refused in the middle of a served request.
+    #[test]
+    fn the_named_plan_sums_to_the_byte_plan() {
+        let config = config();
+        for tokens in [1_u32, 6, 15, 128] {
+            let plan = Plan::new(&config, &Partition::single(), tokens, &[]).expect("a plan");
+            let named = Buffers::plan(&plan, nn::DType::BF16);
+            let sum: u64 = named.iter().map(Buffer::bytes).sum();
+            assert_eq!(
+                sum,
+                Buffers::bytes(&plan, nn::DType::BF16).expect("the byte plan"),
+                "the named plan for {tokens} tokens disagrees with the byte plan"
+            );
+            let names: std::collections::BTreeSet<&String> =
+                named.iter().map(|buffer| &buffer.name).collect();
+            assert_eq!(names.len(), named.len(), "a buffer is named twice");
+        }
+    }
+
+    /// The tower's named plan is its byte plan, for a block of patches.
+    #[test]
+    fn the_tower_named_plan_sums_to_its_byte_plan() {
+        let config = config();
+        let patches = 16 * 16;
+        let named = crate::vision::Buffers::plan(&config.vision, patches, nn::DType::BF16);
+        let sum: u64 = named.iter().map(Buffer::bytes).sum();
+        assert_eq!(
+            sum,
+            crate::vision::Buffers::bytes(&config.vision, patches, nn::DType::BF16)
+                .expect("the tower's byte plan"),
+            "the tower's named plan disagrees with its byte plan"
+        );
+        let names: std::collections::BTreeSet<&String> =
+            named.iter().map(|buffer| &buffer.name).collect();
+        assert_eq!(names.len(), named.len(), "a buffer is named twice");
+    }
+
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
         crate::config::tests_support::released_config().text_encoder
@@ -1934,8 +2120,8 @@ mod tests {
     fn an_images_tables_are_one_time_steps_samples_repeated_over_its_grid() {
         let config = config();
         let merge = config.vision.spatial_merge_size;
-        let side = Geometry::position_grid(&config.vision).expect("a square table");
-        let head_dim = Geometry::head_dim(&config.vision).expect("a head width");
+        let side = BlockRows::position_grid(&config.vision).expect("a square table");
+        let head_dim = BlockRows::head_dim(&config.vision).expect("a head width");
         // One 4x6 image block: 24 patches, 6 merged rows, after three prompt tokens.
         let ids = [7, 8, 9, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, 10];
         let layout = EncoderLayout {
@@ -2086,7 +2272,7 @@ mod tests {
         // Both calls' rows are in the same tables: forty-eight patches of taps, factors and
         // sequence lengths, the image's one single-step sequence first. The factors carry the
         // tower's own head width, not the language model's.
-        let tower_head = Geometry::head_dim(&config.vision).expect("a head width");
+        let tower_head = BlockRows::head_dim(&config.vision).expect("a head width");
         assert_eq!(out[2].len(), 48 * positions::POSITION_TAPS as usize * 4);
         assert_eq!(out[4].len(), 48 * (tower_head / 2) as usize * 4);
         let lengths = (0..5).map(|row| i32_at(&out[6], row)).collect::<Vec<_>>();

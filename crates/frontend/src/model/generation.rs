@@ -2,9 +2,6 @@
 //! deployment's engine is configured from before its workers report their own
 //! (`specs/worker.md` §4.2).
 
-use models::omni::GenerationControls;
-use proto::request::GenerationLimits;
-
 use super::{BagelProfile, ModelConfig, ModelParameters};
 
 impl ModelConfig {

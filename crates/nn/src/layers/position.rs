@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 
 /// Elements one thread block handles.
-const BLOCK: u32 = 1024;
+pub const BLOCK: u32 = 1024;
 
 /// Bilinear resample of a learned position table, one launch per grid.
 #[derive(Clone, Copy)]

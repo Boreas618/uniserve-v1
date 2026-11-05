@@ -745,7 +745,7 @@ pub trait Denoiser {
     /// each clip's voxel. They are filled once per layout, not once per request, so the executor
     /// keys its storage by `(layout, name)` beside the request's state and shares one set between
     /// every request of that shape.
-    fn layout_tables(&self, layout: &Layout) -> Vec<StateTable>;
+    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
 
     /// Write the host bytes of each layout constant of `layout`, in [`Self::layout_tables`]' order.
     ///
@@ -804,7 +804,12 @@ pub trait Decoder {
     /// positions and the packed row of each clip's voxel all follow from the layout's counts, not
     /// from a request's seed or schedule. Deterministic for a layout, so the executor keys storage
     /// by `(layout, name)` and shares one set between every request of that shape.
-    fn layout_tables(&self, layout: &Layout) -> Vec<StateTable>;
+    ///
+    /// A layout the block cannot serve is a **named error**, not an empty list: a block with no
+    /// tables and a block that cannot answer are different facts, and only one of them is the
+    /// caller's to act on. Returning `Ok(vec![])` for a contradictory layout is the shape a silent
+    /// failure takes - the runner uploads nothing, the decode reads nothing, and nothing said so.
+    fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
 
     /// Write the host bytes of each table of `layout`, in [`Self::layout_tables`]' order.
     ///
