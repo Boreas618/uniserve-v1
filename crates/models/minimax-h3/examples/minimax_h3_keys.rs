@@ -372,7 +372,12 @@ fn main() {
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::BF16,
+                // The component's own type is BF16, but `denoiser_rows` keys every row from this one
+                // value, and **model-lead01 measures the AdaLN cache as F32 whatever the stack is** -
+                // so the stack's rows are stated at both until each row takes the type of the tensor
+                // that produces it. F32 is the safe direction: an over-stated row costs a compile, a
+                // missing one stops a run with a store that looks complete.
+                transformer: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },
@@ -555,7 +560,7 @@ fn main() {
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::BF16,
+                transformer: DType::F32,
                 video: vae,
                 audio: DType::F32,
             },

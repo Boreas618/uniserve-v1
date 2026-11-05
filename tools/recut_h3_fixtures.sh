@@ -55,6 +55,11 @@ samples=124,192,243,362
 rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
+# The task the fixture's deployment serves. The walk refuses without it, and it is not cosmetic: the
+# serving partition derives the capacity from it, so the packed row bound — and the gated activation's
+# `wide` form with it — follows from this line. `ref2va` is the widest of the three: 304,976 dense and
+# 351,232 sparse, and one store means the widest.
+task=ref2va
 elements=123456
 # One track per clip, `audio_samples` of it: the walk refuses a track no stated clip implies, so this
 # line cannot drift from the one above without a refusal naming both.
@@ -94,12 +99,12 @@ echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
