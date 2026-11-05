@@ -657,6 +657,42 @@ mod tests {
     }
 
     #[test]
+    fn a_deployments_row_bound_follows_its_condition_capacity() {
+        // `Layouts::rows_bound` is the number every class-crossing row is keyed at, and the condition
+        // capacity is part of the packed row count. So the three tasks' bounds must differ by exactly
+        // their capacities and nothing else: a bound that stopped following the capacity is a store
+        // keyed for a layout the deployment never serves, and it agrees with a walk that reads the
+        // same stale number - which is why this is asserted at the layout rule rather than at a flag.
+        let config = config();
+        let denoiser = config
+            .denoisers
+            .get(&crate::checkpoint::Dit::Base)
+            .expect("a base DiT");
+        let bound = |task| -> u32 {
+            let partition = Partition::serving(&config, task, 1, 1, 0, 0).expect("a partition");
+            let arrangement = partition.arrangement(denoiser).expect("an arrangement");
+            crate::denoiser::Layouts::new(denoiser.clone(), arrangement)
+                .expect("a layout rule")
+                .rows_bound()
+                .expect("a bound")
+        };
+        let unconditioned = bound(VideoTask::TextToVideoAudio);
+        let keyframes = bound(VideoTask::FirstLastToVideoAudio);
+        let reference = bound(VideoTask::ReferenceToVideoAudio);
+        let capacity = |task| condition_rows(&config, task).expect("a capacity");
+        assert_eq!(
+            keyframes - unconditioned,
+            capacity(VideoTask::FirstLastToVideoAudio) - capacity(VideoTask::TextToVideoAudio),
+            "the keyframe deployment's bound moves by its capacity and by nothing else"
+        );
+        assert_eq!(
+            reference - keyframes,
+            capacity(VideoTask::ReferenceToVideoAudio) - capacity(VideoTask::FirstLastToVideoAudio),
+            "a reference clip's bound moves by the extra rows its clip reserves"
+        );
+    }
+
+    #[test]
     fn a_conditioned_deployment_reserves_its_own_keyframes_not_the_checkpoints_table() {
         // The released table's 192 rows describe the reference's 64-row units. An H3 keyframe is a
         // whole generated frame: 1008 patch rows at 1344x768, so two of them are 2016 and the
