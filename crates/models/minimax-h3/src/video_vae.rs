@@ -1533,6 +1533,11 @@ impl Decoder for VideoDecoder {
             })
     }
 
+    /// The checkpoint's own element type, read at load rather than chosen (design 1).
+    fn element_type(&self) -> nn::DType {
+        self.dtype
+    }
+
     /// The latent layout one clip's raster decodes from.
     ///
     /// The argument is the **decoded raster** - frames, rows and columns of the media this block

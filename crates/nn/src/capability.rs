@@ -851,6 +851,18 @@ pub trait Decoder {
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
 
+    /// The element type this decoder reads its latents in and writes its decoded media in.
+    ///
+    /// The runner allocates the latents column and the raster column before a graph exists, and a
+    /// buffer's width in bytes is irreversible into an element type: a `[voxels, channels]` column
+    /// of `u16` and of `bf16` are the same bytes. The design's `dtype = "auto"` reads this from the
+    /// checkpoint rather than choosing it, so the model states it here and no runner infers it from
+    /// a byte count or from its deployment's configuration.
+    ///
+    /// Required rather than defaulted: a decoder that does not say has no honest answer to give, and
+    /// the point of this boundary is that the alternative - guessing - is silent.
+    fn element_type(&self) -> DType;
+
     /// The latent layout one clip's raster decodes from.
     ///
     /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and
