@@ -46,9 +46,13 @@ use std::process::ExitCode;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
-use nn::capability::{VideoRequest, VideoTask};
+use nn::capability::{
+    Encoder, EncoderInputs, EncoderOutputs, TokenBatch, VideoRequest, VideoTask,
+};
+use nn::{PhaseKind, TensorView};
 use minimax_h3::AttentionKind;
 use minimax_h3::output::{Splice, VideoPostprocessor};
+use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::video_vae::{Canvas, VideoDecoder};
 use minimax_h3::Partition;
 use nn::layers::{Linear, WeightOrder};
@@ -156,12 +160,14 @@ fn run() -> Result<(), String> {
             ("video-decoder", video_decoder as Harness),
             ("denoiser", denoiser as Harness),
             ("video-postprocessor", video_postprocessor as Harness),
+            ("text-encoder", text_encoder as Harness),
         ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
         "denoiser" => vec![("denoiser", denoiser as Harness)],
         "video-postprocessor" => vec![("video-postprocessor", video_postprocessor as Harness)],
+        "text-encoder" => vec![("text-encoder", text_encoder as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -428,6 +434,85 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     Ok(recorded.0)
 }
 
+/// The text encoder's own prefill: one prompt of the deployment's length, no images.
+///
+/// The tower is a separate component only when a request carries one, so the harness states the text-only
+/// path — the same one a prompt without media takes — and the tower is the row set still owed.
+fn text_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = text_config(&request.root)?;
+    let partition = Partition {
+        tensor_parallel: 1,
+        tensor_rank: 0,
+        ulysses_degree: 1,
+        ..Partition::single()
+    };
+    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
+    let encoder = TextEncoder::load(&mut loader, &config, &partition, request.dtype)
+        .map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+    let tokens = 4096u32;
+    let count = u64::from(tokens);
+    let ints = |values: Vec<i32>| -> Result<TensorView, String> {
+        let shape = Shape::new(&[values.len() as u64]);
+        let view = arena
+            .tensor(DType::I32, shape)
+            .map_err(|error| error.to_string())?;
+        let _ = values;
+        Ok(view)
+    };
+    let ids = arena
+        .tensor(DType::I32, Shape::new(&[count]))
+        .map_err(|error| error.to_string())?;
+    let batch = TokenBatch {
+        positions: ints((0..tokens as i32).collect())?,
+        slot_mapping: ints((0..tokens as i32).collect())?,
+        seq_lens: ints(vec![tokens as i32])?,
+        query_offsets: ints(vec![0, tokens as i32])?,
+        logits_rows: ints(vec![tokens as i32 - 1])?,
+        phase: PhaseKind::Prefill,
+        page_size: 64,
+        num_tokens: tokens,
+        max_kv_len: tokens,
+        draft_lens: None,
+    };
+    let layout = Encoder::layout(&encoder, &batch, &[]);
+    let specs = Encoder::state_tables(&encoder, &layout);
+    let mut tables = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        tables.push(
+            arena
+                .tensor(spec.dtype, spec.shape)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let hidden = arena
+        .tensor(
+            request.dtype,
+            Shape::new(&[count, u64::from(config.hidden_size)]),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = encoder.encode(
+        &forward,
+        EncoderInputs {
+            ids,
+            batch,
+            images: &[],
+            layout: &layout,
+            state: &tables,
+            diagnostics: &[],
+        },
+        EncoderOutputs { hidden },
+    );
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
+}
+
 /// The post-processor's own blend: the clip's raster into the timeline's bytes.
 ///
 /// It is the one decoded component with no checkpoint of its own — its two constants are the model's — so it
@@ -622,6 +707,17 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
+}
+
+/// The text encoder's statement: its own `config.json` and the processor's preprocessor config.
+fn text_config(root: &Path) -> Result<minimax_h3::TextEncoderConfig, String> {
+    let read = |path: PathBuf| -> Result<serde_json::Value, String> {
+        let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let metadata = read(root.join("text_encoder/config.json"))?;
+    let processor = read(root.join("text_encoder/preprocessor_config.json"))?;
+    minimax_h3::TextEncoderConfig::parse(&metadata, &processor).map_err(|error| error.to_string())
 }
 
 fn video_config(root: &Path) -> Result<minimax_h3::VideoVaeConfig, String> {
