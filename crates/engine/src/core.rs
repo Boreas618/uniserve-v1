@@ -1479,7 +1479,7 @@ impl SchedulerHandle {
     }
 
     /// Records the serving generation, from the control thread's switchover arm.
-    pub(crate) fn set_generation(&self, generation: u64) {
+    pub fn set_generation(&self, generation: u64) {
         self.generation
             .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
