@@ -1775,7 +1775,7 @@ impl Decoder for VideoDecoder {
     ///
     /// The layout states the canvas's latent extents, and the block decodes one canvas, so a layout
     /// naming another raster is refused by name - the same mismatch `layout_of` refuses from its side,
-    /// reached here by a caller that built the layout itself. The plan is [`video_arena`]'s for that
+    /// reached here by a caller that built the layout itself. The plan is `video_arena`'s for that
     /// canvas at this decoder's element type, so the number and the plan a runner allocates from are
     /// one statement rather than two.
     fn arena_bytes(&self, layout: &nn::capability::Layout) -> nn::Result<u64> {
