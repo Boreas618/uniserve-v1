@@ -347,17 +347,31 @@ impl Lifecycle {
         for ((operator, _, launch), (_, _, held)) in walked.nodes.iter().zip(served.nodes()) {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
-            // Only a launch the walk states differently is set: the executable starts from the
-            // template, so every other node already holds what it should, and a node that is
-            // rewritten for nothing is a chance to disturb a kernel the update never touched.
+            // A rebind re-points a node at another kernel and changes nothing else (4.5): the
+            // walk maps its activations in the preparation's pool, and the executable replays in
+            // the serving one, so a node keeps the arguments the serving graph captured. Only a
+            // launch whose kernel changed is set, because every other node is already right.
             let mut differs = false;
             for (node, serving) in launch.iter().zip(held) {
                 if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
                 let walked_params = walked.template.kernel_node_params(&node.node)?;
-                differs |= walked_params != template.kernel_node_params(&serving.node)?;
-                params.push(walked_params);
+                let serving_params = template.kernel_node_params(&serving.node)?;
+                let widths = |params: &platform::OwnedKernelNodeParams| -> Vec<usize> {
+                    params.parameters.iter().map(Vec::len).collect()
+                };
+                if widths(&walked_params) != widths(&serving_params) {
+                    return Err(Error::Invariant(format!(
+                        "operator {operator} changed its kernel's signature under the same launch \
+                         structure, so the bucket {bucket} cannot be rebound"
+                    )));
+                }
+                differs |= !walked_params.function.same_kernel(&serving_params.function);
+                params.push(platform::OwnedKernelNodeParams {
+                    parameters: serving_params.parameters,
+                    ..walked_params
+                });
             }
             if differs {
                 launches.push((*operator, *ordinal, params));

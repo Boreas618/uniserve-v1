@@ -1410,7 +1410,9 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     let token_bound = config
         .max_num_batched_tokens
         .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
-        .or_else(|| config.cuda_graph_config.tiers().tokens);
+        .or_else(|| config.cuda_graph_config.tiers().tokens)
+        // A media deployment captures no token graph, and its prompt is the most one batch holds.
+        .or_else(|| config.max_model_len.map(|length| length.get()));
     // A batch of requests is bounded by the largest captured decode graph, and
     // the deployment's batch is the smaller of its own and that: a deployment
     // that leaves the batch at its default means the catalog's figure, and one
