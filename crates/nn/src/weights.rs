@@ -2245,6 +2245,27 @@ fn round_even(value: u32, shift: u32) -> u32 {
     }
 }
 
+/// The bfloat16 bit pattern nearest to `value`.
+///
+/// A bf16 is an `f32` whose low sixteen bits are dropped, with round-to-nearest-even: the rounding
+/// adds one less than half a unit in the last place, and the surviving bit decides a tie. That is
+/// what the device's own conversion does, so a producer that narrows on the host and a layer that
+/// narrows on the card agree bit for bit.
+///
+/// A `NaN` is returned as a `NaN` with its sign and payload's top bits: the rounding add would
+/// otherwise carry a large payload into an infinity, and a boundary that turns a `NaN` into an
+/// infinity is a boundary that hides a divergence.
+pub fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        // Quiet, with the payload's top six bits: an `f32` NaN is any exponent of all ones with a
+        // non-zero mantissa, and the truncation keeps both.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
 /// The `f32` value of an IEEE half-precision bit pattern.
 ///
 /// Public because a container that must hold `f32` (the diagnosis' `.npy`, which numpy reads) is
@@ -2473,6 +2494,27 @@ mod tests {
         assert!(f32_to_half(f32::NAN) & 0x03ff != 0);
         assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
         assert_eq!(half_to_f32(0x8000), -0.0);
+    }
+
+    #[test]
+    fn a_bf16_conversion_rounds_like_the_hardware() {
+        // A value whose low half is zero keeps exactly its top sixteen bits.
+        for value in [0.0_f32, 1.0, -1.0, 2.0, 0.5, 1.0e-30, 3.0e38] {
+            assert_eq!(
+                f32_to_bf16(value),
+                (value.to_bits() >> 16) as u16,
+                "{value:e}"
+            );
+        }
+        // Half a unit in the last place ties between two neighbours and the even one wins; a value
+        // past the tie rounds up.
+        assert_eq!(f32_to_bf16(1.0 + 2.0_f32.powi(-8)), 0x3f80);
+        assert_eq!(f32_to_bf16(1.0 + 3.0 * 2.0_f32.powi(-9)), 0x3f81);
+        // The specials keep their meaning: an infinity is the top exponent with a zero mantissa, and
+        // a NaN stays a NaN instead of carrying into that infinity.
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
+        assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xff80);
+        assert!(f32::from_bits(u32::from(f32_to_bf16(f32::NAN)) << 16).is_nan());
     }
 
     #[test]
