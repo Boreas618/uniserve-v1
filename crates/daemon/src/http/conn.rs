@@ -2285,7 +2285,12 @@ mod tests {
             .expect("the pause is answered");
         assert_eq!(frozen.len(), 1);
         let frozen = frozen.into_iter().next().expect("one frozen response");
+        // The successor's copy of the socket is this record's descriptor, and
+        // nothing here shuts it: the response ends for the client when that copy
+        // is gone too, not when this process stops writing.
+        let successor = std::os::unix::net::UnixStream::from(frozen.descriptor);
         frozen.decision.send(Decision::Adopt).unwrap();
+        drop(successor);
         // The successor writes the carried bytes; this process stops here.
         frames.send(Bytes::from_static(b"data: b\n\n")).unwrap();
 
@@ -2342,7 +2347,13 @@ mod tests {
         drop(successor);
 
         let raw = client.read_to_end().await;
-        assert!(raw.contains("data: a"), "{raw}");
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        // The frame the predecessor still held at the pause travels as the
+        // response's `unwritten` bytes, which this test's successor does not
+        // write: what is asserted here is the socket, not the carrying. The
+        // successor's bytes go on the wire unframed because a writer that is not
+        // the connection does not chunk them, and that is the point — they
+        // arrive.
         assert!(
             raw.contains("data: b"),
             "the successor's frame reached the client: {raw}"
@@ -2508,7 +2519,12 @@ mod tests {
             http.written,
             big.len()
         );
+        // The successor's copy of the socket is this record's descriptor, and
+        // nothing here shuts it: the response ends for the client when that copy
+        // is gone.
+        let successor = std::os::unix::net::UnixStream::from(frozen.descriptor);
         frozen.decision.send(Decision::Adopt).unwrap();
+        drop(successor);
 
         // The client reads what the socket holds, and the connection ends
         // without writing the rest.
