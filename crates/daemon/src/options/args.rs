@@ -702,7 +702,7 @@ mod tests {
         config
             .validate(&stated)
             .expect("an unstated budget follows the catalog");
-        assert_eq!(config.cuda_graph_config.token_bound(), Some(512));
+        assert_eq!(config.cuda_graph_config.tiers().tokens, Some(512));
 
         let (config, stated) = resolved(&[
             "m",
@@ -722,6 +722,37 @@ mod tests {
         );
         assert!(
             message.contains("512 tokens the deployment's captured graphs"),
+            "{message}"
+        );
+
+        // The batch of requests is the same rule against the largest decode
+        // graph: a deployment that leaves it unstated follows the catalog, and
+        // one that states more than it captured is refused by name.
+        let decodes = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]";
+        let (config, stated) = resolved(&["m", "--set", decodes]).unwrap();
+        config
+            .validate(&stated)
+            .expect("an unstated batch follows the catalog");
+        assert_eq!(config.cuda_graph_config.tiers().rows, Some(8));
+
+        let (config, stated) = resolved(&[
+            "m",
+            "--set",
+            decodes,
+            "--set",
+            "scheduler_config.max_batch=16",
+        ])
+        .unwrap();
+        let error = config
+            .validate(&stated)
+            .expect_err("a batch above the captured decode graphs is refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("`scheduler_config.max_batch` is 16"),
+            "{message}"
+        );
+        assert!(
+            message.contains("8 requests the deployment's captured decode graphs"),
             "{message}"
         );
 

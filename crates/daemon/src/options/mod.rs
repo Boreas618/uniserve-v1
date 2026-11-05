@@ -610,14 +610,14 @@ pub struct CudaGraphOptions {
 }
 
 impl CudaGraphOptions {
-    /// The largest shape the deployment's captured graphs bound a batch to.
+    /// The bounds the deployment's captured graphs put on a batch.
     ///
-    /// This is the bound the engine admits a batch under and the bound a
+    /// These are the bounds the engine admits a batch under and the bounds a
     /// scheduling policy's declared limits must fit inside
-    /// (`proto::catalog::largest_tier`, which both ends read). `None` when the
-    /// deployment states no catalog: the worker's own catalog then bounds the
-    /// batch, and there is no stated figure to hold a policy against.
-    pub fn token_bound(&self) -> Option<u32> {
+    /// (`proto::catalog::largest_tier`, which both ends read). Absent when the
+    /// deployment states no catalog: the executor's own catalogue then bounds
+    /// the batch, and there is no stated figure to hold a policy against.
+    pub fn tiers(&self) -> proto::catalog::Tiers {
         let sizes = |values: &Option<Vec<NonZeroU32>>| -> Vec<u32> {
             values
                 .iter()
@@ -1189,21 +1189,22 @@ impl ServeConfig {
         // policy's declared limits would be refused at the first prepare
         // instead (`crates/scheduling/src/limits.rs`). A stated value is never
         // clamped — the deployment either means it or is wrong.
-        if let Some(ceiling) = self.cuda_graph_config.token_bound() {
-            let mut stated = Vec::new();
-            if let Some(budget) = self.max_num_batched_tokens {
-                stated.push((
-                    "max_num_batched_tokens",
-                    u32::try_from(budget.get()).unwrap_or(u32::MAX),
-                ));
-            }
-            if let Some(chunk) = self.scheduler_config.chunked_prefill_size {
-                stated.push((
-                    "scheduler_config.chunked_prefill_size",
-                    u32::try_from(chunk.get()).unwrap_or(u32::MAX),
-                ));
-            }
-            for (option, value) in stated {
+        let tiers = self.cuda_graph_config.tiers();
+        let mut token_bounds = Vec::new();
+        if let Some(budget) = self.max_num_batched_tokens {
+            token_bounds.push((
+                "max_num_batched_tokens",
+                u32::try_from(budget.get()).unwrap_or(u32::MAX),
+            ));
+        }
+        if let Some(chunk) = self.scheduler_config.chunked_prefill_size {
+            token_bounds.push((
+                "scheduler_config.chunked_prefill_size",
+                u32::try_from(chunk.get()).unwrap_or(u32::MAX),
+            ));
+        }
+        if let Some(ceiling) = tiers.tokens {
+            for (option, value) in token_bounds {
                 anyhow::ensure!(
                     value <= ceiling,
                     "`{option}` is {value}, above the {ceiling} tokens the deployment's captured \
@@ -1213,6 +1214,23 @@ impl ServeConfig {
                      `cuda_graph_config`"
                 );
             }
+        }
+        // A batch of requests is bounded by the largest *decode* graph, which is
+        // a row count: a prefill graph's token count says nothing about how many
+        // requests a decode step may hold.
+        if let Some(ceiling) = tiers.rows {
+            let batch = u32::try_from(self.scheduler_config.max_batch.get()).unwrap_or(u32::MAX);
+            // A batch the deployment leaves unstated follows the catalog
+            // (`policy_arguments` takes the smaller of the two), so only a
+            // stated batch can be outside it.
+            anyhow::ensure!(
+                batch <= ceiling || !stated.contains("scheduler_config.max_batch"),
+                "`scheduler_config.max_batch` is {batch}, above the {ceiling} requests the \
+                 deployment's captured decode graphs bound a batch to: the engine admits no batch \
+                 wider than its largest decode bucket, so the scheduling policy's limits would be \
+                 refused at the first prepare. State a batch at or below {ceiling}, or capture a \
+                 larger decode bucket in `cuda_graph_config`"
+            );
         }
         let speculation = &self.speculative_config;
         if let Some(speedup) = speculation.expected_speedup {

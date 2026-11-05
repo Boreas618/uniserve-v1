@@ -1302,7 +1302,18 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     let token_bound = config
         .max_num_batched_tokens
         .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
-        .or_else(|| config.cuda_graph_config.token_bound());
+        .or_else(|| config.cuda_graph_config.tiers().tokens);
+    // A batch of requests is bounded by the largest captured decode graph, and
+    // the deployment's batch is the smaller of its own and that: a deployment
+    // that leaves the batch at its default means the catalog's figure, and one
+    // that states more than its graphs capture is refused at load
+    // (`ServeConfig::validate`), never clamped here.
+    let max_batch = u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX);
+    let max_batch = config
+        .cuda_graph_config
+        .tiers()
+        .rows
+        .map_or(max_batch, |rows| max_batch.min(rows));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size
@@ -1311,7 +1322,7 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         max_queued_requests: scheduler
             .max_queued_requests
             .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
-        max_batch: u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX),
+        max_batch,
         max_num_batched_tokens: token_bound,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
@@ -1922,6 +1933,43 @@ mod tests {
             programs.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(512),
             "and an unstated chunk is that same bound"
+        );
+
+        // The batch the policy may hold follows the same catalog: the
+        // deployment's own batch, or the largest decode graph when it states
+        // none, and a catalog that grows with a new world moves the derived
+        // figure with it.
+        let mut config = ServeConfig::default();
+        config.cuda_graph_config.decode_batch_sizes = Some(vec![
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            NonZeroU32::new(4).unwrap(),
+            NonZeroU32::new(8).unwrap(),
+        ]);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(8),
+            "an unstated batch is the largest decode graph the deployment captured"
+        );
+        config
+            .cuda_graph_config
+            .decode_batch_sizes
+            .as_mut()
+            .unwrap()
+            .push(NonZeroU32::new(16).unwrap());
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(16),
+            "and it moves with the catalog a new world captures"
+        );
+        // A batch the deployment states below the catalog keeps its own value.
+        config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_batch"],
+            toml::Value::Integer(4)
         );
 
         // A deployment that states no token bound and no catalog states no
