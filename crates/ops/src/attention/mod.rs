@@ -547,8 +547,24 @@ impl Op for PagedAttention {
                 address(args.cum_seq_lens_q.ptr) as usize as *const i32
             }
             Phase::Decode => {
-                // A decode has one query per row, so the offsets are the row ends and the package
-                // derives nothing from them; an empty view is passed as null.
+                // A decode has one query per row, and the kernel indexes the page table and the
+                // sequence lengths by that row: a call whose query or output is shorter than the
+                // page table's rows is a row the kernel reads and writes past, which is an illegal
+                // address rather than a wrong number. The invariant was stated and not enforced.
+                for (name, view) in [("query", args.query), ("out", args.out)] {
+                    if view.shape.dim(0) != batch {
+                        return Err(Error::argument(
+                            Self::NAME,
+                            format!(
+                                "a decode has one {name} row per page-table row: {batch} rows of \
+                                 pages, {} rows of {name}",
+                                view.shape.dim(0)
+                            ),
+                        ));
+                    }
+                }
+                // The offsets are the row ends and the package derives nothing from them; an empty
+                // view is passed as null.
                 if args.cum_seq_lens_q.numel() == 0 {
                     std::ptr::null()
                 } else {

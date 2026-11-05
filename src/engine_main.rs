@@ -3518,6 +3518,25 @@ impl MainProcess {
     /// daemon addresses commands to the main process, and the mechanism keeps
     /// the rank of every request it accepted.
     fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
+        // Two of a request's commands are the connection's bookkeeping rather than a scheduler's,
+        // and this process is the connection: it forwards every event as the scheduler produces it,
+        // so there is no window of its own to release, and a takeover moves the stream between
+        // daemon connections, of which this process has exactly one — the socket the successor
+        // inherits (§7.5.1 step 4). Accepting them by name keeps the scheduler's refusal, which is
+        // right for a scheduler, from ending the epoch on the first long request: the daemon
+        // reports a consumer's position every `EVENT_WINDOW / 2` events, so a stream of a few dozen
+        // frames ended the process before this.
+        match command.kind {
+            Some(proto::request::wire::command::Kind::Consumed(_))
+            | Some(proto::request::wire::command::Kind::Takeover(_)) => {
+                tracing::debug!(
+                    request = command.request,
+                    "a request's connection bookkeeping belongs to this process, not a scheduler"
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
         // A command names its request, not the scheduler serving it, so the rank is read from the
         // stream the submission answered with. A request that is not in flight here has already
         // ended: a cancel or a stop for it is a no-op, not a fault, and ending an epoch because a
