@@ -187,15 +187,40 @@ else
         local recorded_txt=$2
         shift 2
         : >"$recorded_txt"
+        : >"$recorded_txt.refusals"
+        : >"$recorded_txt.build"
         for cond in false true; do
             for point in $points; do
                 r_canvas=${point%%:*}
                 r_clip=${point##*:}
-                cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
+                # The recorder drives the components one at a time and, when one cannot be driven,
+                # names it and carries on with the rest. So a refusal is a hole in the recorded set
+                # and never a row mismatch: the subset check below would pass with that component's
+                # rows absent, which is a smaller number where a defect was. Both streams are kept
+                # and a refusal is reported and failed on.
+                if cargo run -q -p minimax-h3 --example record -- --root "$root" --component all \
                     --clip "$r_clip" --raster "$r_canvas" --tokens 4096 \
                     --track "$(python3 -c "print(round($r_clip * 40 / 24) * 800)")" \
                     --elements 123456 --types "$types" --extents "$extents" --conditioned "$cond" \
-                    "$@" 2>/dev/null | grep -P '\t' >>"$recorded_txt" || true
+                    "$@" >"$recorded_txt.out" 2>"$recorded_txt.err"; then
+                    :
+                fi
+                grep -P '\t' "$recorded_txt.out" >>"$recorded_txt" || true
+                grep -h '^# refused: ' "$recorded_txt.out" 2>/dev/null \
+                    | sed "s|^|$r_canvas clip $r_clip cond $cond: |" >>"$recorded_txt.refusals" || true
+                if ! grep -qP '\t' "$recorded_txt.out"; then
+                    # A point that drew nothing drew nothing for one of two reasons, and they are
+                    # not the same claim: the example did not build (the tree moved under this run,
+                    # which a shared worktree does), or the model refused. A build failure reported
+                    # as a refusal would send a reader to the model for the compiler's line.
+                    if grep -q '^error\[E\|^error: could not compile' "$recorded_txt.err" 2>/dev/null; then
+                        grep -m1 '^error' "$recorded_txt.err" \
+                            | sed "s|^|$r_canvas clip $r_clip cond $cond DID NOT BUILD: |" >>"$recorded_txt.build" || true
+                    else
+                        sed -n '1p' "$recorded_txt.err" 2>/dev/null \
+                            | sed "s|^|$r_canvas clip $r_clip cond $cond drew nothing: |" >>"$recorded_txt.refusals" || true
+                    fi
+                fi
             done
         done
         cut -f1,2 "$recorded_txt" | grep -v '^#' | sort -u >"$recorded_txt.rows"
@@ -214,7 +239,18 @@ else
                 fi
                 printf '%s\n' "$row"
             done >"$recorded_txt.missing"
-        echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s)"
+        # The two `--conditioned` settings are two deployments behind one denominator (seven fixed
+        # harnesses and one of two), so the line states both settings rather than letting a reader
+        # take the total for one deployment's harness count.
+        echo "   $(wc -l <"$recorded_txt.rows") row(s) recorded of $(wc -l <"$recorded_txt.file.rows") stated at $(echo "$points" | wc -w) point(s), both --conditioned settings"
+        if [ -s "$recorded_txt.build" ]; then
+            sort -u "$recorded_txt.build" | head -2 | sed 's/^/     BUILD: /'
+            fail "the record example did not build at $(sort -u "$recorded_txt.build" | wc -l) point(s): the tree moved under this run, and no row of it is a statement about the model"
+        fi
+        if [ -s "$recorded_txt.refusals" ]; then
+            sort -u "$recorded_txt.refusals" | head -4 | sed 's/^/     REFUSED: /'
+            fail "the recorder could not drive ${fixture_path##*/} at $(sort -u "$recorded_txt.refusals" | wc -l) point(s), so its rows are absent from the count above"
+        fi
         if [ -s "$recorded_txt.missing" ]; then
             sed 's/^/     NOT IN THE FILE: /' "$recorded_txt.missing" | head -6
             # The file's own name is taken by parameter expansion: a command substitution
