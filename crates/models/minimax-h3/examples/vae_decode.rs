@@ -2439,7 +2439,7 @@ fn convert_latents(bytes: &[u8], held: u8, dtype: DType) -> Result<Vec<u8>> {
         let value = f32::from_le_bytes(element.try_into().unwrap_or_default());
         match dtype {
             DType::F16 => out.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
-            DType::BF16 => out.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::BF16 => out.extend_from_slice(&nn::weights::f32_to_bf16(value).to_le_bytes()),
             DType::F32 => out.extend_from_slice(&value.to_le_bytes()),
             other => {
                 return Err(Failure::message(format!(
@@ -2477,7 +2477,7 @@ fn pattern_latents(
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
         match dtype {
             DType::F16 => bytes.extend_from_slice(&nn::weights::f32_to_half(value).to_le_bytes()),
-            DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::BF16 => bytes.extend_from_slice(&nn::weights::f32_to_bf16(value).to_le_bytes()),
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             other => {
                 return Err(Failure::message(format!(
@@ -2487,18 +2487,6 @@ fn pattern_latents(
         }
     }
     Ok(bytes)
-}
-
-/// The nearest bfloat16 bit pattern of `value`: the high half of its float32, rounded half to even.
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let upper = (bits >> 16) as u16;
-    let remainder = bits & 0xffff;
-    if remainder > 0x8000 || (remainder == 0x8000 && upper & 1 == 1) {
-        upper.wrapping_add(1)
-    } else {
-        upper
-    }
 }
 
 /// Pack `[channels, frames, height, width]` float16 into the rows this decoder reads, in tile order.
