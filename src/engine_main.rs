@@ -557,6 +557,24 @@ pub(crate) fn run(
 /// each executor thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
+/// How many of a request's events this process keeps for a takeover to replay.
+///
+/// The event window is the credit a consumer reports in, not the distance it can be behind by:
+/// this process writes every event as it is produced, the daemon files them without bound, and the
+/// body writes them to a socket the client drains at its own speed, so at a fast decode a response
+/// that stops reading is tens of events behind. The pause is that case at its sharpest - a
+/// predecessor's consumer stops at the pause while this process goes on producing - and it begins
+/// before this process has an attached front to tell it so, so the wide bound is the ordinary one
+/// and pruning on a consumer's report is what keeps the journal small in service.
+///
+/// **It is a memory budget, not a protocol bound.** An event is a token or a scheduling fact,
+/// about 100 bytes with its wire form: 4096 of them is roughly 400 KB for one request, so a
+/// deployment whose every stream stalls at the bound spends about 50 MB at 128 streams. Raising it
+/// buys a longer stall before a takeover is refused; it does not change what the refusal means. A
+/// takeover whose position is older than what is kept is refused by name rather than served as a
+/// stream with a hole in it.
+pub(crate) const HANDOVER_JOURNAL: usize = 4096;
+
 /// One admitted request and the connection its events belong to.
 ///
 /// A request belongs to the daemon front that submitted it until a `Takeover`
@@ -581,31 +599,14 @@ struct Served {
     /// The events written to a front that a takeover from an earlier position
     /// has to replay, by their position.
     ///
-    /// Bounded by [`KEPT_EVENTS`], not by the event window the consumer's credit
-    /// names: this process hands every event to the daemon as it is produced and
-    /// the daemon files them into a channel it drains at the client's pace, so
-    /// the consumer can be further behind the producer than any window. The
-    /// events the consumer reported consumed are dropped as they are reported.
+    /// Bounded by [`HANDOVER_JOURNAL`], not by the event window the consumer's
+    /// credit names: this process hands every event to the daemon as it is
+    /// produced and the daemon files them into a channel it drains at the
+    /// client's pace, so the consumer can be further behind the producer than any
+    /// window. The events the consumer reported consumed are dropped as they are
+    /// reported.
     kept: std::collections::VecDeque<(u64, proto::request::wire::Event)>,
 }
-
-/// How many events one request's journal keeps for a takeover to replay.
-///
-/// This is a memory guard, not a protocol bound. It has to exceed every backlog
-/// a consumer can be behind by, and that backlog is not the event window: the
-/// daemon's reader files events without bound and the body writes them to a
-/// socket the client drains at its own speed. At 25 ms a decoded token the
-/// backlog reaches tens of events on an ordinary connection — which is exactly
-/// the range a window-sized journal drops, silently losing the tokens a handover
-/// was meant to carry. A request that reaches this bound has a consumer that
-/// stopped; the takeover logs the gap when it is asked for one.
-///
-/// **It is a memory budget, not a number.** An event is a token or a scheduling
-/// fact, about 100 bytes with its wire form: 4096 of them is roughly 400 KB for
-/// one request, so a deployment whose every stream stall at the bound spends
-/// about 50 MB at 128 streams. Raising it buys a longer stall before a takeover
-/// would have to state a gap; it does not change what a gap means.
-const KEPT_EVENTS: usize = 4096;
 
 pub(crate) struct MainProcess {
     control: Control,
@@ -1744,9 +1745,15 @@ impl MainProcess {
     fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
         // §7.3's steps are answered here. A run that stops between two of them needs to know which
         // one was answered last, and the daemon's own log of its commands is not this side's.
+        // The reason travels with the status, and a run that reads only this log needs it too.
+        let failure = match &status {
+            ProgramStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
+            _ => String::new(),
+        };
         tracing::info!(
             status = status_name(&status),
             to_peer = reply.is_some(),
+            failure,
             "answering the epoch's program layer"
         );
         if let Some(rank) = reply {
@@ -2657,8 +2664,10 @@ impl MainProcess {
                     // that never answers is not a device that never answered, and the previous
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
-                    let policy =
-                        matches!(poll_answers(&precopy.policies), Some(StageFailure::Pending));
+                    let policy = matches!(
+                        poll_answers(&mut precopy.policies),
+                        Some(StageFailure::Pending)
+                    );
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -2679,7 +2688,7 @@ impl MainProcess {
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
-                match poll_answers(&precopy.policies) {
+                match poll_answers(&mut precopy.policies) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Executors(submissions);
                         self.precopy = Some(precopy);
@@ -2843,7 +2852,7 @@ impl MainProcess {
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            PrecopyStage::Shadow(answers) => {
+            PrecopyStage::Shadow(mut answers) => {
                 // A shadow step runs inside a batch the scheduler forms from its resident requests.
                 // An engine with none forms no batch, so the step never runs and nothing is
                 // compared - and a comparison nobody made is how a wrong kernel reaches a
@@ -2860,7 +2869,7 @@ impl MainProcess {
                 }
                 // The shadow pass runs on the scheduler's own thread, one step of the batches it
                 // formed, so the serve pass polls it rather than waiting (§2.4).
-                match poll_answers(&answers) {
+                match poll_answers(&mut answers) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Shadow(answers);
                         self.precopy = Some(precopy);
@@ -3761,10 +3770,10 @@ impl MainProcess {
                 return Ok(());
             }
             Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
-                let Some(served) = self
+                let Some(index) = self
                     .streams
-                    .iter_mut()
-                    .find(|served| served.request == command.request)
+                    .iter()
+                    .position(|served| served.request == command.request)
                 else {
                     // A handover's takeover names a request this process kept running for it:
                     // one it does not hold is either a request that ended first or a front that
@@ -3781,24 +3790,49 @@ impl MainProcess {
                 // predecessor produced past it is replayed, because its own consumer stopped
                 // reading at the pause.
                 //
-                // A position older than the journal is a gap the successor would serve as if it
-                // were continuous, so the gap is stated: nothing below can fill it, and the count
-                // the client reads is the only other place it would appear.
-                if let Some((oldest, _)) = served.kept.front()
-                    && *oldest > takeover.events + 1
-                {
-                    tracing::warn!(
-                        request = command.request,
-                        front,
-                        from = takeover.events,
-                        oldest = *oldest,
-                        lost = *oldest - takeover.events - 1,
-                        "a takeover names a position this process no longer holds: the events \
-                         between are lost"
-                    );
+                // The journal and the position are read out before the process is borrowed again:
+                // a refusal writes to a front, and the stream is a field of the same process.
+                let kept = self.streams[index].kept.clone();
+                let sent = self.streams[index].sent;
+                // A position older than the journal cannot be replayed: the events between it and
+                // the oldest one kept were dropped, and handing the successor what is left is a
+                // stream that skips tokens with nothing saying so. It is refused, naming the two
+                // positions and how far behind the consumer was, so the daemon ends the response
+                // instead of serving a body with a hole in it.
+                if let (Some((oldest, _)), true) = (kept.front(), sent > takeover.events) {
+                    if takeover.events + 1 < *oldest {
+                        let oldest = *oldest;
+                        let behind = sent - takeover.events;
+                        tracing::error!(
+                            request = command.request,
+                            front,
+                            from = takeover.events,
+                            oldest,
+                            sent,
+                            behind,
+                            "a takeover names a position this process no longer holds: the \
+                             consumer was more events behind than the journal kept"
+                        );
+                        self.reject(
+                            front,
+                            command.request,
+                            proto::request::RejectionKind::Overloaded,
+                            format!(
+                                "the request could not be taken over: its consumer's position \
+                                 {} is {} event(s) behind, and this process kept the last {} of \
+                                 them from position {} - the handover produced more events of \
+                                 this request than a pause may",
+                                takeover.events,
+                                behind,
+                                kept.len(),
+                                oldest,
+                            ),
+                        );
+                        return Ok(());
+                    }
                 }
-                let replay = replay_after(&served.kept, takeover.events);
-                served.front = front;
+                let replay = replay_after(&kept, takeover.events);
+                self.streams[index].front = front;
                 for event in replay {
                     tracing::debug!(
                         request = command.request,
@@ -4226,6 +4260,9 @@ impl MainProcess {
         // The streams are taken out so that sending an event can borrow the process: the map is
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
+        // Whether a handover is open, read once for the pass: a second front that has attached and
+        // not yet taken its requests over. The journal's bound is wider while it is, because a
+        // predecessor's consumer stops reading at the pause while this process keeps producing.
         let mut running = Vec::with_capacity(streams.len());
         for mut served in streams {
             let id = served.request;
@@ -4258,7 +4295,12 @@ impl MainProcess {
                         // The position this event is written at, and the copy a takeover from an
                         // earlier position replays.
                         served.sent += 1;
-                        keep_event(&mut served.kept, served.sent, wire.clone());
+                        keep_event(
+                            &mut served.kept,
+                            served.sent,
+                            wire.clone(),
+                            HANDOVER_JOURNAL,
+                        );
                         self.send_event(
                             served.front,
                             proto::request::wire::from_engine::Kind::Event(wire),
@@ -4555,13 +4597,11 @@ impl MainProcess {
             );
         }
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.switchover_policy(),
                 self.watchdog.stall_bound(),
                 "the policy switchover",
-            ) {
-                tracing::error!(%error, "switching the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4577,13 +4617,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.revert_policy(),
                 self.watchdog.stall_bound(),
                 "the policy revert",
-            ) {
-                tracing::error!(%error, "reverting the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4708,11 +4746,15 @@ fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
 /// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
 /// may not wait on a stage whose length the daemon's load decides (§2.4).
 fn poll_answers(
-    answers: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+    answers: &mut Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
 ) -> Option<StageFailure> {
-    for receiver in answers {
+    // An answer is taken once and its sender is gone after it, so a receiver that answered leaves
+    // the list: polling it again would read a scheduler that finished as one that was lost.
+    while let Some(receiver) = answers.first() {
         match receiver.try_recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                answers.remove(0);
+            }
             Ok(Err(reason)) => return Some(StageFailure::Failed(reason)),
             Err(crossbeam_channel::TryRecvError::Empty) => return Some(StageFailure::Pending),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -4723,6 +4765,23 @@ fn poll_answers(
         }
     }
     None
+}
+
+/// Logs one scheduler's answer to a policy step when it comes, off the control thread.
+///
+/// A scheduler answers at its next batch boundary, and it reaches that boundary only while the
+/// control thread drains what it sends: a control thread that waited here held the scheduler it
+/// waited for, and a switchover under traffic stood still for the whole stall bound (§2.4).
+fn report_policy_answer(
+    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
+    bound: Duration,
+    what: &'static str,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = answer(receiver, bound, what) {
+            tracing::error!(%error, "a scheduling policy step failed");
+        }
+    });
 }
 
 /// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
@@ -4764,14 +4823,15 @@ fn replay_after(
         .collect()
 }
 
-/// Journals one event at `position`, dropping the oldest past [`KEPT_EVENTS`].
+/// Journals one event at `position`, dropping the oldest past `bound`.
 fn keep_event(
     kept: &mut std::collections::VecDeque<(u64, proto::request::wire::Event)>,
     position: u64,
     event: proto::request::wire::Event,
+    bound: usize,
 ) {
     kept.push_back((position, event));
-    while kept.len() > KEPT_EVENTS {
+    while kept.len() > bound {
         kept.pop_front();
     }
 }
@@ -6979,7 +7039,7 @@ mod tests {
         let backlog = proto::request::EVENT_WINDOW as usize * 3;
         let mut kept = std::collections::VecDeque::new();
         for at in 1..=backlog as u64 {
-            keep_event(&mut kept, at, event(9, "e"));
+            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
         }
 
         assert!(
@@ -6994,7 +7054,7 @@ mod tests {
         );
     }
 
-    /// The journal drops its oldest only past [`KEPT_EVENTS`], and what it holds
+    /// The journal drops its oldest only past its bound, and what it holds
     /// is replayable from any position inside it.
     #[test]
     fn the_journal_is_bounded_by_its_own_bound_and_not_by_the_window() {
@@ -7007,20 +7067,24 @@ mod tests {
             )),
         };
         let mut kept = std::collections::VecDeque::new();
-        let positions = KEPT_EVENTS as u64 + 10;
+        let positions = HANDOVER_JOURNAL as u64 + 10;
         for at in 1..=positions {
-            keep_event(&mut kept, at, event(9, "e"));
+            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
         }
 
-        assert_eq!(kept.len(), KEPT_EVENTS, "the journal keeps its own bound");
+        assert_eq!(
+            kept.len(),
+            HANDOVER_JOURNAL,
+            "the journal keeps its own bound"
+        );
         assert_eq!(
             kept.front().map(|(position, _)| *position),
-            Some(positions - KEPT_EVENTS as u64 + 1),
+            Some(positions - HANDOVER_JOURNAL as u64 + 1),
             "the oldest event kept is the one at the bound"
         );
         assert_eq!(
             replay_after(&kept, 0).len(),
-            KEPT_EVENTS,
+            HANDOVER_JOURNAL,
             "a takeover from before the journal replays all of it"
         );
     }

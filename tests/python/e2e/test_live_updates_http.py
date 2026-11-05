@@ -1464,7 +1464,9 @@ def _restart_while_streaming(
         assert numbers == list(range(1, len(numbers) + 1)), (
             f"stream {index} broke: {''.join(read)[:400]}"
         )
-        assert len(numbers) > before_restart[index], (
+        # `before_restart` counts frames, and a frame need not hold a number.
+        before = re.findall(r"\d+", "".join(read[: before_restart[index]]))
+        assert len(numbers) > len(before), (
             f"stream {index} carried no number after the restart"
         )
         assert numbers and numbers[-1] >= last // 2, (
