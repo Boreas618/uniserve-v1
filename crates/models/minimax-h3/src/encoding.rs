@@ -3450,14 +3450,18 @@ mod tests {
         };
         let plan = video_encoder_tile_arena(&config, raster).expect("the plan");
         // A tiled driver looks every entry up by name, so what a plan owes the driver is its set of
-        // names: the tile's pad, and per level the pair its blocks alternate between and the working
-        // buffer each block reads back, a projection exactly where the level widens, and the pad and
-        // strided output exactly where it downsamples. Nothing else, and no name twice. This is stated
-        // as the set and not as a count because a count of a formula is a second copy of the plan's
-        // arithmetic, and the copy is what drifts - the input convolution's output is `level0.first`,
-        // not a buffer of its own.
+        // names: the tile's pad, the input convolution's output, and per level the pair its blocks
+        // alternate between and the working buffer each block reads back, a projection exactly where
+        // the level widens, and the pad and strided output exactly where it downsamples. Nothing else,
+        // and no name twice. This is stated as the set and not as a count because a count of a formula
+        // is a second copy of the plan's arithmetic, and the copy is what drifts.
+        //
+        // `stream` is a buffer of its own even though its shape equals `level0.first`'s: the input
+        // convolution writes the stream and the first block writes `level0.first`, and a plan that
+        // named only the second was short by exactly one of them - 570,425,344 B at 17 frames of
+        // 768x768, which is what a device run stopped on.
         let extents = stack.extents(raster);
-        let mut expected = vec!["padded".to_owned()];
+        let mut expected = vec!["padded".to_owned(), "stream".to_owned()];
         for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
             let width = stack.widths[index];
             let input = match index {
