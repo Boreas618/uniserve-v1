@@ -199,11 +199,15 @@ impl Output {
     /// A deployment states the rates and nothing else: the installation is the environment's
     /// (`MediaConfig::from_env`, which is `UNISERVE_FFMPEG` or the prefix the crate was built
     /// against), so a plan constructs this in one call and the lane actions borrow it.
-    pub fn from_env(rates: Rates) -> Self {
-        Self::new(
-            Arc::new(media::MediaRunner::new(media::MediaConfig::from_env())),
-            rates,
-        )
+    ///
+    /// **The codecs are required here rather than at the first request.** A host whose FFmpeg was
+    /// built without the two encoders the artifact needs cannot serve a video at all, and the refusal
+    /// belongs where the deployment is assembled - named, before any weight is loaded - instead of at
+    /// the end of a request whose decode, denoise and audio all succeeded.
+    pub fn from_env(rates: Rates) -> Result<Self> {
+        let media = media::MediaRunner::new(media::MediaConfig::from_env());
+        media.require_codecs()?;
+        Ok(Self::new(Arc::new(media), rates))
     }
 
     pub fn new(media: Arc<media::MediaRunner>, rates: Rates) -> Self {
@@ -343,6 +347,55 @@ fn request_id(request: RequestKey) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request's two units and its track assemble into one MP4.
+    ///
+    /// This is the artifact a served `t2va` request ends with, and the one thing this module can
+    /// prove without a device: the three stages `MediaWork` runs, in the order the engine runs them,
+    /// over the bytes a postprocessor and an audio decode publish. The assertions are the
+    /// container's own - its file type box, its media-data box, and a length no single unit's bytes
+    /// reach - rather than this code's idea of what an encoder produced.
+    ///
+    /// It needs the runtime's `libx264` and `aac`, as `crates/media`'s own tests do: a host without
+    /// them cannot serve a video at all, and `Output::from_env` refuses there by name.
+    #[test]
+    fn a_requests_units_and_track_assemble_into_one_mp4() {
+        let output = Output::from_env(Rates {
+            frame_rate: 24,
+            audio_rate: 32_000,
+        })
+        .expect("the runtime provides libx264 and aac");
+        let request = RequestKey::new(0, ipc::RequestId(7), 0);
+        let units = [17_u32, 22];
+        let (height, width) = (16_u32, 16_u32);
+        let mut unit_bytes = 0_usize;
+        for frames in units {
+            let pixels = vec![0x40_u8; frames as usize * height as usize * width as usize * 3];
+            unit_bytes += pixels.len();
+            output
+                .encode_clip(request, &units, (frames, height, width), &pixels)
+                .expect("a unit encodes");
+        }
+        let samples = output.rates.samples(&units);
+        let pcm = vec![0_u8; samples * 2 * size_of::<i16>()];
+        output
+            .encode_track(request, &pcm, samples)
+            .expect("a track encodes");
+        let mp4 = output.finish(request).expect("the assembly ends");
+        assert_eq!(&mp4[4..8], b"ftyp", "an MP4 begins with its file type box");
+        assert!(
+            mp4.windows(4).any(|box_type| box_type == b"moov"),
+            "the container holds its movie box"
+        );
+        assert!(
+            mp4.windows(4).any(|box_type| box_type == b"mdat"),
+            "the container holds its media data"
+        );
+        assert!(
+            mp4.len() < unit_bytes,
+            "a compressed artifact is smaller than the frames it was made from"
+        );
+    }
 
     /// The soundtrack covers every frame of every unit at the artifact's rate.
     ///
