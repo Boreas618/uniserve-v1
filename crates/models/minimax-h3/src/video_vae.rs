@@ -2215,6 +2215,17 @@ pub(crate) mod tests {
         // The position table is axis-major over the largest tile's rows, and the register rows and the
         // trailing zero row carry no coordinate.
         let tile = largest_tile(&config, raster.height, raster.width).expect("a tile");
+        // **The table the decoder publishes is a tile's, and every entry is a row of the tile-sized
+        // stream the decode scatters into.** That bound is the whole reason the placement is in bounds:
+        // a clip-built table names the clip's rows, up to nine times a tile's on a served canvas, and
+        // `Rows::replace` writes `destination[index]` with no row check of its own.
+        let tile_rows = voxel_rows(&config, AttentionKind::Dense, tile.height, tile.width)
+            .expect("the tile's rows");
+        assert_eq!(tile_rows.len() as u64, tile.voxels());
+        assert!(
+            tile_rows.iter().all(|row| u64::from(*row) < tile.rows()),
+            "every entry is a row of the tile's stream, and the stream is `tile.rows()` tall"
+        );
         let table = positions(&tile).expect("positions");
         assert_eq!(table.len() as u64, 3 * tile.rows());
         for channel in 0..3u64 {
