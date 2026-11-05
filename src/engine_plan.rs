@@ -850,11 +850,40 @@ impl EpochPlan {
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))
             }
-            ModelClass::Media => bail!(
-                "{} declares model class MiniMaxH3ModularPipeline: this build resolves the class \
-                 and has no media load path yet, so nothing can bind it",
-                self.checkpoint.display()
-            ),
+            ModelClass::Media => {
+                // §8: the deployment's own representation, which the daemon resolved against the
+                // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
+                // main process as `auto`: it arrives as the checkpoint's own type).
+                let opened = nn::Checkpoint::open(&self.checkpoint)?;
+                let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
+                let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+                // **The pipeline's two parallel degrees are the deployment's, and one of them has
+                // no field in the build config yet.** A causal-language deployment splits its
+                // weights and its experts; the media class splits the denoiser's sequence (Ulysses)
+                // and the text encoder's tensors. Until the deployment states the Ulysses degree,
+                // the two agree only at one rank, so a wider deployment is refused here by name
+                // rather than served with a partition nobody stated.
+                let width = usize::try_from(placement.tensor_parallel)
+                    .context("a parallel width wider than this process addresses")?;
+                if width != 1 {
+                    bail!(
+                        "this rank is one of {width} and the media class's Ulysses degree is the \
+                         deployment's to state: the build config carries the tensor-parallel width \
+                         and no sequence degree, so a partition of {width} would be assumed rather \
+                         than declared"
+                    );
+                }
+                let partition = minimax_h3::Partition::new(&config, 1, 1, 0, 0)?;
+                let dtype = match self.build.dtype {
+                    proto::request::ModelDtype::Float16 => DType::F16,
+                    proto::request::ModelDtype::BFloat16 => DType::BF16,
+                    proto::request::ModelDtype::Float32 => DType::F32,
+                };
+                let model = minimax_h3::load(&opened, partition, Some(dtype), &mut loader)?;
+                let served = Served::Media(Arc::new(model));
+                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                Ok((served, memory, info, graph))
+            }
         }
     }
 
