@@ -46,6 +46,7 @@ which of the two it is.
 """
 
 import argparse
+import re
 import sys
 from collections import Counter
 
@@ -115,6 +116,52 @@ def statements(path):
     return rasters, text
 
 
+def sample_of(path):
+    """The sample a walk was generated at, as `{dimension: [numbers]}`.
+
+    A walk's header states the question it was asked: clip lengths, rasters, prompt
+    lengths, packed rows, trajectory elements, audio tracks. A key carrying one of
+    those numbers is a key the request decides, so a gap in it is a different
+    question asked of the file rather than a row the file lacks - and reading the
+    statement is what tells the two apart without a hand-written list of which
+    operators vary.
+    """
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            if "clip lengths:" not in line and "raster sizes:" not in line:
+                continue
+            dimensions = {}
+            for name, value in re.findall(
+                r"([A-Za-z][A-Za-z ]*):\s*(\[[^\]]*\])", line
+            ):
+                numbers = [
+                    int(part) for part in re.split(r"\D+", value) if part
+                ]
+                if numbers:
+                    dimensions[name.strip()] = numbers
+            return dimensions
+    return {}
+
+
+# The key fields that name an extent the request decides: a column count, a row count, an
+# element count, a table's rows, a fade's extent. A number under one of these that equals a
+# number in the walk's own header is the walk's question, not the file's answer - while the
+# same number under `block`, `head_dim`, `block_pixels` or `tile` is a program constant, and
+# reading only these fields is what keeps a clip length from matching a head width.
+EXTENT_FIELDS = ("columns", "elements", "rows", "extent", "samples", "tokens")
+
+
+def extents_in(key):
+    """The numbers a key states under one of `EXTENT_FIELDS`, with the field's name."""
+    found = []
+    for field in EXTENT_FIELDS:
+        for match in re.finditer(rf"(?:^|_){field}_(\d+)", key):
+            found.append((field, int(match.group(1))))
+    return found
+
+
 def by_shape(args):
     """Every shape the walks produced, against the shapes the file holds at any element type."""
     shapes = {}
@@ -153,6 +200,23 @@ def by_shape(args):
     print(f"walk statement: {stated or 'none'}")
     print(f"fixture statement: {fixture_text or 'none'}")
 
+    # The walk's own sample: a gap is a defect only when both sides were asked the
+    # same question, so the question is printed beside the answer.
+    sample = {}
+    for path in args.walk:
+        for name, values in sample_of(path).items():
+            sample.setdefault(name, sorted(set(values)))
+    if sample:
+        print(
+            "walk sample: "
+            + ", ".join(
+                f"{name} {values}" for name, values in sorted(sample.items())
+            )
+        )
+    sampled = {
+        number: name for name, values in sample.items() for number in values
+    }
+
     missing = sorted(set(shapes) - held)
     canvas = [shape for shape in missing if shape[0] in CANVAS_CLASS]
     for operator, key in missing:
@@ -164,11 +228,23 @@ def by_shape(args):
                 for element in shapes[(operator, key)][path]
             }
         )
-        mark = (
-            "  RASTER-DEPENDENT"
-            if operator in CANVAS_CLASS
-            else "  MISSING at every type"
+        carried = sorted(
+            {
+                (field, number)
+                for field, number in extents_in(key)
+                if number in sampled
+            }
         )
+        if carried:
+            asked = ", ".join(
+                f"{field} {number} = the walk's {sampled[number]}"
+                for field, number in carried
+            )
+            mark = f"  SAMPLE-DEPENDENT ({asked})"
+        elif operator in CANVAS_CLASS:
+            mark = "  RASTER-DEPENDENT"
+        else:
+            mark = "  MISSING at every type"
         print(f"{mark}: {operator}\t{key}")
         print(f"    launched at {', '.join(launched_at)} by {', '.join(where)}")
     if canvas:
@@ -182,11 +258,22 @@ def by_shape(args):
             " file describes."
         )
     if missing:
+        # Three answers, not one: a row the file lacks, a row the *request* decides, and - where
+        # the walk states no sample - a difference nobody can classify yet.
+        # A shape can be both: `scaled_add ... columns_4096` is a canvas-class operator whose
+        # width is the walk's prompt length. The sample answers it first, since it is the more
+        # specific claim - and a shape counted twice would make the remainder too small.
+        dependent = sorted(
+            shape
+            for shape in missing
+            if any(number in sampled for _, number in extents_in(shape[1]))
+        )
+        canvas = sorted(set(canvas) - set(dependent))
+        real = len(missing) - len(canvas) - len(dependent)
         print(
             f"\n{len(missing)} shape(s) a walk produced and the file cannot build at any element "
-            "type; "
-            f"{len(missing) - len(canvas)} of them at any raster: each of those stops a run at "
-            "`no kernel`"
+            f"type: {real} at any raster (each stops a run at `no kernel`), "
+            f"{len(canvas)} raster-class, {len(dependent)} the walk's own sample"
         )
         return 1
     print(
