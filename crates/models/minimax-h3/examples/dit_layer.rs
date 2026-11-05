@@ -665,6 +665,145 @@ fn stage_denoise(args: &Args) -> Result<()> {
         + (text_rows + u64::from(shape.condition_rows) + 1) * hidden * 2
         + video_elements * 4
         + audio_rows.unwrap_or(0) * audio_width * 4;
+    // The schedule the checkpoint states, and how much of it this case runs - before the allocation,
+    // because it is host data and the case states it. The case may shorten the schedule and may not
+    // change it: the steps are the schedule's own, each naming its index and the count of the grid
+    // it belongs to.
+    let schedule = block.schedule();
+    let steps = schedule.steps(Modality::Video)?;
+    let num_steps = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+    if num_steps != block.evaluations() {
+        return Err(Failure::message(format!(
+            "the schedule states {num_steps} evaluations and the block was loaded for {}",
+            block.evaluations()
+        )));
+    }
+    let evaluations = args.evaluations.unwrap_or(num_steps);
+    if evaluations > num_steps {
+        return Err(Failure::message(format!(
+            "the case asks {evaluations} evaluations and the checkpoint's {} grid has {num_steps}",
+            schedule.spec().grid.kind()
+        )));
+    }
+    if evaluations == 0 {
+        return Err(Failure::message(
+            "the case asks no evaluations: `e0` would be its only state, and a stage that draws \
+             and stops says nothing about the schedule",
+        ));
+    }
+    println!(
+        "schedule: {} grid, {num_steps} evaluations, running {evaluations}, seed {}",
+        schedule.spec().grid.kind(),
+        args.seed
+    );
+
+    // The prefix source's row count, stated before the case that carries it: it is
+    // `text_rows + condition_rows + 1` (the prompt, one per packed condition row, and the
+    // zero row every padding row gathers), and it is derivable the moment the layout is.
+    let prefix_rows = text_rows + u64::from(shape.condition_rows) + 1;
+
+    // The case, before the allocation and before the trajectory. It names the run: a stop in the
+    // arena, in the draw or inside the loop is read against it, and the reference producer can be
+    // given the same case whatever this side got as far as. Everything the case states is host data
+    // - the layout's extents, the schedule's grid, the seed and the counts - so nothing here waits
+    // for a device to say what the run would have been.
+    let grid = schedule.spec().grid.kind();
+    let directory = args.out.join("denoiser");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // A stage reuses one output directory across tips, so a trajectory file the last run wrote is
+    // still there when this one stops earlier than it did - and a comparison would then pair this
+    // run's draw with that run's evaluations and report a page no run produced. The files this
+    // stage writes are cleared first, and the count is printed so a reader can see a stale tree
+    // being cleaned rather than wonder where its numbers went. Everything else in the directory
+    // (`case.json`, `walk.txt`, the prefix source) is rewritten by this run anyway.
+    let stale = clear_trajectory(&directory)?;
+    if stale > 0 {
+        println!("cleared {stale} trajectory files from the previous run");
+    }
+    // The case's `schedule` is the checkpoint's own word for its grid - `ScheduleGrid::kind()`,
+    // which is what the checkpoint's config states - and not the reference's class name
+    // (`UniformGrid`, `BlockGrid`, `PddGrid`). One vocabulary, and it is the one the model reads:
+    // the field's job is to make a FastH3 contract read as another grid a refusal rather than a
+    // page, and a spelling difference between two tools would be the same failure with none of the
+    // meaning.
+    // The latent buffer's extents, which the case states: the same four numbers the arena's video
+    // tensor is built with below, taken from the layout so the case does not need an allocation.
+    let video_shape = format!(
+        "[{}, {}, {}, {}]",
+        video.channels, video.frames, video.height, video.width
+    );
+    let case = format!(
+        "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
+         \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
+         \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
+         \"schedule\": {grid:?}, \"attention\": \"{attention_kind}\", \
+         \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \"dtype\": \"{dtype}\", \
+         \"video_shape\": {}}}\n",
+        args.width,
+        args.height,
+        frames,
+        request.text_tokens,
+        shape.condition_rows,
+        denoiser_config.transformer.num_hidden_layers,
+        args.seed,
+        video_shape,
+    );
+    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
+    // comma would otherwise cost a device run to discover, and the refusal names the file.
+    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
+        Failure::message(format!(
+            "the case this stage states is not JSON ({error}): {case}"
+        ))
+    })?;
+    std::fs::write(directory.join("case.json"), case)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The arrangement, stated beside the case in the object the reference's producer writes too
+    // (`dump_denoiser.py`, `denoiser/layout.json`). The trajectory files hold the latents, whose
+    // shapes do not depend on the packed row count: two sides running different layouts write
+    // files of the same shape and different trajectories, which a comparator can only report as an
+    // arithmetic difference. This statement is what lets it refuse the pair instead
+    // (`compare_trajectory.py`), and the line below prints the same numbers for a reader.
+    // The grid and the step count are the third thing a pair can differ in: two sides can agree on
+    // every layout field and still have run different schedules - a FastH3 student's `blocks` grid
+    // against the base `uniform` one, or a shortened run against a whole one - and their
+    // trajectories then differ everywhere for a reason that is not arithmetic. Stated here, in the
+    // model's own word for the grid, so the comparator refuses that pair instead of tabulating it.
+    let arrangement = format!(
+        "{{\"frames\": {frames}, \"canvas\": [{}, {}], \"text_rows\": {}, \
+         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}, \
+         \"schedule\": {grid:?}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}}}\n",
+        canvas.height,
+        canvas.width,
+        packing.text_rows,
+        packing.condition_rows,
+        packing.video_rows,
+        packing.audio_rows,
+        packing.padded_tokens,
+    );
+    // The arrangement is JSON a comparator parses, so it is parsed here first for the same reason the
+    // case is: a format-string typo would otherwise surface on the run host as a comparator refusing
+    // a file nobody can see, and the refusal names the statement instead.
+    serde_json::from_str::<serde_json::Value>(&arrangement).map_err(|error| {
+        Failure::message(format!(
+            "the layout statement this stage writes is not JSON ({error}): {arrangement}"
+        ))
+    })?;
+    std::fs::write(directory.join("layout.json"), arrangement)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The wording is the reference producer's own, so the two logs can be read side by side
+    // (`dump_denoiser.py`, the same line): a reader comparing two arrangements should not have to
+    // allow for two spellings of one statement.
+    println!(
+        "layout  {} packed rows = {} video + {} audio + {} text + {} condition \
+         ({frames} frames, {evaluations} of {num_steps} evaluations)",
+        packing.padded_tokens,
+        packing.video_rows,
+        packing.audio_rows,
+        packing.text_rows,
+        packing.condition_rows,
+    );
+
     let arena_bytes = needed.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
@@ -728,7 +867,6 @@ fn stage_denoise(args: &Args) -> Result<()> {
     //    encoder's output; the zero row is not synthetic data and pseudo-noise there would be wrong
     //    in every packed row that reads it. `text_features.h3t` holds the text segment alone,
     //    because the zero row is the runner's and the reference producer appends its own.
-    let prefix_rows = text_rows + u64::from(shape.condition_rows) + 1;
     let text_width = hidden
         * dtype
             .bytes()
@@ -805,129 +943,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
     )?;
     stream.synchronize()?;
 
-    // 9. The schedule the checkpoint states, and how much of it this case runs. The case may shorten
-    //    it and may not change it: the steps are the schedule's own, each naming its index and the
-    //    count of the grid it belongs to.
-    let schedule = block.schedule();
-    let steps = schedule.steps(Modality::Video)?;
-    let num_steps = u32::try_from(steps.len()).unwrap_or(u32::MAX);
-    if num_steps != block.evaluations() {
-        return Err(Failure::message(format!(
-            "the schedule states {num_steps} evaluations and the block was loaded for {}",
-            block.evaluations()
-        )));
-    }
-    let evaluations = args.evaluations.unwrap_or(num_steps);
-    if evaluations > num_steps {
-        return Err(Failure::message(format!(
-            "the case asks {evaluations} evaluations and the checkpoint's {} grid has {num_steps}",
-            schedule.spec().grid.kind()
-        )));
-    }
-    if evaluations == 0 {
-        return Err(Failure::message(
-            "the case asks no evaluations: `e0` would be its only state, and a stage that draws \
-             and stops says nothing about the schedule",
-        ));
-    }
-    println!(
-        "schedule: {} grid, {num_steps} evaluations, running {evaluations}, seed {}",
-        schedule.spec().grid.kind(),
-        args.seed
-    );
 
-    // 10. The case and the draw, then the evaluations. The case goes out before the trajectory: it
-    //     names the run, and a stop inside the loop is read against it.
-    let grid = schedule.spec().grid.kind();
-    let directory = args.out.join("denoiser");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
-    // A stage reuses one output directory across tips, so a trajectory file the last run wrote is
-    // still there when this one stops earlier than it did - and a comparison would then pair this
-    // run's draw with that run's evaluations and report a page no run produced. The files this
-    // stage writes are cleared first, and the count is printed so a reader can see a stale tree
-    // being cleaned rather than wonder where its numbers went. Everything else in the directory
-    // (`case.json`, `walk.txt`, the prefix source) is rewritten by this run anyway.
-    let stale = clear_trajectory(&directory)?;
-    if stale > 0 {
-        println!("cleared {stale} trajectory files from the previous run");
-    }
-    // The case's `schedule` is the checkpoint's own word for its grid - `ScheduleGrid::kind()`,
-    // which is what the checkpoint's config states - and not the reference's class name
-    // (`UniformGrid`, `BlockGrid`, `PddGrid`). One vocabulary, and it is the one the model reads:
-    // the field's job is to make a FastH3 contract read as another grid a refusal rather than a
-    // page, and a spelling difference between two tools would be the same failure with none of the
-    // meaning.
-    let case = format!(
-        "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
-         \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
-         \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
-         \"schedule\": {grid:?}, \"attention\": \"{attention_kind}\", \
-         \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \"dtype\": \"{dtype}\", \
-         \"video_shape\": {}}}\n",
-        args.width,
-        args.height,
-        frames,
-        request.text_tokens,
-        shape.condition_rows,
-        denoiser_config.transformer.num_hidden_layers,
-        args.seed,
-        format_sample(&video_latents),
-    );
-    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
-    // comma would otherwise cost a device run to discover, and the refusal names the file.
-    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
-        Failure::message(format!(
-            "the case this stage states is not JSON ({error}): {case}"
-        ))
-    })?;
-    std::fs::write(directory.join("case.json"), case)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
-    // The arrangement, stated beside the case in the object the reference's producer writes too
-    // (`dump_denoiser.py`, `denoiser/layout.json`). The trajectory files hold the latents, whose
-    // shapes do not depend on the packed row count: two sides running different layouts write
-    // files of the same shape and different trajectories, which a comparator can only report as an
-    // arithmetic difference. This statement is what lets it refuse the pair instead
-    // (`compare_trajectory.py`), and the line below prints the same numbers for a reader.
-    // The grid and the step count are the third thing a pair can differ in: two sides can agree on
-    // every layout field and still have run different schedules - a FastH3 student's `blocks` grid
-    // against the base `uniform` one, or a shortened run against a whole one - and their
-    // trajectories then differ everywhere for a reason that is not arithmetic. Stated here, in the
-    // model's own word for the grid, so the comparator refuses that pair instead of tabulating it.
-    let arrangement = format!(
-        "{{\"frames\": {frames}, \"canvas\": [{}, {}], \"text_rows\": {}, \
-         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}, \
-         \"schedule\": {grid:?}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}}}\n",
-        canvas.height,
-        canvas.width,
-        packing.text_rows,
-        packing.condition_rows,
-        packing.video_rows,
-        packing.audio_rows,
-        packing.padded_tokens,
-    );
-    // The arrangement is JSON a comparator parses, so it is parsed here first for the same reason the
-    // case is: a format-string typo would otherwise surface on the run host as a comparator refusing
-    // a file nobody can see, and the refusal names the statement instead.
-    serde_json::from_str::<serde_json::Value>(&arrangement).map_err(|error| {
-        Failure::message(format!(
-            "the layout statement this stage writes is not JSON ({error}): {arrangement}"
-        ))
-    })?;
-    std::fs::write(directory.join("layout.json"), arrangement)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
-    // The wording is the reference producer's own, so the two logs can be read side by side
-    // (`dump_denoiser.py`, the same line): a reader comparing two arrangements should not have to
-    // allow for two spellings of one statement.
-    println!(
-        "layout  {} packed rows = {} video + {} audio + {} text + {} condition \
-         ({frames} frames, {evaluations} of {num_steps} evaluations)",
-        packing.padded_tokens,
-        packing.video_rows,
-        packing.audio_rows,
-        packing.text_rows,
-        packing.condition_rows,
-    );
     write_h3t(
         &directory.join("text_features.h3t"),
         &[text_rows, hidden],
@@ -1129,11 +1145,6 @@ fn write_sample(
 }
 
 /// The video raster's extents, as the case writes them.
-fn format_sample(video: &TensorView) -> String {
-    let dims: Vec<String> = video.shape.dims().iter().map(u64::to_string).collect();
-    format!("[{}]", dims.join(", "))
-}
-
 /// Stage 2: one stack layer's arithmetic on a device.
 ///
 /// The order is the executor's, done by hand: the device and its stream, the kernels, the weights,
@@ -1246,6 +1257,41 @@ fn stage_block(args: &Args) -> Result<()> {
     //    keeping a second copy of the plan, and the forward's own reservation refuses by name if the
     //    estimate is ever short.
     let bytes = tokens * hidden * 2 * 24 + (256 << 20);
+    // The directory and the case go out before the arena: the case names the run, everything it
+    // states is host data, and a stop in the allocation or in the forward then still leaves the
+    // statement the reference producer and the comparator are run against.
+    let directory = args.out.join("denoiser");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+
+    let evaluation: i32 = 0;
+    let width = args.width;
+    let height = args.height;
+    let text_tokens = request.text_tokens;
+    let layers = args.layers;
+    let video_rows = packing.video_rows;
+    let audio_rows = packing.audio_rows;
+    let text_rows = packing.text_rows;
+    let condition_rows = packing.condition_rows;
+    let checkpoint = args.root.display().to_string();
+    let case = format!(
+        "{{\"task\": \"t2va\", \"width\": {width}, \"height\": {height}, \"frames\": {frames}, \
+         \"text_tokens\": {text_tokens}, \"layers\": {layers}, \"padded_tokens\": {tokens}, \
+         \"packed_rows\": {tokens}, \"hidden\": {hidden}, \"video_rows\": {video_rows}, \
+         \"audio_rows\": {audio_rows}, \"text_rows\": {text_rows}, \
+         \"condition_rows\": {condition_rows}, \"step\": {evaluation}, \"dtype\": \"{dtype}\", \
+         \"checkpoint\": {checkpoint:?}}}\n"
+    );
+    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
+    // comma would otherwise cost a device run to discover, and the refusal names the file.
+    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
+        Failure::message(format!(
+            "the case this stage states is not JSON ({error}): {case}"
+        ))
+    })?;
+    std::fs::write(directory.join("case.json"), case)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+
     let arena_bytes = bytes.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
@@ -1292,7 +1338,6 @@ fn stage_block(args: &Args) -> Result<()> {
     // cache's entry table is indexed at. It is printed and written into `case.json`, because the
     // reference producer runs its own stack at one step and two sides at different steps differ by
     // exactly the modulation, which reads like an arithmetic difference.
-    let evaluation: i32 = 0;
     let step = upload_i32(&stream, &arena, Shape::new(&[1]), &[evaluation])?;
     // The visibility the deployment's own state tables state: every packed query row sees the
     // request's **attended** keys and none of the padding rows. Without it the stack attends all
@@ -1349,9 +1394,6 @@ fn stage_block(args: &Args) -> Result<()> {
     // reference producer would then run today's blocks on our output and call the result a
     // comparison. The two payloads are also required to differ - two byte-identical files mean the
     // forward wrote nothing, which is a silent failure the exit code would otherwise pass.
-    let directory = args.out.join("denoiser");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     write_h3t(
         &directory.join("stack_in.h3t"),
         &[tokens, hidden],
@@ -1377,32 +1419,6 @@ fn stage_block(args: &Args) -> Result<()> {
     // would have to re-derive the packing in another language, which is a second statement of the
     // rounding - and a file whose order is not stated cannot be shown to be in the order the
     // reference ran (`compare_stack.py`).
-    let width = args.width;
-    let height = args.height;
-    let text_tokens = request.text_tokens;
-    let layers = args.layers;
-    let video_rows = packing.video_rows;
-    let audio_rows = packing.audio_rows;
-    let text_rows = packing.text_rows;
-    let condition_rows = packing.condition_rows;
-    let checkpoint = args.root.display().to_string();
-    let case = format!(
-        "{{\"task\": \"t2va\", \"width\": {width}, \"height\": {height}, \"frames\": {frames}, \
-         \"text_tokens\": {text_tokens}, \"layers\": {layers}, \"padded_tokens\": {tokens}, \
-         \"packed_rows\": {tokens}, \"hidden\": {hidden}, \"video_rows\": {video_rows}, \
-         \"audio_rows\": {audio_rows}, \"text_rows\": {text_rows}, \
-         \"condition_rows\": {condition_rows}, \"step\": {evaluation}, \"dtype\": \"{dtype}\", \
-         \"checkpoint\": {checkpoint:?}}}\n"
-    );
-    // A case is JSON that a comparator reads, so it is parsed before it is written: a misplaced
-    // comma would otherwise cost a device run to discover, and the refusal names the file.
-    serde_json::from_str::<serde_json::Value>(&case).map_err(|error| {
-        Failure::message(format!(
-            "the case this stage states is not JSON ({error}): {case}"
-        ))
-    })?;
-    std::fs::write(directory.join("case.json"), case)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let walk_path = args.out.join("walk.txt");
     walk_file.write()?;
     println!(
