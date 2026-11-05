@@ -1230,6 +1230,13 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// previous batch's replay, and the pages batch N+1 writes land in the row batch N is reading.
     /// Submit therefore states which batch the rows belong to, and a replay of another batch
     /// refuses rather than installing the wrong request's pages.
+    /// The page the dump digests: the first unit of the batch's own staged table, remembered here
+    /// because a batch that installs no new rows (a decode step on pages it already addresses) has
+    /// no staged table to read, and the pages a request reads do not move between its batches.
+    ///
+    /// Only a diagnosis reads this; it costs one `Option<u64>` and is filled where the install sees
+    /// the table, so no step pays for it.
+    cache_page: Option<u64>,
     /// What the captured attention launch was given, read from the device after the replay and
     /// printed on the device thread (`UNISERVE_RUNNER_DUMP`).
     ///
@@ -1354,6 +1361,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            cache_page: None,
             pending_attention: None,
             pending_install: None,
             pending_dump: None,
@@ -1757,7 +1765,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     );
                 }
                 if runner_dump() {
-                    let call = self.dump_attention_call(captured, first_page);
+                    let call = self.dump_attention_call(captured, first_page.or(self.cache_page));
                     self.pending_attention = Some(call);
                 }
                 if runner_dump() {
@@ -2504,6 +2512,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 install.batch.0, batch.0
             )));
         }
+        self.cache_page = install
+            .tables
+            .first()
+            .and_then(|table| table.unit_ids.first())
+            .map(|unit| u64::from(unit.0))
+            .or(self.cache_page);
         self.kv.install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)
     }
