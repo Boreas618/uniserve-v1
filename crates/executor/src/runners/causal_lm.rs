@@ -920,6 +920,132 @@ fn eager_replay() -> bool {
     })
 }
 
+/// Whether a replay compares the graph it is about to launch with a fresh capture of the same walk.
+///
+/// A captured node keeps what the host computed when the capture ran - the kernel's arguments, the
+/// tensor maps built from the pose, every device pointer the walk derived from it - and the walk that
+/// serves a batch issues the same launches with the batch's own values. Comparing the two, node for
+/// node in capture order, names the first place the graph and the walk disagree, which is the
+/// difference between a replay that answers right and one that does not.
+fn graph_diff() -> bool {
+    static DIFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIFF.get_or_init(|| {
+        std::env::var_os("UNISERVE_GRAPH_DIFF").is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// Every kernel node of one walk's table, in capture order, with the operator it belongs to.
+fn kernel_nodes<'a>(
+    nodes: &'a crate::captured::Nodes,
+) -> Vec<(&'static str, &'a platform::GraphNode)> {
+    nodes
+        .iter()
+        .flat_map(|(operator, _, launch)| launch.iter().map(move |node| (*operator, &node.node)))
+        .collect()
+}
+
+/// The first difference between one node's captured launch and the same launch issued live.
+fn launch_difference(
+    captured: &platform::OwnedKernelNodeParams,
+    walked: &platform::OwnedKernelNodeParams,
+) -> Option<String> {
+    if captured.grid != walked.grid {
+        return Some(format!(
+            "grid replay={:?} walk={:?}",
+            captured.grid, walked.grid
+        ));
+    }
+    if captured.block != walked.block {
+        return Some(format!(
+            "block replay={:?} walk={:?}",
+            captured.block, walked.block
+        ));
+    }
+    if captured.shared_memory != walked.shared_memory {
+        return Some(format!(
+            "shared replay={} walk={}",
+            captured.shared_memory, walked.shared_memory
+        ));
+    }
+    if captured.parameters.len() != walked.parameters.len() {
+        return Some(format!(
+            "arguments replay={} walk={}",
+            captured.parameters.len(),
+            walked.parameters.len()
+        ));
+    }
+    // A pointer is printed as the word it is: the two blobs differ in a value only where something
+    // the host computed at capture time was replaced by something it computed for this batch.
+    let word = |blob: &[u8], at: usize| -> u64 {
+        blob.get(at & !7..(at & !7) + 8)
+            .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap_or([0; 8])))
+            .unwrap_or(0)
+    };
+    for (index, (replay, live)) in captured.parameters.iter().zip(&walked.parameters).enumerate() {
+        if replay.len() != live.len() {
+            return Some(format!(
+                "argument {index}: replay={} bytes walk={} bytes",
+                replay.len(),
+                live.len()
+            ));
+        }
+        if let Some(at) = replay.iter().zip(live).position(|(left, right)| left != right) {
+            return Some(format!(
+                "argument {index} byte {at}: replay={:#x} walk={:#x}",
+                word(replay, at),
+                word(live, at)
+            ));
+        }
+    }
+    None
+}
+
+/// The first place a serving graph and a fresh capture of the same walk disagree, node by node.
+fn graph_difference(
+    graph: &platform::Graph,
+    nodes: &crate::captured::Nodes,
+    walked: &crate::runners::lifecycle::Walked,
+) -> String {
+    let replay = kernel_nodes(nodes);
+    let live = kernel_nodes(&walked.nodes);
+    let mut report = format!("nodes replay={} walk={}", replay.len(), live.len());
+    for (ordinal, ((replay_operator, replay_node), (live_operator, live_node))) in
+        replay.iter().zip(&live).enumerate()
+    {
+        let Ok(captured) = graph.kernel_node_params(replay_node) else {
+            report.push_str(&format!(" node {ordinal}: the replay's own parameters are unreadable"));
+            return report;
+        };
+        let Ok(issued) = walked.template.kernel_node_params(live_node) else {
+            report.push_str(&format!(" node {ordinal}: the walk's parameters are unreadable"));
+            return report;
+        };
+        if replay_operator != live_operator {
+            report.push_str(&format!(
+                " first={ordinal} operator replay={replay_operator} walk={live_operator}"
+            ));
+            return report;
+        }
+        if let Some(difference) = launch_difference(&captured, &issued) {
+            let name = captured
+                .function
+                .name()
+                .unwrap_or_else(|error| format!("unnamed({error})"));
+            report.push_str(&format!(
+                " first={ordinal} {replay_operator} {name} {difference}"
+            ));
+            return report;
+        }
+    }
+    report.push_str(" all=");
+    report.push_str(if replay.len() == live.len() {
+        "same"
+    } else {
+        "the walks agree as far as both go"
+    });
+    report
+}
+
 fn runner_up(values: &[f32], best: usize) -> f32 {
     let mut second = f32::NEG_INFINITY;
     for (index, value) in values.iter().enumerate() {
@@ -1777,6 +1903,17 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     let kernels = self.lifecycle.generation_named(*generation)?.clone();
                     self.walk(*bucket, &kernels)?;
                 }
+                // A comparison of what the graph baked against what this batch's own walk issues:
+                // a captured node keeps the host's values from capture time, so the first node that
+                // differs between the two names the difference between a replay that answers right
+                // and one that does not. It is a diagnosis, never a serving path.
+                let fresh = if graph_diff() {
+                    let stream = self.stream.clone();
+                    let kernels = self.lifecycle.generation_named(*generation)?.clone();
+                    Some(walk_capture(&stream, || self.walk_body(*bucket, &kernels))?)
+                } else {
+                    None
+                };
                 // A bucket this generation did not prepare launches only operators that did not
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
@@ -1795,6 +1932,13 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         generation,
                         served,
                         "the bucket was prepared for an earlier generation; its programs did not change"
+                    );
+                }
+                if let Some(walked) = &fresh {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        difference = %graph_difference(captured.template(), captured.nodes(), walked),
+                        "the serving graph against a fresh capture of this batch's own walk"
                     );
                 }
                 let enqueue = Instant::now();
@@ -3631,9 +3775,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let slots = self.staging.slots(rows).to_vec();
         let seq_lens = self.staging.batch_rows().seq_lens[..rows].to_vec();
         let live = seq_lens.iter().filter(|&&length| length > 0).count();
+        // The three statements of one partition, beside the rows they describe: a query count, the
+        // partition it makes, and the count the kernels bound by. A batch where they disagree is an
+        // operand mismatch, and it is the reading a one-row and a three-row pose of one bucket differ
+        // in - which is where a fault that appears above one row has to be.
+        let query_offsets = self.staging.batch_rows().query_offsets.to_vec();
+        let calls = self.staging.batch_rows().calls.len();
         let mut out = format!(
-            "rows={rows} live_rows={live} seq_lens={seq_lens:?} slots={slots:?} page_size={} \
-             max_kv_len={}",
+            "rows={rows} live_rows={live} seq_lens={seq_lens:?} query_offsets={query_offsets:?} \
+             live_tokens={} calls={calls} slots={slots:?} page_size={} max_kv_len={}",
+            self.staging.live_tokens(),
             self.kv.page_size(),
             self.geometry.max_kv_len,
         );
@@ -3877,6 +4028,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// the nodes it records are the ones the live graph has and the addresses are the same each
     /// time. It launches nothing: the stream is capturing.
     fn walk(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
+        self.walk_body(bucket, generation)
+    }
+
+    /// The walk's own work, without the wrapper a throwaway capture needs.
+    fn walk_body(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
         let stream = self.stream.clone();
         match self.staging.staged() {
             Some(staged) if staged == bucket => {}
