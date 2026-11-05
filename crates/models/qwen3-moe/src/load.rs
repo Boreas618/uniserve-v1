@@ -24,7 +24,7 @@ use std::f64::consts::PI;
 use std::path::Path;
 
 use nn::layers::{
-    ENCODE_CHUNK, Attention, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
+    Attention, ENCODE_CHUNK, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
     SwiGlu,
 };
 use nn::weights::{Nvfp4Names, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
@@ -34,7 +34,9 @@ use ops::gemm::WeightOrder;
 use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
-use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Projection, Qwen3Moe};
+use crate::model::{
+    AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Projection, Qwen3Moe,
+};
 use crate::representation::{self, Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
@@ -260,6 +262,7 @@ fn load_with(
             DType::F32,
             Shape::new(&[as_u64(config.head_dim / 2, "head_dim / 2")?]),
             &frequency_bytes(&frequencies),
+            "qwen3-moe",
         )
         .map_err(Error::from)?;
     let _ = head_dim;
@@ -487,9 +490,9 @@ fn projection(
         Adopted::Source => Ok(Projection::Dense(dense_projection(
             loader, sources, parameter, partition, rows, columns, bias,
         )?)),
-        Adopted::Quantized => {
-            encoded_projection(loader, sources, parameter, partition, rows, columns, bias, layout)
-        }
+        Adopted::Quantized => encoded_projection(
+            loader, sources, parameter, partition, rows, columns, bias, layout,
+        ),
     }
 }
 
@@ -602,8 +605,15 @@ fn encoded(
         DType::F32,
         Shape::new(&[1]),
         &quantized.global_scale.to_le_bytes(),
+        "qwen3-moe",
     )?;
-    let linear = Nvfp4Linear::new(&quantized, None, quantized.layout, DType::BF16, ENCODE_CHUNK)?;
+    let linear = Nvfp4Linear::new(
+        &quantized,
+        None,
+        quantized.layout,
+        DType::BF16,
+        ENCODE_CHUNK,
+    )?;
     Ok(Projection::Encoded {
         linear: Box::new(linear),
         alpha,
@@ -686,9 +696,9 @@ fn output_projection(
         Adopted::Source => Ok(Projection::Dense(dense_output_projection(
             loader, sources, parameter, partition, hidden, reduction, bias,
         )?)),
-        Adopted::Quantized => {
-            encoded_output_projection(loader, sources, parameter, partition, hidden, reduction, bias, layout)
-        }
+        Adopted::Quantized => encoded_output_projection(
+            loader, sources, parameter, partition, hidden, reduction, bias, layout,
+        ),
     }
 }
 

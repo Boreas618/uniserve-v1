@@ -1119,7 +1119,7 @@ pub(crate) fn ones(
         bytes.extend_from_slice(&value);
     }
     loader
-        .constant(name, dtype, Shape::new(&[columns]), &bytes)
+        .constant(name, dtype, Shape::new(&[columns]), &bytes, "minimax-h3")
         .map_err(Error::from)
 }
 

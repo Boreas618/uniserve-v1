@@ -1264,7 +1264,7 @@ fn constants(
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
+    Ok(loader.constant(name, DType::F32, shape, &bytes, "minimax-h3")?)
 }
 
 /// The table and the load's own list must name the same parameters.
@@ -1607,12 +1607,7 @@ pub(crate) mod tests {
         for (operator, key) in &programs {
             assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");
         }
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         // One program for every one-dimensional convolution of the decoder, in either direction: the
         // window, the bias and the stride are launch values.
@@ -1629,8 +1624,18 @@ pub(crate) mod tests {
         // A row program carries its width, so the stage sums and the divide are per width and per
         // sample count — deduplicated where a width and a count collide.
         let row_programs = count("scaled_add");
-        assert!(row_programs > 0 && row_programs < 2 * stages.len(), "{programs:?}");
-        assert_eq!(programs.len(), count("conv1d") + count("conv_transpose1d") + count("pcm_interleave") + count("audio_activation") + row_programs);
+        assert!(
+            row_programs > 0 && row_programs < 2 * stages.len(),
+            "{programs:?}"
+        );
+        assert_eq!(
+            programs.len(),
+            count("conv1d")
+                + count("conv_transpose1d")
+                + count("pcm_interleave")
+                + count("audio_activation")
+                + row_programs
+        );
     }
 
     pub(crate) fn audio_config() -> AudioVaeConfig {
