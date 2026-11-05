@@ -133,8 +133,8 @@ impl Shadow {
             summary.elements += compare_buffers(
                 pair.real.dtype,
                 pair.real.numel(),
-                self.staging.real(),
-                self.staging.shadow(),
+                &self.staging.real()[..bytes],
+                &self.staging.shadow()[..bytes],
                 tolerance,
             )?;
         }
