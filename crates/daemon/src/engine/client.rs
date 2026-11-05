@@ -368,7 +368,21 @@ impl EngineClient {
         }));
         // A closed connection drops the acceptance with the request, whose
         // stream then holds the connection's error event.
-        let scheduler = acceptance.await.unwrap_or(None);
+        let scheduler = match acceptance.await {
+            Ok(scheduler) => scheduler,
+            Err(_) => {
+                // Nothing took the sender out of `Pending`, so no event of this
+                // request ever arrived and no scheduler was named: the engine
+                // forgot the request before admitting it. Named here because a
+                // response otherwise cannot tell this from a request that was
+                // admitted and then abandoned - both end the event stream.
+                tracing::warn!(
+                    request = id.0,
+                    "an engine dropped a request before accepting it"
+                );
+                None
+            }
+        };
         Ok((stream, scheduler))
     }
 
