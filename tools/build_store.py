@@ -88,7 +88,7 @@ def covers(package, key):
     return any(covers_one(descriptors, key) for descriptors in shapes(kernel))
 
 
-def build(package, key, target, out_dir):
+def build(package, key, target, out_dir, python):
     """Compile one descriptor into `out_dir`; returns a failure message or None."""
     manifest = package["manifest"]
     source = manifest["source"]
