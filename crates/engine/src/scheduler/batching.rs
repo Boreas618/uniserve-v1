@@ -884,6 +884,7 @@ impl Scheduler {
                 return;
             };
             requests.push(executor::batch::StagedRequest {
+                request: call.request_key,
                 conditioning: state.request.conditioning.clone(),
                 step: state.denoising.completed(),
                 steps: state.denoising.steps(),

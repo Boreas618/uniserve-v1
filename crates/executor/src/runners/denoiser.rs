@@ -587,14 +587,17 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// The model's prepared inputs for the request a batch placed at `index`, when this runner
-    /// holds them.
+    /// The model's prepared inputs for `request`, when this runner holds them.
     ///
     /// No residency layer for a media request's products exists yet, so this answers `None` and the
     /// step is refused by name where it would be served. The signature is the contract such a layer
-    /// fills: given the row a batch placed a request at, the trajectory and the encoded conditioning
-    /// rows the model prepared for it.
-    fn prepared(&self, _index: u32) -> Option<Prepared> {
+    /// fills: given the request a row names, the trajectory and the encoded conditioning rows the
+    /// model prepared for it.
+    ///
+    /// The key is the request's, not the row's: an in-process batch numbers its calls by position,
+    /// so a request's row may differ between two steps of its own trajectory and states nothing
+    /// about which state belongs to whom.
+    fn prepared(&self, _request: ipc::RequestKey) -> Option<Prepared> {
         None
     }
 
@@ -807,13 +810,15 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 .map_err(|_| Error::Invalid("a batch of more requests than rows".into()))?;
             // What a step also reads is the model's own preparation, and a runner that invented it
             // would stage a trajectory nobody produced: the refusal names both halves.
-            let prepared = self.prepared(index).ok_or_else(|| {
+            let prepared = self.prepared(stated_request.request).ok_or_else(|| {
                 Error::Invalid(format!(
-                    "a denoise step of bucket {bucket} names row {index}, whose latents and encoded \
-                     conditioning rows no capability prepared: the mechanism states a request's \
-                     parameters and the model's own preparation of it is held by no runner yet \
-                     (step {} of {})",
-                    stated_request.step, stated_request.steps
+                    "a denoise step of bucket {bucket} names request {} at row {index}, whose \
+                     latents and encoded conditioning rows no capability prepared: the mechanism \
+                     states a request's parameters and the model's own preparation of it is held by \
+                     no runner yet (step {} of {})",
+                    stated_request.request.request_id.0,
+                    stated_request.step,
+                    stated_request.steps
                 ))
             })?;
             self.stage_request(bucket, index, &prepared)?;

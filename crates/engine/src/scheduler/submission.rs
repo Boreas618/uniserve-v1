@@ -805,6 +805,7 @@ mod tests {
 
     fn staged() -> StagedRequest {
         StagedRequest {
+            request: ipc::RequestKey::new(1, ipc::RequestId(9), 0),
             conditioning: vec![1, 2, 3],
             step: 2,
             steps: 8,
