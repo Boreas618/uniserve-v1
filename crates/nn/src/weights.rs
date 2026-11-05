@@ -1121,7 +1121,8 @@ impl<'a> WeightLoader<'a> {
                 WeightSource::Parts { .. } => {
                     return Err(Error::weight(
                         &scales.tensor,
-                        "block scales gathered from fused parts have no single row stride".to_owned(),
+                        "block scales gathered from fused parts have no single row stride"
+                            .to_owned(),
                     ));
                 }
             };
@@ -1148,7 +1149,8 @@ impl<'a> WeightLoader<'a> {
                     dtype,
                     layout: product_layout,
                     region: WeightRegion {
-                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor)).collect(),
+                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor))
+                            .collect(),
                         start: 0,
                         shape,
                         stride: None,
@@ -2128,7 +2130,11 @@ mod tests {
                 "the table is padded to 128 rows and 4 columns"
             );
 
-            let mut present: Vec<u8> = swizzled.iter().copied().filter(|value| *value != 0).collect();
+            let mut present: Vec<u8> = swizzled
+                .iter()
+                .copied()
+                .filter(|value| *value != 0)
+                .collect();
             let mut expected = linear.clone();
             present.sort_unstable();
             expected.sort_unstable();

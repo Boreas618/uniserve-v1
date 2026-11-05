@@ -36,9 +36,9 @@ architectures = ["sm_100a", "sm_90a"]
 # (H3 turns 96 of 128 channels). One backend, because a deployment names a
 # backend and not a key shape.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["4", "8", "2", "1", "56"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["4", "8", "2", "1", "56"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"], affine = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["56", "32", "28", "24", "16", "8", "64"], k_heads = ["56", "28", "4", "8", "2", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"], rotated = ["96", "64", "128"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["56", "32", "28", "24", "16", "8", "64"], k_heads = ["56", "28", "4", "8", "2", "1", "32"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["128", "64", "256"], pdl = ["true", "false"], affine = ["true", "false"], rotated = ["96", "64", "128", "48"] }
 
 [parameters]
