@@ -201,6 +201,13 @@ fn run() -> Result<(), String> {
     }
 
     let dtype = dtype.ok_or("--dtype is the deployment's own element type and has no default")?;
+    // A row set without its element types is as unattributable as one without its tree: a row is keyed
+    // by a type, and a reader who cannot see which type each component holds cannot tell a differing
+    // row from a differing deployment. Required, like the fixture's `--commit`.
+    let types = types.ok_or(
+        "--types is the caller's `component-tensors.json`, the four components' stored element types, \
+         and it has no default: a recording that does not state them cannot be attributed",
+    )?;
     let table = match extents.as_deref() {
         Some(path) => read_extents(path)?,
         None => BTreeMap::new(),
@@ -214,7 +221,7 @@ fn run() -> Result<(), String> {
         tokens,
         track,
         elements,
-        types,
+        types: Some(types),
         extents: table,
         sparse,
     };
