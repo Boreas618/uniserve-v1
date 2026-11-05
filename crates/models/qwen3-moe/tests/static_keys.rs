@@ -12,28 +12,47 @@ use qwen3_moe::{Config, Partition};
 fn config() -> Config {
     let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B");
     if path.join("config.json").is_file() {
-        return Config::read(path).unwrap_or_else(|error| panic!("the checkpoint's metadata: {error}"));
+        return Config::read(path)
+            .unwrap_or_else(|error| panic!("the checkpoint's metadata: {error}"));
     }
     panic!("Qwen3-30B-A3B's config.json")
 }
 
 fn partition() -> Partition {
-    Partition::new(&config(), 1, 0, 1, 0)
-        .unwrap_or_else(|error| panic!("a single rank: {error}"))
+    Partition::new(&config(), 1, 0, 1, 0).unwrap_or_else(|error| panic!("a single rank: {error}"))
 }
 
 /// The deployment's own values: the cache's page, the exchange's capacity, the buckets.
 const PAGE: u32 = 64;
 
-fn walk(dtype: DType, cache: DType, buckets: &[u32], experts: bool, projections: bool) -> Vec<(String, String)> {
-    keys(&config(), &partition(), dtype, PAGE, cache, 0, buckets, experts, projections)
-        .unwrap_or_else(|error| panic!("enumerating: {error}"))
+fn walk(
+    dtype: DType,
+    cache: DType,
+    buckets: &[u32],
+    experts: bool,
+    projections: bool,
+) -> Vec<(String, String)> {
+    keys(
+        &config(),
+        &partition(),
+        dtype,
+        PAGE,
+        cache,
+        0,
+        buckets,
+        experts,
+        projections,
+    )
+    .unwrap_or_else(|error| panic!("enumerating: {error}"))
 }
 
 #[test]
 fn the_walk_states_the_model_with_no_weights_and_no_device() {
     let walked = walk(DType::BF16, DType::BF16, &[], false, false);
-    let named: Vec<&str> = walked.iter().map(|(operator, _)| operator.as_str()).collect();
+    let named: Vec<&str> = walked
+        .iter()
+        .map(|(operator, _)| operator.as_str())
+        .collect();
     for operator in [
         "embedding",
         "add_rms_norm",
@@ -54,7 +73,10 @@ fn the_walk_states_the_model_with_no_weights_and_no_device() {
         assert!(named.contains(&operator), "{operator} is not in {named:?}");
     }
     // A dense deployment compiles no encoded program and no exchange.
-    assert!(!named.iter().any(|operator| operator.starts_with("nvfp4_")), "{named:?}");
+    assert!(
+        !named.iter().any(|operator| operator.starts_with("nvfp4_")),
+        "{named:?}"
+    );
     assert!(!named.contains(&"expert_exchange"), "{named:?}");
 
     // The print, which is the store's input: one line per row, the operator then its key.
@@ -95,8 +117,14 @@ fn the_encoded_experts_add_the_encoder_and_their_two_products_and_no_bucket_rows
         rows.iter().filter(|(name, _)| name == operator).count()
     };
     let without = walk(DType::BF16, DType::BF16, &[], true, false);
-    assert_eq!(counted(&encoded, "gather_gemm_nvfp4"), counted(&without, "gather_gemm_nvfp4"));
-    assert_eq!(counted(&encoded, "nvfp4_quantize"), counted(&without, "nvfp4_quantize"));
+    assert_eq!(
+        counted(&encoded, "gather_gemm_nvfp4"),
+        counted(&without, "gather_gemm_nvfp4")
+    );
+    assert_eq!(
+        counted(&encoded, "nvfp4_quantize"),
+        counted(&without, "nvfp4_quantize")
+    );
     for (operator, key) in &encoded {
         if operator.starts_with("nvfp4_") || operator.ends_with("_nvfp4") {
             println!("{operator} {key}");
@@ -108,12 +136,25 @@ fn the_encoded_experts_add_the_encoder_and_their_two_products_and_no_bucket_rows
 fn a_packed_projection_costs_one_product_per_bucket_and_refuses_an_empty_list() {
     let one = walk(DType::BF16, DType::BF16, &[8], false, true);
     let three = walk(DType::BF16, DType::BF16, &[1, 8, 64], false, true);
-    let products = |rows: &[(String, String)]| {
-        rows.iter().filter(|(name, _)| name == "nvfp4_gemm").count()
-    };
-    assert_eq!(products(&one) * 3, products(&three), "one product per bucket per geometry");
+    let products =
+        |rows: &[(String, String)]| rows.iter().filter(|(name, _)| name == "nvfp4_gemm").count();
+    assert_eq!(
+        products(&one) * 3,
+        products(&three),
+        "one product per bucket per geometry"
+    );
 
-    let refused = keys(&config(), &partition(), DType::BF16, PAGE, DType::BF16, 0, &[], false, true)
-        .expect_err("a packed projection with no buckets");
+    let refused = keys(
+        &config(),
+        &partition(),
+        DType::BF16,
+        PAGE,
+        DType::BF16,
+        0,
+        &[],
+        false,
+        true,
+    )
+    .expect_err("a packed projection with no buckets");
     assert!(format!("{refused}").contains("bucket"), "{refused}");
 }

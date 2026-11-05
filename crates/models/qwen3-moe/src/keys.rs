@@ -41,10 +41,10 @@ use nn::layers::{
 };
 use ops::Op;
 use ops::attention::Phase;
+use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
 use ops::moe::exchange::Mode;
 use ops::moe::grouped::{GatherGemmNvfp4, RouteGemmNvfp4};
-use ops::fp4::ScaleLayout;
 
 use crate::load::activation;
 use crate::{Config, Error, Partition, Qwen3Moe, Result};
@@ -56,11 +56,7 @@ use crate::{Config, Error, Partition, Qwen3Moe, Result};
 /// scatter — so the row must follow the dispatch. A row that named one program for both planes
 /// builds a module nothing launches and leaves the launched one absent, and the failure then reads
 /// as a missing program rather than as this function's.
-pub fn write_row(
-    attention: &Attention,
-    projection: DType,
-    cache: DType,
-) -> (&'static str, String) {
+pub fn write_row(attention: &Attention, projection: DType, cache: DType) -> (&'static str, String) {
     if cache == DType::F8E4M3 {
         (
             <ops::kv::KvWriteScaled as Op>::NAME,
@@ -121,7 +117,8 @@ pub fn keys(
     projections_packed: bool,
 ) -> Result<Vec<(String, String)>> {
     let width = |value: usize, what: &str| -> Result<u32> {
-        u32::try_from(value).map_err(|_| Error::Config(format!("this checkpoint's {what} is beyond u32")))
+        u32::try_from(value)
+            .map_err(|_| Error::Config(format!("this checkpoint's {what} is beyond u32")))
     };
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, key: String| keys.push((operator.to_owned(), key));
@@ -145,7 +142,10 @@ pub fn keys(
     let dense_width = width(config.intermediate_size, "dense intermediate width")?;
     let moe = MoeGeometry {
         hidden: u64::from(hidden),
-        intermediate: u64::from(width(config.moe_intermediate_size, "expert intermediate width")?),
+        intermediate: u64::from(width(
+            config.moe_intermediate_size,
+            "expert intermediate width",
+        )?),
         top: u64::from(width(config.num_experts_per_tok, "routes per token")?),
         experts: u64::from(width(config.num_experts, "expert count")?),
         tile: u64::from(TILE_ROWS),
@@ -154,7 +154,10 @@ pub fn keys(
     // The vocabulary: this rank's shard of the embedding, and the head that projects it. The shard is
     // the deployment's rank count, the vocabulary is the checkpoint's.
     let (first, _) = partition.vocabulary_shard(config.vocab_size);
-    let shard = width(partition.padded_vocabulary_shard(config.vocab_size), "vocabulary shard")?;
+    let shard = width(
+        partition.padded_vocabulary_shard(config.vocab_size),
+        "vocabulary shard",
+    )?;
     let vocabulary = width(config.vocab_size, "vocabulary")?;
     push(
         "embedding",
@@ -181,8 +184,14 @@ pub fn keys(
 
     for layer in 0..config.num_hidden_layers {
         // The fused residual-add and normalization that opens each sublayer.
-        push("add_rms_norm", RmsNorm::add_descriptor_of(hidden, dtype).to_string());
-        push("add_rms_norm", RmsNorm::add_descriptor_of(hidden, dtype).to_string());
+        push(
+            "add_rms_norm",
+            RmsNorm::add_descriptor_of(hidden, dtype).to_string(),
+        );
+        push(
+            "add_rms_norm",
+            RmsNorm::add_descriptor_of(hidden, dtype).to_string(),
+        );
 
         // The rotation's own table, and the fused per-head normalization that reads it: the affine
         // form, because the checkpoint has learned Q/K norm weights.
@@ -223,9 +232,16 @@ pub fn keys(
                 for rows in buckets {
                     push(
                         <ops::fp4::Nvfp4Gemm as Op>::NAME,
-                        Nvfp4Linear::descriptor_of(*rows, n, k, ScaleLayout::Swizzled128X4, false, dtype)
-                            .map_err(Error::from)?
-                            .to_string(),
+                        Nvfp4Linear::descriptor_of(
+                            *rows,
+                            n,
+                            k,
+                            ScaleLayout::Swizzled128X4,
+                            false,
+                            dtype,
+                        )
+                        .map_err(Error::from)?
+                        .to_string(),
                     );
                 }
             }
@@ -245,56 +261,88 @@ pub fn keys(
         for phase in [Phase::Prefill, Phase::Decode] {
             push(
                 "paged_attention",
-                attention.descriptor(phase, dtype, cache_dtype, dtype).to_string(),
+                attention
+                    .descriptor(phase, dtype, cache_dtype, dtype)
+                    .to_string(),
             );
         }
 
         if config.sparse(layer) {
-            push("topk_softmax", moe.topk_descriptor(dtype, config.norm_topk_prob, None).to_string());
+            push(
+                "topk_softmax",
+                moe.topk_descriptor(dtype, config.norm_topk_prob, None)
+                    .to_string(),
+            );
             push("expert_gather", moe.map_descriptor().to_string());
             // The sort covers the experts this rank owns: every expert of a dense deployment, its
             // own shard under expert parallelism.
             let local = width(partition.expert_range(config).len(), "local expert count")?;
             push("moe_sort", moe.sort_descriptor(local).to_string());
             if experts_encoded {
-                for k in [hidden, width(config.moe_intermediate_size, "expert intermediate width")?] {
+                for k in [
+                    hidden,
+                    width(config.moe_intermediate_size, "expert intermediate width")?,
+                ] {
                     push(
                         <ops::fp4::Nvfp4Quantize as Op>::NAME,
-                        Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4).to_string(),
+                        Moe::quantize_descriptor_of(dtype, k, ScaleLayout::Swizzled128X4)
+                            .to_string(),
                     );
                 }
                 push(
                     <GatherGemmNvfp4 as Op>::NAME,
-                    moe.gather_nvfp4_descriptor(dtype, activation(config.hidden_act)?, DType::F8E4M3, ScaleLayout::Swizzled128X4)
-                        .to_string(),
+                    moe.gather_nvfp4_descriptor(
+                        dtype,
+                        activation(config.hidden_act)?,
+                        DType::F8E4M3,
+                        ScaleLayout::Swizzled128X4,
+                    )
+                    .to_string(),
                 );
                 push(
                     <RouteGemmNvfp4 as Op>::NAME,
-                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, ScaleLayout::Swizzled128X4).to_string(),
+                    moe.route_nvfp4_descriptor(dtype, DType::F8E4M3, ScaleLayout::Swizzled128X4)
+                        .to_string(),
                 );
             } else {
                 push(
                     "gather_gemm",
-                    moe.gather_descriptor(dtype, activation(config.hidden_act)?).to_string(),
+                    moe.gather_descriptor(dtype, activation(config.hidden_act)?)
+                        .to_string(),
                 );
                 push("route_gemm", moe.route_descriptor(dtype).to_string());
             }
             // The combine reads the *products'* dtype, which is the model's, and rounds once into
             // `dtype`: the walk that named `F32` here named a program the layer never launches.
-            push("moe_unpermute", moe.combine_descriptor(dtype, dtype).to_string());
+            push(
+                "moe_unpermute",
+                moe.combine_descriptor(dtype, dtype).to_string(),
+            );
         } else {
-            for (n, k) in [(dense_width, hidden), (dense_width, hidden), (hidden, dense_width)] {
+            for (n, k) in [
+                (dense_width, hidden),
+                (dense_width, hidden),
+                (hidden, dense_width),
+            ] {
                 push(
                     <ops::gemm::Gemm as Op>::NAME,
-                    Linear::descriptor_of(k, dtype, dtype, WeightOrder::NxK, false, dtype).to_string(),
+                    Linear::descriptor_of(k, dtype, dtype, WeightOrder::NxK, false, dtype)
+                        .to_string(),
                 );
                 if projections_packed {
                     for rows in buckets {
                         push(
                             <ops::fp4::Nvfp4Gemm as Op>::NAME,
-                            Nvfp4Linear::descriptor_of(*rows, n, k, ScaleLayout::Swizzled128X4, false, dtype)
-                                .map_err(Error::from)?
-                                .to_string(),
+                            Nvfp4Linear::descriptor_of(
+                                *rows,
+                                n,
+                                k,
+                                ScaleLayout::Swizzled128X4,
+                                false,
+                                dtype,
+                            )
+                            .map_err(Error::from)?
+                            .to_string(),
                         );
                     }
                 }
@@ -303,7 +351,10 @@ pub fn keys(
     }
 
     // The output norm, and the vocabulary head's two programs.
-    push("rms_norm", RmsNorm::descriptor_of(hidden, dtype).to_string());
+    push(
+        "rms_norm",
+        RmsNorm::descriptor_of(hidden, dtype).to_string(),
+    );
     push(
         <ops::gemm::Gemm as Op>::NAME,
         Linear::descriptor_of(hidden, dtype, dtype, WeightOrder::NxK, false, dtype).to_string(),
