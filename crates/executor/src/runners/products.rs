@@ -56,6 +56,21 @@ use crate::arena::StreamId;
 /// are one list rather than one mechanism per product because they differ only in their size and in
 /// which call produces them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// What one request hands to the next call.
+///
+/// **Which of these a runner publishes today, and which is only named:**
+///
+/// | product | published by | read by |
+/// | --- | --- | --- |
+/// | [`Product::Text`] | the encoder runner | the denoiser, through `copy_into` |
+/// | [`Product::VideoLatents`] | the denoiser runner | the decoder, through `copy_into` |
+/// | [`Product::AudioLatents`] | the denoiser runner | nothing yet - `ref2va` only |
+/// | [`Product::Video`] | the decoder runner | the transport, when it writes the artifact |
+/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - the encoder writes one region | - |
+/// | [`Product::Track`] | **nobody** - the audio decode is not built | - |
+///
+/// A kind nobody published is not a hole a reader falls into: the store answers `None` and a refusal
+/// names the product and the request, which is what `ref2va` reports today.
 pub enum Product {
     /// `[text_rows, width]` encoded prompt: the text encoder's rows.
     Text,
@@ -79,6 +94,12 @@ pub enum Product {
     /// request was admitted under rather than by a position in a batch.
     Video,
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
+    ///
+    /// **No runner publishes it yet**: the audio decode is the piece of this seam that is not built,
+    /// and `ref2va` is the only task that asks for it. It is named here because a product's name is
+    /// the design's vocabulary rather than a record of what compiles - and the store refuses a kind
+    /// nothing published by name (`absent`), so a reader of it today is told which product is
+    /// missing rather than reading a region nobody wrote.
     Track,
 }
 
