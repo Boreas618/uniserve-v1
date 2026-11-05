@@ -938,6 +938,7 @@ impl PagedAttention {
     /// makes them true: an E4M3 cache read without its scale, a window this program was not compiled
     /// for, a phase it does not serve. Each names what it refused, so a store that resolved the
     /// wrong program is a launch error rather than plausible attention.
+    #[allow(clippy::too_many_arguments)]
     fn launch_program(
         kernel: &Kernel,
         descriptor: &Descriptor,

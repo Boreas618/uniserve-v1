@@ -1309,6 +1309,14 @@ impl VideoEncoder {
             crate::config::SpatialPadding::Reflect
         );
         // A pad's block split is its output's column count, so each extent's pad is its own row.
+        //
+        // **This is the one tile rule, and it has a fallback no pad of this model takes.** `tiles_of`
+        // returns `(PAD_PIXELS, PAD_CHANNELS) = (32, 64)` when the source's columns are not unit-strided
+        // or the output is not row-major; the encoder's arena allocates every padded frame contiguous
+        // and reads its source's columns unit-strided, so the branch is unreachable here and the block
+        // is always `min(ROW_PIXELS, next_power_of_two(columns))` pixels with `ROW_ELEMENTS` divided
+        // by it. Stated here because the reachable classes are four and the fallback looks like a
+        // fifth: a list carrying `block_pixels_32_block_channels_64` would be one no launch asks for.
         let pad = |programs: &mut Programs, columns: u64| {
             let (block_pixels, block_channels) =
                 ops::frame::FramePadDescriptor::tiles_of(true, true, columns);
@@ -1368,9 +1376,11 @@ impl VideoEncoder {
                         // the element count here named 36 keys no launch asks for, at widths up to
                         // 2.2e9, and a package cannot serve a key nothing launches.
                         let columns = u64::from(*out);
-                        if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                            programs.launch::<ScaledAddOp>(&descriptor);
-                        }
+                        // Stated or refused, never silently omitted: a width the descriptor cannot
+                        // hold cannot be launched either, so swallowing the refusal would turn a
+                        // configuration this VAE cannot run into a program list that looks complete.
+                        let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
+                        programs.launch::<ScaledAddOp>(&descriptor);
                     }
                 }
                 // The output normalization convolves the last level's extent at the last width.
@@ -1793,7 +1803,30 @@ impl AudioEncoder {
     /// **FP32 throughout and no dtype argument**: the encoder's convolutions, its Snake activations and
     /// its whole attention are the design's declared FP32 rows, not the checkpoint's representation.
     /// `samples` states the residual units' reach: each unit's output is one operator, so its width is
-    /// `inner · samples` and a longer track is a different program.
+    /// the unit's **sample count** and a longer track is a different program.
+    ///
+    /// # Each row, the launch that asks for it, and the line the number comes from
+    ///
+    /// A row is written here because a launch elsewhere computes the same key; the pair has to be
+    /// read together or a wrong number looks like a wrong list. The launches are all in
+    /// [`Self::encode`] and the projection it calls, and every number below is read from the
+    /// configuration or from the layer the load built - never restated:
+    ///
+    /// | row | asked for by | the number's source |
+    /// | --- | --- | --- |
+    /// | `conv1d` (three element types) | `self.input.forward` (input), each unit's two `convs[i].forward`, `stage.widen.forward`, `self.output.forward` | `crate::audio_vae::geometry(7, 1, 3)` and `dilated_geometry(7, 1, 3 · dilation, dilation)` at [`Self::load`] - **one row, because `conv1d/cudnn/package.toml` declares only `input`, `weight` and `output`: the geometry travels as a launch argument, dilation included** |
+    /// | `snake` per width | each unit's two snakes and the stage's tail snake (`unit.snakes[i].forward`, `stage.snake.forward`) | [`Self::load`]'s `widths`: `config.encoder_dim` doubled once per `config.encoder_rates` entry, then once more for the tail |
+    /// | `layer_norm` at `width` and at `channels` | the projection's three normalizations | `width` = the last entry of [`Self::load`]'s `widths`; `channels` = `config.latent_channels` |
+    /// | `gemm` | `self.projection`'s four dense products | `Linear::descriptor_of(config.latent_channels, ..., WeightOrder::NxK, ...)` |
+    /// | `dense_attention` (causal, unpacked) | `Projection`'s attention | bound `LONGEST_TRACK`; `head_dim = width / config.num_attention_heads`; `causal = true` because `Projection::load` builds it so |
+    /// | `adaptive_pool` | `self.mean` | `(heads, width / heads, config.latent_channels)` |
+    /// | `transpose` | the three `self.transpose.forward` calls that move the latent layout | `Transpose::new(dtype)` - element type only |
+    /// | `act_and_mul` at `2 · channels` | the projection's gated product | `2 · config.latent_channels`, read three times in `GatedActivation::descriptor_of` because the gate's three views are all that width |
+    /// | `scaled_add` per track length | `ScaledAdd.forward(f, residual, matrix(second)?, 1.0, 1.0)` in each unit | **`length` of the track**, i.e. `samples` - the view it adds is the unit's `[channels, samples]` convolution output, so `columns` is the sample count and the channel count is the row count (a launch extent, not a key) |
+    ///
+    /// The one row whose extent is *not* the track's is `dense_attention`: it is compiled for
+    /// `LONGEST_TRACK` and a longer track is refused by [`Self::frames`] before a launch, which is why
+    /// the bound appears here once rather than per request.
     pub fn programs(
         config: &crate::AudioVaeConfig,
         samples: &[u32],
@@ -1901,14 +1934,35 @@ impl AudioEncoder {
             false,
         )?);
 
-        // Each residual unit's output is one addition over the whole unit, so its width is the inner
-        // channel count times the track's samples.
+        // Each residual unit's output is one addition over the whole unit, and the view it adds is the
+        // unit's convolution output `[channels, samples]` - so the descriptor's `columns` is the
+        // track's **sample count**, and the channel count is the row count, which is a launch extent
+        // the kernel reads rather than a key. Stating `channels × samples` here asked for a key no
+        // launch can produce (a `[1, channels × samples]` view), and the widest one at the model's
+        // longest clip was 2796748800 - a row that could never have been built.
+        // The projection's **two** residual adds run over the latent channels, not over the track:
+        // `shortcut` is `[frames, channels]` whatever the track's length is, so its last dimension is
+        // the channel count and the two adds of one projection share one row.
+        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, u64::from(channels))?);
+
+        // **One row per stage, from the list the launch walks.** A track of `samples` reaches the
+        // residual add at five extents, not one: the input at its own length and then once per stage
+        // divided by that stage's rate. Stating the input length alone asked for a row the deployment
+        // never launches and left four it does without a cell - the fault the decoder's ladder had in
+        // the other direction.
+        let hop = config
+            .encoder_rates
+            .iter()
+            .map(|rate| u64::from(*rate))
+            .product::<u64>()
+            .max(1);
         for samples in samples {
-            for inner in &widths {
-                let columns = u64::from(*inner) * u64::from(*samples);
-                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                    programs.launch::<ScaledAddOp>(&descriptor);
-                }
+            // The pad is the caller's before the first convolution, so the rows are the pad's lengths.
+            let padded = padded_samples(u64::from(*samples), hop)?;
+            for extent in AudioEncoder::stage_extents(config, padded)? {
+                // As above: the refusal is the statement's, not a reason to leave the row out.
+                let descriptor = ScaledAdd.descriptor(dtype, dtype, extent)?;
+                programs.launch::<ScaledAddOp>(&descriptor);
             }
         }
 
@@ -1959,6 +2013,41 @@ impl AudioEncoder {
             )));
         }
         Ok(frames)
+    }
+
+    /// The sample count each stage's residual units run at, from the track's padded length.
+    ///
+    /// **One expression, two readers.** The units of stage `k` add over the extent that stage
+    /// receives - the track's length halved and fifthed once per rate, `[2, 4, 4, 5, 5]` here - so a
+    /// track of `L` samples launches the residual add at `L`, `L/2`, `L/8`, `L/32` and `L/160`, five
+    /// programs and not one. [`Self::encode`] walks this list and [`Self::programs`] states it, which
+    /// is why a stated row cannot be a summary of a different arithmetic: the two read the same
+    /// vector.
+    ///
+    /// The length is the **padded** one, because the pad is applied before the first convolution
+    /// (see [`Self::encode`]) - a track that is not a whole number of latent frames never reaches a
+    /// stage, so it states no row.
+    pub fn stage_extents(config: &crate::AudioVaeConfig, samples: u64) -> Result<Vec<u64>> {
+        let hop = config
+            .encoder_rates
+            .iter()
+            .map(|rate| u64::from(*rate))
+            .product::<u64>()
+            .max(1);
+        if !samples.is_multiple_of(hop) {
+            let padded = padded_samples(samples, hop)?;
+            return Err(Error::config(format!(
+                "{samples} samples is not a whole number of {hop}-sample latent frames: the stages \
+                 run the padded track ({padded} samples), so an unpadded length states no program"
+            )));
+        }
+        let mut extent = samples;
+        let mut extents = Vec::with_capacity(config.encoder_rates.len());
+        for rate in &config.encoder_rates {
+            extents.push(extent);
+            extent /= u64::from(*rate).max(1);
+        }
+        Ok(extents)
     }
 
     /// The samples one latent frame covers: the product of the encoder's rates.
@@ -2138,8 +2227,10 @@ impl AudioEncoder {
         // stage's shape, so the stage reserves them once and the three units take turns: a unit writes
         // `first` from the residual stream before reading it, and `second` from its own convolution. The
         // residual stream itself is `hidden`, which no unit writes.
-        let mut extent = length;
-        for stage in &self.stages {
+        // The extents this track launches at, from the one expression the statement also reads.
+        let extents = Self::stage_extents(&self.config, length)?;
+        for (index, stage) in self.stages.iter().enumerate() {
+            let extent = extents.get(index).copied().unwrap_or(frames);
             let inner = u64::from(stage.inner);
             let inner_shape = Shape::new(&[batch, inner, extent]);
             let first = f.arena().tensor(DType::F32, inner_shape)?;
@@ -2163,8 +2254,11 @@ impl AudioEncoder {
                 .forward(f, hidden, stage.alpha.view(), scratch)?;
             stage.widen.forward(f, scratch, next)?;
             hidden = next;
-            extent = widened;
         }
+
+        // The tail runs at the latent frame count, which is the last stage's own `extent` divided by
+        // its rate - `frames`, from the same expression that refused an unpadded track.
+        let extent = frames;
 
         // The tail Snake and the convolution to the latent width.
         let wide = u64::from(self.config.latent_dim);
@@ -2815,7 +2909,43 @@ mod tests {
         assert_eq!(
             fixed(&other),
             fixed(&programs),
-            "a raster changes the residuals' extent and the pads' columns, not the frame statistics"
+            "a raster changes the pads' columns, not the frame statistics"
+        );
+
+        // **The residuals are the levels' channel widths, and no raster can change them.** A block's add
+        // reshapes the level to `[frames · pixels, channels]` and the descriptor takes the last
+        // dimension, so the aligned packing of a raster reaches the pads and never the residuals - and a
+        // statement that keyed the element count instead would move with every raster, which is the
+        // shape of the defect this row replaced.
+        let residuals = |rows: &[(String, String)]| -> Vec<String> {
+            rows.iter()
+                .filter(|(name, _)| name == "scaled_add")
+                .map(|(_, key)| key.clone())
+                .collect()
+        };
+        assert_eq!(
+            residuals(&other),
+            residuals(&programs),
+            "the residual rows are channel widths: a raster cannot move one"
+        );
+        let stack = Stack::of(&config).expect("the stack");
+        for width in &stack.widths {
+            assert!(
+                residuals(&programs)
+                    .iter()
+                    .any(|key| key.contains(&format!("columns_{width}_"))),
+                "no residual row for a level's {width} channels: {:?}",
+                residuals(&programs)
+            );
+        }
+        // Two levels can share a width (`block_out_channels` repeats 256 and 512), and the rows are a
+        // set, so the count is over the **distinct** widths rather than over the levels.
+        let distinct: std::collections::BTreeSet<u32> = stack.widths.iter().copied().collect();
+        assert_eq!(
+            residuals(&programs).len(),
+            distinct.len(),
+            "one residual row per distinct level width: {:?}",
+            residuals(&programs)
         );
     }
 
@@ -2851,6 +2981,61 @@ mod tests {
         widths.sort_unstable();
         widths.dedup();
         assert_eq!(count("snake"), widths.len(), "{programs:?}");
+
+        // **The residual rows are the extents the stages run at, and there is one per stage.** The unit
+        // of stage `k` adds over the extent that stage receives, so a track of five rates launches the
+        // add five times - at the padded length and then once per division. Stating the input length
+        // alone asked for a row no launch makes and left four a launch needs.
+        let hop: u64 = config
+            .encoder_rates
+            .iter()
+            .map(|rate| u64::from(*rate))
+            .product();
+        let padded = padded_samples(44_100, hop).expect("the pad the caller applies");
+        let extents = AudioEncoder::stage_extents(&config, padded).expect("the stage extents");
+        assert_eq!(
+            extents.first().copied(),
+            Some(padded),
+            "the first stage runs the padded track"
+        );
+        assert_eq!(
+            extents.len(),
+            config.encoder_rates.len(),
+            "one extent per stage: {extents:?}"
+        );
+        let residuals: Vec<&String> = programs
+            .iter()
+            .filter(|(name, _)| name == "scaled_add")
+            .map(|(_, key)| key)
+            .collect();
+        // The stage's extents, and the projection's channel-wide adds: two readers of the two
+        // quantities, so the set is stated as the set rather than by count.
+        let channels = u64::from(config.latent_channels);
+        assert_eq!(
+            residuals.len(),
+            extents.len() + 1,
+            "one residual row per stage plus the projection's: {residuals:?}"
+        );
+        for extent in &extents {
+            assert!(
+                residuals
+                    .iter()
+                    .any(|key| key.contains(&format!("columns_{extent}_"))),
+                "no residual row for the stage's extent {extent}: {residuals:?}"
+            );
+        }
+        assert!(
+            residuals
+                .iter()
+                .any(|key| key.contains(&format!("columns_{channels}_"))),
+            "no residual row for the projection's {channels} channels: {residuals:?}"
+        );
+        // An unpadded track reaches no stage, so it states no program: the pad is the caller's, and a
+        // row for the unpadded length would be a width no launch passes.
+        assert!(
+            AudioEncoder::stage_extents(&config, 44_100).is_err(),
+            "an unpadded track must state no extent"
+        );
 
         // Every launch of the encoder is FP32: the design's declared rows, not the checkpoint's type.
         for (operator, key) in &programs {

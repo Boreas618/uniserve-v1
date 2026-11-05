@@ -181,10 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // column exists to make visible; a named exclusion is a decision, and a reader who cannot
         // see it cannot tell the two apart.
         for exclusion in load::excluded_names(component.name()) {
-            println!(
-                "  not asked for: {} ({})",
-                exclusion.name, exclusion.reason
-            );
+            println!("  not asked for: {} ({})", exclusion.name, exclusion.reason);
         }
         let mut budget = 0_u64;
         for directory in directories {
