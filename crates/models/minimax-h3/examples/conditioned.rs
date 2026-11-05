@@ -287,11 +287,14 @@ fn task_name(task: VideoTask) -> &'static str {
 /// The condition rows one case asks for, from the packing's own segments.
 ///
 /// A stage's layout is sized **before** the checkpoint is loaded, so the rows cannot come from the
-/// loaded denoiser: they come from the packing the request would be laid out under. The case's own
-/// canvas and its own pieces decide, which is why this is not `Partition::serving`'s deployment-wide
-/// worst - that one reserves two keyframes at the largest canvas the deployment offers (2016 rows),
-/// and a case at 768x768 needs 1152. An oversized capacity is not free: the prefix the DiT gathers
-/// from holds one row per reserved condition row.
+/// loaded denoiser: they come from the packing the request would be laid out under.
+///
+/// **This is not what sizes the layout.** The packed row bound - and therefore the dense attention's
+/// `max_kv_len`, which is part of a program's key - follows the arrangement a stage is *loaded* with,
+/// so a layout sized to one case would key its attention at a different bound from every other stage
+/// and from any store: it would stop on a missing cell before it computed anything. One store serves
+/// every task, so the layout is sized to the widest one (`store_capacity`) and a case's own rows are
+/// only compared with it.
 fn case_condition_rows(config: &Config, request: &VideoRequest) -> Result<u32, String> {
     // `condition_segments` reduces each shape's pixels to its latent raster through the packing's own
     // rule, and counts an image, a video and a keyframe as the model does.
@@ -309,6 +312,39 @@ fn case_condition_rows(config: &Config, request: &VideoRequest) -> Result<u32, S
         .sum();
     // An arrangement states its capacity in whole units, so the case's rows round up to them.
     minimax_h3::partition::capacity(config, Dit::Base, rows).map_err(show)
+}
+
+/// A case whose pieces need more rows than the store's capacity is refused here, by both numbers.
+///
+/// The layout is the store's, so this cannot be a silent clamp: a request that overflows it would be
+/// laid out at a capacity it cannot hold and stop inside the packing with a count instead of a case.
+fn require_case_fits(task: VideoTask, case_rows: u32, capacity: u32) -> Result<(), String> {
+    if case_rows > capacity {
+        return Err(format!(
+            "a {task:?} case needs {case_rows} condition rows and this store's capacity is \
+             {capacity}: the store is walked for the widest task it serves, so a case beyond it is a \
+             deployment the store was not built for"
+        ));
+    }
+    Ok(())
+}
+
+/// The condition capacity one store must hold: the widest of the tasks it serves.
+///
+/// A `max_kv_len` is exact and belongs to a program's key, so a deployment that served two bounds
+/// would need two sets of attention cells. The store is one, so the layout is the widest task's -
+/// `ref2va` here, whose reference clip reserves two latent frames at the largest canvas - and a
+/// narrower task simply does not fill it.
+fn store_capacity(config: &Config) -> Result<u32, String> {
+    let mut widest = 0;
+    for task in [
+        VideoTask::TextToVideoAudio,
+        VideoTask::FirstLastToVideoAudio,
+        VideoTask::ReferenceToVideoAudio,
+    ] {
+        widest = widest.max(minimax_h3::partition::condition_rows(config, task).map_err(show)?);
+    }
+    Ok(widest)
 }
 
 fn stage_partition(
@@ -394,12 +430,7 @@ fn weights(args: &Args) -> Result<(), String> {
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
 
-    let partition = stage_partition(
-        &config,
-        args.task,
-        args.place,
-        minimax_h3::partition::condition_rows(&config, args.task).map_err(show)?,
-    )?;
+    let partition = stage_partition(&config, args.task, args.place, store_capacity(&config)?)?;
     println!(
         "{} places {} blocks (the text encoder is the stage before this one): {}",
         task_name(args.task),
@@ -554,7 +585,11 @@ fn plan(args: &Args) -> Result<(), String> {
         conditions: &conditions,
         vision_spans: &[],
     };
-    let condition_rows = case_condition_rows(&config, &request)?;
+    // The layout is the store's, not the case's: a program's key carries the bound the arrangement
+    // states, so sizing it to this case would key attention differently from the store that serves it.
+    let condition_rows = store_capacity(&config)?;
+    let case_rows = case_condition_rows(&config, &request)?;
+    require_case_fits(args.task, case_rows, condition_rows)?;
     let partition = stage_partition(&config, args.task, args.place, condition_rows)?;
     let dit = config
         .denoisers
@@ -607,7 +642,8 @@ fn plan(args: &Args) -> Result<(), String> {
         );
     }
     println!(
-        "rows: text capacity {}, condition capacity {}, prefix {} rows of {}",
+        "rows: text capacity {}, condition capacity {} (this case needs {case_rows}), prefix {} rows \
+         of {}",
         one.text_rows,
         one.condition_rows,
         packing.zero_row() + 1,
@@ -769,7 +805,11 @@ fn encode(args: &Args) -> Result<(), String> {
         conditions: &conditions,
         vision_spans: &[],
     };
-    let condition_rows = case_condition_rows(&config, &request)?;
+    // The layout is the store's, not the case's: a program's key carries the bound the arrangement
+    // states, so sizing it to this case would key attention differently from the store that serves it.
+    let condition_rows = store_capacity(&config)?;
+    let case_rows = case_condition_rows(&config, &request)?;
+    require_case_fits(args.task, case_rows, condition_rows)?;
     let partition = stage_partition(&config, args.task, args.place, condition_rows)?;
     let dit = config
         .denoisers
