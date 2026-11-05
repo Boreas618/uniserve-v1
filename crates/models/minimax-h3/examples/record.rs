@@ -84,6 +84,8 @@ struct Request {
     raster: (u32, u32),
     rows: u32,
     extents: BTreeMap<String, (DType, Shape)>,
+    /// The sparse deployment's served tile and keep rate, absent for a dense one.
+    sparse: Option<(u32, f64, Option<f64>)>,
 }
 
 /// The rows a recording pass collected, in the order the model launched them.
@@ -106,6 +108,7 @@ fn run() -> Result<(), String> {
     let mut rows = 32_000u32;
     let mut against: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
+    let mut sparse: Option<(u32, f64, Option<f64>)> = None;
     let mut list = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or_else(|| format!("{argument} needs a value"));
@@ -132,6 +135,27 @@ fn run() -> Result<(), String> {
             "--rows" => rows = value()?.parse().map_err(|_| "--rows is a count")?,
             "--against" => against = Some(PathBuf::from(value()?)),
             "--extents" => extents = Some(PathBuf::from(value()?)),
+            // `tile,sparsity[,reference_keep]`: the bound the compression reduces over is the
+            // deployment's own, computed from its layouts at load, so it is not a flag here.
+            "--sparse" => {
+                let stated = value()?;
+                let parts: Vec<&str> = stated.split(',').collect();
+                if parts.len() != 2 && parts.len() != 3 {
+                    return Err("--sparse is `tile,sparsity[,reference_keep]`".to_owned());
+                }
+                sparse = Some((
+                    parts[0].trim().parse().map_err(|_| "--sparse's tile is a row count")?,
+                    parts[1].trim().parse().map_err(|_| "--sparse's sparsity is a fraction")?,
+                    match parts.get(2) {
+                        Some(keep) => Some(
+                            keep.trim()
+                                .parse()
+                                .map_err(|_| "--sparse's keep rate is a fraction")?,
+                        ),
+                        None => None,
+                    },
+                ));
+            }
             "--list" => list = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -152,6 +176,7 @@ fn run() -> Result<(), String> {
         raster,
         rows,
         extents: table,
+        sparse,
     };
 
     let harnesses: Vec<(&str, Harness)> = match component.as_str() {
@@ -178,13 +203,14 @@ fn run() -> Result<(), String> {
     };
 
     println!(
-        "# recorded from the model's own forward, at {}: dtype {}, clip {}, raster {}x{}, packed rows {}",
+        "# recorded from the model's own forward, at {}: dtype {}, clip {}, raster {}x{}, packed rows {}, sparse {:?}",
         request.root.display(),
         request.dtype,
         request.clip,
         request.raster.0,
         request.raster.1,
-        request.rows
+        request.rows,
+        request.sparse
     );
     let mut all: Vec<(String, String)> = Vec::new();
     let mut refusals: Vec<(&str, String)> = Vec::new();
@@ -633,6 +659,13 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
         .get(&Dit::Base)
         .ok_or("this checkpoint holds no base network")?
         .clone();
+    // A sparse deployment states its served tile and keep rate, and the tile bound its compression
+    // reduces over is the model's own: it is computed at load from these layouts, not stated here.
+    let mut network = network;
+    if let Some((tile, sparsity, reference_keep)) = request.sparse {
+        network.attention = AttentionKind::sparse(tile, sparsity, reference_keep)
+            .map_err(|error| error.to_string())?;
+    }
     let config_hidden = network.transformer.hidden_size;
     // The two prefix capacities are the request's own: a prompt of the walk's length and one unit of
     // condition rows, which a `t2va` request leaves empty. The bound is the deployment's.
