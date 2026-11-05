@@ -23,14 +23,9 @@
 #
 # The launch's default dtype is bfloat16 and an empty quantization_config loads
 # the model's first precision preset, quality (DiT and text encoder BF16, video
-# VAE decoder FP16), so on most servers the omitted selectors name exactly the
-# representation the shipped performance profiles state, and stating them would
-# be redundant. `base-reference` is the measured exception: with the selectors
-# omitted, `check-base-ref2va` failed its warmup with a constant frame and
-# silence and wrote no MP4; with `dtype=bfloat16` and
-# `quantization_config.mode=quality` stated it passes (1/1 requests, an MP4 of
-# 219890 bytes). The two are therefore stated there and nowhere else, because a
-# check cell states only what its own path was measured to need.
+# VAE decoder FP16), so no server states either: every cell measures the
+# representation the shipped performance profiles serve, and a cell states only
+# what its own path was measured to need.
 #
 # No server pins --worker-executable either: the worker processes must run the
 # same build as the daemon, so a deployment launched with --executable runs the
@@ -104,12 +99,22 @@ command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--ser
 # -------------------------------------------------------------------- t2va cells
 # W1's seed-0 row: the official t2va prompt at 16:9, 5 seconds.
 
-# The base-reference cell runs FIRST. It is the one cell that cannot inherit
-# the earlier base servers' retained state on the same checkpoint: the two
-# servers share their load identity and their `--set` keys, so the Storage
-# Server's retained pages of one are the other's. Ordering it first is the
-# strongest form of fresh the check set can state without a teardown, and a
-# teardown would discard the 61 GB per GPU the later cells were measured in.
+# The base-reference cell runs FIRST in `points`, and that is the one ordering
+# this check set depends on. Its warmup fails with
+# `invalid_video_output: nonzero_video_variance` — a constant frame and silence,
+# no MP4 — when it runs after the other five cells on a host whose Storage
+# Server still holds their retained pages and 61 GiB per GPU; it passes on a
+# fresh host, and fails again on the same host once another cell has run.
+#
+# What it inherits is that retained state, not a selector: `base-transformer`
+# and `base-reference` share the whole load identity on the same checkpoint
+# (same defaults, and of the `--set` keys they have in common the media paths
+# are identical and only the video capacities and durations are sized
+# differently), so the two differ by retention alone. Running it first measures
+# it on the clean host the protocol promises every cell; the other five keep
+# the order they were measured in, and none of them is sensitive to the
+# retention. The inheritance itself is a serving defect, not a property of this
+# check set.
 [benchmarks.check-base-ref2va]
 server = "base-reference"
 task = "video"
@@ -297,4 +302,4 @@ checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
 task = "ref2va"
 
 [suites.check-h3]
-points = ["check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va", "check-base-ref2va"]
+points = ["check-base-ref2va", "check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va"]
