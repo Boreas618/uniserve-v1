@@ -1,17 +1,24 @@
 //! Selecting the key tiles a video sparse attention reads (VSA).
 //!
 //! The sequence is cut into `tile_rows`-row tiles and a query tile attends only to the key tiles its
-//! pooled scores select. Five programs do it, none of them allocating, all of them leaving their
+//! pooled scores select. **Six programs** do it, none of them allocating, all of them leaving their
 //! indices on the device so a captured graph replays the selection (specs/worker.md 9, "VSA 分块";
 //! `ops::segments`):
 //!
 //! ```text
 //! prepare     normalize and rotate Q and K in place, zero each tile's padding rows, pool the means
 //! zero        zero each tile's padding rows, in place
-//! add_gated   fold the compressed branch's gated rows into a tile's rows, in place
-//! compose     write one row interval of every member's gated rows, member-major
+//! scores      one dot product per (query tile, key tile) and head, over the pooled means
 //! select      choose each query tile's key tiles from its pooled scores
+//! compress    reduce each (head, query tile) over the tiles it selects, pooled value in, rows out
+//! add_gated   fold the compressed branch's gated rows into a tile's rows, in place
 //! ```
+//!
+//! `ops::segments` also declares `vsa_compose_gated_rows` — the member-major composition of one row
+//! interval from several members — which **no launch in this model reaches**: the sparse chain here
+//! composes a single member per query interval, and the multi-member form belongs to a caller that
+//! has not appeared. It stays declared for that reason and not as a stage this chain fuses; a store
+//! built for it would have no launch to serve.
 //!
 //! The layer holds the geometry — tile rows, heads, features, the rotation's extent — and the
 //! epsilon of the Q/K normalization. Every activation, every score and every derived table is the
@@ -406,6 +413,30 @@ impl VsaTiles {
     /// `[heads, query tiles, tiles]` FP32, contiguous, written here and read by [`Self::select`]. One
     /// dot product per (query tile, key tile) and head — no scale and no softmax, because the
     /// selection only compares and the attention scales its own products.
+    /// The descriptor one score launch takes: the head count, the features per head and the bound on
+    /// the dot product's length. A walk states it from the layer's own geometry.
+    pub fn scores_descriptor(&self) -> segments::ScoresDescriptor {
+        segments::ScoresDescriptor::new(
+            self.heads,
+            self.width,
+            self.width.next_power_of_two(),
+            false,
+        )
+    }
+
+    /// The descriptor one compression launch takes: the element type, the head count, the features
+    /// per head, and the bound on the key tiles one reduction covers.
+    pub fn compress_descriptor(&self, dtype: DType) -> segments::CompressPooledDescriptor {
+        segments::CompressPooledDescriptor::new(
+            dtype,
+            self.heads,
+            self.width,
+            self.max_tiles,
+            self.width.next_power_of_two(),
+            false,
+        )
+    }
+
     pub fn scores(
         &self,
         f: &Forward,
@@ -428,8 +459,7 @@ impl VsaTiles {
                 format!("{} features per head", pooled_query.shape.dim(2)),
             )
         })?;
-        let descriptor =
-            segments::ScoresDescriptor::new(self.heads, width, width.next_power_of_two(), false);
+        let descriptor = self.scores_descriptor();
         let args = segments::ScoresArgs {
             pooled_query,
             pooled_key,
@@ -458,14 +488,7 @@ impl VsaTiles {
         out: TensorView,
     ) -> Result<()> {
         self.check_compress(scores, values, sizes, out)?;
-        let descriptor = segments::CompressPooledDescriptor::new(
-            out.dtype,
-            self.heads,
-            self.width,
-            self.max_tiles,
-            self.width.next_power_of_two(),
-            false,
-        );
+        let descriptor = self.compress_descriptor(out.dtype);
         let args = segments::CompressPooledArgs {
             scores,
             values,
