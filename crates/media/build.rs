@@ -10,8 +10,6 @@
 //! The runtime path is recorded in every executable this package builds, so a
 //! test binary runs without a wrapper script.
 
-use std::path::Path;
-
 /// Libraries the shim calls, in link order.
 const LIBRARIES: [&str; 5] = ["avformat", "avcodec", "swscale", "swresample", "avutil"];
 
@@ -34,7 +32,7 @@ fn main() {
             prefix.display()
         );
     }
-    if !has_library(&lib) {
+    if !has_ffmpeg(&prefix) {
         panic!(
             "FFmpeg shared libraries are missing from {}; the media crate loads no static \
              FFmpeg (crates/media/README.md describes how the runtime is provisioned)",
@@ -64,24 +62,4 @@ fn main() {
         "cargo:rustc-env=UNISERVE_MEDIA_RUNTIME={}",
         prefix.display()
     );
-}
-
-/// Whether `lib` holds a shared libav* library.
-fn has_library(lib: &Path) -> bool {
-    LIBRARIES.iter().any(|name| {
-        ["so", "dylib"].iter().any(|extension| {
-            let file = format!("lib{name}.{extension}");
-            lib.join(&file).is_file()
-                || std::fs::read_dir(lib).is_ok_and(|mut entries| {
-                    entries.any(|entry| {
-                        entry.is_ok_and(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with(&format!("{file}."))
-                        })
-                    })
-                })
-        })
-    })
 }
