@@ -71,3 +71,7 @@ mUseShuffledMatrix = "1"
 mBiasType = "m"
 mBiasDtype = "Fp32"
 mFusedAct = "0"
+# The down product applies no activation of its own: the gate and the up product are the first
+# GEMM's, and this one is linear. Stating it is what separates the plain cubin family from the
+# `relu2` one, which the filter otherwise kept because both match every other option.
+mEltwiseActType = "none"
