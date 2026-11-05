@@ -37,6 +37,11 @@ const ANSWER: Duration = Duration::from_secs(60);
 const FIRST_TOKEN: Duration = Duration::from_secs(60);
 
 /// Blocks until a command answers, and answers its result.
+///
+/// `track_caller` so a timeout names the command that was awaited rather than
+/// the helper: every wait here shares one bound, and a location inside the
+/// helper cannot tell one unanswered command from another.
+#[track_caller]
 fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
     match receiver.recv_timeout(ANSWER) {
         Ok(result) => result,
@@ -109,9 +114,15 @@ fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
 
 #[test]
 fn a_request_is_served_through_the_executors_own_batch_path() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(crate::support::serving::config(&serving, "in-process-completion"), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(
+        crate::support::serving::config(&serving, "in-process-completion"),
+        batches,
+    )
+    .expect("the pool serves");
     install(&handle, &serving);
     // The kernels this epoch serves on, as the control thread's switchover arm
     // publishes it. The handle's stage command is not the arm that numbers a
@@ -193,7 +204,9 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
 /// world that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
     let mut config = crate::support::serving::config(&serving, "in-process-completion");
     config.max_running_requests = 1;
@@ -244,9 +257,15 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// a batch handed to the executor with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
-    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool("model")]));
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let handle = SchedulerHandle::over_batches(crate::support::serving::config(&serving, "in-process-completion"), batches).expect("the pool serves");
+    let handle = SchedulerHandle::over_batches(
+        crate::support::serving::config(&serving, "in-process-completion"),
+        batches,
+    )
+    .expect("the pool serves");
     install(&handle, &serving);
     // The consumer is kept open for the case's length: a world whose client
     // went away ends its requests, which is not what is under test.
