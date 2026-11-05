@@ -2873,9 +2873,13 @@ mod tests {
             count("frame_pad") >= 1,
             "the encoder states its pad: {programs:?}"
         );
-        assert!(
-            count("scaled_add") > 1,
-            "each level's residual is its own width: {programs:?}"
+        // **One residual add for every level and every raster.** The add's operand is a level's width,
+        // which is the launch's extent; measured at one raster, at two and at three, the row count is
+        // one each time and its key names no extent.
+        assert_eq!(
+            count("scaled_add"),
+            1,
+            "one residual add, whatever the level widths: {programs:?}"
         );
         for (operator, key) in &programs {
             assert!(
@@ -3069,10 +3073,13 @@ mod tests {
         let channels = u64::from(config.latent_channels);
         // One row for the projection's two adds and one per track the encoder serves: the stage adds
         // are one program at every stage, because the width is the operand's.
+        // **One row, not one per track and not one for the projection.** Every add is the same program
+        // at a different extent - measured at one track, at two and at three, the count is one - so a
+        // row per track would be a program per request length.
         assert_eq!(
             residuals.len(),
-            2,
-            "the projection's row and one per track: {residuals:?}"
+            1,
+            "one residual add for every stage, track and the projection: {residuals:?}"
         );
         for extent in &extents {
             assert!(
