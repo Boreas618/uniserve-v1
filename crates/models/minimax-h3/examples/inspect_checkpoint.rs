@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             "audio_vae",
             "audio decoder",
-            minimax_h3::audio_vae::AudioDecoder::keys(&config.audio_vae)?,
+            minimax_h3::audio_vae::BigVgan::keys(&config.audio_vae)?,
         ),
         (
             "text_encoder",

@@ -40,7 +40,12 @@ fi
 
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
-samples=256
+# The delivery's four durations, as the clips the model makes of them: `uniserve_eval/workloads/minimax_h3/`
+# asks for 5, 8, 10 and 15 seconds, which at 24 fps are 120, 192, 240 and 360 frames and, through
+# `align_num_frames`, clips of 124, 192, 243 and 362. **A duration is the delivery's; the clip is the
+# model's.** The values are stated here rather than derived because this is `sh`; the generator states
+# the same four through the two functions (`DELIVERY_SECONDS`), and a mismatch is a finding.
+samples=124,192,243,362
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -50,8 +55,22 @@ samples=256
 rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
+# The task the fixture's deployment serves. The walk refuses without it, and it is not cosmetic: the
+# serving partition derives the capacity from it, so the packed row bound — and the gated activation's
+# `wide` form with it — follows from this line. `ref2va` is the widest of the three: 304,976 dense and
+# 351,232 sparse, and one store means the widest.
+task=ref2va
+# The tasks **one store serves**, which is every task the model answers: a row is the pair
+# (operator, key) and the key depends on the task, so a walk of one task states one task's rows. The
+# `logits_gather` that reads the modulation table is the one that differs — `columns_2` when nothing
+# is conditioned over (`t2va`) and `columns_4` when a conditioner is (`fl2va`, `ref2va`) — so a
+# fixture walked at `task` above lacks a cell a `t2va` request launches. The rows only the other
+# tasks state are appended below, and their source is named in the fixture.
+serves='t2va fl2va ref2va'
 elements=123456
-track=44100
+# One track per clip, `audio_samples` of it: the walk refuses a track no stated clip implies, so this
+# line cannot drift from the one above without a refusal naming both.
+track=165600,256000,324000,482400
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
@@ -87,15 +106,62 @@ echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
+
+# 1b. The rows the other served tasks state and this one does not. Appended to the walk's own print so
+# that the generator counts them, and so that `keys_delta` compares the fixture with the rows it was
+# built from. A task that states nothing new appends nothing; a task that states something prints it,
+# because a difference nobody looked at reads exactly like a difference that lost twelve rows.
+echo 'rows the other served tasks state:'
+other_dense="$staging/walk-other-dense.txt"
+other_sparse="$staging/walk-other-sparse.txt"
+: >"$other_dense"
+: >"$other_sparse"
+for other in $serves; do
+    [ "$other" = "$task" ] && continue
+    case "$other" in
+        t2va) other_conditioned=false ;;
+        *) other_conditioned=true ;;
+    esac
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example programs -- "$root" \
+        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
+        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
+        --track "$track" --types "$types" >>"$other_dense"
+    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example programs -- "$root" \
+        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
+        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
+        --track "$track" --types "$types" --sparse "$sparse" >>"$other_sparse"
+done
+# Only whole rows (`operator<TAB>key`), only those the fixture's own task does not state, sorted and
+# deduplicated across the other tasks.
+for pair in "dense:$walk_dense:$other_dense" "sparse:$walk_sparse:$other_sparse"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    walk=${rest%%:*}
+    others=${rest#*:}
+    only="$staging/only-$name.txt"
+    comm -23 \
+        <(grep -P '^[a-z0-9_]+\t' "$others" | sort -u) \
+        <(grep -P '^[a-z0-9_]+\t' "$walk" | sort -u) >"$only"
+    printf '  %-10s %s row(s)' "$name" "$(wc -l <"$only")"
+    if [ -s "$only" ]; then
+        printf ', appended:\n'
+        sed 's/^/    /' "$only"
+        cat "$only" >>"$walk"
+    else
+        printf '\n'
+    fi
+done
 
 # 2. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
@@ -120,6 +186,28 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
     --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
+
+# 3b. One file, one attention backend. The dense and sparse walks differ by seven operators
+# (`sparse_attention` and the six `vsa_*`), so a dense fixture that names one of them is the union of
+# two deployments - a store with cells no launch of that deployment reads, and the omni fixture was
+# deleted for exactly this. The check is a grep because the alternative is a rule nobody runs.
+echo 'one deployment per file:'
+for pair in "dense:$fixture_dense:" "sparse:$fixture_sparse:sparse"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    fixture=${rest%%:*}
+    want=${rest#*:}
+    others=$(grep -cP '^(sparse_attention|vsa_[a-z_]+)\t' "$fixture")
+    if [ "$name" = dense ] && [ "$others" -ne 0 ]; then
+        printf '  %-10s FAILED - %s row(s) of the sparse backend in the dense file\n' "$name" "$others"
+        exit 1
+    fi
+    if [ "$name" = sparse ] && [ "$others" -eq 0 ]; then
+        printf '  %-10s FAILED - no row of the sparse backend in the sparse file\n' "$name"
+        exit 1
+    fi
+    printf '  %-10s ok (%s row(s) of the sparse backend)\n' "$name" "$others"
+done
 
 # 4. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
