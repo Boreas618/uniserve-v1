@@ -1533,7 +1533,14 @@ impl Decoder for VideoDecoder {
             })
     }
 
-    /// The latent layout this decoder's canvas decodes to a raster.
+    /// The latent layout one clip's raster decodes from.
+    ///
+    /// The argument is the **decoded raster** - frames, rows and columns of the media this block
+    /// writes - and the return is the **latent** layout its tables and arena are keyed by. The
+    /// ratios between them are this deployment's own, read at construction from the checkpoint's
+    /// config (`temporal_compression` frames per latent frame, `spatial_compression()` pixels per
+    /// latent cell), which is why the map is the decoder's: a runtime that divided by either would
+    /// be holding this checkpoint's compression in its own code.
     ///
     /// **The decoder is built for one canvas** (`VideoDecoder::load` takes it), because its register
     /// rows, its voxel-row table and its sequence offsets are the canvas's constants rather than a
