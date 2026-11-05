@@ -1608,13 +1608,64 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     counters.launches(captured.kernel_nodes());
                 }
                 if runner_dump() {
-                    // The node count is what separates a graph that does per-token work from one
-                    // that does per-batch work: a prefill an order of magnitude slower than a
-                    // decode and holding an order of magnitude more nodes is a graph shaped by its
-                    // token axis, not a slow kernel.
+                    // What a replay launches, by node kind, and how many launches the recording
+                    // saw. A forward of forty-eight layers holds hundreds of kernel nodes; a graph
+                    // that reports one node while the model has hundreds means the launches did not
+                    // land in the template - they ran during the capture - and a replay is then a
+                    // graph replaying work that is not the forward.
+                    let mut histogram: Vec<(String, u64)> = Vec::new();
+                    let mut launches = 0_u64;
+                    for (_, _, launch) in captured.nodes() {
+                        launches += 1;
+                        for walked in launch {
+                            let kind = walked
+                                .node
+                                .kind()
+                                .map(|kind| format!("{kind:?}"))
+                                .unwrap_or_else(|_| "unknown".to_owned());
+                            match histogram.iter_mut().find(|(name, _)| *name == kind) {
+                                Some((_, count)) => *count += 1,
+                                None => histogram.push((kind, 1)),
+                            }
+                        }
+                    }
+                    let kinds = histogram
+                        .iter()
+                        .map(|(name, count)| format!("{name}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    // The template's own node table, straight from the driver: what a replay
+                    // actually launches, which the recording's table can only claim.
+                    let (template_nodes, template_kinds) = match captured.template().nodes() {
+                        Ok(nodes) => {
+                            let mut counted: Vec<(String, u64)> = Vec::new();
+                            for node in &nodes {
+                                let kind = node
+                                    .kind()
+                                    .map(|kind| format!("{kind:?}"))
+                                    .unwrap_or_else(|_| "unknown".to_owned());
+                                match counted.iter_mut().find(|(name, _)| *name == kind) {
+                                    Some((_, count)) => *count += 1,
+                                    None => counted.push((kind, 1)),
+                                }
+                            }
+                            let spelled = counted
+                                .iter()
+                                .map(|(name, count)| format!("{name}:{count}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            (nodes.len(), spelled)
+                        }
+                        Err(error) => (0, format!("unreadable({error})")),
+                    };
                     tracing::info!(
                         bucket = %bucket,
                         kernels = captured.kernel_nodes(),
+                        walks = launches,
+                        recorded_kinds = %kinds,
+                        template_nodes,
+                        template_kinds = %template_kinds,
+                        kernels_held = captured.kernels().len(),
                         launch_ms = launched.elapsed().as_secs_f64() * 1e3,
                         "a replay issued its graph"
                     );
