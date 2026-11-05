@@ -197,5 +197,26 @@ fn text_is_served_before_any_rejection() {
         }
     }
     assert!(finished, "the deployment serves text before any rejection");
+
+    // A second text request separates a state the first request poisoned from
+    // an admission that closed: if this one is refused too, nothing is being
+    // admitted any more; if it serves, the first request's path is what fails.
+    let mut second = engine
+        .submit(text_request(2, 8))
+        .expect("the second text request is accepted");
+    let deadline = Instant::now() + ANSWER;
+    let mut served_again = false;
+    while Instant::now() < deadline && !served_again {
+        if let Ok(event) = second.try_recv() {
+            served_again = matches!(event, Event::Finished { .. });
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        served_again,
+        "a second text request is served: admission is open and the first request did not \
+         poison the engine"
+    );
     engine.shutdown();
 }
