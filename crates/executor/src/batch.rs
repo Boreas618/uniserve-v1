@@ -715,14 +715,14 @@ impl Executors {
             .iter()
             .find(|executor| executor.serves(phase))
             .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "no device of this rank serves phase {phase:?}; its {} device(s) serve {:?}",
-                    self.executors.len(),
-                    self.executors
+                route_refusal(
+                    phase,
+                    &self
+                        .executors
                         .iter()
                         .flat_map(|executor| executor.phases().iter().copied())
-                        .collect::<Vec<_>>()
-                ))
+                        .collect::<Vec<_>>(),
+                )
             })
     }
 
@@ -735,6 +735,24 @@ impl Executors {
     pub fn is_empty(&self) -> bool {
         self.executors.is_empty()
     }
+}
+
+/// The refusal of a batch whose phase no device of this rank serves.
+///
+/// A phase number is a plan's, and the plan that numbers the batches and the plan that splits the
+/// model must agree on it; when they do not, the batch reaches this rank and nothing here can serve
+/// it. Both numbers are named - the phase asked for and the phases this rank's devices serve -
+/// because the disagreement is between two plans and one figure alone cannot show it. The answer is
+/// `Invalid`: the batch is not servable here, which is a refusal rather than a broken device. What a
+/// reader of the number does with that distinction is the caller's - the in-process submission path
+/// currently wraps every executor error alike, so an `Invalid` and a broken context read the same
+/// there.
+fn route_refusal(phase: PhaseId, served: &[PhaseId]) -> Error {
+    Error::Invalid(format!(
+        "no device of this rank serves phase {}; its devices serve {:?}",
+        phase.0,
+        served.iter().map(|served| served.0).collect::<Vec<_>>()
+    ))
 }
 
 impl Batches for Executors {
@@ -1051,5 +1069,25 @@ mod media_tests {
         };
         assert_eq!(encode.computation.variant(), Some(Variant::Encode));
         encode.check().expect("an encode is sized by rows and tokens");
+    }
+
+    /// A batch whose phase no device of this rank serves is refused where it is routed, and the
+    /// refusal names the phase the plan asked for and the phases this rank's devices serve: the
+    /// disagreement is between two plans, and one figure alone cannot show it. It is a refusal and
+    /// not a device failure - the batch is not servable here, which is not the same as a broken
+    /// device - and it is stated as such, because a reader that can tell the two apart can end one
+    /// batch instead of the epoch.
+    #[test]
+    fn a_phase_no_device_serves_is_refused_by_both_numbers() {
+        let refusal = route_refusal(ipc::PhaseId(3), &[ipc::PhaseId(0), ipc::PhaseId(1)]);
+        assert!(
+            matches!(refusal, Error::Invalid(_)),
+            "a batch nothing here can serve was refused as a device failure: {refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("phase 3") && text.contains("[0, 1]"),
+            "the refusal names neither the phase asked for nor the ones served: {text}"
+        );
     }
 }
