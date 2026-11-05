@@ -1034,6 +1034,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
+    // **The conditioner's per-head normalization.** `TokenRefiner::programs` states two norm widths -
+    // the hidden state's and **one head's**, `config.head_dim` = 128 - because its attention
+    // normalizes each query and key over a head rather than through the fused `qk_norm_rope` the DiT's
+    // blocks use. The hidden width was a row; the head's was not, so the conditioner's attention would
+    // have stopped at its first normalization. It is the conditioner's dtype - BF16 at `auto`, like
+    // the rest of that path - and the tile is the operator's for 128 columns.
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: deployment,
+            columns: HEAD_DIM,
+            tile: HEAD_DIM.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
     // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
     for (target, source) in [(DType::F32, DType::F32), (deployment, deployment)] {
