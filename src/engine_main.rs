@@ -597,6 +597,9 @@ pub(crate) struct MainProcess {
     /// answer when admission opens. `Switched` means this process serves, so it waits for the
     /// buckets a batch would be planned into; a warmup that fails answers the switchover instead.
     pending_switch: Option<(u64, Option<u32>)>,
+    /// When the warmup now running was queued: a warmup that outlives twice the stall bound is
+    /// failed by name rather than left to answer nothing.
+    warming_since: Option<Instant>,
     /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
     ///
     /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
@@ -866,6 +869,7 @@ impl MainProcess {
             command_wait: Wait::default(),
             warmup_wait: Wait::default(),
             pending_switch: None,
+            warming_since: None,
             policy_probe_at: None,
             policy_missing_since: None,
             prepared: Vec::new(),
@@ -1211,9 +1215,12 @@ impl MainProcess {
             Action::Revert => {
                 let generation = self.update.phase().generation().unwrap_or_default();
                 let reason = failure.reason();
-                self.revert(generation, failure)?;
-                // The revert answers the daemon itself; the failure that caused it is what the
-                // revert's own report carries.
+                let status = self.revert(generation, failure)?;
+                // The answer goes out from here: a revert this process started - a warmup that
+                // failed, a device that could not continue - has no command to answer, and the
+                // daemon waiting on the switchover learns it from this report or not at all. Two
+                // minutes of silence and then a timeout is what its absence looks like.
+                self.report(status);
                 tracing::info!(generation, %reason, "an update on probation was reverted");
                 Ok(None)
             }
@@ -2160,6 +2167,30 @@ impl MainProcess {
     /// the cut-over happened, which is why the failure goes through the update's decision table
     /// rather than through the switchover's answer.
     fn advance_warmup(&mut self) -> Result<Option<UpdateFailure>> {
+        // A warmup still running past twice the stall bound is a device that will not finish it: its
+        // answer is owed to the daemon's switchover wait, so silence here is a timeout with no cause
+        // in the log. Failing it by name reverts the update and leaves the process serving what it
+        // held.
+        if let (Some(since), true) = (self.warming_since, !self.warming.is_empty()) {
+            if since.elapsed() > self.watchdog.stall_bound() * 2 {
+                let (device, generation) = self
+                    .warming
+                    .first()
+                    .map_or((0, 0), |(device, _, generation)| (*device, *generation));
+                let failure = UpdateFailure::Device {
+                    device,
+                    error: format!(
+                        "warming generation {generation} on device {device} did not finish in {}s",
+                        since.elapsed().as_secs()
+                    ),
+                    batch: None,
+                };
+                self.warming.clear();
+                self.warming_since = None;
+                self.pending_switch = None;
+                return self.failure(failure);
+            }
+        }
         let mut pending = Vec::with_capacity(self.warming.len());
         for (device, submission, generation) in std::mem::take(&mut self.warming) {
             match submission.outcome() {
@@ -2180,17 +2211,11 @@ impl MainProcess {
                         ),
                         batch: None,
                     };
-                    // A switchover whose answer is still owed is answered with this failure: the
-                    // daemon must not read the epoch as served after a warmup that did not finish.
-                    if let Some((owed, owed_reply)) = self.pending_switch.take() {
-                        self.answer(
-                            owed_reply,
-                            ProgramStatus::Failed {
-                                generation: owed,
-                                failure: failure.clone(),
-                            },
-                        );
-                    }
+                    // The answer owed to the switchover goes out from the revert below, as
+                    // `Reverted` - the status the daemon's wait accepts for a generation that took
+                    // over and went back. Reading it as served is what this ordering prevents.
+                    self.pending_switch = None;
+                    self.warming_since = None;
                     // The table decides, as it does for every other failure: on probation this
                     // reverts the generation, and an update the daemon already committed leaves a
                     // device that cannot run it, which ends the epoch rather than serving on.
@@ -2991,6 +3016,7 @@ impl MainProcess {
             // opens a frontend onto a process that cannot take a request.
             SwitchoverAnswer::AfterTheWarmup => {
                 self.pending_switch = Some((generation, reply));
+                self.warming_since = Some(Instant::now());
                 Ok(None)
             }
         }
@@ -3323,6 +3349,7 @@ impl MainProcess {
         // stopped describing serving, and a failure read from a stale entry would revert an update
         // that is over.
         self.warming.clear();
+        self.warming_since = None;
         // The answer owed to that warmup goes with it: the daemon's switchover wait is answered by
         // the revert's own report, and a later `Switched` would state a generation that does not
         // serve.
