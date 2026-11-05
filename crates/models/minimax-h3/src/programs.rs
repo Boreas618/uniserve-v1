@@ -12,7 +12,10 @@
 
 use ops::Op;
 
-use crate::config::{Config, MAX_FRAMES};
+use crate::config::{AttentionKind, Config, MAX_FRAMES};
+use crate::denoiser::Arrangement;
+use crate::modulation::Groups;
+use crate::partition::Partition;
 use crate::{Error, Result};
 
 /// The launches a component makes, as the operator and the key its descriptor states.
@@ -163,6 +166,49 @@ impl Deployment {
                 .ok()
             })
             .collect()
+    }
+
+    /// The rows the two DiTs state: their stacks, the orchestration around them, and the
+    /// conditioner.
+    ///
+    /// Three facts are the caller's and are handed in rather than held, because they are the
+    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement, the
+    /// tensor-parallel placement, and whether the modulation cache is the conditioned one. The
+    /// packed row bound is not among them: it is derived from the arrangement by the layout rule
+    /// (`Layouts::rows_bound`), which is the one place that answers it.
+    ///
+    /// `elements` is empty by construction. The solver's residual is one operator over the whole
+    /// trajectory, so its width is a request's element count - a row for it would compile a program
+    /// for numbers no request states until it arrives, which is the class this file keeps naming:
+    /// **a runtime quantity that sizes a launch is an argument, not a key.**
+    pub fn denoiser_rows(
+        &self,
+        partition: &Partition,
+        arrangement: &Arrangement,
+        groups: Groups,
+    ) -> Result<Vec<(String, String)>> {
+        let mut programs = Programs::default();
+        for config in self.config.denoisers.values() {
+            let rules = crate::denoiser::Layouts::new(config.clone(), *arrangement)?;
+            let rows = rules.rows_bound()?;
+            let tiles = match config.attention {
+                AttentionKind::Dense => 0,
+                _ => rows
+                    .div_ceil(config.attention.capacity_rows())
+                    .next_power_of_two(),
+            };
+            programs.extend(crate::denoiser::Denoiser::programs(
+                &config.transformer,
+                config.attention,
+                self.types.transformer,
+                rows,
+                groups,
+                partition,
+                &[],
+                tiles,
+            )?);
+        }
+        Ok(programs.finish())
     }
 
     /// The rows the two audio VAEs and the video VAE state: the components whose whole argument is
