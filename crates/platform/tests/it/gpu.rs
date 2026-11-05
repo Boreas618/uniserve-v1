@@ -1418,12 +1418,16 @@ fn a_programmatic_dependency_is_walked_and_its_kind_is_read() {
         write.launch_ex(&stream, &launch, &mut parameters).unwrap();
         // The frontier query the walk runs first: a null edge-data array here
         // was the second half of the same defect.
-        assert_eq!(capture.record().unwrap().len(), 1, "the second launch");
+        let walked = capture.record_walk().unwrap();
+        assert_eq!(walked.len(), 1, "the second launch adds one node");
+        assert_eq!(
+            walked[0].incoming.len(),
+            1,
+            "one dependency reaches it from the first launch"
+        );
         let graph = capture.end().unwrap();
         assert_eq!(graph.node_count().unwrap(), 2);
-        let edges = graph.edges().unwrap();
-        assert_eq!(edges.len(), 1, "one dependency joins the two launches");
-        edges[0].kind
+        walked[0].incoming[0]
     };
 
     assert_eq!(

@@ -77,8 +77,8 @@ pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::{
-    Capture, CaptureMode, EdgeKind, Graph, GraphEdge, GraphExec, GraphNode, GraphNodeKind,
-    KernelNodeParams, OwnedKernelNodeParams, open_captures,
+    Capture, CaptureMode, EdgeKind, Graph, GraphExec, GraphNode, GraphNodeKind, KernelNodeParams,
+    OwnedKernelNodeParams, WalkedNode, open_captures,
 };
 pub use launch::{
     Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig, ParamInfo,

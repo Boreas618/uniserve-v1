@@ -151,40 +151,6 @@ impl Graph {
             .collect())
     }
 
-    /// Every dependency the graph holds, with what each edge says.
-    ///
-    /// This is the graph's structure as a rebind keeps it (design 4.5): an
-    /// executable graph is updated in place only while the structure it was
-    /// instantiated from is unchanged, and a structure is not unchanged if an
-    /// edge became programmatic - the downstream node may then start before its
-    /// upstream node has finished, so the two graphs do not order their work
-    /// the same way. A comparison of two captures that reads this is total; one
-    /// that compares nodes alone is not.
-    ///
-    /// **A walk that ignores the edge data cannot run at all** on a graph with a
-    /// programmatic edge (`CUDA_ERROR_LOSSY_QUERY`); see [`dependent_edges`].
-    pub fn edges(&self) -> Result<Vec<GraphEdge>> {
-        let mut seen: HashSet<usize> = HashSet::new();
-        let mut queue: std::collections::VecDeque<Handle> = root_handles(&self.core)?.into();
-        for node in queue.iter() {
-            seen.insert(*node as usize);
-        }
-        let mut edges = Vec::new();
-        while let Some(node) = queue.pop_front() {
-            for (dependent, data) in dependent_edges(node)? {
-                edges.push(GraphEdge {
-                    from: node as usize,
-                    to: dependent as usize,
-                    kind: EdgeKind::of(&data)?,
-                });
-                if seen.insert(dependent as usize) {
-                    queue.push_back(dependent);
-                }
-            }
-        }
-        Ok(edges)
-    }
-
     /// The graph's node handles, in the driver's order.
     fn node_handles(&self) -> Result<Vec<Handle>> {
         let driver = driver::driver()?;
@@ -692,6 +658,21 @@ impl Capture {
     /// the nodes are that operation's, and the owner records which operation
     /// they belong to for a later rebind.
     pub fn record(&mut self) -> Result<Vec<GraphNode>> {
+        Ok(self
+            .record_walk()?
+            .into_iter()
+            .map(|walked| walked.node)
+            .collect())
+    }
+
+    /// [`Self::record`], with the kind of every dependency that reaches each node.
+    ///
+    /// This is the walk a structure comparison reads: two captures of the same work
+    /// are compared per operation and per position, so the kinds belong to the
+    /// positions rather than to the handles. A rebind sets node parameters and keeps
+    /// the template's edges, so a launch whose edge became programmatic is a
+    /// structure change and its bucket is recaptured.
+    pub fn record_walk(&mut self) -> Result<Vec<WalkedNode>> {
         let (status, _, frontier) = capture_info(&self.stream)?;
         if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
@@ -700,34 +681,54 @@ impl Capture {
         }
 
         let mut found: Vec<Handle> = Vec::new();
+        let mut kinds: std::collections::HashMap<usize, Vec<EdgeKind>> =
+            std::collections::HashMap::new();
         let mut queue: std::collections::VecDeque<Handle> =
             frontier.iter().map(|(node, _)| *node).collect();
+        // An edge of the frontier is a dependency of the nodes this operation adds,
+        // so its kind is recorded against them as well.
+        let mut pending: Vec<EdgeKind> = Vec::new();
+        for (_, data) in &frontier {
+            pending.push(EdgeKind::of(data)?);
+        }
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
         for root in root_handles(&self.core)? {
             if self.seen.insert(root as usize) {
                 found.push(root);
+                kinds.insert(root as usize, Vec::new());
                 queue.push_back(root);
             }
         }
         while let Some(node) = queue.pop_front() {
             // Both edge kinds are dependencies: a programmatic edge lets the
             // downstream node start early, not become unrelated to it.
-            for (dependent, _) in dependent_edges(node)? {
+            for (dependent, data) in dependent_edges(node)? {
                 if self.seen.insert(dependent as usize) {
                     found.push(dependent);
+                    let entry = kinds.entry(dependent as usize).or_default();
+                    entry.push(EdgeKind::of(&data)?);
                     queue.push_back(dependent);
                 }
             }
         }
         self.frontier = frontier.into_iter().map(|(node, _)| node).collect();
 
+        // The frontier's edges reach the first nodes the operation added, which are
+        // the ones no other new node depends on.
+        if let Some(first) = found.first().copied() {
+            kinds.entry(first as usize).or_default().extend(pending);
+        }
+
         Ok(found
             .into_iter()
-            .map(|raw| GraphNode {
-                core: Arc::clone(&self.core),
-                raw,
+            .map(|raw| WalkedNode {
+                node: GraphNode {
+                    core: Arc::clone(&self.core),
+                    raw,
+                },
+                incoming: kinds.remove(&(raw as usize)).unwrap_or_default(),
             })
             .collect())
     }
@@ -919,13 +920,20 @@ impl EdgeKind {
     }
 }
 
-/// One dependency of a captured graph: the nodes it joins and what it means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GraphEdge {
-    /// The upstream node, as [`GraphNode::raw`] answers it.
-    pub from: usize,
-    /// The downstream node, as [`GraphNode::raw`] answers it.
-    pub to: usize,
-    /// What the edge says about the order between them.
-    pub kind: EdgeKind,
+/// One node an operation added, with the kinds of the dependencies that reach it.
+///
+/// The edges are stated **per node, in the walk's order**, rather than as pairs of
+/// driver handles. Two captures of the same work are compared position by position
+/// (design 4.5's rebind condition), and a handle belongs to one graph while a
+/// position belongs to the order both walks agree on. Every edge of the graph
+/// appears here exactly once: it is in the `incoming` list of the node it reaches,
+/// and the walk reaches every node.
+#[derive(Clone, Debug)]
+pub struct WalkedNode {
+    /// The node the operation added.
+    pub node: GraphNode,
+    /// The kinds of the edges from the nodes already walked into this one, in the
+    /// driver's order. A node an operation added after another operation's nodes has
+    /// one entry per dependency that crosses the boundary.
+    pub incoming: Vec<EdgeKind>,
 }
