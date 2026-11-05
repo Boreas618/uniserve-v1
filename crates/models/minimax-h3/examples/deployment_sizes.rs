@@ -227,10 +227,18 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
     let width = u64::from(denoiser.transformer.hidden_size);
 
     println!("\n## recomputed from {}\n", root.display());
+    // The condition capacity is the deployment's own, derived from the largest conditioned request
+    // it can be asked for - two keyframes at the largest canvas it offers - not the checkpoint's
+    // 192-row table, which is a statement about the reference's rasters.
+    let conditioned = minimax_h3::partition::condition_rows(
+        &config,
+        nn::capability::VideoTask::FirstLastToVideoAudio,
+    )?;
+    println!("condition capacity: {conditioned} rows (two keyframes at the largest canvas)");
     for frames in [124_u32, 362] {
         let capacity = Capacity {
             text_rows: 128,
-            condition_rows: 192,
+            condition_rows: conditioned,
             frames,
         };
         let rows = u64::from(capacity.rows(denoiser)?);
