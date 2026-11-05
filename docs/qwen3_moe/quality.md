@@ -91,10 +91,10 @@ REF=/abs/path/artifacts/qwen3_moe/gsm8k-reference
 # The candidate side, in this checkout.
 cd <candidate worktree>
 cargo build --release
-cp -p .venv/bin/uniserve .venv/bin/uniserve.previous
-install -m 755 target/release/uniserve .venv/bin/uniserve
+[ -f .venv/bin/uniserve ] && cp -p .venv/bin/uniserve .venv/bin/uniserve.previous
+install -D -m 755 target/release/uniserve .venv/bin/uniserve
 cmp target/release/uniserve .venv/bin/uniserve   # silent: the installed copy is the build
-export VIRTUAL_ENV=$PWD/.venv
+export VIRTUAL_ENV=$PWD/.venv                    # the environment `uniserve-eval` runs in
 .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable "$PWD/target/release/uniserve"
 # The FP8 KV cell's provider name differs by implementation: the reference
 # side's `torch` provider does not exist in the rewrite, whose FP8 planes its
