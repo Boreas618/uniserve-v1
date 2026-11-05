@@ -144,8 +144,16 @@ impl Representation {
                 "the checkpoint's two declarations disagree about `{parameter}`: `config.json` \
                  {} it and `{DECLARATION_FILE}` {} it, and a packed tensor read as dense is a \
                  matrix of E2M1",
-                if excluded_here { "excludes" } else { "quantizes" },
-                if excluded_here { "quantizes" } else { "excludes" },
+                if excluded_here {
+                    "excludes"
+                } else {
+                    "quantizes"
+                },
+                if excluded_here {
+                    "quantizes"
+                } else {
+                    "excludes"
+                },
             )));
         }
         // A calibration quantizes a *module class* — ModelOpt's NVFP4 packs `Linear` and nothing
@@ -221,7 +229,10 @@ pub fn parameters(config: &Config) -> Vec<(String, Role)> {
     for layer in 0..config.num_hidden_layers {
         let base = format!("model.layers.{layer}");
         for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-            parameters.push((format!("{base}.self_attn.{projection}.weight"), Role::Projection));
+            parameters.push((
+                format!("{base}.self_attn.{projection}.weight"),
+                Role::Projection,
+            ));
         }
         for norm in ["input_layernorm", "post_attention_layernorm"] {
             parameters.push((format!("{base}.{norm}.weight"), Role::Norm));
@@ -433,7 +444,11 @@ impl Declared {
             // no method of its own; the group it states is what pins the spelling (see below).
             method: string("quant_method")?.or(producer_method(value)),
             also_excluded: Vec::new(),
-            excluded: if excluded.is_empty() { group_excluded } else { excluded },
+            excluded: if excluded.is_empty() {
+                group_excluded
+            } else {
+                excluded
+            },
         })
     }
 }
@@ -454,9 +469,9 @@ fn group_algorithm(groups: &Value, what: &str) -> Result<String> {
     })?;
     let mut algorithm: Option<String> = None;
     for (name, group) in groups {
-        let weights = group.get("weights").ok_or_else(|| {
-            Error::Config(format!("{what}'s group `{name}` states no `weights`"))
-        })?;
+        let weights = group
+            .get("weights")
+            .ok_or_else(|| Error::Config(format!("{what}'s group `{name}` states no `weights`")))?;
         let bits = weights.get("num_bits").and_then(Value::as_u64);
         let kind = weights.get("type").and_then(Value::as_str);
         let block = weights.get("group_size").and_then(Value::as_u64);
@@ -474,7 +489,9 @@ fn group_algorithm(groups: &Value, what: &str) -> Result<String> {
         match group.get("targets") {
             None => {}
             Some(Value::Array(targets))
-                if targets.iter().all(|target| target.as_str() == Some("Linear")) => {}
+                if targets
+                    .iter()
+                    .all(|target| target.as_str() == Some("Linear")) => {}
             Some(other) => {
                 return Err(Error::Config(format!(
                     "{what}'s group `{name}` targets {other}, and this tree quantizes linear \
@@ -557,8 +574,11 @@ mod tests {
     #[test]
     fn a_checkpoint_that_declares_nothing_is_dense() {
         let dir = tempdir();
-        std::fs::write(dir.join("config.json"), r#"{"architectures": ["Qwen3MoeForCausalLM"]}"#)
-            .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures": ["Qwen3MoeForCausalLM"]}"#,
+        )
+        .unwrap();
         assert_eq!(Representation::read(&dir).unwrap(), Representation::Dense);
         // And every role is read in the checkpoint's own dtype.
         for role in [
@@ -630,8 +650,14 @@ mod tests {
             .adopts("model.layers.4.mlp.gate.weight", Role::Router)
             .expect_err("a quantized router");
         let message = format!("{refused}");
-        assert!(message.contains("model.layers.4.mlp.gate.weight"), "{message}");
-        assert!(message.contains("the router's scoring projection"), "{message}");
+        assert!(
+            message.contains("model.layers.4.mlp.gate.weight"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the router's scoring projection"),
+            "{message}"
+        );
         // The head is excluded by the checkpoint, so it is read as it is stored.
         assert_eq!(
             declared.adopts("lm_head.weight", Role::Head).unwrap(),
@@ -641,7 +667,11 @@ mod tests {
 
     #[test]
     fn an_algorithm_this_tree_does_not_serve_is_refused_by_name() {
-        for (algo, method) in [("FP8", "modelopt"), ("MXFP4", "modelopt"), ("W4A16", "compressed-tensors")] {
+        for (algo, method) in [
+            ("FP8", "modelopt"),
+            ("MXFP4", "modelopt"),
+            ("W4A16", "compressed-tensors"),
+        ] {
             let dir = tempdir();
             std::fs::write(
                 dir.join("config.json"),
@@ -666,7 +696,10 @@ mod tests {
         )
         .unwrap();
         let refused = Representation::read(&dir).expect_err("a non-ModelOpt method");
-        assert!(format!("{refused}").contains("compressed-tensors"), "{refused}");
+        assert!(
+            format!("{refused}").contains("compressed-tensors"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -694,7 +727,10 @@ mod tests {
         )
         .unwrap();
         let refused = Representation::read(&dir).expect_err("two different declarations");
-        assert!(format!("{refused}").contains("two different quantizations"), "{refused}");
+        assert!(
+            format!("{refused}").contains("two different quantizations"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -780,7 +816,10 @@ mod tests {
         );
         assert_eq!(
             representation
-                .adopts("model.layers.0.mlp.experts.7.down_proj.weight", Role::Projection)
+                .adopts(
+                    "model.layers.0.mlp.experts.7.down_proj.weight",
+                    Role::Projection
+                )
                 .expect("a packed expert projection"),
             Adopted::Quantized
         );
