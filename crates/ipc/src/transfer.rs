@@ -105,7 +105,7 @@ pub enum TransferTransport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
     /// Loaded producer rank that owns this export.
-    pub source: WorkerEndpoint,
+    pub source: MainProcessEndpoint,
     /// Transport-specific export descriptor.
     pub transport: TransferTransport,
     /// Payload size in bytes of this shard or replica.

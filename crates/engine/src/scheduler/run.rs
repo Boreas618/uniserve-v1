@@ -21,7 +21,7 @@ use ipc::{ForwardMode, MediaCall};
 /// buffer-pool, and encoder-cache capacities.
 fn resolve_generation_limits(
     mut limits: crate::GenerationLimits,
-    info: &WorkerInfo,
+    info: &MainProcessInfo,
 ) -> crate::GenerationLimits {
     let supports = |kind| info.supported_calls.contains(&kind);
     let mut available = crate::GenerationFeatures::empty();
@@ -77,10 +77,10 @@ pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 2;
 /// A cache runtime with denoising keeps a row for a running request's
 /// text-unconditional guidance prefix, and another for its
 /// image-unconditional prefix when the worker states one for its model
-/// (`WorkerInfo::image_unconditional_token_ids`): each prefix
+/// (`MainProcessInfo::image_unconditional_token_ids`): each prefix
 /// (`Scheduler::ensure_guidance_prefix`) allocates its own row from the same
 /// request pool. Other runtimes keep none.
-pub(crate) fn guidance_prefix_rows(info: &WorkerInfo) -> usize {
+pub(crate) fn guidance_prefix_rows(info: &MainProcessInfo) -> usize {
     let denoises = info.uses_cache()
         && info
             .supported_calls
@@ -212,7 +212,7 @@ impl Scheduler {
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = PrefixCacheManager::from_worker_info(&info);
+        let cache = PrefixCacheManager::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
             cache.as_ref().map_or(0, PrefixCacheManager::usable_units),
@@ -393,9 +393,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
+    /// The worker groups that prefill only (`ExecutorGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
-    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::ExecutorGroupId>) {
         self.placement.prefill_groups = groups.into_iter().collect();
     }
 
@@ -609,7 +609,7 @@ impl Scheduler {
     ) {
         let info = self.executor.info();
         let groups: Vec<(
-            crate::WorkerGroupId,
+            crate::ExecutorGroupId,
             Vec<(u32, crate::encoder_outputs::RankEncoders<'_>)>,
         )> = info
             .rank_encoders
@@ -664,7 +664,7 @@ impl Scheduler {
     }
 
     /// Returns the executor's aggregate worker capabilities.
-    pub fn info(&self) -> &WorkerInfo {
+    pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
@@ -1001,7 +1001,7 @@ impl Scheduler {
     ///
     /// Waits in `Executor::poll` and applies at most one returned result.
     /// Commands and consumer reads fire the engine's `CommandWaker`. A real
-    /// waker, such as `WorkerExecutor::command_waker`, ends the poll early.
+    /// waker, such as `Dispatcher::command_waker`, ends the poll early.
     /// With the no-op waker, a command waits for the executor's own wake
     /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
     /// liveness deadline.

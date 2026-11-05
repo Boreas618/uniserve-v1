@@ -1,16 +1,17 @@
 //! Execution batches: the planned calls of one numerical call on one
 //! component.
 //!
-//! These are the semantic types of the scheduler-to-worker protocol,
-//! independent of wire framing. The engine lowers each scheduled batch into a
-//! [`Batch`] (`ExecutionBatch::into_protocol`, which validates it), projects
+//! These are the semantic types of the scheduler-to-main-process protocol,
+//! independent of wire framing. The scheduler lowers each scheduled batch into
+//! a [`Batch`] (`ExecutionBatch::into_protocol`, which validates it), projects
 //! it onto the calls each rank owns (`rank_projection`, which narrows forward
 //! rows with [`ForwardBatch::select`] and sets each call's `consumer_slots`),
 //! and sends it as the message of a [`Frame`]. A rank answers with one
 //! [`BatchOutput`] of per-call [`CallOutput`] completions, which it
-//! validates where it builds the response. The worker runtime
-//! (`uniserve worker`) consumes these types directly; a frame carries a
-//! message its sender validated, and its receiver does not check it again.
+//! validates where it builds the response. Both ends are main processes
+//! (`specs/worker.md` 2.4), and each consumes these types directly: a frame
+//! carries a message its sender validated, and its receiver does not check it
+//! again.
 //!
 //! Besides its calls, a batch carries the cache page tables of its requests
 //! ([`BlockTable`], with the units newly acquired for them in
