@@ -1371,7 +1371,14 @@ mod tests {
         .expect("the stack's programs");
         let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
-        assert_eq!(count("gemm"), 1);
+        // **Five products, not one**: the stack's own (`dtype` over `dtype`, no bias) and the four a
+        // deployment whose boundary type differs from the stack's crosses - a boundary weight with and
+        // without a bias, and a boundary activation over a stack weight and over a boundary one. The
+        // keys are distinct because the pair of element types and the epilogue are what select a
+        // module; the widths are launch values. A statement of one product named the direct product
+        // only and left every boundary cell unstated, which is a run that stops at its first
+        // projection.
+        assert_eq!(count("gemm"), 5);
         assert_eq!(count("rms_norm"), 1);
         assert_eq!(count("logits_gather"), 3);
         assert_eq!(count("modulated_rms_norm"), 2);
