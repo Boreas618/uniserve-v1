@@ -2790,10 +2790,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return " planes=empty".to_owned();
         };
         let mark = |at: u64, own: u64| if at == own { "own" } else { "OTHER" };
+        // The three statements of a page's length, side by side: what the batch declares, what the
+        // cache allocates, and what the plane's own view holds. A kernel that forms page addresses
+        // at one of them while the pages were written at another reads the wrong keys for every
+        // prompt, with no fault and no dependence on the prompt at all.
         format!(
-            " planes=layer0:{} /{}(key,value)",
+            " planes=layer0:{} /{}(key,value) page_size={}/{}/{} (batch/cache/plane)",
             mark(key, first.key.ptr.address()),
-            mark(value, first.value.ptr.address())
+            mark(value, first.value.ptr.address()),
+            self.geometry.page_size,
+            self.kv.page_size(),
+            first.key.shape.dim(1)
         )
     }
 
