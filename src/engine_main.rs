@@ -1847,7 +1847,7 @@ impl MainProcess {
                 );
             }
         }
-        Ok(resolve_slots(named, &chosen, &built))
+        resolve_slots(named, &chosen, &built).map_err(invalid)
     }
 
     /// One operator's program from this host's store, for a walk that named an operator the
@@ -5801,7 +5801,7 @@ fn resolve_slots(
     named: &Programs,
     chosen: &BTreeMap<String, Vec<(String, u32)>>,
     built: &BTreeMap<(String, String, u32), Vec<String>>,
-) -> (Programs, Candidates) {
+) -> std::result::Result<(Programs, Candidates), String> {
     let keys_of = |op: &str, program: &Program| -> Vec<String> {
         built
             .get(&(op.to_owned(), program.backend.clone(), program.revision))
@@ -5828,6 +5828,36 @@ fn resolve_slots(
     };
     for op in operators {
         let stated = named_here(&op);
+        // A deployment that names a program has chosen an operator's implementation, and the name
+        // is a fact rather than a preference: this host either built that program or it did not.
+        // When it did not, substituting another program is not the smaller failure - the named
+        // program's keys are unknown here, so a substitute may cover no more than the phase it was
+        // not named for, and the walk finds the rest one capture at a time (a generation that holds
+        // one program of a two-phase operator stands at its first warmup). The refusal names what
+        // the store does hold, which is the fact the operator needs to build or to name.
+        if let Some((_, program)) = stated
+            .iter()
+            .find(|(_, program)| keys_of(&op, program).is_empty())
+        {
+            let held: Vec<String> = chosen
+                .get(&op)
+                .into_iter()
+                .flatten()
+                .map(|(backend, revision)| format!("{backend} revision {revision}"))
+                .collect();
+            return Err(format!(
+                "the deployment names {op}/{} revision {} and this host has built no module of it \
+                 for its targets: the store holds {} - build the named package for this host's \
+                 targets, or name a backend the store holds",
+                program.backend,
+                program.revision,
+                if held.is_empty() {
+                    format!("no package of {op}")
+                } else {
+                    held.join(", ")
+                }
+            ));
+        }
         // A deployment that states a backend per phase - a prefill attention backend and a decode
         // one - has already said which keys each of them covers, so nothing here is decided from
         // the store: both programs are the operator's, each in its own phase.
@@ -5893,7 +5923,7 @@ fn resolve_slots(
             candidates.insert(op, ordered.clone());
         }
     }
-    (programs, candidates)
+    Ok((programs, candidates))
 }
 
 /// Adds one slot's keys to a package's request, merging with a slot of an operator the package
@@ -6377,7 +6407,8 @@ mod tests {
             vec![decode.to_owned()],
         );
 
-        let (programs, candidates) = resolve_slots(&named, &chosen, &built);
+        let (programs, candidates) =
+            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6447,7 +6478,8 @@ mod tests {
             vec![decode.to_owned()],
         );
 
-        let (programs, _) = resolve_slots(&named, &chosen, &built);
+        let (programs, _) =
+            resolve_slots(&named, &chosen, &built).expect("the store built what was named");
 
         assert_eq!(
             programs.len(),
@@ -6872,4 +6904,116 @@ mod tests {
             "a name read out of an object is not a name: {names:?}"
         );
     }
+
+    /// One store, read twice: with the deployment naming one backend and with it naming nothing.
+    /// The two must produce the same slot set, because the name chooses the implementation of the
+    /// keys its own package covers and the store keeps the other phases. A relaunch hands the engine
+    /// the epoch's kernels - the named form of a start that named nothing - so the two forms meeting
+    /// one store is the equality a relaunch depends on.
+    #[test]
+    fn a_named_start_and_an_unnamed_one_agree_on_the_slots_of_one_store() {
+        let prefill = "phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let decode = "phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        chosen.insert(
+            "paged_attention".to_owned(),
+            vec![("fa4".to_owned(), 1), ("trtllm".to_owned(), 1)],
+        );
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        built.insert(
+            ("paged_attention".to_owned(), "fa4".to_owned(), 1),
+            vec![prefill.to_owned()],
+        );
+        built.insert(
+            ("paged_attention".to_owned(), "trtllm".to_owned(), 1),
+            vec![decode.to_owned()],
+        );
+        let mut named = Programs::new();
+        named.insert(
+            ProgramSlot {
+                op: "paged_attention".to_owned(),
+                phase: None,
+            },
+            Program {
+                backend: "trtllm".to_owned(),
+                revision: 1,
+                arguments: Default::default(),
+            },
+        );
+
+        let (unnamed, _) = resolve_slots(&Programs::new(), &chosen, &built)
+            .expect("the store decides when nothing is named");
+        let (with_name, _) =
+            resolve_slots(&named, &chosen, &built).expect("the named package is built here");
+
+        let slots = |programs: &Programs| {
+            let mut held: Vec<(String, Option<PhaseKind>, String)> = programs
+                .iter()
+                .map(|(slot, program)| (slot.op.clone(), slot.phase, program.backend.clone()))
+                .collect();
+            held.sort();
+            held
+        };
+        assert_eq!(
+            slots(&with_name),
+            slots(&unnamed),
+            "naming one backend changed the slot set of one store"
+        );
+        assert_eq!(
+            slots(&with_name),
+            vec![
+                (
+                    "paged_attention".to_owned(),
+                    Some(PhaseKind::Decode),
+                    "trtllm".to_owned()
+                ),
+                (
+                    "paged_attention".to_owned(),
+                    Some(PhaseKind::Prefill),
+                    "fa4".to_owned()
+                ),
+            ],
+            "the deployment's own backend did not take the phase its keys cover"
+        );
+    }
+
+    /// A program this host has built nothing of is refused by name rather than substituted. The
+    /// keys the name owned are not known here, so a substitute may cover a different phase and the
+    /// walk would find out one capture at a time - which is how a relaunch stood past the watchdog
+    /// at `this node's devices` while the log said the store had filled the operator.
+    #[test]
+    fn a_named_program_this_host_did_not_build_is_refused_by_name() {
+        let prefill = "phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        chosen.insert("paged_attention".to_owned(), vec![("fa4".to_owned(), 1)]);
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        built.insert(
+            ("paged_attention".to_owned(), "fa4".to_owned(), 1),
+            vec![prefill.to_owned()],
+        );
+        let mut named = Programs::new();
+        named.insert(
+            ProgramSlot {
+                op: "paged_attention".to_owned(),
+                phase: None,
+            },
+            Program {
+                backend: "trtllm".to_owned(),
+                revision: 1,
+                arguments: Default::default(),
+            },
+        );
+
+        let error = resolve_slots(&named, &chosen, &built)
+            .expect_err("nothing of the named package was built here");
+        assert!(
+            error.contains("paged_attention/trtllm revision 1"),
+            "the refusal does not name the program the deployment named: {error}"
+        );
+        assert!(
+            error.contains("fa4 revision 1"),
+            "the refusal does not name what the store holds instead: {error}"
+        );
+    }
+
 }
