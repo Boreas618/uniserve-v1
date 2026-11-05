@@ -306,6 +306,19 @@ fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
     }
 }
 
+/// The rows and width of one request's conditioning in the columns: `(text_rows + condition_rows)`
+/// rows of `width` elements each.
+///
+/// One statement for the two readers that need it - the view a step hands the model
+/// ([`DenoiserRunner::conditioning`]) and the copies that fill it from the store
+/// ([`DenoiserRunner::seed`]). Two statements of this arithmetic would be a step that reads a row
+/// the copies never filled, which is a plausible clip rather than an error.
+fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
+    let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
+    let width = u64::from(shape.width.max(1));
+    (rows, width)
+}
+
 /// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
 ///
 /// A free function so the presence rule is testable without a runner: constructing one takes a
@@ -611,8 +624,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
-        let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let width = u64::from(self.shape.width.max(1));
+        let (rows, width) = conditioning_row(&self.shape, &layout);
         let view = self.columns.text.shaped(&[rows * width]);
         let text = view
             .at(view.offset_elements(u64::from(index) * rows * width))
@@ -660,8 +672,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             return Ok(());
         };
         let layout = layout_of(bucket)?;
-        let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let width = u64::from(self.shape.width.max(1));
+        let (rows, width) = conditioning_row(&self.shape, &layout);
         let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
         })?);
@@ -1252,6 +1263,59 @@ mod tests {
             condition_rows: 0,
             condition_elements: 0,
         }
+    }
+
+    /// A layout survives the bucket that carries it and the reader that unwraps it.
+    ///
+    /// The equality is the seam's own: a runner hands the model the layout its bucket carries, and
+    /// every bucket was built from a layout the model stated, so anything but an identity through
+    /// `Bucket::denoise` and `layout_of` is a transposition the model can never see - it receives
+    /// one layout in place of another and computes correctly over the wrong one.
+    ///
+    /// **A square latent cannot show it**, which is why this case carries paint on four distinct
+    /// numbers: the same reason a decoder's rectangle is only caught by a canvas whose extents
+    /// differ. The transposed layout is asserted different too, so a change that made every layout
+    /// compare equal could not pass this by being vacuous.
+    #[test]
+    fn a_layout_survives_its_bucket_and_back() {
+        let stated = Layout {
+            video: LatentShape {
+                channels: 16,
+                frames: 2,
+                height: 3,
+                width: 5,
+            },
+            audio: Some(LatentShape {
+                channels: 8,
+                frames: 3,
+                height: 2,
+                width: 4,
+            }),
+            text_rows: 7,
+            condition_rows: 2,
+            condition_elements: 6,
+        };
+        let bucket = Bucket::denoise(1, stated);
+        assert_eq!(
+            layout_of(bucket).expect("a denoising bucket names the layout it serves"),
+            stated,
+            "the layout the model stated is the layout the runner hands it back"
+        );
+        let transposed = Layout {
+            video: LatentShape {
+                channels: 16,
+                frames: 2,
+                height: 5,
+                width: 3,
+            },
+            ..stated
+        };
+        assert_ne!(stated, transposed, "the two video extents differ");
+        assert_ne!(
+            layout_of(Bucket::denoise(1, transposed)).expect("a denoising bucket names its layout"),
+            stated,
+            "a transposed canvas is not the canvas that was stated"
+        );
     }
 
     #[test]
