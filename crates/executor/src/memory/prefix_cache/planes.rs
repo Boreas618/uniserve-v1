@@ -1762,12 +1762,23 @@ mod layer_view_tests {
         quantized: bool,
     ) -> CachePlanes {
         let checkpoints = Vec::new();
+        // One column's unit of one layer is `block_size` rows of a token, and these groups are
+        // `block_size` 16 at one head of 8 BF16 dimensions: a unit is 16 * 16 = 256 bytes. The
+        // figure is derived from the group rather than written, because a plane's geometry and the
+        // stride a view computes from `plane_bytes` must be the same number - a fixture stating 16
+        // where the geometry says 256 makes every values view's page stride wrong by 16 times, which
+        // is what `a_layer_of_the_second_unit_reads_that_unit` was reading.
+        let first = groups.first();
+        let unit_bytes = first.map_or(16, |group| {
+            u64::from(group.num_kv_heads) * u64::from(group.head_dim) * group.dtype.bytes() as u64
+        });
+        let plane_bytes = first.map_or(16, |group| u64::from(group.block_size) * unit_bytes);
         planes_of(
             CachePlan {
                 columns,
-                plane_bytes: 16,
+                plane_bytes,
                 quantized,
-                unit_bytes: 16,
+                unit_bytes,
                 dtype: ipc::PrefixCacheDtype::BFloat16,
                 groups,
                 states: Vec::new(),
@@ -1782,7 +1793,9 @@ mod layer_view_tests {
     /// would address past its end.
     fn planes_of(plan: CachePlan, num_units: u32) -> CachePlanes {
         let cells = usize::try_from(u64::from(plan.columns) * u64::from(num_units)).unwrap();
-        let plane_bytes = 16;
+        // Each plane holds one unit's bytes per cell, which the plan states: a storage of a
+        // smaller cell would let a view address past the end of its own plane.
+        let plane_bytes = usize::try_from(plan.plane_bytes).expect("a plane's bytes fit a host");
         let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1) * plane_bytes));
         let flags = || Storage::host(cells.max(1));
         let state = (0..plan.state_fields())
