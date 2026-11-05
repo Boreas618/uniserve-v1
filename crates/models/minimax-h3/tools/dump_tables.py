@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# The container's dtype codes: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16
+# The container's dtype codes: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16, 6 i16
 # (notes/h3/numeric-diagnosis.md). The comparators read a half-precision payload as the dtype its
 # producer computed in: a BF16 activation widened before writing is twice its width on disk and
 # changes none of the numbers, so the container keeps it narrow.
@@ -32,6 +32,7 @@ CODES = {
     np.dtype(np.int64): 2,
     np.dtype(np.int32): 3,
     np.dtype(np.float16): 5,
+    np.dtype(np.int16): 6,
 }
 
 #: The codes whose payload is half precision, and the torch dtype each stands for.
@@ -98,6 +99,7 @@ def load(path: Path) -> torch.Tensor:
         1: torch.float32,
         2: torch.int64,
         3: torch.int32,
+        6: torch.int16,
     }.get(code)
     if dtype is None:
         dtype = HALVES.get(code)

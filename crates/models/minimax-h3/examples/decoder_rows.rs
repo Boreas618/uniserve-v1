@@ -416,10 +416,25 @@ fn fit_arenas(
             capture::set_sink(None);
             let used = clip_arena.used();
             match run {
-                Err(error) => failures.push(format!(
-                    "{dtype:?} {height}x{width}: a clip does not fit the {} bytes its plan states: {error}",
-                    need
-                )),
+                // The plan's order is the reservation order, so a running sum names the buffer a
+                // decode ran past without guessing at it - which is the whole difference between
+                // "the plan is short" and "this entry is short".
+                Err(error) => {
+                    let mut offset = 0u64;
+                    let mut order = String::new();
+                    for buffer in &plan {
+                        order.push_str(&format!(
+                            "\n    {:>18}: {} B at offset {offset}",
+                            buffer.name,
+                            buffer.reservation()
+                        ));
+                        offset += buffer.reservation();
+                    }
+                    failures.push(format!(
+                        "{dtype:?} {height}x{width}: a clip does not fit the {} bytes its plan states: {error}\n    the plan's own order and sizes:{order}",
+                        need
+                    ))
+                }
                 Ok(()) if used != need => failures.push(format!(
                     "{dtype:?} {height}x{width}: the clip takes {used} of the {} bytes its {} stated buffers reserve, so {} byte(s) are reserved for nothing",
                     need,
@@ -440,7 +455,9 @@ fn fit_arenas(
         }
     }
     if failures.is_empty() {
-        println!("# every canvas's clip fits its plan exactly, at every element type a deployment can name.");
+        println!(
+            "# every canvas's clip fits its plan exactly, at every element type a deployment can name."
+        );
         Ok(())
     } else {
         for failure in &failures {
