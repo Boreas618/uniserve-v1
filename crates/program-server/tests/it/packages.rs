@@ -350,8 +350,11 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
     // and `build_store` certify. `minimax-h3-keys.txt` is a walk print of the older enumeration and
     // states rows whose fields no package has had since the key changed — reading it here asserted
     // about a file the store is not built from.
+    // Both subject files are the committed ones: `.local/qwen3-moe-keys.txt` is a generator's
+    // output that exists only on a host that ran it, so naming it here made the Qwen3 half of this
+    // test skip silently on every other checkout — a check that is not reached is not a check.
     let fixtures = [
-        root.join("../../.local/qwen3-moe-keys.txt"),
+        root.join("../../notes/programs/qwen3-moe-keys.txt"),
         root.join("../../notes/programs/minimax-h3-deployment-keys.txt"),
     ];
     let mut failures: Vec<String> = Vec::new();

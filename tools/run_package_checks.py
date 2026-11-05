@@ -11,6 +11,14 @@ set `TRITON_INTERPRET` themselves or accept it from here.
 A script is **run** only when it is a check: one with an `if __name__` block. A module a check
 imports (`scenario.py` and the like) is not run on its own.
 
+**A tree check answers about the whole tree rather than about one package** (`TREE_CHECKS`): today
+`tools/kernel_arguments.py --check`, which compares the three statements of every Triton kernel's
+argument list — the kernel's `def`, the package's `spec`, and the operator's Rust `Arguments` chain.
+It is one check in the count line like any other, and its verdict is `passed`, `failed` or
+`unrunnable`; never `skipped`, because a disagreement it finds is a defect and an absence of the tool
+is a gap in the harness. An instrument a run never calls is a gap this runner exists to name: nineteen
+checks read as device-dependent for weeks because nothing called them with the argument they wanted.
+
 **A check that refuses for a missing argument is called again with the arguments this runner can
 answer** — today that is `--op`, whose value is the operator the package is for, since it is the
 directory the check lives under. One that needs an argument nobody here can answer is **unrunnable**,
@@ -82,6 +90,23 @@ FAILURE_VERDICTS = ("FAIL", "DIFFERS")
 #: once, and the `gated_residual` copy then launched the modulated form's kernel against the gated
 #: literals for a whole stretch. The sweep compares them before it runs anything.
 SHARED_CHECKS = ("modulation_check.py",)
+
+#: Checks that are not a package's own but the whole tree's, run by name from `tools/`. Each is one
+#: check in the count line. They are listed here rather than discovered, because a tool that refuses
+#: by not existing must still be one entry in the count: an instrument missing from the tree is a gap
+#: to report, not a check that disappears from the arithmetic.
+#:
+#: `kernel_arguments.py` compares the three statements of a Triton kernel's argument list. **Only
+#: against a built artifact**, whose `metadata.json` is what a launch reads: its source mode compares
+#: one operator's Rust chain against the union of its arms, so an operator with a phase-selected or
+#: field-selected kernel is reported as disagreeing with itself - eight operators and thirteen causes
+#: on the first run, at least two of them impossible, since the launch refuses a count or kind
+#: mismatch before it runs. A check that guesses is worse than one that refuses, so without a built
+#: store this check is `unrunnable` and says so.
+#:
+#: The store is one this runner is **given**, never one it builds: a second store for one run is two
+#: statements of one thing. Each entry is `(tool, arguments, options it needs)`.
+TREE_CHECKS = (("kernel_arguments.py", ("--check",), ("--fixture", "--store")),)
 
 #: Where a launch's descriptor is built. A package whose operator no file here names **in code** is
 #: a check over a kernel nothing can reach, and its green is not evidence about the model: five
@@ -282,13 +307,97 @@ def run_one_alone(script, timeout):
         return subprocess.CompletedProcess([], 124, "", "no answer")
 
 
+def tree_arguments(name, fixture=None, store=None, target="sm_100a"):
+    """The arguments one tree check is called with when it can run at all.
+
+    The store is one this runner is **given**, never one it builds: a second store for one run is two
+    statements of one thing, and this runner is the place they would drift apart.
+    """
+    if tree_needs(name, fixture, store):
+        raise ValueError(f"{name} cannot run without {' and '.join(tree_needs(name, fixture, store))}")
+    arguments = {entry[0]: entry[1] for entry in TREE_CHECKS}[name]
+    if name == "kernel_arguments.py":
+        arguments = (*arguments, "--fixture", fixture, "--store", store, "--target", target)
+    return arguments
+
+
+def store_holds_cells(store):
+    """Whether a store holds at least one built cell.
+
+    A comparison against an empty store compares nothing and passes, which is the one green that is
+    worse than a refusal: `--store` naming a directory the build never filled would read as agreement.
+    """
+    return store is not None and any(pathlib.Path(store).rglob("metadata.json"))
+
+
+def tree_needs(name, fixture=None, store=None):
+    """The options one tree check needs and was not given, by name.
+
+    A check that cannot run soundly here is `unrunnable` with what it needs, never run in a mode that
+    guesses: `kernel_arguments.py` enters its artifact comparison on `--fixture`, so a store without a
+    fixture would fall back to the source comparison the ruling excludes.
+    """
+    needs = {entry[0]: entry[2] for entry in TREE_CHECKS}[name]
+    given = {"--fixture": fixture, "--store": store}
+    return [option for option in needs if not given.get(option)]
+
+
+def run_tree_check(root, name, arguments, timeout):
+    """Run one tree check and classify it the way a package check is classified.
+
+    `passed` for exit 0 — the check may still report gaps, and its own line counts them; `failed` for
+    exit 1 with a report, which is the check saying a shape disagrees, and the line names the cause;
+    `unrunnable` for anything else, including the tool not being in this tree, because a check this
+    runner cannot call is the harness's gap and not a verdict about a kernel.
+    """
+    script = pathlib.Path(root) / "tools" / name
+    if not script.is_file():
+        return (
+            "unrunnable",
+            f"tools/{name} is not in this tree, so nothing compares the kernels' argument lists",
+            "",
+        )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), *arguments],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ("timeout", f"tools/{name} did not answer in {timeout} s", "")
+    output = (completed.stdout + completed.stderr).strip().splitlines()
+    summary = output[0] if output else ""
+    if completed.returncode == 0:
+        return ("passed", summary, "")
+    if completed.returncode == 1 and not any("Traceback (most recent call last)" in line for line in output):
+        problems = [line.strip() for line in output if line.strip().startswith("problem:")]
+        named = problems[0] if problems else summary
+        extra = f" (+{len(problems) - 1} more cause(s))" if len(problems) > 1 else ""
+        return ("failed", f"{named}{extra}", "")
+    # A tool that ends in an exception did not compare anything, so its exit status is not a verdict
+    # about a kernel: the last line of the traceback is the reason, and the outcome is the harness's
+    # gap. Reading a crash as a disagreement would report a defect nobody can act on.
+    reason = output[-1].strip() if output else "no output"
+    return ("unrunnable", f"tools/{name} could not run here: {reason}", "")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernels", default="crates/ops/kernels", type=pathlib.Path)
     parser.add_argument("--jobs", type=int, default=6, help="checks run at once")
     parser.add_argument("--timeout", type=int, default=120, help="seconds per check")
     parser.add_argument("--verbose", action="store_true", help="name every check, not only outcomes")
+    parser.add_argument(
+        "--fixture",
+        help="the key fixture a tree check compares built cells against (needs --store)",
+    )
+    parser.add_argument("--store", help="a store already built for --fixture")
+    parser.add_argument("--target", default="sm_100a", help="the architecture --store was built for")
     options = parser.parse_args()
+    if options.fixture and not options.store:
+        parser.error("--fixture needs --store: the cells are what the comparison reads")
 
     found = packages(options.kernels)
     diverged = []
@@ -348,18 +457,57 @@ def main():
             name = f"{package.relative_to(options.kernels)}/{script.name}"
             outcomes[outcome].append((name, detail, code))
 
-    checks = sum(len(scripts) for _, scripts in found)
+    # A tree check stands outside `packages()`: there is no package directory under it, and its
+    # subject is every package at once. It runs after the packages so its output reads beside theirs.
+    for name, _, _ in TREE_CHECKS:
+        missing = tree_needs(name, options.fixture, options.store)
+        if missing:
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    f"needs {' and '.join(missing)}: the comparison is only sound against a built "
+                    f"artifact, and source mode reports an operator's arms against each other",
+                    "",
+                )
+            )
+            continue
+        if not store_holds_cells(options.store):
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    f"the store under --store holds no built cell, so there is nothing to compare",
+                    "",
+                )
+            )
+            continue
+        arguments = tree_arguments(name, options.fixture, options.store, options.target)
+        outcome, detail, code = run_tree_check(pathlib.Path("."), name, arguments, options.timeout)
+        outcomes[outcome].append((f"tools/{name}", detail, code))
+
+    checks = sum(len(scripts) for _, scripts in found) + len(TREE_CHECKS)
     # A package directory is one backend of one operator, so the two counts differ where an operator
     # has more than one backend. Both are stated because a count is quoted without its unit, and an
     # operator with two backends read as two operators is a number nobody can reconcile later.
     operators_count = len({package.relative_to(options.kernels).parts[0] for package, _ in found})
+    parts = (
+        ("passed", len(outcomes["passed"])),
+        ("skipped", len(outcomes["skipped"])),
+        ("failed", len(outcomes["failed"])),
+        ("timed out", len(outcomes["timeout"])),
+        ("contended", len(outcomes["contended"])),
+        ("unrunnable", len(outcomes["unrunnable"])),
+    )
     print(
         f"# {len(found)} packages ({operators_count} operators), {checks} checks: "
-        f"{len(outcomes['passed'])} passed, "
-        f"{len(outcomes['skipped'])} skipped, {len(outcomes['failed'])} failed, "
-        f"{len(outcomes['timeout'])} timed out, {len(outcomes['contended'])} contended, "
-        f"{len(outcomes['unreachable'])} unreachable, {len(outcomes['unrunnable'])} unrunnable"
+        + ", ".join(f"{count} {word}" for word, count in parts)
+        + f"; {len(outcomes['unreachable'])} unreachable operator(s)"
     )
+    # The arithmetic is printed because a count that does not close is a finding rather than a
+    # rounding: every check has exactly one outcome, and `unreachable` is a statement about an
+    # operator (a package no launch names) rather than about a check, so it is not in the sum.
+    total = sum(count for _, count in parts)
+    closing = " + ".join(f"{count} {word}" for word, count in parts) + f" = {total}"
+    print(f"# {total} checks by outcome: {closing}" + ("" if total == checks else f" — NOT {checks}"))
     for outcome in ("failed", "timeout", "contended", "unreachable", "unrunnable", "skipped"):
         for name, detail, code in sorted(outcomes[outcome]):
             prefix = f" [{code}]" if code not in (0, "", None) else ""
