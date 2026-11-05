@@ -598,7 +598,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // plausible clip and no error.
         if self.pending.is_empty() {
             return Err(Error::Invariant(format!(
-                "a replay of bucket {bucket} names no staged row: its batch was served already or                  the job outlived the submit that produced it, and the columns hold a warm                  capture's zeros rather than a request's conditioning"
+                "a replay of bucket {bucket} names no staged row: its batch was served already, or the job \
+                 outlived the submit that produced it, and the columns hold a warm capture's zeros \
+                 rather than a request's conditioning"
             )));
         }
         let Some(products) = self.products.as_ref() else {
