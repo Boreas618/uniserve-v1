@@ -116,6 +116,11 @@ impl Driver {
         }
     }
 
+    /// Whether no switch runs: the one that ran was committed or returned to the previous epoch.
+    pub(crate) fn settled(&self) -> bool {
+        self.lock().switch.is_none()
+    }
+
     /// States that the running switch's target on `host` is given its programs by the daemon.
     pub(crate) fn await_programs(&self, host: &str) {
         let mut state = self.lock();
