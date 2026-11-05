@@ -778,7 +778,7 @@ impl VideoDecoder {
         use ops::norm::LayerNorm as LayerNormOp;
         use ops::norm::RmsNorm as RmsNormOp;
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, RotaryFactors};
+        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
         use ops::rows::{self, Rows as RowsOp};
         use nn::layers::UnpatchifyVideo;
         use ops::unpatchify::Unpatchify;
