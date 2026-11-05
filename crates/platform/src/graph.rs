@@ -910,6 +910,11 @@ impl EdgeKind {
     /// A kind it does not know is refused rather than read as a completion
     /// edge: the driver may add kinds, and a walk that guessed would put a
     /// weaker order where a stronger one was meant.
+    ///
+    /// The driver states a programmatic edge in either of two ways - the
+    /// dependency kind itself, or the default kind with the upstream node's
+    /// programmatic port - so both are read, and a comparison of two captures
+    /// does not depend on which encoding the driver used in each.
     fn of(data: &GraphEdgeData) -> Result<Self> {
         let programmatic_port = data.from_port == CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC;
         match data.kind {
