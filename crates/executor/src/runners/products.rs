@@ -65,9 +65,9 @@ use crate::arena::StreamId;
 /// | [`Product::Text`] | the encoder runner | the denoiser, through `copy_into` |
 /// | [`Product::VideoLatents`] | the denoiser runner | the decoder, through `copy_into` |
 /// | [`Product::AudioLatents`] | the denoiser runner | nothing yet - `ref2va` only |
-/// | [`Product::Video`] | the decoder runner | the transport, when it writes the artifact |
-/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - the encoder writes one region | - |
-/// | [`Product::Track`] | **nobody** - the audio decode is not built | - |
+/// | [`Product::Video`] | the decoder runner | the media encode, when it writes the artifact |
+/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - a reference condition, `ref2va` only | - |
+/// | [`Product::Track`] | the audio decode runner | the audio encode, when it writes the artifact |
 ///
 /// A kind nobody published is not a hole a reader falls into: the store answers `None` and a refusal
 /// names the product and the request, which is what `ref2va` reports today.
@@ -95,11 +95,11 @@ pub enum Product {
     Video,
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
     ///
-    /// **No runner publishes it yet**: the audio decode is the piece of this seam that is not built,
-    /// and `ref2va` is the only task that asks for it. It is named here because a product's name is
-    /// the design's vocabulary rather than a record of what compiles - and the store refuses a kind
-    /// nothing published by name (`absent`), so a reader of it today is told which product is
-    /// missing rather than reading a region nobody wrote.
+    /// The audio decode runner publishes it and an audio encode reads it. It is a different product
+    /// from [`Product::Audio`] on purpose: that one is a request's reference audio condition (an
+    /// input the media reader produced), and this one is what this request's own denoising produced
+    /// - one is read by a conditioner, the other by the muxer's audio encode, and a store that gave
+    /// them one name would let a `ref2va` request read its input as its output.
     Track,
 }
 
