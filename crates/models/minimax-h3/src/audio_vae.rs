@@ -1701,6 +1701,33 @@ pub(crate) mod tests {
         assert!(bound.len() < parameters(&config).expect("seven stages' list").len());
         check_table(&table, &bound).expect("the two agree with six stages");
     }
+
+    /// A weight the audio VAE cannot compute in is refused at the load, by name.
+    ///
+    /// Both audio halves compute in FP32 - the alias-free resample's Kaiser-sinc filters, the
+    /// SnakeBeta exponentials and the seven stages' transposed convolutions are stated in it - and
+    /// the loader converts nothing by default. A checkpoint whose audio weights are stored narrower
+    /// would therefore reach an FP32 operator with weights that are not, and the refusal at the
+    /// loading boundary is the whole of what stops it: without this, the mismatch appears at the
+    /// kernel that reads one type and is handed another, if the kernel checks at all.
+    ///
+    /// A shapes-only loader answers each request in its own shape and at the stated type
+    /// (`WeightLoader::load`), so the first weight the load reads is enough to reach the refusal.
+    #[test]
+    fn a_weight_the_audio_vae_cannot_compute_in_is_refused_by_name() {
+        let config = audio_config();
+        let mut loader = WeightLoader::stated(DType::F16, None);
+        // `BigVgan` is not `Debug`, so the outcome is matched rather than unwrapped.
+        let error = match BigVgan::load(&config, &mut loader) {
+            Ok(_) => panic!("an F16 audio weight was accepted"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("must be converted at load"),
+            "the refusal names the type the audio VAE cannot compute in: {message}"
+        );
+    }
     use super::*;
 
     /// The checkpoint's audio VAE config (`audio_vae/config.json`).
