@@ -2170,14 +2170,28 @@ impl Denoiser {
         // deployment's type on both sides and states nothing here; the recorder found the launch, not
         // the walk.
         if groups == crate::modulation::Groups::Conditioned {
-            programs.launch::<GemmOp>(&nn::layers::Linear::descriptor_of(
-                config.hidden_size,
-                nn::DType::F32,
-                nn::layers::WeightOrder::NxK,
-                true,
-                nn::DType::F32,
-                dtype,
-            ));
+            // The rows the projection reads are the condition features, which are the stack's own
+            // type - the FP32 in this crossing is the weight, not the operand. Two projections read
+            // them (video's and audio's), one carrying its bias and one not, so both epilogues are
+            // stated: a store holding one serves one condition and dies on the other.
+            // Three products read the projection's FP32 weight: the video condition's rows are
+            // already FP32 (`input_f32`, its bias carried) while the audio condition's are the stack's
+            // own type, once with its bias and once without. Each is one launch of the served path, and
+            // a store holding two of the three serves one condition and dies on the other.
+            for (input, bias) in [
+                (nn::DType::F32, true),
+                (dtype, true),
+                (dtype, false),
+            ] {
+                programs.launch::<GemmOp>(&nn::layers::Linear::descriptor_of(
+                    config.hidden_size,
+                    nn::DType::F32,
+                    nn::layers::WeightOrder::NxK,
+                    bias,
+                    input,
+                    dtype,
+                ));
+            }
         }
         for (target, source, columns) in crossings {
             programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
