@@ -6,7 +6,16 @@ deployment's rows at one element type, so a file that serves several deployments
 more than one type - and the failure that matters is the shape that is absent at *every* type, because
 that key cannot be built by any run. `--by-shape` compares walks and file with the element type
 normalised to `<t>` and takes any number of `--walk` files, which is the union rule: the union of the
-walks each stage has produced, against the file. The other half of the rule - rows no walk states but
+walks each stage has produced, against the file. **A gap is a defect only when the walk and the file were asked the same question**, and
+a question has a raster, a clip length, a token count and an element count. The walk's own
+header states those, so the check prints them and answers a gap in three disjoint ways: a row
+the file lacks (a run stops at `no kernel`), a raster-class row (`frame_pad`, `scaled_add`),
+or a number under an extent field that equals one of the walk's own. **A block, a head width
+and a pixel tile are program constants; a column count at a token length is the request's** -
+which is why only `columns`, `elements`, `rows`, `extent`, `samples` and `tokens` are read as
+extents, and why a clip length of 256 does not excuse `head_dim_256`.
+
+The other half of the rule - rows no walk states but
 the construction requires - is `check_manifests.py`'s question, not this one's.
 
 The store a caller builds comes from a fixture under `notes/programs/`, one per deployment, and it is
