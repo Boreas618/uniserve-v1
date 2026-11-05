@@ -480,10 +480,17 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // installed over it: the world this case is about is one whose serving
     // program has admitted the request and given it no work.
     let world = World::serving(Toy::idle());
-    world
+    // The submission's receiver is kept: a request whose events nobody reads
+    // is withdrawn, and the trial would be asked to admit a request the
+    // mechanism no longer holds.
+    let _events = world
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
+    // A trial runs on the mechanism's state at the boundary it is prepared at,
+    // so the arrival must have been applied before the trial that admits it:
+    // one step of the idle program leaves the request queued.
+    stepped_past(&world, world.step());
     world
         .install("fcfs", 2, admitting)
         .expect("the good program serves");
