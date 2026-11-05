@@ -1285,6 +1285,10 @@ mod product_tests {
             Ok(())
         }
 
+        fn forget(&self, _request: ipc::RequestKey) -> usize {
+            unreachable!("the presence rule never ends a request")
+        }
+
         fn borrow(
             &self,
             _request: ipc::RequestKey,
