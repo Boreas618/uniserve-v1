@@ -1036,7 +1036,10 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         frames: 1,
         height: raster.height,
         width: raster.width,
-        audio_samples: 0,
+        // A reference condition that carries audio: the audio projection and its narrow crossing
+        // (`target_bf16_source_f32 columns 2688`, the audio modulation at 56) exist only for a
+        // request with an audio condition, and a harness that states `0` never reaches them.
+        audio_samples: request.track,
     }];
     let asked = VideoRequest {
         conditions: &conditions,
