@@ -48,7 +48,6 @@ use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
 use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
-use ops::fp4::ScaleLayout;
 
 /// What a deployment sets when it loads a Qwen3-MoE model.
 #[derive(Clone, Copy, Debug)]
@@ -357,7 +356,7 @@ impl Plan {
                         nn::layers::step_bytes(
                             tokens,
                             geometry,
-                            ScaleLayout::Linear,
+                            Moe::GATED_TOKEN_SCALE_LAYOUT,
                             Moe::ACTIVATION_SCALE_LAYOUT,
                             dtype,
                             options.experts_encoded,
