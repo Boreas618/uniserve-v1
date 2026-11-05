@@ -790,10 +790,8 @@ fn decode_arena_bytes(
             .saturating_mul(4),
     };
     let planes = layers.saturating_mul(2).saturating_mul(plane);
-    let flags = layers
-        .saturating_mul(2)
-        .saturating_mul(pages)
-        .saturating_mul(4);
+    // One byte per page, not four: the initialized plane is `[pages]` u8.
+    let flags = layers.saturating_mul(2).saturating_mul(pages);
     let rows = tokens.saturating_mul(plan.hidden).saturating_mul(2);
     // The batch's i32 metadata: positions, slots, sequence lengths, the two offsets and the logits
     // rows are seven per token; the page table is `[sequences, pages]` and this batch is one
@@ -1029,8 +1027,8 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         planes.push(KvPlanes {
             key: arena.tensor(page_dtype, plane)?,
             value: arena.tensor(page_dtype, plane)?,
-            key_initialized: zeroed_i32(&stream, &arena, flag)?,
-            value_initialized: zeroed_i32(&stream, &arena, flag)?,
+            key_initialized: zeroed_flags(&stream, &arena, flag)?,
+            value_initialized: zeroed_flags(&stream, &arena, flag)?,
             key_scale,
             value_scale,
         });
@@ -2667,11 +2665,16 @@ fn top_logprobs(row: &[f32], count: usize) -> Vec<(usize, f64)> {
     scored
 }
 
-/// A flag plane of `shape` i32 zeros: an initialized flag of zero makes the first write initialize
-/// the page it touches.
-fn zeroed_i32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<TensorView> {
-    let view = arena.tensor(DType::I32, shape)?;
-    let zeros = vec![0_i32; usize::try_from(shape.numel()).unwrap_or(0)];
+/// A flag plane of `shape` **u8** zeros: an initialized flag of zero makes the first write
+/// initialize the page it touches.
+///
+/// One byte per page, not four. The cache's flag plane is a byte per page end to end - the
+/// Storage Server carries `ElementType::U8` and `cache_copy_region` already declares `*u8` - so an
+/// i32 plane would write four bytes at each page and clobber three neighbours' flags with zeros,
+/// and the cache would then report pages nobody wrote as uninitialized.
+fn zeroed_flags(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<TensorView> {
+    let view = arena.tensor(DType::U8, shape)?;
+    let zeros = vec![0_u8; usize::try_from(shape.numel()).unwrap_or(0)];
     // SAFETY: `zeros` outlives the copy, which completes before the wait below.
     unsafe {
         platform::memcpy_async(
