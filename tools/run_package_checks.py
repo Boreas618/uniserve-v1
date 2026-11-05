@@ -105,8 +105,14 @@ SHARED_CHECKS = ("modulation_check.py",)
 #: store this check is `unrunnable` and says so.
 #:
 #: The store is one this runner is **given**, never one it builds: a second store for one run is two
-#: statements of one thing. Each entry is `(tool, arguments, options it needs)`.
-TREE_CHECKS = (("kernel_arguments.py", ("--check",), ("--fixture", "--store")),)
+#: statements of one thing. Each entry is `(tool, invocations, options it needs)`, and a tool may need
+#: more than one invocation to cover its subject: `kernel_arguments.py` compares a cubin cell against
+#: its recorded signature by default and a native cell's C entry against the Rust structure that
+#: mirrors it only under `--native`, so the deployment's cells are compared in two passes and one
+#: verdict - 131 cells and 21 call structures of the H3 deployment, which is all 152 of them.
+TREE_CHECKS = (
+    ("kernel_arguments.py", (("--check",), ("--check", "--native")), ("--fixture", "--store")),
+)
 
 #: Where a launch's descriptor is built. A package whose operator no file here names **in code** is
 #: a check over a kernel nothing can reach, and its green is not evidence about the model: five
@@ -308,17 +314,19 @@ def run_one_alone(script, timeout):
 
 
 def tree_arguments(name, fixture=None, store=None, target="sm_100a"):
-    """The arguments one tree check is called with when it can run at all.
+    """The invocations one tree check is called with when it can run at all.
 
     The store is one this runner is **given**, never one it builds: a second store for one run is two
-    statements of one thing, and this runner is the place they would drift apart.
+    statements of one thing, and this runner is the place they would drift apart. Each invocation
+    carries the store, because each compares cells of it.
     """
     if tree_needs(name, fixture, store):
         raise ValueError(f"{name} cannot run without {' and '.join(tree_needs(name, fixture, store))}")
-    arguments = {entry[0]: entry[1] for entry in TREE_CHECKS}[name]
-    if name == "kernel_arguments.py":
-        arguments = (*arguments, "--fixture", fixture, "--store", store, "--target", target)
-    return arguments
+    invocations = {entry[0]: entry[1] for entry in TREE_CHECKS}[name]
+    return tuple(
+        (*invocation, "--fixture", fixture, "--store", store, "--target", target)
+        for invocation in invocations
+    )
 
 
 def store_holds_cells(store):
@@ -342,7 +350,23 @@ def tree_needs(name, fixture=None, store=None):
     return [option for option in needs if not given.get(option)]
 
 
-def run_tree_check(root, name, arguments, timeout):
+def run_tree_check(root, name, invocations, timeout):
+    """Run one tree check's invocations and merge them into one verdict.
+
+    The loudest outcome wins and names the mode that produced it; all clean is `passed` with the
+    detail of each, because the subject is "the deployment's arguments" and half of it is not a pass.
+    """
+    outcomes = []
+    for arguments in invocations:
+        outcomes.append((arguments, run_one_invocation(root, name, arguments, timeout)))
+    for arguments, (outcome, detail, code) in outcomes:
+        if outcome != "passed":
+            mode = " ".join(arguments[:2])
+            return (outcome, f"{mode}: {detail}", code)
+    return ("passed", "; ".join(detail for _, (_, detail, _) in outcomes), "")
+
+
+def run_one_invocation(root, name, arguments, timeout):
     """Run one tree check and classify it the way a package check is classified.
 
     `passed` for exit 0 — the check may still report gaps, and its own line counts them; `failed` for
