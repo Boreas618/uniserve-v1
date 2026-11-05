@@ -107,3 +107,52 @@ fn an_engine_serves_once_its_only_group_is_relaunched() {
     commands.shutdown();
     let _ = scheduler_thread.join();
 }
+
+/// A group whose replacement is starting does not take the whole executor
+/// with it: the deployment's other group keeps its capacity and its readiness
+/// while the first is not ready, and the first takes work again once its
+/// replacement stands.
+///
+/// The launched-path case states the same events with two launches: one rank
+/// dies, its group's failure domain starts another, and the executor goes on
+/// serving the other group while that launch starts.
+#[test]
+fn a_relaunching_group_leaves_its_executor_serving_the_others() {
+    use engine::{Executor, WorkerGroupId};
+
+    let mut sim = SimEngine::new();
+    sim.name_groups(&["model", "vision"]);
+    let executor = SimExecutor::new(sim);
+    let loss = executor.loss();
+    let model = WorkerGroupId("model".to_owned());
+    let vision = WorkerGroupId("vision".to_owned());
+
+    assert!(executor.is_ready(&model) && executor.is_ready(&vision));
+    assert!(executor.has_capacity(&model) && executor.has_capacity(&vision));
+
+    // The model group's rank died and its replacement is starting.
+    loss.lose_to_replace(model.clone(), "the launch was lost");
+    assert!(
+        !executor.is_ready(&model),
+        "a group whose replacement is starting is not ready"
+    );
+    assert!(
+        !executor.is_closed(&model),
+        "a group whose replacement is starting is not closed"
+    );
+    assert!(
+        executor.is_ready(&vision) && executor.has_capacity(&vision),
+        "the other group keeps serving while the replacement starts"
+    );
+    assert!(
+        !executor.has_capacity(&model),
+        "the lost group takes no work until its replacement stands"
+    );
+
+    // The replacement stands.
+    loss.restore(&model);
+    assert!(
+        executor.is_ready(&model) && executor.has_capacity(&model),
+        "the replacement takes work"
+    );
+}

@@ -255,6 +255,7 @@ impl SimExecutor {
         let info = engine.info().clone();
         let placement = engine.placement.clone();
         let max_model_len = engine.max_model_len;
+        let groups = engine.groups.clone();
         let latent_pools = engine.latent_pools.clone();
         let encoder_pools = engine.encoder_pools.clone();
         let results_on_wait = engine.results_on_wait;
@@ -295,10 +296,15 @@ impl SimExecutor {
             .expect("spawn sim executor thread");
         let mut executor = Self {
             executor_info: {
-                let id = WorkerGroupId("sim".to_owned());
                 ExecutorInfo {
-                    workers: vec![(id.clone(), info.clone())],
-                    placements: BTreeMap::from([(id.clone(), placement)]),
+                    workers: groups
+                        .iter()
+                        .map(|group| (group.clone(), info.clone()))
+                        .collect(),
+                    placements: groups
+                        .iter()
+                        .map(|group| (group.clone(), placement.clone()))
+                        .collect(),
                     // The pool's own launch fact, as `WorkerExecutor` reads it
                     // from the ranks' launch arguments: the mechanism shapes a
                     // KV view to it, and refuses to shape one without it.
@@ -306,12 +312,18 @@ impl SimExecutor {
                     rank_latents: if latent_pools.is_empty() {
                         BTreeMap::new()
                     } else {
-                        BTreeMap::from([(id.clone(), latent_pools)])
+                        groups
+                            .iter()
+                            .map(|group| (group.clone(), latent_pools.clone()))
+                            .collect()
                     },
                     rank_encoders: if encoder_pools.is_empty() {
                         BTreeMap::new()
                     } else {
-                        BTreeMap::from([(id, encoder_pools)])
+                        groups
+                            .iter()
+                            .map(|group| (group.clone(), encoder_pools.clone()))
+                            .collect()
                     },
                     ..ExecutorInfo::default()
                 }
@@ -1118,6 +1130,13 @@ pub struct SimEngine {
     canvas_sampling: Option<ipc::CanvasSampling>,
     /// How the simulated worker speculates, when it runs a drafter.
     speculation: Option<SimSpeculation>,
+    /// The worker groups the simulated deployment runs: one named `sim` unless
+    /// a test names more.
+    ///
+    /// A deployment's groups are separate launches that serve different
+    /// components and fail independently, so a statement about one group
+    /// failing while another serves needs more than one here.
+    groups: Vec<WorkerGroupId>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -1284,6 +1303,7 @@ impl SimEngine {
                 ranks: 1,
                 components: BTreeMap::new(),
             },
+            groups: vec![WorkerGroupId("sim".to_owned())],
             max_model_len: SIM_MAX_MODEL_LEN,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
@@ -1890,6 +1910,18 @@ impl SimEngine {
     /// to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
         self.placement.queue_depth = (depth as usize).max(1);
+    }
+
+    /// Names the worker groups this deployment runs, replacing the single
+    /// `sim` group.
+    ///
+    /// Each group reports the same placement, ranks and pools: what differs
+    /// between them in a test is which one has failed.
+    pub fn name_groups(&mut self, names: &[&str]) {
+        self.groups = names
+            .iter()
+            .map(|name| WorkerGroupId((*name).to_owned()))
+            .collect();
     }
 
     /// Places the pool's components, as a launch places a worker group's,
