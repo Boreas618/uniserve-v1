@@ -33,12 +33,22 @@ struct Stage {
 /// this checkpoint holds as 703 F32 tensors.
 const TABLE_DECODE: nn::DType = nn::DType::F32;
 
+/// **The bytes a weight costs are its component's stored type**, and under `dtype = "auto"` the
+/// loader converts nothing. From `artifacts/h3-reference/component-tensors.json`: `text_encoder` is
+/// BF16 (1058 tensors), `transformer` is 626 BF16 + 12 F32, `vae` is 703 F32 and `audio_vae` is 1087
+/// F32. So a VAE weight row is **4 bytes a parameter, not 2** - the two VAE stages were stated at 2
+/// for as long as the note said the video VAE decoder was FP16, which was the converted deployment
+/// and not this one. Corrected: `video_decoder` 2,423,531,096 params = 9,244 MiB (9.03 GiB),
+/// `video` encoder 180,337,888 = 688 MiB, `audio_decoder` 64,939,353 = 248 MiB, `audio` encoder
+/// 86,386,176 = 330 MiB - so the two encoders a conditioned deployment attaches are 1,018 MiB, not
+/// 500, and every `+ encoders` row below carries that.
+
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va dense", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     // The encoder set and the conditioner's six buffers are a **bump released before the layout is
@@ -46,32 +56,32 @@ const STAGES: &[Stage] = &[
     // are dead when the replays reserve. They never coexist with the captured plan, so the arena is
     // the plan's own 10,129 MiB and not the sum - the runner's order is prepare -> condition in the
     // bump -> release -> capture -> replay, and a runner that captures first holds 17,041.
-    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 12 },
-    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42971, constants: 1946, arena: 10909, tables: 12 },
+    Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 10909, tables: 14 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42971, constants: 1946, arena: 10909, tables: 14 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10909, tables: 12 },
-    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     // The DiT's weights are not sliced by the Ulysses degree: every rank reads the whole 638-name
     // set at the global head width (`Attention::load` projects `heads * head_dim`, and `projection`
     // takes no rank), so this row is the one-rank row plus the four exchange entries' arena.
     Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11949, tables: 12 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 1313, tables: 1 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 9244, constants: 0, arena: 1313, tables: 1 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 248, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 295, tables: 0 },
 ];
 
