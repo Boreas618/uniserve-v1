@@ -1903,15 +1903,16 @@ impl AudioEncoder {
             false,
         )?);
 
-        // Each residual unit's output is one addition over the whole unit, so its width is the inner
-        // channel count times the track's samples.
+        // Each residual unit's output is one addition over the whole unit, and the view it adds is the
+        // unit's convolution output `[channels, samples]` - so the descriptor's `columns` is the
+        // track's **sample count**, and the channel count is the row count, which is a launch extent
+        // the kernel reads rather than a key. Stating `channels × samples` here asked for a key no
+        // launch can produce (a `[1, channels × samples]` view), and the widest one at the model's
+        // longest clip was 2796748800 - a row that could never have been built.
         for samples in samples {
-            for inner in &widths {
-                let columns = u64::from(*inner) * u64::from(*samples);
-                // As above: the refusal is the statement's, not a reason to leave the row out.
-                let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
-                programs.launch::<ScaledAddOp>(&descriptor);
-            }
+            // As above: the refusal is the statement's, not a reason to leave the row out.
+            let descriptor = ScaledAdd.descriptor(dtype, dtype, u64::from(*samples))?;
+            programs.launch::<ScaledAddOp>(&descriptor);
         }
 
         Ok(programs.finish())
