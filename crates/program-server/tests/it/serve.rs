@@ -163,7 +163,10 @@ fn request(backend: &str) -> program_server::protocol::PrepareRequest {
 /// Serves `configuration` on a thread until the flag it answers is raised.
 fn serving(
     configuration: &ServerConfig,
-) -> (Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server = Arc::new(ProgramServer::open(configuration).unwrap());
     let thread = std::thread::spawn({

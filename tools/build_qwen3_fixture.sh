@@ -18,8 +18,18 @@
 #   tools/build_qwen3_fixture.sh <checkpoint root> <runner keys file> <out file> [<commit>]
 #
 # `runner keys file` holds `operator<TAB>key` lines for the sampler and the commit,
-# produced by the crate that owns those launches (`executor`). It is required: a
-# fixture without it is the list that stops a run.
+# and it is required: a fixture without it is the list that stops a run. Two
+# launches produce it, and neither is reachable from the model's enumeration:
+#
+#   sampler   cargo run -q -p ops --example qwen3_moe_keys
+#             the rows whose operator is one of the ten sampler operators; that
+#             example also prints the model's, which this script takes from the
+#             checkpoint instead, so the two halves stay told apart.
+#   commit    cargo run -q -p executor --example runner_keys -- \
+#                 --rows 1,2,4,8 --tokens 128,512 --sampled true --vocabulary 151936
+#
+# The checked-in file is `notes/programs/qwen3-moe-runner-keys.txt`, whose header
+# states both commands and the deployment values it was generated with.
 set -eu
 
 root=${1:?usage: build_qwen3_fixture.sh <checkpoint root> <runner keys file> <out file> [<commit>]}
