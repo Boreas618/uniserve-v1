@@ -1510,16 +1510,35 @@ mod tests {
 
     /// Every unit a layer's planes are made of is charged: a deeper model holds
     /// fewer units in the same grant and a larger fixed figure.
+    ///
+    /// The grant decides the pool here, so the request states no token demand:
+    /// a plan that states one is fitted to the demand and both models fit the
+    /// same units of it, which is a different question.
     #[test]
     fn a_deeper_model_holds_fewer_units_of_a_larger_unit() {
-        let shallow = plan(CacheGeometry {
-            layers: 2,
-            ..geometry()
-        });
-        let deep = plan(CacheGeometry {
-            layers: 16,
-            ..geometry()
-        });
+        let plan = |layers: u32| {
+            token_plan(
+                &CapacityRequest {
+                    max_total_tokens: None,
+                    ..request()
+                },
+                report(),
+                &facts(),
+                1,
+                /* width */ 64,
+                TOTAL,
+                crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
+                None,
+                &HostGroup::single(0),
+                dense(CacheGeometry {
+                    layers,
+                    ..geometry()
+                }),
+            )
+            .expect("the device has room for this cache")
+        };
+        let shallow = plan(2);
+        let deep = plan(16);
         let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
         assert!(units(&deep) < units(&shallow));
         assert!(
@@ -1531,10 +1550,16 @@ mod tests {
     /// imports fits fewer units of the same grant, and its fixed figure does not
     /// grow by the same bytes - the columns follow the unit count, not the
     /// tables.
+    ///
+    /// Grant-bound again: a stated token demand caps both ranks at the demand,
+    /// so the column charge would be invisible in the answer.
     #[test]
     fn more_import_workers_hold_fewer_units_of_the_same_grant() {
         let plan = |calls: usize| {
-            let mut request = request();
+            let mut request = CapacityRequest {
+                max_total_tokens: None,
+                ..request()
+            };
             request.max_batch_calls = calls;
             token_plan(
                 &request,

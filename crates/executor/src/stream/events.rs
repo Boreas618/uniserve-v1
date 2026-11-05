@@ -775,8 +775,16 @@ mod tests {
         Ok(())
     }
 
+    /// A failed job established nothing: the work it fenced stays deferred and the lease it retained
+    /// is not completed by the failure.
+    ///
+    /// **Shutdown then runs that work**, because the event was never recorded: the platform's rule is
+    /// that "an event that was never recorded is complete", and nothing was issued on the device for
+    /// the fences of a job that never ran. What keeps work deferred through a shutdown is an
+    /// *announced* record (`Event::queue_record`), which is the case a writer of a fence must state
+    /// before handing the record to another thread - not the absence of one.
     #[test]
-    fn a_failed_job_established_nothing_and_keeps_the_work_deferred() -> Result<()> {
+    fn a_failed_job_established_nothing_and_shutdown_runs_the_work_it_fenced() -> Result<()> {
         let (events, jobs) = served();
         let runs = Arc::new(AtomicUsize::new(0));
         let event = fence(&events)?;
@@ -787,9 +795,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 0);
         assert!(events.owns(job), "the work stays deferred");
 
-        // Shutdown waits for the events on the host; an event that is not
-        // recorded yet does not complete, so the work stays.
-        assert!(events.drain().is_err());
+        events.drain()?;
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "shutdown left the work of a fence that was never recorded unrun"
+        );
         Ok(())
     }
 
