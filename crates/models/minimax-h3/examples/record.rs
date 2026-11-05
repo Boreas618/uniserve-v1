@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::audio_vae::AudioDecoder;
+use minimax_h3::video_vae::Tiles;
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
@@ -521,7 +522,18 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let ratio = config.spatial_compression();
     let latent_height = height / ratio;
     let latent_width = width / ratio;
-    let canvas = Canvas::clip(&config, latent_height, latent_width);
+    let clip_canvas = Canvas::clip(&config, latent_height, latent_width);
+    // **The decoder decodes one tile, not a clip.** Its scratch is sized for a tile's rows and every
+    // buffer it reads is the tile's own canvas (`Tiles::tiles` states one per tile), so a harness that
+    // hands it the clip's canvas asks for a decode of 10 920 rows into scratch sized for 1 792 - which
+    // is exactly the refusal this harness reported before the tile existed here.
+    let tiles = Tiles::of(&config, &clip_canvas).map_err(|error| error.to_string())?;
+    let canvas = tiles
+        .tiles(&config, &clip_canvas)
+        .first()
+        .copied()
+        .ok_or("a clip with no tiles to decode")?
+        .canvas;
     let model_width =
         config.decoder_num_attention_heads * config.decoder_attention_head_dim;
 
