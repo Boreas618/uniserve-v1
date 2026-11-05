@@ -2125,7 +2125,13 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
 /// The checkpoint is stored in one of the three floating-point formats every model here uses, and
 /// a conversion goes through `f32`: the design keeps a checkpoint's own representation unless the
 /// launch states another (specs/worker.md 1), and an explicit statement is one conversion.
-fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>> {
+///
+/// It is public because a boundary between two computations can need exactly one conversion and no
+/// loader: a model that hands a decoder a tensor its own layers produced states the pair it needs,
+/// and `tensor` is what the refusal names when the pair is not one of the six. A caller that
+/// converts on a path a launch did not state is widening the rule above, so the conversion belongs
+/// where the boundary itself is stated.
+pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>> {
     match (from, to) {
         (DType::BF16, DType::F32)
         | (DType::BF16, DType::F16)
