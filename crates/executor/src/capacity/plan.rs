@@ -1139,12 +1139,16 @@ mod tests {
     /// A grant that holds the graph range but not the scratch beside it is refused, and the same
     /// grant with the shadow region added admits the cache.
     ///
-    /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the GB200 the
+    /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the device the
     /// runs plan into, the graph range is the two pools the run logged, and `mem_fraction_static`
-    /// is 0.7 as the run's own placement stated. The shadow is not optional - `Pools::new` reserves
-    /// it at spawn and the first shadow execution maps it - so a plan fitted into the bytes it will
-    /// take leaves the rank to map past the device after the model load, which is the refusal this
-    /// case buys.
+    /// is 0.7 as the run's own placement stated.
+    ///
+    /// What this case models is a plan whose grant binds - no token capacity, so the pool is sized
+    /// by the storage left rather than by the model's context. The served deployment is not that
+    /// shape: `plan_rank` states the model's context length, so its cache is demand-bound at about
+    /// 4 GB and the device keeps tens of gigabytes of slack. This case exists for the shape where
+    /// the grant does bind, and for the invariant that a plan reserves what the pools map before it
+    /// fits a unit - not as a reproduction of the deployment's plan.
     #[test]
     fn a_grant_that_holds_the_graph_range_without_the_scratch_is_refused() {
         let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
