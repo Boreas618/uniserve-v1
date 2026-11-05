@@ -803,3 +803,132 @@ fn a_revert_releases_the_whole_capture_set_of_the_failed_generation() {
         "generation 1's graph lost its holder, which is what a purge must never do"
     );
 }
+
+/// A program that orders its work differently is a different structure, and the rebind condition
+/// must decline it.
+///
+/// The case is programmatic dependent launch, which the slice's attention kernels use: a kernel
+/// launched with PDL may start at its predecessor's trigger point rather than after it finishes, and
+/// the graph records that as a `Programmatic` edge instead of a `Completion` one. A rebind
+/// instantiates a fresh executable from the **serving** graph's template and sets node parameters on
+/// it, so the prepared generation would keep the serving edges - a kernel that no longer synchronizes
+/// itself with its predecessor would then read what the predecessor has not written. So the edge
+/// kinds are part of 4.5's structure, and this test is the one that says so on a device.
+///
+/// Two launches in one capture, because the interesting edge is the one between them: the first
+/// launch's node is a root of the graph and has no incoming edge to read.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_programmatic_edge_is_a_different_structure() {
+    let device = Device::new(DEVICE).expect("a CUDA device");
+    let mut allocator =
+        Allocator::new(&device, Arc::new(Allowance::default())).expect("an allocator");
+    allocator
+        .reserve(PoolKind::Graph, 1 << 20)
+        .expect("reserve the graph pool");
+    let buffer: Buffer = allocator
+        .allocate(PoolKind::Graph, BYTES)
+        .expect("the activation buffer");
+    let stream = Stream::new(DEVICE).expect("a stream");
+    // SAFETY: the fill lies inside the allocation.
+    unsafe { memset_d32(buffer.address(), 0, WORDS, &stream) }.expect("zero the activation");
+
+    let image = std::fs::read(cubin()).expect("the compiled probe kernels");
+    let kernel = |pdl: bool| -> Arc<Kernel> {
+        let mut metadata = CubinMetadata::named("probe_exact");
+        // What a Triton module states for a kernel that launches with PDL: the attribute the
+        // driver turns into a programmatic dependency on the preceding kernel of the stream.
+        metadata.launch_pdl = pdl;
+        Arc::new(
+            Kernel::load_cubin(&device, &image, metadata)
+                .unwrap_or_else(|error| panic!("loading probe_exact: {error}")),
+        )
+    };
+    let descriptor = ProbeDescriptor {
+        words: WORDS as u32,
+    };
+    let key = descriptor::key(&descriptor);
+    let arena = nn::Arena::new(DevicePtr::new(0), 0);
+    let data = TensorView::new(
+        DevicePtr::new(buffer.address()),
+        DType::I32,
+        Shape::new(&[WORDS as u64]),
+    );
+
+    // One capture of two launches of the same operator, the second stating `pdl`.
+    let capture_two = |pdl: bool, number: u64| -> (platform::Graph, executor::captured::Nodes) {
+        let generation = Generation::new(
+            number,
+            [KernelEntry::keyed(Probe::NAME, key.clone(), kernel(pdl))],
+        );
+        let capture = Rc::new(RefCell::new(
+            platform::Capture::begin(&stream, CaptureMode::Relaxed).expect("a capture begins"),
+        ));
+        let mut recording = Recording::new(Rc::clone(&capture));
+        ops::capture::set_sink(Some(&mut recording));
+        let forward = Forward::new(&stream, &generation, &arena);
+        for _ in 0..2 {
+            forward
+                .operate::<Probe>(
+                    &descriptor,
+                    ProbeArgs {
+                        data,
+                        count: WORDS as u32,
+                        value: CAPTURED,
+                    },
+                )
+                .expect("the probe launches");
+        }
+        ops::capture::set_sink(None);
+        if let Some(failure) = recording.failure() {
+            panic!("the capture failed while recording a launch: {failure}");
+        }
+        let nodes = recording.into_nodes();
+        assert_eq!(nodes.len(), 2, "two launches were recorded");
+        let template = Rc::try_unwrap(capture)
+            .unwrap_or_else(|_| panic!("the capture is still shared by its recorder"))
+            .into_inner()
+            .end()
+            .expect("the capture ends");
+        (template, nodes)
+    };
+
+    let (template, completion) = capture_two(false, 1);
+    let (_, programmatic) = capture_two(true, 2);
+    // The edge the second launch states: one dependency on the first launch's node, and its kind is
+    // the whole point of the test.
+    let kind_of = |nodes: &executor::captured::Nodes| nodes[1].2[0].incoming.clone();
+    assert_eq!(
+        kind_of(&completion),
+        vec![platform::EdgeKind::Completion],
+        "a plain launch orders the second kernel after the first one has finished"
+    );
+    assert_eq!(
+        kind_of(&programmatic),
+        vec![platform::EdgeKind::Programmatic],
+        "a launch with PDL states a programmatic dependency, not a completion one"
+    );
+
+    let captured =
+        Captured::new(template, completion, vec![kernel(false)]).expect("a captured bucket");
+    assert!(
+        captured
+            .same_structure(captured.nodes())
+            .expect("the structure compares"),
+        "a capture is its own structure"
+    );
+    let reason = captured
+        .structure_mismatch(&programmatic)
+        .expect("the structures compare")
+        .expect("a programmatic edge is a different structure, so the bucket must be recaptured");
+    assert!(
+        reason.contains("Programmatic"),
+        "the refusal did not name the edge kind that decided it: {reason}"
+    );
+    assert!(
+        !captured
+            .same_structure(&programmatic)
+            .expect("the structures compare"),
+        "a bucket was rebound onto a structure whose edges order the work differently"
+    );
+}
