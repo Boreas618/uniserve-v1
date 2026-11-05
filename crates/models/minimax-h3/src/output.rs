@@ -211,15 +211,18 @@ impl Splice {
 /// `arange(5)/5`, so the first blended frame is entirely the predecessor's), yields the tail to the next
 /// clip as state, and writes the kept frames as `[frames, rows, columns, 3]` bytes.
 ///
-/// The blend is `CrossFade` on the **frames** axis: the two sources are each one contiguous block (a
-/// `[3, 25, H, W]` clip and a `[3, 5, H, W]` tail), which is the operator's condition, and the frames'
-/// weights are the ones it applies along the leading positions of its axis, and they are the reference's
-/// to the rounding: the weights are `i / 5` for frame `i` of the overlap, which is
-/// `torch.arange(5, dtype=torch.float16)/5` in `output.py`, and each frame is two `scaled_add` launches
-/// with those two host scalars. The ramp is built here in FP32 where the reference builds it in the
-/// raster's type: one declared deviation, at the ramp's last bit and not in the blend's arithmetic. The arithmetic is the reference's decoded-precision
-/// blend followed by the FP32 de-normalization, in that order: the de-normalization is [`RgbBytes`]' and
-/// reads the same constants the checkpoint publishes.
+/// The blend is two `scaled_add` launches per overlap frame, with the frame's two weights as host
+/// scalars: the two sources a frame reads are each one contiguous block (a `[3, 25, H, W]` clip and a
+/// `[3, 5, H, W]` tail), which is the operands `scaled_add` takes. It is **not** `CrossFade` with the
+/// frames axis: that operator is the row-and-column seam blend and refuses frames, so a frame-axis
+/// blend has no `CrossFade` row and this component states none.
+///
+/// The weights are the reference's to the rounding: `i / 5` for frame `i` of the overlap, which is
+/// `torch.arange(5, dtype=torch.float16)/5` in `output.py`. The ramp is built here in FP32 where the
+/// reference builds it in the raster's type: one declared deviation, at the ramp's last bit and not in
+/// the blend's arithmetic. The arithmetic is the reference's decoded-precision blend followed by the
+/// FP32 de-normalization, in that order: the de-normalization is [`RgbBytes`]' and reads the same
+/// constants the checkpoint publishes.
 pub struct VideoPostprocessor {
     bytes: RgbBytes,
     dtype: DType,
