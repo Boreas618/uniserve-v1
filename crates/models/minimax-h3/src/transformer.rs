@@ -695,14 +695,24 @@ impl Transformer {
         )?);
 
         // The rotation and the attention, both over this rank's heads.
-        let sections = nn::layers::Sections::new(&rotated_axes(config))
-            .map_err(Error::from)?
-            .interleaved();
+        //
+        // **The factors are built contiguous and the rotation applies them interleaved**, and the two
+        // are separate keys for that reason: one spectrum over the three axes is written as three
+        // blocks (`188b8b1d5`), while the per-head rotation pairs the halves of a block. Stating the
+        // factors as `interleaved` named a key no launcher binds - the deployment list's contiguous row
+        // was the launch's, and this statement was the one that disagreed.
+        //
+        // The positions are the **integer** table: `position_ids` is declared `i32` beside the tables
+        // it is indexed with (`denoiser.rs`), a coordinate being an index rather than a measured value,
+        // so a statement typing them F32 named a key no launch binds - and the failure that produced
+        // says so in its own words (`generation 1 has no kernel for rotary_factors descriptor
+        // dtype_f32_positions_f32_columns_48`). The row the file holds is `positions_i32`.
+        let sections = nn::layers::Sections::new(&rotated_axes(config)).map_err(Error::from)?;
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
             rotated,
             1.0,
             Some(sections),
-            nn::DType::F32,
+            nn::DType::I32,
         ));
         programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
             head,
@@ -1352,6 +1362,24 @@ mod tests {
                     .iter()
                     .any(|key| key.contains("dtype_bf16_columns_10752")),
             "the modulation tables are gathered at the stack's type: {gathers:?}"
+        );
+
+        // The rotation's factor table: **contiguous** sections over the three axes (one spectrum
+        // written in blocks) and **integer** positions, because `position_ids` is an `i32` table - a
+        // coordinate is an index, not a measured value. Stating either the other way named a key no
+        // launch binds, and the store had the launch's row both times.
+        let factors = programs
+            .iter()
+            .find(|(name, _)| name == "rotary_factors")
+            .map(|(_, key)| key.clone())
+            .expect("the stack states one factor table");
+        assert!(
+            factors.contains("positions_i32"),
+            "the factor table reads the integer position table: {factors}"
+        );
+        assert!(
+            factors.contains("sections_32-32-32") && !factors.contains("interleaved_true"),
+            "the factor table is contiguous over three equal axes: {factors}"
         );
 
         // A conditioned deployment's modulation cache has four groups where a text-only one has two,
