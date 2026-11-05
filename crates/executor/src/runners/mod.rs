@@ -20,4 +20,5 @@ pub(crate) mod tables;
 
 pub use causal_lm::CausalLmRunner;
 pub use decoder::DecoderRunner;
+pub mod products;
 pub mod resident;

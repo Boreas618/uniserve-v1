@@ -49,6 +49,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::diag::Diag;
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -267,6 +268,37 @@ pub struct Prepared {
     pub text: Vec<u8>,
 }
 
+/// The products one denoising step reads, in the order a refusal names them.
+///
+/// The model states each kind's size through its `Layout`, so this list is the model's own list of
+/// what a step consumes and not a choice this runner makes.
+const STEP_PRODUCTS: &[Product] = &[
+    Product::Text,
+    Product::Source,
+    Product::Images,
+    Product::Audio,
+    Product::Media,
+    Product::Latents,
+];
+
+/// The first of [`STEP_PRODUCTS`] that `products` does not hold for `request`, if any.
+///
+/// A free function so the presence rule is testable without a runner: constructing one takes a
+/// device, and the rule is about a store rather than about a device.
+fn missing_product(
+    products: &dyn Products,
+    request: ipc::RequestKey,
+    device: platform::DeviceId,
+    stream: StreamId,
+) -> Result<Option<Product>> {
+    for kind in STEP_PRODUCTS {
+        if products.borrow(request, *kind, device, stream)?.is_none() {
+            return Ok(Some(*kind));
+        }
+    }
+    Ok(None)
+}
+
 /// One bucket and the request it was derived from.
 #[derive(Clone, Debug)]
 pub struct BucketPlan {
@@ -292,6 +324,11 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     columns: DenoiseColumns,
+    /// The epoch's product store: what a call of this request produced for this one to read.
+    ///
+    /// `None` until the executor attaches it, and a step that needs a product without one refuses by
+    /// name rather than staging zeros.
+    products: Option<Arc<dyn Products>>,
     /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
     diag: Diag,
     /// The step of the schedule the staged batch is, which names the diagnosis dumps.
@@ -352,6 +389,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             counters: None,
             tables: Tables::new(),
             columns,
+            products: None,
             diag: Diag::from_env(),
             staged_step: None,
         })
@@ -587,6 +625,23 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
+    /// Refuses a step whose request has no store, or whose store lacks one of the six products.
+    ///
+    /// The kinds a step reads are the model's own, so the list is stated once here rather than
+    /// discovered per call: the text rows and the encoder's features for the prompt, the reference
+    /// media for a conditioned task, and the trajectory every step updates. A store that answers
+    /// `None` for one of them is refused by name, naming the kind - which is the difference between a
+    /// step that fails because nobody ran the encoder and one that runs on zeros.
+    fn require_products(&self, request: ipc::RequestKey) -> Result<()> {
+        let Some(products) = self.products.as_ref() else {
+            return Err(products::no_store(request));
+        };
+        match missing_product(products.as_ref(), request, self.device, self.stream_id())? {
+            Some(kind) => Err(products::absent(request, kind)),
+            None => Ok(()),
+        }
+    }
+
     /// The model's prepared inputs for `request`, when this runner holds them.
     ///
     /// No residency layer for a media request's products exists yet, so this answers `None` and the
@@ -808,8 +863,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             let stated_request = media.request(index)?;
             let index = u32::try_from(index)
                 .map_err(|_| Error::Invalid("a batch of more requests than rows".into()))?;
-            // What a step also reads is the model's own preparation, and a runner that invented it
-            // would stage a trajectory nobody produced: the refusal names both halves.
+            // What a step also reads is produced by other calls of the same request - the text
+            // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
+            // and never derived here.
+            self.require_products(stated_request.request)?;
             let prepared = self.prepared(stated_request.request).ok_or_else(|| {
                 Error::Invalid(format!(
                     "a denoise step of bucket {bucket} names request {} at row {index}, whose \
@@ -914,6 +971,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
         self.counters = Some(counters);
+    }
+
+    fn attach_products(&mut self, products: Arc<dyn Products>) {
+        self.products = Some(products);
     }
 
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
@@ -1153,5 +1214,104 @@ mod tests {
         fn prepare_evaluation(&self, _index: u32, _out: &mut [Vec<u8>]) -> nn::Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod product_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A product store that answers for exactly the kinds it was given.
+    struct Store {
+        held: Vec<Product>,
+        asked: Mutex<Vec<Product>>,
+    }
+
+    impl Products for Store {
+        fn publish(
+            &self,
+            _request: ipc::RequestKey,
+            _kind: Product,
+            _device: platform::DeviceId,
+            _stream: StreamId,
+            _view: &TensorView,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn borrow(
+            &self,
+            _request: ipc::RequestKey,
+            kind: Product,
+            _device: platform::DeviceId,
+            _stream: StreamId,
+        ) -> Result<Option<TensorView>> {
+            self.asked.lock().unwrap().push(kind);
+            Ok(self
+                .held
+                .contains(&kind)
+                .then(|| TensorView::new(ops::DevicePtr::new(0), DType::BF16, Shape::new(&[1, 1]))))
+        }
+    }
+
+    fn request() -> ipc::RequestKey {
+        ipc::RequestKey::new(1, ipc::RequestId(41), 0)
+    }
+
+    /// The rule a step depends on: the kind it refuses names the first product no call produced, in
+    /// the model's own order, so a failure says whether the encoder ran or the trajectory is missing.
+    #[test]
+    fn the_first_absent_kind_is_the_one_a_step_refuses() {
+        let store = Store {
+            held: vec![Product::Text, Product::Source],
+            asked: Mutex::new(Vec::new()),
+        };
+        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
+            .expect("a store answers");
+        assert_eq!(
+            missing,
+            Some(Product::Images),
+            "the reference media is the first kind this store lacks"
+        );
+        assert!(
+            products::absent(request(), Product::Images)
+                .to_string()
+                .contains("images"),
+            "the refusal names the kind"
+        );
+    }
+
+    /// A store holding every kind a step reads has nothing missing, and it is asked in one pass.
+    #[test]
+    fn a_store_holding_every_kind_leaves_nothing_missing() {
+        let store = Store {
+            held: STEP_PRODUCTS.to_vec(),
+            asked: Mutex::new(Vec::new()),
+        };
+        let missing = missing_product(&store, request(), platform::DeviceId(0), StreamId(0))
+            .expect("a store answers");
+        assert_eq!(missing, None);
+        assert_eq!(
+            store.asked.lock().unwrap().len(),
+            STEP_PRODUCTS.len(),
+            "each kind is asked once"
+        );
+    }
+
+    /// A step with no store at all is a different fact from one whose store lacks a kind, and it says
+    /// so: the first is the executor not having attached one, the second is a call that never ran.
+    #[test]
+    fn no_store_is_its_own_refusal() {
+        let refusal = products::no_store(request()).to_string();
+        assert!(
+            refusal.contains("no product store"),
+            "the refusal names the attached store: {refusal}"
+        );
+        assert_eq!(
+            Product::Latents.name(),
+            "latents",
+            "a kind is named as the design names it"
+        );
     }
 }

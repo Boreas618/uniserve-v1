@@ -68,7 +68,9 @@ pub trait Runner: Send {
     ///
     /// The caller dedups by the handle's address, because two runners of one device may share one
     /// cache and a second wake would reset units the first had just mapped.
-    fn cache(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+    fn cache(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
         None
     }
 
@@ -174,6 +176,20 @@ pub trait Runner: Send {
     /// `kernel_launches` is the device's figure and not a per-runner estimate.
     fn attach_counters(&mut self, counters: std::sync::Arc<crate::device::SharedCounters>) {
         let _ = counters;
+    }
+
+    /// Gives the runner the epoch's product store: the conditioning and trajectories one call
+    /// produces and another call of the same request reads.
+    ///
+    /// The device executor calls this when it starts, beside [`Runner::attach_pools`]. A runner that
+    /// produces or reads no product across calls ignores it; one that does refuses a call whose
+    /// product no call produced, rather than reading a region nobody wrote
+    /// ([`crate::runners::products`]).
+    fn attach_products(
+        &mut self,
+        products: std::sync::Arc<dyn crate::runners::products::Products>,
+    ) {
+        let _ = products;
     }
 
     /// Performs one job this runner returned from `submit` or `precopy`, on the device executor's
