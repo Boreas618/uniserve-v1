@@ -182,6 +182,38 @@ def extents_in(key):
     return found
 
 
+def classify(missing, shapes, rasters_of, sampled):
+    """Split the missing shapes by the question each absence answers.
+
+    Three answers, not one: a row the file lacks at every raster, a row the request's raster
+    decides, and a row the walk's own sample decides. A shape can be both of the last two -
+    `scaled_add ... columns_4096` is a canvas-class operator whose width is the walk's prompt
+    length - and the sample answers first, because it is the more specific claim: a shape counted
+    twice would make the remainder too small.
+
+    **A canvas-class operator is canvas-class only when the walks that produced it share one
+    raster.** With a single raster the label absorbs every absence that does not depend on the
+    raster - twelve rows a store must hold were filed under it that way - so the absence has to
+    survive a change of canvas before the canvas is allowed to explain it.
+    """
+    canvas, dependent, real = [], [], []
+    for shape in missing:
+        carried = sorted(
+            (field, number)
+            for field, number in extents_in(shape[1])
+            if number in sampled
+        )
+        if carried:
+            dependent.append(shape)
+        elif shape[0] in CANVAS_CLASS and len(
+            {tuple(rasters_of[path]) for path in shapes[shape]}
+        ) < 2:
+            canvas.append(shape)
+        else:
+            real.append(shape)
+    return canvas, dependent, real
+
+
 def by_shape(args):
     """Every shape the walks produced, against the shapes the file holds at any element type."""
     shapes = {}
@@ -238,18 +270,13 @@ def by_shape(args):
     }
 
     missing = sorted(set(shapes) - held)
-    # The rasters each walk states, so a shape absent from walks of two *different* canvases is
-    # not called canvas-class: the canvas cannot explain an absence that survives a change of
-    # canvas, and labelling it that way hides a row a store has to hold at every raster.
+    # The rasters each walk states, so a shape absent from walks of two *different* canvases is not
+    # called canvas-class: the canvas cannot explain an absence that survives a change of canvas.
     stated = {path: statements(path)[0] for path in args.walk}
-    canvas = [
-        shape
-        for shape in missing
-        if shape[0] in CANVAS_CLASS
-        and len({tuple(stated[path]) for path in shapes[shape]}) < 2
-    ]
+    canvas, dependent, real = classify(missing, shapes, stated, sampled)
     for operator, key in missing:
-        where = sorted(shapes[(operator, key)])
+        shape = (operator, key)
+        where = sorted(shapes[shape])
         launched_at = sorted(
             {
                 element
@@ -264,15 +291,13 @@ def by_shape(args):
                 if number in sampled
             }
         )
-        if carried:
+        if shape in dependent:
             asked = ", ".join(
                 f"{field} {number} = the walk's {sampled[number]}"
                 for field, number in carried
             )
             mark = f"  SAMPLE-DEPENDENT ({asked})"
-        elif operator in CANVAS_CLASS and len(
-            {tuple(stated[path]) for path in where}
-        ) < 2:
+        elif shape in canvas:
             mark = "  RASTER-DEPENDENT"
         elif operator in CANVAS_CLASS:
             mark = (
@@ -305,16 +330,9 @@ def by_shape(args):
         # A shape can be both: `scaled_add ... columns_4096` is a canvas-class operator whose
         # width is the walk's prompt length. The sample answers it first, since it is the more
         # specific claim - and a shape counted twice would make the remainder too small.
-        dependent = sorted(
-            shape
-            for shape in missing
-            if any(number in sampled for _, number in extents_in(shape[1]))
-        )
-        canvas = sorted(set(canvas) - set(dependent))
-        real = len(missing) - len(canvas) - len(dependent)
         print(
             f"\n{len(missing)} shape(s) a walk produced and the file cannot build at any element "
-            f"type: {real} at any raster (each stops a run at `no kernel`), "
+            f"type: {len(real)} at any raster (each stops a run at `no kernel`), "
             f"{len(canvas)} raster-class, {len(dependent)} the walk's own sample"
         )
         return 1
@@ -324,13 +342,70 @@ def by_shape(args):
     return 0
 
 
+def self_test() -> int:
+    """Prove the classification: four absences, one answer each.
+
+    The regression this guards is the one that made `0 at any raster` wrong: a canvas-class
+    operator absent from walks of two different canvases is a row a store must hold, and the
+    operator's name alone must never be enough to file it under the canvas.
+    """
+    def key(columns: int) -> str:
+        return f"dtype_f32_columns_{columns}_block_1024"
+
+    canvas_row = ("frame_pad", "dtype_f32_block_pixels_64_block_channels_32")
+    sample_row = ("scaled_residual", key(123456))
+    twice_row = ("scaled_add", key(131072))
+    once_row = ("scaled_add", key(4096))
+    # `scaled_add ... 4096` is also the walk's prompt length, so the sample answers it first:
+    # the ordering in `classify` is part of what this test states.
+    # `a` and `b` are two walks at the same canvas - the conditioned and the plain one a caller
+    # runs - and `c` is the second canvas whose presence makes an absence a fact.
+    shapes = {
+        canvas_row: {"a": {"f16"}, "b": {"f16"}},
+        sample_row: {"a": {"f32"}},
+        twice_row: {"a": {"bf16"}, "c": {"bf16"}},
+        once_row: {"a": {"bf16"}},
+    }
+    rasters_of = {"a": [(256, 256)], "b": [(256, 256)], "c": [(1344, 768)]}
+    sampled = {123456: "trajectory elements", 4096: "prompt length"}
+    canvas, dependent, real = classify(
+        sorted(shapes), shapes, rasters_of, sampled
+    )
+    assert canvas == [canvas_row], canvas
+    # The order is the input's, so the test states membership rather than an ordering the
+    # reader of the report never sees.
+    assert set(dependent) == {sample_row, once_row}, dependent
+    assert real == [twice_row], real
+
+    # The same absence in one walk only: the canvas may explain it, and the tool says so
+    # rather than guessing.
+    single = dict(rasters_of, c=[(256, 256)])
+    canvas, dependent, real = classify([twice_row], shapes, single, {})
+    assert canvas == [twice_row] and not real, (canvas, real)
+
+    # A row the file holds is not missing at all.
+    canvas, dependent, real = classify([], shapes, rasters_of, sampled)
+    assert not canvas and not dependent and not real
+
+    print(
+        "ok   a canvas-class row absent from two canvases is real, from one it is the canvas,"
+        " and the walk's own sample answers before either"
+    )
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--walk",
-        required=True,
+        required=False,
         action="append",
         help="what the forward reported, one launch a line; repeat it to take a union of stages",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove the classification on walks and a file it makes itself",
     )
     parser.add_argument(
         "--by-shape",
@@ -339,7 +414,7 @@ def main(argv=None):
         "shapes a file serving several deployments must hold; fails on a shape absent at every type",
     )
     parser.add_argument(
-        "--fixture", required=True, help="the store list the caller builds from"
+        "--fixture", help="the store list the caller builds from"
     )
     parser.add_argument(
         "--unbound",
@@ -349,6 +424,10 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if args.self_test:
+        return self_test()
+    if not args.walk or not args.fixture:
+        parser.error("--walk and --fixture name the two sides, or --self-test proves the tool")
     if args.by_shape:
         return by_shape(args)
     walk = read_lines(args.walk[0])
