@@ -116,6 +116,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let (expected, finished) = support::wait_for_tokens(
         &mut reference_events,
         GENERATED + CONTINUED,
+        ANSWER,
     );
     assert!(
         finished.is_none(),
@@ -139,6 +140,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let (first, _) = support::wait_for_tokens(
         &mut running_events,
         GENERATED,
+        ANSWER,
     );
     assert_eq!(first, expected[..GENERATED], "the running world generates the reference's first tokens");
 
@@ -186,6 +188,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let (continued, _) = support::wait_for_tokens(
         &mut continuation,
         CONTINUED,
+        ANSWER,
     );
     assert_eq!(
         continued,
