@@ -74,6 +74,20 @@ impl CrossFade {
     /// produces the raster. Never synthesise a zero tile to satisfy the signature: it costs a copy
     /// per clip and it makes the seam arithmetic wrong at the edge, which is why the parameter is
     /// optional.
+    /// The descriptor one blend launches: the element type, the extent along the axis and the axis.
+    ///
+    /// One module serves every seam of one width, so a walk that knows the grid's seam widths states
+    /// every blend the decoder compiles.
+    pub fn descriptor(&self) -> cross_fade::Descriptor {
+        cross_fade::Descriptor {
+            dtype: self.dtype,
+            extent: self.extent,
+            axis: self.axis,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -97,13 +111,7 @@ impl CrossFade {
             }
             return Ok(());
         };
-        let descriptor = cross_fade::Descriptor {
-            dtype: self.dtype,
-            extent: self.extent,
-            axis: self.axis,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor();
         f.operate::<CrossFadeOp>(
             &descriptor,
             cross_fade::Args {

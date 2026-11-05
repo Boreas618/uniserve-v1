@@ -73,9 +73,18 @@ impl FramePadDescriptor {
     /// descriptor carries the result, so the caller and the compiled program agree on the variant.
     pub fn tiles(values: &TensorView, out: &TensorView) -> (u32, u32) {
         let contiguous_out = out.strides == Strides::row_major(out.shape);
-        if values.strides.last() == 1 && contiguous_out {
-            let columns = out.shape.dim(4);
-            let pixels = ROW_PIXELS.min(columns.next_power_of_two().max(1) as u32);
+        Self::tiles_of(
+            values.strides.last() == 1,
+            contiguous_out,
+            out.shape.dim(4),
+        )
+    }
+
+    /// The same split, from the two facts it turns on: whether the source's columns are unit-strided
+    /// and the output's, and the output's column count. A walk has the extents and not the views.
+    pub fn tiles_of(unit_columns: bool, contiguous_out: bool, out_columns: u64) -> (u32, u32) {
+        if unit_columns && contiguous_out {
+            let pixels = ROW_PIXELS.min(out_columns.next_power_of_two().max(1) as u32);
             (pixels, ROW_ELEMENTS / pixels)
         } else {
             (PAD_PIXELS, PAD_CHANNELS)

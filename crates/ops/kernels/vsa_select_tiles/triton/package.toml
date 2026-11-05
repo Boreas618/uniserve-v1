@@ -32,6 +32,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { block = ["512", "1024", "2048", "4096"] }
+dimensions = { block = ["512", "1024", "2048", "4096", "256"] }
 
 [parameters]
