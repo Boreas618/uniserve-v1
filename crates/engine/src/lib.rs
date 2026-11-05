@@ -71,7 +71,7 @@ pub use crate::scheduler::{
     ParkedCache, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
     PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
-    Validators, WorkerStats, arrival_view, ceilings_of,
+    PhaseKind, Validators, WorkerStats, arrival_view, ceilings_of, phase_id,
 };
 pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_requests};
 // The simulated engine is test support: `mod sim` is built only with the

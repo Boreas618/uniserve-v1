@@ -2919,6 +2919,9 @@ impl MainProcess {
                 failure: UpdateFailure::Precopy { reason },
             }));
         }
+        // Before the devices cut over and before admission can open on a batch: the generation a
+        // step stamps its batches with is the one whose graphs the runner has to find.
+        self.record_generation(generation);
         self.switchover_policy(generation, step);
         for executor in &self.executors {
             let device = executor.device();
@@ -3228,15 +3231,17 @@ impl MainProcess {
         }
         self.policy_probe_at = None;
 
+        // The scheduler's own signal, not a reading of its policy slot: `note_policy_serves` fires
+        // where a policy actually adopts, so a probe cannot disagree with the fact it reports. A
+        // probe that finds every scheduler serving clears the missing state and says nothing - a log
+        // that states both that a policy serves and that none was installed is worse than either.
         let serving = self
             .schedulers
             .iter()
-            .filter(|scheduler| scheduler.policy_mut().running().is_some())
+            .filter(|scheduler| *scheduler.serving().borrow())
             .count();
         if serving == self.schedulers.len() {
-            if self.policy_missing_since.take().is_some() {
-                tracing::info!(serving, "the switchover's policy serves every scheduler");
-            }
+            self.policy_missing_since = None;
             return Ok(None);
         }
         if !running.is_empty() {
@@ -3354,6 +3359,10 @@ impl MainProcess {
                 failure,
             });
         }
+        // The batches that form from here serve the generation that served before the update, so the
+        // number they are stamped with is that one: a revert that left the update's number in place
+        // would stamp every batch with a generation whose graphs are about to be released.
+        self.record_generation(self.update.current());
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
@@ -4063,15 +4072,53 @@ impl MainProcess {
     /// §7.3 step 3's policy half: every scheduler's next batch boundary answers from the prepared
     /// policy. `step` is the boundary the epoch's schedulers agreed on, which only the scheduler
     /// node can name; the control thread does not choose one.
+    /// Records on every scheduler the generation whose kernels the next step's batches serve
+    /// (§4.2, §7.3).
+    ///
+    /// A step reads this cell once and stamps every batch it forms with it, and a runner serves a
+    /// batch from the graphs captured for that number. A control thread that cut the devices over
+    /// without recording it left the first batch of the deployment stamped `0`, and the runner
+    /// answered `no graph of bucket ... in generation 0 or in a generation it replaces`: the graphs
+    /// were captured under the generation the daemon named, and no batch ever asked for it.
+    fn record_generation(&self, generation: u64) {
+        for scheduler in &self.schedulers {
+            scheduler.set_generation(generation);
+        }
+        // One line, because the figure a batch carries is invisible until a runner refuses it: a run
+        // whose first batch names a generation this line never stated is a run where something cut a
+        // generation over without recording it.
+        tracing::info!(
+            generation,
+            schedulers = self.schedulers.len(),
+            "the generation this process's batches carry is recorded"
+        );
+    }
+
     fn switchover_policy(&self, generation: u64, _step: Option<u64>) {
-        // Before the switch, how many schedulers hold a prepared candidate: a first switchover with
-        // none adopts nothing, serves nothing, raises nothing, and the run says only that no policy
-        // was installed - which names the symptom and not the side of the switch it came from.
+        // This states the candidate, not the serving policy: a scheduler adopts at its next batch
+        // boundary, which is after this returns, so a "serving" figure here would be a second
+        // statement of a fact `serving()` reports - and the two disagreed in a run. What this can
+        // say is whether anything was prepared to adopt.
         let prepared = self
             .schedulers
             .iter()
             .filter(|scheduler| scheduler.policy_mut().prepared().is_some())
             .count();
+        if prepared == self.schedulers.len() {
+            tracing::info!(
+                generation,
+                prepared,
+                schedulers = self.schedulers.len(),
+                "every scheduler holds a prepared policy candidate"
+            );
+        } else {
+            tracing::warn!(
+                generation,
+                prepared,
+                schedulers = self.schedulers.len(),
+                "a scheduler holds no prepared policy candidate: a switchover adopts nothing there"
+            );
+        }
         for scheduler in &self.schedulers {
             if let Err(error) = answer(
                 scheduler.switchover_policy(),
@@ -4080,27 +4127,6 @@ impl MainProcess {
             ) {
                 tracing::error!(%error, "switching the scheduling policy failed");
             }
-        }
-        let serving = self
-            .schedulers
-            .iter()
-            .filter(|scheduler| scheduler.policy_mut().running().is_some())
-            .count();
-        if serving == self.schedulers.len() {
-            tracing::info!(
-                generation,
-                prepared,
-                serving,
-                "the switchover's policy serves every scheduler"
-            );
-        } else {
-            tracing::warn!(
-                generation,
-                prepared,
-                serving,
-                schedulers = self.schedulers.len(),
-                "the policy switchover left a scheduler without a serving policy"
-            );
         }
     }
 

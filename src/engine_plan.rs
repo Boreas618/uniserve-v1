@@ -533,7 +533,7 @@ impl EpochPlan {
                 let runner = CausalLmRunner::new(
                     Binding {
                         id: RunnerId(0),
-                        phases: vec![PhaseId(0)],
+                        phases: served_phases(&self.buckets),
                         device,
                         stream,
                     },
@@ -1102,9 +1102,75 @@ impl Placement {
 }
 
 
+/// The phases this node's runner serves, in the numbering the scheduler plans with: one id per phase
+/// kind this plan's own buckets are launched as.
+///
+/// The kinds come from the buckets - what this rank's plan can launch - and the ids from
+/// `engine::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
+/// literal: a plan that stated `PhaseId(0)` for its device (text encoding) served no phase the
+/// scheduler ever planned, and the executor refused the deployment's first completion with `no
+/// device of this rank serves phase PhaseId(3)`.
+fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
+    let mut kinds: Vec<engine::PhaseKind> = buckets
+        .iter()
+        .map(|bucket| match bucket.variant {
+            Variant::PrefillWrite | Variant::PrefillOutput => engine::PhaseKind::Prefill,
+            Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
+            Variant::Encode => engine::PhaseKind::TextEncoding,
+            Variant::Denoise => engine::PhaseKind::Denoise,
+            Variant::Decode => engine::PhaseKind::ImageDecode,
+        })
+        .collect();
+    // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
+    // chunk does, so the device that serves prefill states it as well: the scheduler may name a
+    // refill and the batch then routes here.
+    if kinds.contains(&engine::PhaseKind::Prefill) {
+        kinds.push(engine::PhaseKind::Refill);
+    }
+    kinds.sort_by_key(|kind| engine::phase_id(*kind).0);
+    kinds.dedup();
+    kinds
+        .into_iter()
+        // The scheduler numbers a phase with the world's `u32` and the executor names one with the
+        // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
+        // this process cannot state rather than a phase to serve quietly.
+        .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan serves the phases its buckets are launched as, in the scheduler's numbering, and no
+    /// phase it does not run.
+    ///
+    /// The defect this pins: the plan stated `PhaseId(0)` for its device, so the executor refused
+    /// the deployment's first completion with `no device of this rank serves phase PhaseId(3)`.
+    /// `PhaseId(3)` is a whole-prompt forward and `PhaseId(0)` is text encoding: the plan and the
+    /// scheduler were numbering phases in two tables.
+    #[test]
+    fn a_plan_serves_the_phases_its_buckets_are_planned_as() {
+        let buckets = Buckets::causal_lm(&[8], &[64], true);
+        let phases = served_phases(&buckets);
+        let id = |kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits"));
+        assert!(
+            phases.contains(&id(engine::PhaseKind::Prefill)),
+            "a prefill batch routes to this node's device: {phases:?}"
+        );
+        assert!(
+            phases.contains(&id(engine::PhaseKind::Decode)),
+            "a decode batch routes to this node's device: {phases:?}"
+        );
+        assert!(
+            !phases.contains(&id(engine::PhaseKind::TextEncoding)),
+            "this node encodes no request itself: {phases:?}"
+        );
+        assert!(
+            !phases.contains(&id(engine::PhaseKind::Denoise)),
+            "a batch this plan has no bucket for is not served: {phases:?}"
+        );
+    }
 
     /// A checkpoint directory holding the files a test states.
     fn checkpoint(files: &[(&str, &str)]) -> tempfile::TempDir {

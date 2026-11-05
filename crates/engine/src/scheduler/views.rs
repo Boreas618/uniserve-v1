@@ -119,31 +119,8 @@ const PHASES: [PhaseKind; 21] = [
 /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does
 /// not know; the mechanism never names a request's phase with it, and it has no
 /// id.
-pub(crate) const fn phase_id(kind: PhaseKind) -> PhaseId {
-    PhaseId(match kind {
-        PhaseKind::TextEncoding => 0,
-        PhaseKind::VisionEncoding => 1,
-        PhaseKind::LatentEncoding => 2,
-        PhaseKind::Prefill => 3,
-        PhaseKind::Decode => 4,
-        PhaseKind::Verify => 5,
-        PhaseKind::TokenDenoise => 6,
-        PhaseKind::Readout => 7,
-        PhaseKind::ImageDecode => 8,
-        PhaseKind::CacheInstall => 9,
-        PhaseKind::MediaRead => 10,
-        PhaseKind::Denoise => 11,
-        PhaseKind::VideoDecode => 12,
-        PhaseKind::AudioDecode => 13,
-        PhaseKind::VideoEncode => 14,
-        PhaseKind::AudioEncode => 15,
-        PhaseKind::Mux => 16,
-        PhaseKind::LatentPrepare => 17,
-        PhaseKind::TensorTransfer => 18,
-        PhaseKind::CacheExport => 19,
-        PhaseKind::Refill => 20,
-        PhaseKind::Other => u32::MAX,
-    })
+pub const fn phase_id(kind: PhaseKind) -> PhaseId {
+    kind.id()
 }
 
 /// The phase kind an id names; `None` for an id this epoch has no phase for,
