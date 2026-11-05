@@ -199,7 +199,7 @@ impl Buffer {
 /// `[voxels_tile, latent_channels]` block out of the clip's one `[frames·h·w, latent_channels]` latent
 /// with `nn::layers::Rows`, which is model layout arithmetic, uploaded once per layout.
 ///
-/// `tiles` are in grid order ([`Tiles::tiles`]), and each tile contributes
+/// `tiles` are in grid order (`Tiles::tiles`), and each tile contributes
 /// `frames · (rows_end − rows_start) · (columns_end − columns_start)` entries: the row index
 /// `((frame · h + row) · w + column)` of each of its voxels.
 ///

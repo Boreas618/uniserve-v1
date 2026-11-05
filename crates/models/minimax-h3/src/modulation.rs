@@ -110,7 +110,7 @@ impl AdaLnCache {
     /// Every checkpoint tensor the cache is built from, as complete names.
     ///
     /// The cache's tables are derived at load from these projections; the names are the ones
-    /// [`AdaLnCache::load`] requests. `norm_out.linear` is the output table, which is a different
+    /// `AdaLnCache::load` requests. `norm_out.linear` is the output table, which is a different
     /// tensor from the stack's own `norm_out.norm.weight`.
     pub fn keys(config: &crate::config::TransformerConfig) -> Vec<String> {
         let mut keys = Vec::new();
@@ -319,7 +319,7 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
 /// The reference builds the cache with one shared pair of FP32 linear maps over the sinusoidal
 /// timestep embedding and one projection per layer, then releases them
 /// (`uniserve/models/minimax_h3/modulation.py`, `TimestepEmbedding`). Nothing runs them per
-/// evaluation, so they are held only until [`Projections::fill`] has produced the tables once.
+/// evaluation, so they are held only until `Projections::fill` has produced the tables once.
 pub struct Projections {
     /// `time_embedder.linear_1`: `[time_hidden, frequency]`, FP32, with its bias.
     first: (Weight, Weight),
