@@ -23,6 +23,7 @@ use nn::{Arena, DType, Forward, Shape};
 
 use minimax_h3::audio_vae::{BigVgan, audio_arena, track_samples};
 use minimax_h3::decoding::arena_reservation;
+use minimax_h3::encoding::{AudioEncoder, audio_encoder_arena};
 
 fn main() {
     if let Err(error) = run() {
@@ -119,6 +120,60 @@ fn run() -> Result<(), String> {
     println!(
         "# a plan the forward fills is a number a runner may size storage from; slack is headroom nobody uses."
     );
+    println!(
+        "# Up to {} B of slack is expected: each buffer's bytes are rounded up to the arena's {}-byte alignment, and the last buffer's trailing pad is never read.",
+        nn::forward::ALIGNMENT - 1,
+        nn::forward::ALIGNMENT
+    );
+
+    // The encoder half of the same question, since both plans are this crate's: it reads a padded
+    // track and writes one latent frame's moments per hop.
+    let mut exact = 0usize;
+    for track in [362_u64, 725] {
+        let mut loader = WeightLoader::stated(DType::F32, Some(&extents));
+        let encoder =
+            AudioEncoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
+        let length = minimax_h3::encoding::padded_samples(track, encoder.hop())
+            .map_err(|e| e.to_string())?;
+        // The encoder reads the stereo pair the wire carries, two identical rows for a mono track.
+        let plan = audio_encoder_arena(&config, 2, length).map_err(|error| error.to_string())?;
+        let reserved = arena_reservation(&plan);
+        let arena = Arena::new(ops::DevicePtr::new(0), reserved);
+        let caller = Arena::new(ops::DevicePtr::new(0), 1_u64 << 40);
+        let f = Forward::recording(&arena);
+        let samples = caller
+            .tensor(DType::F32, Shape::new(&[2, 1, length]))
+            .map_err(|error| error.to_string())?;
+        let frames = encoder.frames(length).map_err(|error| error.to_string())?;
+        // The latent is the stereo pair's rows, channel-major: `[batch * frames, latent_channels]`,
+        // which is the form the DiT's audio conditioning reads.
+        let out = caller
+            .tensor(
+                DType::F32,
+                Shape::new(&[2 * frames, u64::from(config.latent_channels)]),
+            )
+            .map_err(|error| error.to_string())?;
+        encoder
+            .encode(&f, samples, out)
+            .map_err(|error| format!("audio encoder track {track}: {error}"))?;
+        let used = arena.used();
+        if used > reserved {
+            return Err(format!(
+                "audio encoder track {track}: the encode took {used} B of a {reserved}-byte plan"
+            ));
+        }
+        exact += usize::from(used == reserved);
+        println!(
+            "audio encoder, {track} samples ({length} padded): {} buffer(s), {reserved} B planned, {used} B taken, {}",
+            plan.len(),
+            match reserved.cmp(&used) {
+                std::cmp::Ordering::Equal => "exact".to_owned(),
+                std::cmp::Ordering::Greater => format!("{} B of slack", reserved - used),
+                std::cmp::Ordering::Less => unreachable!(),
+            }
+        );
+    }
+    println!("# {exact} of the two encodes fills its plan exactly");
     Ok(())
 }
 
