@@ -682,7 +682,13 @@ fn stage_decode(args: &Args) -> Result<()> {
         None => String::new(),
     };
     let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
-    let packed = pack_latents(&latent_bytes, &tiles, &canvas)?;
+    let packed = pack_latents(&latent_bytes, &tiles, &canvas, dtype)?;
+    println!(
+        "latents: {} bytes = {} elements at {dtype}; the rows this stage reads hold {}",
+        latent_bytes.len(),
+        u64::try_from(latent_bytes.len()).unwrap_or(0) / dtype.bytes().unwrap_or(1),
+        packed.len()
+    );
     let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
     let latents = upload(
         &stream,
@@ -1483,17 +1489,31 @@ fn pack_latents(
     bytes: &[u8],
     tiles: &[minimax_h3::video_vae::Tile],
     canvas: &Canvas,
+    dtype: DType,
 ) -> Result<Vec<u8>> {
     let channels = 24_u64;
     let frames = u64::from(canvas.frames);
     let height = u64::from(canvas.height);
     let width = u64::from(canvas.width);
-    let expected = channels * frames * height * width * 2;
+    // The width is **the decode's**, read from its element type and never written down: a `* 2` here
+    // meant "f16" and refused every whole-stored export by a factor of two, which read as a size
+    // disagreement rather than as the assumption it was.
+    let element = dtype.bytes().unwrap_or(0);
+    if element == 0 {
+        return Err(Failure::message(format!(
+            "the decode is {dtype}, which has no whole-byte element size"
+        )));
+    }
+    let elements = channels * frames * height * width;
+    let expected = elements * element;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
         return Err(Failure::message(format!(
-            "the latents hold {} bytes and a {frames}x{height}x{width} clip of {channels} channels \
-             needs {expected}",
-            bytes.len()
+            "the latents hold {} bytes = {} elements at {element} B, and a {frames}x{height}x{width} \
+             clip of {channels} channels at {dtype} needs {expected} bytes = {elements} elements - \
+             the element type is the decode's, so a disagreement here is a file of another type, \
+             not a conversion this stage performs silently",
+            bytes.len(),
+            u64::try_from(bytes.len()).unwrap_or(0) / element,
         )));
     }
     let mut packed = Vec::with_capacity(bytes.len());
@@ -1503,6 +1523,7 @@ fn pack_latents(
             (frames, height, width, channels),
             (tile.latent_rows.0, tile.latent_rows.1),
             (tile.latent_columns.0, tile.latent_columns.1),
+            element,
             &mut packed,
         )?;
     }
@@ -1519,6 +1540,7 @@ fn gather_tile(
     geometry: (u64, u64, u64, u64),
     rows: (u32, u32),
     columns: (u32, u32),
+    element: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (frames, height, width, channels) = geometry;
@@ -1526,7 +1548,11 @@ fn gather_tile(
         .checked_mul(height)
         .and_then(|value| value.checked_mul(width))
         .ok_or_else(|| Failure::message("the latent raster's extent overflows".to_owned()))?;
-    let element = 2_u64;
+    if element == 0 {
+        return Err(Failure::message(
+            "an element of zero bytes cannot be gathered".to_owned(),
+        ));
+    }
     for frame in 0..frames {
         for row in u64::from(rows.0)..u64::from(rows.1) {
             for column in u64::from(columns.0)..u64::from(columns.1) {
@@ -1621,7 +1647,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        match gather_tile(&raster, (1, 1, 3, 3), (0, 1), (0, 3), &mut out) {
+        match gather_tile(&raster, (1, 1, 3, 3), (0, 1), (0, 3), 2, &mut out) {
             Ok(()) => {}
             Err(Failure::Message(message)) => panic!("the gather: {message}"),
         }
@@ -1635,12 +1661,39 @@ mod tests {
         assert_eq!(got, vec![0, 10, 20, 1, 11, 21, 2, 12, 22]);
     }
 
+    /// The gather's element width is the raster's, not a constant: the same geometry at four bytes
+    /// per element reads four-byte elements, which is what a whole-stored export writes. A `* 2` that
+    /// meant "f16" here refused every f32 latent by a factor of two and read as a size disagreement.
+    #[test]
+    fn a_gather_reads_its_elements_at_the_rasters_own_width() {
+        let word = |value: f32| value.to_le_bytes();
+        let mut raster = Vec::new();
+        for channel in 0..2_u32 {
+            for column in 0..2_u32 {
+                raster.extend_from_slice(&word((10 * channel + column) as f32));
+            }
+        }
+        let mut out = Vec::new();
+        match gather_tile(&raster, (1, 1, 2, 2), (0, 1), (0, 2), 4, &mut out) {
+            Ok(()) => {}
+            Err(Failure::Message(message)) => panic!("the gather: {message}"),
+        }
+        let got: Vec<f32> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|element| f32::from_le_bytes(*element))
+            .collect();
+        // Voxel 0 takes one element from each plane, then voxel 1 - at four bytes each.
+        assert_eq!(got, vec![0.0, 10.0, 1.0, 11.0]);
+    }
+
     /// A raster shorter than the tile's spans is refused with the element it ran out at, not read past
     /// the end into another tile's bytes.
     #[test]
     fn a_raster_that_ends_early_is_refused() {
         let mut out = Vec::new();
-        assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), &mut out).is_err());
+        assert!(gather_tile(&[0_u8; 4], (1, 1, 3, 3), (0, 1), (0, 3), 2, &mut out).is_err());
     }
 
     /// The two containers are told apart by rank and by element type, and neither is guessed from a
