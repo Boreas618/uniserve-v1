@@ -2439,6 +2439,10 @@ mod tests {
             text.contains("decode_sampled") && text.contains("row 1"),
             "the refusal names neither the bucket nor the row: {text}"
         );
+        assert!(
+            text.contains("temperature 0"),
+            "the refusal does not name the temperature the row stated: {text}"
+        );
 
         let error = refuse_mixed_sampling(crate::plan::Variant::DecodeGreedy, &rows(&[0.5]))
             .expect_err("a sampled row was argmaxed in a greedy bucket");
@@ -2446,6 +2450,47 @@ mod tests {
             error.to_string().contains("decode_greedy"),
             "the refusal does not name the bucket: {error}"
         );
+    }
+
+    /// The homogeneity check reads the **batch's** rows, and the rows the bucket pads around them
+    /// are not rows of the batch: a padded row's parameters are zero, and zero reads as a greedy
+    /// row, so a check handed the bucket's rows would refuse a perfectly homogeneous sampled batch
+    /// for the rows nobody sent.
+    ///
+    /// This is the same boundary the capture's failure was on, with a boolean instead of a count:
+    /// the figure the check reads is the batch's, the figure the graph is built from is the bucket's.
+    #[test]
+    fn the_rows_a_bucket_pads_are_not_rows_of_the_batch() -> Result<()> {
+        let buckets = Buckets::new([
+            Bucket::decode(2, Variant::DecodeSampled),
+            Bucket::decode(4, Variant::DecodeSampled),
+        ]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        let bucket = Bucket::decode(4, Variant::DecodeSampled);
+        let mut columns = decode_columns();
+        let stated = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..2 {
+            columns.parameters[row * stated + ops::sampler::TEMPERATURE as usize] = 0.7;
+        }
+        let shape = Shape::decode(2, Variant::DecodeSampled);
+        staging.stage(&columns, &[CallId(0), CallId(1)], &shape, bucket)?;
+
+        // The batch's own rows: both sampled, so the bucket takes them.
+        assert!(
+            refuse_mixed_sampling(bucket.variant, staging.parameters(shape.rows as usize)).is_ok(),
+            "a homogeneous sampled batch was refused for rows it did not send"
+        );
+        // The bucket's rows: the two the staging padded state temperature 0, so they read as greedy
+        // rows of a sampling bucket. That is what the capture used to be refused by.
+        let error = refuse_mixed_sampling(bucket.variant, staging.parameters(bucket.rows as usize))
+            .expect_err("a padded row read as a row of the batch");
+        let text = error.to_string();
+        assert!(
+            text.contains("row 2") && text.contains("temperature 0"),
+            "the refusal does not name the first padded row: {text}"
+        );
+        Ok(())
     }
 
     /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
