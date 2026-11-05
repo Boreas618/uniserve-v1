@@ -111,8 +111,8 @@ impl Stated {
     /// # Errors
     ///
     /// Fails, naming the first such option and the served model, when a
-    /// video pipeline states a token-model option, or another model states
-    /// a MiniMax-H3 or DiffusionGemma table.
+    /// video pipeline states a token-model option, or a token model states a
+    /// MiniMax-H3 table.
     pub fn refuse_foreign_options(&self, description: ModelDescription) -> anyhow::Result<()> {
         for (family, paths) in FAMILY_OPTIONS {
             if family.serves(description) {
@@ -778,7 +778,7 @@ pub enum ReasoningParser {
     None,
 }
 
-/// Chat models: Qwen3, SenseNova, BAGEL and DiffusionGemma (`chat_config`).
+/// Chat models: Qwen3 (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatOptions {
