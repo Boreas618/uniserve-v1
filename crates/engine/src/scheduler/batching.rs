@@ -733,7 +733,11 @@ impl Scheduler {
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
         let mut tables = Vec::with_capacity(batch.requests.len());
-        for (call, placed) in &batch.requests {
+        // Mutable, because the resolved table is written back to the placement: the executor
+        // installs the table the batch states, so a batch that stated only the wire's delta left a
+        // decode's row uninstalled and its gather read whatever the slot held before. One value,
+        // one statement - the table this batch addresses.
+        for (call, placed) in &mut batch.requests {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a batch is dropped: {:?} names a request this scheduler is not running",
@@ -764,7 +768,7 @@ impl Scheduler {
             // did not move declares none, and the batch it travels in still
             // needs the table it writes through.
             let declared = placed.block_tables.clone();
-            tables.push(if declared.is_empty() {
+            let resolved = if declared.is_empty() {
                 let Some(pool) = state.request_pool_idx() else {
                     tracing::debug!("a batch is dropped: a request holds no pool row");
                     return;
@@ -785,7 +789,12 @@ impl Scheduler {
                 }
             } else {
                 declared
-            });
+            };
+            // The placement now states the table this batch addresses, so the executor installs it
+            // and the columns address it: a decode that declared nothing no longer travels with an
+            // empty statement while its rows read the request's pages.
+            placed.block_tables = resolved.clone();
+            tables.push(resolved);
         }
         batch.columns = columns::columns(
             &batch.requests,
