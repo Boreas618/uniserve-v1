@@ -4435,10 +4435,13 @@ impl HostAction for Install {
                 .join(", ");
             tracing::warn!(
                 target = %self.target,
-                "the Program Server prepared this generation's programs and this device installed                  no module of any of them"
+                "the Program Server prepared this generation's programs and this device installed no module \
+                 of any of them"
             );
             return Err(executor::Error::Invalid(format!(
-                "the Program Server prepared {} program(s) for target {} and this device installed                  no module of any of them ({asked}): a program given no key was never asked for a                  module, and one given keys built nothing",
+                "the Program Server prepared {} program(s) for target {} and this device installed no module \
+                 of any of them ({asked}): a program given no key was never asked for a module, and \
+                 one given keys built nothing",
                 prepared.programs.len(),
                 self.target
             )));
