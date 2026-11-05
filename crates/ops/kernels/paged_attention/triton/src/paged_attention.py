@@ -79,6 +79,21 @@ def _paged_attention_decode_kernel(
 
     seq_len = tl.load(seq_lens_ptr + row)
     pages = tl.cdiv(seq_len, PAGE)
+    out_offsets = out_ptr + row * o_stride_tokens + head * o_stride_heads + dims * o_stride_dim
+    # A row with no keys is a padded row of a bucket wider than its batch, and it is a **valid
+    # token whose output is discarded** - not a row with no route: the capture runs the router over
+    # every token the bucket holds, so this row's answer is read by the MoE block whether or not
+    # anyone serves it. `0/0` would hand that block a NaN, and a NaN picks an expert from no number
+    # and hands the sort an index nothing can serve, which faults one kernel later. The inert value
+    # is written instead, so the route the padding produces is a route of the right arity.
+    if seq_len == 0:
+        padded = (
+            tl.zeros((HEAD_DIM,), tl.bfloat16)
+            if OUT_BF16
+            else tl.zeros((HEAD_DIM,), tl.float32)
+        )
+        tl.store(out_offsets, padded)
+        return
 
     running_max = tl.full((), float("-inf"), tl.float32)
     running_sum = tl.zeros((), tl.float32)
@@ -127,7 +142,6 @@ def _paged_attention_decode_kernel(
         running_max = new_max
 
     result = accumulator / running_sum
-    out_offsets = out_ptr + row * o_stride_tokens + head * o_stride_heads + dims * o_stride_dim
     if OUT_BF16:
         tl.store(out_offsets, result.to(tl.bfloat16))
     else:
@@ -191,12 +205,23 @@ def _paged_attention_prefill_kernel(
     else:
         first = row * max_q_len
         length = max_q_len
-    # A tile beyond the row's own length is padding: it returns before it reads a page.
+    token = first + position
+    out_offsets = out_ptr + token * o_stride_tokens + head * o_stride_heads + dims * o_stride_dim
+    # A tile past the row's own length is padding, and it is a valid token whose output is
+    # discarded: this bucket's graph runs the router over all of its tokens, so leaving the row
+    # untouched hands it whatever the arena held - stale bytes from the previous replay - and the
+    # route computed from them indexes a table nothing can serve (an illegal address inside the
+    # MoE gather, one kernel later). The inert value is written instead.
     if position >= length:
+        padded = (
+            tl.zeros((HEAD_DIM,), tl.bfloat16)
+            if OUT_BF16
+            else tl.zeros((HEAD_DIM,), tl.float32)
+        )
+        tl.store(out_offsets, padded)
         return
 
     seq_len = tl.load(seq_lens_ptr + row)
-    token = first + position
     query = tl.load(
         query_ptr + token * q_stride_tokens + head * q_stride_heads + dims * q_stride_dim
     ).to(tl.float32)
@@ -250,7 +275,6 @@ def _paged_attention_prefill_kernel(
         running_max = new_max
 
     result = accumulator / running_sum
-    out_offsets = out_ptr + token * o_stride_tokens + head * o_stride_heads + dims * o_stride_dim
     if OUT_BF16:
         tl.store(out_offsets, result.to(tl.bfloat16))
     else:
