@@ -2512,8 +2512,8 @@ pub fn video_encoder_run_arena(
 /// The list matters because the arena never rewinds, so everything accumulates for the length of the
 /// encode. The dominant entries are the first stage's, which run at the *sample* rate: at 207 latent
 /// frames a three-minute track is 165,600 samples, and one `[2, 64, 165600]` f32 buffer is 84.8 MB, so
-/// the encoder's plan is several hundred MB even though its weights are 330 MiB - 86,386,176
-/// parameters at the checkpoint's F32, which is 165 MiB only in a converted deployment.
+/// the encoder's plan is several hundred MB even though its weights are 330 MiB - the deployment
+/// table's 86,386,176 parameters at the checkpoint's F32, 165 MiB only in a converted deployment.
 pub fn audio_encoder_arena(
     config: &crate::AudioVaeConfig,
     batch: u64,

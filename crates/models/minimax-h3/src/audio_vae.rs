@@ -345,8 +345,10 @@ impl Pcm {
 /// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
 /// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
 /// therefore large: at 207 latent frames each buffer of stages one to six is `[2, c, L]` with `c · L` near
-/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against the decoder's 248 MiB of weights - 64,939,353
-/// parameters at the checkpoint's F32, which is 124 MiB only in a converted deployment. The
+/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against the decoder's 248 MiB of weights - the
+/// deployment table's 64,939,353 parameters at the checkpoint's F32, 124 MiB only in a converted
+/// deployment. The parameter count is `deployment_sizes`' reading of the checkpoint's index and is
+/// quoted here rather than re-derived. The
 /// remaining reduction is the shape-family one - `c · L` is within a factor of the patch area across the
 /// stages, so a set sized for the largest and viewed per stage would serve all seven - and it would make
 /// the plan a *bound* rather than a sum of distinct buffers. The stage loop states one shape per stage
