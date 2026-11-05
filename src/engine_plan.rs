@@ -521,6 +521,143 @@ impl EpochPlan {
         })
     }
 
+    /// The runners a media rank serves `device` with: one per block the pipeline holds.
+    ///
+    /// **Three runners, one stream each.** An encoder writes the hidden states a denoise step reads,
+    /// a denoiser reads them and publishes the trajectory, and a decoder reads that trajectory as a
+    /// clip, so each is a separate stream on the one device - a stream per runner is what lets the
+    /// store order the crossings between them.
+    ///
+    /// **The buckets are the deployment's canvases and prompt capacities**, not the checkpoint's: a
+    /// bucket is a captured graph, and a deployment that captures a canvas it does not serve would
+    /// pay a capture for nothing.
+    fn media_runners(
+        &self,
+        device: DeviceId,
+        pipeline: &Arc<minimax_h3::load::MinimaxH3>,
+        generation: &Arc<Generation>,
+    ) -> Result<Vec<NamedRunner>> {
+        use executor::runners::decoder as media_decoder;
+        use executor::runners::denoiser as media_denoiser;
+        use executor::runners::encoder as media_encoder;
+
+        if Some(&device) != self.devices.first() {
+            bail!(
+                "this build maps one model per rank, on device {}; a runner on device {} would \
+                 forward from another device's addresses",
+                self.devices.first().map_or(-1, |first| first.0),
+                device.0
+            );
+        }
+        let longest = self.build.max_model_len.map(|length| length.get()).context(
+            "a deployment of the media class states no `max_model_len`, and its prompt capacities \
+             are checked against it",
+        )?;
+        let capacities = prompt_capacities(&self.build.video, longest)?;
+        let candidates = media_candidates(&self.build.video, &capacities)?;
+
+        // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
+        // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
+        // set here is what the encoder and the decoder are bound with.
+        let mut encode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        let rows = u32::try_from(self.build.max_running_requests.get())
+            .context("more request slots than the protocol addresses")?;
+        for capacity in &capacities {
+            for row in 1..=rows {
+                encode_buckets.push(executor::plan::Bucket::prefill(
+                    row,
+                    *capacity,
+                    Variant::Encode,
+                ));
+            }
+        }
+        let decode_buckets: Vec<executor::plan::Bucket> = candidates
+            .iter()
+            .map(|candidate| {
+                executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
+            })
+            .collect();
+
+        let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+        let hidden = config.text_encoder.hidden_size;
+        let text = pipeline.text_encoder().context(
+            "the checkpoint holds no text encoder, so a media request's prompt could not be \
+             encoded",
+        )?;
+        let denoiser = pipeline
+            .transformer()
+            .context("the checkpoint holds no transformer, so no denoising step could run")?;
+        let decoder = pipeline
+            .video_decoder()
+            .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
+        // The encoder writes its hidden states in the deployment's effective type, which the daemon
+        // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
+        // never reaches a main process as `auto`).
+        let dtype = match self.build.dtype {
+            proto::request::ModelDtype::Float16 => DType::F16,
+            proto::request::ModelDtype::BFloat16 => DType::BF16,
+            proto::request::ModelDtype::Float32 => DType::F32,
+        };
+
+        let stream = |name: &str| -> Result<platform::Stream> {
+            platform::Stream::new(device)
+                .with_context(|| format!("creating device {}'s {name} stream", device.0))
+        };
+        let encode_set = Buckets::new(encode_buckets);
+        let decode_set = Buckets::new(decode_buckets);
+        let encoder = media_encoder::EncoderRunner::new(
+            Binding {
+                id: RunnerId(0),
+                phases: served_phases(&encode_set),
+                device,
+                stream: stream("encoder")?,
+            },
+            Arc::clone(text),
+            encode_set,
+            media_encoder::EncoderShape { hidden, dtype },
+            Arc::clone(generation),
+        )?;
+        let warm = executor::runners::warm::distinct(&**denoiser, &candidates);
+        // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
+        // derived from them rather than named, so a rank that captures no denoise bucket states no
+        // denoise phase.
+        let denoise_set = Buckets::new(warm.iter().map(|candidate| {
+            executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view()))
+        }));
+        let denoise = media_denoiser::DenoiserRunner::new(
+            Binding {
+                id: RunnerId(1),
+                phases: served_phases(&denoise_set),
+                device,
+                stream: stream("denoiser")?,
+            },
+            Arc::clone(denoiser),
+            warm,
+            media_denoiser::DenoiserShape {
+                stack: dtype,
+                sample: minimax_h3::denoiser::SAMPLE_DTYPE,
+                width: hidden,
+            },
+            Arc::clone(generation),
+        )?;
+        let decode = media_decoder::DecoderRunner::new(
+            Binding {
+                id: RunnerId(2),
+                phases: served_phases(&decode_set),
+                device,
+                stream: stream("decoder")?,
+            },
+            Arc::clone(decoder),
+            decode_set,
+            Arc::clone(generation),
+        )?;
+        Ok(vec![
+            NamedRunner::new(RunnerId(0), Box::new(encoder)),
+            NamedRunner::new(RunnerId(1), Box::new(denoise)),
+            NamedRunner::new(RunnerId(2), Box::new(decode)),
+        ])
+    }
+
     /// What a media rank advertises of itself: the facts its scheduler is configured from.
     ///
     /// **A media rank keeps no paged key/value cache**, so the three facts that describe one are
@@ -603,11 +740,10 @@ impl EpochPlan {
         generation: &Arc<Generation>,
     ) -> Result<Vec<NamedRunner>> {
         let Served::Text(model) = served else {
-            bail!(
-                "this rank's class is {:?} and its runners are built for a causal language model \
-                 only",
-                served.class()
-            );
+            let Served::Media(pipeline) = served else {
+                unreachable!("Served has two variants");
+            };
+            return self.media_runners(device, pipeline, generation);
         };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
