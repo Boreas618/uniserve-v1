@@ -368,7 +368,26 @@ def self_test() -> int:
         ).view(numpy.float32).reshape(values.shape)
         checks.append(("a BF16 tensor reads back as its own halves", name == "bf16" and numpy.array_equal(read, rounded)))
 
-        # 2. The reference absent: every block says so, and no number is invented.
+        # 2. The reader against the **other** writer's bytes: the committed fixture is a BF16 H3D1 and
+        #    its `.npy` twin, both written by the reference producer (`dump_tables.dump`), so this
+        #    proves the widening against an implementation this crate does not own - the one thing a
+        #    reader tested only on its own output cannot show.
+        fixture = (
+            pathlib.Path(__file__).resolve().parents[1] / "tests" / "data" / "h3t-bf16" / "stack_out"
+        )
+        if fixture.with_suffix(".h3t").is_file():
+            theirs, fixture_name = read_h3t(fixture.with_suffix(".h3t"))
+            twin = numpy.load(fixture.with_suffix(".npy"))
+            checks.append(
+                (
+                    "a BF16 container written by the reference producer reads as its own .npy twin",
+                    fixture_name == "bf16" and numpy.array_equal(theirs, twin),
+                )
+            )
+        else:
+            checks.append((f"the reference producer's BF16 fixture is committed at {fixture}.h3t", False))
+
+        # 3. The reference absent: every block says so, and no number is invented.
         table = compare(ours, ref)
         checks.append(
             (
