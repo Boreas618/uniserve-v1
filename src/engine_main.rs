@@ -2919,6 +2919,9 @@ impl MainProcess {
                 failure: UpdateFailure::Precopy { reason },
             }));
         }
+        // Before the devices cut over and before admission can open on a batch: the generation a
+        // step stamps its batches with is the one whose graphs the runner has to find.
+        self.record_generation(generation);
         self.switchover_policy(generation, step);
         for executor in &self.executors {
             let device = executor.device();
@@ -3356,6 +3359,10 @@ impl MainProcess {
                 failure,
             });
         }
+        // The batches that form from here serve the generation that served before the update, so the
+        // number they are stamped with is that one: a revert that left the update's number in place
+        // would stamp every batch with a generation whose graphs are about to be released.
+        self.record_generation(self.update.current());
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
@@ -4065,6 +4072,28 @@ impl MainProcess {
     /// §7.3 step 3's policy half: every scheduler's next batch boundary answers from the prepared
     /// policy. `step` is the boundary the epoch's schedulers agreed on, which only the scheduler
     /// node can name; the control thread does not choose one.
+    /// Records on every scheduler the generation whose kernels the next step's batches serve
+    /// (§4.2, §7.3).
+    ///
+    /// A step reads this cell once and stamps every batch it forms with it, and a runner serves a
+    /// batch from the graphs captured for that number. A control thread that cut the devices over
+    /// without recording it left the first batch of the deployment stamped `0`, and the runner
+    /// answered `no graph of bucket ... in generation 0 or in a generation it replaces`: the graphs
+    /// were captured under the generation the daemon named, and no batch ever asked for it.
+    fn record_generation(&self, generation: u64) {
+        for scheduler in &self.schedulers {
+            scheduler.set_generation(generation);
+        }
+        // One line, because the figure a batch carries is invisible until a runner refuses it: a run
+        // whose first batch names a generation this line never stated is a run where something cut a
+        // generation over without recording it.
+        tracing::info!(
+            generation,
+            schedulers = self.schedulers.len(),
+            "the generation this process's batches carry is recorded"
+        );
+    }
+
     fn switchover_policy(&self, generation: u64, _step: Option<u64>) {
         // This states the candidate, not the serving policy: a scheduler adopts at its next batch
         // boundary, which is after this returns, so a "serving" figure here would be a second
