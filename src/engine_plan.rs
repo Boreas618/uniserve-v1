@@ -1643,7 +1643,11 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
             Variant::Encode => engine::PhaseKind::TextEncoding,
             Variant::Denoise => engine::PhaseKind::Denoise,
-            Variant::Decode => engine::PhaseKind::ImageDecode,
+            // The scheduler plans a clip's decode as `VideoDecode` and a track's as `AudioDecode`
+            // (`call_phase`), so a device that advertised `ImageDecode` for either served no phase
+            // the scheduler ever planned - the same defect this function's doc records.
+            Variant::Decode => engine::PhaseKind::VideoDecode,
+            Variant::AudioDecode => engine::PhaseKind::AudioDecode,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
