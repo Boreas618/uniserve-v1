@@ -611,6 +611,16 @@ pub(crate) struct MainProcess {
     retired: Vec<Arc<Generation>>,
     /// The generation each device serves now, in `executors` order.
     generations: Vec<Arc<Generation>>,
+    /// The kernel programs the serving generation was built from, by slot (§7.3 step 2). The shadow
+    /// pass pairs a *changed* operator's kernel with the one serving, so "changed" is a fact about
+    /// programs and never about generation numbers.
+    serving_programs: Programs,
+    /// The programs of the generation `retired` holds: a revert serves that generation again, and
+    /// the changed set of the update after it is measured against the programs it serves under.
+    retired_programs: Programs,
+    /// The programs of the generation `prepared` holds, waiting for the switchover to make them
+    /// serving.
+    prepared_programs: Programs,
     /// What this node resolves a module for (§5.3).
     targets: Vec<Target>,
     /// The Program Server's socket, which a policy's source resolves its module through.
@@ -871,6 +881,9 @@ impl MainProcess {
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
             catalogue: plan.prefill_catalogue(),
+            serving_programs: Programs::new(),
+            retired_programs: Programs::new(),
+            prepared_programs: Programs::new(),
             standby: launch.standby,
             promoted: false,
             parked: None,
@@ -1588,6 +1601,7 @@ impl MainProcess {
         let mut precopy = Precopy {
             generation,
             reply,
+            changed: Vec::new(),
             policy: policy.clone(),
             programs: programs.clone(),
             candidates: Candidates::new(),
@@ -2496,6 +2510,26 @@ impl MainProcess {
                     }
                 }
 
+                // §7.3 step 2's shadow pass pairs a changed operator's kernel with the one serving,
+                // in the buckets a resident request occupies, so it is owed only when an operator's
+                // program changed (§4.5). The set is empty on an epoch's first precopy - nothing
+                // serves, so no kernel has an old one to be paired against - and asking every
+                // scheduler there waits for a step an idle epoch never runs.
+                let changed = changed_operators(&precopy.programs, &self.serving_programs);
+                if changed.is_empty() {
+                    tracing::info!(
+                        generation,
+                        "no operator's program changed, so this precopy asks for no shadow step"
+                    );
+                    return self.finish_precopy(precopy);
+                }
+                tracing::info!(
+                    generation,
+                    changed = changed.len(),
+                    operators = %changed.join(", "),
+                    "the operators this update changed, whose kernels the shadow step pairs"
+                );
+
                 // Shadow execution: every scheduler shadows one step of its own resident requests
                 // against the prepared generation, in the buckets those requests occupy, and
                 // answers once that step ran (§7.3 step 2). The paired kernels compare themselves
@@ -2504,11 +2538,26 @@ impl MainProcess {
                 for scheduler in &self.schedulers {
                     shadow.push(scheduler.shadow(generation));
                 }
+                precopy.changed = changed;
                 precopy.stage = PrecopyStage::Shadow(shadow);
                 self.precopy = Some(precopy);
                 Ok(())
             }
             PrecopyStage::Shadow(answers) => {
+                // A shadow step runs inside a batch the scheduler forms from its resident requests.
+                // An engine with none forms no batch, so the step never runs and nothing is
+                // compared - and a comparison nobody made is how a wrong kernel reaches a
+                // deployment. The update is abandoned with the operators named, rather than
+                // waiting out the daemon's whole bound and then passing without the comparison.
+                if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
+                    let reason =
+                        shadow_stall_message(&precopy.changed, precopy.since.elapsed().as_secs());
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy { reason },
+                        precopy.reply,
+                    );
+                }
                 // The shadow pass runs on the scheduler's own thread, one step of the batches it
                 // formed, so the serve pass polls it rather than waiting (§2.4).
                 match poll_answers(&answers) {
@@ -2527,23 +2576,45 @@ impl MainProcess {
                     None => {}
                 }
 
-                // The generations built here are *prepared*, not serving: `generations` is what each
-                // device serves now, and a precopy that finished is not serving until the switchover
-                // (§7.3 steps 2 and 3). They wait here, so a descriptor lookup still reads the
-                // serving generation and a revert has nothing to undo.
-                self.prepared = std::mem::take(&mut precopy.next);
-                self.update.precopied(generation)?;
-                self.answer(
-                    precopy.reply,
-                    ProgramStatus::Precopied {
-                        generation,
-                        uncompared: self.uncompared(),
-                    },
-                );
-                Ok(())
+                self.finish_precopy(precopy)
             }
             PrecopyStage::Done => Ok(()),
         }
+    }
+
+    /// A precopy that needs no further stage: its generation is built, its policy instantiated and
+    /// its executors rebound or recaptured, so it waits as *prepared* for the switchover.
+    ///
+    /// Reached from the shadow stage and, directly, from a precopy whose changed set is empty - the
+    /// two are the same finished state, and a first generation takes the second because there is no
+    /// old kernel to shadow.
+    fn finish_precopy(&mut self, mut precopy: Precopy) -> Result<()> {
+        let generation = precopy.generation;
+        // The generations built here are *prepared*, not serving: `generations` is what each device
+        // serves now, and a precopy that finished is not serving until the switchover (§7.3 steps 2
+        // and 3). They wait here, so a descriptor lookup still reads the serving generation and a
+        // revert has nothing to undo.
+        self.prepared = std::mem::take(&mut precopy.next);
+        self.prepared_programs = precopy.programs.clone();
+        self.update.precopied(generation)?;
+        let mut uncompared = self.uncompared();
+        if precopy.changed.is_empty() {
+            // "Nothing to compare" and "nobody compared it" are different facts, and only one of
+            // them is safe: a precopy that shadowed nothing says which it was.
+            uncompared.insert(
+                0,
+                "no operator's program changed, so no kernel had an older one to compare with"
+                    .to_owned(),
+            );
+        }
+        self.answer(
+            precopy.reply,
+            ProgramStatus::Precopied {
+                generation,
+                uncompared,
+            },
+        );
+        Ok(())
     }
 
     /// The generations the loaded kernels build, the candidate policy
@@ -2703,6 +2774,12 @@ impl MainProcess {
         // cut over, which is what the phase decides, and it cannot be asked before this line.
         self.update.switchover(generation, Instant::now())?;
         self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+        // The programs move with the generations, as one record: the next precopy's changed set is
+        // measured against what serves, and a revert serves the programs the retired pair holds.
+        self.retired_programs = std::mem::replace(
+            &mut self.serving_programs,
+            std::mem::take(&mut self.prepared_programs),
+        );
 
         // §4.5: the first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
@@ -2778,8 +2855,10 @@ impl MainProcess {
     fn commit(&mut self, generation: u64) -> Result<ProgramStatus> {
         self.update.commit(generation)?;
         // Probation ended in a commit, so the generation before the update can never serve again.
-        // Its graphs and kernels live until the purge, which is the executor's book to keep.
+        // Its graphs and kernels live until the purge, which is the executor's book to keep - and
+        // the programs it was built from go with the record of it, since no revert can serve it.
         self.retired.clear();
+        self.retired_programs.clear();
         self.commit_policy(generation);
         Ok(ProgramStatus::Committed { generation })
     }
@@ -2845,6 +2924,7 @@ impl MainProcess {
             }
         }
         self.prepared.clear();
+        self.prepared_programs.clear();
         Ok(())
     }
 
@@ -3085,8 +3165,10 @@ impl MainProcess {
         let kept = !self.retired.is_empty();
         if kept {
             self.generations = std::mem::take(&mut self.retired);
+            self.serving_programs = std::mem::take(&mut self.retired_programs);
         }
         self.prepared.clear();
+        self.prepared_programs.clear();
         // The warmups still queued warm the generation this revert went back from: what runs when
         // they reach the device is the generation that serves, so nothing hangs - the list is what
         // stopped describing serving, and a failure read from a stale entry would revert an update
@@ -4897,6 +4979,48 @@ impl HostAction for Install {
     }
 }
 
+/// The operators whose program differs between what serves and what a precopy prepared (§7.3).
+///
+/// `changed` is not `new`. An operator the prepared generation holds and the serving one does not
+/// has no old kernel to pair a shadowed step against, so it is not changed; the set is exactly the
+/// intersection where the two programs differ. It is empty when nothing serves yet - there is no old
+/// kernel then either - which is what makes an epoch's first precopy pass without a shadow stage,
+/// and why no rule here needs a generation number.
+fn changed_operators(prepared: &Programs, serving: &Programs) -> Vec<String> {
+    let mut changed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (slot, program) in prepared {
+        match serving.get(slot) {
+            Some(old) if old == program => {}
+            Some(_) => {
+                changed.insert(slot.op.as_str());
+            }
+            // No program served this operator: there is no old kernel to compare against.
+            None => {}
+        }
+    }
+    changed.into_iter().map(str::to_owned).collect()
+}
+
+/// The failure a shadow step that never ran is (§7.3 step 2).
+///
+/// The step runs inside a batch, and an engine with no resident request forms none: the stage waits
+/// for something that cannot happen, so the update is abandoned with the operators named rather than
+/// passing without the comparison it was there to make.
+fn shadow_stall_message(changed: &[String], waited: u64) -> String {
+    let count = changed.len();
+    let operators = changed.join(", ");
+    let noun = if count == 1 {
+        "changed operator"
+    } else {
+        "changed operators"
+    };
+    format!(
+        "the shadow step of {count} {noun} ({operators}) waited {waited}s: no resident request ran \
+         a step, so nothing was compared - the update is abandoned rather than passed without the \
+         comparison it was prepared for"
+    )
+}
+
 /// The argument a policy's step is bounded by: the figure §4.4 checks against this rank's
 /// catalogue of prefill buckets.
 const TOKEN_LIMIT: &str = "max_num_batched_tokens";
@@ -4960,6 +5084,10 @@ struct Precopy {
     generation: u64,
     /// The peer whose command this precopy answers, when a peer asked.
     reply: Option<u32>,
+    /// The operators whose program this precopy changed, in sorted order: the set the shadow pass
+    /// pairs, and the set a stall names. Empty when nothing changed - a first generation, or an
+    /// update that touched no kernel.
+    changed: Vec<String>,
     /// The policy program the update installs.
     policy: Program,
     /// The kernel programs the update installs, by slot: kept so the discovery loop can admit the
@@ -5479,6 +5607,82 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// An epoch's first precopy has no serving generation, so no operator has an old kernel to pair
+    /// a shadowed step against: the changed set is empty and the precopy finishes without asking
+    /// for a step an idle epoch never runs.
+    #[test]
+    fn a_first_generation_changes_no_operator_and_asks_for_no_shadow() {
+        let mut prepared = Programs::new();
+        prepared.insert(
+            program_server::program::ProgramSlot {
+                op: "paged_attention".to_owned(),
+                phase: None,
+            },
+            Program {
+                backend: "fa4".to_owned(),
+                revision: 3,
+                arguments: Default::default(),
+            },
+        );
+
+        assert!(
+            changed_operators(&prepared, &Programs::new()).is_empty(),
+            "a first generation reported a changed operator, which would wait for a shadow step \
+             that cannot run"
+        );
+    }
+
+    /// `changed` is the intersection where the two programs differ, and not `new`: an operator the
+    /// prepared generation adds has no old kernel either, so it is not changed.
+    #[test]
+    fn only_an_operator_whose_program_differs_is_changed() {
+        let slot = |op: &str| program_server::program::ProgramSlot {
+            op: op.to_owned(),
+            phase: None,
+        };
+        let program = |backend: &str, revision: u32| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+        let mut serving = Programs::new();
+        serving.insert(slot("gemm"), program("cublas", 1));
+        serving.insert(slot("softmax"), program("reference", 2));
+
+        let mut prepared = serving.clone();
+        prepared.insert(slot("gemm"), program("cublas", 2));
+        prepared.insert(slot("rms_norm"), program("reference", 1));
+
+        assert_eq!(changed_operators(&prepared, &serving), vec!["gemm"]);
+    }
+
+    /// A shadow step runs inside a batch a resident request formed; an engine with none forms no
+    /// batch, so the stage fails by name rather than waiting out the daemon's bound and passing
+    /// without the comparison.
+    #[test]
+    fn a_shadow_step_no_request_can_run_fails_naming_the_operators() {
+        let changed = vec!["gemm".to_owned(), "paged_attention".to_owned()];
+
+        let message = shadow_stall_message(&changed, 300);
+
+        assert!(
+            message.contains("2 changed operators (gemm, paged_attention)"),
+            "the operators are not named: {message}"
+        );
+        assert!(
+            message.contains("no resident request ran a step, so nothing was compared"),
+            "the cause is not named: {message}"
+        );
+        assert!(
+            message.contains("abandoned rather than passed"),
+            "the decision is not named: {message}"
+        );
+        assert!(
+            shadow_stall_message(&["gemm".to_owned()], 5).contains("1 changed operator (gemm)"),
+            "one operator does not read as one"
+        );
+    }
+
     /// The refusal a deployment reader acts on names both figures, where each came from, and the
     /// two changes that would satisfy it - and keeps the mechanism's own words in front of them.
     #[test]
