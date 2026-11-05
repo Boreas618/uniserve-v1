@@ -44,6 +44,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
+use minimax_h3::AttentionKind;
+use minimax_h3::video_vae::{Canvas, VideoDecoder};
+use nn::layers::{Linear, WeightOrder};
+use nn::weights::WeightRequest;
 use nn::forward::Arena;
 use nn::tensor::DevicePtr;
 use nn::weights::WeightLoader;
@@ -144,9 +148,11 @@ fn run() -> Result<(), String> {
         "all" => vec![
             ("audio-encoder", audio_encoder as Harness),
             ("video-encoder", video_encoder as Harness),
+            ("video-decoder", video_decoder as Harness),
         ],
         "audio-encoder" => vec![("audio-encoder", audio_encoder as Harness)],
         "video-encoder" => vec![("video-encoder", video_encoder as Harness)],
+        "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
         other => return Err(format!("unknown component {other}")),
     };
 
@@ -321,6 +327,81 @@ fn video_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
     let run = encoder.encode(&forward, pixels, moments);
+    ops::capture::set_sink(None);
+    run.map_err(|error| error.to_string())?;
+    Ok(recorded.0)
+}
+
+/// The video decoder's own forward, at one clipped latent raster.
+///
+/// The decoder takes its input projection as an operand rather than loading it — the model's patch
+/// projection is a layer the runner owns — so the harness states one here: a shapes-only weight, whose
+/// extents are the loader's to name and never a byte of a checkpoint.
+fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = video_config(&request.root)?;
+    let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
+    let (height, width) = request.raster;
+    // The latent raster of one decode call is the clip's own: the latent frames a clip decodes, and the
+    // pixel raster over the VAE's spatial compression.
+    let ratio = config.spatial_compression();
+    let latent_height = height / ratio;
+    let latent_width = width / ratio;
+    let canvas = Canvas::clip(&config, latent_height, latent_width);
+    let model_width =
+        config.decoder_num_attention_heads * config.decoder_attention_head_dim;
+
+    let projection = loader
+        .load(&WeightRequest::region(
+            "virtual.proj_in.weight",
+            0,
+            Shape::new(&[
+                u64::from(model_width),
+                u64::from(config.latent_channels),
+            ]),
+        ))
+        .map_err(|error| error.to_string())?;
+    let input = Linear::new(projection, None, WeightOrder::NxK).map_err(|error| error.to_string())?;
+    let decoder = VideoDecoder::load(
+        &config,
+        canvas,
+        AttentionKind::Dense,
+        DType::F32,
+        input,
+        &mut loader,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+    let scratch = decoder.scratch(&forward).map_err(|error| error.to_string())?;
+    let latents = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
+        )
+        .map_err(|error| error.to_string())?;
+    let positions = arena
+        .tensor(
+            DType::I32,
+            Shape::new(&[3, canvas.rows()]),
+        )
+        .map_err(|error| error.to_string())?;
+    // The decoder writes one row per token, and a row is the pixels and frames its final projection
+    // produces: three channels over the temporal and both spatial upsamples, not the model's width.
+    let out_channels = u64::from(config.out_channels)
+        * u64::from(config.temporal_compression())
+        * u64::from(config.spatial_compression())
+        * u64::from(config.spatial_compression());
+    let out = arena
+        .tensor(
+            DType::F32,
+            Shape::new(&[canvas.rows(), out_channels]),
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = decoder.decode(&forward, latents, positions, out, &scratch);
     ops::capture::set_sink(None);
     run.map_err(|error| error.to_string())?;
     Ok(recorded.0)
