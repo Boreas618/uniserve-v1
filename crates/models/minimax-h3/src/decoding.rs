@@ -931,10 +931,6 @@ mod tests {
         let plan = video_arena(&config, &canvas, nn::DType::F32).expect("the plan");
         let raw: u64 = plan.iter().map(Buffer::bytes).sum();
         let reserved = arena_reservation(&plan);
-        let padded: u64 = plan
-            .iter()
-            .filter(|buffer| buffer.bytes() % nn::forward::ALIGNMENT != 0)
-            .count() as u64;
         assert_eq!(
             reserved,
             plan.iter()
@@ -943,15 +939,45 @@ mod tests {
             "the reservation is each buffer at the arena's alignment"
         );
         assert!(reserved >= raw, "an aligned sum is never smaller");
+        // **The difference is padding, buffer by buffer, and not a multiple of anything.** An earlier
+        // version of this test asserted `(reserved - raw) % 256 == 0`, which is false whenever the
+        // buffers' raw sum is not itself a multiple of the alignment - the paddings sum to whatever
+        // they sum to. What is true is that each buffer pads by less than one alignment, and that the
+        // total difference is those paddings.
+        let padding: u64 = plan
+            .iter()
+            .map(|buffer| buffer.reservation() - buffer.bytes())
+            .sum();
         assert_eq!(
-            (reserved - raw) % 256,
-            0,
-            "every byte of the difference is padding, {padded} buffer(s) of it"
+            reserved - raw,
+            padding,
+            "the difference is the buffers' padding"
         );
-        assert!(
-            reserved > raw,
-            "this canvas pads: the rotary tables' element counts are not multiples of the alignment"
-        );
+        for buffer in &plan {
+            assert!(
+                buffer.reservation() - buffer.bytes() < nn::forward::ALIGNMENT,
+                "{}: {} pads by no more than one alignment",
+                buffer.name,
+                buffer.bytes()
+            );
+        }
+        // And the function's own rule, on a size no canvas has to supply: a buffer whose element
+        // count is not a multiple of the alignment is rounded up, not down, and one that is a
+        // multiple is left alone. The device run that found this was 64 bytes short because two
+        // 172,512-byte tables were placed at their raw size.
+        let uneven = Buffer {
+            name: "a table".to_owned(),
+            element: "f32",
+            elements: 172_512 / 4,
+        };
+        assert_eq!(uneven.bytes(), 172_512);
+        assert_eq!(uneven.reservation(), 172_544, "rounded up to the next 256");
+        let even = Buffer {
+            name: "an aligned tensor".to_owned(),
+            element: "f32",
+            elements: 65_536 / 4,
+        };
+        assert_eq!(even.reservation(), even.bytes(), "a multiple is not moved");
     }
 
     #[test]
