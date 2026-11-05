@@ -301,6 +301,21 @@ fn missing_product(
     Ok(None)
 }
 
+/// One row of the batch a replay serves.
+///
+/// The request and its row are what the store is seeded and published by; the seed is what the
+/// first step's draw is addressed by, and it is kept here because the draw is issued by the
+/// replay rather than by the `submit` that read it.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    /// The request this row belongs to.
+    request: ipc::RequestKey,
+    /// The row of the bucket's columns the request occupies.
+    index: u32,
+    /// The request's noise seed: the draw is addressed by it and the element's index.
+    seed: nn::capability::Seed,
+}
+
 /// One bucket and the request it was derived from.
 #[derive(Clone, Debug)]
 pub struct BucketPlan {
@@ -335,12 +350,12 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     diag: Diag,
     /// The step of the schedule the staged batch is, which names the diagnosis dumps.
     staged_step: Option<u32>,
-    /// The rows of the batch being served, as `(request, row)`: what a replay seeds from the store
-    /// and what it publishes its trajectory back to.
+    /// The rows of the batch being served: what a replay seeds from the store, what it publishes
+    /// its trajectory back to, and the seed its first step's draw is addressed by.
     ///
     /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
     /// a second `submit` before a replay would be a second batch, which the executor does not do.
-    pending: Vec<(ipc::RequestKey, u32)>,
+    pending: Vec<Pending>,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -627,14 +642,15 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
         })?);
         let bytes = rows * width * element;
-        for (request, index) in &self.pending {
+        for row in &self.pending {
+            let (request, index) = (row.request, row.index);
             for (kind, column) in [
                 (Product::Text, &self.columns.text),
                 (Product::Source, &self.columns.source),
             ] {
-                let Some(view) = products.borrow(*request, kind, self.device, self.stream_id())?
+                let Some(view) = products.borrow(request, kind, self.device, self.stream_id())?
                 else {
-                    return Err(products::absent(*request, kind));
+                    return Err(products::absent(request, kind));
                 };
                 let available = view.byte_len()?;
                 if available < bytes {
@@ -653,7 +669,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 // the graph that reads it is ordered after it.
                 unsafe {
                     platform::memcpy_async(
-                        column.host.address() + u64::from(*index) * bytes,
+                        column.host.address() + u64::from(index) * bytes,
                         view.ptr.address(),
                         usize::try_from(bytes)
                             .map_err(|_| Error::Invalid("a row is larger than memory".into()))?,
@@ -661,6 +677,50 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Issues each pending row's first step: the model's own draw and fold, on the replay's arena
+    /// and stream, before the captured graph launches.
+    ///
+    /// A trajectory's value at step zero is not a step: it is `Denoiser::draw_noise` (Philox
+    /// addressed by the request's seed and the element's index, section 9) followed by
+    /// `Denoiser::prepare_latents` (the schedule's start over that draw), and both take a
+    /// `Forward` because their operators reserve scratch in an arena.
+    ///
+    /// The replay's arena is the one its captured graph addresses: `Pool::base` is the stream's
+    /// range and `Pool::begin` answers only whether a bucket is planning or replaying, so the same
+    /// range serves a replay. That is what makes the draw affordable here - its reservations are
+    /// the walk's own, and the graph's nodes address their recorded offsets above a column the draw
+    /// writes rather than above scratch it overwrites. A later step needs none of this: its
+    /// trajectory is the column the previous replay advanced in place, which is why only step zero
+    /// draws.
+    fn first_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        if self.staged_step != Some(0) || self.pending.is_empty() {
+            return Ok(());
+        }
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        self.fill(bucket)?;
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved();
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let layout = layout_of(bucket)?;
+        let tables = self.model.state_tables(&layout);
+        let key = Self::key(bucket);
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        // A denoising step reads no condition media: the media reader's views belong to a
+        // conditioner's forward, and this is a denoiser's first step.
+        let media: [nn::capability::MediaInput; 0] = [];
+        for row in &self.pending {
+            let latents = self.latents(bucket, row.index)?;
+            let cond = self.conditioning(bucket, row.index, &state, &media)?;
+            self.model.draw_noise(&forward, row.seed, layout, latents)?;
+            self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
     }
@@ -674,10 +734,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let Some(products) = self.products.as_ref() else {
             return Ok(());
         };
-        for (request, index) in &self.pending {
-            let latents = self.latents(bucket, *index)?;
+        for row in &self.pending {
+            let request = row.request;
+            let latents = self.latents(bucket, row.index)?;
             products.publish(
-                *request,
+                request,
                 Product::VideoLatents,
                 self.device,
                 self.stream_id(),
@@ -685,7 +746,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             )?;
             if let Some(audio) = latents.audio {
                 products.publish(
-                    *request,
+                    request,
                     Product::AudioLatents,
                     self.device,
                     self.stream_id(),
@@ -928,21 +989,14 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             // encoder's rows, the trajectory an earlier step advanced - so it is asked for by name
             // and never derived here.
             self.require_products(stated_request.request)?;
-            // A request's first step has no trajectory yet: it must be drawn and folded from the
-            // request's own conditioning by `Denoiser::draw_noise` and `prepare_latents`, and both
-            // take a `Forward`, whose arena a replay may not begin over the reservation its captured
-            // graph already addresses. Until that is ruled, step zero is refused here rather than
-            // served on whatever the warm capture left in the column.
-            if stated_request.step == 0 {
-                return Err(Error::Invalid(format!(
-                    "a denoise step of bucket {bucket} names request {} at row {index}, its first \
-                     step: the trajectory's first values come from the model's own draw and fold, \
-                     which a replay cannot issue (a forward needs an arena, and a captured graph \
-                     already addresses the reservation's)",
-                    stated_request.request.request_id.0
-                )));
-            }
-            self.pending.push((stated_request.request, index));
+            // A request's first step has no trajectory yet: its values are the model's own draw
+            // and fold, which the replay issues before its graph launches (`first_step`). The seed
+            // travels with the row, because the draw is addressed by it and by the element's index.
+            self.pending.push(Pending {
+                request: stated_request.request,
+                index,
+                seed: nn::capability::Seed(stated_request.seed),
+            });
             // Every row of one batch is the same step of the same schedule: a batch is one step
             // (`Variant::Denoise`), so a row that names another step describes another batch.
             let stated = steps
@@ -1051,6 +1105,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 // The conditioning is the store's, and it overwrites the rows the upload just wrote:
                 // that order is why one upload covers every column.
                 self.seed(*bucket)?;
+                // The first step's trajectory is drawn and folded here, on the arena the graph
+                // below addresses, so the graph advances a trajectory rather than a warm capture's
+                // zeros (4.5, section 9).
+                self.first_step(*bucket, *generation)?;
                 let (served, captured) = self
                     .lifecycle
                     .graphs
