@@ -166,7 +166,14 @@ impl Layout {
         let contract = Contract::read(root)?;
         let packed = root.join("modelopt_manifest.json").is_file();
         if let Some(contract) = contract {
-            let dits = vec![(contract.dit, tasks_of(contract.dit))];
+            // **An export serves the task it was distilled for, and the contract is where that is
+            // stated.** The student replaces the base partition's weights, so the DiT's own task set
+            // (`tasks_of`) is the *architecture's* answer and not the export's: a `t2av` student that
+            // claimed `fl2va` as well would be sized for a conditioned task no distillation trained
+            // for, and a deployment would refuse every request wanting one partition per task. The
+            // contract's own doc says it: "the task the student was distilled for, and so the tasks
+            // it serves".
+            let dits = vec![(contract.dit, vec![contract.task])];
             return Ok(Self {
                 dits,
                 contract: Some(contract),
@@ -757,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dmd_export_states_its_rungs_and_serves_its_partitions_tasks() {
+    fn a_dmd_export_states_its_rungs_and_serves_the_task_it_was_distilled_for() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
             root.path(),
@@ -775,13 +782,9 @@ mod tests {
         let layout = Layout::detect(root.path()).expect("an export is recognized");
         assert_eq!(
             layout.dits,
-            vec![(
-                Dit::Base,
-                vec![
-                    VideoTask::TextToVideoAudio,
-                    VideoTask::FirstLastToVideoAudio
-                ]
-            )]
+            vec![(Dit::Base, vec![VideoTask::TextToVideoAudio])],
+            "a t2av student serves the task its contract states, not every task its partition \
+             architecture can express"
         );
         let contract = layout.contract.expect("the export states a contract");
         assert_eq!(contract.task, VideoTask::TextToVideoAudio);
