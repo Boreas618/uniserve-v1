@@ -6,8 +6,15 @@
 //! cargo run -p minimax-h3 --example minimax_h3_keys
 //! ```
 //!
-//! The output is `notes/programs/minimax-h3-keys.txt`: what a kernel program must package for
-//! `crates/models/minimax-h3`, so no package has to guess a variant.
+//! The output is `notes/programs/minimax-h3-deployment-keys.txt`: **the store's list** - every row
+//! every component this build loads states, over both element types - so no package has to guess a
+//! variant.
+//!
+//! It is not the fixture. `notes/programs/minimax-h3-keys.txt` is **one deployment's** rows, copied
+//! from that deployment's walk (`examples/programs.rs` then `examples/h3_fixture.rs`), and it is a
+//! subset in the sense that matters: a store built from this file serves a deployment, and a fixture
+//! is what a walk bound. Two lists, two questions - `notes/h3/fixture-delta.md` is the two-way check
+//! between them, and the difference between them is the finding rather than the error.
 //!
 //! ## Regenerating the list, and its second opinion
 //!
@@ -15,9 +22,9 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-deployment-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-//!     --against notes/programs/minimax-h3-keys.txt
+//!     --against notes/programs/minimax-h3-deployment-keys.txt
 //! ```
 //!
 //! The second command is a host-side set difference in one direction only: it asks whether every key
