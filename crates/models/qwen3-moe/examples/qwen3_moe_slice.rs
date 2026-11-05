@@ -1512,6 +1512,24 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    // The row's own reading, before any argmax: an id chosen from a row that is not all finite says
+    // nothing about the operator that wrote it, so the count and the finite range are printed first.
+    let mut nonfinite = 0_usize;
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for value in &values {
+        if value.is_finite() {
+            low = low.min(*value);
+            high = high.max(*value);
+        } else {
+            nonfinite += 1;
+        }
+    }
+    println!(
+        "the logits row: {} of {} not finite, finite range {low:.4} .. {high:.4}",
+        nonfinite,
+        values.len()
+    );
     print_kv_digests(
         &stream,
         &planes,
@@ -2690,6 +2708,33 @@ fn report_stage(
         width,
     } = stage;
     dump_stage(args, stage, values)?;
+    // The first question a wrong number asks is whether it is a number at all. A stage whose values
+    // are not all finite names the operator that produced them, and every later reading is a
+    // consequence of that one, so the walk stops here and says which stage it was.
+    let mut nonfinite = 0_usize;
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for value in values {
+        if value.is_finite() {
+            let value = f64::from(*value);
+            low = low.min(value);
+            high = high.max(value);
+        } else {
+            nonfinite += 1;
+        }
+    }
+    println!(
+        "  {label}: {} of {} not finite ({low:.4} .. {high:.4})",
+        nonfinite,
+        values.len()
+    );
+    if nonfinite > 0 {
+        return Err(Failure::message(format!(
+            "{label} is the first stage whose values are not all finite: {nonfinite} of {} are \
+             NaN or infinite, and the operator that wrote this stage is the one to read",
+            values.len()
+        )));
+    }
     let Some(dir) = args.reference.as_deref() else {
         return Ok(None);
     };
