@@ -99,7 +99,15 @@ command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--ser
 # -------------------------------------------------------------------- t2va cells
 # W1's seed-0 row: the official t2va prompt at 16:9, 5 seconds.
 
-# The base-reference cell runs FIRST in `points`, and that is the one ordering
+# The base-reference cell runs FIRST in `points` **for the baseline**. Today's
+# implementation keys `base-transformer` and `base-reference` under one load
+# identity (one checkpoint, one `--set` set), and a weight the loader computes
+# has no file, so two deployments computing different numbers under one label
+# got one key. The candidate inherits no such ordering: it must pass these six
+# cells in any order on retained weights, and its procedure carries a
+# reversed-order run with the reference cell last.
+#
+# That ordering is one ordering
 # this check set depends on. Its warmup fails with
 # `invalid_video_output: nonzero_video_variance` — a constant frame and silence,
 # no MP4 — when it runs after the other five cells on a host whose Storage
