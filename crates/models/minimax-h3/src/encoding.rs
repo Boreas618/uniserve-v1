@@ -713,8 +713,8 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
+    Activation, AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad,
+    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1250,6 +1250,138 @@ struct LevelSet {
 }
 
 impl VideoEncoder {
+
+    /// The programs the video encoder launches, from the configuration alone and one list of rasters.
+    ///
+    /// **The raster is load-bearing here, unlike everywhere else in this model**: three of the
+    /// encoder's operators key on classes derived from a frame's extent — the statistics' reduction
+    /// (`channels/groups · pixels`, padded to a power of two), the fused normalize-pad's same class
+    /// with its layout and affine flags, and each block's residual add over its level's whole extent.
+    /// So a walk states a raster and gets the rows that raster launches.
+    ///
+    /// Every convolution runs FP32 with TF32 allowed, the design's declared row for this VAE, so there
+    /// is no dtype argument.
+    pub fn programs(
+        config: &crate::VideoVaeConfig,
+        rasters: &[(u32, u32)],
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::conv::Conv3d as Conv3dOp;
+        use ops::frame::{
+            FrameMoments as FrameMomentsOp, FrameNormPad as FrameNormPadOp, FramePad as FramePadOp,
+        };
+        use ops::posterior::Posterior as PosteriorOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+
+        let stack = Stack::of(config)?;
+        let groups = u64::from(config.norm_num_groups);
+        let epsilon = config.norm_eps;
+        let dtype = DType::F32;
+        let mut programs = Programs::default();
+
+        // Every convolution of the network — the input, each block's two, each level's downsampler, the
+        // output and the two of the posterior head — takes the same key: element types and a bias.
+        programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            crate::audio_vae::geometry(3, 1, 1)?,
+            true,
+        ));
+        // The head's sample: the moments and the noise, one operator.
+        programs.launch::<PosteriorOp>(&Posterior::new().descriptor());
+
+        let reflect = matches!(
+            config.spatial_padding_mode,
+            crate::config::SpatialPadding::Reflect
+        );
+        // A pad's block split is its output's column count, so each extent's pad is its own row.
+        let pad = |programs: &mut Programs, columns: u64| {
+            let (block_pixels, block_channels) =
+                ops::frame::FramePadDescriptor::tiles_of(true, true, columns);
+            programs.launch::<FramePadOp>(&FramePad::descriptor_of(
+                dtype,
+                reflect,
+                block_pixels,
+                block_channels,
+            ));
+        };
+
+        for (height, width) in rasters {
+            // The encoder reads one still or one clip, and the clip's length is the configuration's.
+            for frames in [1, stack.clip.frames] {
+            let extents = stack.extents(Extent {
+                frames,
+                height: *height,
+                width: *width,
+            });
+            // The input convolution reads padded pixels and normalizes nothing of its own.
+            pad(&mut programs, u64::from(*width) + 2);
+            // Each level's blocks run at the level's incoming extent and its incoming width.
+            for (index, out) in stack.widths.iter().enumerate() {
+                let extent = extents[index];
+                let channels = if index == 0 {
+                    stack.input_channels
+                } else {
+                    stack.widths[index - 1]
+                };
+                let pixels = u64::from(extent.height) * u64::from(extent.width);
+                let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
+                // The level's downsampler reads a padded frame of its own.
+                pad(&mut programs, u64::from(extent.width) + 2);
+                // Each block takes the statistics of its input and then the fused normalize-pad of the
+                // same frame; the classes follow from the frame and are deduplicated by `finish`.
+                for _ in 0..stack.blocks {
+                    programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                        dtype,
+                        u64::from(channels),
+                        pixels,
+                        groups,
+                        epsilon,
+                    ));
+                    programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                        dtype,
+                        u64::from(channels),
+                        pixels,
+                        groups,
+                        false,
+                        true,
+                        padded,
+                    ));
+                    // The block's residual add covers the whole level: `frames · extent · channels`.
+                    let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                    if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                        programs.launch::<ScaledAddOp>(&descriptor);
+                    }
+                }
+            }
+            // The output normalization convolves the last level's extent at the last width.
+            let last = extents[stack.widths.len()];
+            let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
+            let pixels = u64::from(last.height) * u64::from(last.width);
+            programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                dtype,
+                u64::from(channels),
+                pixels,
+                groups,
+                epsilon,
+            ));
+            programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                dtype,
+                u64::from(channels),
+                pixels,
+                groups,
+                false,
+                true,
+                (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
+            ));
+            }
+        }
+
+        Ok(programs.finish())
+    }
+
     /// Encode one raster into the posterior moments of its latent.
     ///
     /// One tile, with its buffers reserved for the call: a driver of several tiles reserves once with
@@ -1636,6 +1768,125 @@ impl AudioEncoder {
     /// "all absent" - a refusal naming the block, not a read error from inside a layer.
     pub fn keys(config: &crate::AudioVaeConfig) -> Result<Vec<String>> {
         Ok(crate::audio_vae::tensor_keys(&audio_sources(config)?))
+    }
+
+    /// The programs the audio encoder launches, from the configuration and the deployment's longest
+    /// track.
+    ///
+    /// **FP32 throughout and no dtype argument**: the encoder's convolutions, its Snake activations and
+    /// its whole attention are the design's declared FP32 rows, not the checkpoint's representation.
+    /// `samples` states the residual units' reach: each unit's output is one operator, so its width is
+    /// `inner · samples` and a longer track is a different program.
+    pub fn programs(
+        config: &crate::AudioVaeConfig,
+        samples: &[u32],
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::conv::Conv1d as Conv1dOp;
+        use ops::gemm::Gemm;
+        use ops::norm::LayerNorm as LayerNormOp;
+        use ops::adaptive_pool::AdaptivePool as PoolOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+        use ops::snake::Snake as SnakeOp;
+        use ops::transpose::Transpose as TransposeOp;
+
+        let dtype = DType::F32;
+        // The widths the encoder runs at: `encoder_dim`, doubled per stage, and the final width that
+        // the tail Snake and the output convolution read.
+        let mut widths = Vec::new();
+        let mut width = config.encoder_dim;
+        for _ in &config.encoder_rates {
+            widths.push(width);
+            width = width
+                .checked_mul(2)
+                .ok_or_else(|| Error::config("the encoder's widths overflow".to_owned()))?;
+        }
+        widths.push(width);
+        widths.sort_unstable();
+        widths.dedup();
+        let channels = config.latent_channels;
+        let mut programs = Programs::default();
+
+        // Every convolution of the encoder: the input, each unit's two, each stage's widening one and
+        // the output. The window, the stride, the dilation and the bias travel with the call.
+        programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            crate::audio_vae::geometry(7, 1, 3)?,
+            false,
+        ));
+        // One Snake per channel width it runs at.
+        for channels in &widths {
+            programs.launch::<SnakeOp>(&Snake::descriptor_of(dtype, u64::from(*channels)));
+        }
+
+        // The projection: three layer normalizations, four dense products, the attention, the pool and
+        // the transpose that hands the latent features to the moments convolution.
+        for columns in [width, channels] {
+            programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, columns, true));
+        }
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            channels,
+            dtype,
+            WeightOrder::NxK,
+            true,
+            dtype,
+            dtype,
+        ));
+        let head_dim = (width / config.num_attention_heads.max(1)).max(1);
+        let attention = Attention::dense(
+            head_dim,
+            config.num_attention_heads,
+            config.num_attention_heads,
+            LONGEST_TRACK,
+            false,
+            None,
+            1.0 / (head_dim as f32).sqrt(),
+        )?;
+        // The audio encoder's attention is the **unpacked** FP32 form: one track, no offsets table
+        // (`encoding.rs`'s launch passes none). The `f32` package serves exactly that key; the flash
+        // backend serves the packed form only, and no package serves f16 unpacked — which is why this
+        // row names `cu_seq_lens_false` and must.
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, LONGEST_TRACK, false,
+        ));
+        programs.launch::<PoolOp>(
+            &AdaptivePool::new(
+                u64::from(config.num_attention_heads),
+                u64::from(width / config.num_attention_heads.max(1)),
+                u64::from(channels),
+            )?
+            .descriptor(dtype),
+        );
+        programs.launch::<TransposeOp>(&Transpose::new(dtype)?.descriptor());
+
+        // The GeGLU's gated product: the reference's normalized tanh-GELU gate.
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(2 * channels),
+            Activation::GeluTanh,
+            u64::from(2 * channels),
+            u64::from(2 * channels),
+            u64::from(2 * channels),
+            false,
+        )?);
+
+        // Each residual unit's output is one addition over the whole unit, so its width is the inner
+        // channel count times the track's samples.
+        for samples in samples {
+            for inner in &widths {
+                let columns = u64::from(*inner) * u64::from(*samples);
+                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                    programs.launch::<ScaledAddOp>(&descriptor);
+                }
+            }
+        }
+
+        Ok(programs.finish())
     }
 
     /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
@@ -2393,6 +2644,127 @@ mod tests {
         );
     }
 
+
+    /// The video encoder states its programs from its configuration and the rasters it serves: one
+    /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
+    /// frame, the posterior head's sample, and one residual per block at its level's own extent.
+    ///
+    /// **The raster reaches these rows through the residual and not through the frame operators**: a
+    /// frame's reduction class is a declared bound in the descriptor and not part of the key, which is
+    /// what lets one program serve every raster a deployment serves.
+    #[test]
+    fn the_video_encoder_states_its_programs_from_its_config_and_raster() {
+        let config = crate::video_vae::tests::video_config();
+        let raster = [(480, 832)];
+        let programs = VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("conv3d"), 1, "one program whatever the window or stride");
+        assert_eq!(count("posterior"), 1);
+        assert_eq!(
+            count("frame_moments"),
+            1,
+            "the reduction is a bound, not a key: {programs:?}"
+        );
+        assert_eq!(count("frame_norm_pad"), 1);
+        assert!(
+            count("frame_pad") > 1,
+            "each extent's pad splits its blocks by its own column count: {programs:?}"
+        );
+        assert!(
+            count("scaled_add") > 1,
+            "each level's residual is its own width: {programs:?}"
+        );
+        for (operator, key) in &programs {
+            assert!(
+                key.contains("f32") || operator == "posterior" || operator == "scaled_add",
+                "{operator} {key} is not FP32"
+            );
+        }
+
+        // A different raster is different residual programs and different pad classes — the pad's block
+        // split is its output's column count — while the statistics, the normalize-pad and the network's
+        // convolutions keep one row each.
+        let other = VideoEncoder::programs(&config, &[(480, 448)]).expect("a narrower raster");
+        assert_ne!(other, programs);
+        let fixed = |rows: &[(String, String)]| {
+            rows.iter()
+                .filter(|(name, _)| name != "scaled_add" && name != "frame_pad")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fixed(&other),
+            fixed(&programs),
+            "a raster changes the residuals' extent and the pads' columns, not the frame statistics"
+        );
+    }
+
+    /// The audio encoder states its programs from its own configuration: one convolution, one Snake per
+    /// channel width it runs at, the projection's two normalizations and its pool, the FP32 attention,
+    /// the GeGLU, and the residual of each unit at its own width times the track's samples.
+    #[test]
+    fn the_audio_encoder_states_its_programs_from_its_config() {
+        let config = crate::audio_vae::tests::audio_config();
+        let programs =
+            AudioEncoder::programs(&config, &[44_100]).expect("the audio encoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("conv1d"), 1, "one program whatever the window or stride");
+        assert_eq!(count("adaptive_pool"), 1);
+        assert_eq!(count("transpose"), 1);
+        assert_eq!(count("act_and_mul"), 1);
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("dense_attention"), 1);
+        assert_eq!(count("layer_norm"), 2);
+
+        // One Snake per channel width: `encoder_dim` doubled per stage, plus the tail's width.
+        let mut widths = Vec::new();
+        let mut width = config.encoder_dim;
+        for _ in &config.encoder_rates {
+            widths.push(width);
+            width *= 2;
+        }
+        widths.push(width);
+        widths.sort_unstable();
+        widths.dedup();
+        assert_eq!(count("snake"), widths.len(), "{programs:?}");
+
+        // Every launch of the encoder is FP32: the design's declared rows, not the checkpoint's type.
+        for (operator, key) in &programs {
+            assert!(
+                key.contains("f32") || operator == "scaled_add" || operator == "act_and_mul",
+                "{operator} {key} is not FP32"
+            );
+        }
+
+        // The attention's key, stated whole: FP32 operands, head_dim from the final width, plain MHA
+        // (q_heads == kv_heads), and no offsets table because one track is one unpacked sequence.
+        // The `f32` package declares exactly this cell; an f16 form of it is served by no package and
+        // the encoder never asks for one, since its `programs` takes no dtype at all.
+        let attention: Vec<&str> = programs
+            .iter()
+            .filter(|(name, _)| name == "dense_attention")
+            .map(|(_, key)| key.as_str())
+            .collect();
+        assert_eq!(
+            attention,
+            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"],
+            "{programs:?}"
+        );
+
+        // A longer track is another residual program, because the unit's whole output is its width.
+        let longer = AudioEncoder::programs(&config, &[88_200]).expect("a longer track");
+        assert_ne!(longer, programs);
+    }
     use super::*;
     use crate::video_vae::tests::video_config;
 
@@ -2449,9 +2821,12 @@ mod tests {
         let first = conditioning_arena(&config, frames, vertical).expect("the vertical condition");
         let second = conditioning_arena(&config, frames, wide).expect("the wide condition");
         let names: Vec<&str> = first.iter().map(|buffer| buffer.name.as_str()).collect();
+        // One tile per run, not one per tile: the pass tiles the condition itself, so the plan is one
+        // plan whatever grid the frame turns out to have. `posterior` is the sampler's buffer, between
+        // the sample it draws from and the clean latent the tile reads.
         assert_eq!(
             names,
-            ["tile", "stitch", "moments", "sample", "clean", "anchored"]
+            ["tile", "stitch", "moments", "sample", "posterior", "clean", "anchored"]
         );
         assert_eq!(
             second
@@ -2499,7 +2874,9 @@ mod tests {
             width: 48,
         };
         let plan = conditioning_arena(&config, 1, still).expect("a still's plan");
-        assert_eq!(plan.len(), 6);
+        // The six buffers the pass fills in order — tile, stitch, moments, sample, clean, anchored —
+        // and the posterior sampler's own, which carries the latent it draws before the tile converts it.
+        assert_eq!(plan.len(), 7);
         let stack = Stack::of(&config).expect("the stack");
         let canvas = crate::video_vae::Canvas::clip(&config, still.height, still.width);
         let grid = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");

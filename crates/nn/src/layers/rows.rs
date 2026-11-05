@@ -55,6 +55,19 @@ impl Rows {
         self.forward(f, Mode::Replace, destination, source, indices)
     }
 
+    /// The descriptor one gather or scatter of `columns`-wide rows launches, stated without a device.
+    ///
+    /// The mode is part of the key: a replace and a tap are two programs over the same table.
+    pub fn descriptor_of(dtype: DType, mode: Mode, columns: u32) -> rows::Descriptor {
+        rows::Descriptor {
+            dtype,
+            mode,
+            columns,
+            block: BLOCK,
+            pdl: false,
+        }
+    }
+
     /// `destination[indices[j]] += source[j]`: a tap adds into the rows already there.
     pub fn add(
         &self,
@@ -74,13 +87,7 @@ impl Rows {
         source: TensorView,
         indices: TensorView,
     ) -> Result<()> {
-        let descriptor = rows::Descriptor {
-            dtype: self.datatype,
-            mode,
-            columns: self.columns,
-            block: BLOCK,
-            pdl: false,
-        };
+        let descriptor = Self::descriptor_of(self.datatype, mode, self.columns);
         f.operate::<RowsOp>(
             &descriptor,
             rows::Args {

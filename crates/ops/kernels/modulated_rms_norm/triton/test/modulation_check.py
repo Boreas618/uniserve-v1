@@ -396,7 +396,7 @@ def check_gated(case, generator, dtype, width, rows, gate, indices):
         gate,
         indices,
         case["gate_stride"],
-        ELEMENTS=elements,
+        elements,
         WIDTH=width,
         BLOCK=GATED_BLOCK,
     )
@@ -434,6 +434,115 @@ def check_gated(case, generator, dtype, width, rows, gate, indices):
         "  hidden: not written by this operator, and unchanged in the shape check"
     )
     return counted
+
+
+#: A hand-computed case per form: two activation rows of four with fixed operands and the
+#: expected values written out as decimals. The randomized cases compare a launch against a
+#: reference this same file computes, so a mistake both share — a row read as a column, a
+#: dropped `eps`, a gate row selected by the wrong index, a rounding fused away — is
+#: invisible to them. These numbers were computed once by hand and are literals here for that
+#: reason. `modulated_rms_norm`'s mean squares are `9.063125` and `2.421875`; `gated_residual`'s
+#: expected values are exact in binary except where the gate product itself rounds.
+HAND = {
+    "width": 4,
+    "value": [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 0.0]],
+    "update": [[0.1, 0.2, 0.3, 0.4], [-0.5, 0.25, 0.5, -0.25]],
+    "gate": [[1.0, 2.0, 0.5, 1.0], [0.5, 1.0, 2.0, 1.0]],
+    "scale": [[0.0, 0.5, 0.0, 0.25], [0.25, 0.0, 0.5, 0.0]],
+    "shift": [[0.5, 0.0, 0.0, 0.0], [0.0, 0.25, 0.0, 0.5]],
+    "weight": [1.0, 0.5, -1.0, 2.0],
+    "indices": [0, 1],
+    "eps": 1e-6,
+    "modulated": [
+        [
+            0.8653874918463837,
+            0.5979068048395371,
+            -1.0463369084691898,
+            3.6538749184638375,
+        ],
+        [
+            0.20080479076915603,
+            0.00903425107701275,
+            -2.891588987075847,
+            0.17871233476935033,
+        ],
+    ],
+    "gated": [
+        [1.1, 2.4, 3.15, 4.4],
+        [0.25, -0.75, 3.0, -0.25],
+    ],
+}
+
+
+def check_hand(operator):
+    """Run the hand-computed case of one form and compare every element with its literal."""
+    width = HAND["width"]
+    rows = len(HAND["value"])
+    gate = torch.tensor(HAND["gate"], dtype=torch.float32)
+    indices = torch.tensor(HAND["indices"], dtype=torch.int64)
+    expect = torch.tensor(HAND[operator], dtype=torch.float64)
+
+    if operator == "gated_residual":
+        import gated_residual as kernels
+
+        elements = rows * width
+        hidden = torch.tensor(HAND["value"], dtype=torch.float32).reshape(elements)
+        # `update` receives the written residual, so the operand is read before the launch.
+        update = torch.tensor(HAND["update"], dtype=torch.float32).reshape(elements)
+        grids = (elements + GATED_BLOCK - 1) // GATED_BLOCK
+        kernels._gated_residual_kernel[(grids,)](
+            hidden,
+            update,
+            gate,
+            indices,
+            width,
+            elements,
+            WIDTH=width,
+            BLOCK=GATED_BLOCK,
+        )
+        got = update.reshape(rows, width)
+        relative = gamma(width) + 2.0 * UNIT_ROUNDOFF["f32"]
+    else:
+        import modulated_rms_norm as kernels
+
+        hidden = torch.tensor(HAND["value"], dtype=torch.float32)
+        update = torch.tensor(HAND["update"], dtype=torch.float32)
+        weight = torch.tensor(HAND["weight"], dtype=torch.float32)
+        shift = torch.tensor(HAND["shift"], dtype=torch.float32)
+        scale = torch.tensor(HAND["scale"], dtype=torch.float32)
+        got = torch.full((rows, width), float("nan"), dtype=torch.float32)
+        kernels._modulated_rms_kernel[(rows,)](
+            hidden,
+            update,
+            gate,
+            weight,
+            shift,
+            scale,
+            indices,
+            got,
+            got,
+            got,
+            width,
+            width,
+            width,
+            WIDTH=width,
+            BLOCK=GATED_BLOCK,
+            EPS=HAND["eps"],
+            HAS_UPDATE=True,
+            FP8_OUTPUT=False,
+            RETAIN=False,
+        )
+        # The row reduction in FP32 plus the chain's eight roundings, as the operator declares.
+        relative = gamma(width) + 8.0 * UNIT_ROUNDOFF["f32"]
+
+    difference = (got.double() - expect).abs()
+    outside = (~(difference <= relative * expect.abs())).sum().item()
+    print(
+        f"{'exact' if outside == 0 else 'FAIL'}: hand-computed {rows} x {width}, f32 — "
+        f"max absolute {difference.max().item():.3e}, bound {relative:.3e} "
+        f"({outside} outside)"
+    )
+    return outside
 
 
 def cases(operator, flags):
@@ -586,7 +695,7 @@ def main() -> int:
     if arguments.expect_key is not None and arguments.expect_key != key:
         parser.error(f"the flags name {key}, not {arguments.expect_key}")
 
-    failures = 0
+    failures = check_hand(arguments.op)
     for case in cases(arguments.op, arguments):
         # Triton's interpreter truncates a bf16 store and rounds an f16 one; hardware rounds.
         case["truncate"] = arguments.interpreter and case["dtype"] == "bf16"

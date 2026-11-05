@@ -72,6 +72,21 @@ impl Noise {
     /// passes the global flat index it begins at, and two draws at adjacent offsets reproduce one
     /// longer draw. An odd offset is legal and takes the high half of a word first; a caller with a
     /// whole buffer of its own passes 0.
+    /// The descriptor one draw takes, stated without a device: the element type, the distribution and
+    /// the key source. The keys, the stage, the draw's index and its offset travel with the call.
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        kind: ops::noise::NoiseKind,
+        source: ops::noise::KeySource,
+    ) -> noise::NoiseDescriptor {
+        noise::NoiseDescriptor {
+            dtype,
+            block: BLOCK,
+            kind,
+            source,
+        }
+    }
+
     pub fn draw(
         &self,
         f: &Forward,
@@ -97,12 +112,7 @@ impl Noise {
             }
             Key::Scalar(seed) => (KeySource::Scalar, None, seed),
         };
-        let descriptor = noise::NoiseDescriptor {
-            dtype: out.dtype,
-            block: BLOCK,
-            kind: self.kind,
-            source,
-        };
+        let descriptor = Self::descriptor_of(out.dtype, self.kind, source);
         let args = noise::NoiseArgs {
             out,
             keys,

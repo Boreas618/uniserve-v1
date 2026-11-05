@@ -16,6 +16,7 @@
 //! contract the caller holds.
 
 use ops::TensorView;
+use ops::DType;
 use ops::activation::{self, Activation};
 
 use crate::error::{Error, Result};
@@ -56,6 +57,34 @@ impl GatedActivation {
         self.activation
     }
 
+    /// The descriptor one gated activation of `width` channels launches, stated without a device.
+    ///
+    /// The two row strides are launch values a walk reads from the scratch layout, and `elements` is
+    /// the output's element count — the descriptor's `wide` form is a second program, so it is part of
+    /// the key and not a heuristic.
+    pub fn descriptor_of(
+        dtype: DType,
+        width: u64,
+        activation: Activation,
+        gate_stride: u64,
+        value_stride: u64,
+        elements: u64,
+        stepwise: bool,
+    ) -> Result<activation::ActAndMulDescriptor> {
+        Ok(activation::ActAndMulDescriptor {
+            dtype,
+            width: u32::try_from(width)
+                .map_err(|_| Error::shape("GatedActivation", "a row wider than a u32".to_owned()))?,
+            block: BLOCK,
+            activation,
+            gate_stride,
+            value_stride,
+            wide: elements >= u64::from(u32::MAX),
+            pdl: PDL,
+            stepwise,
+        })
+    }
+
     /// `out = act(gate) · value`.
     ///
     /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
@@ -69,19 +98,15 @@ impl GatedActivation {
         out: TensorView,
     ) -> Result<()> {
         let width = out.shape.last();
-        let descriptor = activation::ActAndMulDescriptor {
-            dtype: out.dtype,
-            width: u32::try_from(width).map_err(|_| {
-                Error::shape("GatedActivation", "a row wider than a u32".to_owned())
-            })?,
-            block: BLOCK,
-            activation: self.activation,
-            gate_stride: gate.strides.get(0),
-            value_stride: value.strides.get(0),
-            wide: out.shape.numel() >= u64::from(u32::MAX),
-            pdl: PDL,
-            stepwise: self.stepwise,
-        };
+        let descriptor = Self::descriptor_of(
+            out.dtype,
+            width,
+            self.activation,
+            gate.strides.get(0),
+            value.strides.get(0),
+            out.shape.numel(),
+            self.stepwise,
+        )?;
         let args = activation::ActAndMulArgs { gate, value, out };
 
         f.operate::<activation::ActAndMul>(&descriptor, args)
@@ -250,6 +275,30 @@ pub struct PackedSwiGlu {
 }
 
 impl PackedSwiGlu {
+    /// The descriptor one packed gated activation of `width` channels launches, stated without a
+    /// device or a projection.
+    ///
+    /// `input_stride` is the row stride of the projection's output, which a walk reads from the
+    /// scratch tensor the layer carves; the bias's presence and the absolute-max mode are the
+    /// layer's.
+    pub fn descriptor_of(
+        dtype: DType,
+        width: u64,
+        input_stride: u64,
+        bias: bool,
+        absmax: bool,
+    ) -> Result<activation::ValueFirstSwigluDescriptor> {
+        Ok(activation::ValueFirstSwigluDescriptor {
+            dtype,
+            width: u32::try_from(width)
+                .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
+            block: BLOCK,
+            input_stride,
+            bias,
+            absmax,
+        })
+    }
+
     /// The gated activation of a projection whose rows hold the value half then the gate half, with
     /// the packed `[value_bias, gate_bias]` bias when the checkpoint has one.
     pub fn new(bias: Option<Weight>) -> Result<Self> {
@@ -303,15 +352,13 @@ impl PackedSwiGlu {
                 ),
             ));
         }
-        let descriptor = activation::ValueFirstSwigluDescriptor {
-            dtype: out.dtype,
-            width: u32::try_from(width)
-                .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
-            block: BLOCK,
-            input_stride: projection.strides.get(0),
-            bias: self.bias.is_some(),
-            absmax: self.absmax,
-        };
+        let descriptor = Self::descriptor_of(
+            out.dtype,
+            width,
+            projection.strides.get(0),
+            self.bias.is_some(),
+            self.absmax,
+        )?;
         let args = activation::ValueFirstSwigluArgs {
             value_gate: projection,
             bias: self.bias.as_ref().map(Weight::view),
@@ -352,6 +399,24 @@ impl Gelu {
         self.approximation
     }
 
+    /// The descriptor one GELU over rows of `columns` channels launches, stated without a device.
+    ///
+    /// The approximation is part of the key: the checkpoint's blocks and its merger use two different
+    /// ones, which are two programs.
+    pub fn descriptor_of(
+        dtype: DType,
+        columns: u32,
+        approximate: ops::gelu::Approximation,
+    ) -> ops::gelu::Descriptor {
+        ops::gelu::Descriptor {
+            dtype,
+            columns,
+            block: BLOCK,
+            approximate,
+            pdl: PDL,
+        }
+    }
+
     /// `out = gelu(x)` over the rows.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         if x.shape.rank() != 2 || x.shape != out.shape {
@@ -362,13 +427,7 @@ impl Gelu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = ops::gelu::Descriptor {
-            dtype: x.dtype,
-            columns,
-            block: BLOCK,
-            approximate: self.approximation,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, columns, self.approximation);
         f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
     }
 }
@@ -392,6 +451,17 @@ impl Snake {
             ));
         }
         Ok(Self { channels })
+    }
+
+    /// The descriptor one Snake launch takes: the element type and the channel count, which is the
+    /// length of every frequency. The samples per channel travel with the call.
+    pub fn descriptor_of(dtype: ops::DType, channels: u64) -> ops::snake::Descriptor {
+        ops::snake::Descriptor {
+            dtype,
+            channels: u32::try_from(channels).unwrap_or(u32::MAX),
+            block: BLOCK,
+            pdl: PDL,
+        }
     }
 
     /// `out = snake(x, alpha)` over `[rows, channels, width]`.
@@ -424,14 +494,7 @@ impl Snake {
                 ),
             ));
         }
-        let descriptor = ops::snake::Descriptor {
-            dtype: x.dtype,
-            channels: u32::try_from(self.channels).map_err(|_| {
-                Error::shape("Snake", "more channels than a descriptor holds".to_owned())
-            })?,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, self.channels);
         f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
     }
 }
@@ -444,6 +507,17 @@ impl Snake {
 pub struct Silu;
 
 impl Silu {
+    /// The descriptor one SiLU launch takes: the element type and the row's column count, which is the
+    /// width the timestep embedding activates.
+    pub fn descriptor_of(dtype: ops::DType, columns: u32) -> ops::activation::SiluDescriptor {
+        ops::activation::SiluDescriptor {
+            dtype,
+            columns,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// `out = silu(x)` over the rows.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         if x.shape.rank() != 2 || x.shape != out.shape {
@@ -454,12 +528,7 @@ impl Silu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = ops::activation::SiluDescriptor {
-            dtype: x.dtype,
-            columns,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, columns);
         f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
     }
 }

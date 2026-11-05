@@ -31,6 +31,5 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["64", "1024", "1536", "2048", "3072", "4096", "4304", "4608", "12288"], block = ["256", "512", "1024", "2048", "4096"], approximate = ["exact", "tanh"], pdl = ["true", "false"] }
-
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["64", "1024", "1536", "2048", "3072", "4096", "4304", "4608", "12288"], block = ["256", "512", "1024", "2048", "4096"], approximate = ["exact", "tanh"], pdl = ["false", "true"] }
 [parameters]

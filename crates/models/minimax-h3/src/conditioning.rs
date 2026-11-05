@@ -22,7 +22,7 @@
 //! around the attention (design 4.3). With one rank the exchange is absent and every view is the
 //! rank's own.
 
-use nn::layers::{Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange};
+use nn::layers::{Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -249,6 +249,80 @@ pub struct TokenRefiner {
 }
 
 impl TokenRefiner {
+    /// The programs the prompt's refinement launches, from the configuration alone.
+    ///
+    /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
+    /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
+    /// gated activation, and the residual each block folds its two updates through.
+    pub fn programs(config: &TransformerConfig, dtype: nn::DType) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::gemm::Gemm;
+        use ops::norm::RmsNorm as RmsNormOp;
+        use ops::residual::ScaledResidual as ResidualOp;
+
+        let hidden = config.hidden_size;
+        let inner = config.num_attention_heads * config.head_dim;
+        let head = config.head_dim;
+        let heads = config.num_attention_heads;
+        let mut programs = Programs::default();
+
+        // Every projection: the input one, the four of each block's attention and its feed-forward
+        // pair. None carries a bias.
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            hidden,
+            dtype,
+            WeightOrder::NxK,
+            false,
+            dtype,
+            dtype,
+        ));
+
+        // Two normalization widths: the hidden state's and one head's, which the query and the key
+        // normalize over.
+        for columns in [hidden, head] {
+            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, dtype));
+        }
+
+        // The identity residual each block folds both of its updates through.
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
+            dtype,
+            u64::from(hidden),
+            false,
+        )?);
+
+        // The attention over the request's document, and the stepwise gated activation.
+        let attention = Attention::dense(
+            head,
+            heads,
+            heads,
+            hidden,
+            false,
+            None,
+            1.0 / (head as f32).sqrt(),
+        )
+        .map_err(Error::from)?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype,
+            dtype,
+            dtype,
+            hidden,
+            true,
+        ));
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(config.intermediate_size),
+            Activation::Silu,
+            u64::from(config.intermediate_size),
+            u64::from(config.intermediate_size),
+            u64::from(inner),
+            true,
+        )?);
+
+        Ok(programs.finish())
+    }
+
     /// Every checkpoint tensor the refiner reads, as complete names.
     ///
     /// [`TokenRefiner::load`]'s requests, in its order: the input projection, each block's ten
