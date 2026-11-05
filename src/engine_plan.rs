@@ -406,9 +406,12 @@ impl EpochPlan {
         Ok(GraphStorage {
             bytes,
             budget,
-            // One stream per device in this epoch: one causal-language runner serves every bucket
-            // of it, so the graph reservation is not divided among streams.
-            streams: 1,
+            // Two ranges, because two streams walk this device's graphs: the serving generation's
+            // runner and the preparation's beside it - `graph.bytes` is already `pool * 2` for
+            // exactly that reason, and `Pools::pool` allocates ONE stream's share of it whole.
+            // With one range the first walk takes the reservation entire and the preparation's
+            // range has nothing to take, which is an update that cannot map its own capture.
+            streams: 2,
             scratch,
             // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
             // the reservation that also holds the state group's snapshot (7.3, 4.5).
