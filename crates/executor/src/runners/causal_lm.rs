@@ -209,7 +209,14 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        if tokens < bucket_tokens
+        // Padding **tokens** belong to a prefill: a chunk of host tokens shorter than the bucket has
+        // the rest of the bucket's token axis to fill, and the last row's range extends over it
+        // (those tokens write no cache page). A decode bucket has no padding tokens - it has padding
+        // *rows*, each evaluating one token with a commit slot below zero - so extending the last
+        // row's range there would make a one-token row own the rest of the bucket's token axis: a
+        // row attending to tokens it never carried and a pack whose end is not the batch's.
+        if !bucket.variant.is_decode()
+            && tokens < bucket_tokens
             && let Some(last) = self.rows.query_offsets.last_mut()
         {
             *last = bucket_tokens as i32;
@@ -2833,8 +2840,10 @@ mod tests {
         assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
         let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
-        // The rows past the batch are not written from the staged table.
-        assert_eq!(slots[rows], 0);
+        // The rows past the batch are **inert**, not zero: a zero slot is slot 0, a real destination,
+        // so a launch that ever ran over the whole capacity would commit phantom tokens into the
+        // first slot the deployment serves. `-1` is the operator's sentinel for "no slot".
+        assert_eq!(&slots[rows..], &[-1, -1]);
         // A table of the wrong length is refused rather than read past its end.
         assert!(commit_table(&staged[..rows], rows, capacity).is_err());
         Ok(())
