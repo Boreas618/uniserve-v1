@@ -410,6 +410,16 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     /// extents and the addresses repeat), so an arena-backed product would be good only until the
     /// next capture or replay of *any* bucket on the producer's stream.
     ///
+    /// **One region, therefore one in-flight encode per runner.** The captured graph writes
+    /// `EncoderOutputs::hidden` at the address the capture fixed, so a runner cannot give a second
+    /// request its own span: a second encode batch overwrites the rows the first request's product
+    /// still points at, silently, because the store's view is a name for the producer's memory and
+    /// not a copy of it. Two requests inside **one** batch are fine - their spans are disjoint inside
+    /// that write - and a second batch must wait for the first request's products to be forgotten.
+    /// That is the admission rule the media path already keeps in one place (a decode bucket refuses a
+    /// batch of two clips for the same reason), and it belongs to execution rather than here: this
+    /// runner states the region's lifetime, and the scheduler states when a second encode may run.
+    ///
     /// Only `Text` is published. The conditioning rows a `ref2va` request lays out are a different
     /// packing of a vision tower's features rather than a slice of this sequence, and this encoder
     /// writes one region (`EncoderOutputs::hidden`); publishing a second product from it would be
