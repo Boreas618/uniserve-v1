@@ -101,8 +101,19 @@ fn tokens(receiver: &mut engine::EventRx, want: usize) -> (Vec<u32>, Option<Even
     let deadline = Instant::now() + ANSWER;
     while Instant::now() < deadline {
         match receiver.try_recv() {
+            // The engine publishes generated tokens as `TextTokens` carrying
+            // the ids a step produced (`scheduler/output.rs`); a single
+            // `TextToken` is the one-id form of the same event. A wait that
+            // matched only the second would read a served request as a starved
+            // one and burn its whole bound doing it.
             Ok(Event::TextToken { id, .. }) => {
                 tokens.push(id);
+                if tokens.len() >= want {
+                    return (tokens, None);
+                }
+            }
+            Ok(Event::TextTokens { ids }) => {
+                tokens.extend(ids);
                 if tokens.len() >= want {
                     return (tokens, None);
                 }
