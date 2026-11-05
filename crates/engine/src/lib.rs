@@ -80,7 +80,7 @@ pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_reque
 // not there.
 #[cfg(feature = "testing")]
 pub use crate::sim::{
-    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
+    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimLoss, SimSpeculation,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
 pub use crate::worker::{
