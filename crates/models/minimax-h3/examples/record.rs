@@ -286,7 +286,7 @@ fn run() -> Result<(), String> {
         request.tokens,
         request.rows,
         request.elements,
-        deployment_types(request.types.as_deref()),
+        deployment_types(request.types.as_deref().expect("--types is required")),
         request.sparse,
         request.root.display()
     );
@@ -936,48 +936,21 @@ fn audio_config(root: &Path) -> Result<minimax_h3::AudioVaeConfig, String> {
     minimax_h3::AudioVaeConfig::parse(&values).map_err(|error| error.to_string())
 }
 
-/// The element types the four components store their weights in, as the caller's tensor table states
-/// them.
+/// The four components' stored element types, as the caller's tensor table states them.
 ///
-/// A recording is one deployment, and a deployment's rows are keyed by element type: a reader who
-/// cannot see which type each component was recorded at cannot tell a differing row from a differing
-/// deployment. **The types cannot be read on a host with no shard** - `nn::Checkpoint::open` reads a
-/// shard's header and `unopened` carries no names - so they arrive as the caller's
-/// `component-tensors.json`, the same artifact the extents table is filled from. The transformer stores
-/// **two** types (one for its stack, one for its declared crossings), and that is stated as it is rather
-/// than collapsed: the crossings are weights a layer pins, not a mixture someone had to choose.
-fn deployment_types(path: Option<&Path>) -> String {
-    let Some(path) = path else {
-        return "unstated (pass --types <component-tensors.json>)".to_owned();
-    };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) => return format!("unreadable ({error})"),
-    };
-    let table: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(table) => table,
-        Err(error) => return format!("unreadable ({error})"),
-    };
-    let mut parts = Vec::new();
-    for component in ["text_encoder", "transformer", "vae", "audio_vae"] {
-        let Some(tensors) = table.get(component).and_then(|value| value.as_object()) else {
-            parts.push(format!("{component}: absent"));
-            continue;
-        };
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for meta in tensors.values() {
-            if let Some(dtype) = meta.get("dtype").and_then(|value| value.as_str()) {
-                *counts.entry(dtype.to_owned()).or_default() += 1;
-            }
-        }
-        let stated = counts
+/// One function with two callers: the walk and this recorder state the same field from the same
+/// artifact, so their deployment lines cannot disagree about what a deployment is. The types are not
+/// derivable on a host with no shard (`nn::Checkpoint::open` reads a shard's header and `unopened`
+/// carries no names), which is why they arrive as a table rather than being read here.
+fn deployment_types(path: &Path) -> String {
+    match minimax_h3::load::element_types(path) {
+        Ok(found) => found
             .iter()
-            .map(|(dtype, count)| format!("{dtype} x{count}"))
+            .map(minimax_h3::load::StoredTypes::field)
             .collect::<Vec<_>>()
-            .join(" + ");
-        parts.push(format!("{component}: {stated}"));
+            .join(", "),
+        Err(error) => format!("unreadable ({error})"),
     }
-    parts.join(", ")
 }
 
 /// Every checkpoint tensor the chosen component's load asks for, in the load's order.
