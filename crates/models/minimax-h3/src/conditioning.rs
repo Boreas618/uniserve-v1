@@ -22,7 +22,9 @@
 //! around the attention (design 4.3). With one rank the exchange is absent and every view is the
 //! rank's own.
 
-use nn::layers::{Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange};
+use nn::layers::{
+    Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -303,13 +305,9 @@ impl TokenRefiner {
             1.0 / (head as f32).sqrt(),
         )
         .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype,
-            dtype,
-            dtype,
-            hidden,
-            true,
-        ));
+        programs.launch::<DenseAttention>(
+            &attention.dense_descriptor(dtype, dtype, dtype, hidden, true),
+        );
         programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
             dtype,
             u64::from(config.intermediate_size),

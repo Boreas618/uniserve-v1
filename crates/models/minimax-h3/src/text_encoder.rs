@@ -768,7 +768,7 @@ impl TextEncoder {
         use ops::gemm::Gemm;
         use ops::norm::{AddRmsNorm, RmsNorm as RmsNormOp};
         use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, Rotation, RotaryFactors};
+        use ops::rope::{QkNormRope, RotaryFactors, Rotation};
         use ops::rows::{self, Rows as RowsOp};
 
         let rank = Rank::new(config, partition)?;
@@ -833,9 +833,9 @@ impl TextEncoder {
             (head as f32).sqrt().recip(),
         )
         .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, tokens, true,
-        ));
+        programs.launch::<DenseAttention>(
+            &attention.dense_descriptor(dtype, dtype, dtype, tokens, true),
+        );
 
         // The gated feed-forward over two separate projections, and the residual that folds each
         // layer's output back into the stream.
@@ -1932,12 +1932,7 @@ mod tests {
         let config = config();
         let programs = TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 4096)
             .expect("the encoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
 
         assert_eq!(count("embedding"), 1);
         // One dense product whatever the contraction, one normalization pair, one rotation, one
@@ -1955,9 +1950,8 @@ mod tests {
 
         // A second prompt length states the same programs: the key bound is a launch value, and the
         // gated activation's `wide` form is nowhere near its threshold at these sizes.
-        let wider =
-            TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 8192)
-                .expect("the encoder's programs");
+        let wider = TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 8192)
+            .expect("the encoder's programs");
         assert_eq!(wider, programs);
 
         // A sharded rank states a different rotation, because the head count is the shard's.
