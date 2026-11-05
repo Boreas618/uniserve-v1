@@ -57,7 +57,17 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
         .recv_timeout(ANSWER)
         .expect("the scheduler answers a switchover");
     switched.expect("the policy serves");
+    // The kernels this epoch serves on. The switchover command publishes the
+    // program but does not number a generation — that is the process command's
+    // arm, which a case does not drive — so the number is stated here through
+    // the one cell both threads share, as the green text case does.
+    handle
+        .generation()
+        .store(GENERATION, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// The generation this deployment's steps are served under.
+const GENERATION: u64 = 7;
 
 /// A text request over `length` prompt tokens.
 fn text_request(id: u64, length: u32) -> GenerationRequest {
