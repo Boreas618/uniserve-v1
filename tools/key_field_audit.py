@@ -148,6 +148,8 @@ def main() -> int:
     seen = set()
     unearned = 0
     audited = 0
+    unbuilt = 0
+    first_failure = None
     for fixture in FIXTURES:
         for operator, key in rows_of(fixture):
             if arguments.operator and operator != arguments.operator:
@@ -166,9 +168,29 @@ def main() -> int:
                 print(f"  {field:12} {verdict}")
                 if "NOT EARNED" in verdict:
                     unearned += 1
+                if verdict.startswith("the fixture's key does not build"):
+                    unbuilt += 1
+                    if first_failure is None:
+                        first_failure = f"{operator}: {verdict}"
             if arguments.limit and audited >= arguments.limit:
-                return 0 if unearned == 0 else 1
-    print(f"{audited} operator(s) audited, {unearned} field value(s) not earned")
+                return report(audited, unbuilt, unearned, first_failure)
+    return report(audited, unbuilt, unearned, first_failure)
+
+
+def report(audited, unbuilt, unearned, first_failure):
+    """State what was measured, and refuse to pass over operators that could not be built.
+
+    An operator whose base key does not build contributes no evidence: a moved key could not be
+    compiled either, so "not earned" is unanswerable for it. Counting it as audited would put a
+    clean line over nothing — the failure this tool exists to detect in a key, one level out.
+    """
+    measured = audited - unbuilt
+    print(f"{audited} operator(s) read, {measured} whose base built, "
+          f"{unearned} field value(s) not earned")
+    if unbuilt:
+        print(f"{unbuilt} operator(s) could not be measured: the interpreter running this script is "
+              f"the one that must carry the toolchain (Triton, CuTe DSL, nvcc). First: {first_failure}")
+        return 1
     return 0 if unearned == 0 else 1
 
 
