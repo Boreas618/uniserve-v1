@@ -81,7 +81,8 @@ struct Args {
     frames: u32,
     /// Prompt tokens the case presents.
     text_tokens: u32,
-    /// The condition image's raster, in pixels; an anchor is fitted to the canvas.
+    /// A **reference**'s raster, in pixels. Unused by `fl2va`: a keyframe is fitted to the
+    /// generated canvas, so an anchor's raster is the canvas and no flag states it.
     image: u32,
     /// The request's seed, which addresses the condition's draw.
     seed: u64,
@@ -716,36 +717,27 @@ fn encode(args: &Args) -> Result<(), String> {
     let store_root = args.store.clone().ok_or_else(|| {
         "stage `encode` needs a program store: pass --store <path> or set UNISERVE_STORE".to_owned()
     })?;
-    // `--image` is a **condition's** raster: an anchor is fitted to the canvas and a reference keeps
-    // the raster it arrives at, so the flag states both and the packing decides which applies.
+    // `--image` states a **reference**'s raster. An `fl2va` keyframe is fitted to the generated
+    // canvas, so an anchor's raster is the canvas and the flag states nothing for that task.
     let anchors = args.task == VideoTask::FirstLastToVideoAudio;
-    if !anchors {
+    if anchors {
         println!(
-            "case: {} has no anchor, so --image {} is unused and the reference is encoded at the \
-             canvas",
+            "case: {} anchors the generated canvas, so --image {} is unused and each anchor is \
+             encoded from the canvas's own {}x{} pixels",
             task_name(args.task),
-            args.image
+            args.image,
+            args.width,
+            args.height
         );
-    }
-    if anchors
-        && !args
-            .image
-            .is_multiple_of(minimax_h3::video_vae::TILE_PIXELS)
+    } else if !args
+        .image
+        .is_multiple_of(minimax_h3::video_vae::TILE_PIXELS)
     {
         return Err(format!(
-            "the condition image is {} px and the encoder's tile is {} px, so a raster that is not a \
+            "the reference is {} px and the encoder's tile is {} px, so a raster that is not a \
              whole number of tiles is not this stage's case",
             args.image,
             minimax_h3::video_vae::TILE_PIXELS
-        ));
-    }
-    if anchors && args.image != args.width.min(args.height) && args.image != args.width {
-        return Err(format!(
-            "a first-frame anchor is fitted to the generated canvas, and {} px is neither the \
-             canvas's {} px nor its short edge {}: the packing would refuse it",
-            args.image,
-            args.width,
-            args.width.min(args.height)
         ));
     }
 
