@@ -619,6 +619,19 @@ impl Runner for MediaStage {
         }
     }
 
+    /// The three host calls this runner serves, as the plan states them.
+    ///
+    /// A host call captures no graph, so its bucket states only which device serves it. Stating
+    /// them here is what makes the mechanism's question answerable: `Executor::media` answers from
+    /// the plan's buckets, and a device that listed none would refuse every encode of the artifact
+    /// with "the executor does not serve this computation".
+    fn media_plan(&self) -> Vec<crate::plan::Bucket> {
+        [Variant::VideoEncode, Variant::AudioEncode, Variant::Mux]
+            .into_iter()
+            .map(crate::plan::Bucket::host)
+            .collect()
+    }
+
     /// The store the request's products are read from (4.5's executor-owned storage).
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);

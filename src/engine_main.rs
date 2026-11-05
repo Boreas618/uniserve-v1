@@ -863,7 +863,7 @@ impl MainProcess {
         let products: Arc<dyn executor::runners::products::Products> = Arc::new(Held::new());
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = plan.runners(*device, &model, &mut memory, &generation)?;
+            let runners = plan.runners(*device, &model, &mut memory, &generation, &blocking)?;
             let executor = Executor::spawn(
                 *device,
                 runners,

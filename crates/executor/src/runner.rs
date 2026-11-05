@@ -275,12 +275,14 @@ pub fn server_of<'a>(
         if !named.phases.contains(&phase) {
             continue;
         }
-        let holds = named.runner.media_plan().iter().any(|bucket| {
-            bucket.variant == variant
-                && bucket.extent == computation.extent
-                && bucket.rows >= computation.rows
-                && bucket.tokens >= computation.tokens
-        });
+        // The bucket's own rule, so the plan's selection and this routing cannot disagree about
+        // which shapes a bucket holds (a host bucket holds every canvas; a captured one holds its
+        // own extent, or any when the caller states none).
+        let holds = named
+            .runner
+            .media_plan()
+            .iter()
+            .any(|bucket| bucket.holds_computation(computation));
         if holds {
             claims.push(named);
         }

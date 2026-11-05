@@ -536,10 +536,12 @@ impl EpochPlan {
         device: DeviceId,
         pipeline: &Arc<minimax_h3::load::MinimaxH3>,
         generation: &Arc<Generation>,
+        blocking: &executor::blocking::ThreadPool,
     ) -> Result<Vec<NamedRunner>> {
         use executor::runners::decoder as media_decoder;
         use executor::runners::denoiser as media_denoiser;
         use executor::runners::encoder as media_encoder;
+        use executor::runners::media as media_host;
         use nn::capability::Denoiser as _;
 
         if Some(&device) != self.devices.first() {
@@ -684,11 +686,11 @@ impl EpochPlan {
             NamedRunner::new(RunnerId(1), Box::new(denoise)),
             NamedRunner::new(RunnerId(2), Box::new(decode)),
         ];
+        let audio_decoder = pipeline.audio_decoder().context(
+            "the checkpoint holds no audio decoder, so no track could be decoded or encoded and \
+             every response would be a clip with no sound",
+        )?;
         if !audio_buckets.is_empty() {
-            let audio_decoder = pipeline.audio_decoder().context(
-                "the checkpoint holds no audio decoder, so no track could be decoded and every \
-                 response would be a clip with no sound",
-            )?;
             let audio_set = Buckets::new(audio_buckets);
             let audio = executor::runners::AudioDecoderRunner::new(
                 Binding {
@@ -703,6 +705,28 @@ impl EpochPlan {
             )?;
             runners.push(NamedRunner::new(RunnerId(3), Box::new(audio)));
         }
+        // The artifact's three calls. They are a runner of this device because the products they
+        // stage live in this device's memory and their copies are ordered on this device's stream,
+        // and they own the process's media lane because encoding and muxing are not device work
+        // (2.4). The two numbers they work at are the checkpoint's: the frame rate the timeline is
+        // measured in and the sample clock the track was decoded at.
+        let media = media_host::MediaStage::new(
+            Binding {
+                id: RunnerId(4),
+                phases: host_phases(),
+                device,
+                stream: stream("media")?,
+            },
+            Arc::new(media_host::Output::from_env(media_host::Rates {
+                frame_rate: minimax_h3::config::FPS,
+                audio_rate: audio_decoder.sampling_rate(),
+            })?),
+            blocking.lane::<media_host::MediaWork>(executor::blocking::BlockingKind::Media)?,
+            // A video unit's frames are the model's schedule, not this plan's arithmetic: the
+            // postprocessor states the one home of `CLIP_FRAMES * n + OVERLAP_FRAMES`.
+            video_units,
+        );
+        runners.push(NamedRunner::new(RunnerId(4), Box::new(media)));
         Ok(runners)
     }
 
@@ -786,12 +810,13 @@ impl EpochPlan {
         served: &Served,
         memory: &mut Memory,
         generation: &Arc<Generation>,
+        blocking: &executor::blocking::ThreadPool,
     ) -> Result<Vec<NamedRunner>> {
         let Served::Text(model) = served else {
             let Served::Media(pipeline) = served else {
                 unreachable!("Served has two variants");
             };
-            return self.media_runners(device, pipeline, generation);
+            return self.media_runners(device, pipeline, generation, blocking);
         };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
@@ -1682,6 +1707,32 @@ impl Placement {
 /// literal: a plan that stated `PhaseId(0)` for its device (text encoding) served no phase the
 /// scheduler ever planned, and the executor refused the deployment's first completion with `no
 /// device of this rank serves phase PhaseId(3)`.
+/// The frames of each video unit of a `frames`-frame timeline, as the model states them.
+///
+/// The host stage is handed this rather than given the arithmetic: a unit's length is the
+/// checkpoint's (`CLIP_FRAMES` and the seam a successor fades against), the model's postprocessor is
+/// its one home, and an executor that recomputed it would be a second.
+fn video_units(frames: u32) -> executor::Result<Vec<u32>> {
+    minimax_h3::output::VideoPostprocessor::splices_of(frames)
+        .map(|splices| splices.into_iter().map(|splice| splice.keep).collect())
+        .map_err(|error| executor::Error::Invalid(format!("a video unit's frames: {error}")))
+}
+
+/// The phases the artifact's three host calls are planned as.
+///
+/// They serve no graph, so no bucket states them: the mechanism plans each call by its phase, and a
+/// device that did not state these three would refuse the first encode of every request.
+fn host_phases() -> Vec<PhaseId> {
+    [
+        engine::PhaseKind::VideoEncode,
+        engine::PhaseKind::AudioEncode,
+        engine::PhaseKind::Mux,
+    ]
+    .into_iter()
+    .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
+    .collect()
+}
+
 fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     let mut kinds: Vec<engine::PhaseKind> = buckets
         .iter()
@@ -1695,6 +1746,11 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             // the scheduler ever planned - the same defect this function's doc records.
             Variant::Decode => engine::PhaseKind::VideoDecode,
             Variant::AudioDecode => engine::PhaseKind::AudioDecode,
+            // The artifact's three host calls are calls the mechanism submits and waits on, so the
+            // device states the phases they run in even though no graph serves them.
+            Variant::VideoEncode => engine::PhaseKind::VideoEncode,
+            Variant::AudioEncode => engine::PhaseKind::AudioEncode,
+            Variant::Mux => engine::PhaseKind::Mux,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
