@@ -30,6 +30,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_f16_extent_5_axis_2_block_1024_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["3", "4", "5", "6", "8"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "64", "80", "96", "112", "128", "144", "160", "176", "192", "208", "224", "240"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
 
 [parameters]

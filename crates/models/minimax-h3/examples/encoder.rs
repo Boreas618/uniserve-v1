@@ -208,10 +208,28 @@ impl Args {
                             .collect::<Result<Vec<u32>>>()?,
                     );
                 }
+                // A prompt with an image is the one input this harness cannot present, and it says
+                // so by name rather than encoding the text alone: the tower's splice needs patch
+                // rows, the grid they came from, and placeholder ids for the prompt, and a case
+                // that carried none of those would spend a device window producing a page that
+                // agrees because both halves dropped the image.
+                "--vision" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| Failure("--vision needs a value".into()))?;
+                    if value != "none" {
+                        return Err(Failure(format!(
+                            "--vision {value}: this harness presents no image. The tower's forward \
+                             needs the patch rows (`[tokens, patch_pixels]`), the grid they came \
+                             from, and the prompt's placeholder ids; the reference probe refuses a \
+                             case with images for the same reason. Encode a text-only prompt."
+                        )));
+                    }
+                }
                 other => {
                     return Err(Failure(format!(
                         "unknown argument {other}; the flags are --stage, --root, --device, \
-                         --store, --out, --prompt and --prompt-ids"
+                         --store, --out, --prompt, --prompt-ids, --dtype, --pool-mib and --vision"
                     )));
                 }
             }
@@ -648,6 +666,20 @@ fn measured_regions(path: &Path) -> Option<(Vec<String>, Vec<u64>)> {
     (!sizes.is_empty()).then_some((names, sizes))
 }
 
+/// When a file was last written, or the reason it cannot be read.
+///
+/// A measurement reused from an earlier run is the one input of this stage whose age the page must
+/// show: the pool it sizes is a claim about *that* run's load, not this one's.
+fn written_time(path: &Path) -> String {
+    match std::fs::metadata(path).and_then(|data| data.modified()) {
+        Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(since) => format!("written {} s after the epoch", since.as_secs()),
+            Err(_) => "written before the epoch".to_owned(),
+        },
+        Err(error) => format!("its time cannot be read: {error}"),
+    }
+}
+
 fn json_field(text: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\"");
     let at = text.find(&needle)? + needle.len();
@@ -996,10 +1028,12 @@ fn stage_encode(args: &Args) -> Result<()> {
         needed = mib.saturating_mul(1 << 20);
     }
     match (&from_regions, pool_mib) {
-        (Some((_, sizes)), _) => println!(
-            "weights: {} regions from {}, {} MiB in {} MiB blocks",
+        (Some((names, sizes)), _) => println!(
+            "weights: {} regions, {} with keys, from {} ({}), {} MiB in {} MiB blocks",
             sizes.len(),
+            names.len(),
             measured.display(),
+            written_time(&measured),
             needed >> 20,
             granularity
         ),
@@ -1044,10 +1078,20 @@ fn stage_encode(args: &Args) -> Result<()> {
     // of them stops inside a publish when they disagree - which the run at `575a17576` did by one
     // block. Comparing them here names the region instead, in the run that sized the pool.
     match &from_regions {
+        // A file without keys cannot say *which* region a size belongs to, so the two sets cannot be
+        // paired - and the reason is always one of three: it was written by a build of `--stage
+        // weights` older than the one that reads it, by a run that wrote to another `--out`, or
+        // while it was being written. The line names all three and the file's time, because a reader
+        // who sees only "cannot be paired" will look for a defect in the pool instead.
         Some((names, sizes)) if names.len() != sizes.len() => println!(
-            "regions: {} published, {} measured, the file names no keys and cannot be paired",
+            "regions: {} published, {} measured, and the file holds no keys to pair them by - it was\n         \
+             written by an older build of `--stage weights`, by a run with another `--out`, or while it\n         \
+             was being written; run both stages from this binary into this directory\n         \
+             ({}, {})",
             weights.published.len(),
-            sizes.len()
+            sizes.len(),
+            measured.display(),
+            written_time(&measured),
         ),
         Some((names, sizes)) => {
             let mut first: Option<String> = None;

@@ -111,6 +111,27 @@ impl Args {
     }
 }
 
+/// Refuse a raster that is not the launch's, checked on the axis a raster ends with.
+///
+/// `require_row` is the row-major idiom: it demands the *last* extent be the number given and the
+/// last stride be one. For `[channels, frames, rows, columns]` the last axis is the **columns**, so
+/// the extent it is given is the raster's own width. Passing the channels instead - the *first*
+/// axis - demands that a latent be as wide as the model has channels, which no canvas satisfies:
+/// at 256x256 the latent is `[24, F, 16, 16]`, so that check refused every real request with
+/// `expected 24 elements on the last axis, found 16`.
+///
+/// The check the raster really needs here is its element type and a unit stride on its innermost
+/// axis, and both are what `require_row` asserts once it is given the axis the view ends with.
+fn check_raster(
+    operator: &'static str,
+    dtype: DType,
+    raster: TensorView,
+    shape: Shape,
+) -> Result<()> {
+    raster.require_shape(operator, shape)?;
+    raster.require_row(operator, dtype, shape.dims()[3])
+}
+
 /// The packed-token to planar-raster mapping, with an optional per-channel denormalization.
 pub struct Unpatchify;
 
@@ -145,9 +166,7 @@ impl Op for Unpatchify {
             height * u64::from(args.patch_height),
             width * u64::from(args.patch_width),
         ]);
-        args.out.require_shape(Self::NAME, out_shape)?;
-        args.out
-            .require_row(Self::NAME, descriptor.dtype, out_shape.dims()[0])?;
+        check_raster(Self::NAME, descriptor.dtype, args.out, out_shape)?;
         args.tokens
             .require_shape(Self::NAME, Shape::new(&[tokens, args.token_width()]))?;
         if args.tokens.dtype != descriptor.dtype {
@@ -283,6 +302,51 @@ mod tests {
             patch_height: 2,
             patch_width: 2,
         }
+    }
+
+    #[test]
+    fn a_raster_is_checked_on_its_width_not_its_channel_count() {
+        // A 256x256 canvas at the VAE's sixteenfold compression is a 16x16 latent, so the
+        // sampler's first velocity output is `[24, F, 16, 16]`. Checking the raster's last axis
+        // against the channel count refused exactly that shape (`expected 24 ... found 16`) and
+        // would have refused the decoder's `[3, F, H, 256]` the same way.
+        let raster = |shape: &[u64]| {
+            TensorView::with_strides(
+                crate::tensor::DevicePtr::new(0x2000),
+                DType::F32,
+                Shape::new(shape),
+                Strides::row_major(Shape::new(shape)),
+            )
+        };
+        let out = [24, 3, 16, 16];
+        assert!(
+            check_raster(
+                "unpatchify_video",
+                DType::F32,
+                raster(&out),
+                Shape::new(&out)
+            )
+            .is_ok()
+        );
+        // The element type and the innermost stride are still asserted.
+        assert!(
+            check_raster(
+                "unpatchify_video",
+                DType::BF16,
+                raster(&out),
+                Shape::new(&out)
+            )
+            .is_err()
+        );
+        assert!(
+            check_raster(
+                "unpatchify_video",
+                DType::F32,
+                raster(&[24, 3, 16, 15]),
+                Shape::new(&out)
+            )
+            .is_err()
+        );
     }
 
     #[test]
