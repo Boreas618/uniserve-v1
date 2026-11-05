@@ -3070,6 +3070,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // because the node's own argument is the struct that holds the pointer.
         let mut layer = 0_usize;
         let mut layer0_out = 0_u64;
+        let mut dirty = Vec::new();
         for (operator, _, launches) in captured.nodes() {
             if *operator != "paged_attention" {
                 continue;
@@ -3105,25 +3106,68 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .and_then(|blob| blob.get(1000..1008))
                     .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
                     .unwrap_or(0);
-                let counted = if counter != 0 && self.in_arena(counter, 4) {
+                let counter_value = if counter != 0 && self.in_arena(counter, 4) {
                     self.read_device(counter, 4)
-                        .map(|raw| {
-                            format!(
-                                " cnt={}",
-                                i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4]))
-                            )
-                        })
-                        .unwrap_or_default()
+                        .map(|raw| i32::from_ne_bytes(raw[..4].try_into().unwrap_or([0; 4])))
                 } else {
-                    String::new()
+                    None
+                };
+                let counted = match counter_value {
+                    Some(value) => format!(" cnt={value}"),
+                    None => String::new(),
                 };
                 if layer == 0 && address != 0 {
                     layer0_out = address;
+                }
+                if let Some(value) = counter_value {
+                    if value != 0 {
+                        dirty.push((layer, value));
+                    }
                 }
                 out.push_str(&format!(" attn{layer}={named}@{grid}{counted}"));
                 layer += 1;
             }
         }
+
+        // Which layers left the multi-CTA counter dirty, and what the graph's kernels actually are.
+        // The counter is a semaphore the kernels reset, so a nonzero value after a launch is a
+        // protocol that did not complete - and the layers that share the value are the answer to
+        // "which batches", because every layer of one batch is launched by the same graph.
+        out.push_str(&format!(" cnt_dirty={}/{}", dirty.len(), layer));
+        if !dirty.is_empty() {
+            let named: Vec<String> = dirty
+                .iter()
+                .take(6)
+                .map(|(layer, value)| format!("L{layer}={value}"))
+                .collect();
+            out.push_str(&format!("[{}]", named.join(",")));
+        }
+        // An operator's name says what asked for a launch; the kernel's name says what ran. A
+        // protocol that is two launches shows as two names under one operator, and a launch filed
+        // under the wrong operator cannot hide.
+        let mut functions: Vec<(String, usize)> = Vec::new();
+        for (_, _, launches) in captured.nodes() {
+            for launch in launches {
+                let Ok(params) = captured.template().kernel_node_params(&launch.node) else {
+                    continue;
+                };
+                let name = params
+                    .function
+                    .name()
+                    .unwrap_or_else(|error| format!("unnamed({error})"));
+                match functions.iter_mut().find(|(known, _)| *known == name) {
+                    Some((_, count)) => *count += 1,
+                    None => functions.push((name, 1)),
+                }
+            }
+        }
+        functions.sort_by(|left, right| right.1.cmp(&left.1));
+        let spelled: Vec<String> = functions
+            .iter()
+            .take(12)
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect();
+        out.push_str(&format!(" functions=[{}]", spelled.join(",")));
 
         // The projection out of the attention block: the slice's `attended` cut is the attention
         // block's output *projected out and before the residual add*, so the tensor to compare
