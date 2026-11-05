@@ -153,6 +153,38 @@ pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION: i32 = 4;
 pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: i32 = 5;
 pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: i32 = 6;
 
+/// `CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC`: the edge activates at the
+/// upstream kernel's programmatic trigger point, before it finishes. Its two
+/// siblings are not used here: `..._PORT_DEFAULT` (0) is what every edge
+/// states when it waits for completion, and `..._PORT_LAUNCH_ORDER` (2) lets a
+/// downstream node be launched as soon as its upstream node is.
+pub(crate) const CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC: u8 = 1;
+/// `CU_GRAPH_DEPENDENCY_TYPE_DEFAULT`: an ordinary dependency.
+pub(crate) const CU_GRAPH_DEPENDENCY_TYPE_DEFAULT: u8 = 0;
+/// `CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC`: the downstream node synchronizes
+/// itself with the upstream one.
+pub(crate) const CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC: u8 = 1;
+
+/// `CUgraphEdgeData`: what one edge between two graph nodes says.
+///
+/// The driver refuses a query that reads a graph's edges without this array
+/// (`CUDA_ERROR_LOSSY_QUERY`) as soon as one edge carries non-default data,
+/// which a programmatic dependent launch does - so an owner that walks a
+/// captured graph reads the data or cannot walk it at all.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GraphEdgeData {
+    /// When, in the upstream node, the dependency is triggered.
+    pub(crate) from_port: u8,
+    /// Which part of the downstream node depends on it; no node type defines a
+    /// non-zero value, so it is zero.
+    pub(crate) to_port: u8,
+    /// A `CUgraphDependencyType`.
+    pub(crate) kind: u8,
+    /// Unused and zeroed; the driver requires zero.
+    pub(crate) reserved: [u8; 5],
+}
+
 /// `CUlaunchConfig`: the full configuration of one `cuLaunchKernelEx`.
 #[repr(C)]
 pub(crate) struct LaunchConfig {
@@ -308,14 +340,14 @@ driver_table! {
         stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, i32);
         stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
         stream_get_capture_info = "cuStreamGetCaptureInfo_v3": fn(
-            Handle, *mut i32, *mut u64, *mut Handle, *mut *const Handle, *mut *const c_void,
+            Handle, *mut i32, *mut u64, *mut Handle, *mut *const Handle, *mut *const GraphEdgeData,
             *mut usize,
         );
         graph_destroy = "cuGraphDestroy": fn(Handle);
         graph_get_nodes = "cuGraphGetNodes": fn(Handle, *mut Handle, *mut usize);
         graph_get_root_nodes = "cuGraphGetRootNodes": fn(Handle, *mut Handle, *mut usize);
         graph_node_get_dependent_nodes = "cuGraphNodeGetDependentNodes_v2": fn(
-            Handle, *mut Handle, *mut c_void, *mut usize,
+            Handle, *mut Handle, *mut GraphEdgeData, *mut usize,
         );
         graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut i32);
         graph_kernel_node_get_params = "cuGraphKernelNodeGetParams_v2": fn(
