@@ -2,8 +2,8 @@
 # Qwen3MoeForCausalLM checkpoint. Three cells confirm the BF16 checkpoint,
 # its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
 #
-# A confirmation compares the same cell measured twice: once on the tree the
-# baseline was accepted on and once at the candidate commit, on the same
+# A confirmation compares the same cell measured twice: once on the existing
+# implementation's tree and once at the candidate commit, on the same
 # 1319-row test split and the same sampling settings, so the two runs differ
 # in the implementation and nothing else. Each cell is compared with itself;
 # two cells are not comparable, because they differ in the checkpoint or the
