@@ -161,8 +161,15 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let named: BTreeSet<String> = walked.iter().map(|(operator, _)| operator.clone()).collect();
-        println!("# {label} pages: {} rows over {} operators", walked.len(), named.len());
+        let named: BTreeSet<String> = walked
+            .iter()
+            .map(|(operator, _)| operator.clone())
+            .collect();
+        println!(
+            "# {label} pages: {} rows over {} operators",
+            walked.len(),
+            named.len()
+        );
 
         // Only the full-precision deployment is the fixture's; the E4M3 rows are reported as what
         // that file would hold instead, so the header's claim is checked rather than repeated.
@@ -181,13 +188,19 @@ fn main() -> ExitCode {
             .unwrap_or_default();
             let mut differs: Vec<String> = Vec::new();
             for (operator, key) in &walked {
-                if !full.iter().any(|(other, full_key)| other == operator && full_key == key) {
+                if !full
+                    .iter()
+                    .any(|(other, full_key)| other == operator && full_key == key)
+                {
                     differs.push(format!("{operator}\t{key}"));
                 }
             }
             let mut gained: Vec<String> = Vec::new();
             for (operator, key) in &full {
-                if !walked.iter().any(|(other, walk_key)| other == operator && walk_key == key) {
+                if !walked
+                    .iter()
+                    .any(|(other, walk_key)| other == operator && walk_key == key)
+                {
                     gained.push(format!("{operator}\t{key}"));
                 }
             }
@@ -203,7 +216,9 @@ fn main() -> ExitCode {
 
         for operator in &named {
             if !present.contains(operator) {
-                failures.push(format!("the walk names `{operator}` and the fixture lacks it"));
+                failures.push(format!(
+                    "the walk names `{operator}` and the fixture lacks it"
+                ));
             }
         }
         let unowned: Vec<&String> = present
@@ -242,16 +257,22 @@ fn main() -> ExitCode {
 
 /// The operators the fixture's rows name, comments and blank lines skipped.
 fn fixture_operators(path: &Path) -> Result<BTreeSet<String>, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(text
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .filter_map(|line| line.split_once('\t').map(|(operator, _)| operator.trim().to_owned()))
+        .filter_map(|line| {
+            line.split_once('\t')
+                .map(|(operator, _)| operator.trim().to_owned())
+        })
         .collect())
 }
 
 fn usage(problem: &str) -> ExitCode {
     eprintln!("{problem}");
-    eprintln!("usage: keys_check [--checkpoint PATH] [--fixture PATH] [--capacity N] [--page-tokens N]");
+    eprintln!(
+        "usage: keys_check [--checkpoint PATH] [--fixture PATH] [--capacity N] [--page-tokens N]"
+    );
     ExitCode::from(2)
 }

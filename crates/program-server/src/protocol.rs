@@ -781,10 +781,7 @@ impl Client {
     /// content and are never overwritten, so a second attempt selects the same
     /// programs and finds the modules an abandoned attempt committed. Steps
     /// may therefore be reported twice.
-    fn call<T>(
-        &mut self,
-        mut attempt: impl FnMut(&mut Connection) -> Result<T>,
-    ) -> Result<T> {
+    fn call<T>(&mut self, mut attempt: impl FnMut(&mut Connection) -> Result<T>) -> Result<T> {
         let Some(socket) = self.socket.clone() else {
             return attempt(&mut self.connection);
         };
