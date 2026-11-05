@@ -227,13 +227,65 @@ def classify(missing, shapes, rasters_of, sampled):
         )
         if carried:
             dependent.append(shape)
-        elif shape[0] in CANVAS_CLASS and len(
-            {tuple(rasters_of[path]) for path in shapes[shape]}
-        ) < 2:
+        elif (
+            shape[0] in CANVAS_CLASS
+            and len({tuple(rasters_of[path]) for path in shapes[shape]}) < 2
+        ):
             canvas.append(shape)
         else:
             real.append(shape)
     return canvas, dependent, real
+
+
+# The extents a key carries: a launch decides these, so counting them apart from the rest of the
+# key says how much a single request multiplies the rows of one operator.
+EXTENTS = ("columns", "elements", "rows", "extent", "samples", "tokens")
+
+
+def without(key, fields):
+    """The key with each named field and its value removed.
+
+    A key is `field_value_field_value_...`, so a field takes the token after it. What remains names
+    the program a launch asks for; what was removed names the run that asked.
+    """
+    parts, index = [], 0
+    tokens = key.split("_")
+    while index < len(tokens):
+        if tokens[index] in fields:
+            index += 2
+            continue
+        parts.append(tokens[index])
+        index += 1
+    return "_".join(parts)
+
+
+def families(args):
+    """Per operator: distinct keys launched, distinct keys with `--fields` removed, and the ratio.
+
+    A field that leaves a key multiplies an operator's rows by the number of values a legitimate run
+    produces for it. That ratio is a fact about launches - it needs no store and no device - so it
+    answers "how many of these rows exist because of this field", not "which of them differ in the
+    compiled program". The second question needs two built keys and their cubins.
+    """
+    fields = set(args.fields.split(","))
+    keys = {}
+    for path in args.walk:
+        for operator, key in read_lines(path):
+            keys.setdefault(operator, set()).add(key)
+    print(
+        f"{len(args.walk)} walk(s), {len(keys)} operators, removing {', '.join(sorted(fields))}"
+    )
+    total, collapsed = 0, 0
+    for operator in sorted(keys):
+        whole = keys[operator]
+        fewer = {without(key, fields) for key in whole}
+        total += len(whole)
+        collapsed += len(fewer)
+        if len(whole) != len(fewer):
+            print(
+                f"  {operator}: {len(whole)} key(s) -> {len(fewer)} without the field(s)"
+            )
+    print(f"{total} key(s) launched, {collapsed} with the field(s) removed")
 
 
 def by_shape(args):
@@ -380,6 +432,7 @@ def self_test() -> int:
     operator absent from walks of two different canvases is a row a store must hold, and the
     operator's name alone must never be enough to file it under the canvas.
     """
+
     def key(columns: int) -> str:
         return f"dtype_f32_columns_{columns}_block_1024"
 
@@ -418,6 +471,11 @@ def self_test() -> int:
     canvas, dependent, real = classify([], shapes, rasters_of, sampled)
     assert not canvas and not dependent and not real
 
+    # `--families` removes a field and the value after it, and nothing else.
+    assert without("a_columns_128_block_1024", {"columns"}) == "a_block_1024"
+    assert without("a_columns_128_lines_4_block_1024", {"columns"}) == "a_lines_4_block_1024"
+    assert without("a_block_1024", {"columns"}) == "a_block_1024"
+
     print(
         "ok   a canvas-class row absent from two canvases is real, from one it is the canvas,"
         " and the walk's own sample answers before either"
@@ -427,6 +485,16 @@ def self_test() -> int:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--families",
+        action="store_true",
+        help="per operator: distinct keys launched, and distinct keys with `--fields` removed",
+    )
+    parser.add_argument(
+        "--fields",
+        default="columns",
+        help="the key fields `--families` removes, comma-separated",
+    )
     parser.add_argument(
         "--walk",
         required=False,
@@ -457,10 +525,16 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
-    if not args.walk or not args.fixture:
-        parser.error("--walk and --fixture name the two sides, or --self-test proves the tool")
+    # `--families` reads launches only: it has no second side to be given.
+    if not args.walk or (not args.fixture and not args.families):
+        parser.error(
+            "--walk and --fixture name the two sides, or --families reads the walks"
+            " alone, or --self-test proves the tool"
+        )
     if args.by_shape:
         return by_shape(args)
+    if args.families:
+        return families(args)
     walk = read_lines(args.walk[0])
     fixture = read_lines(args.fixture)
 
