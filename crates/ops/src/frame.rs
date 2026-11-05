@@ -68,9 +68,11 @@ impl fmt::Display for FramePadDescriptor {
 impl FramePadDescriptor {
     /// The tile a launch of `values` into `out` uses.
     ///
-    /// A source whose columns are contiguous with a contiguous output walks a whole output row at a
-    /// time, up to [`ROW_PIXELS`]; anything else walks fixed tiles of columns and channels. The
-    /// descriptor carries the result, so the caller and the compiled program agree on the variant.
+    /// A unit-strided source with a contiguous output walks a whole output row at a time, up to
+    /// [`ROW_PIXELS`]: one of the two axes the block covers is then contiguous in each operand. A
+    /// channels-last source, a channels-last output, or any other pair walks fixed tiles of columns
+    /// and channels, which coalesces in the layout the operands are stored in. The descriptor
+    /// carries the result, so the caller and the compiled program agree on the variant.
     pub fn tiles(values: &TensorView, out: &TensorView) -> (u32, u32) {
         let contiguous_out = out.strides == Strides::row_major(out.shape);
         Self::tiles_of(values.strides.last() == 1, contiguous_out, out.shape.dim(4))
@@ -91,7 +93,8 @@ impl FramePadDescriptor {
 /// The arguments of `frame_pad`.
 #[derive(Clone, Copy)]
 pub struct FramePadArgs {
-    /// `[batch, channels, frames, height, width]`, any strides, its columns unit-strided.
+    /// `[batch, channels, frames, height, width]`, any strides, channel-first or
+    /// channels-last: the kernel walks both operands through the strides it is given.
     pub values: TensorView,
     /// `[batch, channels, frames + front, height + top + bottom, width + left + right]`, contiguous
     /// or channels-last.
@@ -127,15 +130,6 @@ impl Op for FramePad {
                 format!(
                     "expected {} values and output, found {} and {}",
                     descriptor.dtype, args.values.dtype, args.out.dtype
-                ),
-            ));
-        }
-        if args.values.strides.last() != 1 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the source columns are {} elements apart, the kernel reads them contiguously",
-                    args.values.strides.last()
                 ),
             ));
         }
@@ -286,6 +280,49 @@ pub fn frame_reduction_class(channels_per_group: u64, pixels: u64) -> u32 {
     reduction.next_power_of_two().min(u64::from(u32::MAX)) as u32
 }
 
+/// The element step between neighbouring pixels of one frame, in either layout a video tensor is
+/// stored in.
+///
+/// A frame's reduction is a group's channels by its pixels, in PyTorch's folded order, whatever the
+/// storage order is; the layout changes only where the next pixel is. Channel-first storage keeps a
+/// frame's pixels of one channel contiguous, so the step is `1`. Channels-last storage keeps a
+/// pixel's channels contiguous and moves a pixel by the channel count. Anything else is refused by
+/// name rather than walked at the wrong stride: the reduction would still produce two plausible
+/// numbers.
+///
+/// The batch axis is not constrained — a view of a slice carries whatever step its buffer gives —
+/// because the entry is told it and never derives it.
+pub fn pixel_stride(values: &TensorView) -> Result<i64> {
+    let (channels, height, width) = (
+        values.shape.dim(1),
+        values.shape.dim(3),
+        values.shape.dim(4),
+    );
+    let strides = values.strides.as_slice();
+    // Channel-first: `[batch, channels, frames, height, width]`, a frame's pixels contiguous.
+    if strides[4] == 1 && strides[3] == width && strides[2] == height * width {
+        return Ok(1);
+    }
+    // Channels-last: the same logical axes, a pixel's channels contiguous.
+    if strides[1] == 1
+        && strides[4] == channels
+        && strides[3] == width * channels
+        && strides[2] == height * width * channels
+    {
+        return Ok(i64::try_from(channels).unwrap_or(i64::MAX));
+    }
+    Err(Error::argument(
+        FrameMoments::NAME,
+        format!(
+            "the frame's pixels are in neither layout a video tensor is stored in: strides {:?}              for {:?} are not channel-first ({}) nor channels-last ({})",
+            values.strides,
+            values.shape.dims(),
+            "a frame's pixels contiguous",
+            "a pixel's channels contiguous"
+        ),
+    ))
+}
+
 /// The call structure of `frame_moments`, mirrored by the package's header.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -298,6 +335,10 @@ pub struct FrameMomentsCall {
     pub values_channel: i64,
     /// Elements between frames.
     pub values_frame: i64,
+    /// Elements between neighbouring pixels of one frame: `1` channel-first, the channel count
+    /// channels-last. A frame's reduction is `[channels, pixels]` in PyTorch's folded order in
+    /// either layout; only the address of the next pixel changes.
+    pub values_pixel: i64,
     /// Frames per batch.
     pub frames: i64,
     /// Pixels per frame and channel, `height · width`.
@@ -324,10 +365,11 @@ impl NativeCall for FrameMomentsCall {
 }
 
 const _: () = assert!(offset_of!(FrameMomentsCall, values) == 0);
-const _: () = assert!(offset_of!(FrameMomentsCall, epsilon) == 64);
-const _: () = assert!(offset_of!(FrameMomentsCall, mean) == 72);
-const _: () = assert!(offset_of!(FrameMomentsCall, error) == 88);
-const _: () = assert!(size_of::<FrameMomentsCall>() == 88 + MESSAGE);
+const _: () = assert!(offset_of!(FrameMomentsCall, values_pixel) == 32);
+const _: () = assert!(offset_of!(FrameMomentsCall, epsilon) == 72);
+const _: () = assert!(offset_of!(FrameMomentsCall, mean) == 80);
+const _: () = assert!(offset_of!(FrameMomentsCall, error) == 96);
+const _: () = assert!(size_of::<FrameMomentsCall>() == 96 + MESSAGE);
 
 /// One compilation of `frame_moments`.
 ///
@@ -357,7 +399,8 @@ impl fmt::Display for FrameMomentsDescriptor {
 /// The arguments of `frame_moments`.
 #[derive(Clone, Copy)]
 pub struct FrameMomentsArgs {
-    /// `[batch, channels, frames, height, width]` FP32, each frame's pixels contiguous.
+    /// `[batch, channels, frames, height, width]` FP32, channel-first or channels-last: a
+    /// frame's pixels are one step apart, which [`pixel_stride`] derives from the layout.
     pub values: TensorView,
     /// `[batch · frames, groups]` FP32: receives each frame's group means.
     pub mean: TensorView,
@@ -383,20 +426,13 @@ impl Op for FrameMoments {
         stream: &Stream,
     ) -> Result<()> {
         args.values.require_rank(Self::NAME, 5)?;
-        args.values.require_row(Self::NAME, descriptor.dtype, 1)?;
         if args.values.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
                 "the reference kernel normalizes FP32 values".to_owned(),
             ));
         }
-        if args.values.strides.get(4) != 1 || args.values.strides.get(3) != args.values.shape.dim(4)
-        {
-            return Err(Error::argument(
-                Self::NAME,
-                "a frame's pixels of one channel are not contiguous".to_owned(),
-            ));
-        }
+        let pixel = pixel_stride(&args.values)?;
         let (batch, channels, frames) = (
             args.values.shape.dim(0),
             args.values.shape.dim(1),
@@ -441,6 +477,7 @@ impl Op for FrameMoments {
             values_batch: args.values.strides.get(0) as i64,
             values_channel: args.values.strides.get(1) as i64,
             values_frame: args.values.strides.get(2) as i64,
+            values_pixel: pixel,
             frames: frames as i64,
             pixels: pixels as i64,
             channels_per_group: (channels / args.groups) as i64,
@@ -824,6 +861,54 @@ impl Op for FrameNormPad {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::DevicePtr;
+
+    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
+        TensorView::with_strides(
+            DevicePtr::new(0x1000),
+            DType::F32,
+            Shape::new(shape),
+            Strides::new(strides),
+        )
+    }
+
+    /// The same frame in the two layouts a video tensor is stored in: `[1, 4, 3, 2, 5]` is 120
+    /// values either way and the pixel step is the only thing the layout changes.
+    fn channel_first() -> TensorView {
+        view(&[1, 4, 3, 2, 5], &[120, 30, 10, 5, 1])
+    }
+
+    fn channels_last() -> TensorView {
+        view(&[1, 4, 3, 2, 5], &[120, 1, 40, 20, 4])
+    }
+
+    #[test]
+    fn a_frames_pixel_step_follows_the_layout() {
+        assert_eq!(pixel_stride(&channel_first()).expect("channel-first"), 1);
+        // A pixel's channels are contiguous, so the next pixel is a channel count away.
+        assert_eq!(pixel_stride(&channels_last()).expect("channels-last"), 4);
+    }
+
+    #[test]
+    fn a_frame_in_neither_layout_is_refused_by_name() {
+        // A row of pixels two elements apart is neither layout: the reduction would visit pixels
+        // that are not there and still produce two plausible numbers.
+        let scrambled = view(&[1, 4, 3, 2, 5], &[120, 30, 10, 10, 2]);
+        let error = pixel_stride(&scrambled).expect_err("neither layout must refuse");
+        assert!(error.to_string().contains("neither layout"), "{error}");
+    }
+
+    #[test]
+    fn a_channels_last_source_walks_tiles_rather_than_refusing() {
+        // A channels-last source has no unit-strided columns, so the launch takes the tiled walk;
+        // the operator reads it through the strides the kernel is given.
+        let (pixels, channels) = FramePadDescriptor::tiles(&channels_last(), &channel_first());
+        assert_eq!((pixels, channels), (PAD_PIXELS, PAD_CHANNELS));
+        // A unit-strided source with a contiguous output keeps the whole-row walk: five columns
+        // padded to the next power of two, and the rest of the block's elements over the channels.
+        let (pixels, channels) = FramePadDescriptor::tiles(&channel_first(), &channel_first());
+        assert_eq!((pixels, channels), (8, ROW_ELEMENTS / 8));
+    }
 
     #[test]
     fn a_frames_reduction_class_is_the_length_padded_to_a_power_of_two() {
