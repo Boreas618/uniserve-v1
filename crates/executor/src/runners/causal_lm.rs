@@ -3087,15 +3087,39 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .as_ref()
                     .map(|params| format!("{:?}", params.grid))
                     .unwrap_or_else(|| "unknown".to_owned());
-                let named = if address == 0 {
-                    "null".to_owned()
+                // A digest names a value; a byte count names its content. An output nobody wrote
+                // reads as all zeros, which is the same digest for every batch - and that is a
+                // different defect from an output written wrongly, so it is stated beside the digest.
+                let (named, written) = if address == 0 {
+                    ("null".to_owned(), String::new())
                 } else if !inside(address) {
-                    "outside".to_owned()
+                    ("outside".to_owned(), String::new())
                 } else {
                     match self.read_device(address, width) {
-                        Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
-                        None => "unreadable".to_owned(),
+                        Some(raw) => (
+                            format!("{:016x}", platform::fnv1a(&raw)),
+                            format!(" nz={}", raw.iter().filter(|byte| **byte != 0).count()),
+                        ),
+                        None => ("unreadable".to_owned(), String::new()),
                     }
+                };
+                // The partial matrix and stats the multi-CTA split fills: the FMHA kernel writes
+                // these and a separate reduction turns them into the output, so nonzero partials
+                // beside a zero output is that reduction not having run.
+                let partial = params
+                    .as_ref()
+                    .and_then(|params| params.parameters.first())
+                    .and_then(|blob| blob.get(1024..1032))
+                    .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+                    .unwrap_or(0);
+                let split = if partial != 0 && self.in_arena(partial, 4096) {
+                    self.read_device(partial, 4096)
+                        .map(|raw| {
+                            format!(" pnz={}", raw.iter().filter(|byte| **byte != 0).count())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
                 };
                 // The multi-CTA counter, read after the launch: a reduction that leaves it dirty
                 // hands the next launch a counter that never reaches its CTA bound, which is the
@@ -3124,7 +3148,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                         dirty.push((layer, value));
                     }
                 }
-                out.push_str(&format!(" attn{layer}={named}@{grid}{counted}"));
+                out.push_str(&format!(" attn{layer}={named}{written}{split}@{grid}{counted}"));
                 layer += 1;
             }
         }
