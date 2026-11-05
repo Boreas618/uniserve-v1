@@ -537,7 +537,15 @@ message Parked {
 // A promoted standby's answer to `Command::Promote`: it serves the generation
 // it was spawned at (§2.5).
 message Promoted {
+  // The launch generation this process was spawned at, which the epoch layer
+  // promotes a child by.
   uint64 generation = 1;
+  // The program generation this process holds and serves from now on (§7.3):
+  // the generation its precopy built. The daemon compares it with the epoch's
+  // own before it moves the frontend, so a promotion of a generation the epoch
+  // has since reverted is refused there rather than served. Unstated (`0`) is a
+  // process that holds none, which is today's behaviour.
+  uint64 program_generation = 2;
 }
 
 // The scheduling policy failed (§4.4): the main process reinstantiated the
