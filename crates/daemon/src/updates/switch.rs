@@ -142,6 +142,12 @@ pub(crate) trait Roster {
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
     /// Commands the main process of `generation` on `host`.
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
+    /// Makes the process of `generation` on `host` commandable: the epoch the switch leaves was
+    /// started by the daemon's engine control, so this roster holds no row of it, and a `Drain` to
+    /// a process it does not know would reach nothing.
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        let _ = (host, group, rank, generation);
+    }
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
     /// Returns the previous epoch at `host` to serving.
@@ -187,6 +193,10 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
 
     fn command(&mut self, host: &str, generation: u64, command: process::Command) {
         (**self).command(host, generation, command)
+    }
+
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        (**self).adopt(host, group, rank, generation)
     }
 
     fn serve(&mut self, epoch: u64, requests: &str) {
@@ -247,6 +257,8 @@ pub(crate) struct Switch {
     update: Update,
     /// The target epoch's number, which the record is kept under.
     target: u64,
+    /// The hosts whose targets the daemon has yet to give their programs.
+    awaiting_programs: BTreeSet<String>,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
     /// The launch generation the target's children are started at.
@@ -353,6 +365,7 @@ impl Switch {
             build: start.build,
             requests,
             phase: Phase::Preparing,
+            awaiting_programs: BTreeSet::new(),
             retire: discarded,
             park_sent: BTreeSet::new(),
             parked: BTreeSet::new(),
@@ -436,6 +449,9 @@ impl Switch {
     /// claims the target world's storage before the child maps it.
     pub(crate) fn start(&mut self, roster: &mut impl Roster) {
         for node in &self.nodes {
+            roster.adopt(&node.host, &self.group, node.rank, self.previous_generation);
+        }
+        for node in &self.nodes {
             let spawn = Spawn {
                 host: node.host.clone(),
                 group: self.group.clone(),
@@ -501,6 +517,18 @@ impl Switch {
             return;
         }
         self.parked.insert(host.to_owned());
+        self.progress(roster);
+    }
+
+    /// States that `hosts`' targets are given their programs by the daemon, so none of them is
+    /// promoted before it holds them: a target parks before any `Precopy` names a generation.
+    pub(crate) fn await_programs(&mut self, hosts: impl IntoIterator<Item = String>) {
+        self.awaiting_programs.extend(hosts);
+    }
+
+    /// `host`'s target took its programs.
+    pub(crate) fn handed(&mut self, roster: &mut impl Roster, host: &str) {
+        self.awaiting_programs.remove(host);
         self.progress(roster);
     }
 
@@ -993,7 +1021,9 @@ impl Switch {
     fn progress(&mut self, roster: &mut impl Roster) {
         let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
         match self.phase {
-            Phase::Preparing if hosts.is_subset(&self.parked) => {
+            Phase::Preparing
+                if hosts.is_subset(&self.parked) && self.awaiting_programs.is_empty() =>
+            {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());
                 for node in &self.nodes {

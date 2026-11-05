@@ -267,6 +267,27 @@ impl Control {
         &mut self.daemon
     }
 
+    /// The fronts a report of this process's own state may go out on: the
+    /// launching daemon's, and every daemon that attached since.
+    ///
+    /// A handover closes the launching daemon's front and leaves the attached
+    /// ones serving (§7.5.1 step 2), so a process that reported only on index 0
+    /// would fall silent exactly when a successor took it over — and the
+    /// successor's `/metrics` would hold no figure of the engine it inherited.
+    /// Every daemon keeps its own registry, so a report on each front is one
+    /// figure per registry, not one figure counted twice.
+    pub fn report_fronts(&self) -> Vec<usize> {
+        let mut fronts = vec![0];
+        fronts.extend(
+            self.attached
+                .iter()
+                .enumerate()
+                .filter(|(_, front)| front.is_some())
+                .map(|(index, _)| index + 1),
+        );
+        fronts
+    }
+
     /// The connection of the front `front`, when it is live: index 0 is the
     /// daemon that launched this process.
     pub fn front_mut(&mut self, front: usize) -> Option<&mut Connection> {
@@ -515,6 +536,9 @@ mod tests {
         refusal: String,
         frame: Option<proto::request::wire::ToEngine>,
     ) -> std::thread::JoinHandle<(proto::request::wire::Hello, proto::request::wire::State)> {
+        // Whether the daemon refuses this engine, kept beside the welcome it is sent in: the
+        // fixture's own branch below asks the same question, and the welcome consumes the string.
+        let refuses = !refusal.is_empty();
         std::thread::spawn(move || {
             let mut connection = loop {
                 match listener.try_accept() {
@@ -536,15 +560,22 @@ mod tests {
                     spec: None,
                 })
                 .expect("answering the hello");
-            let reported: Option<proto::request::wire::FromEngine> = connection
-                .recv(Duration::from_secs(10))
-                .expect("reading the state");
-            let state: proto::request::wire::State = reported
-                .and_then(|message| match message.kind {
-                    Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
-                    _ => None,
-                })
-                .expect("the engine stated what it serves");
+            // A refused engine states nothing: the refusal is the whole answer and the engine
+            // closes the connection after reading it, which is the correct behaviour and the
+            // reason this fixture must not wait for a state frame it will never receive.
+            let state: proto::request::wire::State = if !refuses {
+                let reported: Option<proto::request::wire::FromEngine> = connection
+                    .recv(Duration::from_secs(10))
+                    .expect("reading the state");
+                reported
+                    .and_then(|message| match message.kind {
+                        Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
+                        _ => None,
+                    })
+                    .expect("the engine stated what it serves")
+            } else {
+                proto::request::wire::State::default()
+            };
             if let Some(frame) = frame {
                 connection.send(&frame).expect("sending a frame");
             }

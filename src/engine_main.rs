@@ -557,6 +557,16 @@ pub(crate) fn run(
 /// each executor thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
+/// How many of a request's events this process keeps for a takeover while a handover is open.
+///
+/// The ordinary bound is `EVENT_WINDOW`: what a consumer can be behind by, since the same figure
+/// gates the credit this process waits on. A handover is the one case where that reasoning does
+/// not hold - a predecessor's consumer stops reading at the pause while this process goes on
+/// producing - so the gap a successor's position names grows with the pause. The journal is
+/// widened for it and stays bounded: a takeover whose position is older than what is kept is
+/// refused by name rather than served as a stream with a hole in it.
+pub(crate) const HANDOVER_JOURNAL: usize = proto::request::EVENT_WINDOW as usize * 256;
+
 /// One admitted request and the connection its events belong to.
 ///
 /// A request belongs to the daemon front that submitted it until a `Takeover`
@@ -591,6 +601,13 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
+    /// One statistics reporter per scheduler, in the schedulers' order.
+    ///
+    /// A reporter keeps the cumulative baselines of the counters it has already
+    /// reported, so each increment appears in exactly one snapshot: the same
+    /// reporter must see every pass (§2.3's `/metrics`, `uniserve:num_requests_running`
+    /// and its kind).
+    stats_reporters: Vec<engine::SchedulerStatsReporter>,
     /// This node's device executors, shared with the schedulers that submit through them: one
     /// executor thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
@@ -910,9 +927,13 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
 
+        let stats_reporters = (0..schedulers.len())
+            .map(|_| engine::SchedulerStatsReporter::default())
+            .collect();
         let mut process = Self {
             control,
             schedulers,
+            stats_reporters,
             executors,
             memory: Some(memory),
             storage: Some(retained),
@@ -1711,9 +1732,15 @@ impl MainProcess {
     fn answer(&mut self, reply: Option<u32>, status: ProgramStatus) {
         // §7.3's steps are answered here. A run that stops between two of them needs to know which
         // one was answered last, and the daemon's own log of its commands is not this side's.
+        // The reason travels with the status, and a run that reads only this log needs it too.
+        let failure = match &status {
+            ProgramStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
+            _ => String::new(),
+        };
         tracing::info!(
             status = status_name(&status),
             to_peer = reply.is_some(),
+            failure,
             "answering the epoch's program layer"
         );
         if let Some(rank) = reply {
@@ -2625,7 +2652,7 @@ impl MainProcess {
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
                     let policy =
-                        matches!(poll_answers(&precopy.policies), Some(StageFailure::Pending));
+                        matches!(poll_answers(&mut precopy.policies), Some(StageFailure::Pending));
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -2646,7 +2673,7 @@ impl MainProcess {
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
-                match poll_answers(&precopy.policies) {
+                match poll_answers(&mut precopy.policies) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Executors(submissions);
                         self.precopy = Some(precopy);
@@ -2810,7 +2837,7 @@ impl MainProcess {
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            PrecopyStage::Shadow(answers) => {
+            PrecopyStage::Shadow(mut answers) => {
                 // A shadow step runs inside a batch the scheduler forms from its resident requests.
                 // An engine with none forms no batch, so the step never runs and nothing is
                 // compared - and a comparison nobody made is how a wrong kernel reaches a
@@ -2827,7 +2854,7 @@ impl MainProcess {
                 }
                 // The shadow pass runs on the scheduler's own thread, one step of the batches it
                 // formed, so the serve pass polls it rather than waiting (§2.4).
-                match poll_answers(&answers) {
+                match poll_answers(&mut answers) {
                     Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Shadow(answers);
                         self.precopy = Some(precopy);
@@ -3334,6 +3361,8 @@ impl MainProcess {
                 },
             )),
         });
+        // The request link says so too: the daemon's client waits on it to move its frontend.
+        self.announce(proto::request::wire::EngineState::Ready)?;
         Ok(())
     }
 
@@ -3728,10 +3757,10 @@ impl MainProcess {
                 return Ok(());
             }
             Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
-                let Some(served) = self
+                let Some(index) = self
                     .streams
-                    .iter_mut()
-                    .find(|served| served.request == command.request)
+                    .iter()
+                    .position(|served| served.request == command.request)
                 else {
                     // A handover's takeover names a request this process kept running for it:
                     // one it does not hold is either a request that ended first or a front that
@@ -3747,8 +3776,50 @@ impl MainProcess {
                 // The request is this daemon's from the position its consumer states: what the
                 // predecessor produced past it is replayed, because its own consumer stopped
                 // reading at the pause.
-                let replay = replay_after(&served.kept, takeover.events);
-                served.front = front;
+                //
+                // The journal and the position are read out before the process is borrowed again:
+                // a refusal writes to a front, and the stream is a field of the same process.
+                let kept = self.streams[index].kept.clone();
+                let sent = self.streams[index].sent;
+                // A position older than the journal cannot be replayed: the events between it and
+                // the oldest one kept were dropped, and handing the successor what is left is a
+                // stream that skips tokens with nothing saying so. It is refused, naming the two
+                // positions and how far behind the consumer was, so the daemon ends the response
+                // instead of serving a body with a hole in it.
+                if let (Some((oldest, _)), true) = (kept.front(), sent > takeover.events) {
+                    if takeover.events + 1 < *oldest {
+                        let oldest = *oldest;
+                        let behind = sent - takeover.events;
+                        tracing::error!(
+                            request = command.request,
+                            front,
+                            from = takeover.events,
+                            oldest,
+                            sent,
+                            behind,
+                            "a takeover names a position this process no longer holds: the \
+                             consumer was more events behind than the journal kept"
+                        );
+                        self.reject(
+                            front,
+                            command.request,
+                            proto::request::RejectionKind::Overloaded,
+                            format!(
+                                "the request could not be taken over: its consumer's position \
+                                 {} is {} event(s) behind, and this process kept the last {} of \
+                                 them from position {} - the handover produced more events of \
+                                 this request than a pause may",
+                                takeover.events,
+                                behind,
+                                kept.len(),
+                                oldest,
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
+                let replay = replay_after(&kept, takeover.events);
+                self.streams[index].front = front;
                 for event in replay {
                     tracing::debug!(
                         request = command.request,
@@ -3824,7 +3895,6 @@ impl MainProcess {
             // daemon moves the frontend when this process states that it serves.
             Some(proto::request::wire::engine_command::Kind::Promote(_)) => {
                 self.promote_in_place()?;
-                self.announce(proto::request::wire::EngineState::Ready)?;
                 return Ok(None);
             }
             // §7.5.1 step 2: a hot restart's successor gives this engine a second daemon front, so
@@ -4053,14 +4123,65 @@ impl MainProcess {
             policy_calls,
             memory,
         };
-        if let Err(error) = self
-            .control
-            .daemon_mut()
-            .send(&proto::request::wire::FromEngine {
-                kind: Some(proto::request::wire::from_engine::Kind::Metrics(metrics)),
-            })
+        // The scheduler statistics travel beside the counters: a daemon records
+        // `uniserve:num_requests_running` and its kind from this snapshot, so a process that
+        // sent only the allocator's figures would report an idle deployment forever.
+        let mut snapshots = Vec::with_capacity(self.schedulers.len());
+        for (index, (scheduler, reporter)) in self
+            .schedulers
+            .iter()
+            .zip(&mut self.stats_reporters)
+            .enumerate()
         {
-            tracing::warn!(%error, "reporting the engine's metrics failed");
+            let snapshot = reporter.snapshot(scheduler.stats());
+            if let Ok(snapshot) = snapshot.encode() {
+                snapshots.push(proto::request::wire::Stats {
+                    scheduler: index as u32,
+                    snapshot,
+                });
+            }
+        }
+        // Every live front is told: the daemon that launched this process, and each daemon
+        // that attached to it (§7.5.1 step 2). A handover closes the launching daemon's front
+        // and leaves the successor's serving, so a report aimed at index 0 alone would stop
+        // exactly when the successor owns the engine - and the successor's `/metrics` would
+        // hold no figure of what it inherited. Each daemon keeps its own registry, so a report
+        // on each front is one figure per registry.
+        let fronts = self.control.report_fronts();
+        let mut delivered = 0;
+        let mut failure = None;
+        for front in fronts {
+            let Some(connection) = self.control.front_mut(front) else {
+                continue;
+            };
+            let sent = connection
+                .send(&proto::request::wire::FromEngine {
+                    kind: Some(proto::request::wire::from_engine::Kind::Metrics(
+                        metrics.clone(),
+                    )),
+                })
+                .and_then(|()| {
+                    for stats in &snapshots {
+                        connection.send(&proto::request::wire::FromEngine {
+                            kind: Some(proto::request::wire::from_engine::Kind::Stats(
+                                stats.clone(),
+                            )),
+                        })?;
+                    }
+                    Ok(())
+                });
+            match sent {
+                Ok(()) => delivered += 1,
+                Err(error) => failure = Some(error),
+            }
+        }
+        if delivered == 0 {
+            if let Some(error) = failure {
+                tracing::warn!(
+                    %error,
+                    "reporting the engine's metrics failed: no front of this process is live"
+                );
+            }
         }
     }
 
@@ -4126,6 +4247,10 @@ impl MainProcess {
         // The streams are taken out so that sending an event can borrow the process: the map is
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
+        // Whether a handover is open, read once for the pass: a second front that has attached and
+        // not yet taken its requests over. The journal's bound is wider while it is, because a
+        // predecessor's consumer stops reading at the pause while this process keeps producing.
+        let handover_open = self.control.attached_fronts() > 0;
         let mut running = Vec::with_capacity(streams.len());
         for mut served in streams {
             let id = served.request;
@@ -4159,7 +4284,23 @@ impl MainProcess {
                         // earlier position replays.
                         served.sent += 1;
                         served.kept.push_back((served.sent, wire.clone()));
-                        while served.kept.len() > proto::request::EVENT_WINDOW as usize {
+                        // The journal's bound is `EVENT_WINDOW` events - what a consumer can be
+                        // behind by, since the same figure gates the credit this process waits on
+                        // - EXCEPT while a handover is open. A predecessor's consumer stops
+                        // reading at the pause and this process keeps producing, so the gap a
+                        // successor's position names grows with the pause and not with the
+                        // consumer. A journal trimmed to the ordinary bound therefore drops the
+                        // events in the middle of the pause, and the replay that follows hands the
+                        // successor a stream with a hole in it. The wider bound is the pause's,
+                        // and it is still a bound: a handover that produces more than this many
+                        // events of one request is refused at the takeover by name rather than
+                        // served with a gap.
+                        let bound = if handover_open {
+                            HANDOVER_JOURNAL
+                        } else {
+                            proto::request::EVENT_WINDOW as usize
+                        };
+                        while served.kept.len() > bound {
                             served.kept.pop_front();
                         }
                         self.send_event(
@@ -4458,13 +4599,11 @@ impl MainProcess {
             );
         }
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.switchover_policy(),
                 self.watchdog.stall_bound(),
                 "the policy switchover",
-            ) {
-                tracing::error!(%error, "switching the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4480,13 +4619,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.revert_policy(),
                 self.watchdog.stall_bound(),
                 "the policy revert",
-            ) {
-                tracing::error!(%error, "reverting the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4611,11 +4748,15 @@ fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
 /// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
 /// may not wait on a stage whose length the daemon's load decides (§2.4).
 fn poll_answers(
-    answers: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+    answers: &mut Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
 ) -> Option<StageFailure> {
-    for receiver in answers {
+    // An answer is taken once and its sender is gone after it, so a receiver that answered leaves
+    // the list: polling it again would read a scheduler that finished as one that was lost.
+    while let Some(receiver) = answers.first() {
         match receiver.try_recv() {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                answers.remove(0);
+            }
             Ok(Err(reason)) => return Some(StageFailure::Failed(reason)),
             Err(crossbeam_channel::TryRecvError::Empty) => return Some(StageFailure::Pending),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -4626,6 +4767,23 @@ fn poll_answers(
         }
     }
     None
+}
+
+/// Logs one scheduler's answer to a policy step when it comes, off the control thread.
+///
+/// A scheduler answers at its next batch boundary, and it reaches that boundary only while the
+/// control thread drains what it sends: a control thread that waited here held the scheduler it
+/// waited for, and a switchover under traffic stood still for the whole stall bound (§2.4).
+fn report_policy_answer(
+    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
+    bound: Duration,
+    what: &'static str,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = answer(receiver, bound, what) {
+            tracing::error!(%error, "a scheduling policy step failed");
+        }
+    });
 }
 
 /// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
