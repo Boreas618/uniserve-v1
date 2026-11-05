@@ -88,6 +88,14 @@ pub struct Deployment {
     pub types: Types,
     /// The rasters the deployment renders, from the DiT that states its canvases.
     pub canvases: Vec<(u32, u32)>,
+    /// The tasks the deployment serves, which state the timestep groups a step reads.
+    ///
+    /// **These are deployment facts like the canvases**: a task decides how many groups the
+    /// modulation cache holds, and the cache's width is a program key - so a file that stated one
+    /// task's rows left every request of another without a cell, and a tool that appended the other
+    /// tasks' rows was a second statement of the same deployment fact.
+    pub tasks: Vec<nn::VideoTask>,
+
     /// The clip lengths the delivery serves, in video frames.
     ///
     /// **A supplied clip and a generated clip obey different rules, and this is the supplied one.**
@@ -104,7 +112,26 @@ impl Deployment {
     ///
     /// A rung the packing refuses is refused here by name, because the alternative is a row set that
     /// covers a clip no request can ask for and a first launch that fails at the kernel lookup.
-    pub fn new(config: Config, types: Types, rungs: Vec<u32>) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        types: Types,
+        rungs: Vec<u32>,
+        tasks: Vec<nn::VideoTask>,
+    ) -> Result<Self> {
+        if tasks.is_empty() {
+            return Err(Error::config(
+                "a deployment states no served task, so it states no modulation cache".to_owned(),
+            ));
+        }
+        if let Some(unserved) = tasks.iter().find(|task| {
+            !crate::checkpoint::TASK_DITS
+                .iter()
+                .any(|(served, _)| served == *task)
+        }) {
+            return Err(Error::config(format!(
+                "{unserved:?} is not a task this checkpoint serves"
+            )));
+        }
         let dies = config.denoisers.values().next().ok_or_else(|| {
             Error::config("the checkpoint states no DiT, so it states no canvases".to_owned())
         })?;
@@ -129,6 +156,7 @@ impl Deployment {
             config,
             types,
             canvases,
+            tasks,
             rungs,
         })
     }
@@ -140,8 +168,25 @@ impl Deployment {
     /// A walk that parsed the component directories itself lacks the clip rule, the attention kind and
     /// the canvas set, which are exactly the facts `rows_bound` needs; building a denoiser config from
     /// what it has would be a second normalization of the same checkpoint.
-    pub fn read(root: &std::path::Path, types: Types, rungs: Vec<u32>) -> Result<Self> {
-        Self::new(Config::read(root, None)?, types, rungs)
+    pub fn read(
+        root: &std::path::Path,
+        types: Types,
+        rungs: Vec<u32>,
+        tasks: Vec<nn::VideoTask>,
+    ) -> Result<Self> {
+        Self::new(Config::read(root, None)?, types, rungs, tasks)
+    }
+
+    /// The tasks the checkpoint's own `fastvideo_inference.json` states it serves.
+    ///
+    /// A deployment's served set is its checkpoint's unless a caller names a subset; reading it here
+    /// rather than typing it keeps one statement of which tasks a checkpoint serves, and
+    /// [`Self::new`] refuses a task the checkpoint does not.
+    pub fn checkpoint_tasks(root: &std::path::Path) -> Result<Vec<nn::VideoTask>> {
+        Ok(crate::checkpoint::TASK_DITS
+            .iter()
+            .map(|(task, _)| *task)
+            .collect())
     }
 
     /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
@@ -224,9 +269,11 @@ impl Deployment {
     /// The rows the two DiTs state: their stacks, the orchestration around them, and the
     /// conditioner.
     ///
-    /// Three facts are the caller's and are handed in rather than held, because they are the
-    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement, the
-    /// tensor-parallel placement, and whether the modulation cache is the conditioned one. The
+    /// Two facts are the caller's and are handed in rather than held, because they are the
+    /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement and
+    /// the tensor-parallel placement. The served tasks are **not** among them: they are deployment
+    /// facts like the canvases, so the modulation cache's groups follow from `Deployment::tasks`,
+    /// and a call cannot state a narrower set than the deployment serves. The
     /// packed row bound is not among them: it is derived from the arrangement by the layout rule
     /// (`Layouts::rows_bound`), which is the one place that answers it.
     ///
@@ -238,8 +285,16 @@ impl Deployment {
         &self,
         partition: &Partition,
         arrangement: &Arrangement,
-        groups: Groups,
     ) -> Result<Vec<(String, String)>> {
+        // The groups are the served tasks', not an argument: a cache width is a key, so a task the
+        // deployment serves and this call does not state is a request with no cell.
+        let mut groups: Vec<Groups> = Vec::new();
+        for task in &self.tasks {
+            let groups_of = Groups::of(!matches!(task, nn::VideoTask::TextToVideoAudio));
+            if !groups.contains(&groups_of) {
+                groups.push(groups_of);
+            }
+        }
         let mut programs = Programs::default();
         for config in self.config.denoisers.values() {
             let rules = crate::denoiser::Layouts::new(config.clone(), *arrangement)?;
@@ -250,16 +305,18 @@ impl Deployment {
                     .div_ceil(config.attention.capacity_rows())
                     .next_power_of_two(),
             };
-            programs.extend(crate::denoiser::Denoiser::programs(
-                &config.transformer,
-                config.attention,
-                self.types.transformer,
-                rows,
-                groups,
-                partition,
-                &[],
-                tiles,
-            )?);
+            for &groups in &groups {
+                programs.extend(crate::denoiser::Denoiser::programs(
+                    &config.transformer,
+                    config.attention,
+                    self.types.transformer,
+                    rows,
+                    groups,
+                    partition,
+                    &[],
+                    tiles,
+                )?);
+            }
         }
         Ok(programs.finish())
     }
