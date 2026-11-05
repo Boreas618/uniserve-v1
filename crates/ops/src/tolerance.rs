@@ -32,13 +32,14 @@
 //!   convolution, an attention score — where the result can cancel and `Σ|aᵢbᵢ|` can exceed it.
 //!   For summed products of independent signs, `|result| ≈ √n·σ` and `Σ|aᵢbᵢ| ≈ n·σ`, so the bound
 //!   relative to the result is `2γₙ√n`; this is the standard statistical reading of the same
-//!   inequality, not a relaxation of it. A row that cancels harder than that is not covered by any
-//!   data-free bound, and an operator that has such rows declares an envelope with
-//!   [`Tolerance::with_atol`] and says in its documentation what data the envelope is for.
+//!   inequality, not a relaxation of it. One element of such an output can cancel far below its
+//!   own `Σ|aᵢbᵢ|`, so the bound is taken against the largest magnitude of the output it belongs
+//!   to, which is the same order as that sum, rather than against the element's own value.
 //! - [`Tolerance::exact`] is for an operator that only moves values: a gather, a scatter, a sort of
 //!   indices. Two implementations of a copy agree bit for bit.
 //!
-//! The comparison is `|candidate − reference| ≤ atol + rtol·|reference|`.
+//! The comparison is `|candidate − reference| ≤ atol + rtol·magnitude`, where the magnitude is
+//! `|reference|`, or the output's largest `|reference|` for a bound that [`Tolerance::cancels`].
 
 use crate::tensor::DType;
 
@@ -49,6 +50,9 @@ pub struct Tolerance {
     pub atol: f32,
     /// The bound relative to the reference value.
     pub rtol: f32,
+    /// Whether an element may cancel below its own terms, so that `rtol` is relative to the largest
+    /// magnitude of the output and not to the element.
+    pub cancels: bool,
 }
 
 impl Tolerance {
@@ -57,12 +61,17 @@ impl Tolerance {
         Self {
             atol: 0.0,
             rtol: 0.0,
+            cancels: false,
         }
     }
 
     /// A bound stated directly.
     pub const fn new(atol: f32, rtol: f32) -> Self {
-        Self { atol, rtol }
+        Self {
+            atol,
+            rtol,
+            cancels: false,
+        }
     }
 
     /// `2γₙ(u) + u_out`: two implementations of a reduction whose result is the scale of its
@@ -71,6 +80,7 @@ impl Tolerance {
         Self {
             atol: 0.0,
             rtol: relative(2.0 * gamma(reduction, accumulate) + output.unit_roundoff()),
+            cancels: false,
         }
     }
 
@@ -84,6 +94,7 @@ impl Tolerance {
                 2.0 * gamma(reduction as u64, accumulate) * reduction.sqrt()
                     + output.unit_roundoff(),
             ),
+            cancels: true,
         }
     }
 
@@ -97,8 +108,15 @@ impl Tolerance {
 
     /// Whether `candidate` is within this bound of `reference`.
     pub fn allows(&self, reference: f32, candidate: f32) -> bool {
+        self.allows_within(reference.abs(), reference, candidate)
+    }
+
+    /// Whether `candidate` is within this bound of `reference`, an element of an output whose
+    /// largest magnitude is `peak`.
+    pub fn allows_within(&self, peak: f32, reference: f32, candidate: f32) -> bool {
         let difference = (f64::from(candidate) - f64::from(reference)).abs();
-        let bound = f64::from(self.atol) + f64::from(self.rtol) * f64::from(reference).abs();
+        let magnitude = if self.cancels { peak } else { reference.abs() };
+        let bound = f64::from(self.atol) + f64::from(self.rtol) * f64::from(magnitude);
         difference <= bound
     }
 }
