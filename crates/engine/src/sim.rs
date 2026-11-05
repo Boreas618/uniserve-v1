@@ -75,6 +75,10 @@ pub struct SimLoss {
     /// The group reported lost: it stays lost for the executor's lifetime, so
     /// it reports not ready after the report has been answered.
     group: Arc<Mutex<Option<WorkerGroupId>>>,
+    /// Whether the lost group is closed as well as lost: a launch that cannot
+    /// be replaced closes its group, while one whose replacement is starting
+    /// is not ready but not closed.
+    closed: Arc<Mutex<bool>>,
     /// The report the executor's next poll answers with, taken once.
     pending: Arc<Mutex<Option<(WorkerGroupId, String)>>>,
     /// Wakes a scheduler parked on this executor, so the loss is answered
@@ -97,6 +101,10 @@ impl SimLoss {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(lost.is_none(), "a simulated loss is reported once");
             *lost = Some(group.clone());
+            *self
+                .closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             let mut pending = self
                 .pending
                 .lock()
@@ -111,6 +119,47 @@ impl SimLoss {
         {
             waker.wake();
         }
+    }
+
+    /// Reports `group` lost while a replacement is starting: the group is not
+    /// ready, and it is not closed either, so the scheduler waits for the
+    /// replacement instead of treating the engine as unserved.
+    ///
+    /// [`Self::restore`] stands a replacement in its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous report is still pending: a loss is delivered once.
+    pub fn lose_to_replace(&self, group: WorkerGroupId, message: impl Into<String>) {
+        self.lose(group, message);
+        *self
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+
+    /// Installs a replacement group: it is ready again and takes work.
+    pub fn restore(&self, group: &WorkerGroupId) {
+        let mut lost = self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lost.as_ref().is_some_and(|name| name == group) {
+            *lost = None;
+        }
+    }
+
+    /// Whether `group` was reported lost beyond replacement.
+    fn is_closed(&self, group: &WorkerGroupId) -> bool {
+        let lost = self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let closed = *self
+            .closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lost.as_ref().is_some_and(|name| name == group) && closed
     }
 
     /// Wakes `waker` when a loss is reported, so a scheduler parked on this
@@ -462,6 +511,12 @@ impl Executor for SimExecutor {
             _ => self.admissions.contains(&command.request_key()),
         };
         !has_owner || (self.handle.is_some() && self.in_flight < self.depth)
+    }
+
+    /// A lost group is closed only once its replacement has failed: while one
+    /// is starting it is not ready, and the scheduler waits for it.
+    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+        self.handle.is_none() || self.loss.is_closed(worker)
     }
 
     fn is_ready(&self, worker: &WorkerGroupId) -> bool {
