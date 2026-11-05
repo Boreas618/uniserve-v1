@@ -177,6 +177,18 @@ pub struct Output {
 
 impl Output {
     /// An output over `media`, building every artifact at `rates`.
+    /// The deployment's one encoder, over the FFmpeg installation this process can reach.
+    ///
+    /// A deployment states the rates and nothing else: the installation is the environment's
+    /// (`MediaConfig::from_env`, which is `UNISERVE_FFMPEG` or the prefix the crate was built
+    /// against), so a plan constructs this in one call and the lane actions borrow it.
+    pub fn from_env(rates: Rates) -> Self {
+        Self::new(
+            Arc::new(media::MediaRunner::new(media::MediaConfig::from_env())),
+            rates,
+        )
+    }
+
     pub fn new(media: Arc<media::MediaRunner>, rates: Rates) -> Self {
         Self {
             media,
