@@ -1582,12 +1582,14 @@ impl Moe {
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
         //    the product multiplies by, and its global scale is the stack's neutral.
         //
-        // The layout here is the **activation plane's**, and it is plain: the encoder writes one
-        // scale per sixteen codes in row-major order. The weights' plane is the checkpoint's own —
-        // swizzled, F8_E4M3 — and reaches the products through *their* descriptors, below. The two
-        // are different fields of different descriptors and must not be swapped: a product told the
-        // activation's layout would dequantize the checkpoint's swizzled table as if it were linear.
-        let activation_layout = ScaleLayout::Linear;
+        // The layout here is the **activation plane's**, and it is the 128x4 swizzled form: every
+        // E2M1 artifact this deployment builds serves the activation side that way
+        // (`gather_gemm_nvfp4`'s `build.py` states it as the artifact's own rule), and the encoder is
+        // launched per descriptor, so a plain layout here asks the store for a program no artifact
+        // covers. The weights' plane is the checkpoint's own, swizzled F8_E4M3, and reaches the
+        // products through *their* descriptors below; the two are different fields of different
+        // descriptors and must not be swapped.
+        let activation_layout = ScaleLayout::Swizzled128X4;
         // The step's whole working set from one table: the plan sums the same extents to size the
         // arena, so every buffer a launch writes is a buffer the plan reserved.
         let step = self.encoded_step(tokens, activation_layout, hidden.dtype)?;

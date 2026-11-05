@@ -404,14 +404,22 @@ fn stage_weights(args: &Args) -> Result<()> {
     };
     let dit = checkpoint.component(args.dit.directory())?;
     let mut store = HostWeights::default();
-    let rows = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?.rows_bound()?;
+    let layouts = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?;
+    let rows = layouts.rows_bound()?;
+    // A sparse deployment states its key-tile bound from its own layouts, exactly as the model's
+    // loading boundary does (`denoiser.rs`): a zero here is a statement that the deployment's
+    // compression reduces over nothing, and `VsaTiles` carries it into the descriptor a plan reads.
+    let tiles = match denoiser.attention {
+        AttentionKind::Sparse { .. } => layouts.tiles_bound()?,
+        AttentionKind::Dense => 0,
+    };
     {
         let mut loader = WeightLoader::new(dit, &mut store, args.dtype, None);
         let _stack = Transformer::load(
             config,
             denoiser.attention,
             rows,
-            0,
+            tiles,
             &partition,
             &mut loader,
             None,
@@ -1200,11 +1208,15 @@ fn stage_block(args: &Args) -> Result<()> {
     let (stack, projections, cache, memory) = {
         let mut loader = WeightLoader::new(dit, &mut weights, args.dtype, None);
         let rows = layouts.rows_bound()?;
+        let tiles = match denoiser.attention {
+            AttentionKind::Sparse { .. } => layouts.tiles_bound()?,
+            AttentionKind::Dense => 0,
+        };
         let stack = Transformer::load(
             &config,
             denoiser.attention,
             rows,
-            0,
+            tiles,
             &partition,
             &mut loader,
             None,

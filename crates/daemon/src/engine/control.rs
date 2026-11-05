@@ -712,6 +712,10 @@ impl EngineControl {
             return Ok(connection);
         }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
+        // Whether the handed-over control connection has been seen to close: it is the
+        // predecessor's own client to the process socket, and a successor serves its own,
+        // so its end is the predecessor leaving and not the engine. Stated once.
+        let mut control_closed = false;
         loop {
             match self.requests.try_accept() {
                 Ok(Some(mut reader)) => {
@@ -727,17 +731,32 @@ impl EngineControl {
                 Ok(None) => {}
                 Err(error) => return Err(error).context("accepting the engine's connection"),
             }
-            if let Some(control) = control.as_deref_mut() {
-                // Which connection closed is the whole content of this failure: the successor
-                // waits on the engine's process link, and an end here means that link went away,
-                // not the handoff channel it is talking to the predecessor over.
-                if let Err(error) = exited(control) {
-                    tracing::warn!(
-                        engine,
-                        %error,
-                        "the engine's process connection closed while this daemon was adopting it"
-                    );
-                    return Err(error);
+            if let Some(control) = control.as_deref_mut()
+                && !control_closed
+            {
+                match still_serving(control) {
+                    Ok(true) => {}
+                    // The handover's own connection: the predecessor's accepted side of its
+                    // process socket closes with its service, so this end reads closed at the
+                    // first look. Which peer ended is the whole content of the failure, and this
+                    // one is the predecessor - the engine may be serving perfectly well, and the
+                    // dial below is what says so.
+                    Ok(false) => {
+                        control_closed = true;
+                        tracing::info!(
+                            engine,
+                            "the handed-over control connection closed; waiting for the engine \
+                             to dial this daemon's request socket"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            engine,
+                            %error,
+                            "the engine's process connection closed while this daemon was adopting it"
+                        );
+                        return Err(error);
+                    }
                 }
             }
             anyhow::ensure!(
@@ -757,6 +776,18 @@ impl Drop for EngineControl {
 
 /// How long a failed engine takes to close its workers and exit, at most.
 const FAILED_EXIT: Duration = Duration::from_secs(120);
+
+/// Whether the control connection still reports a serving engine: `Ok(false)` when it has
+/// closed, which is a connection ending rather than an engine exit.
+fn still_serving(control: &mut Connection) -> anyhow::Result<bool> {
+    match exited(control) {
+        Ok(()) => Ok(true),
+        Err(error) => match error.downcast_ref::<proto::Error>() {
+            Some(proto::Error::Closed) => Ok(false),
+            _ => Err(error),
+        },
+    }
+}
 
 /// Waits up to `timeout` for the daemon to report the engine process's exit
 /// on its control connection; a wait that times out is logged.
@@ -1640,6 +1671,27 @@ mod tests {
                 (7, Seen::Purge(11)),
                 (8, Seen::Purge(12)),
             ]
+        );
+    }
+
+    /// A handover's own control connection closes with the predecessor's service, and
+    /// that is the predecessor leaving, not an engine exit: the successor waits for the
+    /// engine's own dial instead of refusing the adoption (§7.5.1 step 2).
+    #[test]
+    fn a_closed_control_connection_is_not_an_engine_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("processes.sock");
+        let address = format!("unix:{}", path.display());
+        let listener = proto::Listener::bind(&address).unwrap();
+        // The predecessor's client end, whose accepted side closed with its service.
+        let control = proto::Connection::connect(&address).unwrap();
+        drop(listener.try_accept().expect("the accepted connection"));
+        drop(listener);
+
+        let mut control = control;
+        assert!(
+            !still_serving(&mut control).expect("a closed connection is not an engine exit"),
+            "a closed control connection reports that the daemon's own client is gone"
         );
     }
 

@@ -401,6 +401,12 @@ impl Restarter {
             // The responses' sockets go last, so the successor reads them
             // after every other descriptor.
             descriptors.append(&mut stream_descriptors);
+            tracing::info!(
+                descriptors = descriptors.len(),
+                service = service_count,
+                engines = handoff.len(),
+                "the daemon hands its service, its engines and the responses in flight over"
+            );
             let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
             send(
                 &mut sending,
@@ -419,8 +425,18 @@ impl Restarter {
                 &borrowed,
             )?;
         }
-        drop(descriptors);
+        // The predecessor's copies of what it handed over stay open until the successor
+        // answers: closing them at the send was the earliest moment a peer could see its own
+        // interface go away, and the successor had by then neither resumed it nor claimed the
+        // deployment.
         self.handed_over.store(true, Ordering::Release);
+        // From here the successor owns these engines: this daemon's watch sees their clients
+        // go away with the handover and must not read that as a loss.
+        for replica in leader.replicas() {
+            replica
+                .handed_over
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         for replica in handoff {
             replica.client.attach(&requests);
         }
@@ -441,6 +457,8 @@ impl Restarter {
             }
             (other, _) => anyhow::bail!("the successor answered {other:?}"),
         };
+        // The successor holds the service now, and this daemon is done with its copies.
+        drop(descriptors);
         // The successor's own id either way: it is the process the `handoff ...
         // adopted` record names, and the one every response it did not take
         // stays paused behind here.
@@ -697,7 +715,15 @@ async fn prepared_successor(
     )?;
 
     let (takeover, descriptors) = match recv(channel).await? {
-        (Message::Takeover(takeover), descriptors) => (takeover, descriptors),
+        (Message::Takeover(takeover), descriptors) => {
+            tracing::info!(
+                descriptors = descriptors.len(),
+                service = takeover.service_descriptors,
+                engines = takeover.replicas.len(),
+                "the successor received the service, the engines and the responses in flight"
+            );
+            (takeover, descriptors)
+        }
         (Message::Failed { reason }, _) => anyhow::bail!("the daemon gave up: {reason}"),
         (other, _) => anyhow::bail!("the daemon sent {other:?}"),
     };
