@@ -603,11 +603,18 @@ impl Transformer {
             let tiles_layer = nn::layers::VsaTiles::new(tile, heads, head, config.qk_norm_eps)?
                 .with_rotation(rotated)?
                 .with_tile_bound(tiles)?;
+            // `SegmentAttention`'s fourth argument is the key **row** bound, not the tile bound:
+            // `keys` is "the largest key extent the compiled program serves, from the same
+            // packing", and the layer refuses a value that is not whole `tile`-row tiles. `tiles`
+            // is the reduction length in tiles, and passing it here compiled a program for
+            // `tiles` rows - 43x short of the deployment's packed bound - while passing the
+            // constructor's divisibility check whenever the tile bound happened to divide by the
+            // tile. The other call site (`attention_sparse.rs`) already passes `rows`.
             let fine = nn::layers::SegmentAttention::new(
                 u64::from(tile),
                 u64::from(heads),
                 u64::from(head),
-                u64::from(tiles),
+                u64::from(rows),
                 dtype,
             )?;
             // The prepare launch compiles its strides in, and the buffers are the model's own:
