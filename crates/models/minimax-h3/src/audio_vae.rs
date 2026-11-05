@@ -478,9 +478,13 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         }
     };
 
-    sources.push(normalized(
+    // The decoder's input is a plain 1x1 convolution in the reference - `nn.Conv1d(latent_channels,
+    // latent_dim, 1)` outside `_normalized` - and the checkpoint stores it as one weight, so a
+    // normalized pair here asked for two tensors the export does not have and left the one it does
+    // have unread. The body's 136 convolutions *are* weight-normalized and stay so.
+    sources.push(region(
         "input.weight".to_owned(),
-        "dec_in_proj".to_owned(),
+        "dec_in_proj.weight".to_owned(),
     ));
     sources.push(region(
         "input.bias".to_owned(),
@@ -1541,10 +1545,19 @@ pub(crate) mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // The input projection is the one convolution the reference does not normalize, and the
+        // checkpoint therefore holds one weight for it: a list that asked for a pair would name two
+        // tensors the export does not have and leave the one it has unread (`M5621`'s measurement:
+        // 915 asked against 914 stored, one name each way).
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight"));
+        assert!(
+            keys.iter()
+                .all(|key| !key.starts_with("dec_in_proj.weight_")),
+            "the input projection holds no normalized pair"
+        );
         // A weight-normalized convolution reads a direction and a magnitude, and the load needs both:
         // a list that named only the direction would refuse a checkpoint that is complete.
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_v"));
-        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_g"));
+        assert!(keys.iter().any(|key| key == "decoder.conv_pre.weight_v"));
         let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
         let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
         assert_eq!(magnitudes, directions, "every magnitude has its direction");
