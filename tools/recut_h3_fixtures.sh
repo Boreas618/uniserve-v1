@@ -74,8 +74,19 @@ sparse=64,0.9,8192
 # descriptor with the launch refusing outside it, not in a walk argument that works because nothing
 # tested past it. Delete these two lines the moment the walk reads `rows_bound()`; until then a walk
 # cut below them stamps rows for a packed count the deployment cannot be asked to be.
+# These are the fallback, not the answer: the probe below runs the walk with no `--rows` and uses
+# them only when the walk refuses it. `rows_bound()` is the one authority, and h3-builder04 measured
+# the walk's bound (303056) apart from the serving path's (304912/304976) — so a constant here is a
+# second statement of a live disagreement. **They leave this file when the walk reads the bound.**
 rows_dense=306896
 rows_sparse=353152
+rows_flag=()
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --samples 256 --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
+    --elements "$elements" --track "$track" >/dev/null 2>&1; then
+    rows_flag=(--rows)
+fi
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
@@ -132,14 +143,14 @@ rm -f "$probe"
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
-    --samples "$samples" --rasters "$rasters" --tokens "$tokens" --rows "$rows_dense" \
+    --samples "$samples" --rasters "$rasters" --tokens "$tokens" ${rows_flag:+"${rows_flag[@]}" "$rows_dense"} \
     --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
     --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
-    --types "$types" --rows "$rows_sparse" --sparse "$sparse" >"$walk_sparse"
+    --types "$types" ${rows_flag:+"${rows_flag[@]}" "$rows_sparse"} --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
