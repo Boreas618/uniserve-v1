@@ -727,12 +727,21 @@ impl Transformer {
 
         // The feed-forward's stepwise gated activation: one rounding each, which is a different
         // program from the fused recipe the video decoder's SwiGLU uses.
+        //
+        // **Both row strides are twice the width, because the two halves come from one packed
+        // projection.** `forward` reads them through `projection_halves`, which keeps the packed
+        // tensor's strides: a `[rows, 2 * intermediate]` buffer gives each half a row stride of
+        // `2 * intermediate`, and that is the number the kernel's descriptor carries - so this
+        // statement, the launch, and the deployment list's row are one value, not three. Stating the
+        // width here instead would have been a second, wrong answer to a question the launch already
+        // answers, and the walk that records the launch is what a store is built from.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
         programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
             dtype,
             u64::from(config.intermediate_size),
             nn::layers::Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
+            packed_stride,
+            packed_stride,
             u64::from(rows) * u64::from(config.intermediate_size),
             true,
         )?);
