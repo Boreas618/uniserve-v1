@@ -416,8 +416,13 @@ impl StagedRequest {
             )));
         };
         if record.len() != PARAMETER_BYTES {
+            // The refusal names the **shape**, not the width it expects: the width is
+            // `PARAMETER_BYTES`, which every column this record gains moves by a field, and a
+            // refusal that prints it states a fact about the build rather than about what was
+            // handed over. What the reader needs is which record this is and what arrived.
             return Err(Error::Invalid(format!(
-                "a media request's parameter record is {} bytes; it is {PARAMETER_BYTES}",
+                "a media request's parameter record is step, steps, seed, width, height, frames and \
+                 the request's three identities; this one is {} bytes, which is not that shape",
                 record.len()
             )));
         }
@@ -1284,9 +1289,14 @@ mod media_tests {
     fn a_staged_request_of_the_wrong_shape_is_refused_by_name() {
         let short = vec![vec![0u8; 3], vec![0u8; PARAMETER_BYTES - 1]];
         let error = StagedRequest::decode(&short).expect_err("a truncated record");
+        let text = format!("{error}");
         assert!(
-            format!("{error}").contains("parameter record is 27 bytes"),
-            "{error}"
+            text.contains("step, steps, seed, width, height, frames"),
+            "the refusal does not name the record's shape: {text}"
+        );
+        assert!(
+            text.contains(&format!("{} bytes", PARAMETER_BYTES - 1)),
+            "the refusal does not name the record it was given: {text}"
         );
 
         let one = vec![vec![1u8; 3]];

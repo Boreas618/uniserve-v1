@@ -1008,11 +1008,31 @@ mod tests {
         // prefill: a prefill bucket is captured per row size, because rows bound the packing.
         assert_eq!(buckets.len(), 16, "16 buckets, so 16 captures");
 
-        // The catalogues are the default when a deployment names no size, and the plan is their
-        // cross product: 44 decode sizes and 110 prefill token counts give 44 x (2 + 220).
+        // With no configured size the catalogues are the plan, and every size they state is
+        // captured with each computation it admits. The count is derived from them here rather than
+        // written as a figure: a chunk never holds fewer tokens than its rows, so two catalogue
+        // entries can name one bucket and the set holds it once.
         let catalog = Buckets::for_batch(None, None, u32::MAX, u32::MAX, true)
             .expect("the catalogues");
-        assert_eq!(catalog.len(), 44 * (2 + 110 * 2), "the catalog's cross product");
+        let (rows, tokens) = (decode_catalog(), prefill_catalog());
+        let mut stated: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
+        for &row in &rows {
+            stated.insert(Bucket::decode(row, Variant::DecodeGreedy));
+            stated.insert(Bucket::decode(row, Variant::DecodeSampled));
+            for &count in &tokens {
+                for variant in [Variant::PrefillWrite, Variant::PrefillOutput] {
+                    stated.insert(Bucket::prefill(row, count.max(row), variant));
+                }
+            }
+        }
+        assert_eq!(
+            catalog.len(),
+            stated.len(),
+            "one bucket per (variant, rows, tokens) the catalogues state"
+        );
+        for bucket in &stated {
+            assert!(catalog.contains(bucket), "{bucket} is in the catalog's plan");
+        }
     }
 
     /// The catalog is clamped to what the batch plan admits, so nothing is captured that no batch
