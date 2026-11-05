@@ -154,7 +154,7 @@ impl ParallelLMHead {
                             .to_owned(),
                     )
                 })?
-                .all_gather(projected, gathered, f.stream)?;
+                .all_gather(projected, gathered, f.stream()?)?;
             gathered
         } else {
             projected

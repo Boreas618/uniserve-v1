@@ -26,6 +26,7 @@
 //! device mappings. `nn` owns no device memory: a [`Weight`] is a [`Backing`] plus the view the
 //! operator reads.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ops::fp4::ScaleLayout;
@@ -805,10 +806,15 @@ impl Weight {
 
 /// The boundary between a checkpoint and retained storage: converts a weight once and publishes it.
 pub struct WeightLoader<'a> {
-    checkpoint: &'a Checkpoint,
-    store: &'a mut dyn RetainedWeights,
+    /// The checkpoint the weights come from, or `None` for a loader that states shapes only.
+    checkpoint: Option<&'a Checkpoint>,
+    store: Option<&'a mut dyn RetainedWeights>,
     dtype: Option<DType>,
     quantization: Option<Quantization>,
+    /// The checkpoint tensors' extents, when a shapes-only loader states them from a table instead of
+    /// from a checkpoint's headers. A computed weight — the folded form of a weight-normalized
+    /// convolution — has no request to take its extents from, so it is answered from here.
+    extents: Option<&'a BTreeMap<String, (DType, Shape)>>,
 }
 
 impl<'a> WeightLoader<'a> {
@@ -823,15 +829,89 @@ impl<'a> WeightLoader<'a> {
         quantization: Option<Quantization>,
     ) -> Self {
         Self {
-            checkpoint,
-            store,
+            checkpoint: Some(checkpoint),
+            store: Some(store),
             dtype,
             quantization,
+            extents: None,
+        }
+    }
+
+    /// A loader that states every weight's extents and reads nothing.
+    ///
+    /// `load` answers each request with a view of the requested element type and shape at address
+    /// zero, `constant` with the shape it was given, and every path that would need bytes — a
+    /// checkpoint read, a retained-store round trip, a block scale — refuses by name. The caller is a
+    /// model's `load` driven by a **recording** forward (`Forward::recording`): the shapes a load
+    /// derives are what decide the programs a model launches, and the values never reach a kernel. So
+    /// a walk of a model's programs needs no shards and no device.
+    pub fn shapes(dtype: DType) -> Self {
+        Self::stated(dtype, None)
+    }
+
+    /// A shapes-only loader that also states the checkpoint tensors' extents from `extents`.
+    ///
+    /// A weight a module merely reads takes its extents from the request, so a shapes-only loader needs
+    /// no table for it. A weight **computed at load** does: the folded form of a weight-normalized
+    /// convolution reduces `v · g / ‖v‖`, and `v`'s extents are a fact of the checkpoint's header. The
+    /// table is that header's content — produced where the weights are, used where they are not — so a
+    /// walk needs no shard while still stating the shapes the checkpoint really holds.
+    pub fn stated(dtype: DType, extents: Option<&'a BTreeMap<String, (DType, Shape)>>) -> Self {
+        Self {
+            checkpoint: None,
+            store: None,
+            dtype: Some(dtype),
+            quantization: None,
+            extents,
+        }
+    }
+
+    /// Whether this loader reads a checkpoint, or only states shapes.
+    pub const fn is_shapes(&self) -> bool {
+        self.checkpoint.is_none()
+    }
+
+    /// The checkpoint this loader reads.
+    fn shards(&self) -> Result<&'a Checkpoint> {
+        self.checkpoint.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "this loader states weights' shapes and reads no checkpoint: {}",
+                "a weight's bytes were asked for"
+            ))
+        })
+    }
+
+    /// The retained store this loader publishes into.
+    fn retention(&mut self) -> Result<&mut (dyn RetainedWeights + 'a)> {
+        match self.store.as_deref_mut() {
+            Some(store) => Ok(store),
+            None => Err(Error::Unsupported(
+                "this loader states weights' shapes and retains nothing".to_owned(),
+            )),
         }
     }
 
     /// Load `request`, converting and publishing it the first time and reusing it afterwards.
     pub fn load(&mut self, request: &WeightRequest) -> Result<Weight> {
+        // A shapes-only loader states the extents a launch reads and reads no bytes at all.
+        if self.is_shapes() {
+            let dtype = request.pinned.or(self.dtype).ok_or_else(|| {
+                Error::weight(
+                    &request.tensor,
+                    "a shapes-only loader has no checkpoint to read the element type from".to_owned(),
+                )
+            })?;
+            let bytes = request
+                .shape
+                .numel()
+                .checked_mul(dtype.bytes().unwrap_or(0))
+                .ok_or_else(|| Error::weight(&request.tensor, "the weight's bytes overflow"))?;
+            let backing = Backing::new(DevicePtr::new(0), bytes);
+            return Ok(Weight {
+                view: backing.view(dtype, request.shape)?,
+                backing,
+            });
+        }
         if self.quantization.is_some() {
             return Err(Error::Unsupported(format!(
                 "quantization `{}` is converted at load only for the FP8 and NVFP4 step; the BF16 \
@@ -886,7 +966,7 @@ impl<'a> WeightLoader<'a> {
             provenance: None,
         };
 
-        if let Some(backing) = self.store.retained(&key)? {
+        if let Some(backing) = self.retention()?.retained(&key)? {
             return Ok(Weight {
                 view: backing.view(dtype, request.shape)?,
                 backing,
@@ -923,7 +1003,7 @@ impl<'a> WeightLoader<'a> {
         }
 
         check_layout(&request.tensor, &request.source, request.layout)?;
-        let backing = self.store.publish(&key, dtype, request.shape, &bytes)?;
+        let backing = self.retention()?.publish(&key, dtype, request.shape, &bytes)?;
         Ok(Weight {
             view: backing.view(dtype, request.shape)?,
             backing,
@@ -942,8 +1022,48 @@ impl<'a> WeightLoader<'a> {
     /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
     /// be confused with a plain region of either.
     pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
-        let value = self.checkpoint.read(v)?;
-        let gain = self.checkpoint.read(g)?;
+        if self.is_shapes() {
+            // The folded weight keeps `v`'s extents and one gain per output channel; both are facts of
+            // the checkpoint's header, which the table states.
+            let extents = self.extents.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: this loader states shapes but holds no table of the checkpoint's \
+                     extents, and a weight-normalized weight's extents are not in any request"
+                ))
+            })?;
+            let (value_dtype, shape) = extents.get(v).copied().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: the extents table does not name `{v}`, which the folded weight is read from"
+                ))
+            })?;
+            let (_, gain) = extents.get(g).copied().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "{name}: the extents table does not name `{g}`, which carries the gain"
+                ))
+            })?;
+            if gain.numel() != shape.dim(0) {
+                return Err(Error::weight(
+                    name,
+                    format!(
+                        "a gain of {} elements for {} output channels",
+                        gain.numel(),
+                        shape.dim(0)
+                    ),
+                ));
+            }
+            let dtype = self.dtype.unwrap_or(value_dtype);
+            let bytes = shape
+                .numel()
+                .checked_mul(dtype.bytes().unwrap_or(0))
+                .ok_or_else(|| Error::weight(name, "the weight's bytes overflow".to_owned()))?;
+            let backing = Backing::new(DevicePtr::new(0), bytes);
+            return Ok(Weight {
+                view: backing.view(dtype, shape)?,
+                backing,
+            });
+        }
+        let value = self.shards()?.read(v)?;
+        let gain = self.shards()?.read(g)?;
         if value.shape.rank() == 0 {
             return Err(Error::weight(
                 name,
@@ -986,7 +1106,7 @@ impl<'a> WeightLoader<'a> {
 
             provenance: None,
         };
-        if let Some(backing) = self.store.retained(&key)? {
+        if let Some(backing) = self.retention()?.retained(&key)? {
             return Ok(Weight {
                 view: backing.view(dtype, value.shape)?,
                 backing,
@@ -1005,7 +1125,7 @@ impl<'a> WeightLoader<'a> {
             normalized.extend(rows.iter().map(|value| value * scale));
         }
         let bytes = from_f32(dtype, &normalized, name)?;
-        let backing = self.store.publish(&key, dtype, value.shape, &bytes)?;
+        let backing = self.retention()?.publish(&key, dtype, value.shape, &bytes)?;
         Ok(Weight {
             view: backing.view(dtype, value.shape)?,
             backing,
@@ -1027,11 +1147,14 @@ impl<'a> WeightLoader<'a> {
     /// builds two loaders over the same store.
     pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
         self.check_policy(checkpoint)?;
+        let dtype = self.dtype;
+        let quantization = self.quantization;
         Ok(WeightLoader {
-            checkpoint,
-            store: self.store,
-            dtype: self.dtype,
-            quantization: self.quantization,
+            checkpoint: Some(checkpoint),
+            store: Some(self.retention()?),
+            dtype,
+            quantization,
+            extents: None,
         })
     }
 
@@ -1161,7 +1284,7 @@ impl<'a> WeightLoader<'a> {
             block_scale_dtype(&request.tensor, loaded.dtype())?;
             loaded
         } else {
-            let bytes = self.checkpoint.read(&scales.tensor)?;
+            let bytes = self.shards()?.read(&scales.tensor)?;
             let dtype = block_scale_dtype(&scales.tensor, bytes.dtype)?;
             let blocks = file.columns(columns);
             // The request may name a column block of a row-parallel matrix, so the rows are gathered
@@ -1279,7 +1402,7 @@ impl<'a> WeightLoader<'a> {
         field: &str,
         suffix: &str,
     ) -> Result<()> {
-        if self.checkpoint.tensor(tensor).is_some() {
+        if self.shards()?.tensor(tensor).is_some() {
             return Ok(());
         }
         Err(Error::weight(
@@ -1310,7 +1433,7 @@ impl<'a> WeightLoader<'a> {
     /// product's `alpha` and its activation's to build the encoder's operand, so the reading is
     /// public and the reciprocals are its callers'.
     pub fn tensor_scale(&self, request: &WeightRequest) -> Result<f32> {
-        let tensor = self.checkpoint.read(&request.tensor)?;
+        let tensor = self.shards()?.read(&request.tensor)?;
         if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
             return Err(Error::weight(
                 &request.tensor,
@@ -1407,7 +1530,7 @@ impl<'a> WeightLoader<'a> {
                     "packed E2M1 values",
                     spelling.values,
                 )?;
-                let values = self.checkpoint.read(&values_name)?;
+                let values = self.shards()?.read(&values_name)?;
                 if values.dtype != DType::U8 {
                     return Err(Error::weight(
                         &values_name,
@@ -1441,7 +1564,7 @@ impl<'a> WeightLoader<'a> {
                 agreed(&mut rows, rows_here, "rows")?;
                 agreed(&mut columns, columns_here, "columns")?;
 
-                let scales = self.checkpoint.read(&scales_name)?;
+                let scales = self.shards()?.read(&scales_name)?;
                 let here = block_scale_dtype(&scales_name, scales.dtype)?;
                 match scale_dtype {
                     None => scale_dtype = Some(here),
@@ -1474,7 +1597,7 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
 
-                let tensor = self.checkpoint.read(&tensor_name)?;
+                let tensor = self.shards()?.read(&tensor_name)?;
                 if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
                     return Err(Error::weight(
                         &tensor_name,
@@ -1690,13 +1813,13 @@ impl<'a> WeightLoader<'a> {
 
     /// Publish bytes this loader computed, under a key it built, and answer the weight.
     fn publish_computed(&mut self, key: WeightKey, shape: Shape, bytes: &[u8]) -> Result<Weight> {
-        if let Some(backing) = self.store.retained(&key)? {
+        if let Some(backing) = self.retention()?.retained(&key)? {
             return Ok(Weight {
                 view: backing.view(key.dtype, shape)?,
                 backing,
             });
         }
-        let backing = self.store.publish(&key, key.dtype, shape, bytes)?;
+        let backing = self.retention()?.publish(&key, key.dtype, shape, bytes)?;
         Ok(Weight {
             view: backing.view(key.dtype, shape)?,
             backing,
@@ -1738,6 +1861,14 @@ impl<'a> WeightLoader<'a> {
                 ),
             ));
         }
+        // A shapes-only loader states the constant's extents and keeps the bytes nowhere.
+        if self.is_shapes() {
+            let backing = Backing::new(DevicePtr::new(0), expected);
+            return Ok(Weight {
+                view: backing.view(dtype, shape)?,
+                backing,
+            });
+        }
         let key = WeightKey {
             files: Vec::new(),
             dtype,
@@ -1750,9 +1881,9 @@ impl<'a> WeightLoader<'a> {
             },
             provenance: Some(Provenance::computed(producer, bytes)),
         };
-        let backing = match self.store.retained(&key)? {
+        let backing = match self.retention()?.retained(&key)? {
             Some(backing) => backing,
-            None => self.store.publish(&key, dtype, shape, bytes)?,
+            None => self.retention()?.publish(&key, dtype, shape, bytes)?,
         };
         Ok(Weight {
             view: backing.view(dtype, shape)?,
@@ -1765,7 +1896,7 @@ impl<'a> WeightLoader<'a> {
         names
             .iter()
             .map(|name| {
-                self.checkpoint
+                self.shards()?
                     .identity(name)
                     .cloned()
                     .ok_or_else(|| Error::MissingTensor(name.clone()))
@@ -1778,7 +1909,7 @@ impl<'a> WeightLoader<'a> {
         let mut dtype = None;
         for name in names {
             let location = self
-                .checkpoint
+                .shards()?
                 .tensor(name)
                 .ok_or_else(|| Error::MissingTensor(name.clone()))?;
             match dtype {
@@ -1828,10 +1959,10 @@ impl<'a> WeightLoader<'a> {
                 shape,
             } => {
                 let location = self
-                    .checkpoint
+                    .shards()?
                     .tensor(tensor)
                     .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
-                let bytes = self.checkpoint.bytes(location)?.to_vec();
+                let bytes = self.shards()?.bytes(location)?.to_vec();
                 let element = location.dtype.bytes().ok_or_else(|| {
                     Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
                 })?;
@@ -1861,7 +1992,7 @@ impl<'a> WeightLoader<'a> {
                 row_stride,
             } => {
                 let location = self
-                    .checkpoint
+                    .shards()?
                     .tensor(tensor)
                     .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
                 let element = location.dtype.bytes().ok_or_else(|| {
@@ -1881,7 +2012,7 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
                 let rows = shape.numel() / row.max(1);
-                let bytes = self.checkpoint.bytes(location)?;
+                let bytes = self.shards()?.bytes(location)?;
                 let mut gathered =
                     Vec::with_capacity(usize::try_from(shape.numel() * element).unwrap_or(0));
                 for index in 0..rows {
@@ -1911,7 +2042,7 @@ impl<'a> WeightLoader<'a> {
                 let mut part_shape: Option<Shape> = None;
                 for name in parts {
                     let location = self
-                        .checkpoint
+                        .shards()?
                         .tensor(name)
                         .ok_or_else(|| Error::MissingTensor(name.clone()))?;
                     if location.shape.rank() == 0 {
@@ -1937,7 +2068,7 @@ impl<'a> WeightLoader<'a> {
                             }
                         }
                     }
-                    fused.extend_from_slice(self.checkpoint.bytes(location)?);
+                    fused.extend_from_slice(self.shards()?.bytes(location)?);
                 }
                 if fused.is_empty() {
                     return Err(Error::weight(
@@ -2175,6 +2306,32 @@ pub fn f32_to_half(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shapes-only loader answers a weight request with the extents the caller asked for, at
+    /// address zero, and reads nothing: no checkpoint, no shard, no device.
+    ///
+    /// It exists for the walk — a model's own `load` driven by a recording forward — so what it owes is
+    /// the shapes a `load` derives, and what it must not do is pretend to have bytes: a path that needs
+    /// them refuses by name rather than answering a zero.
+    #[test]
+    fn a_shapes_only_loader_states_extents_and_reads_no_bytes() {
+        let mut loader = WeightLoader::shapes(DType::BF16);
+        assert!(loader.is_shapes());
+
+        let request = WeightRequest::region("block.proj.weight", 0, Shape::new(&[64, 128]));
+        let weight = loader.load(&request).expect("the stated weight");
+        assert_eq!(weight.shape().dims(), &[64, 128]);
+        assert_eq!(weight.dtype(), DType::BF16);
+        assert_eq!(weight.view().ptr.address(), 0);
+
+        // A computed weight states its extents too: the H3 loader publishes tables this way.
+        let bytes = [0u8, 0, 0, 0, 1, 0, 0, 0];
+        let constant = loader
+            .constant("video_vae.voxel_rows", DType::I32, Shape::new(&[2]), &bytes, "test")
+            .expect("the stated constant");
+        assert_eq!(constant.shape().dims(), &[2]);
+        assert_eq!(constant.view().ptr.address(), 0);
+    }
 
     /// The block-scale arrangement is the launcher's `computeSFIndex`: a permutation of the
     /// checkpoint's row-major table into the 128x4 layout, padded with zeros.
