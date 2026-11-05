@@ -151,7 +151,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "fl2va" => nn::VideoTask::FirstLastToVideoAudio,
                     "ref2va" => nn::VideoTask::ReferenceToVideoAudio,
                     other => {
-                        return Err(format!("{other} is not an H3 task (t2va, fl2va, ref2va)").into());
+                        return Err(
+                            format!("{other} is not an H3 task (t2va, fl2va, ref2va)").into()
+                        );
                     }
                 })
             }
@@ -243,14 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let config = minimax_h3::Config::read(&root, None)?;
-    let partition = Partition::serving(
-        &config,
-        task,
-        ulysses.unwrap_or(1),
-        degree,
-        0,
-        0,
-    )?;
+    let partition = Partition::serving(&config, task, ulysses.unwrap_or(1), degree, 0, 0)?;
     // The sparse chain composes each layer's compression across the exchange's members, and that
     // exchange is not written: the model refuses it by name at load, and the walk refuses the same
     // deployment here rather than printing rows that read as served.
