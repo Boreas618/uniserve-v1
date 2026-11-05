@@ -362,9 +362,11 @@ fn stage_weights(args: &Args) -> Result<()> {
         let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
         let mut shards = loader.reborrow(source)?;
+        let spatial = config.video_vae.spatial_compression();
+        let raster = (canvas.width * spatial, canvas.height * spatial);
         let decoder = VideoDecoder::load(
             &config.video_vae,
-            canvas,
+            &[raster],
             AttentionKind::Dense,
             dtype,
             input,
@@ -517,9 +519,11 @@ fn stage_decode(args: &Args) -> Result<()> {
         let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
         let mut shards = loader.reborrow(source)?;
+        let spatial = config.video_vae.spatial_compression();
+        let raster = (canvas.width * spatial, canvas.height * spatial);
         let decoder = VideoDecoder::load(
             &config.video_vae,
-            canvas,
+            &[raster],
             AttentionKind::Dense,
             dtype,
             input,
