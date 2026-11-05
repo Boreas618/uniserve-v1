@@ -267,6 +267,27 @@ impl Control {
         &mut self.daemon
     }
 
+    /// The fronts a report of this process's own state may go out on: the
+    /// launching daemon's, and every daemon that attached since.
+    ///
+    /// A handover closes the launching daemon's front and leaves the attached
+    /// ones serving (§7.5.1 step 2), so a process that reported only on index 0
+    /// would fall silent exactly when a successor took it over — and the
+    /// successor's `/metrics` would hold no figure of the engine it inherited.
+    /// Every daemon keeps its own registry, so a report on each front is one
+    /// figure per registry, not one figure counted twice.
+    pub fn report_fronts(&self) -> Vec<usize> {
+        let mut fronts = vec![0];
+        fronts.extend(
+            self.attached
+                .iter()
+                .enumerate()
+                .filter(|(_, front)| front.is_some())
+                .map(|(index, _)| index + 1),
+        );
+        fronts
+    }
+
     /// The connection of the front `front`, when it is live: index 0 is the
     /// daemon that launched this process.
     pub fn front_mut(&mut self, front: usize) -> Option<&mut Connection> {
