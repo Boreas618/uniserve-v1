@@ -31,7 +31,7 @@ def spec(fields, parameters, target):
             "slots_ptr": "*i32",
             "scales_ptr": "*fp32",
             "cache_ptr": "*fp8e4nv",
-            "initialized_ptr": "*i32",
+            "initialized_ptr": "*u8",
             "tokens": "i64",
             "page": "i32",
             "heads": "i32",

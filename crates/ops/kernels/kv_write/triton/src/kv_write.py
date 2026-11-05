@@ -44,7 +44,7 @@ def _kv_write_kernel(
     ``key`` and ``value`` are ``[tokens, heads, head_dim]``, the caches
     ``[pages, page, heads, head_dim]``, ``slots`` the flat
     ``page · page_size + offset`` of each token (``-1`` skips it) and the flags
-    ``[pages, 1, 1, 1]`` i32. Grid:
+    ``[pages, 1, 1, 1]`` u8, one byte per page. Grid:
     ``[tokens, ceil(heads · head_dim / TILE), 1]``.
     """
     _pdl_prologue(PDL)

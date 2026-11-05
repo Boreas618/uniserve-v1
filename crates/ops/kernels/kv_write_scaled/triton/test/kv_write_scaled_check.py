@@ -12,7 +12,7 @@ source      [tokens, heads · head_dim]   bf16 or f32
 slots       [tokens] i32                 the flat `page · page_size + offset`, or -1 to skip
 scales      [pages, 1, 1, 1] f32         read and written: the page's scale
 cache       [pages, page, heads, head_dim] E4M3, read and written
-initialized [pages, 1, 1, 1] i32         read and written: the page's flag
+initialized [pages, 1, 1, 1] u8          read and written: the page's flag, one byte
 ```
 
 and it derives the scale rather than reading it, so the rule below is the reference. What a wrong
@@ -158,7 +158,10 @@ def launch(module, *, dtype, tokens, pages, page, heads, head_dim, block, slots,
         source = seeds.to(element)
     scales = torch.zeros(pages, 1, 1, 1, dtype=torch.float32)
     cache = torch.zeros(pages, page, heads, head_dim, dtype=torch.float8_e4m3fn)
-    initialized = torch.zeros(pages, 1, 1, 1, dtype=torch.int32)
+    # One byte per page, and the buffer is longer than the view so the bytes after the last page are
+    # visible: a four-byte flag store at an odd page count writes into them.
+    flags = torch.zeros(pages + 4, dtype=torch.uint8)
+    initialized = flags[:pages].view(pages, 1, 1, 1)
     if prefill is not None:
         prefill(scales, cache, initialized)
     slots_tensor = torch.tensor(slots, dtype=torch.int32)
@@ -169,13 +172,13 @@ def launch(module, *, dtype, tokens, pages, page, heads, head_dim, block, slots,
         tokens, page, heads, head_dim, 0,
         BLOCK=block, PDL=False,
     )
-    return source, slots_tensor, before, (scales, cache, initialized)
+    return source, slots_tensor, before, (scales, cache, initialized, flags)
 
 
 def check(what, *, dtype, tokens, pages, page, heads, head_dim, block, slots,
           seeds=None, prefill=None, untouched=()):
     """One write against the reference, the page's scale and flag exactly and the bytes within E4M3."""
-    source, slots_tensor, before, (scales, cache, initialized) = launch(
+    source, slots_tensor, before, (scales, cache, initialized, flags) = launch(
         MODULE, dtype=dtype, tokens=tokens, pages=pages, page=page, heads=heads,
         head_dim=head_dim, block=block, slots=slots, seeds=seeds, prefill=prefill,
     )
@@ -195,6 +198,15 @@ def check(what, *, dtype, tokens, pages, page, heads, head_dim, block, slots,
             f"{where}: the flags differ: {initialized.reshape(-1).tolist()} vs "
             f"{want_flag.reshape(-1).tolist()}"
         )
+    # The bytes past the last page: a flag stored as four bytes at a page count not divisible by
+    # four clobbers them, and no other assertion in the case would show it.
+    tail = flags[len(flags) - 4:]
+    if bool((tail != 0).any()):
+        raise SystemExit(
+            f"{where}: the flags wrote past the last page: {tail.tolist()} after "
+            f"{len(flags)} bytes of a {len(flags) - 4}-page plane"
+        )
+
     # The page's bytes, compared exactly: both sides cast through `interpret_cast`, so a difference
     # here is the rule and not the format's rounding.
     got = cache.to(torch.uint8)
@@ -333,22 +345,22 @@ def main():
     # 7. The row split across passes, the block narrower than a row and wider than it.
     for block in (4, 8, 16, 32):
         check(
-            f"a row walked in passes of {block}",
+            f"a row walked in passes of {block}, five pages",
             dtype="f32",
             tokens=5,
-            pages=3,
+            pages=5,
             page=3,
             heads=3,
             head_dim=5,
             block=block,
             slots=[3, 0, 4, -1, 2],
-            untouched=(2,),
+            untouched=(2, 3, 4),
         )
 
     print(
         "ok: 10 writes, every page's scale and flag exact, every stored byte the rule's own, "
         "the grown page re-encoded over every stored row, the floor holding for an all-zero write, "
-        "and an untouched page never moved"
+        "an untouched page never moved, and no flag written past its page's byte"
     )
     return 0
 

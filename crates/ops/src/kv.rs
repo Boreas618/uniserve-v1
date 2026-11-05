@@ -5,7 +5,7 @@
 //! ```text
 //! key   [pages, page_size, kv_heads, head_dim]   elements of the cache's dtype
 //! value [pages, page_size, kv_heads, head_dim]
-//! key.initialized, value.initialized  [pages, 1, 1, 1]   i32, one flag per page
+//! key.initialized, value.initialized  [pages, 1, 1, 1]   u8, one flag per page
 //! ```
 //!
 //! which is the layout `paged_attention` reads (specs/worker.md 9, KV 写入; the current store's
@@ -84,9 +84,9 @@ pub struct Args {
     pub value_cache: TensorView,
     /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
     pub slots: TensorView,
-    /// `[pages, 1, 1, 1]` i32 initialization flags of the key cache.
+    /// `[pages, 1, 1, 1]` u8 initialization flags of the key cache.
     pub key_initialized: TensorView,
-    /// `[pages, 1, 1, 1]` i32 initialization flags of the value cache.
+    /// `[pages, 1, 1, 1]` u8 initialization flags of the value cache.
     pub value_initialized: TensorView,
 }
 
@@ -208,11 +208,15 @@ impl Op for KvWrite {
         }
         for initialized in [&args.key_initialized, &args.value_initialized] {
             initialized.require_rank(Self::NAME, 4)?;
-            if initialized.dtype != DType::I32 {
+            // One byte per page, because the plane is one byte per page: the executor's
+            // conversion, units and Storage Server all carry `u8`, and `cache_copy_region` already
+            // loads and stores these same flags as `u8`. A flag is a byte of the page's plane, and
+            // a four-byte store into it would clobber the three pages that follow.
+            if initialized.dtype != DType::U8 {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "expected i32 initialization flags, found {}",
+                        "expected u8 initialization flags, one byte per page, found {}",
                         initialized.dtype
                     ),
                 ));
@@ -336,7 +340,7 @@ pub struct ScaledWriteArgs {
     /// `[pages, page, heads, head_dim]` E4M3: the cache, read and rewritten for a page whose scale
     /// grew and written at the new rows for every other.
     pub cache: TensorView,
-    /// `[pages, 1, 1, 1]` i32 initialization flags, written with the scale in the same launch.
+    /// `[pages, 1, 1, 1]` u8 initialization flags, written with the scale in the same launch.
     pub initialized: TensorView,
 }
 
@@ -436,11 +440,13 @@ impl Op for KvWriteScaled {
         }
         args.initialized
             .require_shape(Self::NAME, Shape::new(&[pages, 1, 1, 1]))?;
-        if args.initialized.dtype != DType::I32 {
+        // One byte per page, as in `kv_write`: the flag is the page's own byte of its plane, and a
+        // four-byte store would clobber the three pages after it.
+        if args.initialized.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 initialization flags, found {}",
+                    "expected u8 initialization flags, one byte per page, found {}",
                     args.initialized.dtype
                 ),
             ));
