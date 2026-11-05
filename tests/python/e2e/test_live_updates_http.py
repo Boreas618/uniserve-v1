@@ -594,10 +594,34 @@ def _stream_count(
     done: threading.Event,
     reasons: list[str] | None = None,
     prompt: str = PROMPT,
+    errors: list[BaseException] | None = None,
 ) -> None:
     """Streams the count, appending each content delta to `read` and each
     finish reason to `reasons`.
+
+    Runs on a thread, where an exception would otherwise be printed to a log
+    the test's failure does not carry and read exactly like a stream that
+    produced nothing: a refusal, a timeout and a stall would all show as a
+    count of zero. `errors` keeps what went wrong so the failure states it.
     """  # noqa: D205
+    try:
+        _stream_count_body(base_url, model, read, reasons, prompt)
+    except BaseException as error:  # noqa: BLE001 - reported, never swallowed
+        if errors is not None:
+            errors.append(error)
+        else:
+            raise
+    finally:
+        done.set()
+
+
+def _stream_count_body(
+    base_url: str,
+    model: str,
+    read: list[str],
+    reasons: list[str] | None,
+    prompt: str,
+) -> None:
     with httpx.stream(
         "POST",
         f"{base_url}/v1/chat/completions",
@@ -623,7 +647,6 @@ def _stream_count(
                         read.append(content)
                     if reasons is not None and choice.get("finish_reason"):
                         reasons.append(choice["finish_reason"])
-    done.set()
 
 
 # How long the counters an engine reports every second take to include
@@ -1269,6 +1292,9 @@ def _restart_while_streaming(
     # The finish reason each stream ends with: a response the successor closes
     # instead of finishing carries none, and the count alone would not say so.
     reasons: list[list[str]] = [[] for _ in HANDED_STREAMS]
+    # What each stream's thread raised, if anything: a refusal or a timeout
+    # otherwise reads as a count of zero, the same as a stall.
+    errors: list[BaseException] = []
     streaming = [
         threading.Thread(
             target=_stream_count,
@@ -1277,7 +1303,8 @@ def _restart_while_streaming(
                 "prompt": (
                     f"Count from 1 to {last}, separated by commas and spaces. "
                     "Write only the numbers."
-                )
+                ),
+                "errors": errors,
             },
         )
         for read, done, reason, last in zip(
@@ -1297,7 +1324,8 @@ def _restart_while_streaming(
         # more than one request at a time; a stop here is the engine's own
         # account of what it did with them, not a number of seconds.
         raise AssertionError(
-            f"{error} (counts so far: {[len(read) for read in reads]}){log_tail(log)}"
+            f"{error} (counts so far: {[len(read) for read in reads]}; "
+            f"stream errors: {[repr(one) for one in errors]}){log_tail(log)}"
         ) from error
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
