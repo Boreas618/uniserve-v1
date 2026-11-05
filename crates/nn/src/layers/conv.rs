@@ -83,6 +83,14 @@ pub struct Conv3d {
     tf32: bool,
     /// Whether this convolution reads and writes channels-last (NDHWC) tensors.
     ///
+    /// **The filter is not part of the order.** A checkpoint stores a convolution's weight
+    /// `[out, in, kd, kh, kw]` packed, which is the KCRS form cuDNN's filter descriptor wants, and
+    /// PyTorch's `channels_last_3d` is a memory format of *activations* - module weights stay dense.
+    /// So a channels-last convolution reorders its input and output only.
+    /// `crates/ops/kernels/conv3d/cudnn/src/conv.cu:383-386` currently derives NDHWC strides for the
+    /// filter as well, which reads a packed KCRS weight in the wrong order; no site passes `true`
+    /// today, so the flag is refused by the guard below before that line can run.
+    ///
     /// The reference's stride-1 padded convolutions read channels-last and its strided ones
     /// channels-first, because the two orders can select different algorithms and, for a strided
     /// convolution, different rounding. **Stated per layer, never inferred from the stride**: a 1x1

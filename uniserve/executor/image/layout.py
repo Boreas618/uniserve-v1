@@ -2,8 +2,8 @@
 
 A generated image is denoised as one *framed sequence* per guidance branch:
 its latent patch rows in raster order, framed by an opening and a closing
-token when the network frames images (``framing_tokens`` two, BAGEL's
-start and end markers), otherwise alone (SenseNova). Every token of the
+token when the network frames images (``framing_tokens`` two, the model's
+start and end markers), otherwise alone. Every token of the
 sequence carries three rotary coordinates ``(temporal, row, column)``: the
 temporal coordinate is the branch's, and the spatial ones are a latent
 patch's raster coordinates in the image's latent grid, zero for framing

@@ -99,7 +99,7 @@ def test_readouts_chunk_slots_at_the_largest_bucket():
 
 
 def test_step_chunks_bound_their_transient_logits():
-    # DiffusionGemma: one block of 256 x 262144 entries per chunk.
+    # One block of 256 x 262144 entries per chunk.
     assert chunk_rows(256, 262_144, 64) == 1
     assert chunk_rows(16, 64, 4) == 4
     assert chunk_rows(16, 64, 0) == 1
