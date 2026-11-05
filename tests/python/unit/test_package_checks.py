@@ -130,5 +130,26 @@ def test_the_store_is_the_one_the_runner_is_given(sweep):
     )
 
 
-def test_without_a_fixture_the_check_reads_sources_and_needs_no_store(sweep):
-    assert sweep.tree_arguments("kernel_arguments.py") == ("--check",)
+def test_the_artifact_invocation_carries_the_store_and_the_fixture(sweep):
+    arguments = sweep.tree_arguments(
+        "kernel_arguments.py", "notes/programs/qwen3-moe-keys.txt", "/tmp/store"
+    )
+
+    assert "--check" in arguments
+    assert arguments[arguments.index("--store") + 1] == "/tmp/store"
+
+
+def test_source_mode_is_never_run_because_it_reports_an_operators_arms_against_each_other(sweep):
+    """The check runs against a built artifact or not at all: its source mode over-reports."""
+    assert sweep.tree_needs("kernel_arguments.py") == ["--fixture", "--store"]
+    assert sweep.tree_needs("kernel_arguments.py", "keys.txt") == ["--store"]
+    assert sweep.tree_needs("kernel_arguments.py", "keys.txt", "/tmp/store") == []
+
+
+def test_an_empty_store_is_not_a_green(sweep, tmp_path):
+    """A comparison against a store nothing filled compares nothing, and must not read as agreement."""
+    assert not sweep.store_holds_cells(tmp_path)
+    (tmp_path / "op" / "triton" / "1" / "sm_100a" / "key").mkdir(parents=True)
+    assert not sweep.store_holds_cells(tmp_path)
+    (tmp_path / "op" / "triton" / "1" / "sm_100a" / "key" / "metadata.json").write_text("{}")
+    assert sweep.store_holds_cells(tmp_path)

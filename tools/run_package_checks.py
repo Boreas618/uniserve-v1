@@ -96,13 +96,17 @@ SHARED_CHECKS = ("modulation_check.py",)
 #: by not existing must still be one entry in the count: an instrument missing from the tree is a gap
 #: to report, not a check that disappears from the arithmetic.
 #:
-#: `kernel_arguments.py` compares the three statements of every Triton kernel's argument list. Without
-#: a store it reads each package's declared shapes against the operator's Rust chain, which needs no
-#: device and no build; with `--fixture` and `--store` it compares the *built* cells of those keys,
-#: whose `metadata.json` is what a launch checks. This runner builds no store of its own - a second
-#: store for one run is two statements of one thing - so it passes on the one it is given and names
-#: the pair it would need otherwise.
-TREE_CHECKS = (("kernel_arguments.py", ("--check",)),)
+#: `kernel_arguments.py` compares the three statements of a Triton kernel's argument list. **Only
+#: against a built artifact**, whose `metadata.json` is what a launch reads: its source mode compares
+#: one operator's Rust chain against the union of its arms, so an operator with a phase-selected or
+#: field-selected kernel is reported as disagreeing with itself - eight operators and thirteen causes
+#: on the first run, at least two of them impossible, since the launch refuses a count or kind
+#: mismatch before it runs. A check that guesses is worse than one that refuses, so without a built
+#: store this check is `unrunnable` and says so.
+#:
+#: The store is one this runner is **given**, never one it builds: a second store for one run is two
+#: statements of one thing. Each entry is `(tool, arguments, options it needs)`.
+TREE_CHECKS = (("kernel_arguments.py", ("--check",), ("--fixture", "--store")),)
 
 #: Where a launch's descriptor is built. A package whose operator no file here names **in code** is
 #: a check over a kernel nothing can reach, and its green is not evidence about the model: five
@@ -304,17 +308,38 @@ def run_one_alone(script, timeout):
 
 
 def tree_arguments(name, fixture=None, store=None, target="sm_100a"):
-    """The arguments one tree check is called with.
+    """The arguments one tree check is called with when it can run at all.
 
     The store is one this runner is **given**, never one it builds: a second store for one run is two
-    statements of one thing, and this runner is the place they would drift apart. Without a fixture
-    `kernel_arguments.py` reads each package's declared shapes against the operator's Rust chain, which
-    needs neither a device nor a build.
+    statements of one thing, and this runner is the place they would drift apart.
     """
-    arguments = dict(TREE_CHECKS)[name]
-    if name == "kernel_arguments.py" and fixture:
+    if tree_needs(name, fixture, store):
+        raise ValueError(f"{name} cannot run without {' and '.join(tree_needs(name, fixture, store))}")
+    arguments = {entry[0]: entry[1] for entry in TREE_CHECKS}[name]
+    if name == "kernel_arguments.py":
         arguments = (*arguments, "--fixture", fixture, "--store", store, "--target", target)
     return arguments
+
+
+def store_holds_cells(store):
+    """Whether a store holds at least one built cell.
+
+    A comparison against an empty store compares nothing and passes, which is the one green that is
+    worse than a refusal: `--store` naming a directory the build never filled would read as agreement.
+    """
+    return store is not None and any(pathlib.Path(store).rglob("metadata.json"))
+
+
+def tree_needs(name, fixture=None, store=None):
+    """The options one tree check needs and was not given, by name.
+
+    A check that cannot run soundly here is `unrunnable` with what it needs, never run in a mode that
+    guesses: `kernel_arguments.py` enters its artifact comparison on `--fixture`, so a store without a
+    fixture would fall back to the source comparison the ruling excludes.
+    """
+    needs = {entry[0]: entry[2] for entry in TREE_CHECKS}[name]
+    given = {"--fixture": fixture, "--store": store}
+    return [option for option in needs if not given.get(option)]
 
 
 def run_tree_check(root, name, arguments, timeout):
@@ -434,7 +459,27 @@ def main():
 
     # A tree check stands outside `packages()`: there is no package directory under it, and its
     # subject is every package at once. It runs after the packages so its output reads beside theirs.
-    for name, _ in TREE_CHECKS:
+    for name, _, _ in TREE_CHECKS:
+        missing = tree_needs(name, options.fixture, options.store)
+        if missing:
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    f"needs {' and '.join(missing)}: the comparison is only sound against a built "
+                    f"artifact, and source mode reports an operator's arms against each other",
+                    "",
+                )
+            )
+            continue
+        if not store_holds_cells(options.store):
+            outcomes["unrunnable"].append(
+                (
+                    f"tools/{name}",
+                    f"the store under --store holds no built cell, so there is nothing to compare",
+                    "",
+                )
+            )
+            continue
         arguments = tree_arguments(name, options.fixture, options.store, options.target)
         outcome, detail, code = run_tree_check(pathlib.Path("."), name, arguments, options.timeout)
         outcomes[outcome].append((f"tools/{name}", detail, code))
