@@ -206,9 +206,15 @@ const DEPLOYMENT_STAGES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX
 /// clip's rows. Deriving the ladder this way means the row set cannot describe a timeline no request
 /// can be handed, which is what a list of stage lengths read as clips did for days.
 fn deployment_clips() -> Vec<u32> {
+    // The largest clip the model generates, which is the last rung of its rule and **not** `MAX_FRAMES`:
+    // a request of `MAX_FRAMES` rounds up past it, so a ladder built by rounding alone would state one
+    // clip longer than the model has (1025 against a 1024-frame maximum).
+    let longest = *minimax_h3::programs::Deployment::generated()
+        .last()
+        .expect("the rule has rungs");
     let mut clips: Vec<u32> = DEPLOYMENT_STAGES
         .iter()
-        .map(|frames| minimax_h3::packing::align_num_frames(*frames))
+        .map(|frames| minimax_h3::packing::align_num_frames(*frames).min(longest))
         .collect();
     clips.sort_unstable();
     clips.dedup();
