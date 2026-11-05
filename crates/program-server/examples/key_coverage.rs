@@ -86,6 +86,16 @@ fn main() -> ExitCode {
         }
     };
 
+    // A fixture with no rows is a walk that failed to print, not a store that needs nothing: every
+    // key of an empty set is trivially covered, so the check would pass over no evidence.
+    if rows.is_empty() {
+        eprintln!(
+            "{fixture} names no rows: an empty fixture is a walk that printed nothing, and every \
+             coverage question about it is vacuously true"
+        );
+        return ExitCode::FAILURE;
+    }
+
     if !declared_blocked {
         println!(
             "# {} keys of {fixture} against {} packages, target {target}",
