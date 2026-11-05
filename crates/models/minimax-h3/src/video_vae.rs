@@ -826,8 +826,19 @@ impl VideoDecoder {
 
         let mut programs = Programs::default();
 
-        // The clip's latents in, the clip's pixels out.
-        for k in [config.latent_channels, width, ffn, width, patch] {
+        // The clip's latents in, the clip's pixels out. **The bias flag is the projection's own, not a
+        // policy of the block's**: `proj_in`, the attention's three projections and `proj_out` carry one,
+        // while `to_out`, the packed feed-forward projection and `ff.net.2` do not - their biases are
+        // folded into the residuals and into the packed activation. The epilogue is the only part of the
+        // key that differs, so a statement that assumed one flag for all five launches would name a cell
+        // the decode never asks for and leave the one it does ask for unbuilt.
+        for (k, bias) in [
+            (config.latent_channels, true),
+            (width, true),
+            (width, false),
+            (ffn, false),
+            (patch, true),
+        ] {
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 k,
                 dtype,
