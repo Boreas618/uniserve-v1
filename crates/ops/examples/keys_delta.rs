@@ -68,6 +68,19 @@ fn main() -> ExitCode {
         println!("# a delta below covers only the components the walk reached");
     }
 
+    // A walk that states nothing is a command that did not run, not a fixture that disagrees. Without
+    // this the report reads `N rows only in the fixture` for every row and the verdict says a store
+    // must not be built — a catastrophic answer produced by an invocation error, which is the one
+    // failure mode that looks exactly like evidence. It cost an hour here: a walk missing `--rows`
+    // exits before printing, the delta ran anyway, and its answer was indistinguishable from a
+    // measurement.
+    if walk_rows.is_empty() {
+        println!(
+            "# the walk states no rows at all: it did not run, so this is not a difference to read"
+        );
+        return ExitCode::FAILURE;
+    }
+
     println!(
         "# {} rows in the fixture, {} in the walk",
         fixture_rows.len(),
