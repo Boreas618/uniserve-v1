@@ -4755,6 +4755,7 @@ dependencies = [
  "libloading",
  "mimalloc",
  "minimax-h3",
+ "models",
  "nn",
  "ops",
  "platform",
