@@ -27,7 +27,6 @@ use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
     request_tensor_window,
 };
-use crate::capacity::graph_storage_bytes;
 use crate::config::Device;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
@@ -404,8 +403,11 @@ impl TokenPlan {
 /// which the caller derives from its own `max_model_len`; `total_bytes` is the
 /// storage the rank may plan into - what the device has left at plan time, not
 /// the size it has, because the weights are mapped outside every pool - zero on
-/// CPU, which states no grant; `granularity` is the device's allocation
-/// granularity, in whose granules a device pool splits its planes.
+/// CPU, which states no grant; `reserved_bytes` is the storage the rank maps
+/// beside the cache and out of its own grant, so that no unit is fitted into it:
+/// the graph range and the scratch region, which `Pools::new` reserves as
+/// separate pools; `granularity` is the device's allocation granularity, in
+/// whose granules a device pool splits its planes.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, the measured report, the model's facts and the agreement"
@@ -417,7 +419,7 @@ pub fn token_plan(
     queue_depth: usize,
     width: u32,
     total_bytes: u64,
-    graph_bytes: u64,
+    reserved_bytes: u64,
     granularity: Option<u64>,
     group: &HostGroup,
     mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
@@ -459,7 +461,7 @@ pub fn token_plan(
         unit_overhead,
         request,
         total_bytes,
-        graph_bytes,
+        reserved_bytes,
         granularity,
         group,
     )?;
@@ -484,11 +486,16 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
     // The graph storage is the one figure that is a share of the DEVICE and not of what is left: a
     // rank reserves two pools of address space at open, one per generation a preparation may hold,
     // and books their mappings against the device's total.
-    let graph_bytes = match facts.device {
-        Device::Cuda(index) => graph_storage_bytes(
-            crate::capacity::device::total_bytes(index)? as i64,
-            true,
-            false,
+    // The graph range and the scratch region are one reservation (4.1, 4.5): the graph pools the
+    // rank captures into and the shadow a replaced operator runs in, both reserved at spawn and
+    // both out of the grant the cache is fitted into. `reserved_bytes` answers them as one figure
+    // so a caller cannot pass half of it - a plan fitted into the bytes the shadow will take leaves
+    // the rank to map past the device at its first shadow, after the model load and after every
+    // module installed.
+    let reserved_bytes = match facts.device {
+        Device::Cuda(index) => crate::capacity::reserved_bytes(
+            crate::capacity::device::total_bytes(index)?,
+            /* prepares */ true,
         ),
         Device::Cpu => 0,
     };
@@ -525,7 +532,7 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
         facts.queue_depth,
         0,
         total_bytes,
-        graph_bytes,
+        reserved_bytes,
         None,
         group,
         |size| {
@@ -627,19 +634,21 @@ impl TokenLayout {
 
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
-    /// The pool takes the grant left after the graph storage the rank reserved
-    /// (`graph_bytes`, [`crate::capacity::graph_storage_bytes`]) and the fixed
-    /// storage, in whole units. Every rank reserves that storage, whatever its
+    /// The pool takes the grant left after the storage the rank reserved
+    /// (`reserved_bytes`: the graph range and the shadow region, and this plan's
+    /// own state snapshot, charged here because the scratch holds one beside the
+    /// other) and the fixed storage, in whole units. Every rank reserves that storage, whatever its
     /// graph policy: graph
     /// capture grows into it, and so do the eager allocations warmup makes
     /// (operator workspaces such as an expert kernel's), which a rank that
     /// serves every call eagerly makes too. Graph padding
     /// takes no unit: padding rows read the sentinel unit and write no K/V.
     /// A configured token capacity sizes the pool instead. `total_bytes` is
-    /// what the device has left to plan into, zero on CPU. `graph_bytes` is the
-    /// graph storage the rank reserved - two pools of the device's 10% when a
-    /// preparation may hold a second generation, which is what the pool reserves
-    /// at open, so no unit is fitted into storage the graphs will take - and
+    /// what the device has left to plan into, zero on CPU. `reserved_bytes` is
+    /// the storage the rank reserved - two pools of the device's 10% when a
+    /// preparation may hold a second generation, plus the shadow region - which
+    /// is what the pools reserve at open, so no unit is fitted into storage they
+    /// will take; the state snapshot joins it below, when the plan holds one - and
     /// `unit_overhead` is device
     /// storage other owners keep per unit (unit index columns), charged with
     /// each unit; `total_bytes` is the storage the rank may plan into, the
@@ -657,7 +666,7 @@ impl TokenLayout {
         unit_overhead: u64,
         request: &CapacityRequest,
         total_bytes: u64,
-        graph_bytes: u64,
+        reserved_bytes: u64,
         granularity: Option<u64>,
         group: &HostGroup,
     ) -> Result<CacheCapacity> {
@@ -667,7 +676,10 @@ impl TokenLayout {
             .iter()
             .map(|group| (group.block_size, group.units_per_page))
             .collect();
-        let share = graph_bytes;
+        // The shadow region and the state group's snapshot are one scratch pool (4.5): a twin
+        // allocated from the shadow and a unit's checkpoint copied through the snapshot are
+        // mapped beside the graph range, so the cache is fitted past neither.
+        let share = reserved_bytes.saturating_add(cache.state_snapshot_bytes());
         let reserved_units = share.div_ceil(unit_bytes)
             + self
                 .fixed
@@ -981,7 +993,7 @@ pub(crate) fn slot_requirements(
 mod tests {
     use super::*;
     use crate::config::Device;
-    use crate::memory::{CacheDescription, CachePlan};
+    use crate::memory::{CacheDescription, CachePlan, Checkpoint};
     use crate::parallel::host::HostGroup;
     use platform::DeviceId;
 
@@ -1096,6 +1108,163 @@ mod tests {
         assert!(
             booked <= grant,
             "the pool books {booked} bytes of a {grant}-byte grant"
+        );
+    }
+
+    /// The device total the caller's runs planned into, read from the run's own line: the graph
+    /// reservation it logged is two pools of the device's tenth
+    /// (`graph_reservation=39579549696`), so the device is five times that.
+    const E2E_TOTAL: u64 = 5 * 39_579_549_696;
+
+    /// One plan of `total_bytes` with `reserved` bytes set aside before any unit.
+    fn fitted(total_bytes: u64, reserved: u64) -> Result<Plan> {
+        token_plan(
+            &CapacityRequest {
+                max_total_tokens: None,
+                mem_fraction_static: 0.7,
+                ..request()
+            },
+            report(),
+            &facts(),
+            1,
+            /* width */ 64,
+            total_bytes,
+            reserved,
+            None,
+            &HostGroup::single(0),
+            dense(geometry()),
+        )
+    }
+
+    /// A grant that holds the graph range but not the scratch beside it is refused, and the same
+    /// grant with the shadow region added admits the cache.
+    ///
+    /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the GB200 the
+    /// runs plan into, the graph range is the two pools the run logged, and `mem_fraction_static`
+    /// is 0.7 as the run's own placement stated. The shadow is not optional - `Pools::new` reserves
+    /// it at spawn and the first shadow execution maps it - so a plan fitted into the bytes it will
+    /// take leaves the rank to map past the device after the model load, which is the refusal this
+    /// case buys.
+    #[test]
+    fn a_grant_that_holds_the_graph_range_without_the_scratch_is_refused() {
+        let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
+        assert_eq!(
+            graph, 39_579_549_696,
+            "the graph range of the deployment the runs plan into"
+        );
+        let shadow = crate::capacity::graph_scratch_bytes(E2E_TOTAL as i64);
+        assert_eq!(shadow, 2_473_721_856, "the shadow region of that device");
+        // What a rank reserves before it fits a unit, from the one function that answers it: the
+        // graph range and the shadow together. A reservation that lost the shadow is the defect
+        // this case exists for, and it fails here before the admission cases below.
+        let reserved = crate::capacity::reserved_bytes(E2E_TOTAL, true);
+        assert_eq!(
+            reserved,
+            graph + shadow,
+            "the storage a rank reserves on this device: the graph range and the shadow region"
+        );
+        // A generous grant, only to learn the plan's own fixed storage and unit size.
+        let planned = fitted(E2E_TOTAL, reserved)
+            .expect("the deployment's device holds its own graph range and scratch");
+        let fixed = planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
+        let unit = planned
+            .cache
+            .as_ref()
+            .expect("the model's cache is planned")
+            .unit_bytes;
+        // The least a cache serves is the sentinel unit and one page of its one group; the two
+        // cases below give that twice, so a rounding in the reservation cannot decide the answer.
+        let least = 2 * unit;
+        let with = fixed + reserved + 2 * least;
+        let without = with - shadow;
+        assert!(
+            fitted(without, reserved).is_err(),
+            "a grant of {without} bytes holds the graph range and the fixed storage, and not the \
+             {shadow}-byte shadow region: it must be refused, not fitted"
+        );
+        let admitted =
+            fitted(with, reserved).expect("the same grant with the shadow region holds the cache");
+        let units = admitted
+            .info
+            .prefix_cache
+            .as_ref()
+            .expect("the rank advertises its cache")
+            .num_units;
+        assert!(
+            units >= 2,
+            "the admitted plan serves a cache: {units} units"
+        );
+    }
+
+    /// A model that keeps a state per unit pays for its snapshot out of the same grant, so the
+    /// pool it fits is smaller by the snapshot's share - and what the rank maps afterwards (the
+    /// units, the fixed storage, the graph range, the shadow region and the snapshot) stays inside
+    /// the grant it planned into.
+    ///
+    /// The snapshot is the figure design 4.5 copies a unit's checkpoint through, and it is
+    /// reserved once beside the shadow region: a plan that fitted its units into the bytes the
+    /// scratch will take maps past the device after the model is loaded, where the refusal costs
+    /// the whole startup.
+    #[test]
+    fn a_state_snapshot_is_reserved_out_of_the_grant_before_the_units() {
+        // No token capacity and no stated pool storage: the fit is bounded by the grant alone, so
+        // a byte reserved for the scratch is a byte no unit is fitted into.
+        let request = CapacityRequest {
+            max_total_tokens: None,
+            ..request()
+        };
+        let reserved = crate::capacity::graph_storage_budget_bytes(TOTAL as i64);
+        let mut state = CacheDescription::dense(64, 2, 4, 64, ipc::PrefixCacheDtype::BFloat16);
+        state.groups[0].state = true;
+        state.checkpoints = vec![Checkpoint {
+            first_plane: 0,
+            planes: 8,
+            fields: Vec::new(),
+        }];
+        let snapshot = CachePlan::new(state.clone())
+            .expect("a state group with its checkpoints is a plan")
+            .state_snapshot_bytes();
+        let unit_bytes = CachePlan::new(state.clone())
+            .expect("a state group with its checkpoints is a plan")
+            .unit_bytes;
+        assert!(
+            snapshot > unit_bytes,
+            "the case is only falsifying when the snapshot costs more than one unit: {snapshot} \
+             bytes of snapshot against a {unit_bytes}-byte unit"
+        );
+        let planned = token_plan(
+            &request,
+            report(),
+            &facts(),
+            1,
+            /* width */ 64,
+            TOTAL,
+            reserved,
+            None,
+            &HostGroup::single(0),
+            |_size| Ok(Some(Arc::new(CachePlan::new(state.clone())?))),
+        )
+        .expect("an 8 GiB device plans a state-group cache");
+        let cache = planned
+            .cache
+            .as_ref()
+            .expect("the model's cache is planned");
+        let units = u64::from(
+            planned
+                .info
+                .prefix_cache
+                .as_ref()
+                .expect("the rank advertises its cache")
+                .num_units,
+        );
+        let fixed = planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
+        let mapped = units * cache.unit_bytes + fixed + reserved + snapshot;
+        assert!(
+            mapped <= TOTAL,
+            "the rank maps {mapped} bytes into a {TOTAL}-byte grant: {units} units of {} bytes, \
+             {fixed} bytes of fixed storage, {reserved} bytes reserved for the graph range and the \
+             shadow and {snapshot} bytes of state snapshot",
+            cache.unit_bytes
         );
     }
 
