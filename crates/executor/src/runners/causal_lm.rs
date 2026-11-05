@@ -2492,6 +2492,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
             params.shared_memory,
             params.parameters.len()
         );
+        // Each argument's own bytes, so a program order stated by another lane can be mapped onto
+        // what this launch carries without a second run: `p0=0x…` for a pointer-sized argument and
+        // `p3=512` for a scalar, which is the pair a slice's values are compared against.
+        let mut arguments = String::new();
+        for blob in &params.parameters {
+            let value = match blob.len() {
+                8 => u64::from_ne_bytes(blob[..8].try_into().unwrap_or([0; 8])),
+                4 => u64::from(u32::from_ne_bytes(blob[..4].try_into().unwrap_or([0; 4]))),
+                _ => 0,
+            };
+            arguments.push_str(&format!(" 0x{value:x}"));
+        }
+        shape.push_str(&format!(" args=[{}]", arguments.trim_start()));
         for (index, blob) in params.parameters.iter().enumerate() {
             shape.push_str(&format!(" p{index}({}B)", blob.len()));
             for (name, address) in known {
