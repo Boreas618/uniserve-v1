@@ -331,6 +331,56 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
         stop_server(process)
 
 
+@pytest.fixture(scope="module")
+def server(
+    model: Path, program_server, tmp_path_factory: pytest.TempPathFactory
+):
+    """Serve one Qwen3-MoE deployment against the test's own Program Server.
+
+    The deployment is started through the shared `server_process` helper, which is what every
+    other e2e deployment uses and the only correct shape a deployment start has in this tree: it
+    gives the server a runtime directory of its own - and with it a Storage Server that lives
+    exactly as long as the deployment, released on the failing path too - the GPUs the GPU locks
+    granted, and its log to the health wait. A server started by hand gets none of the three: it
+    looks for a Storage Server in the ambient runtime directory, leaves that Storage Server
+    holding device memory when it dies, and reports a return code with no reason.
+
+    The options are the live-update file's own, because the two files serve the same model on the
+    same host: a deployment that stated a different attention backend, graph catalogue or token
+    budget would be a second deployment whose numbers nobody could compare with the first's.
+    """
+    binary = require_uniserve_binary()
+    work = tmp_path_factory.mktemp("deployment")
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    log = work / "server.log"
+    command = [
+        str(binary),
+        "serve",
+        str(model),
+        "--served-model-name",
+        "qwen3-moe",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--worker-executable",
+        str(worker_executable()),
+        "--set",
+        f"kv_cache_config.host_gib={HOST_GIB}",
+        "--program-server",
+        str(program_server["socket"]),
+    ]
+    for option in DEPLOYMENT_OPTIONS:
+        command += ["--set", option]
+    # No environment of our own: `server_process` gives the deployment a runtime directory whose
+    # Storage Server it also stops - on the path where health never answers, too - and the GPUs
+    # the locks granted. A caller that names a runtime directory owns its Storage Server, and a
+    # server that dies early then leaves that Storage Server holding device memory.
+    with server_process(command, base_url, log, timeout_s=900):
+        yield base_url
+
+
 RESIDENT_TOKENS = 512
 
 # The two sentences a wrong-kernel refusal can carry. The comparison's own
