@@ -91,7 +91,12 @@ pub struct SortArgs {
     pub total_padded_tokens: TensorView,
     /// `[1]` i32: tiles that hold live rows.
     pub num_non_exiting_tiles: TensorView,
-    /// `[1]` i32: the token rows of this batch that are live, device-resident.
+    /// `[1]` i32: the token rows **of this batch** that are live, device-resident.
+    ///
+    /// The subject is the batch's own rows, not the rows a buffer holds: `tokens` may be a bucket
+    /// wider than the batch, and on an expert-parallel path it is a count of delivered route rows
+    /// from many batches at once. Only the single-rank path, where `tokens` is the batch's row
+    /// count, has padding to mark.
     ///
     /// A captured bucket is wider than the batch that fills it, and a row past the batch's extent has
     /// no route: the program writes [`PADDED`] into `expanded_to_permuted` for every route of such a
