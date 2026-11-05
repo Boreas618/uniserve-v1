@@ -689,10 +689,13 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let latent_height = height / ratio;
     let latent_width = width / ratio;
     let clip_canvas = Canvas::clip(&config, latent_height, latent_width);
-    // **The decoder decodes one tile, not a clip.** Its scratch is sized for a tile's rows and every
-    // buffer it reads is the tile's own canvas (`Tiles::tiles` states one per tile), so a harness that
-    // hands it the clip's canvas asks for a decode of 10 920 rows into scratch sized for 1 792 - which
-    // is exactly the refusal this harness reported before the tile existed here.
+    // **The decoder is built for the clip's canvas and decodes one tile at a time.** The two are not
+    // the same statement: its scratch is a tile's (so a decode of one tile reserves 1 792 rows, not
+    // 10 920), and the object's canvas is the clip's, because `ClipDecoder::decode_clip` checks that
+    // the grid it is handed is the grid the object was built for - a decoder built for one tile and
+    // handed a clip's tiles scatters a tile's rows with the wrong permutation. A harness that built it
+    // for a tile recorded the decoder's rows and then refused at the stitch, which is the whole
+    // component absent from a recording.
     let tiles = Tiles::of(&config, &clip_canvas).map_err(|error| error.to_string())?;
     let canvas = tiles
         .tiles(&config, &clip_canvas)
@@ -722,7 +725,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         Linear::new(projection, Some(bias), WeightOrder::NxK).map_err(|error| error.to_string())?;
     let decoder = VideoDecoder::load(
         &config,
-        canvas,
+        clip_canvas,
         AttentionKind::Dense,
         DType::F32,
         input,
