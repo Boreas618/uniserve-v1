@@ -4350,6 +4350,22 @@ impl Resolved {
     }
 }
 
+/// An error with every cause behind it, in one line.
+///
+/// A refusal that names only its own variant is the one thing a log cannot act on: `platform: ...`
+/// with the driver's own message behind it says what failed, and the chain is where that message
+/// lives. Each cause is taken from `source`, so nothing here has to know which errors there are.
+fn causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 /// States what an object defines when the entry a package declared is not among its symbols.
 ///
 /// `dlsym` answers yes or no and nothing else, so a `NativeSymbol` failure names the entry that was
@@ -4568,7 +4584,7 @@ impl HostAction for Install {
             })
             .map_err(|error| {
                 self.note(&error);
-                executor::Error::Invalid(format!("building the new generation: {error}"))
+                executor::Error::Invalid(format!("building the new generation: {}", causes(&error)))
             })?;
 
         let mut entries = Vec::new();
@@ -4606,9 +4622,16 @@ impl HostAction for Install {
                     )
                     .map_err(|error| {
                         self.note(&error);
+                        tracing::warn!(
+                            op = %chosen.slot.op,
+                            key = %key,
+                            error = ?error,
+                            "resolving this generation's module failed"
+                        );
                         executor::Error::Invalid(format!(
-                            "resolving {} for {key}: {error}",
-                            chosen.slot.op
+                            "resolving {} for {key}: {}",
+                            chosen.slot.op,
+                            causes(&error)
                         ))
                     })?;
                 let module = resolved(module)?;
@@ -4618,9 +4641,19 @@ impl HostAction for Install {
                 let entry = match ops::install(&self.device, operator, &key, module.as_ops()?) {
                     Ok(entry) => entry,
                     Err(error) => {
+                        // The refusal that travels is one line; this is the whole value, so a
+                        // failure whose own message is empty still shows which call, status and
+                        // code it carried.
+                        tracing::warn!(
+                            operator,
+                            key = %key,
+                            error = ?error,
+                            "installing this generation's kernel failed"
+                        );
                         report_missing_entry(&error);
                         return Err(executor::Error::Invalid(format!(
-                            "installing {operator} for {key}: {error}"
+                            "installing {operator} for {key}: {}",
+                            causes(&error)
                         )));
                     }
                 };
