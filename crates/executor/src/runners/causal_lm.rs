@@ -825,6 +825,17 @@ fn prompt_token(
     Ok(PromptToken::HostArgmax)
 }
 
+/// The largest logit that is not `best`'s, which is the gap a first-token choice was made by.
+fn runner_up(values: &[f32], best: usize) -> f32 {
+    let mut second = f32::NEG_INFINITY;
+    for (index, value) in values.iter().enumerate() {
+        if index != best && value.is_finite() && *value > second {
+            second = *value;
+        }
+    }
+    values.get(best).copied().unwrap_or(f32::NAN) - second
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best = 0_usize;
     for (index, value) in values.iter().enumerate() {
@@ -1846,12 +1857,24 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
             // buffer holds one i32 per row of this bucket.
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
-            let best = unsafe {
-                argmax(std::slice::from_raw_parts(
+            let row_logits = unsafe {
+                std::slice::from_raw_parts(
                     self.columns.logits_row.as_ptr().cast::<f32>(),
                     width as usize,
-                ))
+                )
             };
+            let best = argmax(row_logits);
+            // The first token of a prompt is the one value a serving run and a reference stack must
+            // agree on before anything downstream means anything, and a wrong token and a right one
+            // read the same in a completion. The margin says which it is: a near-tie is numerics,
+            // a wide one is a defect. Only on the host's greedy path, which is one call per prompt.
+            tracing::debug!(
+                row,
+                token = best,
+                logit = row_logits.get(best).copied().unwrap_or(f32::NAN),
+                runner_up = runner_up(row_logits, best),
+                "the prompt's first token was argmaxed on the host"
+            );
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
                 *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
@@ -1989,13 +2012,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_i32(&mut self.encoded, &batch.logits_rows[..rows]);
         self.columns.logits_rows.write(&self.encoded)?;
 
+        // The sampler gathers rows of the `[tokens, hidden]` stack, and a row that samples reads
+        // the **last token of its own query range**: a prefill's row is its whole prompt, so the
+        // row index and the token index are the same only when every row holds one token. Reading
+        // the row index here samples a prefill from its first token - a decode is unaffected,
+        // which is why this shows as a wrong first token and not as a fault.
+        //
         // A row that samples nothing still gathers some in-range token; its id is discarded.
-        self.indices.clear();
-        self.indices.extend(
-            batch.logits_rows[..rows]
-                .iter()
-                .map(|row| if *row < 0 { 0 } else { *row }),
-        );
+        gather_indices(
+            &batch.logits_rows,
+            &batch.query_offsets,
+            usize::try_from(self.staging.live_tokens()).unwrap_or(usize::MAX),
+            rows,
+            &mut self.indices,
+        )?;
         encode_i32(&mut self.encoded, &self.indices);
         self.columns.indices.write(&self.encoded)?;
 
@@ -2564,8 +2594,83 @@ fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> R
     Ok(())
 }
 
+/// The rows of the `[tokens, hidden]` stack the sampler gathers, one per batch row.
+///
+/// `logits_rows` names, per row, the row whose logits are wanted and is negative where nothing is
+/// sampled; the token whose logits that row samples is the **last token of the row's own query
+/// range**, which `query_offsets` states. The two indices agree only when every row holds one
+/// token - a decode - so a batch whose rows carry several tokens reads its prefill from the wrong
+/// row without this mapping.
+///
+/// A prefilling bucket's padding tokens belong to the **last** row: `Staging::stage` extends that
+/// row's range to the bucket's token axis, because the pack the attention kernel reads ends there.
+/// So the range's end is the last token of the *bucket*, not of the batch, and the count that tells
+/// them apart is the batch's own live token count. A row that samples nothing gathers the stack's
+/// first token, whose id the sampler discards.
+fn gather_indices(
+    logits_rows: &[i32],
+    query_offsets: &[i32],
+    live_tokens: usize,
+    rows: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    if logits_rows.len() < rows || query_offsets.len() < rows + 1 {
+        return Err(Error::Invalid(format!(
+            "a batch of {rows} rows states {} logits rows and {} query offsets",
+            logits_rows.len(),
+            query_offsets.len()
+        )));
+    }
+    let live = i32::try_from(live_tokens)
+        .map_err(|_| Error::Invalid("a batch of more tokens than an i32 counts".into()))?;
+    out.clear();
+    for row in 0..rows {
+        out.push(if logits_rows[row] < 0 {
+            0
+        } else {
+            // The batch's own tokens end at `live_tokens`, and only the last row's range was
+            // extended past them.
+            query_offsets[row + 1].min(live).saturating_sub(1).max(0)
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// A prefill's row is its whole prompt, and the sampler must read the row of the stack that
+    /// token ends: the gather index is the last token of the row's own range, not the row's own
+    /// index. A decode is the case where the two agree, which is why reading the row index fails
+    /// only on a prefill and only from the first token on.
+    #[test]
+    fn a_prefill_samples_the_last_token_of_its_row_and_not_the_rows_own_index() {
+        use super::gather_indices;
+
+        let mut indices = Vec::new();
+        // One call of three prompt tokens, ending its prompt, in a bucket whose token axis holds
+        // eight: `stage` extends the row's range over the five padding tokens, so the row's range
+        // ends at the bucket and the batch's own count is what names the last real token.
+        gather_indices(&[0], &[0, 8], 3, 1, &mut indices).expect("a prefill");
+        assert_eq!(indices, vec![2], "the prefill samples its last real token");
+
+        // Two calls, one of three prompt tokens and one of a single token, the last padded.
+        gather_indices(&[0, 1], &[0, 3, 8], 4, 2, &mut indices).expect("two prefills");
+        assert_eq!(indices, vec![2, 3]);
+
+        // A decode of three one-token rows: the row index is the token index, and a decode bucket
+        // extends no row's range over padding rows.
+        gather_indices(&[0, 1, 2], &[0, 1, 2, 3], 3, 3, &mut indices).expect("a decode");
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // A chunked prefill that ends no prompt samples nothing, and its row gathers an in-range
+        // token the sampler discards, so the row after it still reads its own last token.
+        gather_indices(&[-1, 1], &[0, 2, 8], 3, 2, &mut indices).expect("a chunk and a row");
+        assert_eq!(indices, vec![0, 2]);
+
+        // Fewer columns than rows is refused rather than read past.
+        assert!(gather_indices(&[0], &[0, 3], 3, 2, &mut indices).is_err());
+    }
+
     use super::*;
 
     /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
