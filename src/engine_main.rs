@@ -1823,92 +1823,31 @@ impl MainProcess {
                 "this host's store supplies fewer operators than the build implements"
             );
         }
-        let mut programs = Programs::new();
-        let mut candidates = Candidates::new();
-        // Every operator the store supplies, and every one the deployment names - a named program
-        // whose operator the store does not supply is still installed, and the walk reports what it
-        // cannot bind.
-        let mut operators: Vec<String> = chosen.keys().cloned().collect();
-        for slot in named.keys() {
-            if !operators.contains(&slot.op) {
-                operators.push(slot.op.clone());
-            }
-        }
-        let named_here = |op: &str| -> Vec<(Option<PhaseKind>, Program)> {
-            named
+        // What this host has built for every package the store holds, keyed by the package -
+        // (operator, backend, revision) - because that is what a phase split is read from: the keys
+        // a package built are the phases it can serve.
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        for package in &listing.packages {
+            let mut keys: Vec<String> = package
+                .modules
                 .iter()
-                .filter(|(slot, _)| slot.op == op)
-                .map(|(slot, program)| (slot.phase, program.clone()))
-                .collect()
-        };
-        for op in operators {
-            let stated = named_here(&op);
-            // A deployment that states a backend per phase - a prefill attention backend and a
-            // decode one - has already said which keys each of them covers, so nothing here is
-            // decided from the store: both programs are the operator's, each in its own phase.
-            if stated.iter().any(|(phase, _)| phase.is_some()) {
-                for (phase, program) in &stated {
-                    programs.insert(
-                        ProgramSlot {
-                            op: op.clone(),
-                            phase: *phase,
-                        },
-                        program.clone(),
-                    );
-                }
-                if let Some(ordered) = chosen.get(&op) {
-                    candidates.insert(op, ordered.clone());
-                }
-                continue;
-            }
-            // The deployment's program comes first: it decides the phases its own package covers,
-            // and the store's order decides the rest.
-            let mut ordered: Vec<Program> =
-                stated.into_iter().map(|(_, program)| program).collect();
-            for (backend, revision) in chosen.get(&op).cloned().unwrap_or_default() {
-                ordered.push(Program {
-                    backend,
-                    revision,
-                    // The package's own defaults are the arguments the operator's modules were
-                    // built with; the deployment overrides them by naming a program.
-                    arguments: Default::default(),
-                });
-            }
-            ordered.dedup();
-            // What each program built for this host's targets: the keys a phase split is read from.
-            let holders: Vec<(Program, Vec<String>)> = ordered
-                .iter()
-                .map(|program| {
-                    (
-                        program.clone(),
-                        built_keys(&listing, &op, program, &self.targets),
-                    )
-                })
-                .filter(|(_, keys)| !keys.is_empty())
+                .filter(|module| self.targets.contains(&module.target))
+                .map(|module| module.descriptor.clone())
                 .collect();
-            if !named_here(&op).is_empty()
-                && holders.first().map(|(program, _)| program) != ordered.first()
-            {
-                // The deployment named a program this host has built nothing of, and another
-                // package has: the store decides rather than the name, so say so - silently
-                // serving another backend than the one the deployment named would be the harder
-                // fact to find.
-                tracing::warn!(
-                    op = %op,
-                    named = %ordered.first().map(|program| program.backend.as_str()).unwrap_or(""),
-                    built = %holders.first().map(|(program, _)| program.backend.as_str()).unwrap_or(""),
-                    "the named program is not built for this host's targets: the store's own \
-                     package fills its operator"
+            keys.sort_unstable();
+            keys.dedup();
+            if !keys.is_empty() {
+                built.insert(
+                    (
+                        package.op.clone(),
+                        package.backend.clone(),
+                        package.revision,
+                    ),
+                    keys,
                 );
             }
-            for (slot, program) in operator_slots(&op, &holders, ordered.first()) {
-                programs.insert(slot, program);
-            }
-            if let Some(ordered) = chosen.get(&op) {
-                candidates.insert(op, ordered.clone());
-            }
         }
-        Ok((programs, candidates))
+        Ok(resolve_slots(named, &chosen, &built))
     }
 
     /// One operator's program from this host's store, for a walk that named an operator the
@@ -5769,6 +5708,110 @@ fn operator_slots(
     }
 }
 
+/// The generation's programs, from the deployment's named programs and this host's store.
+///
+/// `chosen` is the store's candidates per operator, in its own preference order; `built` is what
+/// each package built for this host's targets, keyed by the package. Pure, so the resolution a run
+/// depends on can be tested with the shape a `Precopy` actually hands it.
+fn resolve_slots(
+    named: &Programs,
+    chosen: &BTreeMap<String, Vec<(String, u32)>>,
+    built: &BTreeMap<(String, String, u32), Vec<String>>,
+) -> (Programs, Candidates) {
+    let keys_of = |op: &str, program: &Program| -> Vec<String> {
+        built
+            .get(&(op.to_owned(), program.backend.clone(), program.revision))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut programs = Programs::new();
+    let mut candidates = Candidates::new();
+    // Every operator the store supplies, and every one the deployment names - a named program whose
+    // operator the store does not supply is still installed, and the walk reports what it cannot
+    // bind.
+    let mut operators: Vec<String> = chosen.keys().cloned().collect();
+    for slot in named.keys() {
+        if !operators.contains(&slot.op) {
+            operators.push(slot.op.clone());
+        }
+    }
+    let named_here = |op: &str| -> Vec<(Option<PhaseKind>, Program)> {
+        named
+            .iter()
+            .filter(|(slot, _)| slot.op == op)
+            .map(|(slot, program)| (slot.phase, program.clone()))
+            .collect()
+    };
+    for op in operators {
+        let stated = named_here(&op);
+        // A deployment that states a backend per phase - a prefill attention backend and a decode
+        // one - has already said which keys each of them covers, so nothing here is decided from
+        // the store: both programs are the operator's, each in its own phase.
+        if stated.iter().any(|(phase, _)| phase.is_some()) {
+            for (phase, program) in &stated {
+                programs.insert(
+                    ProgramSlot {
+                        op: op.clone(),
+                        phase: *phase,
+                    },
+                    program.clone(),
+                );
+            }
+            if let Some(ordered) = chosen.get(&op) {
+                candidates.insert(op, ordered.clone());
+            }
+            continue;
+        }
+        // The deployment's program comes first: it decides the phases its own package covers, and
+        // the store's order decides the rest. A program is one package however it was written down,
+        // so the named form and the store's form of the same package are one entry - with the
+        // deployment's arguments, which are the ones the epoch pinned.
+        let mut ordered: Vec<Program> = stated.into_iter().map(|(_, program)| program).collect();
+        for (backend, revision) in chosen.get(&op).cloned().unwrap_or_default() {
+            ordered.push(Program {
+                backend,
+                revision,
+                arguments: Default::default(),
+            });
+        }
+        let mut seen: Vec<(String, u32)> = Vec::with_capacity(ordered.len());
+        ordered.retain(|program| {
+            let package = (program.backend.clone(), program.revision);
+            if seen.contains(&package) {
+                return false;
+            }
+            seen.push(package);
+            true
+        });
+        // What each program built for this host's targets: the keys a phase split is read from.
+        let holders: Vec<(Program, Vec<String>)> = ordered
+            .iter()
+            .map(|program| (program.clone(), keys_of(&op, program)))
+            .filter(|(_, keys)| !keys.is_empty())
+            .collect();
+        let was_named = named.keys().any(|slot| slot.op == op);
+        if was_named && holders.first().map(|(program, _)| program) != ordered.first() {
+            // The deployment named a program this host has built nothing of, and another package
+            // has: the store decides rather than the name, so say so - silently serving another
+            // backend than the one the deployment named would be the harder fact to find.
+            tracing::warn!(
+                op = %op,
+                named = %ordered.first().map(|program| program.backend.as_str()).unwrap_or(""),
+                built = %holders.first().map(|(program, _)| program.backend.as_str()).unwrap_or(""),
+                "the named program is not built for this host's targets: the store's own package \
+                 fills its operator"
+            );
+        }
+        for (slot, program) in operator_slots(&op, &holders, ordered.first()) {
+            programs.insert(slot, program);
+        }
+        if let Some(ordered) = chosen.get(&op) {
+            candidates.insert(op, ordered.clone());
+        }
+    }
+    (programs, candidates)
+}
+
 /// Adds one slot's keys to a package's request, merging with a slot of an operator the package
 /// already fills.
 ///
@@ -6200,6 +6243,141 @@ mod tests {
         let reason = promote_refusal(true, 0).unwrap_or_default();
         assert!(reason.contains("no prepared generation"), "{reason}");
         assert!(reason.contains("discarded"), "{reason}");
+    }
+
+    /// The shape the run at `b43aaac5e` met, and the one that stopped it: a deployment names **one**
+    /// backend for attention (`attention_backend=trtllm`, a phase-less slot), this host's store
+    /// holds that package's decode module *and* fa4's prefill one. The generation must hold both -
+    /// the forward launches a prefill key and a decode key - and the deployment's arguments stay on
+    /// the package it named.
+    ///
+    /// The run's log named the failure exactly: `slots=25 named=1 operators=25 alternative=1`, one
+    /// program per operator, and then `generation 1 has no kernel for operator paged_attention
+    /// descriptor phase_prefill_...`. The package was written down twice in one list - once as the
+    /// deployment named it and once as the store lists it, differing only in the arguments - so the
+    /// second copy's decode key collided with the first's and no split was stated.
+    #[test]
+    fn a_deployment_that_names_one_backend_still_holds_the_phases_the_store_builds() {
+        let prefill = "phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let decode = "phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32";
+        let mut arguments = toml::Table::new();
+        arguments.insert("window".to_owned(), toml::Value::Boolean(false));
+
+        // What the `Precopy` hands the install: one phase-less slot for attention, naming trtllm.
+        let mut named = Programs::new();
+        named.insert(
+            ProgramSlot {
+                op: "paged_attention".to_owned(),
+                phase: None,
+            },
+            Program {
+                backend: "trtllm".to_owned(),
+                revision: 1,
+                arguments: arguments.clone(),
+            },
+        );
+
+        // What this host's store holds for the operator: both packages, in its own order.
+        let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        chosen.insert(
+            "paged_attention".to_owned(),
+            vec![("fa4".to_owned(), 1), ("trtllm".to_owned(), 1)],
+        );
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        built.insert(
+            ("paged_attention".to_owned(), "fa4".to_owned(), 1),
+            vec![prefill.to_owned()],
+        );
+        built.insert(
+            ("paged_attention".to_owned(), "trtllm".to_owned(), 1),
+            vec![decode.to_owned()],
+        );
+
+        let (programs, candidates) = resolve_slots(&named, &chosen, &built);
+
+        assert_eq!(
+            programs.len(),
+            2,
+            "the generation held one program of an operator whose keys span two phases, which is \
+             the stop this test is written from"
+        );
+        assert_eq!(
+            programs
+                .get(&ProgramSlot {
+                    op: "paged_attention".to_owned(),
+                    phase: Some(PhaseKind::Prefill),
+                })
+                .map(|program| program.backend.as_str()),
+            Some("fa4"),
+            "the prefill key's package was not bound for prefill"
+        );
+        let decode_slot = ProgramSlot {
+            op: "paged_attention".to_owned(),
+            phase: Some(PhaseKind::Decode),
+        };
+        let Some(decode_program) = programs.get(&decode_slot).cloned() else {
+            panic!("the decode phase bound no program");
+        };
+        assert_eq!(decode_program.backend, "trtllm");
+        assert_eq!(
+            decode_program.arguments, arguments,
+            "the deployment's arguments were replaced by the store's defaults"
+        );
+        assert_eq!(
+            candidates.get("paged_attention").map(Vec::len),
+            Some(2),
+            "the walk lost the operator's alternatives"
+        );
+    }
+
+    /// The other half of the same rule: when the named package covers every phase its operator's
+    /// keys span, one slot is right and a split would be two packages asked for the same keys.
+    #[test]
+    fn a_named_package_that_covers_every_phase_stays_one_slot() {
+        let prefill = "phase_prefill_dtype_bf16";
+        let decode = "phase_decode_dtype_bf16";
+        let mut named = Programs::new();
+        named.insert(
+            ProgramSlot {
+                op: "paged_attention".to_owned(),
+                phase: None,
+            },
+            Program {
+                backend: "fa4".to_owned(),
+                revision: 1,
+                arguments: Default::default(),
+            },
+        );
+        let mut chosen: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        chosen.insert(
+            "paged_attention".to_owned(),
+            vec![("fa4".to_owned(), 1), ("trtllm".to_owned(), 1)],
+        );
+        let mut built: BTreeMap<(String, String, u32), Vec<String>> = BTreeMap::new();
+        built.insert(
+            ("paged_attention".to_owned(), "fa4".to_owned(), 1),
+            vec![prefill.to_owned(), decode.to_owned()],
+        );
+        built.insert(
+            ("paged_attention".to_owned(), "trtllm".to_owned(), 1),
+            vec![decode.to_owned()],
+        );
+
+        let (programs, _) = resolve_slots(&named, &chosen, &built);
+
+        assert_eq!(
+            programs.len(),
+            1,
+            "one package covering both phases was split"
+        );
+        let slot = ProgramSlot {
+            op: "paged_attention".to_owned(),
+            phase: None,
+        };
+        assert_eq!(
+            programs.get(&slot).map(|program| program.backend.as_str()),
+            Some("fa4")
+        );
     }
 
     /// A slot's keys are the ones its phase owns: a generation that holds two packages of one
