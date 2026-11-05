@@ -454,11 +454,7 @@ impl EpochPlan {
         served: &Served,
     ) -> Result<engine::RankFacts> {
         let Served::Text(model) = served else {
-            bail!(
-                "this rank's class is {:?} and its scheduler facts are derived for a causal \
-                 language model only",
-                served.class()
-            );
+            return self.media_rank_facts();
         };
         let (rows, tokens) = self.buckets.bounds();
         let control = checkpoint_tokens(&self.checkpoint)?;
@@ -524,6 +520,69 @@ impl EpochPlan {
             end_of_image: Some(0),
             // What one request may be given to generate on this model; see `understanding_limits`.
             generation_limits: Some(understanding_limits()),
+            max_model_len: self.build.max_model_len.map(|length| length.get()),
+            watchdog_timeout: Some(self.watchdog_timeout()),
+        })
+    }
+
+    /// What a media rank advertises of itself: the facts its scheduler is configured from.
+    ///
+    /// **A media rank keeps no paged key/value cache**, so the three facts that describe one are
+    /// absent rather than zero: `block_size`, `kv_cache_dtype` and the host tier describe a cache
+    /// this class does not hold, and stating a zero page would make a scheduler plan against a
+    /// pool that never exists. What replaces them is the deployment's media statement: the widest
+    /// batch it admits, the prompt capacity its encoder captures, and the length it states.
+    ///
+    /// Every figure here is the deployment's, not a checkpoint's: a pipeline does not imply a
+    /// prompt capacity or a clip length, and a default invented here would be a second statement of
+    /// the deployment's own file.
+    fn media_rank_facts(&self) -> Result<engine::RankFacts> {
+        let longest = self
+            .build
+            .max_model_len
+            .map(|length| length.get())
+            .context(
+                "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
+                 key/value cache, so no checkpoint figure implies one and the deployment's own is \
+                 what its prompt capacities are checked against",
+            )?;
+        let tokens = prompt_capacity(&self.build.video, longest)?;
+        Ok(engine::RankFacts {
+            model: Some(self.checkpoint.display().to_string()),
+            dtype: Some(self.build.dtype.clone()),
+            world: Some(self.world),
+            group: Some(self.group.clone()),
+            rank: Some(self.rank as usize),
+            world_size: Some(self.world_size),
+            devices: Some(
+                self.devices
+                    .iter()
+                    .map(|device| device.0.to_string())
+                    .collect(),
+            ),
+            hosts: match self.world_size {
+                1 => Some(vec![host_name()?]),
+                _ => None,
+            },
+            peers: None,
+            max_running_requests: Some(self.build.max_running_requests.get()),
+            // One media computation per request: a batch's rows are the requests it carries, and
+            // the deployment's admission bound is the number of them.
+            max_batch: Some(self.build.max_running_requests.get()),
+            max_num_batched_tokens: Some(tokens as usize),
+            // No paged cache: the three facts below describe one, and absence is their statement.
+            block_size: None,
+            kv_cache_dtype: None,
+            host_cache: None,
+            // A media rank captures graphs per bucket, and a bucket of this class is not sized by
+            // tokens: the tiers a policy is checked against do not exist here.
+            graph_tiers: None,
+            bos: None,
+            eos: None,
+            end_of_image: None,
+            // A media request generates a clip, not tokens, so the generation limits of a causal
+            // language model do not apply.
+            generation_limits: None,
             max_model_len: self.build.max_model_len.map(|length| length.get()),
             watchdog_timeout: Some(self.watchdog_timeout()),
         })
@@ -1097,6 +1156,61 @@ fn seed() -> u64 {
 /// `value` as the protocol's width, or the name of the field that does not fit it.
 fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{name} of {value} exceeds the protocol's width"))
+}
+
+/// The prompt capacities a media deployment captures: its own statement, or the default ladder.
+///
+/// The deployment's `text_capacities`, when stated, must be strictly increasing and below the
+/// length it admits - a capacity above it would capture an encoder graph no request can fill. The
+/// default is the one its options document states: `1024`, then steps of `2048`, below the length.
+fn prompt_capacities(video: &daemon::options::VideoOptions, longest: u32) -> Result<Vec<u32>> {
+    let stated: Vec<u32> = match &video.text_capacities {
+        Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
+        None => {
+            let mut ladder = Vec::new();
+            let mut capacity = 1024;
+            while capacity < longest {
+                ladder.push(capacity);
+                capacity += 2048;
+            }
+            ladder
+        }
+    };
+    if stated.is_empty() {
+        bail!(
+            "this deployment's video options state no prompt capacity below the {longest} tokens \
+             it admits, so no encoder bucket could be captured"
+        );
+    }
+    for pair in stated.windows(2) {
+        if pair[0] >= pair[1] {
+            bail!(
+                "this deployment's prompt capacities {} are not strictly increasing, so a request \
+                 of {} tokens would select two captured graphs",
+                stated
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pair[0]
+            );
+        }
+    }
+    if let Some(above) = stated.iter().copied().find(|capacity| *capacity > longest) {
+        bail!(
+            "this deployment states the prompt capacity {above} above the {longest} tokens it \
+             admits: the graph would be captured and never filled"
+        );
+    }
+    Ok(stated)
+}
+
+/// The widest prompt capacity a deployment captures: what one media batch may present.
+fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Result<u32> {
+    prompt_capacities(video, longest)?
+        .into_iter()
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
 }
 
 /// The model class a checkpoint declares, as its `config.json` states it.
