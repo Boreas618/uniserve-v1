@@ -255,8 +255,13 @@ def main():
             outcomes[outcome].append((name, detail, code))
 
     checks = sum(len(scripts) for _, scripts in found)
+    # A package directory is one backend of one operator, so the two counts differ where an operator
+    # has more than one backend. Both are stated because a count is quoted without its unit, and an
+    # operator with two backends read as two operators is a number nobody can reconcile later.
+    operators_count = len({package.relative_to(options.kernels).parts[0] for package, _ in found})
     print(
-        f"# {len(found)} packages, {checks} checks: {len(outcomes['passed'])} passed, "
+        f"# {len(found)} packages ({operators_count} operators), {checks} checks: "
+        f"{len(outcomes['passed'])} passed, "
         f"{len(outcomes['skipped'])} skipped, {len(outcomes['failed'])} failed, "
         f"{len(outcomes['timeout'])} timed out, {len(outcomes['contended'])} contended, "
         f"{len(outcomes['unreachable'])} unreachable"
