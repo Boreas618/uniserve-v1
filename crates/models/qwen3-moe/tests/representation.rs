@@ -158,6 +158,7 @@ fn the_declaration_states_itself_in_one_line() {
     let declaration = Representation::Nvfp4 {
         excluded: excluded.clone(),
         also_excluded: Vec::new(),
+        packed: None,
     };
     let line = declaration.summary();
     assert_eq!(line, "nvfp4, 48 module(s) excluded");
@@ -167,6 +168,7 @@ fn the_declaration_states_itself_in_one_line() {
     let side = Representation::Nvfp4 {
         excluded,
         also_excluded: vec!["lm_head".to_owned()],
+        packed: None,
     };
     assert_eq!(
         side.summary(),
