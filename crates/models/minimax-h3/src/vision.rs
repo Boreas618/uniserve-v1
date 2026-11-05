@@ -780,9 +780,9 @@ impl VisionTower {
         programs.launch::<Gemm>(&Linear::descriptor_of(
             hidden,
             dtype,
+            dtype,
             WeightOrder::NxK,
             true,
-            dtype,
             dtype,
         ));
 
