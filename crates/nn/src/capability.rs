@@ -942,11 +942,15 @@ pub trait Decoder {
     /// answered with a number the decode would run past. A decoder that states no plan refuses, as it
     /// does for a layout it cannot map: a zero would be the same value as an arena of no bytes.
     fn arena_bytes(&self, layout: &Layout) -> Result<u64> {
-        let _ = layout;
-        Err(Error::shape(
-            "Decoder",
-            "this decoder states no arena plan for a layout".to_owned(),
-        ))
+        // `Unsupported`, as [`Denoiser::arena_bytes`] answers, and not a shape error: a caller must
+        // be able to tell a block that states no plan from one that refuses the layout it was
+        // given. The first is a block the seam does not cover yet; the second is a deployment whose
+        // layout and block disagree, and a runner that swallowed both would report the second as the
+        // first.
+        Err(Error::Unsupported(format!(
+            "this decoder states no arena plan for a layout of {:?}",
+            layout.video
+        )))
     }
 
     /// Decode `latents` into `out`, reading the layout's tables in order.
@@ -1016,6 +1020,56 @@ mod tests {
             height,
             width,
         }
+    }
+
+    /// "This block states no plan" is `Unsupported`, and a refusal about a layout is not.
+    ///
+    /// A runner passes over `Unsupported` - the pool is then the only figure there is - and fails on
+    /// anything else, because a block that states a plan and refuses the layout it was handed is a
+    /// deployment whose block and layout disagree. Both being one variant would make the second
+    /// report as the first, which is the silent failure the arena plan exists to remove.
+    #[test]
+    fn a_block_that_states_no_arena_plan_says_unsupported() {
+        struct Silent;
+
+        impl Decoder for Silent {
+            fn layout_tables(&self, _layout: &Layout) -> Result<Vec<StateTable>> {
+                Ok(Vec::new())
+            }
+
+            fn prepare_layout(&self, _layout: &Layout, _out: &mut [Vec<u8>]) -> Result<()> {
+                Ok(())
+            }
+
+            fn element_type(&self) -> DType {
+                DType::F32
+            }
+
+            fn decode(
+                &self,
+                _f: &Forward,
+                _latents: TensorView,
+                _state: &[TensorView],
+                _out: DecodedMedia,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let layout = Layout {
+            video: latent(16, 2, 3, 4),
+            audio: None,
+            text_rows: 0,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let error = Silent
+            .arena_bytes(&layout)
+            .expect_err("a block with no plan states nothing");
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "a block with no plan is Unsupported, not a shape error: {error:?}"
+        );
     }
 
     /// The conditions' draw elements are the sum of their own unpacked latent shapes, which is
