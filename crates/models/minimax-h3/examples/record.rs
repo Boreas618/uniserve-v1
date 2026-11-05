@@ -50,8 +50,8 @@ use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
 // The capability trait, for the request's noise draw: it is a method of the trait, not of the struct.
 use nn::capability::Denoiser as _;
 use nn::capability::{
-    Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape, TokenBatch, VideoRequest,
-    VideoTask,
+    ConditionRole, ConditionShape, Encoder, EncoderInputs, EncoderOutputs, ImageInput, ImageShape,
+    TokenBatch, VideoRequest, VideoTask,
 };
 use nn::{PhaseKind, TensorView};
 use minimax_h3::AttentionKind;
@@ -229,6 +229,7 @@ fn run() -> Result<(), String> {
             ("video-encoder", video_encoder as Harness),
             ("video-decoder", video_decoder as Harness),
             ("denoiser", denoiser as Harness),
+            ("conditioned", conditioned as Harness),
             ("video-postprocessor", video_postprocessor as Harness),
             ("text-encoder", text_encoder as Harness),
             ("vision-tower", vision_tower as Harness),
@@ -242,6 +243,7 @@ fn run() -> Result<(), String> {
         "video-decoder" => vec![("video-decoder", video_decoder as Harness)],
         "denoiser" => vec![("denoiser", denoiser as Harness)],
         "video-postprocessor" => vec![("video-postprocessor", video_postprocessor as Harness)],
+        "conditioned" => vec![("conditioned", conditioned as Harness)],
         "text-encoder" => vec![("text-encoder", text_encoder as Harness)],
         "vision-tower" => vec![("vision-tower", vision_tower as Harness)],
         other => return Err(format!("unknown component {other}")),
@@ -896,6 +898,222 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
         .and_then(|source| {
             denoiser
                 .refine_conditioning(&forward, source, text, &tables, None)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|()| {
+            denoiser
+                .denoise(&forward, &step, latents, cond)
+                .map_err(|error| error.to_string())
+        });
+    ops::capture::set_sink(None);
+    run?;
+    Ok(recorded.0)
+}
+
+/// The conditioned pass: one reference still, through the model's own condition path.
+///
+/// A `t2va` request launches neither the condition encoders nor the visual conditioner, so its rows
+/// say nothing about them. This harness builds what the runner builds for a reference - the pixels,
+/// the anchoring draw, the rows the request's own layout counts - and drives
+/// `prepare_conditioning`, the capability call the deployment serves: it encodes the media and
+/// refines the prompt in place. That is where `posterior`, `frame_pad` and the encoders' launches
+/// happen, and nothing else reaches them without a device.
+fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
+    let config = minimax_h3::Config::read(&request.root, None).map_err(|error| error.to_string())?;
+    let network = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or("this checkpoint holds no base network")?
+        .clone();
+    let config_hidden = network.transformer.hidden_size;
+    let (height, width) = request.raster;
+    let partition = Partition {
+        tensor_parallel: 1,
+        tensor_rank: 0,
+        ulysses_degree: 1,
+        ..Partition::single()
+    };
+    // The reference's own raster is the request's canvas at the VAE's spatial compression, and its
+    // packed rows are one per 2x2 patch of its single latent frame. Both are the model's arithmetic:
+    // the canvas comes from the layout rule, and the rows from the packing's own count.
+    let probe = VideoRequest {
+        task: VideoTask::ReferenceToVideoAudio,
+        width,
+        height,
+        frames: request.clip,
+        fps: 24,
+        first_frames: 0,
+        last_frames: 0,
+        references: 1,
+        text_tokens: request.tokens,
+        conditions: &[],
+        vision_spans: &[],
+    };
+    let unit = network.attention.capacity_rows();
+    let probe_rules = Layouts::new(
+        network.clone(),
+        Arrangement::new(&network, request.tokens, unit, 1).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    // The reference's raster is the request's own latent raster, which the layout states for the video
+    // it generates: the canvas the rule returns is the decoder's pixel canvas, not this count.
+    let (probe_layout, _) = probe_rules.layout(&probe).map_err(|error| error.to_string())?;
+    let raster = minimax_h3::packing::LatentRaster {
+        height: probe_layout.video.height,
+        width: probe_layout.video.width,
+    };
+    let rows = minimax_h3::packing::Visual { frames: 1, raster }.rows();
+    // The condition capacity is the deployment's and holds this request's rows, in whole capacity
+    // units: a capacity the packing cannot serve is refused at load rather than at the first write.
+    let capacity = rows.div_ceil(unit) * unit;
+
+    let arrangement = Arrangement::new(&network, request.tokens, capacity, 1)
+        .map_err(|error| error.to_string())?;
+    let rules = Layouts::new(network.clone(), arrangement).map_err(|error| error.to_string())?;
+    let mut loader = WeightLoader::stated(request.dtype, Some(&request.extents));
+    // `ConditionEncoders` reads its weights from the VAE directories, as the decoder halves do, and
+    // the stated loader answers every name from the extents table on a host with no shard.
+    // The encoders compute in FP32 at every deployment, so they get their own statement. They are
+    // built here rather than through `ConditionEncoders::load` because that path reborrows the
+    // loader into the checkpoint's component, and a reborrow publishes into a retained store: a host
+    // with no shard has none, and a recording states shapes instead of reading bytes.
+    let mut encoder_loader = WeightLoader::stated(DType::F32, Some(&request.extents));
+    let encoders = minimax_h3::denoiser::ConditionEncoders {
+        video: VideoEncoder::load(&config.video_vae, &mut encoder_loader)
+            .map_err(|error| error.to_string())?,
+        audio: AudioEncoder::load(&config.audio_vae, &mut encoder_loader)
+            .map_err(|error| error.to_string())?,
+    };
+
+    let conditions = [ConditionShape {
+        role: ConditionRole::Reference,
+        frames: 1,
+        height: raster.height,
+        width: raster.width,
+        audio_samples: 0,
+    }];
+    let asked = VideoRequest {
+        conditions: &conditions,
+        ..probe
+    };
+    let (layout, packing) = rules.layout(&asked).map_err(|error| error.to_string())?;
+    // The deployment's packed-row bound is the layout's own total for this request - the video
+    // and audio rows and the prefix - because a conditioned request carries the condition rows in
+    // the same packed sequence: a bound of the generated rows alone refuses at the first launch.
+    let mut denoiser = Denoiser::load(
+        network,
+        arrangement,
+        packing.padded_tokens,
+        &partition,
+        &mut loader,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    denoiser
+        .attach_encoders(encoders)
+        .map_err(|error| error.to_string())?;
+
+    let arena = Arena::new(DevicePtr::new(0), 1 << 40);
+    let forward = Forward::recording(&arena);
+    let specs = rules.table_specs(&layout).map_err(|error| error.to_string())?;
+    let mut tables = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        tables.push(
+            arena
+                .tensor(spec.dtype, spec.shape)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let hidden = u64::from(config_hidden);
+    // The prefix the conditioner writes into: the prompt's rows, the condition's rows beneath them,
+    // and the zero row the layout reserves after both.
+    let prefix = u64::from(packing.text_rows + packing.condition_rows + 1);
+    // The conditioner's input is the text encoder's own features, at that encoder's width; its output
+    // is the denoiser's rows, at the network's - two widths, and a source at the wrong one is refused.
+    let text_width = u64::from(config.text_encoder.hidden_size);
+    let source = arena
+        .tensor(request.dtype, Shape::new(&[prefix, text_width]))
+        .map_err(|error| error.to_string())?;
+    let text = arena
+        .tensor(request.dtype, Shape::new(&[prefix, hidden]))
+        .map_err(|error| error.to_string())?;
+    // The condition's pixels at the canvas the request names, in the encoder's own channel order,
+    // and the anchoring draw at its latent raster: the runner owns both, and the conditioner
+    // patchifies the draw rather than reading rows from it.
+    let pixels = arena
+        .tensor(
+            ops::DType::F32,
+            Shape::new(&[1, 3, 1, u64::from(height), u64::from(width)]),
+        )
+        .map_err(|error| error.to_string())?;
+    let noise = arena
+        .tensor(
+            ops::DType::F32,
+            Shape::new(&[
+                u64::from(config.video_vae.latent_channels),
+                1,
+                u64::from(raster.height),
+                u64::from(raster.width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    let pieces = [nn::capability::MediaInput {
+        role: nn::capability::MediaRole::Reference,
+        rows,
+        audio_rows: 0,
+        pixels: Some(pixels),
+        audio: None,
+        noise: Some(noise),
+    }];
+    let video = arena
+        .tensor(
+            ops::DType::F32,
+            Shape::new(&[
+                u64::from(config.video_vae.latent_channels),
+                u64::from(layout.video.frames),
+                u64::from(layout.video.height),
+                u64::from(layout.video.width),
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+    let steps = u64::from(packing.audio_rows) / 2;
+    let audio = arena
+        .tensor(ops::DType::F32, Shape::new(&[2, steps]))
+        .map_err(|error| error.to_string())?;
+    let latents = nn::Latents {
+        video,
+        audio: Some(audio),
+    };
+    let cond = nn::Conditioning {
+        text,
+        source: Some(source),
+        media: &pieces,
+        images: None,
+        audio: None,
+        state: &tables,
+        step: None,
+    };
+    let step = nn::Step {
+        index: 0,
+        count: 1,
+        sigma: 1.0,
+        sigma_next: 0.0,
+    };
+
+    let mut recorded = Recorded::default();
+    ops::capture::set_sink(Some(&mut recorded));
+    let run = denoiser
+        .prepare_constants(&forward, &[])
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            denoiser
+                .draw_noise(&forward, nn::capability::Seed(0), layout, latents)
+                .map_err(|error| error.to_string())
+        })
+        // The capability call the runner makes: it encodes the conditions into the prefix rows and
+        // refines the prompt in place, and it is refused when this block holds no encoder.
+        .and_then(|()| {
+            minimax_h3::denoiser::Denoiser::prepare_conditioning(&denoiser, &forward, cond)
                 .map_err(|error| error.to_string())
         })
         .and_then(|()| {

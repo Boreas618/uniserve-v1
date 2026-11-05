@@ -3203,12 +3203,17 @@ impl Denoiser {
         let solver = Solver::load(&schedule, loader)?;
         // The refiner reads the text encoder's features and writes the DiT's conditioning; its rows
         // are bounded by the same packed-row bound the stack's attention is sized for.
-        // The refiner reads the encoder's rows, whose count is the text capacity - not the packed
-        // row bound: its scratch is sized per row it can see, and a packed bound would size it for
-        // every video row of the widest layout.
+        // The refiner reads the encoder's rows, whose count is the **prefix** - not the packed row
+        // bound: its scratch is sized per row it can see, and a packed bound would size it for every
+        // video row of the widest layout. The prefix is the prompt's rows, the condition's rows
+        // beneath them and the zero row the layout reserves after both, because a conditioned
+        // request's conditioner writes into one buffer at those offsets and the refiner reads it
+        // whole: a bound of the prompt's rows alone refuses the first conditioned launch by name
+        // (`a 4096-key bound for a launch of 4545 keys`).
+        let prefix_rows = arrangement.text_rows + arrangement.condition_rows + 1;
         let refiner = crate::conditioning::TokenRefiner::load(
             &config.transformer,
-            arrangement.text_rows,
+            prefix_rows,
             partition,
             loader,
         )?;
