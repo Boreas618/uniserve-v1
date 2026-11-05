@@ -991,6 +991,10 @@ fn convolution(
         weight,
         Some(bias),
         geometry(kernel, stride)?,
+        // `tf32`: the encoder's convolutions are FP32 and the reference keeps cuDNN's TF32 for
+        // them (design section 9). Stated with its name because a bare `true` beside another bool
+        // reads as neither, and a review of this crate took it for absent while it was here.
+        /* tf32 */
         true,
         channels_last,
     )?)
