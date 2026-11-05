@@ -111,7 +111,8 @@ use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
 use program_server::{
-    Client, Descriptors, PrepareRequest, Program, ProgramRequest, Selector, Target,
+    Client, Descriptors, PhaseKind, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
+    Target,
 };
 
 /// The epoch as this node takes it at start.
@@ -1672,43 +1673,30 @@ impl MainProcess {
     /// operator its buckets launch. So the first generation takes this host's store as its set and
     /// the named programs overlaid on it, which is the only reading under which `kernels=1` on a
     /// host that built twenty-seven launches a model rather than a fragment.
+    /// The epoch's first generation: the store's set, with the deployment's named programs deciding
+    /// the phases their own packages cover (§7.3 step 2).
+    ///
+    /// A named program chooses its operator's implementation - its backend and revision - and never
+    /// states the operator set: a deployment that pins one operator's kernel still runs every other
+    /// operator its buckets launch. So the first generation takes this host's store as its set and
+    /// the named programs resolved against it, which is the only reading under which `kernels=1` on
+    /// a host that built twenty-seven launches a model rather than a fragment.
+    ///
+    /// A named program also states nothing about the phases its operator's key spans, and an
+    /// operator split across two packages - a prefill module and a decode one - needs both, so the
+    /// name chooses the implementation *for its own keys* and the store keeps the other phases
+    /// (`operator_slots`).
     fn first_generation(
         &self,
         named: &Programs,
     ) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
-        let (mut listed, ordered) = match self.listed_programs() {
-            Ok(resolved) => resolved,
-            // The store describes nothing for this host's targets. With no named program there is
-            // nothing to install at all and the listing's own refusal is the answer; with a named
-            // one, the named set is installed and the walk reports what it cannot bind.
-            Err(failure) if named.is_empty() => return Err(failure),
-            // A first generation that could not take the store's set holds only what the deployment
-            // named - one operator pinned while the model's buckets launch every other one. Nothing
-            // can bind that generation, so it is refused here, where the figures are, rather than
-            // submitted to the devices: a device stage handed such a generation recaptures the
-            // catalogue bucket by bucket and answers nothing for minutes, which is a hang to every
-            // reader of the log.
-            Err(failure) => {
-                let reason = match failure {
-                    UpdateFailure::Precopy { reason } => reason,
-                    other => format!("{other:?}"),
-                };
-                return Err(UpdateFailure::Precopy {
-                    reason: format!(
-                        "the epoch's first generation would hold {} of the operators its buckets \
-                         launch: {reason}",
-                        named.len()
-                    ),
-                });
-            }
-        };
-        let named_count = named.len();
-        overlay_named(&mut listed, named);
+        let (listed, ordered) = self.listed_programs(named)?;
         tracing::info!(
-            operators = listed.len(),
-            named = named_count,
+            slots = listed.len(),
+            named = named.len(),
+            operators = ordered.len(),
             alternative = ordered.values().filter(|held| held.len() > 1).count(),
-            "this host's built programs, with the deployment's named ones overlaid"
+            "this host's built programs, with the deployment's named ones resolved first"
         );
         Ok((listed, ordered))
     }
@@ -1757,11 +1745,14 @@ impl MainProcess {
     /// the next one if the first cannot serve a descriptor it meets (`advance_candidate`). A
     /// deployment that wants one particular backend says so through the daemon, which names it in
     /// the `Precopy`, and then the walk does not choose at all.
-    fn listed_programs(&self) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
+    fn listed_programs(
+        &self,
+        named: &Programs,
+    ) -> std::result::Result<(Programs, Candidates), UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         let listing = self.listing().map_err(invalid)?;
         let chosen = select_programs(&listing.packages, &self.targets);
-        if chosen.is_empty() {
+        if chosen.is_empty() && named.is_empty() {
             return Err(invalid(format!(
                 "the precopy named no kernel program and this host has built none: the store's \
                  listing holds {} package(s) and none has a module for this host's targets, so \
@@ -1772,7 +1763,8 @@ impl MainProcess {
         tracing::info!(
             packages = listing.packages.len(),
             operators = chosen.len(),
-            "resolved this host's built programs for a precopy that named none"
+            named = named.len(),
+            "resolved this host's built programs, the deployment's named ones first"
         );
         // What this host's store supplies, against what this build implements: the difference is
         // the fact an operator needs, because it names the package nobody built (an operator whose
@@ -1798,24 +1790,88 @@ impl MainProcess {
         }
         let mut programs = Programs::new();
         let mut candidates = Candidates::new();
-        for (op, ordered) in chosen {
-            let Some((backend, revision)) = ordered.first() else {
+        // Every operator the store supplies, and every one the deployment names - a named program
+        // whose operator the store does not supply is still installed, and the walk reports what it
+        // cannot bind.
+        let mut operators: Vec<String> = chosen.keys().cloned().collect();
+        for slot in named.keys() {
+            if !operators.contains(&slot.op) {
+                operators.push(slot.op.clone());
+            }
+        }
+        let named_here = |op: &str| -> Vec<(Option<PhaseKind>, Program)> {
+            named
+                .iter()
+                .filter(|(slot, _)| slot.op == op)
+                .map(|(slot, program)| (slot.phase, program.clone()))
+                .collect()
+        };
+        for op in operators {
+            let stated = named_here(&op);
+            // A deployment that states a backend per phase - a prefill attention backend and a
+            // decode one - has already said which keys each of them covers, so nothing here is
+            // decided from the store: both programs are the operator's, each in its own phase.
+            if stated.iter().any(|(phase, _)| phase.is_some()) {
+                for (phase, program) in &stated {
+                    programs.insert(
+                        ProgramSlot {
+                            op: op.clone(),
+                            phase: *phase,
+                        },
+                        program.clone(),
+                    );
+                }
+                if let Some(ordered) = chosen.get(&op) {
+                    candidates.insert(op, ordered.clone());
+                }
                 continue;
-            };
-            programs.insert(
-                program_server::program::ProgramSlot {
-                    op: op.clone(),
-                    phase: None,
-                },
-                Program {
-                    backend: backend.clone(),
-                    revision: *revision,
+            }
+            // The deployment's program comes first: it decides the phases its own package covers,
+            // and the store's order decides the rest.
+            let mut ordered: Vec<Program> =
+                stated.into_iter().map(|(_, program)| program).collect();
+            for (backend, revision) in chosen.get(&op).cloned().unwrap_or_default() {
+                ordered.push(Program {
+                    backend,
+                    revision,
                     // The package's own defaults are the arguments the operator's modules were
                     // built with; the deployment overrides them by naming a program.
                     arguments: Default::default(),
-                },
-            );
-            candidates.insert(op, ordered);
+                });
+            }
+            ordered.dedup();
+            // What each program built for this host's targets: the keys a phase split is read from.
+            let holders: Vec<(Program, Vec<String>)> = ordered
+                .iter()
+                .map(|program| {
+                    (
+                        program.clone(),
+                        built_keys(&listing, &op, program, &self.targets),
+                    )
+                })
+                .filter(|(_, keys)| !keys.is_empty())
+                .collect();
+            if !named_here(&op).is_empty()
+                && holders.first().map(|(program, _)| program) != ordered.first()
+            {
+                // The deployment named a program this host has built nothing of, and another
+                // package has: the store decides rather than the name, so say so - silently
+                // serving another backend than the one the deployment named would be the harder
+                // fact to find.
+                tracing::warn!(
+                    op = %op,
+                    named = %ordered.first().map(|program| program.backend.as_str()).unwrap_or(""),
+                    built = %holders.first().map(|(program, _)| program.backend.as_str()).unwrap_or(""),
+                    "the named program is not built for this host's targets: the store's own \
+                     package fills its operator"
+                );
+            }
+            for (slot, program) in operator_slots(&op, &holders, ordered.first()) {
+                programs.insert(slot, program);
+            }
+            if let Some(ordered) = chosen.get(&op) {
+                candidates.insert(op, ordered.clone());
+            }
         }
         Ok((programs, candidates))
     }
@@ -1874,8 +1930,14 @@ impl MainProcess {
         // taken from a generation that already launched it: the epoch's first generation has
         // nothing to copy from, and the walk would otherwise discover one descriptor per capture.
         let mut listing: Option<program_server::Listing> = None;
-        let mut descriptors = Vec::with_capacity(programs.len());
-        let mut requests = Vec::with_capacity(programs.len());
+        // One request per package, not one per generation: the Program Server hands every chosen
+        // slot of an operator all the keys a request names for that operator, so a generation whose
+        // operator the store split across two backends - fa4's prefill module and trtllm's decode
+        // one - would have each of them asked for the other's keys, and the package that cannot
+        // build a phase it does not declare would refuse the generation. The keys of a slot are
+        // its own package's, which is what makes the package the request's unit.
+        let mut groups: BTreeMap<(String, u32), (Vec<ProgramRequest>, Vec<Descriptors>)> =
+            BTreeMap::new();
         for (slot, program) in programs {
             let Some(operator) = ops::operator_name(&slot.op) else {
                 return Err(invalid(format!(
@@ -1924,14 +1986,10 @@ impl MainProcess {
             keys.append(&mut known);
             keys.sort_unstable();
             keys.dedup();
-            descriptors.push(Descriptors {
-                op: slot.op.clone(),
-                keys,
-            });
-            requests.push(ProgramRequest {
-                slot: slot.clone(),
-                selector: Selector::Fixed(program.clone()),
-            });
+            let group = groups
+                .entry((program.backend.clone(), program.revision))
+                .or_default();
+            merge_request(group, slot, program, keys);
         }
 
         let mut tasks = Vec::with_capacity(self.executors.len());
@@ -1945,15 +2003,20 @@ impl MainProcess {
             let Some(target) = self.targets.get(index).cloned() else {
                 return Err(invalid(format!("device {} has no build target", ordinal.0)));
             };
+            // One request per package, in the store's own order so two runs ask alike.
+            let requests: Vec<PrepareRequest> = groups
+                .values()
+                .map(|(programs, descriptors)| PrepareRequest {
+                    targets: vec![target.clone()],
+                    programs: programs.clone(),
+                    descriptors: descriptors.clone(),
+                })
+                .collect();
             let install = Install {
                 programs: Arc::clone(&self.programs),
                 device,
-                target: target.clone(),
-                request: PrepareRequest {
-                    targets: vec![target],
-                    programs: requests.clone(),
-                    descriptors: descriptors.clone(),
-                },
+                target,
+                requests,
                 unavailable: Arc::clone(&unavailable),
             };
             match self.modules.admit(ModuleWork::Install(install)) {
@@ -1982,10 +2045,15 @@ impl MainProcess {
         let Some(ordered) = precopy.candidates.get(&op).cloned() else {
             return Advance::Named;
         };
+        // The slot the walk moves on is the one whose *program* the store refused: an operator the
+        // store splits across two packages has a slot per phase, and advancing the other one would
+        // replace a program that served its own keys perfectly.
+        let refused_backend = refused.backend().to_owned();
         let Some((slot, current)) = precopy
             .programs
             .iter()
-            .find(|(slot, _)| slot.op == op)
+            .find(|(slot, program)| slot.op == op && program.backend == refused_backend)
+            .or_else(|| precopy.programs.iter().find(|(slot, _)| slot.op == op))
             .map(|(slot, program)| (slot.clone(), program.clone()))
         else {
             return Advance::Named;
@@ -4255,7 +4323,10 @@ struct Install {
     programs: Arc<Mutex<Client>>,
     device: platform::Device,
     target: Target,
-    request: PrepareRequest,
+    /// One request per package the generation's programs come from: the Program Server names one
+    /// program per operator in a request, and an operator two packages split is asked of each in
+    /// its own request, with only the keys that package built.
+    requests: Vec<PrepareRequest>,
     /// The Program Server's own refusal, when it named a program that cannot serve a shape of this
     /// generation. The task fails with a message either way; this keeps the structured cause so the
     /// walk can ask the operator's next candidate program instead of giving up on the generation.
@@ -4830,27 +4901,28 @@ impl Install {
             }
         }
     }
-}
 
-impl HostAction for Install {
-    type Output = Vec<KernelEntry>;
-
-    fn run(&self) -> executor::Result<Self::Output> {
-        let mut client = self
-            .programs
-            .lock()
-            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+    /// One package's worth of the generation: its programs prepared, each key resolved for this
+    /// node's target, and each module loaded into this device's context as a kernel.
+    ///
+    /// Answers the entries this device installed for that package, and how many of them were
+    /// copied out of the store rather than loaded where they lie.
+    fn install_group(
+        &self,
+        client: &mut Client,
+        request: &PrepareRequest,
+    ) -> executor::Result<(Vec<KernelEntry>, usize)> {
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
         // daemon, so both sides state it.
         tracing::info!(
-            programs = self.request.programs.len(),
-            descriptors = self.request.descriptors.len(),
+            programs = request.programs.len(),
+            descriptors = request.descriptors.len(),
             target = %self.target,
             "asking the Program Server to prepare this generation's modules"
         );
         let prepared = client
-            .prepare(&self.request, &mut |progress| {
+            .prepare(request, &mut |progress| {
                 tracing::debug!(
                     path = %progress.path,
                     state = ?progress.state,
@@ -4872,14 +4944,16 @@ impl HostAction for Install {
                     chosen.slot.op
                 ))
             })?;
-            let keys: Vec<String> = self
-                .request
+            let keys: Vec<String> = request
                 .descriptors
                 .iter()
                 .filter(|descriptor| descriptor.op == chosen.slot.op)
                 .flat_map(|descriptor| descriptor.keys.iter().cloned())
                 .collect();
-            asked.push((format!("{}/{}", chosen.slot.op, chosen.program.backend), keys.len()));
+            asked.push((
+                format!("{}/{}", chosen.slot.op, chosen.program.backend),
+                keys.len(),
+            ));
             for key in keys {
                 let module = client
                     .resolve(
@@ -4965,6 +5039,45 @@ impl HostAction for Install {
             modules = entries.len(),
             copies,
             target = %self.target,
+            "this package's modules are installed for the new generation"
+        );
+        Ok((entries, copies))
+    }
+}
+
+impl HostAction for Install {
+    type Output = Vec<KernelEntry>;
+
+    /// Every package's half of §7.3 step 2 for this device, as one answer.
+    ///
+    /// The lane is admitted one task per device, so the packages are asked one after another under
+    /// one lock of the client: each is its own request, and the entries of all of them are this
+    /// device's kernels for the generation.
+    fn run(&self) -> executor::Result<Self::Output> {
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+        let mut entries = Vec::new();
+        let mut copies = 0_usize;
+        for request in &self.requests {
+            let (mut group, group_copies) = self.install_group(&mut client, request)?;
+            entries.append(&mut group);
+            copies += group_copies;
+        }
+        // A generation's kernels are named once each: two packages of one operator cover disjoint
+        // phases, and the same key twice would be the same kernel installed twice.
+        entries.sort_by(|left, right| {
+            (left.operator, &left.descriptor).cmp(&(right.operator, &right.descriptor))
+        });
+        entries.dedup_by(|left, right| {
+            left.operator == right.operator && left.descriptor == right.descriptor
+        });
+        tracing::info!(
+            modules = entries.len(),
+            copies,
+            packages = self.requests.len(),
+            target = %self.target,
             "this device's modules are installed for the new generation"
         );
         Ok(entries)
@@ -4979,26 +5092,46 @@ impl HostAction for Install {
     }
 }
 
-/// The operators whose program differs between what serves and what a precopy prepared (§7.3).
+/// The operators whose programs differ between what serves and what a precopy prepared (§7.3).
 ///
 /// `changed` is not `new`. An operator the prepared generation holds and the serving one does not
 /// has no old kernel to pair a shadowed step against, so it is not changed; the set is exactly the
-/// intersection where the two programs differ. It is empty when nothing serves yet - there is no old
+/// intersection where the programs differ. It is empty when nothing serves yet - there is no old
 /// kernel then either - which is what makes an epoch's first precopy pass without a shadow stage,
 /// and why no rule here needs a generation number.
+///
+/// An operator is one operator however many packages fill it: a store that splits attention into a
+/// prefill module and a decode one holds two slots of it, and changing either of them changes what
+/// the operator launches. So the comparison is between the two sides' *sets* of programs per
+/// operator, not between slots that a split may have renamed.
 fn changed_operators(prepared: &Programs, serving: &Programs) -> Vec<String> {
-    let mut changed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (slot, program) in prepared {
-        match serving.get(slot) {
-            Some(old) if old == program => {}
-            Some(_) => {
-                changed.insert(slot.op.as_str());
-            }
-            // No program served this operator: there is no old kernel to compare against.
-            None => {}
+    fn of<'a>(programs: &'a Programs, op: &str) -> Vec<(Option<PhaseKind>, &'a Program)> {
+        let mut held: Vec<(Option<PhaseKind>, &Program)> = programs
+            .iter()
+            .filter(|(slot, _)| slot.op == op)
+            .map(|(slot, program)| (slot.phase, program))
+            .collect();
+        held.sort_by(|left, right| (left.0, &left.1.backend).cmp(&(right.0, &right.1.backend)));
+        held
+    }
+    let mut operators: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for slot in prepared.keys().chain(serving.keys()) {
+        operators.insert(slot.op.as_str());
+    }
+    let mut changed: Vec<String> = Vec::new();
+    for op in operators {
+        let next = of(prepared, op);
+        let old = of(serving, op);
+        // An operator either side does not hold is new or retired, not changed: neither has a pair
+        // of programs to compare.
+        if next.is_empty() || old.is_empty() {
+            continue;
+        }
+        if next != old {
+            changed.push(op.to_owned());
         }
     }
-    changed.into_iter().map(str::to_owned).collect()
+    changed
 }
 
 /// The failure a shadow step that never ran is (§7.3 step 2).
@@ -5121,20 +5254,6 @@ struct Precopy {
     /// on the schedulers' own blocking threads, so the serve pass polls them instead of waiting.
     policies: Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>,
     stage: PrecopyStage,
-}
-
-/// Overlays the deployment's named programs on this host's store listing, by operator.
-///
-/// A named program chooses its operator's implementation - its backend, its revision and the
-/// arguments it was built with - and states nothing about the operators it does not name, so the
-/// two sets are united rather than substituted: the store stays the authority for every operator
-/// the deployment left unnamed. The named slot replaces every slot of its operator the listing
-/// holds, whatever phase either states.
-fn overlay_named(listed: &mut Programs, named: &Programs) {
-    for (slot, program) in named {
-        listed.retain(|held, _| held.op != slot.op);
-        listed.insert(slot.clone(), program.clone());
-    }
 }
 
 impl Precopy {
@@ -5469,6 +5588,104 @@ fn built_keys(
     keys
 }
 
+/// The phase a descriptor key states, when its operator's key names one.
+///
+/// A kernel program may be split by phase, and the phase is the first field of the key's own
+/// `Display` form (`phase_decode_dtype_bf16_kv_...`). An operator whose key states no phase - a
+/// `gemm`, an `expert_exchange` - answers `None`, and that `None` is what keeps such an operator
+/// from ever being split across packages: nothing in its keys says which of them a package covers.
+fn key_phase(key: &str) -> Option<PhaseKind> {
+    let rest = key.strip_prefix("phase_")?;
+    let (name, _) = rest.split_once('_')?;
+    PhaseKind::ALL
+        .into_iter()
+        .find(|phase| phase.as_str() == name)
+}
+
+/// The slots one operator's generation holds, from what each candidate package built for this host.
+///
+/// An operator may be built by more than one package - `paged_attention` is fa4's prefill module and
+/// trtllm's decode one - and then its generation must hold *both*: the forward launches a prefill
+/// key and a decode key, and a generation that holds one package serves one of them and refuses the
+/// other ("no kernel for operator paged_attention descriptor phase_prefill_..."). So the packages
+/// are split by the phase their own built keys state, one slot per phase, `holders` being in the
+/// deployment's preference order.
+///
+/// The split is only stated when it is exact: every key of a holder names a phase, and no phase is
+/// claimed twice. A package covering everything, an operator whose keys state no phase, or packages
+/// overlapping in one phase fall back to the single slot this has always been - the deployment's
+/// preference, or the store's order, decides - because a wrong split is worse than no split: two
+/// slots of one operator would have each package asked for a key it cannot serve.
+fn operator_slots(
+    op: &str,
+    holders: &[(Program, Vec<String>)],
+    fallback: Option<&Program>,
+) -> Vec<(ProgramSlot, Program)> {
+    let slot = |phase: Option<PhaseKind>| ProgramSlot {
+        op: op.to_owned(),
+        phase,
+    };
+    let phaseful = holders
+        .iter()
+        .all(|(_, keys)| keys.iter().all(|key| key_phase(key).is_some()));
+    let mut claims: Vec<(PhaseKind, usize)> = Vec::new();
+    let mut clash = false;
+    if phaseful && holders.len() > 1 {
+        for (index, (_, keys)) in holders.iter().enumerate() {
+            let mut phases: Vec<PhaseKind> = keys.iter().filter_map(|key| key_phase(key)).collect();
+            phases.sort_unstable();
+            phases.dedup();
+            for phase in phases {
+                clash |= claims.iter().any(|(held, _)| *held == phase);
+                claims.push((phase, index));
+            }
+        }
+    }
+    if !clash && claims.len() > 1 {
+        return claims
+            .into_iter()
+            .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
+            .collect();
+    }
+    match holders.first().map(|(program, _)| program).or(fallback) {
+        Some(program) => vec![(slot(None), program.clone())],
+        None => Vec::new(),
+    }
+}
+
+/// Adds one slot's keys to a package's request, merging with a slot of an operator the package
+/// already fills.
+///
+/// A request names one program per operator, and the Program Server hands that program every key
+/// the request names for the operator, so two slots of one operator filled by the same package
+/// belong in one entry rather than two that would each be asked for both key sets.
+fn merge_request(
+    group: &mut (Vec<ProgramRequest>, Vec<Descriptors>),
+    slot: &ProgramSlot,
+    program: &Program,
+    keys: Vec<String>,
+) {
+    if let Some(index) = group
+        .1
+        .iter()
+        .position(|descriptor| descriptor.op == slot.op)
+    {
+        let descriptor = &mut group.1[index];
+        descriptor.keys.extend(keys);
+        descriptor.keys.sort_unstable();
+        descriptor.keys.dedup();
+        return;
+    }
+    group.0.push(ProgramRequest {
+        slot: slot.clone(),
+        selector: Selector::Fixed(program.clone()),
+    });
+    group.1.push(Descriptors {
+        op: slot.op.clone(),
+        keys,
+    });
+}
+
 fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<String> {
     generation
         .iter()
@@ -5765,46 +5982,176 @@ mod tests {
     }
 
     /// A named program chooses its operator's implementation and never states the operator set:
-    /// the generation's programs are the store's listing with the named ones overlaid by operator.
+    /// the generation's programs are the store's packages, split by the phases their own built keys
+    /// state, with the deployment's preference deciding where two of them could serve.
+    ///
+    /// This is the shape `attention_backend` needs: `paged_attention` is fa4's prefill module and
+    /// trtllm's decode one, and a generation holding only one of them serves one phase and refuses
+    /// the other ("no kernel for operator paged_attention descriptor phase_prefill_...").
     #[test]
-    fn a_named_program_replaces_its_operator_and_leaves_the_rest_of_the_listing() {
-        let slot = |op: &str| program_server::program::ProgramSlot {
-            op: op.to_owned(),
-            phase: None,
-        };
+    fn an_operator_two_packages_build_is_bound_once_per_phase() {
         let program = |backend: &str, revision: u32| Program {
             backend: backend.to_owned(),
             revision,
             arguments: Default::default(),
         };
+        let prefill = vec!["phase_prefill_dtype_bf16_head_dim_128".to_owned()];
+        let decode = vec!["phase_decode_dtype_bf16_kv_bf16_head_dim_128".to_owned()];
 
-        let mut listed = Programs::new();
-        listed.insert(slot("paged_attention"), program("fa4", 3));
-        listed.insert(slot("rms_norm"), program("reference", 1));
-        listed.insert(slot("softmax"), program("reference", 2));
+        // fa4 built the prefill cell and trtllm the decode one: both are the operator's, and each
+        // keeps only the keys its own package built.
+        let holders = vec![
+            (program("fa4", 3), prefill.clone()),
+            (program("trtllm", 7), decode.clone()),
+        ];
+        let slots = operator_slots(
+            "paged_attention",
+            &holders,
+            holders.first().map(|(held, _)| held),
+        );
 
-        let mut named = Programs::new();
-        named.insert(slot("paged_attention"), program("trtllm", 7));
-
-        overlay_named(&mut listed, &named);
-
-        assert_eq!(listed.len(), 3, "the overlay changed the operator set");
+        assert_eq!(slots.len(), 2, "one operator's two packages were collapsed");
+        let phases: Vec<Option<PhaseKind>> = slots.iter().map(|(slot, _)| slot.phase).collect();
         assert_eq!(
-            listed
-                .get(&slot("paged_attention"))
-                .map(|held| held.backend.as_str()),
-            Some("trtllm"),
-            "the deployment's own choice did not replace the store's default"
+            phases,
+            vec![Some(PhaseKind::Prefill), Some(PhaseKind::Decode)]
         );
         assert_eq!(
-            listed.get(&slot("rms_norm")).map(|held| held.revision),
-            Some(1),
-            "an operator the deployment did not name was dropped"
+            slots
+                .iter()
+                .map(|(_, held)| held.backend.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fa4", "trtllm"],
+            "the phase split bound a package to the other phase's cell"
         );
+
+        // One package covering both phases is one slot, as it always was.
+        let both = vec![(
+            program("fa4", 3),
+            prefill.iter().cloned().chain(decode.clone()).collect(),
+        )];
+        let slots = operator_slots("paged_attention", &both, both.first().map(|(held, _)| held));
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0.phase, None);
+
+        // An operator whose keys state no phase - a gemm - is never split on a guess.
+        let holders = vec![
+            (
+                program("cublas", 1),
+                vec!["dtype_f16_m_128_n_128_k_7168".to_owned()],
+            ),
+            (
+                program("cutlass", 2),
+                vec!["dtype_f16_m_128_n_128_k_7168".to_owned()],
+            ),
+        ];
+        let slots = operator_slots("gemm", &holders, holders.first().map(|(held, _)| held));
+        assert_eq!(slots.len(), 1, "a phase-less operator was split");
+        assert_eq!(slots[0].0.phase, None);
+
+        // Two packages claiming one phase is a states-nothing case, not a split: the deployment's
+        // preference decides, and neither package is asked for the other's key.
+        let holders = vec![
+            (program("fa4", 3), prefill.clone()),
+            (program("trtllm", 7), prefill),
+        ];
+        let slots = operator_slots(
+            "paged_attention",
+            &holders,
+            holders.first().map(|(held, _)| held),
+        );
+        assert_eq!(slots.len(), 1, "an overlapping split was stated");
+        assert_eq!(slots[0].1.backend, "fa4");
+    }
+
+    /// An operator is one operator however many packages fill it: a store that splits attention
+    /// into a prefill module and a decode one holds two slots of it, and changing either changes
+    /// what the operator launches, so the shadow stage is owed for it.
+    #[test]
+    fn an_operator_filled_by_two_packages_is_one_changed_operator() {
+        let program = |backend: &str, revision: u32| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+        let slot = |phase: Option<PhaseKind>| ProgramSlot {
+            op: "paged_attention".to_owned(),
+            phase,
+        };
+        // What serves: one package filling both phases.
+        let mut serving = Programs::new();
+        serving.insert(slot(None), program("fa4", 3));
+        // What was prepared: the store's split - the prefill cell unchanged, the decode cell taken
+        // over by another package.
+        let mut prepared = Programs::new();
+        prepared.insert(slot(Some(PhaseKind::Prefill)), program("fa4", 3));
+        prepared.insert(slot(Some(PhaseKind::Decode)), program("trtllm", 7));
+
         assert_eq!(
-            listed.get(&slot("softmax")).map(|held| held.revision),
-            Some(2),
-            "an operator the deployment did not name was dropped"
+            changed_operators(&prepared, &serving),
+            vec!["paged_attention"],
+            "a split of one operator was not seen as a change of that operator"
+        );
+        // The same two slots on both sides is no change: a split that serves on both sides is the
+        // same operator running the same programs.
+        assert!(changed_operators(&prepared, &prepared).is_empty());
+    }
+
+    /// The Program Server hands a request's program every key the request names for its operator,
+    /// so a generation's slots are grouped by the package that fills them: two slots of one
+    /// operator from one package are one request entry with both key sets, and two packages are
+    /// two requests that never name each other's keys.
+    #[test]
+    fn a_package_asks_once_per_operator_for_the_keys_it_built() {
+        let program = |backend: &str, revision: u32| Program {
+            backend: backend.to_owned(),
+            revision,
+            arguments: Default::default(),
+        };
+        let slot = |op: &str, phase: Option<PhaseKind>| ProgramSlot {
+            op: op.to_owned(),
+            phase,
+        };
+
+        let mut group: (Vec<ProgramRequest>, Vec<Descriptors>) = (Vec::new(), Vec::new());
+        let prefill = program("fa4", 3);
+        merge_request(
+            &mut group,
+            &slot("paged_attention", Some(PhaseKind::Prefill)),
+            &prefill,
+            vec!["phase_prefill_dtype_bf16".to_owned()],
+        );
+        merge_request(
+            &mut group,
+            &slot("paged_attention", Some(PhaseKind::Decode)),
+            &prefill,
+            vec!["phase_decode_dtype_bf16".to_owned()],
+        );
+        merge_request(
+            &mut group,
+            &slot("gemm", None),
+            &prefill,
+            vec!["dtype_f16_m_128_n_128_k_7168".to_owned()],
+        );
+
+        assert_eq!(group.0.len(), 2, "one package asked twice for one operator");
+        assert!(group
+            .0
+            .iter()
+            .all(|request| request.selector == Selector::Fixed(prefill.clone())));
+        let attention = group
+            .1
+            .iter()
+            .find(|descriptor| descriptor.op == "paged_attention")
+            .map(|descriptor| descriptor.keys.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            attention,
+            vec![
+                "phase_decode_dtype_bf16".to_owned(),
+                "phase_prefill_dtype_bf16".to_owned()
+            ],
+            "a phase's key was dropped from the package's one request"
         );
     }
 
