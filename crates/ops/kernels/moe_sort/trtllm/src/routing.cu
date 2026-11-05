@@ -69,12 +69,16 @@ __device__ __forceinline__ void count_routes(const uniserve_moe_sort_call& call,
     const int64_t local = local_expert_of(call, route);
     if (local >= 0) {
       atomicAdd(reinterpret_cast<unsigned long long*>(&counts[local]), 1ull);
+    } else {
+      // A route this rank does not hold is stated absent here, by the pass that already computes
+      // the predicate, so no caller has to pre-fill the map and none can forget to.
+      call.expanded_to_permuted[route] = -1;
     }
   }
 }
 
-/// The first pass: counts, the tile metadata, the two scalars, and the -1 an
-/// out-of-window route keeps.
+/// The first pass: counts, the tile metadata, the two scalars, and the -1 this
+/// rank writes for a route it does not hold.
 __global__ void sort_metadata_kernel(uniserve_moe_sort_call call) {
   extern __shared__ int64_t shared[];
   int64_t* counts = shared;

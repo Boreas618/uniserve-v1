@@ -217,8 +217,10 @@ def main() -> int:
 
     tile_to_expert = torch.full((tiles,), -1, dtype=torch.int32, device=device)
     tile_to_limit = torch.full((tiles,), -1, dtype=torch.int32, device=device)
+    # A sentinel the sort must overwrite: pre-filling with -1 would hide a kernel that never writes
+    # the absent entries, which is the defect this check exists to catch.
     expanded_to_permuted = torch.full(
-        (tokens, top), -1, dtype=torch.int32, device=device
+        (tokens, top), -7, dtype=torch.int32, device=device
     )
     permuted_to_expanded = torch.full(
         (permuted,), -1, dtype=torch.int32, device=device
