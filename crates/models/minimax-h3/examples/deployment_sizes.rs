@@ -42,7 +42,6 @@ const TABLE_DECODE: nn::DType = nn::DType::F32;
 /// `video` encoder 180,337,888 = 688 MiB, `audio_decoder` 64,939,353 = 248 MiB, `audio` encoder
 /// 86,386,176 = 330 MiB - so the two encoders a conditioned deployment attaches are 1,018 MiB, not
 /// 500, and every `+ encoders` row below carries that.
-
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
