@@ -91,9 +91,25 @@ pub struct SortArgs {
     pub total_padded_tokens: TensorView,
     /// `[1]` i32: tiles that hold live rows.
     pub num_non_exiting_tiles: TensorView,
+    /// `[1]` i32: the token rows of this batch that are live, device-resident.
+    ///
+    /// A captured bucket is wider than the batch that fills it, and a row past the batch's extent has
+    /// no route: the program writes [`PADDED`] into `expanded_to_permuted` for every route of such a
+    /// row, which the combine skips because it refuses any negative index. The value lives on the
+    /// device rather than in [`Call`]'s host scalars because it changes per replay of one captured
+    /// graph, and a host value is read once at launch. `None` states no count, which every row live
+    /// means here: a deployment that has not been given one behaves exactly as it did before the
+    /// operand existed, and the kernel reads a null pointer as "all rows are live".
+    pub live_tokens: Option<TensorView>,
     /// First logical expert this rank holds.
     pub local_offset: u32,
 }
+
+/// The map's value for a route of a token row the batch does not fill.
+///
+/// Distinct from `-1`, which means the route is held by another rank. The combine refuses any
+/// negative index, so both are skipped by one predicate.
+pub const PADDED: i32 = -2;
 
 /// The call structure the package's entry receives.
 ///
@@ -116,11 +132,12 @@ pub struct Call {
     pub tile_tokens: i64,
     pub scales_dtype: i64,
     pub error: [u8; 512],
+    pub live_tokens: *const i32,
 }
 
 /// The size and field offsets the package's header must mirror, in bytes.
 pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 632,
+    size: 640,
     ids: 0,
     scales: 8,
     tile_to_expert: 16,
@@ -137,6 +154,7 @@ pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
     tile_tokens: 104,
     scales_dtype: 112,
     error: 120,
+    live_tokens: 632,
 };
 
 /// The layout of [`Call`], for the header's mirror and its test.
@@ -159,6 +177,7 @@ pub struct CallLayout {
     pub tile_tokens: usize,
     pub scales_dtype: usize,
     pub error: usize,
+    pub live_tokens: usize,
 }
 
 const _: () = assert!(
@@ -172,6 +191,10 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(Call, tokens) == SORT_CALL_LAYOUT.tokens,
     "the moe_sort call structure's extents moved without its header"
+);
+const _: () = assert!(
+    std::mem::offset_of!(Call, live_tokens) == SORT_CALL_LAYOUT.live_tokens,
+    "the moe_sort call structure's live count moved without its header"
 );
 const _: () = assert!(
     std::mem::offset_of!(Call, error) == SORT_CALL_LAYOUT.error,
@@ -246,6 +269,10 @@ impl Op for MoeSort {
             .require_shape(Self::NAME, Shape::new(&[1]))?;
         args.num_non_exiting_tiles
             .require_shape(Self::NAME, Shape::new(&[1]))?;
+        if let Some(live_tokens) = args.live_tokens {
+            live_tokens.require_shape(Self::NAME, Shape::new(&[1]))?;
+            live_tokens.require_row(Self::NAME, DType::I32, 1)?;
+        }
         for view in [
             &args.expanded_to_permuted,
             &args.permuted_to_expanded,
@@ -286,6 +313,9 @@ impl Op for MoeSort {
             tile_tokens: to_i64(Self::NAME, tile)?,
             scales_dtype: dtype_code(descriptor.scales),
             error: [0; 512],
+            live_tokens: args.live_tokens.map_or(std::ptr::null(), |view| {
+                address(view.ptr) as usize as *const i32
+            }),
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
         // pinned by the assertions above and by the test below.

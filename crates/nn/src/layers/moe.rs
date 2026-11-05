@@ -712,6 +712,7 @@ enum ExpertStacks {
 /// All of them are the forward's arena, sized from the routing geometry, so a captured graph
 /// replays over the same addresses however the router routes a later batch.
 #[derive(Clone, Copy)]
+
 struct Routes {
     /// `[tokens, top]` i32: the weight row of each route.
     local_ids: TensorView,
@@ -1260,6 +1261,7 @@ impl Moe {
             permuted_to_expanded,
             total_padded_tokens,
             num_non_exiting_tiles,
+            live_tokens: f.live_of(),
             local_offset: 0,
         };
 
@@ -1864,6 +1866,7 @@ impl Moe {
             permuted_to_expanded,
             total_padded_tokens,
             num_non_exiting_tiles,
+            live_tokens: f.live_of(),
             local_offset: self.local_offset,
         };
 
