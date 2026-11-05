@@ -76,8 +76,81 @@ enum uniserve_phase : int64_t {
   UNISERVE_PHASE_DECODE = 1,
 };
 
+// Every field is asserted, not one: two fields of the same size can be swapped between this
+// header and the operator without a size assert noticing, and the operator reads them by
+// name. The Rust side reads these literals (crates/ops/src/attention/mod.rs,
+// `the_package_header_declares_this_call_layout`), so a layout that moves on one side fails
+// on the other rather than at run time.
+static_assert(offsetof(uniserve_paged_attention_call, out) == 0,
+              "the call's out must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, query) == 8,
+              "the call's query must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, key) == 16,
+              "the call's key must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, value) == 24,
+              "the call's value must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, key_scale) == 32,
+              "the call's key_scale must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, value_scale) == 40,
+              "the call's value_scale must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, workspace) == 48,
+              "the call's workspace must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, page_table) == 56,
+              "the call's page_table must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, seq_lens) == 64,
+              "the call's seq_lens must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, cum_seq_lens_q) == 72,
+              "the call's cum_seq_lens_q must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, batch) == 80,
+              "the call's batch must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, tokens) == 88,
+              "the call's tokens must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, max_q_len) == 96,
+              "the call's max_q_len must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, max_kv_len) == 104,
+              "the call's max_kv_len must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, num_pages) == 112,
+              "the call's num_pages must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, page_size) == 120,
+              "the call's page_size must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, q_heads) == 128,
+              "the call's q_heads must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, kv_heads) == 136,
+              "the call's kv_heads must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, head_dim) == 144,
+              "the call's head_dim must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, q_stride_tokens) == 152,
+              "the call's q_stride_tokens must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, q_stride_heads) == 160,
+              "the call's q_stride_heads must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, kv_stride_page) == 168,
+              "the call's kv_stride_page must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, kv_stride_tokens) == 176,
+              "the call's kv_stride_tokens must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, kv_stride_heads) == 184,
+              "the call's kv_stride_heads must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, o_stride_tokens) == 192,
+              "the call's o_stride_tokens must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, o_stride_heads) == 200,
+              "the call's o_stride_heads must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, scale) == 208,
+              "the call's scale must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, window_left) == 216,
+              "the call's window_left must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, causal) == 224,
+              "the call's causal must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, workspace_bytes) == 232,
+              "the call's workspace_bytes must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, dtype_query) == 240,
+              "the call's dtype_query must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, dtype_key_value) == 248,
+              "the call's dtype_key_value must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, dtype_output) == 256,
+              "the call's dtype_output must sit where the operator's layout puts it");
+static_assert(offsetof(uniserve_paged_attention_call, phase) == 264,
+              "the call's phase must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_paged_attention_call, error) == 272,
-              "the call's error message must sit where the operator's layout puts it");
+              "the call's error must sit where the operator's layout puts it");
 static_assert(sizeof(uniserve_paged_attention_call) == 784,
               "the call must be the size of the operator's layout");
 
