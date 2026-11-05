@@ -2903,11 +2903,19 @@ fn needed_keys(
         };
         // A cache this deployment does not select is not a missing program: the `kv_f8e4m3` rows
         // belong to an fp8 deployment and the bf16 rows to a bf16 one, and a run must not be blocked
-        // by the other's gap.
+        // by the other's gap - and, just as much, must be blocked by a gap in its own. Only the
+        // cache's own operators are per-page-type: `kv_write`/`kv_write_scaled` and the fused
+        // attention, whose key carries the plane. Every other operator is the deployment's whatever
+        // the page is, so a filter that compares the page type across all rows drops the embedding,
+        // the projections and the MoE from an fp8 run's list and leaves three rows where nineteen
+        // launch - which the run then reports as a missing program far from the cause.
+        let cache_row = operator == "kv_write"
+            || operator == "kv_write_scaled"
+            || operator == "paged_attention";
         let scaled = operator == "kv_write_scaled"
             || descriptor.contains("kv_f8e4m3")
             || descriptor.contains("kv_f8e5m2");
-        if scaled != (kv_pages == KvPages::Fp8) {
+        if cache_row && scaled != (kv_pages == KvPages::Fp8) {
             continue;
         }
         // An encoded checkpoint's programs are its own: a dense deployment must not be held up by
