@@ -635,7 +635,15 @@ fn width_of(kind: &str) -> usize {
 mod tests {
     use super::*;
 
-    fn plan_of(recipe: serde_json::Value, metadata: serde_json::Value) -> (Recipe, Metadata) {
+    /// A recipe and its module on disk, and the directory that holds them.
+    ///
+    /// The directory is returned because a `TempDir` deletes its files when it is dropped: a
+    /// caller that lets it fall here reads a recipe whose module no longer exists, and the baked
+    /// constants then read as an empty set rather than as a missing file.
+    fn plan_of(
+        recipe: serde_json::Value,
+        metadata: serde_json::Value,
+    ) -> (tempfile::TempDir, Recipe, Metadata) {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let recipe_path = directory.path().join("case.json");
         std::fs::write(&recipe_path, recipe.to_string()).expect("the recipe is written");
@@ -646,6 +654,7 @@ mod tests {
         std::fs::write(module.join("baked.json"), "{\"experts\": 128, \"top\": 8}")
             .expect("the baked constants are written");
         (
+            directory,
             Recipe::read(&recipe_path).expect("the recipe reads"),
             Metadata::read(&module).expect("the metadata reads"),
         )
@@ -653,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_baked_constant_reaches_the_word_the_recipe_names() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -675,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_word_array_the_signature_does_not_describe_is_refused() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -699,7 +708,7 @@ mod tests {
 
     #[test]
     fn a_module_without_a_signature_is_launched_unchecked_and_says_so() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -719,7 +728,7 @@ mod tests {
 
     #[test]
     fn a_pointer_to_no_buffer_is_refused_before_anything_is_allocated() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -734,7 +743,7 @@ mod tests {
 
     #[test]
     fn a_structure_passed_by_value_is_one_word_of_its_own_bytes() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_moe_sort",
