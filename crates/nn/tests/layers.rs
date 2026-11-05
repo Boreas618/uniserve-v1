@@ -8,9 +8,9 @@
 
 use nn::{
     AdaptivePool, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, DType, DevicePtr, FrameNormPad,
-    GatedResidual, KvGroup, KvPlanes, KvView, Linear,
-    ModulatedRmsNorm, Patch, Rotary, Rotate, Rotation, ScaledResidual, ScaledResidualRmsNorm,
-    Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    GatedResidual, KvGroup, KvPlanes, KvView, Linear, ModulatedRmsNorm, Patch, Rotary, Rotate,
+    Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles,
+    Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -275,10 +275,18 @@ fn a_vision_rotation_holds_a_head_and_its_heads() {
 fn a_layer_reads_the_planes_its_own_index_names() {
     let plane = |marker: u64| {
         let page = |offset: u64| {
-            TensorView::new(DevicePtr::new(marker + offset), DType::BF16, Shape::new(&[2, 4, 2, 8]))
+            TensorView::new(
+                DevicePtr::new(marker + offset),
+                DType::BF16,
+                Shape::new(&[2, 4, 2, 8]),
+            )
         };
         let flag = |offset: u64| {
-            TensorView::new(DevicePtr::new(marker + offset), DType::I32, Shape::new(&[2, 1, 1, 1]))
+            TensorView::new(
+                DevicePtr::new(marker + offset),
+                DType::I32,
+                Shape::new(&[2, 1, 1, 1]),
+            )
         };
         KvPlanes {
             key: page(0x0),
@@ -307,11 +315,22 @@ fn a_layer_reads_the_planes_its_own_index_names() {
     let read = cache.planes(0, 1).expect("the second layer");
     assert_eq!(read.key.ptr.address(), second.key.ptr.address());
     assert_eq!(read.value.ptr.address(), second.value.ptr.address());
-    assert_eq!(read.key_initialized.ptr.address(), second.key_initialized.ptr.address());
-    assert_eq!(read.value_initialized.ptr.address(), second.value_initialized.ptr.address());
+    assert_eq!(
+        read.key_initialized.ptr.address(),
+        second.key_initialized.ptr.address()
+    );
+    assert_eq!(
+        read.value_initialized.ptr.address(),
+        second.value_initialized.ptr.address()
+    );
     assert_ne!(read.key.ptr.address(), first.key.ptr.address());
     assert_eq!(
-        cache.planes(0, 0).expect("the first layer").key.ptr.address(),
+        cache
+            .planes(0, 0)
+            .expect("the first layer")
+            .key
+            .ptr
+            .address(),
         first.key.ptr.address()
     );
 
@@ -346,8 +365,7 @@ fn a_convolution_states_the_descriptor_its_launch_takes() {
         Conv1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
     );
 
-    let transposed =
-        ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
+    let transposed = ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
     assert_eq!(
         transposed.descriptor(DType::F32, DType::F32),
         ConvTranspose1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)

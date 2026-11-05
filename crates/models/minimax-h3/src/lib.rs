@@ -47,8 +47,8 @@ pub mod modulation;
 pub mod output;
 pub mod packing;
 pub mod partition;
-pub mod programs;
 pub mod positions;
+pub mod programs;
 pub mod schedule;
 pub mod solver;
 pub mod text_encoder;
@@ -68,6 +68,15 @@ pub use config::{
     ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
     UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
 };
+/// The rotation convention every fused normalization-and-rotation in this model uses.
+///
+/// The reference rotates **split-half**: coordinate `i` of a rotated span pairs with
+/// `i + span / 2` (`uniserve/nn/functional/_rope.py:48`, and `:258` passes `"split"` at the fused
+/// call; `attention.py:94-96` says the same in words: "its leading 96 channels split-half"). The
+/// neox pairing - adjacent coordinates - is a different arithmetic from the same factor table, so
+/// the convention is stated once here and read by every call site and by the store's key list.
+pub const SPLIT_HALF: ops::rope::Rotation = ops::rope::Rotation::Half;
+
 pub use load::load;
 pub use partition::{Component, Partition};
 pub use transformer::Trace;

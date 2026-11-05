@@ -35,6 +35,16 @@ pub(crate) fn scheduler_with(
     special_tokens: SpecialTokenIds,
     config: SchedulerConfig,
 ) -> anyhow::Result<Scheduler> {
+    scheduler_with_stating(executor, special_tokens, config, Parameters::default())
+}
+
+/// [`scheduler_with`], installing a policy that also states `stated`.
+pub(crate) fn scheduler_with_stating(
+    executor: Box<dyn Executor>,
+    special_tokens: SpecialTokenIds,
+    config: SchedulerConfig,
+    stated: Parameters,
+) -> anyhow::Result<Scheduler> {
     let info = executor.info().runtime_info()?;
     let calls = &info.supported_calls;
     let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
@@ -74,7 +84,7 @@ pub(crate) fn scheduler_with(
         ModelDtype::BFloat16,
         limits,
     )?;
-    install_policy(&mut scheduler, engine::BatchCapacity::of(&info));
+    install_policy_stating(&mut scheduler, engine::BatchCapacity::of(&info), stated);
     Ok(scheduler)
 }
 
@@ -102,6 +112,21 @@ pub(crate) fn policy_module() -> Vec<u8> {
 /// deployment has, and every test world whose workers were built for fewer
 /// would have no policy at all.
 pub(crate) fn install_policy(scheduler: &mut Scheduler, capacity: engine::BatchCapacity) {
+    install_policy_stating(scheduler, capacity, Parameters::default());
+}
+
+/// Installs `fcfs` with the ceilings a world advertises and the parameters the
+/// world states about itself.
+///
+/// A judgement the views cannot carry is the policy's, weighed from the
+/// parameters the deployment states (design §7.7): a world that speculates
+/// states its speedup and what a refilled token costs there, because the
+/// mechanism's own measurement is not a view a policy reads.
+pub(crate) fn install_policy_stating(
+    scheduler: &mut Scheduler,
+    capacity: engine::BatchCapacity,
+    stated: Parameters,
+) {
     let ceilings = engine::ceilings_of(capacity);
     let program = PolicyProgram {
         backend: "fcfs".to_owned(),
@@ -113,7 +138,7 @@ pub(crate) fn install_policy(scheduler: &mut Scheduler, capacity: engine::BatchC
             max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
             prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
             timeout: Some(ceilings.timeout),
-            ..Default::default()
+            ..stated
         },
         stated: Default::default(),
     };

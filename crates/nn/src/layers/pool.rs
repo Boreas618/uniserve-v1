@@ -15,7 +15,7 @@ use crate::forward::Forward;
 use crate::layers::launch::PDL;
 
 /// The elements one pool program produces.
-const BLOCK: u32 = 1024;
+pub const BLOCK: u32 = 1024;
 
 /// The head average and the adaptive width pool of an attention projection.
 pub struct AdaptivePool {

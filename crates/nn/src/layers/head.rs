@@ -24,6 +24,9 @@ pub struct ParallelLMHead {
     padded: u32,
 }
 
+/// Elements one `logits_gather` / `logits_unpad` program handles.
+pub const BLOCK: u32 = 1024;
+
 impl ParallelLMHead {
     /// The head whose rank holds `local` vocabulary rows starting at id `first`, padded to `padded`.
     ///
@@ -214,7 +217,7 @@ impl ParallelLMHead {
             output,
             vocabulary: self.vocabulary,
             padded: gathered_width,
-            block: 1024,
+            block: BLOCK,
             pdl: crate::layers::launch::PDL,
         }
     }
@@ -263,6 +266,19 @@ pub fn gather_rows(
 ) -> Result<()> {
     let columns = hidden.last();
     let count = rows.numel();
+    // The operator's indices are one axis and its output two, because it derives the row count from
+    // `out`. A caller holding `[1, count]` - the shape an output of one row needs - must flatten it
+    // itself: the same bytes as a two-axis view reach the kernel as two axes and are refused there
+    // (`expected 1 axes, found 2`), which names neither the caller nor the fix.
+    if rows.shape.rank() != 1 {
+        return Err(Error::shape(
+            "gather_rows",
+            format!(
+                "rows is {:?}, and the operator takes a flat [count] index view",
+                rows.shape.dims()
+            ),
+        ));
+    }
     if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != columns {
         return Err(Error::shape(
             "gather_rows",
@@ -276,7 +292,7 @@ pub fn gather_rows(
         dtype: hidden.dtype,
         columns: u32::try_from(columns)
             .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
-        block: 1024,
+        block: BLOCK,
         pdl: crate::layers::launch::PDL,
     };
     let args = logits::GatherArgs { hidden, rows, out };

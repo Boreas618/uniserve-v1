@@ -1179,7 +1179,24 @@ impl<'a> ProgramSwitch<'a> {
                 PRECOPY_TIMEOUT,
                 "Precopy",
                 |report| match report.kind.as_ref() {
-                    Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
+                    Some(report::Kind::Precopied(precopied)) => {
+                        // The answer carries the operators this update could
+                        // not compare, and an empty list is the statement that
+                        // every replaced operator was (process.proto,
+                        // `Precopied`). Nothing else prints it: a generation
+                        // with no shadow evidence for part of what it changed
+                        // would read exactly like one with evidence for all of
+                        // it, which is what an update's trial rests on.
+                        if !precopied.uncompared.is_empty() {
+                            tracing::warn!(
+                                host = %process.host,
+                                engine = process.engine,
+                                uncompared = ?precopied.uncompared,
+                                "a generation was prepared with operators it could not compare",
+                            );
+                        }
+                        Some(Ok(precopied.generation))
+                    }
                     Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
                         kind: "precopy_failed".to_owned(),
                         reason: failed.reason.clone(),
@@ -1476,9 +1493,6 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixListener;
-    use std::sync::{Arc, Mutex};
-
     use super::*;
     use crate::engine::stand_in::{Answer, Seen, main_processes, process};
     use crate::options::ServeConfig;

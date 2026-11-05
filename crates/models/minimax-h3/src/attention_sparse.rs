@@ -1,4 +1,4 @@
-use nn::layers::{Linear, Rotary, Rotation, Sections, SegmentAttention, SegmentTables, VsaTiles};
+use nn::layers::{Linear, Rotary, Sections, SegmentAttention, SegmentTables, VsaTiles};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -84,7 +84,7 @@ impl Sparse {
         }
         let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
         let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
-        let frequencies = frequencies(loader, config, rotated)?;
+        let frequencies = frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
         // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
         // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
         // named the global count would refuse its own query view at any degree above one.
@@ -95,11 +95,13 @@ impl Sparse {
             local_heads,
             local_heads,
             config.qk_norm_eps,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?
-        .sectioned(Sections::new(rotated_axes)?.interleaved())?;
+        // Contiguous sections, not the interleaved cycle: the reference's factors are one block
+        // per coordinate axis (axis 0 first), and the cycle belongs to the text encoder's M-RoPE.
+        .sectioned(Sections::new(rotated_axes)?)?;
         // The reference composes a layer's compression across the exchange's members (`compose`,
         // `slots`); until that is written, a sharded sparse deployment would attend its own rows
         // alone and silently produce a different model.
@@ -344,20 +346,30 @@ impl Scratch {
     }
 }
 
+/// The rotary frequency table of the sparse path: the dense path's, built the same way.
+///
+/// One `rope_frequency_dim` spectrum repeated once per coordinate axis, because the reference hands
+/// its rotary one axis spanning the whole head and flattens the three axes' factors into three
+/// contiguous blocks (`attention.rs::frequencies` states the evidence).
 fn frequencies(
     loader: &mut WeightLoader<'_>,
     config: &TransformerConfig,
     rotated: u32,
+    axes: u32,
 ) -> Result<Weight> {
-    let half = (rotated / 2) as usize;
-    let mut bytes = Vec::with_capacity(half * 4);
-    for index in 0..half {
-        let exponent = 2.0 * index as f64 / f64::from(rotated);
-        let value = (config.rope_theta as f64).powf(-exponent) as f32;
+    let pairs = config.rope_frequency_dim;
+    if pairs == 0 || axes == 0 || rotated != 2 * pairs * axes {
+        return Err(Error::config(format!(
+            "{rotated} rotated channels are not {axes} axes of {pairs} frequency pairs"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(rotated as usize * 2);
+    for value in crate::attention::table(pairs, axes, config.rope_theta) {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    let name = format!("transformer.rotary.{rotated}.{}", config.rope_theta);
-    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half as u64]), &bytes)?)
+    let name = format!("transformer.rotary.{pairs}x{axes}.{}", config.rope_theta);
+    let half = u64::from(rotated / 2);
+    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half]), &bytes)?)
 }
 
 fn projection(

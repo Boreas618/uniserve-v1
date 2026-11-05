@@ -32,7 +32,7 @@
 //! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
-use nn::layers::{Attention as Flash, Linear, Rotary, Rotation, Sections, UlyssesExchange};
+use nn::layers::{Attention as Flash, Linear, Rotary, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -281,7 +281,7 @@ impl Dense {
 
         let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
         let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
-        let frequencies = frequencies(loader, config, rotated)?;
+        let frequencies = frequencies(loader, config, rotated, rotated_axes.len() as u32)?;
         // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
         // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
         // named the global count would refuse its own query view at any degree above one.
@@ -292,11 +292,13 @@ impl Dense {
             local_heads,
             local_heads,
             config.qk_norm_eps,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?
-        .sectioned(Sections::new(rotated_axes)?.interleaved())?;
+        // Contiguous sections, not the interleaved cycle: the reference's factors are one block
+        // per coordinate axis (axis 0 first), and the cycle belongs to the text encoder's M-RoPE.
+        .sectioned(Sections::new(rotated_axes)?)?;
 
         Ok(Self {
             query: projection(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?,
@@ -364,17 +366,25 @@ impl Dense {
                 )
             }
         };
+        // The operator's operands are one axis of tokens, then the heads, then a head's channels
+        // (`ops/src/attention/dense.rs` requires rank 3 of all four), while a projection writes
+        // `[rows, inner]`. The reshaping is by `heads`, which takes the token axis from the view's
+        // own element count - the rows differ between the exchanged and the local path, so a token
+        // count computed once outside would be right on one of them and wrong on the other.
+        let (local_heads, head_dim) = (self.local_heads, self.head_dim);
         self.attention.attend_dense(
             f,
-            query,
-            key,
-            value,
+            query.reshape(heads(query, local_heads, head_dim)),
+            key.reshape(heads(key, local_heads, head_dim)),
+            value.reshape(heads(value, local_heads, head_dim)),
             Some(visible.cu_seq_lens_q),
             Some(visible.cu_seq_lens_k),
             // Every query attends the whole key set in one sequence: the longest key run is the
             // number of used key rows, which `Visible` states.
             visible.key_rows,
-            scratch.attended,
+            scratch
+                .attended
+                .reshape(heads(scratch.attended, local_heads, head_dim)),
         )?;
         let attended = match &self.exchange {
             None => scratch.attended,
@@ -392,18 +402,24 @@ impl Dense {
             f,
             scratch
                 .query
-                .reshape(heads(self.local_heads, self.head_dim)),
-            scratch.key.reshape(heads(self.local_heads, self.head_dim)),
+                .reshape(heads(scratch.query, self.local_heads, self.head_dim)),
+            scratch
+                .key
+                .reshape(heads(scratch.key, self.local_heads, self.head_dim)),
             Some(self.query_gain.view()),
             Some(self.key_gain.view()),
             factors.cosine,
             factors.sine,
-            scratch
-                .rotated_query
-                .reshape(heads(self.local_heads, self.head_dim)),
-            scratch
-                .rotated_key
-                .reshape(heads(self.local_heads, self.head_dim)),
+            scratch.rotated_query.reshape(heads(
+                scratch.rotated_query,
+                self.local_heads,
+                self.head_dim,
+            )),
+            scratch.rotated_key.reshape(heads(
+                scratch.rotated_key,
+                self.local_heads,
+                self.head_dim,
+            )),
         )?)
     }
 }
@@ -473,11 +489,32 @@ impl Scratch {
 }
 
 /// The three-dimensional view of a projected `[rows, heads · head_dim]` block.
-fn heads(count: u32, head_dim: u32) -> Shape {
-    Shape::new(&[0, u64::from(count), u64::from(head_dim)])
+/// A `[tokens, inner]` view as `[tokens, heads, head_dim]`.
+///
+/// The token axis is the view's own element count divided by one row's width: `reshape` takes a
+/// shape literally, so a `0` written there is a zero-row tensor rather than an inferred axis. It was
+/// written that way, and the first launch to reach the rotation read it as `0 tokens` - three gemms
+/// had already written the rows the rope then found empty.
+fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
+    let width = u64::from(count) * u64::from(head_dim);
+    Shape::new(&[
+        view.shape.numel() / width.max(1),
+        u64::from(count),
+        u64::from(head_dim),
+    ])
 }
 
-/// The rotary frequencies of `rotated` channels: `theta^(-2i / rotated)`, one per pair.
+/// The rotary frequency table of `rotated` channels: one spectrum, repeated once per axis.
+///
+/// The reference builds `RotaryEmbedding(2 * rope_frequency_dim, theta=...)` and hands it **one
+/// axis spanning the whole head** (`uniserve/models/minimax_h3/attention.py:94-105`,
+/// `axis_dims=(self.head_dim,)`), so the same `rope_frequency_dim` frequencies are evaluated at each
+/// of the three coordinate axes and the factors of the axes are three contiguous blocks of one
+/// table (`uniserve/nn/rope.py:355-380` builds `[axes, tokens, dim / 2]`, and the model flattens it
+/// to `[tokens, 3 * rope_frequency_dim]`). A single spectrum spread over all `rotated` channels
+/// instead gives the second and third axes frequencies that differ from the reference's by a
+/// constant factor of `theta^(-1/3)` and `theta^(-2/3)` at every pair - a slow phase drift with
+/// position, and not a mistake any shape or dtype check can see.
 ///
 /// The table is a constant of the checkpoint's rope parameters, published through the loader like
 /// any other weight, so the operator reads it as a device weight.
@@ -485,16 +522,50 @@ fn frequencies(
     loader: &mut WeightLoader<'_>,
     config: &TransformerConfig,
     rotated: u32,
+    axes: u32,
 ) -> Result<Weight> {
-    let half = (rotated / 2) as usize;
-    let mut bytes = Vec::with_capacity(half * 4);
-    for index in 0..half {
-        let exponent = 2.0 * index as f64 / f64::from(rotated);
-        let value = (config.rope_theta as f64).powf(-exponent) as f32;
+    let pairs = config.rope_frequency_dim;
+    if pairs == 0 || axes == 0 || rotated != 2 * pairs * axes {
+        return Err(Error::config(format!(
+            "{rotated} rotated channels are not {axes} axes of {pairs} frequency pairs"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(rotated as usize * 2);
+    for value in table(pairs, axes, config.rope_theta) {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    let name = format!("transformer.rotary.{rotated}.{}", config.rope_theta);
-    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half as u64]), &bytes)?)
+    // The name states the construction as well as the width: the values a name publishes changed
+    // when the spectrum stopped being spread over the whole rotated width, and a retained buffer
+    // served under the older name would be a cache hit on the wrong table.
+    let name = format!("transformer.rotary.{pairs}x{axes}.{}", config.rope_theta);
+    let half = u64::from(rotated / 2);
+    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half]), &bytes)?)
+}
+
+/// The factor table of `axes` coordinate axes: one spectrum of `pairs` frequencies, repeated.
+///
+/// The spectrum is the reference's `RotaryEmbedding(2 * pairs)` inverse frequency
+/// (`uniserve/nn/rope.py:294-306`: `theta ** (arange(0, dim, 2) / dim)`, `dim = 2 * pairs`,
+/// inverted), and the repetition is its flattening of `[axes, tokens, dim / 2]` factors into
+/// `[tokens, axes * dim / 2]` (`:355-380` and `attention.py:94-105`): pair `a * pairs + i` is the
+/// `i`-th frequency of axis `a`, so every axis rotates with the same spectrum and the axes occupy
+/// contiguous blocks.
+///
+/// Public because it is a host statement a comparison can read: the spectrum and the axes' order
+/// are the two facts a rotation can have wrong while every shape, type and count stays right, and
+/// only a table compares them (`tools/compare_rope_factors.py --dit`).
+pub fn table(pairs: u32, axes: u32, theta: f32) -> Vec<f32> {
+    let spectrum: Vec<f32> = (0..pairs)
+        .map(|index| {
+            let exponent = 2.0 * f64::from(index) / (2.0 * f64::from(pairs));
+            (f64::from(theta).powf(-exponent)) as f32
+        })
+        .collect();
+    let mut table = Vec::with_capacity((pairs * axes) as usize);
+    for _ in 0..axes {
+        table.extend_from_slice(&spectrum);
+    }
+    table
 }
 
 /// The exchange of a partition's sequence degree, absent when one rank holds the sequence.
@@ -523,4 +594,33 @@ fn projection(
 /// A normalization's learned gain.
 fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[columns])))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table;
+
+    /// Every coordinate axis rotates with the same spectrum, in its own contiguous block.
+    ///
+    /// The reference hands its rotary one axis spanning the whole head and flattens the three
+    /// axes' factors into one table (`uniserve/nn/rope.py:355-380`), so a table whose blocks differ
+    /// would rotate the height and width coordinates with the wrong frequencies - which is a phase
+    /// drift with position, not a shape or dtype error.
+    #[test]
+    fn each_coordinate_axis_owns_a_block_of_the_same_spectrum() {
+        let pairs = 16;
+        let axes = 3;
+        let table = table(pairs, axes, 10_000.0);
+        assert_eq!(table.len(), (pairs * axes) as usize);
+        for axis in 1..axes {
+            assert_eq!(
+                &table[(axis * pairs) as usize..((axis + 1) * pairs) as usize],
+                &table[0..pairs as usize],
+                "axis {axis} does not carry axis 0's spectrum"
+            );
+        }
+        // A rotary's first frequency is unity and the rest fall with the pair index.
+        assert_eq!(table[0], 1.0);
+        assert!(table[1] < 1.0 && table[1] > table[15]);
+    }
 }

@@ -521,6 +521,30 @@ impl EpochPlan {
                 let (memory, info, graph) = self.open_memory(&model, storage)?;
                 Ok((Arc::new(model), memory, info, graph))
             }
+            // The media class is stated rather than left to the refusal below, so the line names
+            // what is missing instead of "cannot serve". Its runners are not built into this
+            // process yet, and they are what a binding needs: the model's three capabilities -
+            // `nn::capability::Encoder` for the encode of a prompt's conditions,
+            // `nn::capability::Denoiser` for one denoising step of a latent layout and
+            // `nn::capability::Decoder` for one clip decoded from latents - plus the partition the
+            // checkpoint's own layout declares.
+            //
+            // This class keeps no paged key/value cache: the package holds no cache view and no
+            // page table, and the one cache in it is the denoiser's AdaLN modulation table, which
+            // is model memory the weight loader allocates (4.1's retained weights). So the resident
+            // pool holds no KV units for it - but it is not empty either: a model's state tables
+            // book there, sized at plan time from the layouts the checkpoint declares
+            // (`Encoder::state_tables` and the denoiser's own), filled at the load and retired with
+            // the generation, never allocated on the request path. The state group's snapshot, when
+            // the denoiser allocates one, comes from the cache plan beside it. Until the runners
+            // exist nothing can bind a `MiniMaxH3` model, and the update and serving paths must not
+            // pretend otherwise.
+            "MiniMaxH3ModularPipeline" => bail!(
+                "{} declares model class {class}: the deployment selects MiniMaxH3ModularPipeline \
+                 and its runners (encoder, denoiser, decoder) are not built into this process, so \
+                 nothing can bind it",
+                self.checkpoint.display()
+            ),
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
                 self.checkpoint.display()

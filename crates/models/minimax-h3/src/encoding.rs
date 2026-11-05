@@ -346,6 +346,30 @@ pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     values
 }
 
+impl VideoEncoder {
+    /// Every checkpoint tensor the video encoder reads, by name.
+    ///
+    /// The encoder is a component whose names were already data (`sources` maps each parameter to
+    /// the checkpoint key that fills it), so this list is that mapping's other column rather than a
+    /// second spelling of it: a weight-normalized pair names both of its tensors, and a fused
+    /// request names every part. A checkpoint that lacks one is refused by block and name before a
+    /// byte is read.
+    pub fn keys(config: &VideoVaeConfig) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for source in sources(config)? {
+            match source.tensor {
+                crate::audio_vae::Tensor::Region(tensor) => keys.push(tensor),
+                crate::audio_vae::Tensor::Parts(parts) => keys.extend(parts),
+                crate::audio_vae::Tensor::Normalized { value, gain } => {
+                    keys.push(value);
+                    keys.push(gain);
+                }
+            }
+        }
+        Ok(keys)
+    }
+}
+
 /// Every parameter of the video encoder, with the checkpoint key that fills it.
 ///
 /// The encoder is the input convolution, six stages of two blocks each, the final normalization and
@@ -1735,6 +1759,15 @@ struct GeGlu {
 }
 
 impl AudioEncoder {
+    /// Every checkpoint tensor the audio encoder reads, by name.
+    ///
+    /// Built from [`audio_sources`], the table the load drives, so the list cannot drift from what is
+    /// bound: a weight-normalized convolution names its direction and its magnitude, and the fused
+    /// attention projections name every part. The export this tree was checked against ships
+    /// `audio_vae/config.json` and no tensor file, so against that checkpoint the honest verdict is
+    /// "all absent" - a refusal naming the block, not a read error from inside a layer.
+    pub fn keys(config: &crate::AudioVaeConfig) -> Result<Vec<String>> {
+        Ok(crate::audio_vae::tensor_keys(&audio_sources(config)?))
     /// The programs the audio encoder launches, from the configuration and the deployment's longest
     /// track.
     ///
@@ -2222,6 +2255,9 @@ pub fn conditioning_arena(
         buffer("stitch", 2 * channels * voxels),
         buffer("moments", 2 * channels * voxels),
         buffer("sample", channels * voxels),
+        // The posterior's own draw, which the encoder samples under its module seed
+        // (`denoiser::POSTERIOR_SEED`), at the latent's shape.
+        buffer("posterior", channels * voxels),
         buffer("clean", patch_rows * channels * 4),
         buffer("anchored", patch_rows * channels * 4),
     ])
@@ -2579,6 +2615,33 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_audio_encoders_keys_are_the_encoders_half_and_name_every_part() {
+        let config = crate::audio_vae::tests::audio_config();
+        let keys = AudioEncoder::keys(&config).expect("the encoder's keys");
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // The encoder's 171 names are 37 weight-normalized pairs and the rest single tensors; the
+        // export this tree was checked against ships `audio_vae/config.json` and no tensor file, so
+        // against it the honest verdict is "all absent" rather than a load that reads nothing.
+        assert_eq!(keys.len(), 171);
+        assert_eq!(
+            keys.iter().filter(|key| key.ends_with(".weight_g")).count(),
+            37
+        );
+        assert_eq!(
+            keys.iter().filter(|key| key.ends_with(".weight_v")).count(),
+            37
+        );
+        let decoder = crate::audio_vae::AudioDecoder::keys(&config).expect("the decoder's keys");
+        assert!(
+            keys.iter().all(|key| !decoder.contains(key)),
+            "the two audio halves read disjoint tensors"
+        );
+    }
+
 
     /// The video encoder states its programs from its configuration and the rasters it serves: one
     /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
@@ -2707,6 +2770,24 @@ mod tests {
     /// weights are loaded.
     fn encoder_stack() -> Stack {
         Stack::of(&video_config()).expect("the fixture's stack")
+    }
+
+    /// The encoder names only its own tensors, and each of them once.
+    ///
+    /// Two properties the checkpoint makes a load depend on: a name asked twice would be read twice
+    /// and reported twice by a missing-name check, and a name outside the encoder's own two prefixes
+    /// would be the decoder's or the post-quant convolution's - a different component's tensors in
+    /// the same export, which this encoder must never read.
+    #[test]
+    fn keys_name_only_the_encoder_and_once_each() {
+        let keys = VideoEncoder::keys(&video_config()).expect("the encoder's names");
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
+        assert!(
+            keys.iter()
+                .all(|key| key.starts_with("encoder.") || key.starts_with("quant_conv.")),
+            "a key lies outside the encoder's own tensors"
+        );
     }
 
     #[test]

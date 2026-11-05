@@ -167,6 +167,14 @@ def main():
 
     packages = load_packages(Path(args.kernels))
     root = Path(args.root)
+    # A fixture with no rows is a walk that failed to print, and a store built from it is empty and
+    # says so as a success: "built 0 of 0" reads like a complete store and is no evidence at all.
+    if not [line for line in Path(args.fixture).read_text().splitlines()
+            if line.strip() and not line.startswith("#")]:
+        raise SystemExit(
+            f"{args.fixture} names no rows: an empty fixture is a walk that printed nothing, and "
+            f"a store built from it would be empty rather than correct"
+        )
     rows = [
         line.rstrip("\n").split("\t")
         for line in Path(args.fixture).read_text().splitlines()

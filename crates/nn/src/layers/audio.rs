@@ -155,7 +155,13 @@ impl AudioActivation {
     /// One construction with [`AudioActivation::descriptor_of`], so the walk and the launch cannot
     /// state different descriptors for the same block.
     fn descriptor(&self) -> audio_activation::Descriptor {
-        Self::descriptor_of(self.dtype, self.channels, self.kernel, self.ratio, self.block)
+        Self::descriptor_of(
+            self.dtype,
+            self.channels,
+            self.kernel,
+            self.ratio,
+            self.block,
+        )
     }
 
     /// The samples one channel has after the block, for an input of `length` samples.

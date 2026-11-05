@@ -101,9 +101,33 @@ impl Scheduler {
             // batch.
             let shadow = self.shadow_generation();
             let shadow_batch = shadow.map(|_| batch.clone());
+            // The `Finish` commands this batch carries close the rows of the
+            // requests they name once it is submitted: batches reach a rank in
+            // submission order, so no later `Start` can name a row before the
+            // worker has seen its close.
+            // The in-process arm has no worker process to tell: the rows and
+            // buffers a lifecycle command closes are this scheduler's own
+            // pools, so the command is answered here, where it would have been
+            // submitted. Its `Finish` and `Free` have nothing left to reach.
+            if batch.requests.is_empty() && self.executor.serves_in_process() {
+                self.acknowledge_commands(&batch.commands);
+                progressed = true;
+                continue;
+            }
+            let finishing: Vec<RequestKey> = batch
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    BatchCommand::Finish { request_key, .. } => Some(*request_key),
+                    _ => None,
+                })
+                .collect();
             match self.executor.submit(batch) {
                 Ok(()) => {
                     progressed = true;
+                    for request_key in finishing {
+                        self.close_retiring_row(request_key);
+                    }
                     // A wall or a full queue is not the pass's failure: the
                     // batch stays with the step and the next one tries again,
                     // as the serving submit does. A refused pass is answered at
@@ -148,6 +172,34 @@ impl Scheduler {
             .any(|(worker, _)| self.executor.has_capacity(worker))
     }
 
+    /// Closes the scheduler-owned half of a retiring request's record.
+    ///
+    /// The request row, the prefix-cache table and the latent pages are the
+    /// scheduler's own capacity: they return as soon as the `Finish` that names
+    /// the request has been submitted, because every later batch on that rank
+    /// is ordered behind it and no admission can reuse the row before the
+    /// worker has seen the close. The buffers stay in the record until the
+    /// acknowledgement, because they are spans the worker still holds.
+    fn close_retiring_row(&mut self, request_key: RequestKey) {
+        let Some(retiring) = self
+            .retiring_requests
+            .get_mut(&request_key.request_id)
+            .filter(|retiring| retiring.request_key == request_key)
+        else {
+            return;
+        };
+        for mut allocation in std::mem::take(&mut retiring.allocations) {
+            let buffers = std::mem::take(&mut allocation.buffers);
+            retiring.buffers.extend(buffers);
+            allocation.free(&mut self.storage);
+        }
+        if let Some(media) = retiring.media_allocations.as_mut()
+            && let Err(unknown) = media.close_rows(&mut self.storage)
+        {
+            self.invariant_broken(&unknown.to_string());
+        }
+    }
+
     /// Releases the request latent.
     fn free_request_latent(&mut self, id: RequestId) {
         let allocation = self
@@ -172,12 +224,13 @@ impl Scheduler {
     /// Returns whether the loop made progress or handled an executor outcome.
     #[cfg(feature = "testing")]
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
-        if self.drain_commands(commands) {
+        let (stop, handled) = self.drain_commands(commands);
+        if stop {
             self.abort_all_requests();
             let _ = self.executor.close();
             return false;
         }
-        let progressed = self.step_nonblocking();
+        let progressed = self.step_nonblocking() || handled;
         if progressed || self.inflight.pending_batches.is_empty() {
             return progressed;
         }
