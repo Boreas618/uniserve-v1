@@ -430,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // deployment's own bound decides the class.
         let tiles = match (attention, sparse) {
             (AttentionKind::Dense, _) => 0,
-            (sparse_kind, Some((tile, _, stated_tiles, _))) if stated_tiles == 0 => {
+            (sparse_kind, Some((tile, _, 0, _))) => {
                 let _ = (sparse_kind, tile);
                 rows_bound.div_ceil(tile).next_power_of_two()
             }
@@ -445,9 +445,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 derived
             }
-            (_, None) => rows_bound
-                .div_ceil(stated_attention.expect("a stated contract").tile)
-                .next_power_of_two(),
+            (_, None) => {
+                let Some(contract) = stated_attention else {
+                    unreachable!("a dense deployment states its attention contract")
+                };
+                rows_bound.div_ceil(contract.tile).next_power_of_two()
+            }
         };
         rows.extend(Denoiser::programs(
             &config,

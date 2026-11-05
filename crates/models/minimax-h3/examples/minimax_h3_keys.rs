@@ -209,9 +209,12 @@ fn deployment_clips() -> Vec<u32> {
     // The largest clip the model generates, which is the last rung of its rule and **not** `MAX_FRAMES`:
     // a request of `MAX_FRAMES` rounds up past it, so a ladder built by rounding alone would state one
     // clip longer than the model has (1025 against a 1024-frame maximum).
-    let longest = *minimax_h3::programs::Deployment::generated()
+    let Some(longest) = minimax_h3::programs::Deployment::generated()
         .last()
-        .expect("the rule has rungs");
+        .copied()
+    else {
+        unreachable!("the rule has rungs")
+    };
     let mut clips: Vec<u32> = DEPLOYMENT_STAGES
         .iter()
         .map(|frames| minimax_h3::packing::align_num_frames(*frames).min(longest))
@@ -484,7 +487,7 @@ fn main() {
         clip_frames = deployment_clips.clone();
     } else {
         for frames in &deployment_clips {
-            if !clip_frames.contains(&frames) {
+            if !clip_frames.contains(frames) {
                 panic!(
                     "the run states the ladder {clip_frames:?}, which omits {frames} - a clip the \
                      deployment drives; state a superset of {deployment_clips:?} or no --frames"
