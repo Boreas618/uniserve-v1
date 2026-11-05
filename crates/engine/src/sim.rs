@@ -79,8 +79,9 @@ pub struct SimLoss {
     /// be replaced closes its group, while one whose replacement is starting
     /// is not ready but not closed.
     closed: Arc<Mutex<bool>>,
-    /// The report the executor's next poll answers with, taken once.
-    pending: Arc<Mutex<Option<(WorkerGroupId, String)>>>,
+    /// The report the executor's next poll answers with, taken once: the
+    /// group, why it failed, and the requests whose work is gone.
+    pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
     /// Wakes a scheduler parked on this executor, so the loss is answered
     /// without waiting out its park.
     wake: Arc<Mutex<Option<CommandWaker>>>,
@@ -109,7 +110,53 @@ impl SimLoss {
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *pending = Some((group, message.into()));
+            *pending = Some((group, message.into(), Vec::new()));
+        }
+        if let Some(waker) = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            waker.wake();
+        }
+    }
+
+    /// Reports `group` failed by the stall `stall` names, as a rank whose
+    /// builder thread stayed inside one job reports it: the executor's next
+    /// poll answers with the same failure a launch reports, naming the forward
+    /// the job belongs to and the requests whose calls it held.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous report is still pending: a report is delivered
+    /// once.
+    pub fn stall(&self, group: WorkerGroupId, stall: &ipc::Stall) {
+        {
+            let mut lost = self
+                .group
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(lost.is_none(), "a simulated loss is reported once");
+            *lost = Some(group.clone());
+            *self
+                .closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            let requests = stall
+                .calls
+                .iter()
+                .map(|call| call.request_key)
+                .collect::<Vec<_>>();
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *pending = Some((
+                group,
+                crate::worker::stall_failure(stall).to_string(),
+                requests,
+            ));
         }
         if let Some(waker) = self
             .wake
@@ -180,7 +227,7 @@ impl SimLoss {
     }
 
     /// Takes the report the next poll answers with, if it has not been.
-    fn take(&self) -> Option<(WorkerGroupId, String)> {
+    fn take(&self) -> Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)> {
         self.pending.lock().ok().and_then(|mut slot| slot.take())
     }
 }
@@ -615,11 +662,11 @@ impl Executor for SimExecutor {
         // A lost group is reported before any result: its work is gone, and a
         // closed group's loss is engine-fatal when no other model group
         // serves.
-        if let Some((worker_id, message)) = self.loss.take() {
+        if let Some((worker_id, message, requests)) = self.loss.take() {
             return Err(anyhow::Error::new(WorkerFailure {
                 worker_id,
                 endpoints: Vec::new(),
-                requests: Vec::new(),
+                requests,
                 refusals: Default::default(),
                 retired: Vec::new(),
                 buffers: Vec::new(),
