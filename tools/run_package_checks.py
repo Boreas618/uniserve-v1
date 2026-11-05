@@ -106,7 +106,11 @@ SHARED_CHECKS = ("modulation_check.py",)
 #:
 #: The store is one this runner is **given**, never one it builds: a second store for one run is two
 #: statements of one thing. Each entry is `(tool, arguments, options it needs)`.
-TREE_CHECKS = (("kernel_arguments.py", ("--check",), ("--fixture", "--store")),)
+#: One entry, both comparisons. `--native` needs no store: it compares every native package's call
+#: structure - or a cubin entry's parameter list - against the Rust structure it mirrors, and there
+#: are as many of those as there are native packages. Asking for both in one invocation keeps a table
+#: keyed by tool name from needing two entries for one tool.
+TREE_CHECKS = (("kernel_arguments.py", ("--check", "--native"), ("--fixture", "--store")),)
 
 #: Where a launch's descriptor is built. A package whose operator no file here names **in code** is
 #: a check over a kernel nothing can reach, and its green is not evidence about the model: five
@@ -475,7 +479,7 @@ def main():
             outcomes["unrunnable"].append(
                 (
                     f"tools/{name}",
-                    f"the store under --store holds no built cell, so there is nothing to compare",
+                    "the store under --store holds no built cell, so there is nothing to compare",
                     "",
                 )
             )
