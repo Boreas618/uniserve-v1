@@ -48,6 +48,23 @@ pub enum Error {
     /// launch, a module path that names no file.
     #[error("{0}")]
     Interface(String),
+    /// A failure as it happened, with the work in flight when it was taken.
+    ///
+    /// A device fault arrives at the control thread with a batch number and nothing else, and the
+    /// device thread is the only owner of what it was doing: the bucket, its rows and the operator
+    /// whose launch was issued. That work travels here, inside the error, so every report of the
+    /// failure - the device's own line, the submission's outcome, the main process's reason - names
+    /// it without any of them having to reach back for state that is gone by then.
+    ///
+    /// The wrapper is transparent: an illegal address is still a driver failure and its kind is
+    /// still the inner error's, so classification does not change by being namable.
+    #[error("{error} (in flight: {activity})")]
+    InFlight {
+        /// The work in flight, as the device thread states it.
+        activity: String,
+        /// The failure taken while it ran.
+        error: Box<Error>,
+    },
     /// A failure every party of one operation observes: the result of a read,
     /// the state of a pool or an export that several owners consult. It
     /// reports and classifies as the failure it shares.
@@ -62,6 +79,14 @@ impl Error {
         Self::Transport {
             what: what.into(),
             source: None,
+        }
+    }
+
+    /// `error`, stated with the work that was in flight when it was taken.
+    pub fn in_flight(activity: impl Into<String>, error: Error) -> Self {
+        Self::InFlight {
+            activity: activity.into(),
+            error: Box::new(error),
         }
     }
 
@@ -211,6 +236,7 @@ fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
         Error::Shared(shared) => driver_failure(shared),
+        Error::InFlight { error, .. } => driver_failure(error),
         _ => None,
     }
 }
@@ -230,6 +256,7 @@ fn driver_code(failure: &platform::Error) -> ErrorCode {
 fn kind_code(error: &Error) -> ErrorCode {
     match error {
         Error::Shared(shared) => kind_code(shared),
+        Error::InFlight { error, .. } => kind_code(error),
         Error::Invalid(_) => ErrorCode::InvalidDescriptor,
         Error::Resource(_) | Error::ReadBackpressure { .. } => ErrorCode::ResourceError,
         Error::Unsupported(_) | Error::Interface(_) => ErrorCode::UnsupportedSetup,
@@ -306,6 +333,39 @@ mod tests {
             Failure::classify(driver(1, "out of memory"), None).code,
             ErrorCode::ComputeError
         );
+    }
+
+    /// A failure states the work in flight when it was taken, and stating it changes nothing else:
+    /// an illegal address is still a fatal driver failure, a refusal is still a refusal, and the
+    /// message carries the bucket and the operator beside the driver's own text.
+    #[test]
+    fn a_failure_names_the_work_in_flight_without_losing_its_kind() {
+        let faulted = Failure::classify(
+            Error::in_flight(
+                "warmup, capturing bucket decode_sampled/8 rows/512 tokens",
+                driver(700, "an illegal memory access was encountered"),
+            ),
+            None,
+        );
+        assert_eq!(faulted.code, ErrorCode::FatalWorkerFailure);
+        assert!(faulted.fatal);
+        assert!(
+            faulted.message().contains("decode_sampled/8 rows/512 tokens"),
+            "the fault does not name the work in flight: {}",
+            faulted.message()
+        );
+        assert!(
+            faulted.message().contains("illegal memory access"),
+            "the fault lost the driver's own text: {}",
+            faulted.message()
+        );
+
+        let refused = Failure::classify(
+            Error::in_flight("serving batch 18", Error::Invalid("a batch of 3 rows".into())),
+            None,
+        );
+        assert_eq!(refused.code, ErrorCode::InvalidDescriptor);
+        assert!(!refused.fatal);
     }
 
     #[test]
