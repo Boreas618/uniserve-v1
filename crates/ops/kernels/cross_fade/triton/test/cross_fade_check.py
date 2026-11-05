@@ -142,7 +142,11 @@ def run(module, *, channels, frames, rows, columns, extent, axis, dtype, alias, 
     block = 1024
     elements = channels * frames * rows * columns
     grid = ((elements + block - 1) // block,)
-    out_strides = out.stride()
+    previous_strides, current_strides, out_strides = (
+        previous.stride(),
+        current.stride(),
+        out.stride(),
+    )
     module._cross_fade_kernel[grid](
         previous,
         current,
@@ -153,6 +157,12 @@ def run(module, *, channels, frames, rows, columns, extent, axis, dtype, alias, 
         frames,
         rows,
         columns,
+        previous_strides[0],
+        previous_strides[1],
+        previous_strides[2],
+        current_strides[0],
+        current_strides[1],
+        current_strides[2],
         out_strides[0],
         out_strides[1],
         out_strides[2],
@@ -168,12 +178,20 @@ def run(module, *, channels, frames, rows, columns, extent, axis, dtype, alias, 
         expected = blend_narrowed_to_bf16(previous, original, extent, axis).to(torch.bfloat16)
     else:
         expected = blend_decoded_overlap(previous, original, extent, axis)
-    got = out
-    # The comparison is bit for bit in all three types. F16 and F32 round to nearest in the
-    # interpreter as the hardware does; BF16 is narrowed by truncation, which the reference
-    # reproduces (`truncate_to_bf16`), and the measured rule is in
-    # `notes/programs/kernel-arithmetic-checks.md`. What this check therefore proves about a BF16
-    # blend is its arithmetic and its narrowing points, not a bound that could hide one of them.
+    compare(out, expected, dtype, f"{dtype} axis {axis} extent {extent} {channels}x{frames}x{rows}x{columns}"
+            f"{' aliased' if alias else ''}{' in a raster' if raster else ''}")
+    return out.numel(), 0
+
+
+def compare(got, expected, dtype, label):
+    """Compare a launch's output with the reference bit for bit.
+
+    F16 and F32 round to nearest in the interpreter as the hardware does; BF16 is narrowed by
+    truncation, which the reference reproduces (`truncate_to_bf16`), and the measured rule is in
+    `notes/programs/kernel-arithmetic-checks.md`. What this proves about a BF16 blend is its
+    arithmetic and its narrowing points, not a bound that could hide one of them.
+    """
+    element = DTYPES[dtype]
     got_bits = got.reshape(-1).to(torch.int32) if element == torch.float32 else (
         got.reshape(-1).view(torch.int16).to(torch.int32)
     )
@@ -185,13 +203,86 @@ def run(module, *, channels, frames, rows, columns, extent, axis, dtype, alias, 
     if differing:
         position = int((distance != 0).nonzero()[0])
         raise SystemExit(
-            f"{dtype} axis {axis} extent {extent} {channels}x{frames}x{rows}x{columns}"
-            f"{' aliased' if alias else ''}{' in a raster' if raster else ''}: "
-            f"{differing} of {got.numel()} values differ; first at {position}: "
+            f"{label}: {differing} of {got.numel()} values differ; first at {position}: "
             f"{float(got.reshape(-1)[position])} vs {float(expected.reshape(-1)[position])}"
         )
-    return got.numel(), 0
+    return got.numel()
 
+
+def run_seam(module, *, channels, frames, rows, columns, extent, axis, dtype):
+    """Blend a seam whose sources and destination are strided views of wider rasters.
+
+    This is the shape the decoder hands over: the predecessor's last `extent` positions of the band
+    axis and this tile's first `extent`, each a view inside the raster the tiles were decoded into,
+    so every view's band axis is exactly `extent` wide and its outer strides are the raster's. The
+    reference is the same blend over **contiguous copies** of the two bands — that equivalence is
+    the whole argument for reading strided sources, and it is what this case holds the kernel to.
+    """
+    torch.manual_seed(23)
+    element = DTYPES[dtype]
+    if axis == 3:
+        previous_raster = torch.randn(channels, frames, rows, 2 * columns, dtype=element)
+        current_raster = torch.randn(channels, frames, rows, 2 * columns, dtype=element)
+        previous = previous_raster[..., columns - extent : columns]
+        current = current_raster[..., columns - extent : columns]
+        destination = torch.full((channels, frames, rows, 2 * extent), 7.0, dtype=element)
+        out = destination[..., :extent]
+        seam_rows, seam_columns = rows, extent
+    else:
+        previous_raster = torch.randn(channels, frames, 2 * rows, columns, dtype=element)
+        current_raster = torch.randn(channels, frames, 2 * rows, columns, dtype=element)
+        previous = previous_raster[:, :, rows - extent : rows, :]
+        current = current_raster[:, :, rows - extent : rows, :]
+        destination = torch.full((channels, frames, 2 * extent, columns), 7.0, dtype=element)
+        out = destination[:, :, :extent, :]
+        seam_rows, seam_columns = extent, columns
+
+    block = 1024
+    elements = channels * frames * seam_rows * seam_columns
+    grid = ((elements + block - 1) // block,)
+    previous_strides, current_strides, out_strides = (
+        previous.stride(),
+        current.stride(),
+        out.stride(),
+    )
+    module._cross_fade_kernel[grid](
+        previous,
+        current,
+        out,
+        extent,
+        axis,
+        channels,
+        frames,
+        seam_rows,
+        seam_columns,
+        previous_strides[0],
+        previous_strides[1],
+        previous_strides[2],
+        current_strides[0],
+        current_strides[1],
+        current_strides[2],
+        out_strides[0],
+        out_strides[1],
+        out_strides[2],
+        block,
+        0,
+        AXIS=axis,
+        BLOCK=block,
+    )
+    if dtype == "bf16":
+        expected = blend_narrowed_to_bf16(
+            previous.contiguous(), current.contiguous(), extent, axis
+        ).to(torch.bfloat16)
+    else:
+        expected = blend_decoded_overlap(previous.contiguous(), current.contiguous(), extent, axis)
+    compare(
+        out,
+        expected,
+        dtype,
+        f"{dtype} axis {axis} extent {extent} seam {channels}x{frames}x{seam_rows}x{seam_columns}"
+        f" read from strided rasters",
+    )
+    return out.numel()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -238,9 +329,24 @@ def main():
         raster=False,
     )
     checked += 1
+    for dtype in ("f16", "bf16", "f32"):
+        for axis in (2, 3):
+            for extent in (3, 5):
+                run_seam(
+                    module,
+                    channels=3,
+                    frames=2,
+                    rows=6,
+                    columns=8,
+                    extent=extent,
+                    axis=axis,
+                    dtype=dtype,
+                )
+                checked += 1
     print(
         f"ok: {checked} launches, f16 and f32 bit for bit (the fixture's cell is f16), both axes, "
-        f"aliased and strided destinations, bf16 bit for bit with its truncating store reproduced"
+        f"aliased and strided destinations, seams read from strided rasters, bf16 bit for bit with "
+        f"its truncating store reproduced"
     )
     return 0
 

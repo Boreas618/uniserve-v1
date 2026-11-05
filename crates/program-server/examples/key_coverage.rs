@@ -141,7 +141,9 @@ fn main() -> ExitCode {
     // With `--declared-blocked` the output is the block itself: nothing else goes to stdout, so a
     // regeneration of the fixture is a paste and not a transcription.
     if declared_blocked {
-        eprintln!("{uncovered} blocked row(s) of {}", rows.len());
+        // The block is pasted into a fixture, so the count has to name the set it was counted
+        // over: a number beside no fixture is the failure this lane keeps quoting.
+        eprintln!("{uncovered} blocked row(s) of {} in {fixture}", rows.len());
         return ExitCode::SUCCESS;
     }
 

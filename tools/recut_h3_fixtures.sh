@@ -7,17 +7,12 @@
 # this lane has hit most often.
 #
 # Usage:
-#   tools/recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]
+#   tools/recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]
 #
 #   <checkpoint root>     e.g. /opt/uv/models/MiniMax-H3
 #   <element-types json>  the `--types` fallback, used where the host has no shard headers,
 #                         e.g. artifacts/h3-reference/component-tensors.json
 #   <commit>              the revision the rows are stamped with; defaults to HEAD
-#   <recorder print>      optional: the dense recording's row print (`record`'s output, from a host
-#                         with weights). When it is given the fixture is compared against it, which is
-#                         the only check that finds a flag reaching a key - `--elements` did
-#                         (`wide_false` recorded, `wide_true` in the file), and no walk-versus-fixture
-#                         delta can see it because both sides carry the same flag's answer.
 #
 # Everything is written to a staging directory first and only moved into `notes/programs/` once both
 # files certify, so an interrupted run leaves the checked-in fixtures untouched rather than half
@@ -25,12 +20,8 @@
 
 set -eu
 
-root=${1:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]}
-types=${2:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>] [<recorder print>]}
-# A recording of the same deployment, where a host with weights has made one. The comparison against
-# it is the one instrument that catches a flag reaching a program's key: the walk and the fixture share
-# their flags, so a delta between them cannot see a class the deployment's own bound decides.
-recorder=${4:-}
+root=${1:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]}
+types=${2:?usage: recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]}
 # The revision the rows are stamped with. In a git tree it defaults to HEAD and the tree must be clean:
 # a walk reads the working tree, so a fixture cut from a dirty tree would be stamped with a commit that
 # did not produce it, and the stamp is the only thing tying a row set to the code that enumerated it.
@@ -49,12 +40,14 @@ fi
 
 # The deployment arguments. All of these are part of the fixture's identity and the walk prints them
 # back into its own header, so a fixture states the deployment it belongs to without anyone retyping it.
-# The delivery's four durations, as the clips the model makes of them: `uniserve_eval/workloads/minimax_h3/`
-# asks for 5, 8, 10 and 15 seconds, which at 24 fps are 120, 192, 240 and 360 frames and, through
-# `align_num_frames`, clips of 124, 192, 243 and 362. **A duration is the delivery's; the clip is the
-# model's.** The values are stated here rather than derived because this is `sh`; the generator states
-# the same four through the two functions (`DELIVERY_SECONDS`), and a mismatch is a finding.
-samples=124,192,243,362
+# The clip length is a count of **generated frames**, and a generated frame count is `17n + 5`: the
+# legal clips are 22, 39, 56, ... A round number like 256 is not one of them, so a walk cut at 256
+# states rows for a clip no request can ask for.
+# `SAMPLES` and `TRACK` are the deployment's clip lengths and their audio tracks, and they come from
+# outside because the deployment states them: `124,192,243,362` are the delivery's durations snapped to
+# the `17n + 5` rung. A clip set written here is a second statement of the deployment, which is the
+# defect this file has already been fixed for twice (a raster and a bound).
+samples=${SAMPLES:-260}
 # The six canvases the model serves, in the walk's own `HxW` order. **The authority is
 # `crates/models/minimax-h3/src/config/canvas.rs`'s `NAMED_CANVASES`**, and this line is a second
 # statement of it — `programs --rasters offered` reading `offered_canvases()` is owed so that a
@@ -64,27 +57,61 @@ samples=124,192,243,362
 rasters=672x1536,768x1344,768x1024,768x768,1024x768,1344x768
 tokens=4096
 conditioned=true
-# The task the fixture's deployment serves. The walk refuses without it, and it is not cosmetic: the
-# serving partition derives the capacity from it, so the packed row bound — and the gated activation's
-# `wide` form with it — follows from this line. `ref2va` is the widest of the three: 304,976 dense and
-# 351,232 sparse, and one store means the widest.
-task=ref2va
-# The tasks **one store serves**, which is every task the model answers: a row is the pair
-# (operator, key) and the key depends on the task, so a walk of one task states one task's rows. The
-# `logits_gather` that reads the modulation table is the one that differs — `columns_2` when nothing
-# is conditioned over (`t2va`) and `columns_4` when a conditioner is (`fl2va`, `ref2va`) — so a
-# fixture walked at `task` above lacks a cell a `t2va` request launches. The rows only the other
-# tasks state are appended below, and their source is named in the fixture.
-serves='t2va fl2va ref2va'
 elements=123456
-# One track per clip, `audio_samples` of it: the walk refuses a track no stated clip implies, so this
-# line cannot drift from the one above without a refusal naming both.
-track=165600,256000,324000,482400
+# The track is a **function of the clip**, not a second number that can disagree with it:
+# `packing::audio_samples(frames) = audio_latent_frames(frames) * AUDIO_HOP`, and for 22 frames that
+# is 29600. The pair is part of the fixture's identity because the audio VAE's `scaled_add` widths
+# are derived from it: measured, 256/44100 and 22/29600 state the same 150 rows with **12 `scaled_add`
+# rows different** and nothing else, so a fixture cut at one pair does not serve a request at the
+# other. The walk still takes `--track` as a free number; deriving it from `--samples` there is owed,
+# exactly as `rows_bound()` is owed, and until then this is the pair both enumerations accept — the
+# recorder refuses any other by name.
+# The walk derives the track from the clip (`--samples [260] imply tracks [346400]`) and refuses a
+# mismatched pair, so this file passes no track to it. `TRACK` is still what the *recorder* takes.
+track=${TRACK:-346400}
+# The task is required and its rows differ: `t2va` states one row the conditioned walks do not.
+task=${TASK:-ref2va}
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
 # by name.
 sparse=64,0.9,8192
+
+# The deployment's packed bound, restated here only because the walk still takes `--rows` as a flag.
+# **This is the value `rows_bound()` computes**: a bound the model can exceed belongs in the
+# descriptor with the launch refusing outside it, not in a walk argument that works because nothing
+# tested past it. Delete these two lines the moment the walk reads `rows_bound()`; until then a walk
+# cut below them stamps rows for a packed count the deployment cannot be asked to be.
+# These are the fallback, not the answer: the probe below runs the walk with no `--rows` and uses
+# them only when the walk refuses it. `rows_bound()` is the one authority, and h3-builder04 measured
+# the walk's bound (303056) apart from the serving path's (304912/304976) — so a constant here is a
+# second statement of a live disagreement. **They leave this file when the walk reads the bound.**
+# No fallback bound. The walk derives it from the deployment (`rows_bound`), and a
+# number typed here describes whatever deployment was current when it was typed -
+# 306896 was the 256-clip era. A tip that demands `--rows` is refused below rather
+# than handed a constant.
+# The walk derived its track from the clip on one tip and required it on another, so this file
+# probes: it passes `--track` only when the walk refuses its absence. A file that states one
+# deployment's convention breaks on the other, which is how `--rows` and `--samples` both went wrong.
+track_flag=()
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --task "$task" --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 \
+    --conditioned "$conditioned" --elements "$elements" >/dev/null 2>&1; then
+    track_flag=(--track)
+fi
+rows_flag=()
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned "$conditioned" \
+    --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" >/dev/null 2>&1; then
+    rows_flag=(--rows)
+fi
+if [ ${#rows_flag[@]} -ne 0 ]; then
+    echo "the re-cut stops: this walk demands --rows, and the bound is the deployment's." >&2
+    echo "  A tool that types one describes a deployment it cannot be asked to be." >&2
+    exit 1
+fi
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
@@ -109,70 +136,102 @@ run() {
 
 echo "re-cutting H3 fixtures at $commit"
 
-# 1. The walks. No `--rows` and no `--dtype`: the deployment's own bound and each component's own
-#    type, both read from the checkpoint (or from `--types` where this host has no shards).
+# The walk this tool drives is the only place a deployment's rows are stated, and the properties it
+# needs have been absent from the tips this tool has been run against more than once: each component's
+# own element type (`--types`), the offered canvases, the deployment's own packed bound (so no
+# `--rows`), and no `--dtype`. A walk without `--types` keys every row from one element type, so a
+# fixture cut from it describes one type where the model runs two - and no delta can see that, because
+# the fixture and the walk agree with each other. Diagnose it by name rather than letting the walk's
+# own flag error read as a tool fault.
+probe=$(mktemp)
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned "$conditioned" \
+    --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" >"$probe" 2>&1; then
+    if grep -q 'unknown flag --types' "$probe"; then
+        cat >&2 <<'EOF'
+the walk at this tip takes no `--types`, so it cannot state each component's own element type:
+  the walk is missing the deployment properties (--types/deployment_dtype, offered_canvases,
+  rows_bound, and no --dtype), and a fixture cut here would key every row from one element type.
+  Land the walk's element types first, then re-cut: the recorder keys its rows per component, so the
+  two enumerations cannot be compared until both do.
+EOF
+        rm -f "$probe"
+        exit 1
+    fi
+fi
+rm -f "$probe"
+
+# 1. The walks. No `--dtype`: each component's own type, read from the checkpoint (or from `--types`
+#    where this host has no shards). `--rows` is passed only because the walk still takes it as a flag;
+#    the two values are what `rows_bound()` computes.
 echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --task "$task" --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
     --types "$types" --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
 
-# 1b. The rows the other served tasks state and this one does not. **The walk states every served
-# task's rows itself** - its gated activation and its logits gather iterate the deployment's task set -
-# so this step appends nothing and refuses instead: a difference here means the walk narrowed to one
-# task, and a fixture that silently patched it would be right by this tool rather than by the model,
-# which is the form that survives longest and confuses the next person to re-check it.
-echo 'rows the other served tasks state (must be zero - the walk states them):'
-other_dense="$staging/walk-other-dense.txt"
-other_sparse="$staging/walk-other-sparse.txt"
-: >"$other_dense"
-: >"$other_sparse"
-for other in $serves; do
-    [ "$other" = "$task" ] && continue
-    case "$other" in
-        t2va) other_conditioned=false ;;
-        *) other_conditioned=true ;;
-    esac
-    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-        cargo run -q -p minimax-h3 --example programs -- "$root" \
-        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
-        --track "$track" --types "$types" >>"$other_dense"
-    RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-        cargo run -q -p minimax-h3 --example programs -- "$root" \
-        --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-        --tp 1 --task "$other" --conditioned "$other_conditioned" --elements "$elements" \
-        --track "$track" --types "$types" --sparse "$sparse" >>"$other_sparse"
-done
-# Only whole rows (`operator<TAB>key`), only those the fixture's own task does not state, sorted and
-# deduplicated across the other tasks.
-for pair in "dense:$walk_dense:$other_dense" "sparse:$walk_sparse:$other_sparse"; do
-    name=${pair%%:*}
-    rest=${pair#*:}
-    walk=${rest%%:*}
-    others=${rest#*:}
-    only="$staging/only-$name.txt"
-    comm -23 \
-        <(grep -P '^[a-z0-9_]+\t' "$others" | sort -u) \
-        <(grep -P '^[a-z0-9_]+\t' "$walk" | sort -u) >"$only"
-    printf '  %-10s %s row(s)' "$name" "$(wc -l <"$only")"
-    if [ -s "$only" ]; then
-        printf ' - FAILED, the walk does not state them:\n'
-        sed 's/^/    /' "$only"
-        exit 1
+# 2. The recorder, against the same walk print. **This is the only check that can see a walk which
+#    forgets a launch.** `keys_delta` compares the fixture with its walk and `key_coverage` asks
+#    whether a package declares a key; both are green on a walk that states 139 rows while the model
+#    launches 175, because the walk is what they take as given. The recorder asks the model instead:
+#    every launch it records must be a row the walk states, or the fixture describes a model that does
+#    not exist. A non-zero count is a walk defect, not a tool fault, so the rows are printed.
+echo 'recorder:'
+recorder() {
+    name=$1
+    walk=$2
+    shift 2
+    if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+        cargo run -q -p minimax-h3 --example record -- --component all \
+        --conditioned "$conditioned" --tokens "$tokens" --elements "$elements" \
+        --track "$track" --extents "$extents" --types "$types" --against "$walk" \
+        "$@" >"$staging/record-$name.txt" 2>&1; then
+        printf '  %-8sFAILED\n' "$name"
+        tail -5 "$staging/record-$name.txt"
+        recorder_failed=1
+        return
     fi
-    printf '\n'
-done
+    line=$(grep -E '^# [0-9]+ recorded' "$staging/record-$name.txt" || true)
+    if [ -z "$line" ]; then
+        printf '  %-8sthe recorder printed no summary, which reads exactly like a pass\n' "$name"
+        tail -5 "$staging/record-$name.txt"
+        recorder_failed=1
+        return
+    fi
+    unstated=$(printf '%s' "$line" | sed -n 's/.*\([0-9][0-9]*\) only recorded.*/\1/p')
+    printf '  %-8s%s\n' "$name" "$line"
+    if [ -z "$unstated" ] || [ "$unstated" != "0" ]; then
+        echo "the model launches rows this walk does not state (${unstated:-unparsed}):" >&2
+        grep '^recorded, not stated:' "$staging/record-$name.txt" >&2 || true
+        echo "a fixture cut here is short of launches the model makes; fix the walk, not the fixture" >&2
+        recorder_failed=1
+    fi
+}
 
-# 2. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
+# `--extents` is the recorder's own fixture of tensor shapes; it is committed beside the fixtures.
+extents=${extents:-notes/programs/h3-extents.json}
+# **Both deployments report before the tool fails.** A gate that exits at the first one states a
+# count for one deployment and reads as if it had spoken about the other: with dense short the tool
+# stopped there, so no run ever printed the sparse count, and a reader comparing the two fixtures had
+# one number where two exist.
+recorder_failed=0
+recorder dense "$walk_dense"
+recorder sparse "$walk_sparse" --sparse 64,0.9
+if [ "$recorder_failed" != "0" ]; then
+    echo "the re-cut stops: a walk above is short of launches the model makes, so no fixture is written" >&2
+    exit 1
+fi
+
+# 3. The blocked block, pasted from the tool rather than written by hand. A stale exemption is as wrong
 #    as a missing one and harder to see, because a test comparing failures to the block goes green on a
 #    file that exempts what nothing fails on.
 echo 'declared blocked:'
@@ -187,7 +246,7 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
 printf '  dense %s, sparse %s\n' \
     "$(wc -l <"$staging/blocked-dense.txt")" "$(wc -l <"$staging/blocked-sparse.txt")"
 
-# 3. The fixtures: the header, the block and the rows, from the walk's own print.
+# 4. The fixtures: the header, the block and the rows, from the walk's own print.
 echo 'fixtures:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
@@ -196,47 +255,7 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example h3_fixture -- \
     --walk "$walk_sparse" --commit "$commit" --blocked "$staging/blocked-sparse.txt" >"$fixture_sparse"
 
-# 3b. One file, one attention backend. The dense and sparse walks differ by seven operators
-# (`sparse_attention` and the six `vsa_*`), so a dense fixture that names one of them is the union of
-# two deployments - a store with cells no launch of that deployment reads, and the omni fixture was
-# deleted for exactly this. The check is a grep because the alternative is a rule nobody runs.
-echo 'one deployment per file:'
-for pair in "dense:$fixture_dense:" "sparse:$fixture_sparse:sparse"; do
-    name=${pair%%:*}
-    rest=${pair#*:}
-    fixture=${rest%%:*}
-    want=${rest#*:}
-    others=$(grep -cP '^(sparse_attention|vsa_[a-z_]+)\t' "$fixture")
-    if [ "$name" = dense ] && [ "$others" -ne 0 ]; then
-        printf '  %-10s FAILED - %s row(s) of the sparse backend in the dense file\n' "$name" "$others"
-        exit 1
-    fi
-    if [ "$name" = sparse ] && [ "$others" -eq 0 ]; then
-        printf '  %-10s FAILED - no row of the sparse backend in the sparse file\n' "$name"
-        exit 1
-    fi
-    printf '  %-10s ok (%s row(s) of the sparse backend)\n' "$name" "$others"
-done
-
-# 3c. The recording, where one was given: the fixture must be the recorder's rows exactly. This is the
-#     only comparison that sees a flag reach a key - `--elements` decided `wide` and the walk and the
-#     file agreed with each other while both disagreed with the model.
-if [ -n "$recorder" ]; then
-    echo 'against the recording:'
-    if RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-        cargo run -q -p ops --example keys_delta -- \
-        --fixture "$fixture_dense" --walk "$recorder" 2>&1 | grep -q 'the fixture is the walk.s rows'; then
-        printf '  %-10s delta   ok\n' dense
-    else
-        printf '  %-10s delta   FAILED - the fixture is not the recording\n' dense
-        RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
-            cargo run -q -p ops --example keys_delta -- --fixture "$fixture_dense" --walk "$recorder" \
-            2>&1 | sed 's/^/    /' | head -20
-        exit 1
-    fi
-fi
-
-# 4. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
+# 5. Certify: the fixture must be the walk's rows, exactly, and every key must be covered or declared
 #    blocked. A fixture that fails either is one a store must not be built from.
 echo 'certify:'
 status=0

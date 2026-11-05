@@ -18,6 +18,14 @@
 //! `out` may alias `current`: every blended position reads `current` at the same position it writes,
 //! and `previous` only at the band, so a single buffer works — which is what the decoder wants, since
 //! the tile it keeps is the one it just decoded.
+//!
+//! **All three views are addressed by their strides**, so an operand may be a view inside a larger
+//! raster: a decoded tile sits at a stride of the raster's width, and the seam between two of them
+//! is a band whose rows are that same stride apart. The decoder hands over the **seam** — the views
+//! `extent` wide along the band axis — and the same program serves a whole tile, where the leading
+//! `extent` positions blend and the rest copy. The stride rule is `tensor::row_readable` for the two
+//! sources and `tensor::row_writable` for the destination, which is what refuses a view that cannot
+//! be read a row at a time rather than a value that does not fit.
 
 use std::fmt;
 
@@ -63,11 +71,13 @@ impl fmt::Display for Descriptor {
 /// The arguments of one blend.
 #[derive(Clone, Copy)]
 pub struct Args {
-    /// `[channels, frames, height, width]` the tile already written.
+    /// `[channels, frames, height, width]` the tile already written, or the seam band of it: a view
+    /// inside the raster, read through its own strides.
     pub previous: TensorView,
-    /// `[channels, frames, height, width]` the tile just decoded; may be the same buffer as `out`.
+    /// `[channels, frames, height, width]` the tile just decoded, or the seam band of it; may be the
+    /// same buffer as `out`.
     pub current: TensorView,
-    /// The blended tile.
+    /// The blended tile, or the seam band written in place.
     pub out: TensorView,
 }
 
@@ -105,14 +115,42 @@ impl Op for CrossFade {
         }
         let extent = u64::from(descriptor.extent);
         let along = dims[descriptor.axis as usize];
+        // The seam is the shape the caller hands, so the refusal is about that shape rather than
+        // about a value: the descriptor compiles `extent` blended positions along axis `axis`, and
+        // the operand must have that many to blend. A seam the caller passed has exactly `extent`
+        // there; a whole tile has more, and the positions past the band copy.
         if extent == 0 || extent > along {
             return Err(Error::argument(
                 Self::NAME,
-                format!("an overlap of {extent} voxels does not fit an axis of {along}"),
+                format!(
+                    "this program blends a seam of {extent} voxels along axis {}, and the operands \
+                     handed have {along} there: what crosses the seam is that band's shape, not the \
+                     tile's",
+                    descriptor.axis
+                ),
             ));
         }
         for (name, view) in [("previous", args.previous), ("current", args.current)] {
-            view.require_shape(Self::NAME, args.current.shape)?;
+            // Named here rather than left to `require_shape`, because the mistake this catches is
+            // specific and the generic refusal sends the reader to the wrong place: a caller that
+            // hands over two whole tiles differing by the grid's stride is told an overlap does not
+            // fit an axis, and goes looking at `extent`. What a cross-fade blends is the band each
+            // tile contributes to the seam — the last `extent` voxels of one and the first `extent`
+            // of the next — so both operands are the same shape by construction.
+            if view.shape != args.current.shape {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "a cross-fade blends two views of the SAME shape, and {name} is {:?} against \
+                         the current tile's {:?}: the operands are the seam band each tile \
+                         contributes along axis {} (the band is {extent} voxels wide), not the tiles \
+                         themselves",
+                        view.shape.dims(),
+                        args.current.shape.dims(),
+                        descriptor.axis
+                    ),
+                ));
+            }
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
@@ -133,6 +171,19 @@ impl Op for CrossFade {
         // The same rule as `unpatchify_video`'s, and stated once: `tensor::row_writable`. `out` may
         // still alias `current` — every element is read before the position it lives at is written.
         let out_strides = crate::tensor::row_writable(&args.out, Self::NAME)?;
+        let previous_strides = crate::tensor::row_readable(&args.previous, Self::NAME)?;
+        let current_strides = crate::tensor::row_readable(&args.current, Self::NAME)?;
+        // Every stride travels as a 32-bit word, and a value that does not fit is refused rather
+        // than truncated: a source inside a raster states its own row stride, which is the raster's
+        // width, so this is the number that used to be assumed.
+        let stride_word = |role: &str, axis: usize, value: u64| -> Result<u32> {
+            u32::try_from(value).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("the {role} view's axis {axis} stride {value} does not fit a kernel parameter"),
+                )
+            })
+        };
         let mut arguments = Arguments::new();
         arguments
             .view(args.previous)
@@ -167,8 +218,14 @@ impl Op for CrossFade {
                     format!("{} columns do not fit a kernel parameter", dims[3]),
                 )
             })?)
-            // The destination's outer strides: one row is written contiguously and its base is
-            // addressed with these, which is what lets a tile land inside a larger raster.
+            // The destination's outer strides, then its block and PDL flag. Its base is addressed
+            // with these, which is what lets a tile land inside a larger raster.
+            .u32(stride_word("previous", 0, previous_strides[0])?)
+            .u32(stride_word("previous", 1, previous_strides[1])?)
+            .u32(stride_word("previous", 2, previous_strides[2])?)
+            .u32(stride_word("current", 0, current_strides[0])?)
+            .u32(stride_word("current", 1, current_strides[1])?)
+            .u32(stride_word("current", 2, current_strides[2])?)
             .u32(u32::try_from(out_strides[0]).map_err(|_| {
                 Error::argument(
                     Self::NAME,
