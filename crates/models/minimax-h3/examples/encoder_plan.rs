@@ -20,12 +20,17 @@
 
 use std::path::PathBuf;
 
+use std::collections::BTreeMap;
+
+use nn::weights::WeightLoader;
+use nn::{Arena, DType, Forward, Shape};
+
 use minimax_h3::VideoVaeConfig;
 use minimax_h3::decoding::{Buffer, arena_reservation};
 use minimax_h3::encoding::{Extent, conditioning_arena, video_encoder_run_arena};
 
 const USAGE: &str = "\
-usage: encoder_plan [--root <checkpoint>] [--frames <n>] [--height <n>] [--width <n>]
+usage: encoder_plan [--root <checkpoint>] [--frames <n>] [--height <n>] [--width <n>] [--extents <json>]
 
   --root    the checkpoint's small files (default /opt/uv/models/MiniMax-H3)
   --frames  the clip's raster frames (default 17, the decoder's clip body)
@@ -44,6 +49,7 @@ fn run() -> Result<(), String> {
     let mut frames = 17_u32;
     let mut height = 768_u32;
     let mut width = 768_u32;
+    let mut extents_path: Option<PathBuf> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -56,6 +62,7 @@ fn run() -> Result<(), String> {
             "--frames" => frames = count(&value()?, "--frames")?,
             "--height" => height = count(&value()?, "--height")?,
             "--width" => width = count(&value()?, "--width")?,
+            "--extents" => extents_path = Some(PathBuf::from(value()?)),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -136,6 +143,93 @@ fn run() -> Result<(), String> {
     }
     let reserved = arena_reservation(&plan);
     println!(
+        "\nthe tile plan alone reserves {} B; the conditioning {} B; the harness's own buffers {} B",
+        arena_reservation(&tile_plan),
+        arena_reservation(&conditioning),
+        reserved - arena_reservation(&tile_plan) - arena_reservation(&conditioning)
+    );
+
+    // What the **forward** asks, measured on the host: a recording forward launches nothing, and the
+    // arena is bookkeeping over an address nothing dereferences, so every allocation the encode would
+    // make is made here and `used()` counts it. The reservation the plan states is compared against
+    // that, which is the only way a short plan can be named rather than inferred from a device failure.
+    if let Some(path) = &extents_path {
+        let table = weight_extents(path)?;
+        let mut loader = WeightLoader::stated(DType::F32, Some(&table));
+        let encoder = minimax_h3::encoding::VideoEncoder::load(&config, &mut loader)
+            .map_err(|error| error.to_string())?;
+        let arena = Arena::new(ops::DevicePtr::new(0), 1_u64 << 42);
+        let forward = Forward::recording(&arena);
+
+        let before = arena.used();
+        let scratch = encoder
+            .reserve(&forward, &extents)
+            .map_err(|error| error.to_string())?;
+        let set_bytes = arena.used() - before;
+        println!(
+            "\ntrace: `reserve` asks {set_bytes} B for {} distinct extent(s)",
+            {
+                let mut distinct = extents.clone();
+                distinct.sort_by_key(|extent| (extent.frames, extent.height, extent.width));
+                distinct.dedup_by_key(|extent| (extent.frames, extent.height, extent.width));
+                distinct.len()
+            }
+        );
+
+        // One tile, exactly as the driver runs it: the caller's pixels and the latent it reads back
+        // come out of this arena here because the harness has one pointer to give.
+        let tile = extents[0];
+        let pixels = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    u64::from(config.in_channels),
+                    u64::from(tile.frames),
+                    u64::from(tile.height),
+                    u64::from(tile.width),
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+        let latent = minimax_h3::encoding::Stack::of(&config)
+            .map_err(|error| error.to_string())?
+            .clip
+            .latent_frames(tile.frames)
+            .map_err(|error| error.to_string())?;
+        let out = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    2 * u64::from(config.latent_channels),
+                    u64::from(latent),
+                    u64::from(tile.height / 16),
+                    u64::from(tile.width / 16),
+                ]),
+            )
+            .map_err(|error| error.to_string())?;
+        let before_tile = arena.used();
+        encoder
+            .encode_tile(&forward, &scratch, pixels, out)
+            .map_err(|error| error.to_string())?;
+        let tile_bytes = arena.used() - before_tile;
+        println!(
+            "trace: one tile asks {tile_bytes} B beyond the run's set; {} tile(s) in the grid is {} B",
+            extents.len(),
+            tile_bytes * u64::try_from(extents.len()).unwrap_or(1)
+        );
+        let asked = set_bytes + tile_bytes * u64::try_from(extents.len()).unwrap_or(1);
+        println!(
+            "trace: the forward asks {asked} B against the plan's {reserved} B - {}",
+            match asked.cmp(&reserved) {
+                std::cmp::Ordering::Greater => format!("SHORT by {} B", asked - reserved),
+                std::cmp::Ordering::Equal => "exactly the plan".to_owned(),
+                std::cmp::Ordering::Less => format!("{} B of slack", reserved - asked),
+            }
+        );
+    }
+
+    println!(
         "\n{} buffer(s) in the whole plan, {total} B raw, {reserved} B at the arena's alignment",
         plan.len()
     );
@@ -146,6 +240,39 @@ fn run() -> Result<(), String> {
         4761421312_u64.saturating_sub(reserved)
     );
     Ok(())
+}
+
+/// The checkpoint's tensor extents for the video VAE, from the reference's own table.
+fn weight_extents(path: &std::path::Path) -> Result<BTreeMap<String, (DType, Shape)>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let values: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let table = values.get("vae").unwrap_or(&values);
+    let object = table
+        .as_object()
+        .ok_or_else(|| format!("{} is not an object", path.display()))?;
+    let mut extents = BTreeMap::new();
+    for (name, entry) in object {
+        let dtype = match entry.get("dtype").and_then(|value| value.as_str()) {
+            Some("F32") => DType::F32,
+            Some("F16") => DType::F16,
+            Some("BF16") => DType::BF16,
+            other => return Err(format!("{name}: {other:?} is not an element type")),
+        };
+        let dims = entry
+            .get("shape")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("{name}: the entry states no shape"))?
+            .iter()
+            .map(|dim| {
+                dim.as_u64()
+                    .ok_or_else(|| format!("{name}: a dimension is not a count"))
+            })
+            .collect::<Result<Vec<u64>, String>>()?;
+        extents.insert(name.clone(), (dtype, Shape::new(&dims)));
+    }
+    Ok(extents)
 }
 
 fn count(text: &str, flag: &str) -> Result<u32, String> {

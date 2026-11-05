@@ -2450,6 +2450,14 @@ pub fn video_encoder_tile_arena(
             * u64::from(raster.height + 2)
             * u64::from(raster.width + 2),
     );
+    // The input convolution's output: the first level's width at the raster's own extent. `set` takes
+    // it before the levels do, so a plan without it is short by exactly this buffer - measured, it was
+    // 570,425,344 B at 17 frames of 768x768, and the device run stopped inside `reserve` at almost
+    // exactly the plan's end.
+    push(
+        "stream".to_owned(),
+        u64::from(stack.widths[0]) * pixels(&raster),
+    );
     for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
         let width = u64::from(stack.widths[index]);
         let input = match index {
