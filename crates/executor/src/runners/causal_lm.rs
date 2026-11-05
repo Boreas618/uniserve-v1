@@ -3763,8 +3763,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
             commit: inert_commit(1),
-            page_size: 1,
-            max_kv_len: 1,
+            // The geometry the upload hands the model, and the same two values the serving pose
+            // states (`token_batch_with`): a captured node's page size and key bound are its own,
+            // so a warm pose that stated its own would freeze a page of one token and a reduction
+            // of one key into the graph every served batch then replays. `page_size` is the
+            // cache's and `max_kv_len` the model's; neither is a property of a bucket, so no pose
+            // states one of its own.
+            page_size: self.geometry.page_size,
+            max_kv_len: self.geometry.max_kv_len,
         };
         self.staging
             .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
