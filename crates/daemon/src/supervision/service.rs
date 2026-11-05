@@ -144,7 +144,17 @@ impl Local {
                 reply.kind = Some(reply::Kind::Stopped(Stopped {}));
             }
             Some(request::Kind::Reserve(reserve)) => {
-                match self.supervisor.reserve(engine, reserve, self.address) {
+                // A reservation is filed under the engine that will spawn the
+                // process inheriting it, which the request states: the asking
+                // connection may be the deployment's planning client, and it may
+                // be re-established between the reservation and the launch
+                // without changing whose socket it is.
+                let owner = if reserve.engine == 0 {
+                    engine
+                } else {
+                    reserve.engine
+                };
+                match self.supervisor.reserve(owner, reserve, self.address) {
                     Ok(reserved) => reply.kind = Some(reply::Kind::Reserved(reserved)),
                     Err(error) => reply.error = error,
                 }
