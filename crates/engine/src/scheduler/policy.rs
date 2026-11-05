@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
@@ -325,6 +326,18 @@ impl ProgramSource {
 impl PolicySource for ProgramSource {
     fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError> {
         let server_program = program.to_server_program()?;
+        // The Program Server builds a policy module its store does not hold, and it streams what it
+        // is doing to the callback below. Discarding that account left a 300-second wait that named
+        // no step; a resolve is the one step of a precopy that compiles, so it is printed with the
+        // target it asked for - the daemon's prepare and this engine's resolve must name the same
+        // one, or the store the daemon filled is not the store this resolve reads.
+        let started = Instant::now();
+        tracing::info!(
+            backend = %program.backend,
+            revision = program.revision,
+            target = %self.target,
+            "resolving the policy program for this host's target"
+        );
         let module = self.with_client(|client| {
             client
                 .resolve(
@@ -332,7 +345,14 @@ impl PolicySource for ProgramSource {
                     &server_program,
                     &self.target,
                     program_server::manifest::POLICY_DESCRIPTOR,
-                    &mut |_| {},
+                    &mut |progress| {
+                        tracing::info!(
+                            target = %self.target,
+                            path = %progress.path,
+                            state = ?progress.state,
+                            "the Program Server is building this policy's module"
+                        );
+                    },
                 )
                 .map_err(|error| PolicyError::Load {
                     message: format!(
@@ -341,6 +361,14 @@ impl PolicySource for ProgramSource {
                     ),
                 })
         })?;
+        tracing::info!(
+            backend = %program.backend,
+            revision = program.revision,
+            target = %self.target,
+            ms = started.elapsed().as_millis() as u64,
+            files = module.files.len(),
+            "the policy program resolved"
+        );
         let mut file = module
             .files
             .into_iter()
@@ -889,8 +917,18 @@ impl PolicySlot {
             parameters: program.arguments.clone(),
             state: snapshot,
         };
-        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
+        // Three blocking steps and one trial, timed separately: a wait that names none of them
+        // cannot be told from a hang, and the resolve is the only one that compiles.
+        let resolving = Instant::now();
+        let bytes = source.bytes(&program)?;
+        let resolve = resolving.elapsed();
+        let loading = Instant::now();
+        let module = PolicyModule::load(engine, &bytes)?;
+        let load = loading.elapsed();
+        let instantiating = Instant::now();
         let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
+        let instantiate = instantiating.elapsed();
+        let trying = Instant::now();
 
         // Every decision of §4.4's table once, on the state that exists now and
         // without executing any of it. The calls are the trial's cost, counted
@@ -927,6 +965,16 @@ impl PolicySlot {
             validators.experts(load, &order)?;
         }
 
+        tracing::info!(
+            backend = %program.backend,
+            revision = program.revision,
+            resolve_ms = resolve.as_millis() as u64,
+            load_ms = load.as_millis() as u64,
+            instantiate_ms = instantiate.as_millis() as u64,
+            trial_ms = trying.elapsed().as_millis() as u64,
+            calls,
+            "the spans of this precopy's policy preparation"
+        );
         Ok(Candidate {
             program,
             module,
