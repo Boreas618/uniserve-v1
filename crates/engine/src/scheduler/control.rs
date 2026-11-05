@@ -82,6 +82,11 @@ pub(super) struct ShadowPass {
     /// One of the step's batches was submitted as a shadow: the step that owns
     /// the answer has begun, and ends before the answer is sent.
     pub(super) shadowed: bool,
+    /// The shapes this pass has compared. A shape is compared once (§7.3 step
+    /// 2): a pass that shadowed every batch of a shape would keep a slow
+    /// comparison in flight for as long as traffic lasts, and it would neither
+    /// settle nor leave the device to the requests it serves.
+    pub(super) shapes: std::collections::HashSet<executor::plan::Shape>,
     /// Where the ask's answer goes, in the shape every stage's answer takes.
     pub(super) answer: StageAnswer,
 }
@@ -510,6 +515,7 @@ impl Scheduler {
         self.shadow_pass = Some(ShadowPass {
             generation,
             shadowed: false,
+            shapes: std::collections::HashSet::new(),
             answer,
         });
     }
@@ -517,16 +523,27 @@ impl Scheduler {
     /// The world generation the following step's batches also run in shadow
     /// for, if an update asked (§7.3 step 2). The step reads it before it
     /// submits, since it names the kernels the shadow pass compares against.
-    pub(super) fn shadow_generation(&self) -> Option<u64> {
-        self.shadow_pass.as_ref().map(|pass| pass.generation)
+    pub(super) fn shadow_generation(&self, batch: &ExecutionBatch) -> Option<u64> {
+        let pass = self.shadow_pass.as_ref()?;
+        let shape = batch
+            .columns
+            .as_ref()
+            .map(crate::scheduler::batching::columns::batch_shape);
+        // A media batch states no token shape: its computation is compared once.
+        let compared = match &shape {
+            Some(shape) => pass.shapes.contains(shape),
+            None => pass.shadowed,
+        };
+        (!compared).then_some(pass.generation)
     }
 
     /// Records that a batch of this step was submitted as a shadow pass: the
     /// ask is answered when the step ends, so an answer never claims a pass
     /// that has not run.
-    pub(super) fn note_shadowed(&mut self) {
+    pub(super) fn note_shadowed(&mut self, shape: Option<executor::plan::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {
             pass.shadowed = true;
+            pass.shapes.extend(shape);
         }
     }
 
@@ -827,6 +844,9 @@ impl Scheduler {
         }
         policy.request(stage);
         let applied = policy.boundary(state).map_err(|error| error.to_string());
+        if applied.is_ok() && matches!(stage, Stage::Switchover | Stage::Revert) {
+            self.seed_from_policy();
+        }
         if serves {
             // A policy instance serves from this boundary on (§7.3 step 3).
             self.note_policy_serves();
