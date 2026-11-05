@@ -149,6 +149,28 @@ impl Supervisor {
                 .get(reservation)
                 .is_some_and(|held| held.engine == engine && held.group == spawn.group)
         }) {
+            // Which of the three cases this is decides three different fixes:
+            // the reservation is gone (a race between two launches), it names
+            // another group, or it names another engine.
+            match self.reservations.get(reservation) {
+                None => eprintln!(
+                    "[dbg] RESERVE-MISS id={reservation} case=absent spawn.engine={engine} \
+                     spawn.group={:?} held={:?}",
+                    spawn.group,
+                    self.reservations
+                        .iter()
+                        .map(|(id, held)| (*id, held.engine, held.group.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                Some(held) => eprintln!(
+                    "[dbg] RESERVE-MISS id={reservation} case={} spawn.engine={engine} \
+                     spawn.group={:?} held.engine={} held.group={:?}",
+                    if held.engine != engine { "engine" } else { "group" },
+                    spawn.group,
+                    held.engine,
+                    held.group,
+                ),
+            }
             return Err(format!(
                 "reservation {reservation} is not one of worker group {}'s",
                 spawn.group
@@ -208,6 +230,10 @@ impl Supervisor {
         self.next_reservation += 1;
         // The process that inherits the socket finds it at this number.
         let descriptor = listener.as_raw_fd();
+        eprintln!(
+            "[dbg] RESERVE id={reservation} engine={engine} group={:?}",
+            reserve.group
+        );
         self.reservations.insert(
             reservation,
             Reservation {
