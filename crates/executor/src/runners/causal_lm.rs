@@ -2757,6 +2757,53 @@ mod tests {
         Ok(())
     }
 
+    /// A prefill bucket's padding tokens are **tokens the graph can serve**, not sentinels.
+    ///
+    /// The captured graph runs the router over every token the bucket holds, so a padded token's
+    /// route is computed from its own row: its id and its rotary position must be values a kernel
+    /// may index with, and the row's answer is discarded rather than left unset. A padding value a
+    /// kernel would index with - a `-1` id, or a row whose attention output nothing writes - is how
+    /// a padded token reached the MoE block as a route nobody could serve and faulted the launch
+    /// (`moeUnpermuteKernel`, block 289 of a 512-token bucket, the first padded token of the
+    /// prompt).
+    #[test]
+    fn a_prefill_bucket_pads_with_tokens_the_graph_can_serve() -> Result<()> {
+        let bucket = Bucket::prefill(1, 64, Variant::PrefillOutput);
+        let buckets = Buckets::new([bucket]);
+        let mut staging = Staging::new();
+        staging.reserve(&buckets)?;
+        staging.stage(
+            &prefill_columns(),
+            &[CallId(1)],
+            &Shape::prefill(1, 3, Variant::PrefillOutput),
+            bucket,
+        )?;
+
+        let tokens = bucket.tokens as usize;
+        assert_eq!(staging.input_ids.len(), tokens);
+        // The three real tokens, then padding that is a *token*: id zero of the vocabulary and
+        // rotary position zero, so the embedding and every position-dependent launch after it read
+        // a value rather than a sentinel. No padding token writes a cache page.
+        assert_eq!(&staging.input_ids[..3], &[1, 2, 3]);
+        for token in 3..tokens {
+            assert_eq!(
+                staging.input_ids[token], 0,
+                "padded token {token} is a real id, not a sentinel"
+            );
+            assert_eq!(
+                staging.batch_rows().positions[token],
+                0,
+                "padded token {token} has a real rotary position"
+            );
+            assert_eq!(
+                staging.batch_rows().slot_mapping[token],
+                -1,
+                "padded token {token} writes no cache page"
+            );
+        }
+        Ok(())
+    }
+
     /// A batch narrower than its bucket fills the bucket's rows with **empty sequences**: the row
     /// count of every per-row operand is the bucket's, and the rows the batch does not fill state
     /// length zero, no pool slot, no logits row and inert sampling parameters.
@@ -2840,10 +2887,11 @@ mod tests {
         assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
         let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
-        // The rows past the batch are **inert**, not zero: a zero slot is slot 0, a real destination,
+        // The row past the batch is **inert**, not zero: a zero slot is slot 0, a real destination,
         // so a launch that ever ran over the whole capacity would commit phantom tokens into the
-        // first slot the deployment serves. `-1` is the operator's sentinel for "no slot".
-        assert_eq!(&slots[rows..], &[-1, -1]);
+        // first slot the deployment serves. `-1` is the operator's sentinel for "no slot", and the
+        // tail is `capacity - rows` rows of it - one here, not two.
+        assert_eq!(&slots[rows..], &[-1]);
         // A table of the wrong length is refused rather than read past its end.
         assert!(commit_table(&staged[..rows], rows, capacity).is_err());
         Ok(())
