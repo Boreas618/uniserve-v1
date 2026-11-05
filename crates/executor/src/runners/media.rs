@@ -22,7 +22,7 @@ use ipc::RequestKey;
 use crate::Result;
 use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::host::{HostAction, Lane, Outcome};
-use crate::plan::{Extent, Variant};
+use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::products::{Product, Products};
 
@@ -182,6 +182,12 @@ pub struct Output {
     /// one request, which is the rule that keeps two units of a request from starting two
     /// containers, so the first clip of a request opens and every later one appends.
     opened: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// How many units each request's assembly holds, counted as they are appended.
+    ///
+    /// A unit's place in the timeline is what says how many frames it covers, and the mechanism's
+    /// encode batch states no extent to carry it: the count is this output's own record of the
+    /// appends, which is the same order the muxer checks against `units` when it finishes.
+    appended: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
 }
 
 impl Output {
@@ -207,7 +213,20 @@ impl Output {
             media,
             rates,
             opened: std::sync::Mutex::new(std::collections::HashSet::new()),
+            appended: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// How many units of `request`'s timeline this output has appended.
+    ///
+    /// The stage that encodes a unit needs the frames that unit covers, and the mechanism's batch
+    /// states them nowhere: a media encode is sized by the raster and the assembly, never by an
+    /// extent, so the place in the timeline is read from what this output has already appended.
+    pub fn units_appended(&self, request: RequestKey) -> usize {
+        crate::lock(&self.appended)
+            .get(&request_id(request))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The rates every artifact of this output is built at.
@@ -276,6 +295,11 @@ impl Output {
         )?;
         framed.truncate(written);
         self.media.append_units(request_id(request), &[framed])?;
+        // The append is what says this unit has its place: the next encode of this request reads
+        // the schedule's following entry, so the count moves only after the encoder accepted it.
+        *crate::lock(&self.appended)
+            .entry(request_id(request))
+            .or_insert(0) += 1;
         Ok(())
     }
 
@@ -527,7 +551,12 @@ impl MediaStage {
 /// The three calls differ in exactly these two facts, and stating them in one place is what keeps
 /// the runner's own dispatch to the protocol: a video unit reads the postprocessor's raster, an
 /// audio encode reads the decoder's window, and the mux reads only what the two encodes wrote.
-fn staged(computation: crate::plan::Computation) -> Result<(Stage, Option<Product>)> {
+fn staged(
+    computation: crate::plan::Computation,
+    canvas: (u32, u32),
+    units: &[u32],
+    index: usize,
+) -> Result<(Stage, Option<Product>)> {
     let variant = computation.variant().ok_or_else(|| {
         crate::Error::Invalid(format!(
             "a {:?} batch is a computation no variant states",
@@ -535,23 +564,28 @@ fn staged(computation: crate::plan::Computation) -> Result<(Stage, Option<Produc
         ))
     })?;
     match variant {
-        Variant::VideoEncode => match computation.extent {
-            Extent::Clip {
-                frames,
-                height,
-                width,
-            } => Ok((
+        // A video unit's frames are the schedule's entry for the place this unit takes in the
+        // timeline, and its raster is the request's canvas - the shape the postprocessor wrote and
+        // the encoder reads. Neither is an extent the mechanism states: a host call is sized by the
+        // request, so a batch that named a canvas would be a second statement of it.
+        Variant::VideoEncode => {
+            let frames = units.get(index).copied().ok_or_else(|| {
+                crate::Error::Invalid(format!(
+                    "request's unit {index} is not one of the {} unit(s) its timeline holds: the \
+                     encodes are appended in the schedule's order",
+                    units.len()
+                ))
+            })?;
+            let (width, height) = canvas;
+            Ok((
                 Stage::Unit {
                     frames,
                     height,
                     width,
                 },
                 Some(Product::Video),
-            )),
-            other => Err(crate::Error::Invalid(format!(
-                "a video encode is a clip's raster and this batch states {other:?}"
-            ))),
-        },
+            ))
+        }
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
         Variant::Mux => Ok((Stage::Mux, None)),
         other => Err(crate::Error::Invalid(format!(
@@ -591,8 +625,14 @@ impl Runner for MediaStage {
             )
         })?;
         let request = media.request(0)?;
-        let (stage, product) = staged(computation)?;
         let units = (self.units_of)(request.frames)?;
+        let appended = self.output.units_appended(request.request);
+        let (stage, product) = staged(
+            computation,
+            (request.width, request.height),
+            &units,
+            appended,
+        )?;
         let input = match product {
             Some(kind) => Some(self.stage_product(request.request, kind)?),
             None => None,
@@ -753,31 +793,41 @@ mod tests {
 
     /// A host call names the stage it is and the product it reads, and nothing else is served.
     ///
-    /// The two facts are what the runner owes the protocol: a video encode works at a clip's
-    /// raster and reads the postprocessor's frames, an audio encode reads the decoder's track, and
-    /// the mux reads neither - its inputs are the two encodes the deployment's output holds. A call
-    /// of another class reaching the stage would otherwise be answered with an empty completion the
-    /// mechanism reads as success.
+    /// The two facts are what the runner owes the protocol: a video encode works at one unit of the
+    /// request's timeline and reads the postprocessor's frames, an audio encode reads the decoder's
+    /// track, and the mux reads neither - its inputs are the two encodes the deployment's output
+    /// already holds. A call of another class reaching the stage would otherwise be answered with an
+    /// empty completion the mechanism reads as success.
     #[test]
     fn a_host_call_states_the_stage_and_the_product_it_reads() {
-        let clip = crate::plan::Extent::Clip {
-            frames: 17,
-            height: 2,
-            width: 2,
-        };
         let video = crate::plan::Computation {
             call: ipc::MediaCall::VideoEncoding,
             rows: 1,
             tokens: 0,
-            extent: clip,
+            extent: crate::plan::Extent::None,
         };
+        let units = [17_u32, 22];
+
+        // The first unit of the timeline is the first entry of the schedule, at the request's own
+        // canvas: the batch states no extent, and nothing about the raster is re-derived here.
         assert_eq!(
-            staged(video).expect("a video encode"),
+            staged(video, (1344, 768), &units, 0).expect("a video encode"),
             (
                 Stage::Unit {
                     frames: 17,
-                    height: 2,
-                    width: 2,
+                    height: 768,
+                    width: 1344,
+                },
+                Some(Product::Video),
+            )
+        );
+        assert_eq!(
+            staged(video, (1344, 768), &units, 1).expect("the timeline's second unit"),
+            (
+                Stage::Unit {
+                    frames: 22,
+                    height: 768,
+                    width: 1344,
                 },
                 Some(Product::Video),
             )
@@ -785,11 +835,10 @@ mod tests {
 
         let audio = crate::plan::Computation {
             call: ipc::MediaCall::AudioEncoding,
-            extent: crate::plan::Extent::None,
             ..video
         };
         assert_eq!(
-            staged(audio).expect("an audio encode"),
+            staged(audio, (1344, 768), &units, 0).expect("an audio encode"),
             (Stage::Track, Some(Product::Track))
         );
 
@@ -797,18 +846,20 @@ mod tests {
             call: ipc::MediaCall::Muxing,
             ..audio
         };
-        assert_eq!(staged(mux).expect("a mux"), (Stage::Mux, None));
+        assert_eq!(
+            staged(mux, (1344, 768), &units, 0).expect("a mux"),
+            (Stage::Mux, None)
+        );
 
-        // A video encode with no raster cannot say which frames it covers: the extent is the
-        // batch's only statement of them.
-        let unshaped = crate::plan::Computation {
-            extent: crate::plan::Extent::None,
-            ..video
-        };
-        let message = format!("{}", staged(unshaped).expect_err("no raster"));
+        // A unit past the schedule's end is refused by name rather than given the last entry: two
+        // encodes running as one is an assembly the muxer would refuse much later.
+        let message = format!(
+            "{}",
+            staged(video, (1344, 768), &units, 2).expect_err("no third unit")
+        );
         assert!(
-            message.contains("raster"),
-            "the refusal names what a video encode needs: {message}"
+            message.contains("2 unit(s)"),
+            "the refusal names the timeline's length: {message}"
         );
 
         // A device computation is another runner's: this one serves the artifact's three calls.
@@ -816,7 +867,10 @@ mod tests {
             call: ipc::MediaCall::Denoising,
             ..video
         };
-        let message = format!("{}", staged(denoise).expect_err("a denoise"));
+        let message = format!(
+            "{}",
+            staged(denoise, (1344, 768), &units, 0).expect_err("a denoise")
+        );
         assert!(
             message.contains("three calls"),
             "the refusal states what this runner serves: {message}"

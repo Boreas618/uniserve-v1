@@ -292,11 +292,8 @@ impl MediaColumns {
         // say which graph serves it.
         let host = matches!(
             computation.variant(),
-            Some(
-                crate::plan::Variant::Encode
-                    | crate::plan::Variant::AudioEncode
-                    | crate::plan::Variant::Mux
-            )
+            Some(variant)
+                if variant.host() || variant == crate::plan::Variant::Encode
         );
         if computation.extent == crate::plan::Extent::None && !host {
             return Err(Error::Invalid(format!(
