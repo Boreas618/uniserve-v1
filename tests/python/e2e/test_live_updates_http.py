@@ -2383,3 +2383,289 @@ def test_a_plugins_graph_policy_chooses_the_captured_buckets(
         if (match := re.search(r"text graphs: (\d+) decode", line))
     ]
     assert captured and all(buckets == 4 for buckets in captured), captured
+
+
+#: How long a lost main process has to put an engine back in front of requests
+#: before the test calls it a stall. The design states no recovery time, so
+#: this is the daemon's own migration bound (``MIGRATION_TIMEOUT``): what a case
+#: measures is recorded, and the bound is only ever a stall bound.
+RECOVERY_BOUND_S = 120.0
+
+#: The count a recovery case streams across its kill: long enough that the kill
+#: lands in the middle of the response, short enough to be compared whole.
+RECOVERY_PROMPT = (
+    "Count from 1 to 60, separated by commas and spaces. "
+    "Write only the numbers."
+)
+
+#: The count a request asks for when its tokens are compared: the same prompt
+#: every time, so the same numbers are the same answer to the same question.
+RECOVERY_TOKENS = 256
+
+
+def _numbers(read: list[str]) -> list[int]:
+    """The integers a streamed answer wrote, in order."""
+    return [int(word) for word in re.findall(r"\d+", "".join(read))]
+
+
+def _serving_engine(log: Path) -> int:
+    """The engine process that serves now: the role's pid the log names most.
+
+    A deployment with a standby has two engine processes and only one of them
+    answers requests, so the busiest pid of the log's tail is the one to kill;
+    a parked standby states itself once and then writes nothing.
+    """
+    counts: dict[int, int] = {}
+    for line in _log_lines(log)[-400:]:
+        match = re.search(r"\(Engine pid=(\d+)\)", line)
+        if match is not None:
+            pid = int(match.group(1))
+            counts[pid] = counts.get(pid, 0) + 1
+    assert counts, "no engine process is named in the log"
+    return max(counts, key=counts.__getitem__)
+
+
+def _recovery_artifacts(case: str, evidence: dict) -> Path:
+    """Writes one case's evidence under `artifacts/main-process-loss/<UTC>/`.
+
+    The recovery time, the tokens the request carried across the loss, and the
+    process that was lost are the record: the design states no recovery time, so
+    what the case measures is the only statement of it.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+    directory = (
+        Path(__file__).resolve().parents[3]
+        / "artifacts"
+        / "main-process-loss"
+        / stamp
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{case}.json"
+    path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _lose_the_serving_engine(
+    base_url: str,
+    log: Path,
+    name: str,
+    case: str,
+    standby: bool,
+) -> dict:
+    """Kills the engine that serves under a request in flight.
+
+    The request in flight is a count: it must carry every number it wrote
+    before the loss and every number after it, with no gap and no repetition,
+    because the response migrates to the engine that takes over. The answer to
+    the same question after the recovery must be the answer the deployment gave
+    before it — that is what says the surviving engine serves the same model and
+    not merely a live one.
+    """
+    baseline = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)[
+        "choices"
+    ][0]["message"]["content"]
+    baseline_numbers = _numbers([baseline])
+    assert baseline_numbers[:10] == list(range(1, 11)), baseline[:200]
+
+    read: list[str] = []
+    done = threading.Event()
+    errors: list[BaseException] = []
+    reasons: list[str] = []
+    streaming = threading.Thread(
+        target=_stream_count,
+        args=(base_url, name, read, done),
+        kwargs={
+            "reasons": reasons,
+            "prompt": RECOVERY_PROMPT,
+            "errors": errors,
+        },
+    )
+    streaming.start()
+    _wait_until(
+        lambda: len(_numbers(read)) >= 8, 300, "the count did not stream"
+    )
+    before = len(_numbers(read))
+    killed = _serving_engine(log)
+    started = time.monotonic()
+    _stop_pid(killed)
+
+    resumed: list[float] = []
+
+    def continues() -> bool:
+        if len(_numbers(read)) > before:
+            resumed.append(time.monotonic())
+            return True
+        return False
+
+    _wait_until(
+        continues,
+        RECOVERY_BOUND_S,
+        f"the response in flight did not continue within "
+        f"{RECOVERY_BOUND_S:.0f} s of the engine {killed} ending",
+    )
+    recovery_s = resumed[0] - started
+
+    streaming.join(timeout=1800)
+    assert done.is_set(), "the count did not end after the recovery"
+    assert not errors, f"the count failed: {errors[0]!r}"
+    numbers = _numbers(read)
+    assert numbers == list(range(1, len(numbers) + 1)), (
+        f"the response lost or repeated a count across the loss: {numbers[:40]}"
+    )
+    assert len(numbers) >= 60, f"the count stopped at {len(numbers)} numbers"
+    assert reasons == ["stop"], f"the count ended {reasons}"
+
+    after = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)[
+        "choices"
+    ][0]["message"]["content"]
+    assert _numbers([after]) == baseline_numbers, (
+        "the engine that serves after the loss answers differently: "
+        f"{after[:200]}"
+    )
+
+    lines = _log_lines(log)
+    promoted = any("the standby promoted in place" in line for line in lines)
+    relaunched = any(
+        "the engine was lost; starting another" in line for line in lines
+    )
+    assert promoted or relaunched, (
+        f"no engine took the lost one's place: {_log_trouble(log)}"
+    )
+    expected = promoted if standby else relaunched
+    assert expected, (
+        f"a deployment with standby={standby} recovered by "
+        f"promoted={promoted} relaunched={relaunched}:\n{_log_trouble(log)}"
+    )
+
+    evidence = {
+        "case": case,
+        "standby": standby,
+        "engine_lost": killed,
+        "recovery_s": round(recovery_s, 3),
+        "promoted": promoted,
+        "relaunched": relaunched,
+        "numbers_across_the_loss": len(numbers),
+        "answer_matches_the_answer_before": True,
+        "recovery_bound_s": RECOVERY_BOUND_S,
+    }
+    _recovery_artifacts(case, evidence)
+    return evidence
+
+
+def test_a_lost_main_process_is_promoted_from_its_standby(
+    tmp_path: Path, runtime: Path
+):
+    """A deployment with a standby loses its serving process and serves on.
+
+    The standby stands beside it for exactly this: it is promoted in place,
+    with the graphs it captured at their addresses, so the requests in flight
+    and the ones after them are answered by the process that was already
+    parked rather than by one that starts now.
+    """
+    name = "qwen3-live-standby"
+    log = tmp_path / "server.log"
+    options = (*OPTIONS, "worker_config.standby=true")
+    with _serve(runtime, log, name, options=options) as base_url:
+        evidence = _lose_the_serving_engine(
+            base_url, log, name, "standby-promoted", standby=True
+        )
+        assert evidence["promoted"]
+
+
+def test_a_lost_main_process_is_relaunched_without_a_standby(
+    tmp_path: Path, runtime: Path
+):
+    """The same loss with no standby beside the serving process.
+
+    The daemon launches a replacement and hands it the epoch's own programs and
+    the requests in flight: the count migrates to the new process, which answers
+    the next request as the lost one did.
+    """
+    name = "qwen3-live-relaunched"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        evidence = _lose_the_serving_engine(
+            base_url, log, name, "relaunched", standby=False
+        )
+        assert evidence["relaunched"]
+
+
+def test_an_epoch_switch_to_a_new_executable_fails_no_request(
+    tmp_path: Path, runtime: Path
+):
+    """A deployment switches to another worker executable under a request.
+
+    The executable is a copy of the worker the test runs, so the switch replaces
+    every main process of the deployment with a process of a different file. A
+    request in flight crosses the switch with its count whole and nothing of it
+    fails: an epoch switch is not a restart of the service the client sees.
+    """
+    name = "qwen3-live-executable"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        before = _pids(log, "Engine")
+        baseline = _chat(
+            base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS
+        )["choices"][0]["message"]["content"]
+        baseline_numbers = _numbers([baseline])
+        successor = tmp_path / worker_executable().name
+        shutil.copy2(worker_executable(), successor)
+
+        read: list[str] = []
+        done = threading.Event()
+        errors: list[BaseException] = []
+        reasons: list[str] = []
+        streaming = threading.Thread(
+            target=_stream_count,
+            args=(base_url, name, read, done),
+            kwargs={
+                "reasons": reasons,
+                "prompt": RECOVERY_PROMPT,
+                "errors": errors,
+            },
+        )
+        streaming.start()
+        _wait_until(
+            lambda: len(_numbers(read)) >= 8, 300, "the count did not stream"
+        )
+        report = _change_world(
+            base_url, f"worker_config.executable={successor}"
+        )
+        assert report, "the epoch switch reported no world"
+        for pid in before:
+            _wait_until(
+                lambda pid=pid: not _runs(pid),
+                RECOVERY_BOUND_S,
+                f"engine {pid} outlived the switch to the new executable",
+            )
+
+        streaming.join(timeout=1800)
+        assert done.is_set(), "the count did not end after the switch"
+        assert not errors, f"the count failed: {errors[0]!r}"
+        numbers = _numbers(read)
+        assert numbers == list(range(1, len(numbers) + 1)), (
+            f"the response lost or repeated a count across the switch: "
+            f"{numbers[:40]}"
+        )
+        assert reasons == ["stop"], f"the count ended {reasons}"
+
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)[
+            "choices"
+        ][0]["message"]["content"]
+        assert _numbers([after]) == baseline_numbers, (
+            "the new executable answers differently from the one it replaced: "
+            f"{after[:200]}"
+        )
+        lines = _log_lines(log)
+        failed = [line for line in lines if "chat completion failed" in line]
+        assert not failed, failed[:3]
+        _recovery_artifacts(
+            "epoch-switch-to-a-new-executable",
+            {
+                "case": "epoch-switch-to-a-new-executable",
+                "executable": str(successor),
+                "numbers_across_the_switch": len(numbers),
+                "answer_matches_the_answer_before": True,
+                "failed_requests": 0,
+            },
+        )
