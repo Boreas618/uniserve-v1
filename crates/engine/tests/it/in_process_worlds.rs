@@ -95,37 +95,6 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
         .expect("the scheduler answers within the bound")
 }
 
-/// Collects a request's tokens until its first `want` and its terminal event.
-fn tokens(receiver: &mut engine::EventRx, want: usize) -> (Vec<u32>, Option<Event>) {
-    let mut tokens = Vec::new();
-    let deadline = Instant::now() + ANSWER;
-    while Instant::now() < deadline {
-        match receiver.try_recv() {
-            // The engine publishes generated tokens as `TextTokens` carrying
-            // the ids a step produced (`scheduler/output.rs`); a single
-            // `TextToken` is the one-id form of the same event. A wait that
-            // matched only the second would read a served request as a starved
-            // one and burn its whole bound doing it.
-            Ok(Event::TextToken { id, .. }) => {
-                tokens.push(id);
-                if tokens.len() >= want {
-                    return (tokens, None);
-                }
-            }
-            Ok(Event::TextTokens { ids }) => {
-                tokens.extend(ids);
-                if tokens.len() >= want {
-                    return (tokens, None);
-                }
-            }
-            Ok(event) if event.is_terminal() => return (tokens, Some(event)),
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(1)),
-        }
-    }
-    panic!("the request did not reach {want} tokens within the bound");
-}
-
 /// A world that succeeds a running one takes over the running world's prefix
 /// cache index and continues a request the running one generated part of: the
 /// continuation samples what the uninterrupted request sampled next.
@@ -144,7 +113,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let mut reference_events = reference
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the reference takes the request");
-    let (expected, finished) = tokens(
+    let (expected, finished) = support::wait_for_tokens(
         &mut reference_events,
         GENERATED + CONTINUED,
     );
@@ -167,7 +136,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let mut running_events = running
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the running world takes the request");
-    let (first, _) = tokens(
+    let (first, _) = support::wait_for_tokens(
         &mut running_events,
         GENERATED,
     );
@@ -214,7 +183,7 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     let mut continuation = successor
         .submit(request(91, 8, 100, first.clone()))
         .expect("the successor takes the continuation");
-    let (continued, _) = tokens(
+    let (continued, _) = support::wait_for_tokens(
         &mut continuation,
         CONTINUED,
     );
