@@ -1272,8 +1272,13 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         if args.cuts {
             let rows = tokens_usize(&batch);
             let width = usize::try_from(plan.hidden).unwrap_or(0);
-            for name in Substage::NAMES {
-                let cut = Substage::parse(name).expect("a declared name parses");
+            for cut in [
+                Substage::Normalized,
+                Substage::Attended,
+                Substage::GateIn,
+                Substage::MlpOut,
+            ] {
+                let name = cut.name();
                 let out = measure(Some(cut))?;
                 stream.synchronize()?;
                 let values = download_bf16(&stream, out, rows, width)?;
