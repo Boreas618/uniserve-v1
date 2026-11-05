@@ -138,9 +138,12 @@ impl VsaTiles {
     /// The descriptor this layer's `vsa_prepare_tiles` launch takes.
     ///
     /// Each program needs its own accessor rather than one shared descriptor, because they are
-    /// different operators with different geometry: `vsa_prepare_tiles`, `vsa_zero_padding`,
-    /// `vsa_scores`, `vsa_select_tiles`, `vsa_compress_pooled` and `vsa_add_gated_tiles` are the six
-    /// this chain launches, and `vsa_compose_gated_rows` is declared and reached by no launch here.
+    /// different operators with different geometry: `vsa_prepare_tiles`, `vsa_scores`,
+    /// `vsa_select_tiles`, `vsa_compress_pooled` and `vsa_add_gated_tiles` are the five this chain
+    /// launches. Two neighbours are declared and not this layer's: `vsa_compose_gated_rows` is
+    /// reached by no launch at all, and `vsa_zero_padding` is launched by the fine attention
+    /// (`SegmentAttention::forward`, which zeroes the rows it just wrote), so its descriptor lives
+    /// there — with the **output's** element type, which is what the padding rows are.
     ///
     /// The prepare launch is the one whose descriptor reads **strides**, so a walk without a device
     /// can state it only for the layout the model's buffers have: `query_row_stride` and
@@ -168,17 +171,6 @@ impl VsaTiles {
             value_row_stride: value.strides.get(0),
             value_head_stride: value.strides.get(1),
             factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
-        }
-    }
-
-    /// The descriptor one `vsa_zero_padding` launch takes.
-    pub fn zero_padding_descriptor(&self, dtype: DType) -> segments::ZeroPaddingDescriptor {
-        segments::ZeroPaddingDescriptor {
-            dtype,
-            heads: self.heads,
-            tile_rows: self.tile_rows,
-            width: self.width,
-            block_rows: self.block_rows,
         }
     }
 
@@ -392,19 +384,6 @@ impl VsaTiles {
             pooled_value,
         };
         f.operate::<segments::VsaPrepareTiles>(&descriptor, args)
-    }
-
-    /// Zero the rows of every tile past its valid size, in place.
-    pub fn zero_padding(&self, f: &Forward, values: TensorView, sizes: TensorView) -> Result<()> {
-        let descriptor = segments::ZeroPaddingDescriptor {
-            dtype: values.dtype,
-            heads: self.heads,
-            tile_rows: self.tile_rows,
-            width: self.width,
-            block_rows: self.block_rows,
-        };
-        let args = segments::ZeroPaddingArgs { values, sizes };
-        f.operate::<segments::VsaZeroPadding>(&descriptor, args)
     }
 
     /// Fold the compressed branch's gated rows into each tile's rows, in place.

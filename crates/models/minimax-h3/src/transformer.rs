@@ -630,9 +630,13 @@ impl Transformer {
             programs.launch::<ops::segments::VsaPrepareTiles>(
                 &tiles_layer.contiguous_prepare_descriptor(dtype, pairs),
             );
-            programs.launch::<ops::segments::VsaZeroPadding>(
-                &tiles_layer.zero_padding_descriptor(dtype),
-            );
+            // `VsaZeroPadding` is launched by the fine attention (`SegmentAttention::forward`,
+            // `nn/src/layers/segment.rs:174`) to zero the rows past each tile's valid size in the
+            // rows it just wrote, so its descriptor is that layer's: the **output's** element type
+            // and the tile geometry the attention's own packing has, not the stack's type. The
+            // `VsaTiles` chain zeroes nothing - `prepare` writes the zeros it pools - so an
+            // accessor on it would state a row no launch reads, at a type no launch passes.
+            programs.launch::<ops::segments::VsaZeroPadding>(&fine.zero_descriptor());
             programs.launch::<ops::segments::VsaScores>(&tiles_layer.scores_descriptor());
             programs.launch::<ops::segments::VsaCompressPooled>(
                 &tiles_layer.compress_descriptor(dtype),
