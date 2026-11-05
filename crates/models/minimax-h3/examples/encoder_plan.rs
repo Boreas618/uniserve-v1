@@ -305,27 +305,26 @@ fn run() -> Result<(), String> {
                 blended,
             },
         );
-        // The block is `[blended.dim(0), blended.dim(1), tile_rows, tile_columns]`, so the latent-frame
-        // axis is part of it - the first version of this line left it out and priced the stitcher at
-        // half, which the driver's own measurement then disagreed with.
+        // The grid's tile columns, which is what the stitcher's ring is a block wide per column of.
         let columns = {
             let mut starts: Vec<u32> = clip.plan().tiles.iter().map(|t| t.columns.0).collect();
             starts.sort_unstable();
             starts.dedup();
             starts.len()
         };
-        let first = clip
-            .plan()
-            .tiles
-            .first()
-            .map(|tile| (u64::from(tile.rows.1), u64::from(tile.columns.1)));
-        let (tile_rows_u, tile_columns_u) = first.unwrap_or((0, 0));
-        let stitch_block = 2
-            * u64::from(config.latent_channels)
-            * u64::from(latent_frames)
-            * tile_rows_u
-            * tile_columns_u;
-        let stitch = (2 * u64::try_from(columns).unwrap_or(0) + 1) * stitch_block * 4;
+        // The raster plan is the model's statement of what a raster driver allocates - the encoder's
+        // set, then the stitcher's ring and hand-off - and the check below is that the driver takes
+        // exactly it. The tool prices nothing of its own here: a formula in this file was a second
+        // answer to a question `tiled_encode` already answers.
+        let raster_plan = minimax_h3::encoding::video_raster_arena(
+            &config,
+            &extents,
+            columns,
+            latent_frames,
+        )
+        .map_err(|error| error.to_string())?;
+        let raster_bytes = arena_reservation(&raster_plan);
+        let stitch = raster_bytes - set_bytes_run;
         match driven {
             Ok(()) => {
                 let beyond = run_arena.used() - set_bytes_run;
@@ -338,18 +337,14 @@ fn run() -> Result<(), String> {
                     "trace: the whole raster driver takes {beyond} B beyond the encoder's set (the set is {set_bytes_run} B)"
                 );
                 println!(
-                    "trace: the stitcher's ring and hand-off are {} block(s) of {stitch_block} elements = {stitch} B ({columns} tile column(s)), which the run plan does not state",
-                    2 * columns + 1
+                    "trace: the raster plan states {raster_bytes} B: the set plus {stitch} B of stitcher ({columns} tile column(s), {} ring and hand-off buffers)",
+                    raster_plan.len() - tile_plan.len()
                 );
-                if stitch != beyond {
+                if raster_bytes != set_bytes_run + beyond {
                     return Err(format!(
-                        "the stitcher's blocks price at {stitch} B but the driver took {beyond} B beyond the set: the pricing and the measurement disagree"
-                    ));
-                }
-                if check && beyond != 0 {
-                    return Err(format!(
-                        "the run plan is {beyond} B short of the raster driver, measured: the stitcher's ring and hand-off are {} block(s) of {stitch_block} elements, which `video_encoder_run_arena` does not state. A run sized from this plan stops at the first of them",
-                        2 * columns + 1
+                        "the raster plan states {raster_bytes} B and the driver takes {} B: the plan and the forward disagree by {} B",
+                        set_bytes_run + beyond,
+                        (set_bytes_run + beyond).abs_diff(raster_bytes)
                     ));
                 }
                 println!(
@@ -358,7 +353,11 @@ fn run() -> Result<(), String> {
                     first
                 );
             }
-            Err(error) => println!("trace: the raster driver does not fit - {error}"),
+            Err(error) => {
+                return Err(format!(
+                    "the raster driver does not run over its {raster_bytes}-byte plan: {error}"
+                ));
+            }
         }
 
         if check && set_plan - set_bytes > nn::forward::ALIGNMENT - 1 {
