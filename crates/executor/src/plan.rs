@@ -777,18 +777,56 @@ mod tests {
         // language-model batch size and must not move it.
         assert_eq!(plan.bounds(), (1, 512));
 
+        // A track-only decode is a variant of its own whose whole extent is the layout: a `t2va`
+        // clip carries a soundtrack, and the decode of the track has no raster to name. Two
+        // canvases of one duration collapse onto one track, which is why the bucket is built from
+        // the layout rather than from the clip the denoiser took it from.
+        let track = Bucket::audio(
+            1,
+            nn::capability::Layout {
+                audio: Some(nn::capability::LatentShape {
+                    channels: 8,
+                    frames: 3,
+                    height: 2,
+                    width: 4,
+                }),
+                ..layout
+            },
+        );
+        let tracks = Buckets::new([track]);
+        let decode = Computation {
+            call: ipc::MediaCall::AudioDecoding,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::None,
+        };
+        assert_eq!(decode.variant(), Some(Variant::AudioDecode));
+        assert_eq!(
+            tracks.select_media(&decode),
+            Some(track),
+            "a track's decode is served by the bucket that states its layout"
+        );
+
+        // The clip's decode is not served by the track's bucket, though both name a layout in some
+        // form: the variant is what keeps them apart, and that is the whole reason the track could
+        // reuse `Extent::Latents` instead of putting a second shape in the extent.
+        let clip_decode = Computation {
+            call: ipc::MediaCall::VideoDecoding,
+            ..decode
+        };
+        assert_eq!(tracks.select_media(&clip_decode), None);
+
         // A call no variant states is served nowhere, and the mechanism reads that as the
         // capability it is.
-        for call in [ipc::MediaCall::AudioDecoding, ipc::MediaCall::Muxing] {
-            let computation = Computation {
-                call,
-                rows: 1,
-                tokens: 0,
-                extent: Extent::None,
-            };
-            assert!(!computation.stated(), "{call:?} states no variant");
-            assert_eq!(plan.select_media(&computation), None);
-        }
+        let mux = Computation {
+            call: ipc::MediaCall::Muxing,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::None,
+        };
+        assert!(!mux.stated(), "a mux states no variant");
+        assert_eq!(plan.select_media(&mux), None);
+        assert_eq!(tracks.select_media(&mux), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media
