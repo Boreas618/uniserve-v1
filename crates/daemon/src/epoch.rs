@@ -1477,10 +1477,6 @@ pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
 /// the model's processor options) and the ones the daemon reads alone
 /// (logging, the update's own policy and the admin API's address). A change
 /// of them is a hot restart of the process that reads them (§7.5).
-///
-/// `readout_config` and `diffusion_generation_config` are the daemon's own
-/// today and belong to neither list; §7.7 retires them, and until then a
-/// change of them is the host layer's rather than silently ignored.
 pub fn host_layer_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
     crate::options::daemon_options_differ(current, target)
         || current.update_config != target.update_config
