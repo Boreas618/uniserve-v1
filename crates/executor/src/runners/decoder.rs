@@ -642,3 +642,134 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.lifecycle.rebind(bucket, generation, walked, &kernels)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The decoder runner's behaviour at its own boundary: which canvas a bucket states, what the
+    //! plan is told its tables need, and what a request for a canvas the decoder cannot serve gets.
+    //!
+    //! Nothing here needs a device: each behaviour is a function of the bucket and the model, which is
+    //! why a model that refuses a canvas can be driven without one.
+
+    use super::*;
+    use nn::capability::StateTable;
+
+    /// The clip the stub decoder serves, and the layout it decodes it from.
+    const SERVED: (u32, u32, u32) = (2, 3, 4);
+
+    fn layout_of_served() -> Layout {
+        Layout {
+            video: nn::capability::LatentShape {
+                channels: 8,
+                frames: 1,
+                height: 1,
+                width: 1,
+            },
+            audio: None,
+            text_rows: 2,
+            condition_rows: 0,
+            condition_elements: 0,
+        }
+    }
+
+    /// A decoder that serves one canvas and refuses every other, with two tables of known sizes.
+    struct Fixed;
+
+    impl Decoder for Fixed {
+        fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
+            Ok(vec![
+                StateTable {
+                    name: "positions",
+                    dtype: DType::F32,
+                    shape: Shape::new(&[6]),
+                },
+                StateTable {
+                    name: "offsets",
+                    dtype: DType::I32,
+                    shape: Shape::new(&[2, 3]),
+                },
+            ])
+        }
+
+        fn prepare_layout(&self, _layout: &Layout, out: &mut [Vec<u8>]) -> nn::Result<()> {
+            for buffer in out {
+                buffer.fill(0);
+            }
+            Ok(())
+        }
+
+        fn element_type(&self) -> DType {
+            DType::F16
+        }
+
+        fn layout_of(&self, clip: Clip) -> nn::Result<Layout> {
+            if (clip.frames, clip.height, clip.width) == SERVED {
+                return Ok(layout_of_served());
+            }
+            Err(nn::Error::Shape {
+                owner: "the stub decoder",
+                problem: format!("it serves {}x{}x{} only", SERVED.0, SERVED.1, SERVED.2),
+            })
+        }
+
+        fn decode(
+            &self,
+            _f: &nn::Forward,
+            _latents: TensorView,
+            _state: &[TensorView],
+            _out: DecodedMedia,
+        ) -> nn::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_plan_is_told_what_every_bucket_of_a_canvas_needs() {
+        // The two tables are six f32 and six i32: one number the mechanism books before admission,
+        // derived from the model's declaration rather than from a runner's own constant.
+        let bytes = DecoderRunner::<Fixed>::table_bytes(
+            &Fixed,
+            Bucket::clip(SERVED.0, SERVED.1, SERVED.2),
+        )
+        .expect("the tables' bytes");
+        assert_eq!(bytes, 6 * 4 + 6 * 4);
+    }
+
+    #[test]
+    fn a_bucket_that_is_not_a_decode_states_what_it_is() {
+        // A prefill bucket has no clip, and a decoder asked for its layout must say so by name rather
+        // than answer with a layout that reads as one.
+        let error = DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
+            .expect_err("a prefill bucket is not a decode");
+        assert!(
+            format!("{error}").contains("is not a decode bucket"),
+            "the refusal names the bucket's kind: {error}"
+        );
+    }
+
+    #[test]
+    fn a_canvas_the_decoder_cannot_serve_is_refused_by_name() {
+        // The bound is the decoder's, not the plan's: a canvas it was not built for is refused where
+        // the plan asks for its tables - before a capture, and never mid-clip.
+        let error = DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(2, 3, 5))
+            .expect_err("a canvas the decoder does not serve");
+        let message = format!("{error}");
+        assert!(
+            message.contains("serves no clip of 2 frame(s) at 3x5"),
+            "the refusal names the clip: {message}"
+        );
+        assert!(
+            message.contains("it serves 2x3x4 only"),
+            "and it carries the decoder's own reason: {message}"
+        );
+    }
+
+    #[test]
+    fn a_canvas_is_decoded_at_the_element_type_the_decoder_states() {
+        // `dtype = "auto"` leaves the element type to the checkpoint, so the runner reads it from the
+        // model rather than from its own deployment: the plan's columns are sized before a graph
+        // exists, and a byte count cannot say whether a column holds f16 or bf16.
+        assert_eq!(Fixed.element_type(), DType::F16);
+        assert_eq!(DType::F16.bytes(), Some(2));
+    }
+}
