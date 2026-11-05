@@ -20,11 +20,13 @@
 //!
 //! **It writes there.** The kernel takes the index as an address, `destination[indices[j]]`, and masks
 //! only the columns: an index of 16 127 against a 1 797-row destination stores into whatever the arena
-//! put next, because a device value cannot be checked on the host and this kernel states no bound. So
-//! the table's provenance is the caller's obligation — it must be computed for the same canvas as the
-//! destination it is launched against — and a guard belongs in the kernel (a device-side assert on
-//! `destination_row < rows`, which needs a device run to be verified) or in a refusal at the object
-//! that builds the table.
+//! put next, because a device value cannot be checked on the host and this kernel states no bound.
+//!
+//! The guard is therefore **the object that builds the table**: its provenance must be the same canvas
+//! as the destination it is launched against, and a caller that cannot say which canvas a table came
+//! from must not launch it. A kernel-side assert was considered and rejected: it would put one
+//! instruction per scatter on every launch to detect a table a refusal upstream already makes
+//! unrepresentable.
 //!
 //! The program is a kernel program: one thread per (row, element) of the source, the row taken from
 //! the second axis and the element block from the third, so a row's elements are never split across
