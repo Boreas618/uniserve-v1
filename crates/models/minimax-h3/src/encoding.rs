@@ -1940,6 +1940,11 @@ impl AudioEncoder {
         // the kernel reads rather than a key. Stating `channels × samples` here asked for a key no
         // launch can produce (a `[1, channels × samples]` view), and the widest one at the model's
         // longest clip was 2796748800 - a row that could never have been built.
+        // The projection's **two** residual adds run over the latent channels, not over the track:
+        // `shortcut` is `[frames, channels]` whatever the track's length is, so its last dimension is
+        // the channel count and the two adds of one projection share one row.
+        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, u64::from(channels))?);
+
         // **One row per stage, from the list the launch walks.** A track of `samples` reaches the
         // residual add at five extents, not one: the input at its own length and then once per stage
         // divided by that stage's rate. Stating the input length alone asked for a row the deployment
@@ -2946,17 +2951,28 @@ mod tests {
             .filter(|(name, _)| name == "scaled_add")
             .map(|(_, key)| key)
             .collect();
+        // The stage's extents, and the projection's channel-wide adds: two readers of the two
+        // quantities, so the set is stated as the set rather than by count.
+        let channels = u64::from(config.latent_channels);
         assert_eq!(
             residuals.len(),
-            extents.len(),
-            "one residual row per stage, not one per track: {residuals:?}"
+            extents.len() + 1,
+            "one residual row per stage plus the projection's: {residuals:?}"
         );
-        for (key, extent) in residuals.iter().zip(&extents) {
+        for extent in &extents {
             assert!(
-                key.contains(&format!("columns_{extent}_")),
-                "{key} is not the stage's extent {extent}"
+                residuals
+                    .iter()
+                    .any(|key| key.contains(&format!("columns_{extent}_"))),
+                "no residual row for the stage's extent {extent}: {residuals:?}"
             );
         }
+        assert!(
+            residuals
+                .iter()
+                .any(|key| key.contains(&format!("columns_{channels}_"))),
+            "no residual row for the projection's {channels} channels: {residuals:?}"
+        );
         // An unpadded track reaches no stage, so it states no program: the pad is the caller's, and a
         // row for the unpadded length would be a width no launch passes.
         assert!(
