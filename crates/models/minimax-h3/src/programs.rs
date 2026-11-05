@@ -87,11 +87,12 @@ pub struct Deployment {
     pub canvases: Vec<(u32, u32)>,
     /// The clip lengths the delivery serves, in video frames.
     ///
-    /// **The delivery states these; the packing only accepts them.** They are not every length the
-    /// packing admits: the audio rows key on a track's extent today, so a deployment that listed all
-    /// 58 admissible clips would ship 58 widths per stage for requests its stages never drive.
-    /// [`Deployment::admissible`] gives the packing's own set, and [`Deployment::new`] refuses a rung
-    /// outside it by name - so a delivery cannot state a clip the model would refuse.
+    /// **A supplied clip and a generated clip obey different rules, and this is the supplied one.**
+    /// A generated timeline is `17n + 5` frames ([`Deployment::generated`]); a clip a request hands
+    /// the model - a reference video, the track `ref2va` conditions on - is any length the encoder
+    /// divides ([`crate::encoding::Clip::latent_frames`]). The audio rows follow the second rule, so
+    /// a delivery that listed only the first would refuse the lengths its own stages drive.
+    /// [`Deployment::new`] refuses a rung the encoder refuses, by name.
     pub rungs: Vec<u32>,
 }
 
@@ -109,13 +110,11 @@ impl Deployment {
             .iter()
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
-        let admissible = Self::admissible();
+        let dies = dies.clone();
         for rung in &rungs {
-            if !admissible.contains(rung) {
+            if let Err(error) = dies.clip.latent_frames(*rung) {
                 return Err(Error::config(format!(
-                    "a {rung}-frame clip is not one the packing accepts: the rule admits {} frames \
-                     up to {MAX_FRAMES}",
-                    admissible.len()
+                    "a {rung}-frame clip is not one the encoder accepts: {error}"
                 )));
             }
         }
@@ -127,12 +126,14 @@ impl Deployment {
         })
     }
 
-    /// The clip lengths the packing accepts, computed from its own rule rather than listed.
+    /// The clip lengths a **generated** timeline may have, computed from the packing's rule rather
+    /// than listed: `17n + 5` up to [`MAX_FRAMES`].
     ///
-    /// The rule is `17n + 5` up to [`MAX_FRAMES`]; the first rung is the shortest clip one window
-    /// holds. A listed ladder is a second statement of the rule and drifts from it at the first
-    /// change - which is why the ladder this crate shipped for two days was wrong at both ends.
-    pub fn admissible() -> Vec<u32> {
+    /// A listed ladder is a second statement of the rule and drifts from it at the first change.
+    /// These are not the rungs a delivery serves - see [`Deployment::rungs`], which is the supplied
+    /// clip's rule - and confusing the two is how a ladder of stage lengths came to be read as a list
+    /// of clips no request can name.
+    pub fn generated() -> Vec<u32> {
         let mut rungs = Vec::new();
         let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
         while frames <= MAX_FRAMES {
