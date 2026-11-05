@@ -444,6 +444,29 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 "the denoiser runner loaded before its device's pools were attached",
             ));
         }
+        // **The plan is the floor of the device's share, checked here rather than discovered by a
+        // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
+        // device per stream); the model states what one evaluation reserves. A share below the plan
+        // is a refusal naming both numbers, and it is asked before anything is filled.
+        let offered = self.pool()?.reserved();
+        let plans = self.buckets.clone();
+        for plan in &plans {
+            let needed = match self.model.arena_bytes(&plan.warm.view()) {
+                Ok(bytes) => bytes,
+                // A model that states no plan is not a shortfall: the pool is then the only figure
+                // there is, and a capture that outgrows it refuses at its own launch by name. The
+                // refusal is not turned into a pass, which would be the same value as "it fits".
+                Err(_) => continue,
+            };
+            if needed > offered {
+                return Err(Error::Invalid(format!(
+                    "bucket {} needs {needed} B of arena for one evaluation and this device's share \
+                     is {offered} B: the model's plan is the floor, so a share below it serves \
+                     nothing - raise the device's graph share or drop a layout from the deployment",
+                    plan.bucket
+                )));
+            }
+        }
         for bucket in self.capture_order() {
             self.fill(bucket)?;
         }
