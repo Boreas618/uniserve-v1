@@ -50,6 +50,7 @@ fn run() -> Result<(), String> {
     let mut height = 768_u32;
     let mut width = 768_u32;
     let mut extents_path: Option<PathBuf> = None;
+    let mut arena_bytes: Option<u64> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -63,6 +64,13 @@ fn run() -> Result<(), String> {
             "--height" => height = count(&value()?, "--height")?,
             "--width" => width = count(&value()?, "--width")?,
             "--extents" => extents_path = Some(PathBuf::from(value()?)),
+            "--arena" => {
+                arena_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--arena takes bytes".to_owned())?,
+                )
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -158,7 +166,7 @@ fn run() -> Result<(), String> {
         let mut loader = WeightLoader::stated(DType::F32, Some(&table));
         let encoder = minimax_h3::encoding::VideoEncoder::load(&config, &mut loader)
             .map_err(|error| error.to_string())?;
-        let arena = Arena::new(ops::DevicePtr::new(0), 1_u64 << 42);
+        let arena = Arena::new(ops::DevicePtr::new(0), arena_bytes.unwrap_or(1_u64 << 42));
         let forward = Forward::recording(&arena);
 
         let before = arena.used();
