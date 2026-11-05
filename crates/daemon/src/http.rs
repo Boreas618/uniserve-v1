@@ -40,7 +40,6 @@ use tracing::{info, warn};
 
 use crate::http::listener::Listener;
 use crate::http::middleware::ConcurrencyLimit;
-use crate::input::readout::SystemOneError;
 use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, images, videos};
@@ -476,7 +475,6 @@ pub(crate) fn router(
     };
 
     let mut generation = Router::new();
-    let mut readout = None;
     let mut api = openai::models_router(Arc::clone(&engine));
     for task in engine.supported_tasks() {
         match task {
@@ -501,27 +499,13 @@ pub(crate) fn router(
                     Arc::clone(&handoff),
                 ));
             }
-            Task::Readout => {
-                readout = Some(
-                    Router::new()
-                        .route("/v1/systemone", post(systemone))
-                        .with_state(Arc::clone(&engine)),
-                );
-            }
         }
     }
     let generation = limited(timeout(generation), |message| {
         ApiError::service_unavailable("server_overloaded", message).into_response()
     });
-    // The readout answers a shed request in its own FastAPI error shape.
-    let readout = readout.map(|readout| {
-        limited(timeout(readout), |message| {
-            SystemOneError::Overloaded(message).into_response()
-        })
-    });
     let api = timeout(api)
         .merge(generation)
-        .merge(readout.unwrap_or_default())
         .layer(from_fn(middleware::track_http_metrics));
 
     // A world change runs for as long as the successor world takes to
@@ -586,17 +570,6 @@ async fn scrape_metrics() -> Response {
 /// fixed at compile time.
 async fn version() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
-}
-
-/// Answers one System One request (`POST /v1/systemone`).
-///
-/// The body is read as bytes so that malformed JSON is reported in the
-/// endpoint's own `422` shape.
-async fn systemone(State(engine): State<Arc<Leader>>, body: Bytes) -> Response {
-    match engine.systemone(&body).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => error.into_response(),
-    }
 }
 
 /// Answers a path no route serves as FastAPI does.

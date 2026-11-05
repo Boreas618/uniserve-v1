@@ -72,26 +72,11 @@ pub(crate) fn router_with(engine: Leader, server: &ServerOptions) -> Router {
 /// The tokenizer is [`configured_tokenizer`], whose
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
-/// API's longest duration capacity, as a default video deployment does, and a
-/// DiffusionGemma model runs under its own generation limits, as
-/// `Leader::start` starts it.
+/// API's longest duration capacity, as a default video deployment does.
 pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
-    sim_readout_engine(parameters, None)
-}
-
-/// Builds an engine like [`sim_engine`] that serves the System One readout
-/// with `readout`.
-pub(crate) fn sim_readout_engine(
-    parameters: ModelParameters,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
-) -> Leader {
     let model = sim_model(parameters);
-    let mut config = EngineConfig::sim(SERVED_MODEL);
-    if let ModelParameters::DiffusionGemma(_) = model.parameters {
-        config.generation_limits = model.generation_limits(ModelDtype::BFloat16);
-    }
-    let core = sim_core(config, SimEngine::new());
-    engine_over(model, configured_tokenizer(), vec![core], readout)
+    let core = sim_core(EngineConfig::sim(SERVED_MODEL), SimEngine::new());
+    engine_over(model, configured_tokenizer(), vec![core])
 }
 
 /// Starts a scheduler under `config` that drives `worker` in process, with the
@@ -135,7 +120,7 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
 /// Builds an engine for a model with `parameters` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
 pub(crate) fn sim_engine_over(parameters: ModelParameters, cores: Vec<SchedulerHandle>) -> Leader {
-    engine_over(sim_model(parameters), configured_tokenizer(), cores, None)
+    engine_over(sim_model(parameters), configured_tokenizer(), cores)
 }
 
 /// A client of `cores`, which serve the request interface on a thread of
@@ -213,11 +198,10 @@ pub(crate) fn engine_over(
     model: ModelConfig,
     tokenizer: DynTokenizer,
     cores: Vec<SchedulerHandle>,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
 ) -> Leader {
     let model_name = cores[0].model_name().to_owned();
     let client = std::sync::Arc::new(sim_client(cores));
-    leader_over(model, tokenizer, model_name, vec![client], readout)
+    leader_over(model, tokenizer, model_name, vec![client])
 }
 
 /// Binds the public leader to independent engine connections.
@@ -226,7 +210,6 @@ pub(crate) fn leader_over(
     tokenizer: DynTokenizer,
     model_name: String,
     clients: Vec<std::sync::Arc<EngineClient>>,
-    readout: Option<crate::input::readout::ReadoutEncoder>,
 ) -> Leader {
     let renderer = match &model.parameters {
         ModelParameters::MiniMaxH3 => RequestRenderer::Video(sim_video_service(MAX_VIDEO_SECONDS)),
@@ -261,7 +244,6 @@ pub(crate) fn leader_over(
         clients,
         processor,
         images,
-        readout,
         &options,
         test_updates(),
     )

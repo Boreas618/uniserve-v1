@@ -45,7 +45,7 @@ fn special_tokens() -> SpecialTokenIds {
 /// fails with it.
 #[test]
 fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
-    let mut executor = SimExecutor::new(SimEngine::new());
+    let executor = SimExecutor::new(SimEngine::new());
     let reports = executor.loss();
     let scheduler = support::scheduler(Box::new(executor), special_tokens(), 32)
         .expect("the scheduler is built over the simulated executor");
