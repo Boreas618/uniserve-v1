@@ -557,7 +557,10 @@ impl EpochPlan {
              are checked against it",
         )?;
         let capacities = prompt_capacities(&self.build.video, longest)?;
-        let candidates = media_candidates(&self.build.video, &capacities)?;
+        // The checkpoint's own statement of what it serves, read once: the candidates are per task,
+        // and a task the checkpoint does not serve gets no graph.
+        let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+        let candidates = media_candidates(&config, &self.build.video, &capacities)?;
 
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
@@ -574,7 +577,6 @@ impl EpochPlan {
                 ));
             }
         }
-        let config = minimax_h3::Config::read(&self.checkpoint, None)?;
         // **A decode bucket is one decode unit, not the timeline.** The video decoder decodes a clip
         // of the checkpoint's own window - `decode_latents` latent frames, `frames_out` native ones -
         // and a timeline longer than one is spliced from its units. A bucket naming the deployment's
@@ -1568,6 +1570,21 @@ fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Resul
         .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
 }
 
+/// The condition counts a task's warm graph is captured with.
+///
+/// A warm request states the **most** a request of its task carries, because the graph is captured
+/// once and a request may carry fewer: `fl2va` anchors a first and a last frame, and `t2va` carries
+/// no condition media at all. `ref2va`'s count is the deployment's `references` limit - a reference
+/// video's length is a request's, so the number is not the task's - and it is `None` rather than a
+/// guess.
+fn task_conditions(task: nn::VideoTask) -> Option<(u32, u32, u32)> {
+    Some(match task {
+        nn::VideoTask::TextToVideoAudio => (0, 0, 0),
+        nn::VideoTask::FirstLastToVideoAudio => (1, 1, 0),
+        nn::VideoTask::ReferenceToVideoAudio => return None,
+    })
+}
+
 /// The least legal timeline of at least `frames` frames (`17 * n + 5`).
 ///
 /// A timeline is one 17-frame body per clip plus a 5-frame tail (`VideoPostprocessor::splices_of`),
@@ -1597,16 +1614,17 @@ fn snap_frames(frames: u32) -> Result<u32> {
 /// `warm::distinct` keeps one candidate per layout, because two candidates that the model's padding
 /// collapses would capture the same graph twice.
 ///
-/// **`t2va` only, for now.** It is the one task whose requests carry no condition media, so it is
-/// the one whose candidate a caller can state without the model's condition arithmetic. `fl2va` and
-/// `ref2va` are refused by name here rather than bound to a graph that could not run: `ref2va`
-/// additionally needs the encoder's `Source` product, which the model does not publish
-/// (`EncoderOutputs` holds one region).
+/// **The tasks are the checkpoint's.** The candidates are one per (task, canvas, prompt capacity)
+/// for every task `Config::tasks` states, with the condition counts of that task: a deployment of a
+/// text-to-video-and-audio export captures the one graph its requests fill, and an export that
+/// serves first/last-frame requests captures those too. A task whose warm graph needs a count this
+/// function cannot state is refused by name rather than captured with a guess.
 ///
 /// The canvas set is the intersection of what the deployment prepares and what the checkpoint
 /// serves, and the frames are the deployment's longest clip at the model's frame rate - the model
 /// snaps them to a legal count itself, which is why the request states the plain figure.
 fn media_candidates(
+    config: &minimax_h3::Config,
     video: &daemon::options::VideoOptions,
     capacities: &[u32],
 ) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
@@ -1653,20 +1671,35 @@ fn media_candidates(
                             .join(", ")
                     )
                 })?;
-            for capacity in capacities {
-                candidates.push(executor::runners::denoiser::WarmRequest {
-                    task: nn::capability::VideoTask::TextToVideoAudio,
-                    width: canvas.width,
-                    height: canvas.height,
-                    frames,
-                    fps: FPS,
-                    first_frames: 0,
-                    last_frames: 0,
-                    references: 0,
-                    text_tokens: *capacity,
-                    conditions: Vec::new(),
-                    vision_spans: Vec::new(),
-                });
+            // **The tasks are the checkpoint's, not this function's.** A deployment captures a
+            // graph per (task, canvas, prompt capacity): the checkpoint states which tasks it
+            // serves (`Config::tasks`), the daemon refuses a request of any other task against that
+            // statement, and a candidate stated here for a task the checkpoint does not serve would
+            // be a graph nothing fills.
+            for task in config.tasks() {
+                let (first_frames, last_frames, references) =
+                    task_conditions(task).with_context(|| {
+                        format!(
+                            "this checkpoint serves {task:?} and a warm graph of that task states \
+                             its reference count, which is the deployment's `references` limit \
+                             rather than a number of the task's"
+                        )
+                    })?;
+                for capacity in capacities {
+                    candidates.push(executor::runners::denoiser::WarmRequest {
+                        task,
+                        width: canvas.width,
+                        height: canvas.height,
+                        frames,
+                        fps: FPS,
+                        first_frames,
+                        last_frames,
+                        references,
+                        text_tokens: *capacity,
+                        conditions: Vec::new(),
+                        vision_spans: Vec::new(),
+                    });
+                }
             }
         }
     }
