@@ -88,7 +88,34 @@ const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
 /// checkpoint's vocabulary, which is the only direction that needs no tokenizer here.
 const DEFAULT_TOKENS: u64 = 1;
 
+/// The stage the run is in, so a panic that aborts names where it happened.
+///
+/// A release build panics through `abort`, and a panic raised without a caller location prints the
+/// panic machinery's own source and nothing of this program's: the NVFP4 run's log held `internal
+/// error: entered unreachable code` and no way to say which stage had reached it. Every stage the
+/// run enters is recorded here, and the hook prints it before the default hook prints the rest, so
+/// one run names the stage even when a backtrace is lost to a log's width.
+static STAGE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start-up");
+
+/// Name the stage the run is entering.
+fn stage(name: &'static str) {
+    if let Ok(mut held) = STAGE.lock() {
+        *held = name;
+    }
+}
+
+/// Print the stage a panic happened in, then let the default hook print the panic itself.
+fn name_panicking_stage() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let held = STAGE.lock().map(|held| *held).unwrap_or("start-up");
+        eprintln!("stage: {held}");
+        previous(info);
+    }));
+}
+
 fn main() -> ExitCode {
+    name_panicking_stage();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Message(message)) => {
@@ -642,6 +669,7 @@ impl RetainedWeights for HostWeights {
 }
 
 fn stage_weights(args: &Args) -> Result<()> {
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let mut store = HostWeights::default();
@@ -703,17 +731,20 @@ fn stage_weights(args: &Args) -> Result<()> {
 // Stage 1: the vocabulary table's rows, launched on the device.
 
 fn stage_embedding(args: &Args) -> Result<()> {
+    stage("the store's programs");
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `embedding` needs a program store: pass --store <path> or set UNISERVE_STORE",
         )
     })?;
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
 
     // 1. The device and the stream every launch is issued on, before any weight is allocated: a
     //    driver that cannot give a device should fail here and not inside a load.
     let device =
         platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    stage("the device");
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
@@ -728,6 +759,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
         args.kv_pages,
         Encoded::default(),
     )?;
+    stage("the program generation");
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary, as the checkpoint declares
@@ -749,6 +781,7 @@ fn stage_embedding(args: &Args) -> Result<()> {
         usize::try_from(bytes).unwrap_or(usize::MAX),
     )?;
     let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    stage("the forward's modules");
     let forward = Forward::new(&stream, &generation, &arena);
 
     // 5. One launch: the ids of the tokens whose rows the checkpoint itself can vouch for.
@@ -891,6 +924,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // A run measures a pair - the checkpoint's representation and the deployment's cache precision -
     // and a number that does not say which pair it measured cannot enter a table. The pair is the
     // run's first line, read from the checkpoint and stated by the deployment, never overridden.
+    stage("the checkpoint's declaration");
     let declared = Representation::read(&args.checkpoint)?;
     // A calibrated checkpoint keeps some tensors in the source dtype and packs the rest, so naming
     // the representation is not the same as measuring it: the counts below come from the checkpoint's
@@ -916,6 +950,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         args.checkpoint.display(),
         args.kv_pages,
     );
+    stage("the store's programs");
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
@@ -938,10 +973,12 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         check_reference_prompt(dir, &tokens)?;
     }
 
+    stage("the checkpoint's index");
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let device =
         platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    stage("the device");
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
@@ -956,9 +993,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             generated: args.generate.map(|_| 1),
         },
     )?;
+    stage("the program generation");
     let generation = load_generation(&device, &store_root, &needed)?;
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
+    stage("the checkpoint's weights");
     let (model, loaded) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
     // What the model holds, by representation, beside what the index declares: a loader that fell
     // back to a full-precision path for a packed tensor still prints the declaration and still reads
@@ -970,6 +1009,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         weights.packed_bytes,
         weights.dense,
     )?;
+    stage("the representation it compares");
     if loaded != declared {
         return Err(Failure::message(format!(
             "the checkpoint declared {} before the load and {} during it: a declaration that \
@@ -980,6 +1020,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
 
     // The arena, from the plan and the config's own cache geometry.
+    stage("the plan");
     let plan = model.plan(count)?;
     let page_size = 64_u64;
     let pages = count.div_ceil(page_size).max(1);
@@ -995,8 +1036,10 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, reserve)?;
+    stage("the arena");
     let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
     let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    stage("the forward's modules");
     let forward = Forward::new(&stream, &generation, &arena);
 
     // The batch of one sequence: every prompt token is one query row, the last asks for logits.
@@ -1087,6 +1130,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The forward: start from the embedding, then either stop at one layer or walk the stack and
     // project the last row. `--from` replaces the embedding with a reference stage, so what the
     // layer below computes is measured against the reference's own state and not a prefix's.
+    stage("the first stage's input");
     let hidden = match args.from {
         Some(from) => {
             let dir = args.reference.as_deref().ok_or_else(|| {
@@ -1476,6 +1520,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     for (token, logprob) in &best {
         println!("  {token}\t{logprob:.6}");
     }
+    stage("the generation");
     if args.generate.is_some() {
         generate(
             args,
@@ -3005,6 +3050,7 @@ fn prompt_ids(text: &str) -> Result<Vec<i32>> {
 /// because it filters the list and cannot see past it. That is `examples/keys_check.rs`'s question,
 /// which walks the model's own enumeration (`qwen3_moe::keys::keys`) against the same file.
 fn preflight(args: &Args) -> Result<()> {
+    stage("the checkpoint's declaration");
     let declared = Representation::read(&args.checkpoint)?;
     let count = u64::try_from(prompt_ids(&args.tokens)?.len()).unwrap_or(0);
     let encoded = Encoded {
