@@ -534,7 +534,9 @@ pub struct Exclusion {
     pub reason: &'static str,
 }
 
-/// The checkpoint tensors a component's load does not ask for, each with the reason it need not.
+/// The checkpoint tensors a **checkpoint directory's** load does not ask for, each with the reason it
+/// need not: the table is keyed by the directory a name is relative to, since one component may hold two
+/// (`latent_encoder` holds `vae` and `audio_vae`).
 ///
 /// **A load is not required to read every tensor a file holds** — a training head's weights sit in
 /// the checkpoint and no inference path evaluates them, so asking for them would be a requirement
@@ -546,8 +548,8 @@ pub fn excluded_names(component: &str) -> &'static [Exclusion] {
     match component {
         // The audio VAE's spectral loss head: `logs_proj` scores training audio through a mel
         // transform, and the decoder's forward reads the latent to samples and nothing else. The
-        // two tensors are 1 088 bytes of the component's 1 087 tensors, and `--names` measured the
-        // rest as asked for.
+        // two are a `[32, 32, 1]` weight and its `[32]` bias - 4 224 bytes at F32 out of the
+        // component's 1 087 tensors - and `--names` measured the rest as asked for.
         "audio_vae" => &[
             Exclusion {
                 name: "logs_proj.weight",

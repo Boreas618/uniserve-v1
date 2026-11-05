@@ -452,21 +452,33 @@ impl ClipDecoder {
             * u64::from(config.temporal_compression())
             * u64::from(spatial)
             * u64::from(spatial);
-        // The grid spreads its slack over the seams, so the overlaps are not all equal: a seam is at
-        // least `MINIMUM_OVERLAP` **output pixels** wide - the raster the blend writes is in pixels, so
-        // that is the extent `cross_fade` is given - and it grows by an alignment step as the slack is
-        // spread, always inside its tile. One compiled blend serves every seam of one width, so the
-        // table is built for every width a grid of the checkpoint's tile size can produce, on both
-        // axes. Building it once, at load, is what lets one decoder block serve every canvas: the grid
-        // itself is arithmetic and is recomputed per request.
-        let alignment = spatial;
-        let mut blends = Vec::new();
-        let mut extent = crate::video_vae::MINIMUM_OVERLAP;
-        while extent < crate::video_vae::TILE_PIXELS {
-            for axis in [2, 3] {
-                blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
+        // **The table is the deployment's own seam set, derived from the canvases it serves.** The grid
+        // spreads its slack over the seams, so a seam's width (in output pixels, which is what the
+        // blend writes and what `cross_fade` is given) is whatever that canvas's grid arithmetic
+        // gives: over the offered canvases the launched widths are 64 to 128, while a ladder of
+        // alignment steps to the tile size states 24 widths of which 8 ever launch. A ladder beside
+        // the grids is a second answer to the same question, so this walks the grids instead: a width
+        // exists here exactly when a served canvas launches it, and a canvas added to the model adds
+        // its seams without anyone editing a list.
+        //
+        // One compiled blend serves every seam of one width, so building this once at load is what
+        // lets one decoder block serve every canvas: the grid itself is recomputed per request.
+        let mut blends: Vec<(u32, u32, CrossFade)> = Vec::new();
+        for offered in crate::config::offered_canvases() {
+            let canvas = Canvas::clip(config, offered.height / spatial, offered.width / spatial);
+            let tiles = crate::video_vae::Tiles::of(config, &canvas)?.tiles(config, &canvas);
+            for tile in &tiles {
+                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
+                    if extent == 0
+                        || blends
+                            .iter()
+                            .any(|(width, side, _)| *width == extent && *side == axis)
+                    {
+                        continue;
+                    }
+                    blends.push((extent, axis, CrossFade::new(dtype, extent, axis)?));
+                }
             }
-            extent += alignment;
         }
         Ok(Self {
             unpatchify,
@@ -1354,5 +1366,54 @@ mod tests {
         // With the contiguous block the same tile is written: the refusal was the buffer, nothing else.
         clip.write_tile(&f, &tiles[1], tokens, decoded, blended, seam)
             .expect("a contiguous seam writes the tile");
+    }
+    /// The blend table and the deployment's seams are one set, in both directions.
+    ///
+    /// The table is derived from the offered canvases' own grids, so a width exists in it exactly
+    /// when a served canvas produces that width on that axis. Each direction fails differently: a
+    /// seam with no module stops a clip decode at that seam rather than at a load, and a module no
+    /// seam reads is a store cell no launch asks for - which is what the ladder of alignment steps
+    /// this replaced produced, 24 widths stated against 8 launched.
+    #[test]
+    fn the_blend_table_and_the_offered_canvases_seams_are_one_set() {
+        let config = crate::video_vae::tests::video_config();
+        let decoder = ClipDecoder::new(&config, DType::F32).expect("a clip decoder");
+        let ratio = config.spatial_compression();
+        let mut realized = Vec::new();
+        for offered in crate::config::offered_canvases() {
+            let canvas = Canvas::clip(&config, offered.height / ratio, offered.width / ratio);
+            let tiles = Tiles::of(&config, &canvas)
+                .expect("the grid")
+                .tiles(&config, &canvas);
+            for tile in tiles {
+                for (extent, axis) in [(tile.above, 2), (tile.left, 3)] {
+                    if extent > 0 && !realized.contains(&(extent, axis)) {
+                        realized.push((extent, axis));
+                    }
+                }
+            }
+        }
+        assert!(
+            !realized.is_empty(),
+            "the deployment's canvases are multi-row and multi-column, so they produce seams"
+        );
+        for (extent, axis) in &realized {
+            assert!(
+                decoder
+                    .blends()
+                    .iter()
+                    .any(|(width, side, _)| width == extent && side == axis),
+                "the deployment launches a {extent}-pixel seam along axis {axis} and the table is \
+                 {} widths on two axes: a missing module stops the clip decode here",
+                decoder.blends().len()
+            );
+        }
+        for (width, side, _) in decoder.blends() {
+            assert!(
+                realized.contains(&(*width, *side)),
+                "the table carries a {width}-pixel seam along axis {side} that no offered canvas \
+                 produces: a store cell no launch reads"
+            );
+        }
     }
 }
