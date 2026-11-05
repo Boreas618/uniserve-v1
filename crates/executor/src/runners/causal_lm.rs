@@ -3778,8 +3778,27 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 } else {
                     String::new()
                 };
+                // The node's own identity, so the capture's line and a serving line can be compared
+                // word for word: a replay that launches a *different* function, or the same function
+                // with different arguments buried where the pointer table does not reach, is visible
+                // as two digests that disagree - and nothing else in the dump compares them.
+                let launched = match params.as_ref() {
+                    Some(params) => {
+                        let name = params
+                            .function
+                            .name()
+                            .unwrap_or_else(|error| format!("unnamed({error})"));
+                        let blob = params
+                            .parameters
+                            .first()
+                            .map(|blob| platform::fnv1a(blob))
+                            .unwrap_or(0);
+                        format!(" fn={name} blob={blob:016x}")
+                    }
+                    None => " fn=unreadable".to_owned(),
+                };
                 out.push_str(&format!(
-                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}{read}"
+                    " attn{layer}={named}{written}{split}@{grid}{counted}{mapped}{read}{launched}"
                 ));
                 if layer0_out != 0 && address == layer0_out && layer > 0 {
                     out.push_str("(shared)");
