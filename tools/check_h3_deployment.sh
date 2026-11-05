@@ -69,8 +69,17 @@ echo "== the sparse list against its generator"
 # produce one row set today - the rows agree and the launches do not. A check that spelled the
 # deployment differently from the tool that cut the file would compare two deployments and call
 # the equality of their rows a match.
+# The three CLIs that take `--sparse` do not spell it alike, and each spelling names
+# a deployment: the generator and the recorder take `tile,sparsity[,keep]` where the
+# third field is a reference keep rate, and the walk takes `tile,sparsity,tiles[,keep]`
+# where the third is a tile count (`programs` is that tool, not the walk). Every invocation
+# below is spelled as its own tool reads it, and the spellings are printed so a reader
+# can reproduce each answer.
+sparse_producer=64,0.9
+sparse_programs=64,0.9,8192
 if [ -f "$sparse_fixture" ]; then
-    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=64,0.9 \
+    echo "   spellings: generator and recorder $sparse_producer, programs $sparse_programs"
+    python3 "$gaps" --generator "$root" --generator-flag=--sparse --generator-flag=$sparse_producer \
         --fixture "$sparse_fixture" || sparse_not_generated=1
 else
     echo "   skipped: $sparse_fixture is absent"
@@ -121,6 +130,10 @@ clips = re.search(r"clip lengths: \[(.*?)\]", header) or re.search(r"clip ladder
 print(" ".join(f"{c}:{k}" for k in clips.group(1).split(", ") for c in canvases))
 PYHDR
 )
+# A count is a function of its arguments, so the arguments are printed with the
+# count: the points are the file's own axes, and a reader who wants `106 of 152`
+# reproduced needs the set it was taken over rather than the number alone.
+echo "   axes: $(echo "$points" | wc -w) points over $(echo "$points" | tr ' ' '\n' | cut -d: -f1 | sort -u | tr '\n' ' ')"
 unbuildable=""
 for point in $points; do
     p_canvas=${point%%:*}
@@ -213,7 +226,7 @@ else
     }
 
     record_deployment "$fixture" "$scratch/recorded.dense" || true
-    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse 64,0.9 || true
+    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse "$sparse_producer" || true
 fi
 
 echo "== four walks: one per task, and a sparse one"
@@ -229,7 +242,7 @@ run() {
 run t2va --task t2va --conditioned false
 run fl2va --task fl2va --conditioned true
 run ref2va --task ref2va --conditioned true
-run sparse --task fl2va --conditioned true --sparse 64,0.9,8192
+run sparse --task fl2va --conditioned true --sparse "$sparse_programs"
 
 echo
 echo "== every operator the list holds, launched by some walk"
