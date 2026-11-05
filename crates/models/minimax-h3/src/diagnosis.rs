@@ -28,11 +28,17 @@ use std::path::Path;
 /// the preamble is a multiple of 64 bytes. A reader rejects a file whose padding is short, so this is
 /// not a cosmetic detail.
 pub fn write_npy(path: &Path, shape: &[u64], payload: &[u8]) -> Result<(), String> {
+    let bytes = npy_bytes(shape, payload)?;
+    std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The file [`write_npy`] writes, as bytes: the container without a path, so its arithmetic can be
+/// read and asserted on a host that has no device and no tree.
+pub fn npy_bytes(shape: &[u64], payload: &[u8]) -> Result<Vec<u8>, String> {
     let elements: u64 = shape.iter().product();
     if payload.len() as u64 != elements * 4 {
         return Err(format!(
-            "{}: {} bytes for {} elements of f32",
-            path.display(),
+            "{} bytes for {} elements of f32",
             payload.len(),
             elements
         ));
@@ -54,7 +60,7 @@ pub fn write_npy(path: &Path, shape: &[u64], payload: &[u8]) -> Result<(), Strin
     bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(payload);
-    std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+    Ok(bytes)
 }
 
 /// The `f32` bytes of a slice, which is the payload [`write_npy`] takes.
@@ -172,5 +178,77 @@ mod tests {
             .flat_map(|value| value.to_le_bytes())
             .collect();
         assert_eq!(f32_bytes_of(DType::F32, &payload).unwrap(), payload);
+    }
+
+    /// The header is numpy's: magic, version, a little-endian length, and a JSON body.
+    ///
+    /// The preamble - magic, version, length word and body - is a multiple of 64 bytes and ends with a newline. A reader rejects a file whose padding is short, so this is the file's contract and not cosmetic.
+    #[test]
+    fn the_header_is_padded_to_sixty_four_bytes_and_closed_by_a_newline() {
+        for shape in [vec![2, 3], vec![321, 5376], vec![3, 1, 256, 256], vec![7]] {
+            let elements: u64 = shape.iter().product();
+            let payload = vec![0_u8; (elements * 4) as usize];
+            let bytes = npy_bytes(&shape, &payload).expect("a payload that fits");
+            assert_eq!(&bytes[..6], b"\x93NUMPY", "the format's magic");
+            assert_eq!((bytes[6], bytes[7]), (1, 0), "version 1.0");
+            let length = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+            assert_eq!(
+                (10 + length) % 64,
+                0,
+                "the preamble of {shape:?} is {length} + 10 bytes, not a multiple of 64"
+            );
+            assert_eq!(bytes[9 + length], b'\n', "the header ends with a newline");
+            assert_eq!(
+                bytes.len(),
+                10 + length + payload.len(),
+                "the payload follows the header unchanged"
+            );
+            assert_eq!(
+                bytes.last().copied(),
+                Some(0),
+                "the payload's own last byte"
+            );
+        }
+    }
+
+    /// The descriptor says little-endian `f32` in C order, which is what the comparator widens from.
+    #[test]
+    fn the_descriptor_names_a_little_endian_f32_in_c_order() {
+        let bytes = npy_bytes(&[2, 3], &[0_u8; 24]).expect("a payload that fits");
+        let length = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let header = std::str::from_utf8(&bytes[10..10 + length]).expect("the header is UTF-8");
+        assert!(header.starts_with("{'descr': '<f4'"), "it says: {header}");
+        assert!(
+            header.contains("'fortran_order': False"),
+            "it says: {header}"
+        );
+        assert!(header.contains("'shape': (2, 3,)"), "it says: {header}");
+        assert!(header.trim_end().ends_with('}'), "the dictionary is closed");
+    }
+
+    /// A payload that does not fit its shape is refused with both numbers rather than written: a file
+    /// whose length disagrees with its header is one numpy reads and a comparison silently truncates.
+    #[test]
+    fn a_payload_that_does_not_fit_its_shape_is_refused() {
+        let error = npy_bytes(&[2, 3], &[0_u8; 20]).expect_err("20 bytes for 6 elements");
+        assert!(error.contains("20 bytes"), "it says: {error}");
+        assert!(error.contains("6 elements"), "it says: {error}");
+    }
+
+    /// `f32_bytes` is the payload the writer takes: the values' little-endian bytes in order, so the
+    /// `.npy` and any other container written from the same slice hold one computation.
+    #[test]
+    fn f32_bytes_is_each_value_in_little_endian_order() {
+        let values = [1.0_f32, -0.0, 3.5];
+        let bytes = f32_bytes(&values);
+        assert_eq!(bytes.len(), values.len() * 4);
+        for (index, value) in values.iter().enumerate() {
+            let start = index * 4;
+            assert_eq!(
+                bytes[start..start + 4],
+                value.to_le_bytes(),
+                "value {index} is little-endian"
+            );
+        }
     }
 }
