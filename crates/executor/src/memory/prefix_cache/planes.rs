@@ -291,6 +291,11 @@ struct Segmenting {
     /// still writes it.
     segments: Vec<(ipc::CacheSegment, AtomicBool)>,
     released_from: AtomicU32,
+    /// The pool's columns, which the parts table is laid out by. Kept here
+    /// rather than derived from the table's length: a table that does not hold
+    /// one part per (column, segment) would index another column's part and
+    /// state the wrong number of mapped bytes.
+    columns: u32,
     /// Each value plane's parts, column-major: the part of segment `k` that
     /// column `c` holds is `c * segments.len() + k`.
     parts: Vec<SegmentPart>,
@@ -313,7 +318,12 @@ impl Segmenting {
     /// The parts of segments `range`, every column's.
     fn parts_of(&self, range: std::ops::Range<u32>) -> Vec<usize> {
         let count = self.count();
-        (0..self.parts.len() as u32 / count.max(1))
+        debug_assert_eq!(
+            self.parts.len(),
+            (self.columns * count) as usize,
+            "the segmenting table does not hold one part per column and segment"
+        );
+        (0..self.columns)
             .flat_map(|column| {
                 range
                     .clone()
@@ -574,6 +584,7 @@ impl CachePlanes {
                                 .map(|laid| (laid.segment, AtomicBool::new(laid.inherited)))
                                 .collect(),
                             released_from: AtomicU32::new(released_from),
+                            columns: plan.columns,
                             parts,
                         });
                         [key.storage, value.storage]
@@ -1349,10 +1360,14 @@ impl CachePlanes {
         }
         let column = (layer as u32) % columns;
         let unit = (layer as u32) / columns;
-        if unit >= plan.units_per_page {
+        // The page's unit count is the one the group's layers make over the
+        // pool's columns, which a plan may leave unstated in its own field;
+        // reading that field instead reported every layer of a plan that states
+        // its layers and not their page as lying in a page holding no unit.
+        let units = self.units_per_page(group)?;
+        if unit >= units {
             return Err(Error::Invariant(format!(
-                "layer {layer} of cache group {group} lies in unit {unit} of a page holding {}",
-                plan.units_per_page
+                "layer {layer} of cache group {group} lies in unit {unit} of a page holding {units}"
             )));
         }
         Ok((column, unit))
@@ -1842,7 +1857,10 @@ mod layer_view_tests {
             ordinal,
             units: 4,
         };
-        let parts = (0..4)
+        // One part per column of this pool and segment of the two: the table is
+        // laid out by the plan's columns, and a table of another shape addresses
+        // another column's part.
+        let parts = (0..pool.columns())
             .flat_map(|column| {
                 (0..2).map(move |ordinal| crate::memory::retained::SegmentPart {
                     length: 128,
@@ -1859,6 +1877,7 @@ mod layer_view_tests {
                 (segment(1), AtomicBool::new(false)),
             ],
             released_from: AtomicU32::new(2),
+            columns: pool.columns(),
             parts,
         };
         pool.segmenting = Some(segmenting);

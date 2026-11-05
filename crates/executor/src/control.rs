@@ -270,7 +270,11 @@ mod tests {
     /// A control thread over a daemon connection that answers nothing, a peer
     /// listener bound at `address`, and this process's engine number.
     fn control(address: &str, engine: u64) -> Control {
-        let (ours, _theirs) = UnixStream::pair().expect("a socket pair");
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        // The daemon's end stays open and answers nothing, which is silence. Dropping it would be a
+        // disconnect - a socket that is readable at once, and `Ready::Daemon` is the right answer to
+        // that - so a test that asserts `Idle` must keep it.
+        std::mem::forget(theirs);
         Control {
             daemon: Connection::from_unix(ours).expect("a connection over the pair"),
             engine,
