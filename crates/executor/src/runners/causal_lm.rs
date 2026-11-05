@@ -1604,6 +1604,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
+                if runner_dump() {
+                    // The node count is what separates a graph that does per-token work from one
+                    // that does per-batch work: a prefill an order of magnitude slower than a
+                    // decode and holding an order of magnitude more nodes is a graph shaped by its
+                    // token axis, not a slow kernel.
+                    tracing::info!(
+                        bucket = %bucket,
+                        kernels = captured.kernel_nodes(),
+                        launch_ms = launched.elapsed().as_secs_f64() * 1e3,
+                        "a replay issued its graph"
+                    );
+                }
                 // The sampled tokens are read back now, before the submission completes: the
                 // mechanism builds the next step's input ids from them (4.4). The wait covers the
                 // replay as well, which is why the launch's instant is what the device segment is
