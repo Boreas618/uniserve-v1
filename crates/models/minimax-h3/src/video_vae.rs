@@ -2319,8 +2319,9 @@ pub(crate) mod tests {
         // A copy's key names its element types as `source_*_out_*`, not `dtype_*`: the two operands
         // are the only thing that selects the program, and this decoder states them as one pair.
         assert!(
-            programs.iter().any(|(name, key)| name == "copy_block"
-                && key.contains("source_bf16_out_bf16")),
+            programs
+                .iter()
+                .any(|(name, key)| name == "copy_block" && key.contains("source_bf16_out_bf16")),
             "the copy states the deployment's element type twice, as its source and its out: {programs:?}"
         );
 

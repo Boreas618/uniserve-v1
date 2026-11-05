@@ -2968,7 +2968,9 @@ mod tests {
             "one residual program serves every level width of every raster"
         );
         assert!(
-            residuals(&programs).iter().all(|key| !key.contains("columns_")),
+            residuals(&programs)
+                .iter()
+                .all(|key| !key.contains("columns_")),
             "the residual's width is a launch argument, not a key field: {:?}",
             residuals(&programs)
         );
