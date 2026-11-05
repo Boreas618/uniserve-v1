@@ -196,8 +196,8 @@ fn an_encoder_output_is_computed_when_missing_and_read_when_stored() {
 const IMAGE_ENCODERS: [(&str, &str); 2] = [("vision_features", "vit"), ("latent_features", "vae")];
 
 /// A simulated image rank whose vision encoder computes its features alike
-/// for every draw and whose latent encoder samples its posterior, as
-/// BAGEL's do: each writes rows of 64 bytes.
+/// for every draw and whose latent encoder samples its posterior: each writes
+/// rows of 64 bytes.
 fn image_worker() -> SimEngine {
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
@@ -232,8 +232,8 @@ fn encoder(encoder: ImageEncoder, tokens: u32) -> ImageEncoderInput {
 }
 
 /// Image request `id` under `seed` and the cache policy `cache`: a prompt
-/// whose input image `image` (a digest) BAGEL encodes with its latent and
-/// its vision encoder, then text and up to one generated image, which a
+/// whose input image `image` (a digest) an encoder encodes with its latent
+/// and its vision encoder, then text and up to one generated image, which a
 /// latent encoder feeds back before text continues. The image parameters it
 /// is admitted with carry `seed`, which the latent encoder's draws follow.
 fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> GenerationRequest {
