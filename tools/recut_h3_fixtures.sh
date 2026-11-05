@@ -66,7 +66,11 @@ elements=123456
 # other. The walk still takes `--track` as a free number; deriving it from `--samples` there is owed,
 # exactly as `rows_bound()` is owed, and until then this is the pair both enumerations accept — the
 # recorder refuses any other by name.
+# The walk derives the track from the clip (`--samples [260] imply tracks [346400]`) and refuses a
+# mismatched pair, so this file passes no track to it. `TRACK` is still what the *recorder* takes.
 track=${TRACK:-29600}
+# The task is required and its rows differ: `t2va` states one row the conditioned walks do not.
+task=${TASK:-ref2va}
 
 # The sparse deployment's attention: 64 tiles of 0.9 budget, keyed at the deployment's own bound's next
 # power of two. The bound is the deployment's, not one request's, and the walk refuses any other class
@@ -84,11 +88,21 @@ sparse=64,0.9,8192
 # second statement of a live disagreement. **They leave this file when the walk reads the bound.**
 rows_dense=306896
 rows_sparse=353152
+# The walk derived its track from the clip on one tip and required it on another, so this file
+# probes: it passes `--track` only when the walk refuses its absence. A file that states one
+# deployment's convention breaks on the other, which is how `--rows` and `--samples` both went wrong.
+track_flag=()
+if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
+    cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
+    --task "$task" --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 \
+    --conditioned "$conditioned" --elements "$elements" >/dev/null 2>&1; then
+    track_flag=(--track)
+fi
 rows_flag=()
 if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
-    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
-    --elements "$elements" --track "$track" >/dev/null 2>&1; then
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned "$conditioned" \
+    --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" >/dev/null 2>&1; then
     rows_flag=(--rows)
 fi
 
@@ -125,8 +139,8 @@ echo "re-cutting H3 fixtures at $commit"
 probe=$(mktemp)
 if ! RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" --types "$types" \
-    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned false \
-    --elements "$elements" --track "$track" >"$probe" 2>&1; then
+    --samples "$samples" --rasters 768x768 --tokens "$tokens" --tp 1 --conditioned "$conditioned" \
+    --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" >"$probe" 2>&1; then
     if grep -q 'unknown flag --types' "$probe"; then
         cat >&2 <<'EOF'
 the walk at this tip takes no `--types`, so it cannot state each component's own element type:
@@ -148,12 +162,12 @@ echo 'walk:'
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" ${rows_flag:+"${rows_flag[@]}" "$rows_dense"} \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
     --types "$types" >"$walk_dense"
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable-aarch64-unknown-linux-gnu} \
     cargo run -q -p minimax-h3 --example programs -- "$root" \
     --samples "$samples" --rasters "$rasters" --tokens "$tokens" \
-    --tp 1 --conditioned "$conditioned" --elements "$elements" --track "$track" \
+    --tp 1 --conditioned "$conditioned" --elements "$elements" ${track_flag:+"${track_flag[@]}" "$track"} --task "$task" \
     --types "$types" ${rows_flag:+"${rows_flag[@]}" "$rows_sparse"} --sparse "$sparse" >"$walk_sparse"
 printf '  dense %s rows, sparse %s rows\n' \
     "$(grep -c '^[a-z]' "$walk_dense")" "$(grep -c '^[a-z]' "$walk_sparse")"
