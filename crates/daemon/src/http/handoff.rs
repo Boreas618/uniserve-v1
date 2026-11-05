@@ -166,15 +166,12 @@ impl Handoff {
             frozen: tokio::sync::Mutex::new(Some(frozen)),
         });
         crate::leader::locked(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
-        // A restart that began pausing before this response started must not
-        // hand over a connection whose next response is already being
-        // written: ask this one to pause too. `pausing` is true only while the
-        // round runs, and the round reads every registration it asked, so a
-        // response that starts after it is written here rather than parked for
-        // a decision the finished round will not make.
-        if self.pausing() {
-            registration.request();
-        }
+        // A response that starts while a round runs is asked to pause by the
+        // round itself, which claims its report before asking: a response that
+        // asks for itself here would report into a round that has not claimed
+        // it, and `Registration::report` reads an unclaimed report as "no round
+        // is waiting" and resumes — the response would then be written here
+        // while the round believed it handed over everything in flight.
         registration
     }
 
@@ -218,15 +215,10 @@ impl Handoff {
                 // A response may still register between that round and this
                 // check, so yield and look again before concluding.
                 tokio::task::yield_now().await;
-                let all_asked = crate::leader::locked(&self.inner.streaming)
-                    .values()
-                    .filter_map(std::sync::Weak::upgrade)
-                    .all(|registration| asked.contains(&registration.id));
-                if all_asked {
+                if self.conclude(&asked) {
                     // The round is over, and `pausing` stops being true: a
                     // response that starts now is written here, and the
                     // registrations it asked stop watching for a boundary.
-                    self.end_pause();
                     return frozen;
                 }
                 continue;
@@ -255,6 +247,29 @@ impl Handoff {
                 }
             }
         }
+    }
+
+    /// Ends the round if every response in flight has been asked, and says
+    /// whether it did.
+    ///
+    /// The registry's own lock is held for the check and for the end of the
+    /// pause together, so a response cannot register between the two: it is
+    /// either seen here, and the round goes on to ask it, or it arrives after
+    /// the round is over and is written by this daemon (§7.5.1 step 4).
+    fn conclude(&self, asked: &BTreeSet<u64>) -> bool {
+        let streaming = crate::leader::locked(&self.inner.streaming);
+        let unsettled = streaming
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|registration| !asked.contains(&registration.id));
+        if unsettled {
+            return false;
+        }
+        self.inner.pausing.store(false, Ordering::Release);
+        for registration in streaming.values().filter_map(std::sync::Weak::upgrade) {
+            registration.release();
+        }
+        true
     }
 
     /// Ends the pause's round: no response asks for a boundary any more, and
