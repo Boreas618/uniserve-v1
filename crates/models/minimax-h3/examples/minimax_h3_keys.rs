@@ -1239,6 +1239,23 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
+    // **The mergers' norm, at a merged row's width** - the same operator one width over, and it was
+    // missing: `vision.rs` launches `LayerNorm::descriptor_of(dtype, merged, true)` beside the
+    // blocks' own, with `merged = hidden_size · spatial_merge_size²` (`BlockRows::merged_width`,
+    // 1152 · 4 = **4608**). The mergers' two `gemm`s at that width were already rows, so the family
+    // was in the file while the normalization that feeds them was not - the encode path would have
+    // stopped between the merger's norm and its own projection.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: deployment,
+            columns: 1152 * 4,
+            tile: (1152 * 4_u32).next_power_of_two(),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The video encoder's four levels normalize in FP32 at their own channel counts
     // (`encoding.rs`: 128, 256, 512 and 1024), each with the tile its width's next power of two is.
     // These are `ref2va`'s keys - the encoder block is the one path a `t2va` request never touches -
