@@ -646,7 +646,11 @@ impl Attention {
             f.operate::<KvWriteScaled>(
                 &descriptor,
                 kv::ScaledWriteArgs {
-                    source: source.reshape(Shape::new(&[source.rows(), rows])),
+                    // The token count, not `source.rows()`: a source arrives as `[tokens, heads,
+                    // head_dim]` as often as `[tokens, heads · head_dim]`, and `rows()` flattens the
+                    // leading dimensions into tokens × heads - a width the operator then compares
+                    // against a slot list of tokens.
+                    source: source.reshape(Shape::new(&[source.shape.dim(0), rows])),
                     slots: batch.slot_mapping,
                     // The reader's own buffer: `attend` multiplies by `planes.key_scale`, so a
                     // second allocation of the right shape would produce a cache that reads as

@@ -380,11 +380,15 @@ impl Op for Nvfp4Gemm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        if descriptor.packed != DType::U8 || descriptor.scale != DType::U8 {
+        // The packed weight is E2M1 pairs carried as bytes, and its block scale is E4M3: the two
+        // are different element types by construction, so a check that wants one type for both
+        // refuses every real NVFP4 operand. What is refused is a weight that is not a byte type and
+        // a scale that is not the 8-bit float NVFP4 blocks are quantized against.
+        if descriptor.packed != DType::U8 || descriptor.scale != DType::F8E4M3 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "NVFP4 operands are U8 bytes, not {} and {}",
+                    "an NVFP4 product takes U8 packed bytes and an f8e4m3 block scale, not {} and {}",
                     descriptor.packed, descriptor.scale
                 ),
             ));
