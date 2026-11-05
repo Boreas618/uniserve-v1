@@ -42,7 +42,16 @@ use std::path::{Path, PathBuf};
 /// One case's launch, as its recipe states it.
 #[derive(Debug)]
 pub struct Recipe {
+    /// The recipe file this was read from, absolute: the directory a relative `module` was resolved
+    /// against, and the directory a run's files are written under when it states none.
+    origin: PathBuf,
     /// The module directory: `module.cubin` (or `cubin`), `metadata.json`, and `baked.json`.
+    ///
+    /// Absolute, resolved against the recipe's own directory when the recipe states it relatively.
+    /// It is resolved at read time because the recipe path is the only thing that can say what a
+    /// relative `module` means: a reader that took the path again could be handed a different one -
+    /// a bare file name, whose parent is the empty path - and would then look for the module
+    /// relative to the process's working directory.
     pub module: PathBuf,
     /// The cubin's file name inside the module directory.
     pub cubin: String,
@@ -69,8 +78,19 @@ impl Recipe {
             .ok_or_else(|| format!("{}: a recipe names its module directory", path.display()))?;
         let entry = text_of(&value, "entry")
             .ok_or_else(|| format!("{}: a recipe names the entry to launch", path.display()))?;
+        let origin = std::path::absolute(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let stated = PathBuf::from(module);
+        let module = match stated.is_absolute() {
+            true => stated,
+            false => origin
+                .parent()
+                .map(|parent| parent.join(&stated))
+                .unwrap_or(stated),
+        };
         Ok(Self {
-            module: PathBuf::from(module),
+            origin,
+            module,
             cubin: text_of(&value, "cubin")
                 .unwrap_or("module.cubin")
                 .to_owned(),
@@ -85,20 +105,19 @@ impl Recipe {
         })
     }
 
-    /// The module directory, resolved against the recipe's own directory when relative.
-    pub fn module_dir(&self, recipe: &Path) -> PathBuf {
-        if self.module.is_absolute() {
-            return self.module.clone();
-        }
-        match recipe.parent() {
-            Some(parent) => parent.join(&self.module),
-            None => self.module.clone(),
-        }
+    /// The module directory, absolute and resolved when this recipe was read.
+    pub fn module_dir(&self) -> PathBuf {
+        self.module.clone()
+    }
+
+    /// The recipe file this was read from.
+    pub fn origin(&self) -> &Path {
+        &self.origin
     }
 
     /// The directory a buffer's `dump` is written under when the run states none.
-    pub fn dump_dir(&self, recipe: &Path) -> PathBuf {
-        recipe
+    pub fn dump_dir(&self) -> PathBuf {
+        self.origin
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
@@ -672,7 +691,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
+        let baked = Baked::read(&recipe.module_dir())
             .expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(launch.words[0].len(), 8);
@@ -696,7 +715,7 @@ mod tests {
                 "signature": {"scores": "*bf16", "rows": "i32", "wide": "constexpr"},
             }),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
+        let baked = Baked::read(&recipe.module_dir())
             .expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         let refused = launch.check_signature(&metadata);
@@ -716,7 +735,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
+        let baked = Baked::read(&recipe.module_dir())
             .expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(
