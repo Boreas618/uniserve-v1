@@ -971,6 +971,46 @@ fn eager_replay() -> bool {
 /// serves a batch issues the same launches with the batch's own values. Comparing the two, node for
 /// node in capture order, names the first place the graph and the walk disagree, which is the
 /// difference between a replay that answers right and one that does not.
+/// Whether the first serving prefill is captured again with its own batch, beside the pose it was captured
+/// with, and the two launches compared byte for byte.
+///
+/// The pose capture and the serving batch issue the same launches with the same geometry and different
+/// values, and a replay that writes nothing is the difference between them. An eager launch is not recorded,
+/// so it has no node parameters to compare: only a *capture* of the real batch states the launch that batch
+/// would have had. This makes that capture once, on the runner's own stream, between steps - and it launches
+/// it once too, because the same graph writing attention's output is the other half of the answer.
+fn recapture_real() -> bool {
+    static RECAPTURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RECAPTURE.get_or_init(|| {
+        std::env::var_os("UNISERVE_RECAPTURE_REAL").is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// The field a `KernelParams` byte offset belongs to, where the structure is known.
+fn field_at(at: usize) -> &'static str {
+    match at & !7 {
+        0 => "tmaQ",
+        128 => "tmaK",
+        256 => "tmaKsw",
+        384 => "tmaV",
+        512 => "tmaO",
+        896 => "grid.x",
+        900 => "grid.y",
+        904 => "grid.z",
+        912 => "ptrO",
+        936 => "cumSeqLensQ",
+        1000 => "counter",
+        1016 => "pageIdx",
+        1024 => "partialO",
+        1096 => "seqLensKv",
+        1112 => "stats",
+        1128 => "window",
+        1132 => "batch",
+        1136 => "chunked",
+        _ => "?",
+    }
+}
+
 fn graph_diff() -> bool {
     static DIFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DIFF.get_or_init(|| {
@@ -1615,6 +1655,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
     /// by the device thread, which is the only thread that may issue to this runner's stream.
     pending_dump: Option<(u32, String)>,
+    /// Whether a batch has been captured again beside the pose it serves (see `recapture_real`).
+    recaptured: bool,
     /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
     /// read beside the write that should have fed it.
     last_prefill: Option<String>,
@@ -1768,6 +1810,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             capturing: false,
             pending_install: None,
             pending_dump: None,
+            recaptured: false,
             last_prefill: None,
             enqueue_ms: 0.0,
             encoded: Vec::new(),
@@ -2132,6 +2175,29 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 for group in 0..self.kv.groups() {
                     self.kv.block_table(group, &slots, &self.stream)?;
                 }
+                // A draw that never ran and a draw that ran wrongly are the same reading afterwards,
+                // because the sampler's output lives in arena memory nothing has initialised. `-1` is
+                // outside every vocabulary and outside every sampled id, so filling the buffer with it
+                // before the launch makes "no draw" visible - and it is written under the dump only,
+                // which is a device fill on this thread's own stream and ordered before the replay.
+                if runner_dump() {
+                    let samples = self.bucket_samples.borrow().get(bucket).copied();
+                    if let Some(samples) = samples {
+                        // SAFETY: the buffer is the sampler's own `[rows]` i32 in this bucket's plan,
+                        // live for the whole epoch, and the fill is ordered before the launch that
+                        // would overwrite it.
+                        if let Err(error) = unsafe {
+                            platform::memset_d32(
+                                samples.tokens.ptr.address(),
+                                u32::MAX,
+                                bucket.rows as usize,
+                                &self.stream,
+                            )
+                        } {
+                            tracing::warn!(bucket = %bucket, %error, "the sampler's sentinel fill failed");
+                        }
+                    }
+                }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -2154,6 +2220,22 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // change, so the newest generation that did prepare it is the same program: it
                 // serves the batch, and the switchover of an update that changed no kernel of this
                 // bucket's does not need a fresh executable per bucket.
+                // A diagnosis of the one difference an eager walk cannot state: the node table a *capture*
+                // of this batch would have. Once per process, on the first prefill this runner replays, and
+                // between the staging and the launch so the values it records are this batch's.
+                if recapture_real()
+                    && !self.recaptured
+                    && matches!(
+                        bucket.variant,
+                        crate::plan::Variant::PrefillWrite | crate::plan::Variant::PrefillOutput
+                    )
+                    && self.staging.live_tokens() > 0
+                {
+                    self.recaptured = true;
+                    if let Err(error) = self.recapture_real(*bucket, *generation) {
+                        tracing::warn!(bucket = %bucket, %error, "the recapture of this batch failed");
+                    }
+                }
                 let (served, captured) = self.lifecycle.graphs.captured_for(*bucket, *generation).ok_or_else(
                     || {
                         Error::Invariant(format!(
@@ -2170,6 +2252,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "the bucket was prepared for an earlier generation; its programs did not change"
                     );
                 }
+                // A diagnosis of the one difference an eager walk cannot state: the node table a *capture*
+                // of this batch would have. Once per process, on the first prefill this runner replays, and
+                // between the staging and the launch so the values it records are this batch's.
+
                 // What the graph baked against what this batch states, node by node: a captured
                 // node keeps the host's values from capture time, and the numbers a pose decides -
                 // the batch size, the sum of the query lengths, the maximum key length, the CTA
@@ -2433,6 +2519,124 @@ impl<M: CausalLm> CausalLmRunner<M> {
             warm_ms = began.elapsed().as_secs_f64() * 1e3,
             "a bucket's operators were warmed before its capture"
         );
+        Ok(())
+    }
+
+    /// Captures this bucket again with the batch it is serving, and compares that launch with the pose's.
+    ///
+    /// Run once, on the runner's own stream, between the staging of a batch and its replay. The walk inside
+    /// the recording is the same work the replay is about to do, so it changes nothing the batch observes:
+    /// the KV pages, the arena region and the page table all hold the same values the replay would write.
+    /// What it adds is a *node table* for the batch's real values, which no eager launch can have - and then
+    /// one launch of that graph, because a graph that writes attention's output is the other half of the
+    /// answer and the two halves are read in one run.
+    fn recapture_real(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        // The pose's own launch, read before the walk borrows this runner mutably.
+        let pose = {
+            let (_, captured) = self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "no graph of bucket {bucket} in generation {generation} to compare a \
+                         recapture with"
+                    ))
+                })?;
+            kernel_nodes(captured.nodes())
+                .into_iter()
+                .find(|(operator, _)| *operator == "paged_attention")
+                .map(|(_, node)| captured.template().kernel_node_params(node))
+                .ok_or_else(|| {
+                    Error::Invariant("the pose's graph holds no attention launch".into())
+                })??
+        };
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        self.capturing = true;
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+        self.capturing = false;
+        let walked = walked?;
+        // The same operator's launch in both graphs: the first attention node of each, in capture order.
+        let real = kernel_nodes(&walked.nodes)
+            .into_iter()
+            .find(|(operator, _)| *operator == "paged_attention")
+            .map(|(_, node)| walked.template.kernel_node_params(node));
+        let Some(real) = real else {
+            return Err(Error::Invariant(
+                "a recapture found no attention launch to compare".into(),
+            ));
+        };
+        let real = real?;
+        let pose_name = pose
+            .function
+            .name()
+            .unwrap_or_else(|error| format!("unnamed({error})"));
+        let real_name = real
+            .function
+            .name()
+            .unwrap_or_else(|error| format!("unnamed({error})"));
+        // Every 8-byte word of the parameter block the two launches disagree on. A pointer that moved is a
+        // buffer the batch's own walk chose; a scalar that moved is a value the pose decided and the batch
+        // did not, which is the class a graph bakes wrongly and no scalar check finds.
+        let mut differences = Vec::new();
+        if let (Some(pose_blob), Some(real_blob)) =
+            (pose.parameters.first(), real.parameters.first())
+        {
+            differences.push(format!("pose_bytes={} real_bytes={}", pose_blob.len(), real_blob.len()));
+            let words = pose_blob.len().min(real_blob.len()) / 8;
+            for word in 0..words {
+                let at = word * 8;
+                let left = u64::from_ne_bytes(pose_blob[at..at + 8].try_into().unwrap_or([0; 8]));
+                let right = u64::from_ne_bytes(real_blob[at..at + 8].try_into().unwrap_or([0; 8]));
+                if left != right {
+                    differences.push(format!(
+                        "{}(@{at}) pose={left:#x} real={right:#x}",
+                        field_at(at)
+                    ));
+                }
+            }
+        }
+        tracing::warn!(
+            bucket = %bucket,
+            pose_fn = %pose_name,
+            real_fn = %real_name,
+            pose_grid = ?pose.grid,
+            real_grid = ?real.grid,
+            pose_block = ?pose.block,
+            real_block = ?real.block,
+            differences = %differences.join(" "),
+            "a capture of this batch beside the capture of the pose it serves"
+        );
+        // Then one launch of the recapture's own graph: the same work, and the one reading that says whether
+        // a graph built from *these* values writes attention's output.
+        let executable = walked.template.instantiate()?;
+        executable.launch(&stream)?;
+        stream.synchronize()?;
+        let wrote = real
+            .parameters
+            .first()
+            .and_then(|blob| blob.get(912..920))
+            .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
+            .unwrap_or(0);
+        let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
+        let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
+        let element = usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let read = self.read_device(wrote, live.saturating_mul(hidden).saturating_mul(element));
+        match read {
+            Some(raw) if wrote != 0 => tracing::warn!(
+                bucket = %bucket,
+                out = %format!("{wrote:#x}"),
+                digest = %format!("{:016x}", platform::fnv1a(&raw)),
+                nz = raw.iter().filter(|byte| **byte != 0).count(),
+                "the recaptured graph, launched once, wrote attention's output"
+            ),
+            _ => tracing::warn!(
+                bucket = %bucket,
+                out = %format!("{wrote:#x}"),
+                "the recaptured graph, launched once, left attention's output unreadable or unwritten"
+            ),
+        }
         Ok(())
     }
 
@@ -2857,8 +3061,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let id = *id;
             id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
         }) {
+            // `-1` is the sentinel the dump fills the sampler's buffer with, so it says which of the
+            // two things happened: no draw wrote this row, or a draw wrote a value outside the
+            // vocabulary. The two are indistinguishable from an id alone, and they are different
+            // defects.
+            let why = if ids[row] == -1 {
+                "the sampler wrote nothing for this row: its buffer still holds the sentinel the dump \
+                 fills before the replay"
+            } else {
+                "a draw produced a value outside the vocabulary"
+            };
             return Err(Error::Invariant(format!(
-                "row {row} sampled token {} outside the vocabulary of {}",
+                "row {row} sampled token {} outside the vocabulary of {}: {why}",
                 ids[row], self.geometry.vocabulary
             )));
         }
