@@ -969,6 +969,7 @@ fn convolution(
     to: u32,
     kernel: u32,
     stride: [u32; 3],
+    channels_last: bool,
 ) -> Result<Conv3d> {
     let weight = read(
         loader,
@@ -987,6 +988,7 @@ fn convolution(
         Some(bias),
         geometry(kernel, stride)?,
         true,
+        channels_last,
     )?)
 }
 
@@ -1021,7 +1023,7 @@ impl VideoEncoder {
             let bias = read(loader, &format!("{norm_name}.bias"), &[u64::from(channels)])?;
             Ok(Normalized {
                 norm: FrameNormPad::new(u64::from(groups), Some(weight), Some(bias), reflect)?,
-                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3])?,
+                conv: convolution(loader, conv_name, channels, to, kernel, [1; 3], true)?,
                 channels,
                 groups,
                 epsilon,
@@ -1035,6 +1037,7 @@ impl VideoEncoder {
             stack.widths[0],
             3,
             [1; 3],
+            true,
         )?;
         let mut width = stack.widths[0];
         let mut levels = Vec::with_capacity(stack.widths.len());
@@ -1070,6 +1073,7 @@ impl VideoEncoder {
                         *out,
                         1,
                         [1; 3],
+                        false,
                     )?)
                 };
                 blocks.push(Block {
@@ -1091,6 +1095,7 @@ impl VideoEncoder {
                     *out,
                     3,
                     stride,
+                    false,
                 )?)
             } else {
                 None
@@ -1113,6 +1118,7 @@ impl VideoEncoder {
             2 * stack.latent_channels,
             1,
             [1; 3],
+            false,
         )?;
         // The latent space's affine: the checkpoint states its statistics, not a tensor for them.
         let latent = u64::from(stack.latent_channels);
@@ -1132,6 +1138,7 @@ impl VideoEncoder {
             )?),
             geometry(1, [1; 3])?,
             true,
+            false,
         )?;
         Ok(Self {
             stack,
@@ -1336,15 +1343,21 @@ impl VideoEncoder {
         let mut programs = Programs::default();
 
         // Every convolution of the network — the input, each block's two, each level's downsampler, the
-        // output and the two of the posterior head — takes the same key: element types and a bias.
-        programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
-            dtype,
-            dtype,
-            true,
-            dtype,
-            crate::audio_vae::geometry(3, 1, 1)?,
-            true,
-        ));
+        // output and the two of the posterior head — takes the same key: element types and a bias. The
+        // **order** does not key the module, so one descriptor does not cover both: a channels-last
+        // convolution and a channels-first one launch the same module with different strides, and the
+        // walk states the two descriptors because the network launches both.
+        for channels_last in [true, false] {
+            programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
+                dtype,
+                dtype,
+                true,
+                dtype,
+                crate::audio_vae::geometry(3, 1, 1)?,
+                true,
+                channels_last,
+            ));
+        }
         // The head's sample: the moments and the noise, one operator.
         programs.launch::<PosteriorOp>(&Posterior::new().descriptor());
 

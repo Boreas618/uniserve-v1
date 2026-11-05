@@ -37,8 +37,8 @@ use ipc::PhaseId;
 use ops::DType;
 use ops::Generation;
 use platform::DeviceId;
-use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 use program_server::Target;
+use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 
 use crate::engine_main::Launch;
 
@@ -57,6 +57,59 @@ pub(crate) struct PrefillCatalogue {
     pub(crate) bound: u32,
     /// Whether the deployment stated the sizes rather than taking the build's default catalogue.
     pub(crate) stated: bool,
+}
+
+/// The model class a checkpoint declares, and the deployment this build serves it as (4.3, 9).
+///
+/// **One place maps a checkpoint's `architectures` entry to a class.** The class is the checkpoint's
+/// own statement (`config.json`), not the deployment's name for it, and every other site branches on
+/// this value rather than on a string: a second `match` on a model name would be a second statement
+/// of which deployments this build serves, and the two would drift the first time one changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelClass {
+    /// A causal language model: prefill and decode forwards over a paged key/value cache.
+    CausalLm,
+    /// The media pipeline: an encode of a request's conditions, denoising steps of a latent layout,
+    /// and a clip decoded from latents. It keeps no paged key/value cache.
+    Media,
+}
+
+impl ModelClass {
+    /// The class `checkpoint` declares, or the refusal that names what it declares.
+    fn of(checkpoint: &std::path::Path) -> Result<Self> {
+        let declared = architectural_class(checkpoint)?;
+        match declared.as_str() {
+            "Qwen3MoeForCausalLM" => Ok(Self::CausalLm),
+            "MiniMaxH3ModularPipeline" => Ok(Self::Media),
+            other => Err(anyhow::anyhow!(
+                "{} declares model class {other}, which this build cannot serve: it serves \
+                 Qwen3MoeForCausalLM as a causal language model and MiniMaxH3ModularPipeline as the \
+                 media pipeline",
+                checkpoint.display()
+            )),
+        }
+    }
+}
+
+/// What a rank of a class holds, once its model is loaded and its resident memory opened.
+///
+/// The class was resolved at the same moment, so the value carries both: a caller that has a
+/// [`Served`] cannot ask it for a figure of the other class, which a bare `Arc<…>` would allow.
+pub(crate) enum Served {
+    /// The causal language model, one `Arc` per rank: every device's runner reads the same weights.
+    Text(Arc<qwen3_moe::Qwen3Moe>),
+    /// The media pipeline, whose blocks the runners take one `Arc` each.
+    Media(Arc<minimax_h3::load::MinimaxH3>),
+}
+
+impl Served {
+    /// The checkpoint-named class this value was loaded as.
+    pub(crate) fn class(&self) -> ModelClass {
+        match self {
+            Self::Text(_) => ModelClass::CausalLm,
+            Self::Media(_) => ModelClass::Media,
+        }
+    }
 }
 
 pub(crate) struct EpochPlan {
@@ -395,11 +448,10 @@ impl EpochPlan {
     /// facts, which neither the launch file nor the model's configuration states.
     /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
     /// fails with the fact it is missing rather than planning against a made-up value.
-    pub(crate) fn rank_facts(
-        &self,
-        memory: &Memory,
-        model: &qwen3_moe::Qwen3Moe,
-    ) -> Result<engine::RankFacts> {
+    pub(crate) fn rank_facts(&self, memory: &Memory, served: &Served) -> Result<engine::RankFacts> {
+        let Served::Text(model) = served else {
+            return self.media_rank_facts();
+        };
         let (rows, tokens) = self.buckets.bounds();
         let control = checkpoint_tokens(&self.checkpoint)?;
         // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
@@ -469,6 +521,207 @@ impl EpochPlan {
         })
     }
 
+    /// The runners a media rank serves `device` with: one per block the pipeline holds.
+    ///
+    /// **Three runners, one stream each.** An encoder writes the hidden states a denoise step reads,
+    /// a denoiser reads them and publishes the trajectory, and a decoder reads that trajectory as a
+    /// clip, so each is a separate stream on the one device - a stream per runner is what lets the
+    /// store order the crossings between them.
+    ///
+    /// **The buckets are the deployment's canvases and prompt capacities**, not the checkpoint's: a
+    /// bucket is a captured graph, and a deployment that captures a canvas it does not serve would
+    /// pay a capture for nothing.
+    fn media_runners(
+        &self,
+        device: DeviceId,
+        pipeline: &Arc<minimax_h3::load::MinimaxH3>,
+        generation: &Arc<Generation>,
+    ) -> Result<Vec<NamedRunner>> {
+        use executor::runners::decoder as media_decoder;
+        use executor::runners::denoiser as media_denoiser;
+        use executor::runners::encoder as media_encoder;
+        use nn::capability::Denoiser as _;
+
+        if Some(&device) != self.devices.first() {
+            bail!(
+                "this build maps one model per rank, on device {}; a runner on device {} would \
+                 forward from another device's addresses",
+                self.devices.first().map_or(-1, |first| first.0),
+                device.0
+            );
+        }
+        let longest = self.build.max_model_len.map(|length| length.get()).context(
+            "a deployment of the media class states no `max_model_len`, and its prompt capacities \
+             are checked against it",
+        )?;
+        let capacities = prompt_capacities(&self.build.video, longest)?;
+        let candidates = media_candidates(&self.build.video, &capacities)?;
+
+        // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
+        // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
+        // set here is what the encoder and the decoder are bound with.
+        let mut encode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        let rows = u32::try_from(self.build.max_running_requests.get())
+            .context("more request slots than the protocol addresses")?;
+        for capacity in &capacities {
+            for row in 1..=rows {
+                encode_buckets.push(executor::plan::Bucket::prefill(
+                    row,
+                    *capacity,
+                    Variant::Encode,
+                ));
+            }
+        }
+        let decode_buckets: Vec<executor::plan::Bucket> = candidates
+            .iter()
+            .map(|candidate| {
+                executor::plan::Bucket::clip(candidate.frames, candidate.height, candidate.width)
+            })
+            .collect();
+
+        let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+        let hidden = config.text_encoder.hidden_size;
+        let text = pipeline.text_encoder().context(
+            "the checkpoint holds no text encoder, so a media request's prompt could not be \
+             encoded",
+        )?;
+        let denoiser = pipeline
+            .transformer()
+            .context("the checkpoint holds no transformer, so no denoising step could run")?;
+        let decoder = pipeline
+            .video_decoder()
+            .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
+        // The encoder writes its hidden states in the deployment's effective type, which the daemon
+        // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
+        // never reaches a main process as `auto`).
+        let dtype = match self.build.dtype {
+            proto::request::ModelDtype::Float16 => DType::F16,
+            proto::request::ModelDtype::BFloat16 => DType::BF16,
+            proto::request::ModelDtype::Float32 => DType::F32,
+        };
+
+        let stream = |name: &str| -> Result<platform::Stream> {
+            platform::Stream::new(device)
+                .with_context(|| format!("creating device {}'s {name} stream", device.0))
+        };
+        let encode_set = Buckets::new(encode_buckets);
+        let decode_set = Buckets::new(decode_buckets);
+        let encoder = media_encoder::EncoderRunner::new(
+            Binding {
+                id: RunnerId(0),
+                phases: served_phases(&encode_set),
+                device,
+                stream: stream("encoder")?,
+            },
+            Arc::clone(text),
+            encode_set,
+            media_encoder::EncoderShape { hidden, dtype },
+            Arc::clone(generation),
+        )?;
+        let warm = executor::runners::warm::distinct(&**denoiser, &candidates);
+        // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
+        // derived from them rather than named, so a rank that captures no denoise bucket states no
+        // denoise phase.
+        let denoise_set = Buckets::new(warm.iter().map(|candidate| {
+            executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view()))
+        }));
+        let denoise = media_denoiser::DenoiserRunner::new(
+            Binding {
+                id: RunnerId(1),
+                phases: served_phases(&denoise_set),
+                device,
+                stream: stream("denoiser")?,
+            },
+            Arc::clone(denoiser),
+            warm,
+            media_denoiser::DenoiserShape {
+                stack: dtype,
+                sample: minimax_h3::denoiser::SAMPLE_DTYPE,
+                width: hidden,
+            },
+            Arc::clone(generation),
+        )?;
+        let decode = media_decoder::DecoderRunner::new(
+            Binding {
+                id: RunnerId(2),
+                phases: served_phases(&decode_set),
+                device,
+                stream: stream("decoder")?,
+            },
+            Arc::clone(decoder),
+            decode_set,
+            Arc::clone(generation),
+        )?;
+        Ok(vec![
+            NamedRunner::new(RunnerId(0), Box::new(encoder)),
+            NamedRunner::new(RunnerId(1), Box::new(denoise)),
+            NamedRunner::new(RunnerId(2), Box::new(decode)),
+        ])
+    }
+
+    /// What a media rank advertises of itself: the facts its scheduler is configured from.
+    ///
+    /// **A media rank keeps no paged key/value cache**, so the three facts that describe one are
+    /// absent rather than zero: `block_size`, `kv_cache_dtype` and the host tier describe a cache
+    /// this class does not hold, and stating a zero page would make a scheduler plan against a
+    /// pool that never exists. What replaces them is the deployment's media statement: the widest
+    /// batch it admits, the prompt capacity its encoder captures, and the length it states.
+    ///
+    /// Every figure here is the deployment's, not a checkpoint's: a pipeline does not imply a
+    /// prompt capacity or a clip length, and a default invented here would be a second statement of
+    /// the deployment's own file.
+    fn media_rank_facts(&self) -> Result<engine::RankFacts> {
+        let longest = self
+            .build
+            .max_model_len
+            .map(|length| length.get())
+            .context(
+                "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
+                 key/value cache, so no checkpoint figure implies one and the deployment's own is \
+                 what its prompt capacities are checked against",
+            )?;
+        let tokens = prompt_capacity(&self.build.video, longest)?;
+        Ok(engine::RankFacts {
+            model: Some(self.checkpoint.display().to_string()),
+            dtype: Some(self.build.dtype.clone()),
+            world: Some(self.world),
+            group: Some(self.group.clone()),
+            rank: Some(self.rank as usize),
+            world_size: Some(self.world_size),
+            devices: Some(
+                self.devices
+                    .iter()
+                    .map(|device| device.0.to_string())
+                    .collect(),
+            ),
+            hosts: match self.world_size {
+                1 => Some(vec![host_name()?]),
+                _ => None,
+            },
+            peers: None,
+            max_running_requests: Some(self.build.max_running_requests.get()),
+            // One media computation per request: a batch's rows are the requests it carries, and
+            // the deployment's admission bound is the number of them.
+            max_batch: Some(self.build.max_running_requests.get()),
+            max_num_batched_tokens: Some(tokens as usize),
+            // No paged cache: the three facts below describe one, and absence is their statement.
+            block_size: None,
+            kv_cache_dtype: None,
+            host_cache: None,
+            // A media rank captures graphs per bucket, and a bucket of this class is not sized by
+            // tokens: the tiers a policy is checked against do not exist here.
+            graph_tiers: None,
+            bos: None,
+            eos: None,
+            end_of_image: None,
+            // A media request generates a clip, not tokens, so the generation limits of a causal
+            // language model do not apply.
+            generation_limits: None,
+            max_model_len: self.build.max_model_len.map(|length| length.get()),
+            watchdog_timeout: Some(self.watchdog_timeout()),
+        })
+    }
+
     /// The Program Server's targets this rank resolves a module for (§5.3).
     pub(crate) fn targets(&self) -> &[Target] {
         &self.targets
@@ -483,10 +736,16 @@ impl EpochPlan {
     pub(crate) fn runners(
         &self,
         device: DeviceId,
-        model: Arc<qwen3_moe::Qwen3Moe>,
+        served: &Served,
         memory: &mut Memory,
         generation: &Arc<Generation>,
     ) -> Result<Vec<NamedRunner>> {
+        let Served::Text(model) = served else {
+            let Served::Media(pipeline) = served else {
+                unreachable!("Served has two variants");
+            };
+            return self.media_runners(device, pipeline, generation);
+        };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
         // second device would read the first device's addresses: a node whose rank serves two
@@ -520,7 +779,7 @@ impl EpochPlan {
                     // A plan that disagrees with the model's stated page size is refused here,
                     // naming both figures, rather than served.
                     page_size: cache_page_size(memory, &model)?,
-                    max_kv_len: self.max_kv_len(&model)?,
+                    max_kv_len: self.max_kv_len(served)?,
                 };
                 let stream = platform::Stream::new(device)
                     .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -537,7 +796,7 @@ impl EpochPlan {
                         device,
                         stream,
                     },
-                    Shared::new(model),
+                    Shared::new(Arc::clone(model)),
                     Arc::clone(generation),
                     self.buckets.clone(),
                     geometry,
@@ -565,16 +824,10 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(
-        Arc<qwen3_moe::Qwen3Moe>,
-        Memory,
-        ipc::WorkerInfo,
-        GraphStorage,
-    )> {
+    ) -> Result<(Served, Memory, ipc::WorkerInfo, GraphStorage)> {
         let placement = &self.placement;
-        let class = architectural_class(&self.checkpoint)?;
-        match class.as_str() {
-            "Qwen3MoeForCausalLM" => {
+        match ModelClass::of(&self.checkpoint)? {
+            ModelClass::CausalLm => {
                 // §8: the checkpoint's own representation stands unless the deployment fixed
                 // another, which is the build config's `dtype` and `quantization`.
                 let opened = nn::Checkpoint::open(&self.checkpoint)?;
@@ -593,37 +846,44 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let (memory, info, graph) = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory, info, graph))
+                let served = Served::Text(Arc::new(model));
+                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                Ok((served, memory, info, graph))
             }
-            // The media class is stated rather than left to the refusal below, so the line names
-            // what is missing instead of "cannot serve". Its runners are not built into this
-            // process yet, and they are what a binding needs: the model's three capabilities -
-            // `nn::capability::Encoder` for the encode of a prompt's conditions,
-            // `nn::capability::Denoiser` for one denoising step of a latent layout and
-            // `nn::capability::Decoder` for one clip decoded from latents - plus the partition the
-            // checkpoint's own layout declares.
-            //
-            // This class keeps no paged key/value cache: the package holds no cache view and no
-            // page table, and the one cache in it is the denoiser's AdaLN modulation table, which
-            // is model memory the weight loader allocates (4.1's retained weights). So the resident
-            // pool holds no KV units for it - but it is not empty either: a model's state tables
-            // book there, sized at plan time from the layouts the checkpoint declares
-            // (`Encoder::state_tables` and the denoiser's own), filled at the load and retired with
-            // the generation, never allocated on the request path. The state group's snapshot, when
-            // the denoiser allocates one, comes from the cache plan beside it. Until the runners
-            // exist nothing can bind a `MiniMaxH3` model, and the update and serving paths must not
-            // pretend otherwise.
-            "MiniMaxH3ModularPipeline" => bail!(
-                "{} declares model class {class}: the deployment selects MiniMaxH3ModularPipeline \
-                 and its runners (encoder, denoiser, decoder) are not built into this process, so \
-                 nothing can bind it",
-                self.checkpoint.display()
-            ),
-            other => bail!(
-                "{} declares model class {other}, which this build cannot serve",
-                self.checkpoint.display()
-            ),
+            ModelClass::Media => {
+                // §8: the deployment's own representation, which the daemon resolved against the
+                // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
+                // main process as `auto`: it arrives as the checkpoint's own type).
+                let opened = nn::Checkpoint::open(&self.checkpoint)?;
+                let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
+                let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+                // **The pipeline's two parallel degrees are the deployment's, and one of them has
+                // no field in the build config yet.** A causal-language deployment splits its
+                // weights and its experts; the media class splits the denoiser's sequence (Ulysses)
+                // and the text encoder's tensors. Until the deployment states the Ulysses degree,
+                // the two agree only at one rank, so a wider deployment is refused here by name
+                // rather than served with a partition nobody stated.
+                let width = usize::try_from(placement.tensor_parallel)
+                    .context("a parallel width wider than this process addresses")?;
+                if width != 1 {
+                    bail!(
+                        "this rank is one of {width} and the media class's Ulysses degree is the \
+                         deployment's to state: the build config carries the tensor-parallel width \
+                         and no sequence degree, so a partition of {width} would be assumed rather \
+                         than declared"
+                    );
+                }
+                let partition = minimax_h3::Partition::new(&config, 1, 1, 0, 0)?;
+                let dtype = match self.build.dtype {
+                    proto::request::ModelDtype::Float16 => DType::F16,
+                    proto::request::ModelDtype::BFloat16 => DType::BF16,
+                    proto::request::ModelDtype::Float32 => DType::F32,
+                };
+                let model = minimax_h3::load(&opened, partition, Some(dtype), &mut loader)?;
+                let served = Served::Media(Arc::new(model));
+                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                Ok((served, memory, info, graph))
+            }
         }
     }
 
@@ -637,9 +897,16 @@ impl EpochPlan {
     /// owners carve their storage from it and the runner is built from them.
     pub(crate) fn open_memory(
         &self,
-        model: &qwen3_moe::Qwen3Moe,
+        served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
     ) -> Result<(Memory, ipc::WorkerInfo, GraphStorage)> {
+        let Served::Text(model) = served else {
+            bail!(
+                "this rank's class is {:?} and its resident memory is planned for a causal \
+                 language model only",
+                served.class()
+            );
+        };
         let device = *self
             .devices
             .first()
@@ -670,7 +937,7 @@ impl EpochPlan {
             max_batch_calls: rows as usize,
             max_batch_tokens: tokens as usize,
             max_request_pool_size: self.build.max_running_requests.get(),
-            max_model_len: self.max_kv_len(model)? as usize,
+            max_model_len: self.max_kv_len(served)? as usize,
             mem_fraction_static: self.build.mem_fraction_static,
             cache,
             kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
@@ -739,11 +1006,18 @@ impl EpochPlan {
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    pub(crate) fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
-        match self.build.max_model_len {
-            Some(length) => Ok(length.get()),
-            None => u32::try_from(model.config().max_position_embeddings)
+    pub(crate) fn max_kv_len(&self, served: &Served) -> Result<u32> {
+        if let Some(length) = self.build.max_model_len {
+            return Ok(length.get());
+        }
+        match served {
+            Served::Text(model) => u32::try_from(model.config().max_position_embeddings)
                 .context("the checkpoint's context length is wider than the protocol's"),
+            Served::Media(_) => bail!(
+                "this rank serves the media class and the deployment states no `max_model_len`: \
+                 the pipeline keeps no key/value cache, so a length that decides one is the \
+                 deployment's to state rather than a checkpoint's to imply"
+            ),
         }
     }
 }
@@ -755,10 +1029,7 @@ impl EpochPlan {
 /// returns through the batch, not as an exported tensor), so no device product is exported and no
 /// media component is routed: the deployment is one class of computation, and saying otherwise
 /// would make the engine reserve storage for exports that never happen.
-pub(crate) fn rank_report(
-    device: DeviceId,
-    host: &str,
-) -> Result<executor::capacity::Report> {
+pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capacity::Report> {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
@@ -823,10 +1094,16 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
     // configuration alone, and an architecture that states a beginning states it there.
     let generation = read_json(&dir.join("generation_config.json")).ok();
     let tokenizer = read_json(&dir.join("tokenizer_config.json")).ok();
-    let end_of_text = tokenizer.as_ref().and_then(|value| added_token(value, "<|endoftext|>"));
+    let end_of_text = tokenizer
+        .as_ref()
+        .and_then(|value| added_token(value, "<|endoftext|>"));
 
     let bos = token_id(config.get("bos_token_id"))
-        .or_else(|| generation.as_ref().and_then(|value| token_id(value.get("bos_token_id"))))
+        .or_else(|| {
+            generation
+                .as_ref()
+                .and_then(|value| token_id(value.get("bos_token_id")))
+        })
         .or(end_of_text)
         .with_context(|| {
             format!(
@@ -839,7 +1116,9 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
 
     let mut eos = Vec::new();
     for value in [
-        generation.as_ref().and_then(|value| value.get("eos_token_id")),
+        generation
+            .as_ref()
+            .and_then(|value| value.get("eos_token_id")),
         config.get("eos_token_id"),
     ]
     .into_iter()
@@ -868,8 +1147,8 @@ fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
 
 /// Reads one JSON file of a checkpoint.
 fn read_json(path: &Path) -> Result<serde_json::Value> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -1046,13 +1325,155 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{name} of {value} exceeds the protocol's width"))
 }
 
+/// The prompt capacities a media deployment captures: its own statement, or the default ladder.
+///
+/// The deployment's `text_capacities`, when stated, must be strictly increasing and below the
+/// length it admits - a capacity above it would capture an encoder graph no request can fill. The
+/// default is the one its options document states: `1024`, then steps of `2048`, below the length.
+fn prompt_capacities(video: &daemon::options::VideoOptions, longest: u32) -> Result<Vec<u32>> {
+    let stated: Vec<u32> = match &video.text_capacities {
+        Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
+        None => {
+            let mut ladder = Vec::new();
+            let mut capacity = 1024;
+            while capacity < longest {
+                ladder.push(capacity);
+                capacity += 2048;
+            }
+            ladder
+        }
+    };
+    if stated.is_empty() {
+        bail!(
+            "this deployment's video options state no prompt capacity below the {longest} tokens \
+             it admits, so no encoder bucket could be captured"
+        );
+    }
+    for pair in stated.windows(2) {
+        if pair[0] >= pair[1] {
+            bail!(
+                "this deployment's prompt capacities {} are not strictly increasing, so a request \
+                 of {} tokens would select two captured graphs",
+                stated
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pair[0]
+            );
+        }
+    }
+    if let Some(above) = stated.iter().copied().find(|capacity| *capacity > longest) {
+        bail!(
+            "this deployment states the prompt capacity {above} above the {longest} tokens it \
+             admits: the graph would be captured and never filled"
+        );
+    }
+    Ok(stated)
+}
+
+/// The widest prompt capacity a deployment captures: what one media batch may present.
+fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Result<u32> {
+    prompt_capacities(video, longest)?
+        .into_iter()
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("this deployment captures no prompt capacity"))
+}
+
+/// The warm candidates a media deployment binds its denoiser with.
+///
+/// **One candidate per (task, canvas, prompt capacity) the deployment serves.** A denoiser bucket is
+/// a layout, and a layout counts the prompt's rows and the request's conditions, so a deployment
+/// that captures three prompt capacities at two canvases has six layouts to walk - and
+/// `warm::distinct` keeps one candidate per layout, because two candidates that the model's padding
+/// collapses would capture the same graph twice.
+///
+/// **`t2va` only, for now.** It is the one task whose requests carry no condition media, so it is
+/// the one whose candidate a caller can state without the model's condition arithmetic. `fl2va` and
+/// `ref2va` are refused by name here rather than bound to a graph that could not run: `ref2va`
+/// additionally needs the encoder's `Source` product, which the model does not publish
+/// (`EncoderOutputs` holds one region).
+///
+/// The canvas set is the intersection of what the deployment prepares and what the checkpoint
+/// serves, and the frames are the deployment's longest clip at the model's frame rate - the model
+/// snaps them to a legal count itself, which is why the request states the plain figure.
+fn media_candidates(
+    video: &daemon::options::VideoOptions,
+    capacities: &[u32],
+) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
+    use minimax_h3::config::{FPS, NAMED_CANVASES};
+    let mut candidates = Vec::new();
+    let frames = (video.max_seconds * f64::from(FPS)).round();
+    if !(frames.is_finite() && frames >= 1.0) {
+        bail!(
+            "this deployment's longest clip is {} seconds, which is not a positive number of \
+             frames at {FPS} frames per second",
+            video.max_seconds
+        );
+    }
+    let frames = frames as u32;
+    for edge in &video.resolutions {
+        let short_edge: u32 = edge
+            .strip_suffix('p')
+            .and_then(|value| value.parse().ok())
+            .with_context(|| {
+                format!("the deployment's resolution class {edge:?} does not name a short edge in pixels")
+            })?;
+        for ratio in &video.aspect_ratios {
+            let (width, height) = ratio
+                .split_once(':')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                .with_context(|| format!("the deployment's aspect ratio {ratio:?} is not W:H"))?;
+            let canvas = NAMED_CANVASES
+                .iter()
+                .find(|canvas| canvas.short_edge == short_edge && canvas.aspect == (width, height))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "this deployment prepares {edge} at {ratio}, and the checkpoint serves no \
+                         such canvas: it serves {}",
+                        NAMED_CANVASES
+                            .iter()
+                            .map(|canvas| format!(
+                                "{}p {}:{}",
+                                canvas.short_edge, canvas.aspect.0, canvas.aspect.1
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            for capacity in capacities {
+                candidates.push(executor::runners::denoiser::WarmRequest {
+                    task: nn::capability::VideoTask::TextToVideoAudio,
+                    width: canvas.width,
+                    height: canvas.height,
+                    frames,
+                    fps: FPS,
+                    first_frames: 0,
+                    last_frames: 0,
+                    references: 0,
+                    text_tokens: *capacity,
+                    conditions: Vec::new(),
+                    vision_spans: Vec::new(),
+                });
+            }
+        }
+    }
+    if candidates.is_empty() {
+        bail!(
+            "this deployment prepares no resolution class at any aspect ratio, so a media runner \
+             would be bound with no canvas to serve"
+        );
+    }
+    Ok(candidates)
+}
+
 /// The model class a checkpoint declares, as its `config.json` states it.
 fn architectural_class(checkpoint: &Path) -> Result<String> {
     let path = checkpoint.join("config.json");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let class = config
         .get("architectures")
         .and_then(|architectures| architectures.as_array())
@@ -1087,7 +1508,11 @@ impl Placement {
         }
         let data_parallel = u32::try_from(build.data_parallel_size.get())
             .context("a data-parallel degree larger than u32::MAX")?;
-        let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
+        let expert_parallel = if build.expert_parallel {
+            data_parallel
+        } else {
+            1
+        };
         Ok(Self {
             tensor_parallel,
             tensor_rank: launch.rank % tensor_parallel,
@@ -1100,7 +1525,6 @@ impl Placement {
         })
     }
 }
-
 
 /// The phases this node's runner serves, in the numbering the scheduler plans with: one id per phase
 /// kind this plan's own buckets are launched as.
@@ -1184,7 +1608,10 @@ mod tests {
     #[test]
     fn a_qwen3_checkpoint_states_its_ends_and_its_tokenizer_names_the_beginning() {
         let directory = checkpoint(&[
-            ("config.json", r#"{"bos_token_id": null, "eos_token_id": 151645}"#),
+            (
+                "config.json",
+                r#"{"bos_token_id": null, "eos_token_id": 151645}"#,
+            ),
             (
                 "tokenizer_config.json",
                 r#"{"added_tokens_decoder": {
@@ -1206,13 +1633,19 @@ mod tests {
     #[test]
     fn the_stated_beginning_wins_and_the_generation_default_orders_the_ends() {
         let directory = checkpoint(&[
-            ("config.json", r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#),
+            (
+                "config.json",
+                r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#,
+            ),
             ("generation_config.json", r#"{"eos_token_id": 2}"#),
         ]);
 
         let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
 
-        assert_eq!(control.bos, 5, "the architecture's own beginning is the one it means");
+        assert_eq!(
+            control.bos, 5,
+            "the architecture's own beginning is the one it means"
+        );
         // `eos[0]` is what the engine gives a completion that commits none, so the generation
         // default leads and the architecture's remaining ids follow, each stated once.
         assert_eq!(control.eos, vec![2, 3]);
@@ -1279,7 +1712,11 @@ mod tests {
         let limits = understanding_limits();
 
         assert!(limits.features.contains(GenerationFeatures::UNDERSTANDING));
-        assert!(!limits.features.contains(GenerationFeatures::IMAGE_GENERATION));
+        assert!(
+            !limits
+                .features
+                .contains(GenerationFeatures::IMAGE_GENERATION)
+        );
         assert!(!limits.features.contains(GenerationFeatures::VISION_ENCODE));
         // The two figures the Qwen3 profile states as one, because zero divides and admits nothing.
         assert_eq!(limits.latent_downsample, 1);
