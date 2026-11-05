@@ -613,7 +613,6 @@ mod tests {
             configured_tokenizer(),
             "refused-handoff".into(),
             vec![client],
-            None,
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
             VideoJobOptions::default(),
@@ -655,7 +654,6 @@ mod tests {
             configured_tokenizer(),
             "refused-handoff-2".into(),
             vec![client],
-            None,
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
             VideoJobOptions::default(),

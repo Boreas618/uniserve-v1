@@ -8,7 +8,7 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use crate::tokenizer::DynTokenizer;
 
 use super::{
-    DelimitedReasoningParser, Gemma4ReasoningParser, Qwen3ReasoningParser, ReasoningParser,
+    DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser,
 };
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
