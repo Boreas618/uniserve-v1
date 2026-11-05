@@ -4020,3 +4020,52 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     handle.shutdown();
     let _ = jh.join();
 }
+
+/// An engine whose only worker group is lost, with nothing to replace it,
+/// stops admitting work: its scheduler thread ends, and a submission after
+/// that is refused rather than queued for workers that will never exist.
+///
+/// The launched-path case this states kills a rank process and makes its
+/// relaunch fail at the OS boundary. The loss here is the same event told to
+/// the simulator, and the assertion is the engine's, not the process's.
+#[test]
+fn losing_every_worker_stops_request_admission() {
+    let mut sim = SimEngine::new();
+    sim.mut_info_for_test().supported_calls = vec![
+        CallKind::Forward(ForwardMode::Prefill),
+        CallKind::Forward(ForwardMode::Decode),
+    ];
+    let mut executor = SimExecutor::new(sim);
+    let loss = executor.loss();
+    let scheduler = support::scheduler(Box::new(executor), special_tokens(), 32)
+        .expect("the scheduler is built over the simulated executor");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let commands = CommandSender::new(tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(rx));
+
+    // The deployment's only group is lost, and nothing can replace it.
+    loss.lose(
+        WorkerGroupId("sim".to_owned()),
+        "the simulated launch could not be replaced",
+    );
+
+    let died = scheduler_thread.join().expect("the scheduler thread ends");
+    assert!(
+        died,
+        "an engine without execution workers kept accepting work"
+    );
+    // A stopped engine refuses submissions instead of queueing them.
+    assert!(
+        commands
+            .submit(generation_request(
+                RequestId(2),
+                text_input(vec![7; 8]),
+                SamplingParams::default(),
+                ImageParams::default(),
+                GenerationConstraint::UndOnly,
+                4,
+            ))
+            .is_err(),
+        "a stopped engine accepted another submission"
+    );
+}
