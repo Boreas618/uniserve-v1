@@ -108,7 +108,7 @@ The baselines of all three cells are measured on today's implementation; every c
 
 | Cell | Commit | Requests | Correct | Accuracy | `decided_by_marker` / `decided_by_boxed` / `unparseable` |
 | --- | --- | --- | --- | --- | --- |
-| `qwen3-moe-gsm8k-bf16` | `0b47282ee` | 1319/1319 | 1248 | 0.946172 | not recorded at this commit; the 1249-row run at `5c6c06a0e` reported 1182 / 136 / 2 |
+| `qwen3-moe-gsm8k-bf16` | `0b47282ee` | 1319/1319 | 1248 | 0.946171 | not recorded at this commit; the 1249-row run at `5c6c06a0e` reported 1182 / 136 / 2 |
 | `qwen3-moe-gsm8k-nvfp4` | `becb9e9a5` | 1319/1319 | 1233 | 0.934799 | 1080 / 239 / 4 |
 | `qwen3-moe-gsm8k-bf16-fp8-kv` | `f1de185a2` | 1319/1319 | 1250 | 0.947688 | 1171 / 148 / 2 |
 
