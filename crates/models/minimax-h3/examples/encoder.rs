@@ -713,9 +713,13 @@ fn load_generation(device: &platform::Device, root: &Path) -> Result<ops::Genera
             installed += 1;
         }
     }
+    // The path is on the line as well as the counts: a stage that stops on a missing program is
+    // answered by *which* store it opened, and a store name in the runner's command is not the
+    // directory a harness resolved.
     println!(
-        "store: {installed} committed modules of {} operators",
-        operators.len()
+        "store: {installed} committed modules of {} operators from {}",
+        operators.len(),
+        root.display()
     );
     Ok(ops::Generation::new(1, entries))
 }
@@ -1084,11 +1088,15 @@ fn stage_encode(args: &Args) -> Result<()> {
         // while it was being written. The line names all three and the file's time, because a reader
         // who sees only "cannot be paired" will look for a defect in the pool instead.
         Some((names, sizes)) if names.len() != sizes.len() => println!(
-            "regions: {} published, {} measured, and the file holds no keys to pair them by - it was\n         \
-             written by an older build of `--stage weights`, by a run with another `--out`, or while it\n         \
-             was being written; run both stages from this binary into this directory\n         \
-             ({}, {})",
+            "regions: {} published, and the file cannot pair them by key - it holds {} keys and {} \
+             sizes, because it was written by an older build of `--stage weights`, by a run with \
+             another `--out`, or while it was being written; run both stages from this binary into \
+             this directory (a file older than the binary) ({}, {})",
             weights.published.len(),
+            // Both counts answer different questions: `0 keys` is a file from another build, and
+            // `N keys` below `M sizes` is one key published twice - two regions and one identity,
+            // which is the measurement's own arithmetic rather than a stale file.
+            names.len(),
             sizes.len(),
             measured.display(),
             written_time(&measured),
@@ -1132,8 +1140,17 @@ fn stage_encode(args: &Args) -> Result<()> {
                     weights.published.len(),
                     names.len()
                 ),
+                // A computed weight's key names the crate that produced it and a digest of the
+                // numbers it produced, so a change to that rule - or to one table's arithmetic -
+                // moves those keys without moving anything a run can see. A file from before such
+                // a change reads as a difference on exactly those names, which is why this line
+                // ends by naming the writer: the weights stage, from this build, is the fix.
                 Some(difference) => println!(
-                    "regions: {} published, {} measured, first difference {difference}",
+                    "regions: {} published, {} measured, first difference {difference}\n         \
+                     (a difference on a computed weight - a rotary table or a ones mask - is also what a\n         \
+                     file from an older build reads as: those keys carry the producing crate and a digest,\n         \
+                     so re-run `--stage weights` from this binary; a checkpoint weight that differs is not\n         \
+                     that, and wants its own look)",
                     weights.published.len(),
                     names.len()
                 ),
@@ -1258,10 +1275,20 @@ fn stage_encode(args: &Args) -> Result<()> {
     outcome?;
 
     // 8. The page: the rows and the case that says what they are. The walk is already on disk.
-    let rows = u64::from(layout.rows);
+    //
+    //    The file holds the *content* rows, because that is what the reference probe writes and what
+    //    the conditioner reads: a `[tokens, hidden]` prompt. The layout's rows are the batch's, which
+    //    is the same number for an unpadded case and larger once a case pads to a text capacity -
+    //    writing the batch's rows would then compare two different shapes, so the count is the
+    //    prompt's and the line below says which it wrote.
+    let rows = u64::from(tokens);
     let elements = usize::try_from(rows * hidden)
         .map_err(|_| Failure::message("the output is larger than this host addresses"))?;
     let payload = download(&stream, output, elements)?;
+    println!(
+        "prompt_hidden: {rows} content rows of the layout's {} ({hidden} columns)",
+        layout.rows
+    );
     println!(
         "walk: {} launches, {} distinct programs",
         walk.0.len(),

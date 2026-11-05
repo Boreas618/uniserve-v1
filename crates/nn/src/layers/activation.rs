@@ -15,8 +15,8 @@
 //! mismatched extents but cannot see a shift inside one row, so the layer's documentation is the
 //! contract the caller holds.
 
-use ops::TensorView;
 use ops::DType;
+use ops::TensorView;
 use ops::activation::{self, Activation};
 
 use crate::error::{Error, Result};
@@ -73,8 +73,9 @@ impl GatedActivation {
     ) -> Result<activation::ActAndMulDescriptor> {
         Ok(activation::ActAndMulDescriptor {
             dtype,
-            width: u32::try_from(width)
-                .map_err(|_| Error::shape("GatedActivation", "a row wider than a u32".to_owned()))?,
+            width: u32::try_from(width).map_err(|_| {
+                Error::shape("GatedActivation", "a row wider than a u32".to_owned())
+            })?,
             block: BLOCK,
             activation,
             gate_stride,

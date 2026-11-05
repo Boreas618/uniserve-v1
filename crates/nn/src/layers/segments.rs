@@ -275,7 +275,15 @@ impl VsaTiles {
         epsilon: Float,
     ) -> segments::PrepareTilesDescriptor {
         let [heads, width, rotated, tile_rows, block_rows] = geometry;
-        let [query_row, query_head, key_row, key_head, value_row, value_head, factor] = strides;
+        let [
+            query_row,
+            query_head,
+            key_row,
+            key_head,
+            value_row,
+            value_head,
+            factor,
+        ] = strides;
         segments::PrepareTilesDescriptor {
             dtype,
             heads,

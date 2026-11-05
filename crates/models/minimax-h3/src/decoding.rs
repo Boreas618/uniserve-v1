@@ -232,6 +232,7 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
 pub fn video_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
+    dtype: nn::DType,
 ) -> Result<Vec<Buffer>> {
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
@@ -259,25 +260,31 @@ pub fn video_arena(
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
         * u64::from(config.spatial_compression());
+    // **The plan's element types are the block's, not a `dtype = "auto"` assumption.** Every buffer the
+    // transformer allocates is at `VideoDecoder::dtype` (`video_vae.rs`'s `scratch`), and the rotary
+    // tables are the one exception: they are F32 whatever the decode is. A plan that spelled `f16` for
+    // both sides reserved half of what an FP32 decode needs, and the shortfall surfaced not as a plan
+    // complaint but as an arena that "cannot give out" a buffer partway through the clip.
+    let element = crate::text_encoder::element_of(dtype);
     Ok(vec![
         Buffer {
             name: "decoded".to_owned(),
-            element: "f16",
+            element,
             elements: raster * channels,
         },
         Buffer {
             name: "tokens".to_owned(),
-            element: "f16",
+            element,
             elements: rows * patch,
         },
         Buffer {
             name: "stream".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "projected".to_owned(),
-            element: "f16",
+            element,
             elements: voxels * columns,
         },
         Buffer {
@@ -292,52 +299,52 @@ pub fn video_arena(
         },
         Buffer {
             name: "normalized".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "query".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "key".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "value".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "rotated_query".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "rotated_key".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "attended".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "update".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns,
         },
         Buffer {
             name: "gate_up".to_owned(),
-            element: "f16",
+            element,
             elements: rows * 2 * columns * ffn,
         },
         Buffer {
             name: "gated".to_owned(),
-            element: "f16",
+            element,
             elements: rows * columns * ffn,
         },
     ])
@@ -888,11 +895,53 @@ mod tests {
         // Clips overlap by two latent frames: the second clip starts five frames after the first.
         assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
     }
+    /// The plan is the block's own allocation list, so its element types are the decode's - all of
+    /// them but the rotary tables, which the block allocates at F32 whatever it decodes at. A plan
+    /// that spelled one type for both reserved half of what an FP32 decode asks the arena for, and the
+    /// shortfall surfaced inside the clip as "cannot give out" rather than as a plan that was short.
+    #[test]
+    fn the_video_arena_is_stated_in_the_decodes_own_element_type() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 16, 16);
+        let tables = |plan: &[Buffer]| -> u64 {
+            plan.iter()
+                .filter(|buffer| buffer.name == "cosine" || buffer.name == "sine")
+                .map(Buffer::bytes)
+                .sum()
+        };
+        let half = video_arena(&config, &canvas, nn::DType::F16).expect("the f16 plan");
+        let whole = video_arena(&config, &canvas, nn::DType::F32).expect("the f32 plan");
+        let total = |plan: &[Buffer]| -> u64 { plan.iter().map(Buffer::bytes).sum() };
+        // Every typed entry doubles, and the two tables do not: the F32 plan is the F16 plan plus the
+        // typed half, with the tables counted once on both sides.
+        assert_eq!(
+            total(&whole),
+            2 * total(&half) - tables(&half),
+            "the f32 plan is the f16 plan with every typed buffer doubled and the tables counted once"
+        );
+        assert_eq!(
+            tables(&whole),
+            tables(&half),
+            "a rotary table is F32 at both"
+        );
+        for (one, other) in half.iter().zip(&whole) {
+            assert_eq!(one.name, other.name, "the two plans name the same buffers");
+            assert_eq!(one.elements, other.elements, "and hold the same elements");
+            let expected = if one.name == "cosine" || one.name == "sine" {
+                "f32"
+            } else {
+                "f16"
+            };
+            assert_eq!(one.element, expected, "{} at f16", one.name);
+            assert_eq!(other.element, "f32", "{} at f32", one.name);
+        }
+    }
+
     #[test]
     fn the_video_arena_holds_all_tiles_of_one_clip() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
-        let arena = video_arena(&config, &canvas).expect("the arena");
+        let arena = video_arena(&config, &canvas, nn::DType::F16).expect("the arena");
         // The served 768x1344 canvas at 256/64 is 4 rows of 7 tiles, each 16x16 latent voxels of
         // 7 frames.
         assert_eq!(canvas.frames, 7);
