@@ -1395,6 +1395,25 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
+                    // §2.5: a standby is promoted to serve the generation the epoch prepared in it.
+                    // A promotion that finds nothing prepared - the precopy was discarded, or the
+                    // epoch moved on before it ran - is a promotion of a process that cannot serve,
+                    // and it is refused here, by name, before admission opens: `Promoted` followed
+                    // by a first request that finds no graph would tell the daemon the promotion
+                    // succeeded and move the frontend onto a process with no kernels.
+                    if let Some(reason) = promote_refusal(self.standby, self.prepared.len()) {
+                        tracing::warn!(%reason, "a promotion this process cannot serve is refused");
+                        self.send_report(proto::process::Report {
+                            kind: Some(proto::process::report::Kind::Fault(
+                                proto::process::Fault {
+                                    kind: "promote".to_owned(),
+                                    reason: reason.clone(),
+                                    device: 0,
+                                },
+                            )),
+                        });
+                        bail!("{reason}");
+                    }
                     // §2.5: the promotion runs on the addresses the predecessor's segments held, so
                     // they are mapped again before anything is admitted, and a wake that fails fails
                     // the promotion by name.
@@ -5137,6 +5156,21 @@ impl HostAction for Install {
     }
 }
 
+/// Why a promotion this process cannot serve is refused, or `None` when it can serve.
+///
+/// A standby is promoted to serve the generation the epoch prepared in it (§2.5), and nothing in
+/// `Promote` states that generation - the message is empty and `Promoted` answers with the launch
+/// number the epoch layer promotes by - so this process cannot tell a generation the epoch still
+/// holds from one it has reverted. What it *can* tell is whether it holds a generation at all: a
+/// promotion with nothing prepared is a process that would open admission with no kernel and no
+/// graph, and answer `Promoted` to a daemon that then moves the frontend onto it.
+fn promote_refusal(standby: bool, prepared: usize) -> Option<String> {
+    (standby && prepared == 0).then(|| {
+        "this standby holds no prepared generation: its precopy was discarded or never ran, so          promoting it would serve a generation this process does not hold"
+            .to_owned()
+    })
+}
+
 /// The operators whose programs differ between what serves and what a precopy prepared (§7.3).
 ///
 /// `changed` is not `new`. An operator the prepared generation holds and the serving one does not
@@ -6120,6 +6154,28 @@ mod tests {
         );
         assert_eq!(slots.len(), 1, "an overlapping split was stated");
         assert_eq!(slots[0].1.backend, "fa4");
+    }
+
+    /// A promotion with nothing prepared is refused, and one with a generation is not: the engine
+    /// cannot see the epoch's current generation (`Promote` states none), so what it can refuse is
+    /// a process that holds none at all.
+    #[test]
+    fn a_promotion_with_nothing_prepared_is_refused_and_one_with_a_generation_is_not() {
+        assert!(
+            promote_refusal(true, 0).is_some(),
+            "a standby with nothing prepared would have been promoted into an empty generation"
+        );
+        assert!(
+            promote_refusal(true, 1).is_none(),
+            "a standby holding its prepared generation was refused"
+        );
+        assert!(
+            promote_refusal(false, 0).is_none(),
+            "an initial process, which is never promoted, was refused"
+        );
+        let reason = promote_refusal(true, 0).unwrap_or_default();
+        assert!(reason.contains("no prepared generation"), "{reason}");
+        assert!(reason.contains("discarded"), "{reason}");
     }
 
     /// A slot's keys are the ones its phase owns: a generation that holds two packages of one
