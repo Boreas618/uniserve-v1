@@ -40,9 +40,16 @@ files = ["src/build.py"]
 script = "src/build.py"
 
 [parameters]
-chunked_prefill_size = 8192
-max_batch = 128
-max_num_batched_tokens = 8192
+# The limits are this fixture's *deployment's*, not the guest's defaults: a
+# policy whose limits exceed the epoch's build config is refused by name
+# (`crates/scheduling/src/limits.rs`), and the delivery test's configuration
+# states the prefill graph's largest token count and its decode batch sizes
+# (`OPTIONS` in `tests/python/e2e/test_live_updates_http.py`:
+# `cuda_graph_config.prefill_token_sizes=[512]` and
+# `decode_batch_sizes=[1, 2, 4, 8]`). A limit above those refuses the epoch.
+chunked_prefill_size = 512
+max_batch = 8
+max_num_batched_tokens = 512
 prefetch_min_tokens = 256
 # Nanoseconds, as `scheduling_guest::limits::Parameters` reads a duration: the
 # fixture states its cap rather than taking the guest's default of the same 30 s.
