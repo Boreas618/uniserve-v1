@@ -2,14 +2,13 @@
 //!
 //! The chat output tool stage (`output::chat`) feeds visible
 //! assistant text chunk by chunk to a [`ToolParser`]: `Qwen25ToolParser`
-//! for Qwen3 and `Gemma4ToolParser` for Gemma-4. The parser turns each chunk
+//! for Qwen3. The parser turns each chunk
 //! into an ordered sequence of plain text and `ToolCallDelta` updates, holding
 //! back bytes it cannot classify yet, such as a partial marker or an
 //! incomplete tool call.
 
 #[macro_use]
 mod error;
-mod gemma4;
 mod json;
 #[cfg(test)]
 mod test_utils;
@@ -18,7 +17,6 @@ mod utils;
 use proto::handoff;
 
 pub use error::{Result, ToolParserError};
-pub use gemma4::Gemma4ToolParser;
 pub use json::Qwen25ToolParser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,7 +97,7 @@ pub struct ToolCallDelta {
     /// Arguments text contributed by this update. Concatenating every update
     /// for one `tool_index` yields the call's arguments as JSON text.
     /// `Qwen25ToolParser` forwards the JSON exactly as the model wrote it,
-    /// neither parsed nor normalized; `Gemma4ToolParser` translates Gemma-4's
+    /// neither parsed nor normalized; `Qwen25ToolParser` translates Qwen3's
     /// native argument encoding into JSON.
     pub arguments: String,
 }

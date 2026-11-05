@@ -2,6 +2,10 @@
 //! real CPU worker processes over the channel.
 
 #![cfg(test)]
+// A case that loses its `#[test]` compiles as a private function and runs nothing;
+// the only signal is a dead-code warning, and a warning nobody reads during a
+// green run is how one stayed silent. Denied here so it is a build failure.
+#![deny(dead_code)]
 
 mod boot;
 mod cache_storage;

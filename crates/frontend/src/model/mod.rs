@@ -23,23 +23,19 @@ pub mod generation;
 // discovery share it immutably.
 //
 // The checkpoint's files are resolved and read here ([`assets`]); what a
-// family makes of them is the family's rules in the `models` crate (the
-// multimodal profiles of `models::omni`, the DiffusionGemma facts of
-// `models::diffusion_gemma`), which read the checkpoint's tokenizer
-// (`crate::tokenizer`) through `models::Vocabulary`. The streaming reasoning
+// family makes of them is the family's rules in the `models` crate, which read
+// the checkpoint's tokenizer (`crate::tokenizer`) through
+// `models::Vocabulary`. The streaming reasoning
 // and tool-call parsers are output processing's (`crate::output`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use models::ModelDescription;
-use models::diffusion_gemma::DiffusionGemmaProfile;
-use models::omni::bagel::BagelProfile;
-use models::omni::sensenova::SenseNovaProfile;
 
 use crate::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
-    load_model_config, load_tokenizer_config, read_json,
+    load_model_config, load_tokenizer_config,
 };
 use crate::tokenizer::HuggingFaceTokenizer;
 
@@ -66,17 +62,11 @@ pub struct SamplingDefaults {
 pub enum ModelParameters {
     /// Qwen3 chat framing and structured text output.
     Qwen3,
-    /// SenseNova image, prompt, and generation settings.
-    SenseNova(SenseNovaProfile),
-    /// Bagel image, prompt, and generation settings.
-    Bagel(BagelProfile),
     /// MiniMax-H3 video generation. What the placed denoiser serves (tasks,
     /// schedule, canvases) belongs to the loaded worker, whose startup
     /// handshake reports it, and the duration capacity to the deployment's
     /// engine settings.
     MiniMaxH3,
-    /// DiffusionGemma canvas, control-token, image, and sampler settings.
-    DiffusionGemma(DiffusionGemmaProfile),
 }
 
 /// Immutable model facts shared by startup, request preprocessing, and discovery.
@@ -106,26 +96,18 @@ impl ModelConfig {
     pub const DEFAULT_MAX_MODEL_LEN: u32 = 8192;
     /// Resolves vocabulary, checkpoint defaults, and model-specific settings once.
     ///
-    /// The family comes from the `model_type` of `files.config_path`, which
-    /// were resolved for the checkpoint `model` (a local directory or Hub
-    /// repository id). Bagel also reads its latent position grid side from
-    /// the checkpoint's safetensors header (see
-    /// `read_bagel_max_latent_size`), and DiffusionGemma its canvas,
-    /// image, and sampler settings (see `DiffusionGemmaProfile::resolve`). A
+    /// The family comes from the `model_type` of `files.config_path`. A
     /// configured `max_model_len` takes precedence over the checkpoint's
     /// `max_position_embeddings`, and
     /// [`ModelConfig::DEFAULT_MAX_MODEL_LEN`] applies when neither is set.
     ///
     /// # Errors
     ///
-    /// Fails when a present metadata file cannot be read or parsed, when
+    /// Fails when a present metadata file cannot be read or parsed, or when
     /// `model_type` is missing or names no family served from a root
-    /// configuration, when a multimodal or DiffusionGemma profile cannot
-    /// resolve its control tokens from `tokenizer`, when DiffusionGemma
-    /// metadata lacks a required field, or when Bagel's latent position table
-    /// cannot be read.
+    /// configuration.
     pub async fn from_files(
-        model: &str,
+        _model: &str,
         files: &ResolvedModelFiles,
         max_model_len: Option<u32>,
         tokenizer: &HuggingFaceTokenizer,
@@ -150,27 +132,6 @@ impl ModelConfig {
 
         let parameters = match description {
             ModelDescription::Qwen3 => ModelParameters::Qwen3,
-            ModelDescription::SenseNova => {
-                ModelParameters::SenseNova(SenseNovaProfile::resolve(tokenizer)?)
-            }
-            ModelDescription::Bagel => {
-                // Read before the vocabulary is borrowed, which a task's
-                // future may not hold across an await.
-                let max_latent_size = read_bagel_max_latent_size(model).await?;
-                ModelParameters::Bagel(BagelProfile::resolve(tokenizer, max_latent_size)?)
-            }
-            ModelDescription::DiffusionGemma => {
-                let config_path = files.config_path.as_deref().ok_or_else(|| {
-                    assets::Error::invalid(
-                        "a DiffusionGemma checkpoint requires its root config.json",
-                    )
-                })?;
-                ModelParameters::DiffusionGemma(DiffusionGemmaProfile::resolve(
-                    read_json(config_path)?,
-                    &generation_config.denoising,
-                    tokenizer,
-                )?)
-            }
             // `from_model_type` resolves only families described by a root
             // configuration; a pipeline family resolves through `from_pipeline`.
             ModelDescription::MiniMaxH3 => {
@@ -180,22 +141,7 @@ impl ModelConfig {
             }
         };
 
-        // The multimodal families sample greedily over the full vocabulary
-        // unless a request says otherwise; their checkpoints contribute only
-        // the default generation length.
-        let mut sampling_defaults = generation_defaults(&generation_config);
-        if matches!(
-            parameters,
-            ModelParameters::SenseNova(_) | ModelParameters::Bagel(_)
-        ) {
-            sampling_defaults = SamplingDefaults {
-                temperature: Some(0.0),
-                top_p: Some(1.0),
-                top_k: Some(0),
-                max_output_tokens: sampling_defaults.max_output_tokens,
-                ..SamplingDefaults::default()
-            };
-        }
+        let sampling_defaults = generation_defaults(&generation_config);
 
         Ok(Self {
             parameters,
@@ -229,10 +175,7 @@ impl ModelConfig {
             // default is the prompt length a deployment prepares layouts and
             // storage for: startup prepares every text capacity up to it.
             ModelDescription::MiniMaxH3 => (ModelParameters::MiniMaxH3, 16_384),
-            ModelDescription::Qwen3
-            | ModelDescription::SenseNova
-            | ModelDescription::Bagel
-            | ModelDescription::DiffusionGemma => {
+            ModelDescription::Qwen3 => {
                 return Err(assets::Error::UnsupportedPipeline {
                     class_name: description.id().to_owned(),
                 });
@@ -252,45 +195,11 @@ impl ModelConfig {
     pub const fn description(&self) -> ModelDescription {
         match &self.parameters {
             ModelParameters::Qwen3 => ModelDescription::Qwen3,
-            ModelParameters::SenseNova(_) => ModelDescription::SenseNova,
-            ModelParameters::Bagel(_) => ModelDescription::Bagel,
             ModelParameters::MiniMaxH3 => ModelDescription::MiniMaxH3,
-            ModelParameters::DiffusionGemma(_) => ModelDescription::DiffusionGemma,
         }
     }
 }
 
-/// Reads the side of a Bagel checkpoint's learned latent position grid, in
-/// latent patches.
-///
-/// The side comes from the latent position table's row count
-/// (`BagelProfile::LATENT_POSITION_TABLE`) in the header of the first present
-/// primary checkpoint file (`BagelProfile::PRIMARY_CHECKPOINT`), as the
-/// worker's `read_config` derives it.
-///
-/// # Errors
-///
-/// Returns the [`assets::resolve_tensor_shape`] errors, and
-/// [`assets::Error::Invalid`] when the table is not two-dimensional with a
-/// square, nonzero row count.
-async fn read_bagel_max_latent_size(model: &str) -> assets::Result<u32> {
-    let shape = assets::resolve_tensor_shape(
-        model,
-        &BagelProfile::PRIMARY_CHECKPOINT,
-        BagelProfile::LATENT_POSITION_TABLE,
-    )
-    .await?;
-    let side = match shape.as_slice() {
-        [rows, _hidden] => Some(rows.isqrt()).filter(|side| *side > 0 && side * side == *rows),
-        _ => None,
-    };
-    side.and_then(|side| u32::try_from(side).ok())
-        .ok_or_else(|| {
-            assets::Error::invalid(format!(
-                "Bagel latent position table must be a square grid, found shape {shape:?}"
-            ))
-        })
-}
 
 /// Extracts serving generation defaults from repository configuration.
 fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
@@ -335,17 +244,13 @@ fn stop_token_ids(
 mod tests {
     use std::fs;
 
-    use proto::request::GenerationConstraint;
     use tempfile::tempdir;
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
-    use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
+    use super::{ModelConfig, ModelDescription, ModelParameters};
     use crate::model::assets::ResolvedModelFiles;
-    use crate::model::assets::checkpoint::bf16_safetensors;
     use crate::tokenizer::HuggingFaceTokenizer;
-    use models::omni::OmniProfile as _;
-    use models::omni::sensenova::SenseNovaProfile;
 
     const SPECIAL_TOKENS: &[&str] = &[
         "<|im_start|>",
@@ -411,15 +316,6 @@ mod tests {
             chat_template_path: None,
             config_path: Some(config_path),
         };
-        // Bagel reads its latent position grid from the primary checkpoint:
-        // a 64x64 table, as in the published checkpoint.
-        if model_type == "bagel" {
-            fs::write(
-                directory.path().join("ema.safetensors"),
-                bf16_safetensors(&[("latent_pos_embed.pos_embed", &[4096, 8])]),
-            )
-            .expect("write checkpoint");
-        }
         (directory, files)
     }
 
@@ -445,8 +341,6 @@ mod tests {
             (ModelDescription::Qwen3, "qwen3"),
             (ModelDescription::Qwen3, "qwen3_moe"),
             (ModelDescription::Qwen3, "qwen3_5"),
-            (ModelDescription::SenseNova, "neo_chat"),
-            (ModelDescription::Bagel, "bagel"),
         ] {
             let (_directory, _tokenizer, profile) = resolved_config(model_type).await;
             let profile = profile.unwrap();
@@ -455,45 +349,8 @@ mod tests {
             assert_eq!(profile.sampling_defaults.max_output_tokens, Some(512));
             match profile.parameters {
                 ModelParameters::Qwen3 => assert_eq!(description, ModelDescription::Qwen3),
-                ModelParameters::SenseNova(profile) => {
-                    assert_eq!(description, ModelDescription::SenseNova);
-                    assert_eq!(
-                        profile.resolution_policy.default.name,
-                        models::omni::resolution::ResolutionName::Landscape16x9
-                    );
-                    assert_eq!(
-                        profile
-                            .image_encoders
-                            .iter()
-                            .map(|input| input.encoder)
-                            .collect::<Vec<_>>(),
-                        vec![proto::request::ImageEncoder::Vision]
-                    );
-                    assert!(profile.image_generation.feedback_source.is_some());
-                }
-                ModelParameters::Bagel(profile) => {
-                    assert_eq!(description, ModelDescription::Bagel);
-                    assert!(profile.resolution_policy.allow_custom);
-                    // 64 latent patches of 16 pixels per canvas side.
-                    assert_eq!(profile.resolution_policy.max_side, Some(1024));
-                    assert_eq!(
-                        profile
-                            .image_encoders
-                            .iter()
-                            .map(|input| input.encoder)
-                            .collect::<Vec<_>>(),
-                        vec![
-                            proto::request::ImageEncoder::Latent,
-                            proto::request::ImageEncoder::Vision
-                        ]
-                    );
-                    assert!(profile.image_generation.feedback_source.is_some());
-                }
                 ModelParameters::MiniMaxH3 => {
                     assert_eq!(description, ModelDescription::MiniMaxH3);
-                }
-                ModelParameters::DiffusionGemma(_) => {
-                    assert_eq!(description, ModelDescription::DiffusionGemma);
                 }
             }
         }
@@ -512,24 +369,6 @@ mod tests {
         assert_eq!(profile.max_model_len, 16_384);
     }
 
-    /// A Bagel latent position table whose rows do not form a square grid
-    /// yields no per-axis bound and is refused.
-    #[tokio::test]
-    async fn a_non_square_bagel_position_table_is_invalid() {
-        let directory = tempdir().unwrap();
-        fs::write(
-            directory.path().join("ema.safetensors"),
-            bf16_safetensors(&[("latent_pos_embed.pos_embed", &[4000, 8])]),
-        )
-        .unwrap();
-
-        let error = super::read_bagel_max_latent_size(directory.path().to_str().unwrap())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, crate::model::assets::Error::Invalid(_)));
-    }
-
     #[tokio::test]
     async fn unsupported_repository_model_type_is_rejected() {
         let (_directory, _tokenizer, config) = resolved_config("llama").await;
@@ -540,227 +379,4 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn omni_descriptions_define_prompt_framing_and_image_geometry() {
-        let (_directory, tokenizer, config) = resolved_config("neo_chat").await;
-        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        let prompt = profile
-            .render_prompt_ids(
-                &tokenizer,
-                GenerationConstraint::GenOnly,
-                "draw a lighthouse",
-            )
-            .unwrap();
-        let rendered = tokenizer.decode(&prompt, false).unwrap();
-        assert!(rendered.starts_with("<|im_start|>system\nYou are an image generation"));
-        assert!(rendered.contains("You support two modes:"));
-        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n<img>"));
-        let negative = profile.render_negative_prompt_ids(&tokenizer, "").unwrap();
-        let rendered_negative = tokenizer.decode(&negative, false).unwrap();
-        assert!(rendered_negative.starts_with("<|im_start|>system\nYou are an image generation"));
-        assert!(rendered_negative.ends_with("<|im_start|>assistant\n<img>"));
-
-        // 2048x1152 is already 32-aligned and inside the pixel bounds, so it
-        // yields a 64x36 grid; generated-image feedback adds one marker token.
-        let ingest = profile
-            .image_encoders_for_dimensions(2048, 1152, 1)
-            .unwrap();
-        assert_eq!(
-            ingest
-                .iter()
-                .map(|input| input.num_cache_tokens)
-                .collect::<Vec<_>>(),
-            vec![Some(2304)]
-        );
-        let policy = profile.image_generation_for_dimensions(2048, 1152).unwrap();
-        assert_eq!(
-            policy
-                .feedback_encoders
-                .iter()
-                .map(|input| input.num_cache_tokens)
-                .collect::<Vec<_>>(),
-            vec![Some(2305)]
-        );
-
-        let (_directory, tokenizer, config) = resolved_config("bagel").await;
-        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        let prompt = profile
-            .render_prompt_ids(
-                &tokenizer,
-                GenerationConstraint::Default,
-                "draw a lighthouse",
-            )
-            .unwrap();
-        let rendered = tokenizer.decode(&prompt, false).unwrap();
-        assert!(rendered.starts_with("<|im_start|>You should first think"));
-        assert!(rendered.ends_with("<|im_start|>assistant\n"));
-
-        // VAE: 1024x512 at stride 16 is a 64x32 grid. ViT: the VAE canvas is
-        // resized to 980x490 at stride 14, a 70x35 grid. Both add two markers.
-        let ingest = profile.image_encoders_for_dimensions(1024, 512, 1).unwrap();
-        assert_eq!(
-            ingest
-                .iter()
-                .map(|input| input.num_cache_tokens)
-                .collect::<Vec<_>>(),
-            vec![Some(2050), Some(2452),]
-        );
-        let policy = profile.image_generation_for_dimensions(512, 512).unwrap();
-        assert_eq!(
-            policy
-                .feedback_encoders
-                .iter()
-                .map(|input| input.num_cache_tokens)
-                .collect::<Vec<_>>(),
-            vec![Some(1026)]
-        );
-    }
-
-    /// The generation limits bound the cache tokens of every image a profile
-    /// admits: the largest input image, the feedback of each canvas, and, for
-    /// SenseNova, the grid of each fixed bucket.
-    #[tokio::test]
-    async fn generation_limits_cover_every_image_the_profiles_admit() {
-        let (_directory, _tokenizer, config) = resolved_config("neo_chat").await;
-        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        let limits = profile.runtime_limits(proto::request::ModelDtype::BFloat16);
-        for (width, height) in [(8192, 8192), (2048, 2048), (512, 512), (4096, 1024)] {
-            let ingest = profile
-                .image_encoders_for_dimensions(width, height, 1)
-                .unwrap();
-            assert!(ingest[0].num_cache_tokens.unwrap() <= limits.max_vit_grid_tokens);
-        }
-        for bucket in &profile.resolution_policy.buckets {
-            let feedback = profile
-                .image_generation_for_dimensions(bucket.width, bucket.height)
-                .unwrap();
-            assert!(
-                feedback.feedback_encoders[0].num_cache_tokens.unwrap()
-                    <= limits.max_vit_grid_tokens
-            );
-            let units = u64::from(bucket.width / SenseNovaProfile::LATENT_DOWNSAMPLE)
-                * u64::from(bucket.height / SenseNovaProfile::LATENT_DOWNSAMPLE);
-            assert!(units <= u64::from(limits.max_vae_grid_tokens));
-        }
-
-        let (_directory, _tokenizer, config) = resolved_config("bagel").await;
-        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        let limits = BagelProfile::runtime_limits(proto::request::ModelDtype::BFloat16);
-        for (width, height) in [(8192, 8192), (1024, 1024), (1024, 512), (3000, 2000)] {
-            let ingest = profile
-                .image_encoders_for_dimensions(width, height, 1)
-                .unwrap();
-            assert!(ingest[0].num_cache_tokens.unwrap() <= limits.max_vae_grid_tokens);
-            assert!(ingest[1].num_cache_tokens.unwrap() <= limits.max_vit_grid_tokens);
-            let feedback = profile
-                .image_generation_for_dimensions(width, height)
-                .unwrap();
-            assert!(
-                feedback.feedback_encoders[0].num_cache_tokens.unwrap()
-                    <= limits.max_vae_grid_tokens
-            );
-        }
-    }
-
-    /// SenseNova input images share one pixel budget per request, so an
-    /// image's cache tokens depend on how many input images the request
-    /// carries. The cases are shared with the worker's image preparation test.
-    #[tokio::test]
-    async fn sensenova_image_tokens_share_the_request_pixel_budget() {
-        #[derive(serde::Deserialize)]
-        struct Fixture {
-            cases: Vec<Case>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Case {
-            width: u32,
-            height: u32,
-            input_images: usize,
-            cache_tokens: u32,
-        }
-        let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../../../tests/python/fixtures/sensenova_image_resize.json"
-        ))
-        .unwrap();
-
-        let (_directory, _tokenizer, config) = resolved_config("neo_chat").await;
-        let ModelParameters::SenseNova(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        for case in fixture.cases {
-            let ingest = profile
-                .image_encoders_for_dimensions(case.width, case.height, case.input_images)
-                .unwrap();
-            assert_eq!(
-                ingest
-                    .iter()
-                    .map(|input| input.num_cache_tokens)
-                    .collect::<Vec<_>>(),
-                vec![Some(case.cache_tokens)],
-                "{}x{} among {} input images",
-                case.width,
-                case.height,
-                case.input_images
-            );
-        }
-    }
-
-    /// Bagel cache-token predictions equal the worker's resize for images whose
-    /// resize scale is not one. The cases are shared with the worker's image
-    /// preparation test, so both sides are checked against the same numbers.
-    #[tokio::test]
-    async fn bagel_image_tokens_follow_the_worker_resize() {
-        #[derive(serde::Deserialize)]
-        struct Fixture {
-            cases: Vec<Case>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Case {
-            width: u32,
-            height: u32,
-            vae_cache_tokens: u32,
-            vit_cache_tokens: u32,
-        }
-        let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../../../tests/python/fixtures/bagel_image_resize.json"
-        ))
-        .unwrap();
-
-        let (_directory, _tokenizer, config) = resolved_config("bagel").await;
-        let ModelParameters::Bagel(profile) = config.unwrap().parameters else {
-            unreachable!()
-        };
-        for case in fixture.cases {
-            let size = (case.width, case.height);
-            let ingest = profile
-                .image_encoders_for_dimensions(case.width, case.height, 1)
-                .unwrap();
-            assert_eq!(
-                ingest
-                    .iter()
-                    .map(|input| input.num_cache_tokens)
-                    .collect::<Vec<_>>(),
-                vec![Some(case.vae_cache_tokens), Some(case.vit_cache_tokens)],
-                "input image {size:?}"
-            );
-
-            // Generated-image feedback re-encodes through the same VAE resize.
-            let policy = profile
-                .image_generation_for_dimensions(case.width, case.height)
-                .unwrap();
-            assert_eq!(
-                policy.feedback_encoders[0].num_cache_tokens,
-                Some(case.vae_cache_tokens),
-                "generated image {size:?}"
-            );
-        }
-    }
 }
