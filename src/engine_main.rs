@@ -3228,15 +3228,17 @@ impl MainProcess {
         }
         self.policy_probe_at = None;
 
+        // The scheduler's own signal, not a reading of its policy slot: `note_policy_serves` fires
+        // where a policy actually adopts, so a probe cannot disagree with the fact it reports. A
+        // probe that finds every scheduler serving clears the missing state and says nothing - a log
+        // that states both that a policy serves and that none was installed is worse than either.
         let serving = self
             .schedulers
             .iter()
-            .filter(|scheduler| scheduler.policy_mut().running().is_some())
+            .filter(|scheduler| *scheduler.serving().borrow())
             .count();
         if serving == self.schedulers.len() {
-            if self.policy_missing_since.take().is_some() {
-                tracing::info!(serving, "the switchover's policy serves every scheduler");
-            }
+            self.policy_missing_since = None;
             return Ok(None);
         }
         if !running.is_empty() {
@@ -4064,14 +4066,30 @@ impl MainProcess {
     /// policy. `step` is the boundary the epoch's schedulers agreed on, which only the scheduler
     /// node can name; the control thread does not choose one.
     fn switchover_policy(&self, generation: u64, _step: Option<u64>) {
-        // Before the switch, how many schedulers hold a prepared candidate: a first switchover with
-        // none adopts nothing, serves nothing, raises nothing, and the run says only that no policy
-        // was installed - which names the symptom and not the side of the switch it came from.
+        // This states the candidate, not the serving policy: a scheduler adopts at its next batch
+        // boundary, which is after this returns, so a "serving" figure here would be a second
+        // statement of a fact `serving()` reports - and the two disagreed in a run. What this can
+        // say is whether anything was prepared to adopt.
         let prepared = self
             .schedulers
             .iter()
             .filter(|scheduler| scheduler.policy_mut().prepared().is_some())
             .count();
+        if prepared == self.schedulers.len() {
+            tracing::info!(
+                generation,
+                prepared,
+                schedulers = self.schedulers.len(),
+                "every scheduler holds a prepared policy candidate"
+            );
+        } else {
+            tracing::warn!(
+                generation,
+                prepared,
+                schedulers = self.schedulers.len(),
+                "a scheduler holds no prepared policy candidate: a switchover adopts nothing there"
+            );
+        }
         for scheduler in &self.schedulers {
             if let Err(error) = answer(
                 scheduler.switchover_policy(),
@@ -4080,27 +4098,6 @@ impl MainProcess {
             ) {
                 tracing::error!(%error, "switching the scheduling policy failed");
             }
-        }
-        let serving = self
-            .schedulers
-            .iter()
-            .filter(|scheduler| scheduler.policy_mut().running().is_some())
-            .count();
-        if serving == self.schedulers.len() {
-            tracing::info!(
-                generation,
-                prepared,
-                serving,
-                "the switchover's policy serves every scheduler"
-            );
-        } else {
-            tracing::warn!(
-                generation,
-                prepared,
-                serving,
-                schedulers = self.schedulers.len(),
-                "the policy switchover left a scheduler without a serving policy"
-            );
         }
     }
 
