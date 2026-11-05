@@ -714,7 +714,8 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 use nn::Forward;
 use nn::layers::{
     Activation, AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad,
-    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
+    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose,
+    WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1250,7 +1251,6 @@ struct LevelSet {
 }
 
 impl VideoEncoder {
-
     /// The programs the video encoder launches, from the configuration alone and one list of rasters.
     ///
     /// **The raster is load-bearing here, unlike everywhere else in this model**: three of the
@@ -1311,71 +1311,71 @@ impl VideoEncoder {
         for (height, width) in rasters {
             // The encoder reads one still or one clip, and the clip's length is the configuration's.
             for frames in [1, stack.clip.frames] {
-            let extents = stack.extents(Extent {
-                frames,
-                height: *height,
-                width: *width,
-            });
-            // The input convolution reads padded pixels and normalizes nothing of its own.
-            pad(&mut programs, u64::from(*width) + 2);
-            // Each level's blocks run at the level's incoming extent and its incoming width.
-            for (index, out) in stack.widths.iter().enumerate() {
-                let extent = extents[index];
-                let channels = if index == 0 {
-                    stack.input_channels
-                } else {
-                    stack.widths[index - 1]
-                };
-                let pixels = u64::from(extent.height) * u64::from(extent.width);
-                let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
-                // The level's downsampler reads a padded frame of its own.
-                pad(&mut programs, u64::from(extent.width) + 2);
-                // Each block takes the statistics of its input and then the fused normalize-pad of the
-                // same frame; the classes follow from the frame and are deduplicated by `finish`.
-                for _ in 0..stack.blocks {
-                    programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
-                        dtype,
-                        u64::from(channels),
-                        pixels,
-                        groups,
-                        epsilon,
-                    ));
-                    programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
-                        dtype,
-                        u64::from(channels),
-                        pixels,
-                        groups,
-                        false,
-                        true,
-                        padded,
-                    ));
-                    // The block's residual add covers the whole level: `frames · extent · channels`.
-                    let columns = u64::from(extent.frames) * pixels * u64::from(*out);
-                    if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                        programs.launch::<ScaledAddOp>(&descriptor);
+                let extents = stack.extents(Extent {
+                    frames,
+                    height: *height,
+                    width: *width,
+                });
+                // The input convolution reads padded pixels and normalizes nothing of its own.
+                pad(&mut programs, u64::from(*width) + 2);
+                // Each level's blocks run at the level's incoming extent and its incoming width.
+                for (index, out) in stack.widths.iter().enumerate() {
+                    let extent = extents[index];
+                    let channels = if index == 0 {
+                        stack.input_channels
+                    } else {
+                        stack.widths[index - 1]
+                    };
+                    let pixels = u64::from(extent.height) * u64::from(extent.width);
+                    let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
+                    // The level's downsampler reads a padded frame of its own.
+                    pad(&mut programs, u64::from(extent.width) + 2);
+                    // Each block takes the statistics of its input and then the fused normalize-pad of the
+                    // same frame; the classes follow from the frame and are deduplicated by `finish`.
+                    for _ in 0..stack.blocks {
+                        programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                            dtype,
+                            u64::from(channels),
+                            pixels,
+                            groups,
+                            epsilon,
+                        ));
+                        programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                            dtype,
+                            u64::from(channels),
+                            pixels,
+                            groups,
+                            false,
+                            true,
+                            padded,
+                        ));
+                        // The block's residual add covers the whole level: `frames · extent · channels`.
+                        let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                        if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                            programs.launch::<ScaledAddOp>(&descriptor);
+                        }
                     }
                 }
-            }
-            // The output normalization convolves the last level's extent at the last width.
-            let last = extents[stack.widths.len()];
-            let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
-            let pixels = u64::from(last.height) * u64::from(last.width);
-            programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
-                dtype,
-                u64::from(channels),
-                pixels,
-                groups,
-                epsilon,
-            ));
-            programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
-                dtype,
-                u64::from(channels),
-                pixels,
-                groups,
-                false,
-                true,
-                (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
-            ));
+                // The output normalization convolves the last level's extent at the last width.
+                let last = extents[stack.widths.len()];
+                let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
+                let pixels = u64::from(last.height) * u64::from(last.width);
+                programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                    dtype,
+                    u64::from(channels),
+                    pixels,
+                    groups,
+                    epsilon,
+                ));
+                programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                    dtype,
+                    u64::from(channels),
+                    pixels,
+                    groups,
+                    false,
+                    true,
+                    (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
+                ));
             }
         }
 
@@ -1783,11 +1783,11 @@ impl AudioEncoder {
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
         use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::adaptive_pool::AdaptivePool as PoolOp;
         use ops::attention::dense::DenseAttention;
         use ops::conv::Conv1d as Conv1dOp;
         use ops::gemm::Gemm;
         use ops::norm::LayerNorm as LayerNormOp;
-        use ops::adaptive_pool::AdaptivePool as PoolOp;
         use ops::residual::ScaledAdd as ScaledAddOp;
         use ops::snake::Snake as SnakeOp;
         use ops::transpose::Transpose as TransposeOp;
@@ -1852,7 +1852,11 @@ impl AudioEncoder {
         // backend serves the packed form only, and no package serves f16 unpacked — which is why this
         // row names `cu_seq_lens_false` and must.
         programs.launch::<DenseAttention>(&attention.dense_descriptor(
-            dtype, dtype, dtype, LONGEST_TRACK, false,
+            dtype,
+            dtype,
+            dtype,
+            LONGEST_TRACK,
+            false,
         ));
         programs.launch::<PoolOp>(
             &AdaptivePool::new(
@@ -2042,17 +2046,20 @@ impl AudioEncoder {
         let length = shape.dim(2);
         let frames = self.frames(length)?;
         // The network's stages divide the length exactly, so a track that is not a whole number of
-        // latent frames is right-padded with zeros to one, which is what the reference's
-        // `unpack_samples` does before it convolves. Writing that pad needs a zero-fill the operator set
-        // does not have yet (a `zero_pad` over the trailing axis); until it exists this is refused by
-        // name rather than truncated, because truncating drops the last latent frame.
+        // latent frames must be right-padded with zeros to one - what the reference's `unpack_samples`
+        // does before it convolves. **The pad is the caller's**, and that is not a punt: the padded
+        // span depends on the request's own sample count, so it is a request buffer, which the runner
+        // allocates and may fill on the host before it uploads. `padded_samples` states the length and
+        // this refusal states the length too, so a caller that meets it needs no operator: truncating
+        // instead would drop the last latent frame, which is why this is a refusal and not a rounding.
         let hop = self.hop();
         if !length.is_multiple_of(hop) {
             let padded = padded_samples(length, hop)?;
             return Err(Error::config(format!(
-                "{length} samples is not a whole number of {hop}-sample latent frames: the reference \
-                 right-pads the track with zeros to {padded} samples and this build has no zero-fill \
-                 program"
+                "{length} samples is not a whole number of {hop}-sample latent frames: hand this call \
+                 the track right-padded with zeros to {padded} samples (`padded_samples`), as the \
+                 reference's `unpack_samples` does before it convolves - the pad is a request \
+                 buffer's tail, so it is the caller's to fill"
             )));
         }
         if frames > u64::from(self.frames) {
@@ -2644,7 +2651,6 @@ mod tests {
         );
     }
 
-
     /// The video encoder states its programs from its configuration and the rasters it serves: one
     /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
     /// frame, the posterior head's sample, and one residual per block at its level's own extent.
@@ -2656,14 +2662,14 @@ mod tests {
     fn the_video_encoder_states_its_programs_from_its_config_and_raster() {
         let config = crate::video_vae::tests::video_config();
         let raster = [(480, 832)];
-        let programs = VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
-        assert_eq!(count("conv3d"), 1, "one program whatever the window or stride");
+        let programs =
+            VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
+        assert_eq!(
+            count("conv3d"),
+            1,
+            "one program whatever the window or stride"
+        );
         assert_eq!(count("posterior"), 1);
         assert_eq!(
             count("frame_moments"),
@@ -2712,13 +2718,12 @@ mod tests {
         let config = crate::audio_vae::tests::audio_config();
         let programs =
             AudioEncoder::programs(&config, &[44_100]).expect("the audio encoder's programs");
-        let count = |operator: &str| {
-            programs
-                .iter()
-                .filter(|(name, _)| name == operator)
-                .count()
-        };
-        assert_eq!(count("conv1d"), 1, "one program whatever the window or stride");
+        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
+        assert_eq!(
+            count("conv1d"),
+            1,
+            "one program whatever the window or stride"
+        );
         assert_eq!(count("adaptive_pool"), 1);
         assert_eq!(count("transpose"), 1);
         assert_eq!(count("act_and_mul"), 1);
@@ -2757,7 +2762,9 @@ mod tests {
             .collect();
         assert_eq!(
             attention,
-            ["dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"],
+            [
+                "dtype_f32_kv_f32_out_f32_head_dim_256_q_heads_8_kv_heads_8_mask_dense_window_false_cu_seq_lens_false"
+            ],
             "{programs:?}"
         );
 
@@ -2826,7 +2833,15 @@ mod tests {
         // the sample it draws from and the clean latent the tile reads.
         assert_eq!(
             names,
-            ["tile", "stitch", "moments", "sample", "posterior", "clean", "anchored"]
+            [
+                "tile",
+                "stitch",
+                "moments",
+                "sample",
+                "posterior",
+                "clean",
+                "anchored"
+            ]
         );
         assert_eq!(
             second
