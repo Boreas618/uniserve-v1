@@ -676,34 +676,34 @@ impl Transformer {
             // projections carry no bias, which is the `epilogue_none` row.
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 hidden,
+                dtype,
                 boundary,
                 WeightOrder::NxK,
                 true,
                 dtype,
-                dtype,
             ));
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 hidden,
+                dtype,
                 boundary,
                 WeightOrder::NxK,
                 false,
                 dtype,
+            ));
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                hidden,
+                boundary,
+                boundary,
+                WeightOrder::NxK,
+                true,
                 dtype,
             ));
             programs.launch::<Gemm>(&Linear::descriptor_of(
                 hidden,
                 boundary,
-                WeightOrder::NxK,
-                true,
-                boundary,
-                dtype,
-            ));
-            programs.launch::<Gemm>(&Linear::descriptor_of(
-                hidden,
                 dtype,
                 WeightOrder::NxK,
                 true,
-                boundary,
                 dtype,
             ));
         }
