@@ -1097,6 +1097,7 @@ impl MainProcess {
         let mut running = Vec::new();
         let mut reported = Instant::now();
         loop {
+            let pass = Instant::now();
             if self.stopping {
                 // The report is stated once more on the way out: an epoch's counters are additive
                 // and a frontend that only saw the passes would lose the last second of them.
@@ -1198,6 +1199,15 @@ impl MainProcess {
             }
             if let Some(failure) = self.watch_probation()? {
                 return Ok(Some(failure));
+            }
+            // A pass that took seconds was blocked somewhere inside it, and a process that is
+            // blocked reads as one that never answered: a handover's attach waits on exactly
+            // that difference.
+            if pass.elapsed() > Duration::from_secs(5) {
+                tracing::warn!(
+                    millis = pass.elapsed().as_millis(),
+                    "a serve pass took longer than five seconds"
+                );
             }
         }
     }
@@ -1467,6 +1477,18 @@ impl MainProcess {
                 Ok(None)
             }
             proto::request::wire::to_engine::Kind::Engine(command) => {
+                // What a daemon commands of the engine arrives on the connection it made, and
+                // a handover's attach is the one such command whose silence reads as a hang.
+                // Stated where it is read, so "the engine never saw it" and "the engine
+                // refused it" are different lines in a run.
+                tracing::info!(
+                    front,
+                    command = command
+                        .kind
+                        .as_ref()
+                        .map_or("none", engine_command_name),
+                    "the engine read an engine command"
+                );
                 self.engine_command(front, command)
             }
         }
