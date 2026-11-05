@@ -418,6 +418,35 @@ fn column_extents(buckets: &Buckets) -> Result<(u64, u64)> {
 }
 
 impl Columns {
+    /// Every column's device address and byte length, named, so a dump can say what a copy writes.
+    ///
+    /// A column's device view names its **host** buffer (a pinned, host-mapped allocation), so the
+    /// two addresses a captured copy states are comparable against these.
+    fn named(&self) -> Vec<(&'static str, u64, usize)> {
+        vec![
+            ("positions", self.positions.device.ptr.address(), self.positions.host.len()),
+            ("input_ids", self.input_ids.device.ptr.address(), self.input_ids.host.len()),
+            ("slot_mapping", self.slot_mapping.device.ptr.address(), self.slot_mapping.host.len()),
+            (
+                "scratch_slots",
+                self.scratch_slots.device.ptr.address(),
+                self.scratch_slots.host.len(),
+            ),
+            ("seq_lens", self.seq_lens.device.ptr.address(), self.seq_lens.host.len()),
+            (
+                "query_offsets",
+                self.query_offsets.device.ptr.address(),
+                self.query_offsets.host.len(),
+            ),
+            ("logits_rows", self.logits_rows.device.ptr.address(), self.logits_rows.host.len()),
+            ("indices", self.indices.device.ptr.address(), self.indices.host.len()),
+            ("parameters", self.parameters.device.ptr.address(), self.parameters.host.len()),
+            ("slots", self.slots.device.ptr.address(), self.slots.host.len()),
+            ("draws", self.draws.device.ptr.address(), self.draws.host.len()),
+            ("live_tokens", self.live_tokens.device.ptr.address(), self.live_tokens.host.len()),
+        ]
+    }
+
     /// Allocates the columns over the widest token count and row count `buckets` hold, with
     /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
@@ -1127,6 +1156,58 @@ fn attention_edges(captured: &crate::captured::Captured) -> String {
     }
     if reported == 0 {
         return " no attention node in the graph".to_owned();
+    }
+    out
+}
+
+/// Every copy a captured graph replays, with the batch column it writes and what its source holds now.
+///
+/// A capture bakes both addresses of a copy. A copy whose source is a buffer the caller fills per
+/// batch replays the values that buffer held **when the recording happened**, and nothing in the
+/// graph's kernels, parameters or edges says so: the batch's own values never reach the destination.
+/// So this names the destination - a column by name, or an address outside every column - and reads
+/// the source as it stands now, which is what the replay is about to copy.
+fn copies_report(
+    captured: &crate::captured::Captured,
+    columns: &[(&'static str, u64, usize)],
+) -> String {
+    let copies = match captured.template().copies() {
+        Ok(copies) => copies,
+        Err(error) => return format!(" copies=unreadable({error})"),
+    };
+    if copies.is_empty() {
+        return " copies=0".to_owned();
+    }
+    let mut out = format!(" copies={}", copies.len());
+    for (index, copy) in copies.iter().enumerate() {
+        let source = copy.source.address().unwrap_or(0);
+        let destination = copy.destination.address().unwrap_or(0);
+        let named = columns
+            .iter()
+            .find(|(_, base, bytes)| {
+                let end = base.saturating_add(*bytes as u64);
+                destination >= *base && destination < end
+            })
+            .map(|(name, base, _)| format!("{name}+{}", destination.saturating_sub(*base)))
+            .unwrap_or_else(|| "no-column".to_owned());
+        // Four words of the source when it is host memory: enough to tell a batch's own values from
+        // a pose's zeros. Reading cannot change what the replay does.
+        let now = match copy.source {
+            platform::Space::Host(address) if address != 0 && copy.bytes >= 16 => {
+                // SAFETY: the driver stated this address as the source of a copy this graph holds,
+                // and reading it without writing it changes nothing the replay will do.
+                let words = unsafe { std::slice::from_raw_parts(address as *const u32, 4) };
+                format!(
+                    "{:08x},{:08x},{:08x},{:08x}",
+                    words[0], words[1], words[2], words[3]
+                )
+            }
+            _ => "n/a".to_owned(),
+        };
+        out.push_str(&format!(
+            " c{index}=[{source:#x}->{destination:#x} {named} {}B now={now}]",
+            copy.bytes
+        ));
     }
     out
 }
@@ -2065,6 +2146,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         bucket = %bucket,
                         edges = %attention_edges(captured),
                         "what the graph's edges say waits for attention"
+                    );
+                    tracing::warn!(
+                        bucket = %bucket,
+                        copies = %copies_report(captured, &self.columns.named()),
+                        "every copy the graph replays, and what each source holds now"
                     );
                 }
                 let enqueue = Instant::now();
