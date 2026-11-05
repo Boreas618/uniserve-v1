@@ -524,16 +524,6 @@ pub struct OwnedKernelNodeParams {
     pub parameters: Vec<Vec<u8>>,
 }
 
-impl PartialEq for OwnedKernelNodeParams {
-    fn eq(&self, other: &Self) -> bool {
-        self.function.raw() == other.function.raw()
-            && self.grid == other.grid
-            && self.block == other.block
-            && self.shared_memory == other.shared_memory
-            && self.parameters == other.parameters
-    }
-}
-
 impl std::fmt::Debug for OwnedKernelNodeParams {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

@@ -45,6 +45,11 @@ impl Function {
         Self { raw, device }
     }
 
+    /// Whether `other` is this very kernel.
+    pub fn same_kernel(&self, other: &Self) -> bool {
+        self.raw() == other.raw()
+    }
+
     pub(crate) fn raw(&self) -> Handle {
         self.raw
     }
