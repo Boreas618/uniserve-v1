@@ -373,6 +373,18 @@ mod tests {
             dtype,
             layout: WeightLayout::named("row_major"),
             region: region(tensor),
+            provenance: None,
+        }
+    }
+
+    /// A computed weight: no file names it, so its provenance does.
+    fn computed(producer: &'static str, bytes: &[u8]) -> WeightKey {
+        WeightKey {
+            files: Vec::new(),
+            dtype: DType::F32,
+            layout: WeightLayout::named("row_major"),
+            region: region("denoiser.video.student_heads.weight"),
+            provenance: Some(nn::weights::Provenance::computed(producer, bytes)),
         }
     }
 
@@ -451,6 +463,33 @@ mod tests {
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert_eq!(storage.fetches.load(Ordering::Relaxed), 1);
         assert_eq!(mine.mapped(), 1);
+    }
+
+    #[test]
+    fn a_computed_weight_of_one_deployment_is_not_answered_to_another() {
+        let storage = Arc::new(FakeStorage::default());
+        let shape = ops::Shape::new(&[4, 8]);
+        let base = computed("transformer", &[0_u8; 128]);
+        let reference = computed("transformer_ref", &[1_u8; 128]);
+
+        let mut first = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
+        first
+            .publish(&base, DType::F32, shape, &[0_u8; 128])
+            .expect("the base deployment publishes its fused heads");
+
+        // The reference deployment asks for its own table under the same label and extent. It
+        // must not be answered the base's bytes: a label is not an identity, and the mapping is
+        // indistinguishable from a correct one once it is handed over.
+        let mut second = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
+        assert!(second.retained(&reference).expect("a miss").is_none());
+        second
+            .publish(&reference, DType::F32, shape, &[1_u8; 128])
+            .expect("the reference deployment publishes its own");
+        assert_eq!(storage.stores.load(Ordering::Relaxed), 2);
+
+        // And each deployment's own restart maps its own table rather than recomputing it.
+        let mut restarted = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
+        assert!(restarted.retained(&reference).expect("a hit").is_some());
     }
 
     #[test]
