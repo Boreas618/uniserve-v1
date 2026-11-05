@@ -1704,6 +1704,13 @@ impl Decoder for VideoDecoder {
     ///
     /// The grid is arithmetic on the raster's extent, so one block serves every canvas of this
     /// checkpoint; the clips are the runner's loop, and so is the splice.
+    ///
+    /// **A caller owes this call one clip at a time.** The transformer scratch and the stitch set are
+    /// *reserved once per clip and reused by every tile* ([`Self::scratch`], `decoding::video_arena`),
+    /// so two decodes in flight on one decoder object write the same buffers of the same arena - the
+    /// second clip corrupts the first silently rather than costing another column. A warmup of one
+    /// clip beside a served clip of another is the same defect, and it looks identical from outside
+    /// because the arena is the same size either way.
     fn decode(
         &self,
         f: &Forward,
