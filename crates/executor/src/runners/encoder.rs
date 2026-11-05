@@ -108,13 +108,14 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     /// The epoch's product store, attached by the executor that starts this runner: what an encode
     /// produces and a denoise step of the same request reads.
     products: Option<std::sync::Arc<dyn Products>>,
-    /// The requests of the batch staged last, and how many token rows of the hidden column each of
-    /// them occupies, in request order.
+    /// The requests of the batch staged last: `(request, first token row, count)` in request order.
     ///
     /// A replay publishes what its own launch wrote, and the batch numbers its calls by position,
     /// so the request's name is kept here beside the rows it covers (`Batch::media`'s staged record
-    /// is the only place a request is named).
-    pending: Vec<(ipc::RequestKey, u32)>,
+    /// is the only place a request is named). The rows are the batch's own offline offsets rather
+    /// than a running sum, so the publish reads the same numbers the encode read: a call's span is
+    /// its real tokens, and whatever the mechanism put before or after it is not this runner's.
+    pending: Vec<(ipc::RequestKey, u32, u32)>,
 }
 
 impl<M: Encoder + Send + Sync> EncoderRunner<M> {
@@ -328,10 +329,14 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.pending.clear();
         if let Some(media) = &batch.media {
             for (index, window) in threads.query_offsets.windows(2).enumerate() {
+                let first = u32::try_from(window[0]).map_err(|_| {
+                    Error::Invalid("a request's first token row does not fit a count".into())
+                })?;
                 let rows = u32::try_from(window[1] - window[0]).map_err(|_| {
                     Error::Invalid("a request's token rows do not fit a count".into())
                 })?;
-                self.pending.push((media.request(index)?.request, rows));
+                self.pending
+                    .push((media.request(index)?.request, first, rows));
             }
         }
         // The columns are sized for the largest bucket the runner was bound with; a batch planned
@@ -393,9 +398,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             return Ok(());
         };
         let width = u64::from(self.shape.hidden.max(1));
-        let mut first = 0u64;
-        for (request, rows) in &self.pending {
-            let rows = u64::from(*rows);
+        for (request, first, rows) in &self.pending {
+            let (first, rows) = (u64::from(*first), u64::from(*rows));
             if rows == 0 {
                 continue;
             }
@@ -412,7 +416,6 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
                 self.stream_id(),
                 &view,
             )?;
-            first += rows;
         }
         Ok(())
     }
