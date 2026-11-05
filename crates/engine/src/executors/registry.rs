@@ -427,12 +427,11 @@ mod tests {
             .expect("a rank of another build fails the launch")
             .to_string();
         assert!(
-            // The rank, the pool it belongs to, and both builds: the noun in front of the
-            // pool's id is not the contract, so the assertion does not pin one.
-            error.contains("rank 0") && error.contains("text") && error.contains(&other),
+            error.contains("rank 0 of executor text")
+                && error.contains(&other)
+                && error.contains(VERSION),
             "{error}"
         );
-        assert!(error.contains(VERSION), "{error}");
     }
 
     #[test]
