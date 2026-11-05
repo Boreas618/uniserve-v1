@@ -256,10 +256,18 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             let layout = Self::layout_of(&self.model, bucket)?;
             let needed = match self.model.arena_bytes(&layout) {
                 Ok(bytes) => bytes,
-                // A decoder that states no plan is not a shortfall: the pool is then the only figure
-                // there is, and a decode that outgrows it refuses at its own launch by name. The
-                // refusal is not turned into a pass, which would be the same value as "it fits".
-                Err(_) => continue,
+                // **Only `Unsupported` is "this block states no plan", and only that is passed
+                // over**: the pool is then the only figure there is, and a decode that outgrows it
+                // refuses at its own launch by name. Any other refusal is the decoder and the layout
+                // disagreeing - a deployment defect - and reporting it as "no plan" would be the
+                // silent failure this check exists to remove.
+                Err(nn::Error::Unsupported(_)) => continue,
+                Err(error) => {
+                    return Err(Error::Invalid(format!(
+                        "bucket {bucket}: this decoder refuses the layout it decodes from, so no \
+                         arena can be stated for it: {error}"
+                    )));
+                }
             };
             if needed > offered {
                 return Err(Error::Invalid(format!(
