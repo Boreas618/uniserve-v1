@@ -28,6 +28,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-keys.txt',
+    HERE.parent / 'notes/programs/minimax-h3-sparse-keys.txt',
 )
 
 #: Fields an extent is likely to be named by, most specific first.
