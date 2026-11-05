@@ -1368,9 +1368,11 @@ impl VideoEncoder {
                         // the element count here named 36 keys no launch asks for, at widths up to
                         // 2.2e9, and a package cannot serve a key nothing launches.
                         let columns = u64::from(*out);
-                        if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                            programs.launch::<ScaledAddOp>(&descriptor);
-                        }
+                        // Stated or refused, never silently omitted: a width the descriptor cannot
+                        // hold cannot be launched either, so swallowing the refusal would turn a
+                        // configuration this VAE cannot run into a program list that looks complete.
+                        let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
+                        programs.launch::<ScaledAddOp>(&descriptor);
                     }
                 }
                 // The output normalization convolves the last level's extent at the last width.
@@ -1906,9 +1908,9 @@ impl AudioEncoder {
         for samples in samples {
             for inner in &widths {
                 let columns = u64::from(*inner) * u64::from(*samples);
-                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
-                    programs.launch::<ScaledAddOp>(&descriptor);
-                }
+                // As above: the refusal is the statement's, not a reason to leave the row out.
+                let descriptor = ScaledAdd.descriptor(dtype, dtype, columns)?;
+                programs.launch::<ScaledAddOp>(&descriptor);
             }
         }
 
