@@ -104,17 +104,51 @@ pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHand
 /// states the command that builds the module.
 pub(crate) fn policy_on(core: &SchedulerHandle) {
     let capacity = engine::BatchCapacity::of(core.info());
-    let (program, module) = engine::packaged_policy(capacity);
+    let (program, module) = packaged_policy(capacity);
     let source: std::sync::Arc<dyn engine::PolicySource + Send + Sync> =
         std::sync::Arc::new(engine::PolicyBytes::new(module));
     core.precopy_policy(program, source)
-        .recv()
-        .expect("the policy precopy is answered")
+        .recv_timeout(POLICY_ANSWER)
+        .expect("the policy precopy is answered within the bound")
         .expect("the packaged policy's limits fit the scheduler's capacity");
     core.switchover_policy()
-        .recv()
-        .expect("the switchover is answered")
+        .recv_timeout(POLICY_ANSWER)
+        .expect("the switchover is answered within the bound")
         .expect("the switchover applies at the next batch boundary");
+}
+
+/// How long a fixture waits for an answer it cannot proceed without.
+///
+/// A scheduler that does not answer must state that, not hang: an unbounded
+/// `recv` in a fixture is a suite that stops with no line saying which answer it
+/// never got, which is exactly how a 53-second run became a 42-minute one.
+pub(crate) const POLICY_ANSWER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the packaged policy module may take to be built on first use.
+///
+/// The build runs `cargo` inside the test process, so it can wait on a package
+/// cache another cargo holds. Its own name is what says so: without a bound the
+/// fixture looks like a deadlock in the daemon.
+pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`engine::packaged_policy`] under a bound, so a stalled build names itself.
+///
+/// The build is blocking and its thread cannot be cancelled; the thread is left
+/// to finish rather than joined, which is what a test fixture can do and a
+/// service cannot.
+pub(crate) fn packaged_policy(
+    capacity: engine::BatchCapacity,
+) -> (engine::PolicyProgram, Vec<u8>) {
+    let (answered, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answered.send(engine::packaged_policy(capacity));
+    });
+    answer.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
+        panic!(
+            "the fcfs policy module was not built within {} s: a cargo build inside this              process is waiting on a package cache or a wasm32 toolchain another process holds.              Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs              --target wasm32-unknown-unknown --release` to run without the build.",
+            POLICY_BUILD.as_secs()
+        )
+    })
 }
 
 /// Builds an engine for a model with `parameters` over started schedulers,
@@ -156,7 +190,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     // the engine installs it here for the route. Without one the engine has no
     // policy to route a request with and refuses every submission.
     let policy = {
-        let (program, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
+        let (program, module) = packaged_policy(engine::BatchCapacity::of(first.info()));
         engine::EpochPolicy {
             program,
             module: std::sync::Arc::new(engine::PolicyBytes::new(module)),

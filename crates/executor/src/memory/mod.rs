@@ -55,8 +55,10 @@ use crate::Result;
 /// wake restores. The retained weights and the encoder cache join as their
 /// loaders publish; their storage is already keyed by `crate::keys`.
 pub struct Memory {
-    /// The KV cache planes, their block tables and their host pages.
-    pub prefix_cache: Arc<Mutex<PrefixCache>>,
+    /// The KV cache planes, their block tables and their host pages, or `None` on a rank that
+    /// keeps no paged cache: a media rank's resident state is each request's own footprint, and
+    /// what it opens here is the product store, the latent pages and the request slots.
+    pub prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     /// The latent pages of diffusion and media calls, on a rank that stores a pool.
     pub latents: Option<LatentStorage>,
     /// The products of cross-call tensors.
@@ -230,8 +232,9 @@ pub fn wake(
 
 impl Memory {
     /// Allocates every resident owner the plan sized, in one call: the cache
-    /// planes and block tables, the latent pages, the product store, the
-    /// request slots, the buffer pool and the page-locked blocks.
+    /// planes and block tables (on a rank that keeps a paged cache), the latent
+    /// pages, the product store, the request slots, the buffer pool and the
+    /// page-locked blocks.
     ///
     /// `storage` is the rank's Storage Server client; it stays the main
     /// process's, so `sleep` and `wake` are the only calls that reach the
@@ -241,7 +244,7 @@ impl Memory {
         let plan = request.plan;
         let info = &plan.info;
         let cache = match (plan.cache.as_ref(), plan.planes.as_ref()) {
-            (Some(cache), layout) => prefix_cache::PrefixCache::new(
+            (Some(cache), layout) => Some(prefix_cache::PrefixCache::new(
                 Arc::clone(cache),
                 info.prefix_cache
                     .as_ref()
@@ -259,12 +262,11 @@ impl Memory {
                 request.stream,
                 storage,
                 Arc::clone(&request.conversion),
-            )?,
-            (None, _) => {
-                return Err(crate::Error::Invalid(
-                    "a rank without a cache plan needs no Memory".into(),
-                ));
-            }
+            )?),
+            // A rank that keeps no paged cache still owns the rest: the products its runners
+            // publish, the latent pages a denoiser stages and the request slots its scheduler
+            // hands out. Only the cache planes and their block tables are absent.
+            (None, _) => None,
         };
         let latents = match plan.latent.as_ref() {
             Some(latent) => Some(LatentStorage::allocate(
@@ -297,7 +299,7 @@ impl Memory {
         let slots = RequestSlots::allocate(request.slots, plan.info.request_slots, request.device)?;
         let pinned = PinnedPool::new(request.device);
         Ok(Self {
-            prefix_cache: Arc::new(Mutex::new(cache)),
+            prefix_cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
             latents,
             products,
             slots,
@@ -329,7 +331,9 @@ impl Memory {
         // The products go first: their reads retain views into the cache, and the cache's
         // segments are the last thing an epoch gives back.
         products.close();
-        lock(&prefix_cache).close()?;
+        if let Some(cache) = prefix_cache {
+            lock(&cache).close()?;
+        }
         drop(latents);
         drop(slots);
         drop(pinned);
@@ -349,7 +353,7 @@ impl Memory {
     /// books and asks no driver, so a figure that could not be computed is left
     /// out rather than failing the report.
     pub fn mapped_resident(&self) -> u64 {
-        let planes = lock(&self.prefix_cache).mapped_bytes();
+        let planes = self.prefix_cache.as_ref().map_or(0, |cache| lock(cache).mapped_bytes());
         let latents = self
             .latents
             .as_ref()
@@ -364,7 +368,11 @@ impl Memory {
     /// caller reaches through an `Arc<Mutex<_>>`, so the device thread and the
     /// control thread call the same body - [`sleep`].
     pub fn sleep(&self, storage: &mut dyn ExclusiveStorage) -> Result<()> {
-        sleep(&self.prefix_cache, storage)
+        match &self.prefix_cache {
+            Some(cache) => sleep(cache, storage),
+            // No cache planes, no segments: a rank that keeps none sleeps and wakes as it stands.
+            None => Ok(()),
+        }
     }
 
     /// Map the released cache segments again, `limit` of them or all.
@@ -377,7 +385,10 @@ impl Memory {
         stream: &Stream,
         limit: Option<u32>,
     ) -> Result<()> {
-        wake(&self.prefix_cache, storage, stream, limit)
+        match &self.prefix_cache {
+            Some(cache) => wake(cache, storage, stream, limit),
+            None => Ok(()),
+        }
     }
 
     /// The device this rank's memory lives on.
@@ -394,7 +405,10 @@ impl Memory {
     /// The cache pool as a reader shares it: the runner's provider holds this
     /// clone for its whole life and takes the lock per call, so a read never
     /// sees a half-installed table. The executor is the only writer.
-    pub fn shared_cache(&self) -> Arc<Mutex<PrefixCache>> {
-        Arc::clone(&self.prefix_cache)
+    ///
+    /// `None` on a rank that keeps no paged cache, which is what its scheduler
+    /// reads to know it takes no paged request.
+    pub fn shared_cache(&self) -> Option<Arc<Mutex<PrefixCache>>> {
+        self.prefix_cache.clone()
     }
 }
