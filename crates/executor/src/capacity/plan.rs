@@ -502,9 +502,7 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
     // startup.
     let shadow = match facts.device {
         Device::Cuda(index) => {
-            crate::capacity::graph_storage_budget_bytes(
-                crate::capacity::device::total_bytes(index)? as i64,
-            ) / 8
+            crate::capacity::graph_scratch_bytes(crate::capacity::device::total_bytes(index)? as i64)
         }
         Device::Cpu => 0,
     };
@@ -1118,6 +1116,82 @@ mod tests {
         assert!(
             booked <= grant,
             "the pool books {booked} bytes of a {grant}-byte grant"
+        );
+    }
+
+    /// The device total the caller's runs planned into, read from the run's own line: the graph
+    /// reservation it logged is two pools of the device's tenth
+    /// (`graph_reservation=39579549696`), so the device is five times that.
+    const E2E_TOTAL: u64 = 5 * 39_579_549_696;
+
+    /// One plan of `total_bytes` with `reserved` bytes set aside before any unit.
+    fn fitted(total_bytes: u64, reserved: u64) -> Result<Plan> {
+        token_plan(
+            &CapacityRequest {
+                max_total_tokens: None,
+                mem_fraction_static: 0.7,
+                ..request()
+            },
+            report(),
+            &facts(),
+            1,
+            /* width */ 64,
+            total_bytes,
+            reserved,
+            None,
+            &HostGroup::single(0),
+            dense(geometry()),
+        )
+    }
+
+    /// A grant that holds the graph range but not the scratch beside it is refused, and the same
+    /// grant with the shadow region added admits the cache.
+    ///
+    /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the GB200 the
+    /// runs plan into, the graph range is the two pools the run logged, and `mem_fraction_static`
+    /// is 0.7 as the run's own placement stated. The shadow is not optional - `Pools::new` reserves
+    /// it at spawn and the first shadow execution maps it - so a plan fitted into the bytes it will
+    /// take leaves the rank to map past the device after the model load, which is the refusal this
+    /// case buys.
+    #[test]
+    fn a_grant_that_holds_the_graph_range_without_the_scratch_is_refused() {
+        let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
+        assert_eq!(
+            graph, 39_579_549_696,
+            "the graph range of the deployment the runs plan into"
+        );
+        let shadow = crate::capacity::graph_scratch_bytes(E2E_TOTAL as i64);
+        assert_eq!(shadow, 2_473_721_856, "the shadow region of that device");
+        // A generous grant, only to learn the plan's own fixed storage and unit size.
+        let planned = fitted(E2E_TOTAL, graph + shadow)
+            .expect("the deployment's device holds its own graph range and scratch");
+        let fixed = planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
+        let unit = planned
+            .cache
+            .as_ref()
+            .expect("the model's cache is planned")
+            .unit_bytes;
+        // The least a cache serves is the sentinel unit and one page of its one group; the two
+        // cases below give that twice, so a rounding in the reservation cannot decide the answer.
+        let least = 2 * unit;
+        let with = fixed + graph + shadow + 2 * least;
+        let without = with - shadow;
+        assert!(
+            fitted(without, graph + shadow).is_err(),
+            "a grant of {without} bytes holds the graph range and the fixed storage, and not the \
+             {shadow}-byte shadow region: it must be refused, not fitted"
+        );
+        let admitted = fitted(with, graph + shadow)
+            .expect("the same grant with the shadow region holds the cache");
+        let units = admitted
+            .info
+            .prefix_cache
+            .as_ref()
+            .expect("the rank advertises its cache")
+            .num_units;
+        assert!(
+            units >= 2,
+            "the admitted plan serves a cache: {units} units"
         );
     }
 
