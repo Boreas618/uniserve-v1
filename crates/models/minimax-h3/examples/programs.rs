@@ -193,9 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokens.sort_unstable();
     tokens.dedup();
-    if packed.is_empty() {
-        return Err("--rows is the deployment's and has no default".into());
-    }
+    // `--rows` is optional: the deployment states its own packed bound (`Layouts::rows_bound`) and
+    // serving sizes its attention from it, so a walk needs no flag. A stated value is a claim this
+    // walk checks, and a wrong one is refused by name rather than stamped into the header.
     packed.sort_unstable();
     packed.dedup();
     if track.is_empty() {
@@ -317,56 +317,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("{component}/config.json is not an object"))?;
         let config =
             TransformerConfig::parse(values, &format!("{component}/config.json"))?;
-        let max = packed.iter().copied().max().unwrap_or(0);
         // The group count is the task set's: a conditioned deployment's modulation cache is another
         // program at the entries' width. The denoiser states its two stacks and the orchestration
         // around them, so the walk asks it rather than a stack.
-        let (attention, tiles) = match (sparse, stated_attention) {
+        let (attention, stated_tiles) = match (sparse, stated_attention) {
             (_, Some(sparse_contract)) => (
                 AttentionKind::sparse(
                     sparse_contract.tile,
                     sparse_contract.sparsity,
                     sparse_contract.reference_keep,
                 )?,
-                // The bound on the key tiles one compression reduces over: the deployments' packed
-                // rows over the tile's rows, rounded up to the next power of two because the bound is
-                // a compiled class rather than a request count.
-                (packed.iter().copied().max().unwrap_or(0).div_ceil(sparse_contract.tile))
-                    .next_power_of_two(),
+                None,
             ),
-            (Some((tile, sparsity, stated_tiles, reference_keep)), None) => {
-                let attention = AttentionKind::sparse(tile, sparsity, reference_keep)?;
-                // The tile bound is the deployment's own rule and not a caller's number: it caps every
-                // canvas and frame count the deployment offers, and the launch keys its next power of
-                // two. A stated bound that is another class is refused by name rather than walked,
-                // because a fixture row naming the wrong class is a module no launch asks for.
-                let mut network = minimax_h3::Config::read(&root, None)?.denoisers;
-                let mut base = network
-                    .remove(&minimax_h3::Dit::Base)
-                    .ok_or("this checkpoint holds no base network")?;
-                base.attention = attention;
-                let tokens_max = tokens.iter().copied().max().unwrap_or(0);
-                let arrangement = Arrangement::new(&base, tokens_max, 64, 1)?;
-                let computed = Layouts::new(base, arrangement)?.tiles_bound()?;
-                if computed.next_power_of_two() != stated_tiles.next_power_of_two() {
-                    return Err(format!(
-                        "--sparse states {stated_tiles} tiles and the deployment's own bound is \
-                         {computed}: the launch keys the bound's next power of two \
-                         ({}, not {}), and a row naming another class is a module no launch asks for",
-                        computed.next_power_of_two(),
-                        stated_tiles.next_power_of_two()
-                    )
-                    .into());
-                }
-                (attention, computed)
-            }
-            (None, None) => (AttentionKind::Dense, 0),
+            (Some((tile, sparsity, stated_tiles, reference_keep)), None) => (
+                AttentionKind::sparse(tile, sparsity, reference_keep)?,
+                Some(stated_tiles),
+            ),
+            (None, None) => (AttentionKind::Dense, None),
         };
+        // **The deployment's own bounds, not a caller's numbers.** `rows_bound` and `tiles_bound` cap
+        // every canvas and frame count the deployment offers, and serving sizes its attention from
+        // them (`load.rs`); a walk that took either from a flag would state a program for a deployment
+        // nobody can ask it to be. A stated value is a claim to check, never a source: a mismatch is
+        // refused by name with both numbers, as `--sparse` already refuses another tile class.
+        let tokens_max = tokens.iter().copied().max().unwrap_or(0);
+        let mut network = minimax_h3::Config::read(&root, None)?.denoisers;
+        let mut base = network
+            .remove(&minimax_h3::Dit::Base)
+            .ok_or("this checkpoint holds no base network")?;
+        base.attention = attention;
+        let arrangement = Arrangement::new(&base, tokens_max, 64, 1)?;
+        let rules = Layouts::new(base, arrangement)?;
+        let rows_bound = rules.rows_bound()?;
+        let tiles = match attention {
+            AttentionKind::Dense => 0,
+            AttentionKind::Sparse { .. } => rules.tiles_bound()?,
+        };
+        if let Some(stated) = packed.iter().copied().max()
+            && stated != rows_bound
+        {
+            return Err(format!(
+                "--rows states {stated} packed rows and the deployment's own bound is \
+                 {rows_bound}: the attention is compiled for the bound it serves, and a walk \
+                 that stamped a smaller one describes a deployment it cannot be asked to be"
+            )
+            .into());
+        }
+        if let Some(stated) = stated_tiles
+            && stated.next_power_of_two() != tiles.next_power_of_two()
+        {
+            return Err(format!(
+                "--sparse states {stated} tiles and the deployment's own bound is {tiles}: the \
+                 launch keys the bound's next power of two ({}, not {}), and a row naming another \
+                 class is a module no launch asks for",
+                tiles.next_power_of_two(),
+                stated.next_power_of_two()
+            )
+            .into());
+        }
+        // The header states the bound the deployment serves, whatever the caller stated.
+        packed = vec![rows_bound];
         rows.extend(Denoiser::programs(
             &config,
             attention,
             dtype,
-            max,
+            rows_bound,
             Groups::of(conditioned),
             &partition,
             tiles,
