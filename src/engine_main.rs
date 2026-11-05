@@ -4323,6 +4323,14 @@ fn native_module(file: &program_server::ModuleFile) -> executor::Result<NativeMo
 }
 
 impl Resolved {
+    /// Whether this module was loaded from a copy rather than from the store's own file: the one
+    /// fact that tells a store whose handles name their files from a store whose do not.
+    fn copied(&self) -> bool {
+        self.native
+            .as_ref()
+            .is_some_and(|native| native.copy.is_some())
+    }
+
     /// The module as `ops::install` takes it.
     fn as_ops(&self) -> executor::Result<ops::Module<'_>> {
         match (&self.image, &self.native) {
@@ -4452,6 +4460,7 @@ impl HostAction for Install {
             })?;
 
         let mut entries = Vec::new();
+        let mut copies = 0_usize;
         let mut asked: Vec<(String, usize)> = Vec::with_capacity(prepared.programs.len());
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
@@ -4491,6 +4500,9 @@ impl HostAction for Install {
                         ))
                     })?;
                 let module = resolved(module)?;
+                if module.copied() {
+                    copies += 1;
+                }
                 let entry = ops::install(&self.device, operator, &key, module.as_ops()?).map_err(
                     |error| {
                         executor::Error::Invalid(format!(
@@ -4529,6 +4541,7 @@ impl HostAction for Install {
         }
         tracing::info!(
             modules = entries.len(),
+            copies,
             target = %self.target,
             "this device's modules are installed for the new generation"
         );
