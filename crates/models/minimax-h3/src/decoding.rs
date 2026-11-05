@@ -243,8 +243,20 @@ pub fn video_arena(
     let frames = canvas.frames_out(config);
     // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
     // because a tile at the canvas's edge can be narrower than the tile size.
-    let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+    let tokens_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
+    // The transformer's fourteen are reserved **once per clip and reused by every tile**
+    // (`VideoDecoder::scratch`), so their entries are one tile's: the canvas the decoder is built
+    // for, which is the tile size and not any one tile of this grid. Sizing them by the grid's sum
+    // multiplies the clip's footprint by the tile count — 28× on a served canvas — and the arena
+    // then cannot fit beside the weights even though no buffer it holds is that large.
+    let spatial = config.spatial_compression();
+    let tile = crate::video_vae::Canvas::clip(
+        config,
+        crate::video_vae::TILE_PIXELS / spatial,
+        crate::video_vae::TILE_PIXELS / spatial,
+    );
+    let rows = u64::from(tile.rows());
+    let voxels = u64::from(tile.voxels());
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
@@ -268,7 +280,7 @@ pub fn video_arena(
         Buffer {
             name: "tokens".to_owned(),
             element: "f16",
-            elements: rows * patch,
+            elements: tokens_rows * patch,
         },
         Buffer {
             name: "stream".to_owned(),
@@ -889,7 +901,7 @@ mod tests {
         assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
     }
     #[test]
-    fn the_video_arena_holds_all_tiles_of_one_clip() {
+    fn the_video_arena_holds_one_tiles_scratch_and_every_tiles_tokens() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
         let arena = video_arena(&config, &canvas).expect("the arena");
@@ -903,11 +915,25 @@ mod tests {
             .tiles(&config, &canvas)
             .len();
         assert_eq!(tiles, 28);
-        let tokens = arena
+        // The transformer's buffers are reserved once per clip and reused by every tile, so their
+        // entry is **one tile's** rows: sizing them by the grid would multiply the clip's footprint
+        // by the tile count, and the arena would not fit beside the weights.
+        let stream = arena
             .iter()
             .find(|buffer| buffer.name == "stream")
             .expect("the residual stream");
-        assert_eq!(tokens.elements, 28 * 1797 * 2048);
+        assert_eq!(stream.elements, 1797 * 2048);
+        // The token buffer is the one entry that holds every tile at once, because each tile's
+        // decode owns its own.
+        let patch = u64::from(config.out_channels)
+            * u64::from(config.temporal_compression())
+            * u64::from(config.spatial_compression())
+            * u64::from(config.spatial_compression());
+        let tokens = arena
+            .iter()
+            .find(|buffer| buffer.name == "tokens")
+            .expect("the token buffer");
+        assert_eq!(tokens.elements, 28 * 1797 * patch);
         assert_eq!(tokens.bytes(), tokens.elements * 2);
         // The two rotary factor tables the code reserves, in the position it reserves them: half the
         // rotated width each, so their sum is the rotated width - not the head.
@@ -922,7 +948,7 @@ mod tests {
         assert_eq!(sine, cosine + 1);
         assert_eq!(
             arena[cosine].elements + arena[sine].elements,
-            28 * 1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
+            1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
         );
         assert_eq!(arena[cosine].elements, arena[sine].elements);
         // The clip-level buffers come first and the per-tile ones after, which is the order the model
