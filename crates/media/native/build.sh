@@ -86,5 +86,14 @@ for library in "$PREFIX"/lib/libav*.so.* "$PREFIX"/lib/libsw*.so.* "$PREFIX"/lib
     patchelf --set-rpath '$ORIGIN' "$library"
   fi
 done
+# `ffmpeg` and `ffprobe` are the second kind of binary here: the media stage spawns `ffmpeg` at
+# the encode, so it must resolve its own libraries too. `--enable-rpath` writes the build
+# directory into them, and a library's own dependencies are resolved with the requiring
+# library's run path, so a provisioned copy starts only once each of these names `$ORIGIN/../lib`.
+for binary in "$PREFIX"/bin/ffmpeg "$PREFIX"/bin/ffprobe; do
+  if [ -f "$binary" ]; then
+    patchelf --set-rpath '$ORIGIN/../lib' "$binary"
+  fi
+done
 
 echo "media native runtime: $PREFIX"
