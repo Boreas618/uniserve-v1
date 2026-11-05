@@ -2,15 +2,13 @@
 //!
 //! Serving states a deployment's model limits from the model's description;
 //! these tests have no model, so a simulated worker's limits follow from the
-//! call kinds it serves. Each test binary uses a subset of these functions.
-
-#![allow(dead_code)]
+//! call kinds it serves.
 
 pub(crate) mod serving;
 pub(crate) mod storage;
 pub(crate) mod video;
 
-pub(crate) use serving::{config, pool, rank, Serving, SAMPLED};
+pub(crate) use serving::{config, pool, Serving, SAMPLED};
 
 /// Waits for `want` generated tokens, or for the request's terminal event.
 ///
@@ -135,20 +133,6 @@ pub(crate) fn scheduler_with_stating(
 /// module named by `SCHED_POLICY_WASM` is read instead.
 pub(crate) fn policy_module() -> Vec<u8> {
     engine::packaged_module()
-}
-
-/// Installs the policy a test world serves with: the `fcfs` package, revision
-/// one, instantiated for the capacity this world's workers were built for.
-///
-/// A policy declares its own limits, and the mechanism refuses a declaration
-/// above the build config's ceilings - the calls and tokens the workers were
-/// started for (§4.4) - rather than clamping it. The declaration is the
-/// policy's argument, so a deployment states the capacity its policy serves:
-/// left at the package's defaults, `fcfs` declares the 128 calls a production
-/// deployment has, and every test world whose workers were built for fewer
-/// would have no policy at all.
-pub(crate) fn install_policy(scheduler: &mut Scheduler, capacity: engine::BatchCapacity) {
-    install_policy_stating(scheduler, capacity, Parameters::default());
 }
 
 /// Installs `fcfs` with the ceilings a world advertises and the parameters the
@@ -290,50 +274,4 @@ pub(crate) fn uniserve_executable() -> std::path::PathBuf {
                 .join("../..")
                 .join(".venv/bin/uniserve")
         })
-}
-
-/// Every process the threads of this test process started, with its
-/// arguments: the daemon's workers among them.
-pub(crate) fn child_processes() -> Vec<(u32, Vec<String>)> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-        return children;
-    };
-    for task in tasks.flatten() {
-        let Ok(pids) = std::fs::read_to_string(task.path().join("children")) else {
-            continue;
-        };
-        for pid in pids.split_whitespace().filter_map(|pid| pid.parse().ok()) {
-            let arguments = std::fs::read(format!("/proc/{pid}/cmdline"))
-                .unwrap_or_default()
-                .split(|byte| *byte == 0)
-                .map(|argument| String::from_utf8_lossy(argument).into_owned())
-                .collect();
-            children.push((pid, arguments));
-        }
-    }
-    children
-}
-
-/// The worker processes of group `worker_id` this test process's daemon
-/// started: each process id with the value of its `--rank` and
-/// `--generation` arguments.
-pub(crate) fn group_processes(worker_id: &str) -> Vec<(u32, u32, u64)> {
-    child_processes()
-        .into_iter()
-        .filter_map(|(pid, arguments)| {
-            let value = |name: &str| {
-                arguments
-                    .iter()
-                    .position(|argument| argument == name)
-                    .and_then(|index| arguments.get(index + 1))
-            };
-            if value("--worker-id").map(String::as_str) != Some(worker_id) {
-                return None;
-            }
-            let rank = value("--rank")?.parse().ok()?;
-            let generation = value("--generation")?.parse().ok()?;
-            Some((pid, rank, generation))
-        })
-        .collect()
 }

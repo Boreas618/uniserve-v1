@@ -33,10 +33,7 @@
 //! completion answered as one body, and a video artifact's byte position. A
 //! response of such a kind whose state cannot be frozen is a defect, and the
 //! driver ends it instead of keeping it: the process that hands the
-//! deployment over does not wait for a response to end (design §7.5.1). Only
-//! the families the design retires (the SenseNova and omni readout output
-//! filters, whose requests have no facts a continuation submits) have no
-//! state, and item 2 removes their routes from the covered set.
+//! deployment over does not wait for a response to end (design §7.5.1).
 
 use std::future::Future;
 use std::pin::Pin;
