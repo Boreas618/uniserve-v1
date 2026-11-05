@@ -4527,13 +4527,11 @@ impl MainProcess {
             );
         }
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.switchover_policy(),
                 self.watchdog.stall_bound(),
                 "the policy switchover",
-            ) {
-                tracing::error!(%error, "switching the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4549,13 +4547,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(
+            report_policy_answer(
                 scheduler.revert_policy(),
                 self.watchdog.stall_bound(),
                 "the policy revert",
-            ) {
-                tracing::error!(%error, "reverting the scheduling policy failed");
-            }
+            );
         }
     }
 
@@ -4699,6 +4695,23 @@ fn poll_answers(
         }
     }
     None
+}
+
+/// Logs one scheduler's answer to a policy step when it comes, off the control thread.
+///
+/// A scheduler answers at its next batch boundary, and it reaches that boundary only while the
+/// control thread drains what it sends: a control thread that waited here held the scheduler it
+/// waited for, and a switchover under traffic stood still for the whole stall bound (§2.4).
+fn report_policy_answer(
+    receiver: crossbeam_channel::Receiver<std::result::Result<(), String>>,
+    bound: Duration,
+    what: &'static str,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = answer(receiver, bound, what) {
+            tracing::error!(%error, "a scheduling policy step failed");
+        }
+    });
 }
 
 /// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
