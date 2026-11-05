@@ -344,20 +344,52 @@ impl Lifecycle {
             Vec::with_capacity(walked.nodes.len());
         let mut ordinal_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
-        for (operator, _, launch) in &walked.nodes {
+        for ((operator, _, launch), (_, _, held)) in walked.nodes.iter().zip(served.nodes()) {
             let ordinal = ordinal_of.entry(*operator).or_insert(0);
             let mut params = Vec::with_capacity(launch.len());
-            for node in launch {
+            // A rebind re-points a node at another kernel and changes nothing else (4.5): the
+            // walk maps its activations in the preparation's pool, and the executable replays in
+            // the serving one, so a node keeps the arguments the serving graph captured. Only a
+            // launch whose kernel changed is set, because every other node is already right.
+            let mut differs = false;
+            for (node, serving) in launch.iter().zip(held) {
                 if node.node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
-                params.push(walked.template.kernel_node_params(&node.node)?);
+                let walked_params = walked.template.kernel_node_params(&node.node)?;
+                let serving_params = template.kernel_node_params(&serving.node)?;
+                let widths = |params: &platform::OwnedKernelNodeParams| -> Vec<usize> {
+                    params.parameters.iter().map(Vec::len).collect()
+                };
+                if widths(&walked_params) != widths(&serving_params) {
+                    return Err(Error::Invariant(format!(
+                        "operator {operator} changed its kernel's signature under the same launch \
+                         structure, so the bucket {bucket} cannot be rebound"
+                    )));
+                }
+                differs |= !walked_params.function.same_kernel(&serving_params.function);
+                params.push(platform::OwnedKernelNodeParams {
+                    parameters: serving_params.parameters,
+                    ..walked_params
+                });
             }
-            launches.push((*operator, *ordinal, params));
+            if differs {
+                launches.push((*operator, *ordinal, params));
+            }
             *ordinal += 1;
         }
         let held = hold_kernels(kernels, &walked.nodes)?;
-        let prepared = Captured::from_template(template, walked.nodes, held)?;
+        // The prepared executable is the serving template's, so its node table is too: the walk's
+        // nodes belong to the graph the walk captured, and no executable of this template can be
+        // set through them. The two tables have one shape, which the comparison above established,
+        // and each launch keeps the descriptor key the walk stated for it.
+        let nodes = served
+            .nodes()
+            .iter()
+            .zip(&walked.nodes)
+            .map(|((operator, _, launch), (_, key, _))| (*operator, key.clone(), launch.clone()))
+            .collect();
+        let prepared = Captured::from_template(template, nodes, held)?;
         let mut applied = 0usize;
         for (operator, ordinal, params) in launches {
             applied += prepared.rebind_launch(operator, ordinal, &params)?;

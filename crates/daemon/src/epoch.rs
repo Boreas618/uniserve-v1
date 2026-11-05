@@ -557,12 +557,25 @@ pub struct Epochs {
     commands: Mutex<Option<crate::supervision::ProcessCommands>>,
     /// The program-layer update in flight: its probation's record (§7.3).
     program: Mutex<Option<ProgramUpdate>>,
+    /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
+    /// this process follows it by moving its hold onto the target's engine.
+    served: tokio::sync::watch::Sender<u64>,
 }
 
 impl Epochs {
     /// No epoch was built and no process started yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// States that the frontend serves `epoch` from now on (§7.4).
+    pub fn announce_serve(&self, epoch: u64) {
+        self.served.send_replace(epoch);
+    }
+
+    /// The epoch the frontend was last told to serve, as it changes.
+    pub fn served(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.served.subscribe()
     }
 
     /// Records `record` as epoch `epoch`'s, replacing what was recorded of
@@ -751,10 +764,45 @@ impl Epochs {
             kernels: record.kernels.clone(),
             policy: record.policy.clone(),
         };
+        self.hand_programs(host, engine, config, &programs, commands)
+    }
+
+    /// Gives an epoch switch's target `programs`, as [`Self::hand_to`] gives a joining process the
+    /// serving epoch's: the target parks before any `Precopy` names a generation, and a promotion
+    /// refuses a process that holds none.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the daemon has no channel to its main processes, and when the process refuses
+    /// the programs or does not answer.
+    pub fn hand_target(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+        programs: &FilledPrograms,
+    ) -> Result<(), Failure> {
+        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
+            kind: "no_command_channel".to_owned(),
+            reason: "the daemon has no channel to its main processes".to_owned(),
+            device: None,
+        })?;
+        self.hand_programs(host, engine, config, programs, commands)
+    }
+
+    fn hand_programs(
+        &self,
+        host: &str,
+        engine: u64,
+        config: &crate::options::ServeConfig,
+        programs: &FilledPrograms,
+        commands: crate::supervision::ProcessCommands,
+    ) -> Result<(), Failure> {
+        let record = programs.clone();
         let deployment = Deployment {
             config: config.clone(),
             build_config: crate::epoch::BuildConfig::of(config),
-            programs,
+            programs: programs.clone(),
         };
         let process = crate::engine::control::EpochProcess {
             host: host.to_owned(),
@@ -1362,7 +1410,9 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     let token_bound = config
         .max_num_batched_tokens
         .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
-        .or_else(|| config.cuda_graph_config.tiers().tokens);
+        .or_else(|| config.cuda_graph_config.tiers().tokens)
+        // A media deployment captures no token graph, and its prompt is the most one batch holds.
+        .or_else(|| config.max_model_len.map(|length| length.get()));
     // A batch of requests is bounded by the largest captured decode graph, and
     // the deployment's batch is the smaller of its own and that: a deployment
     // that leaves the batch at its default means the catalog's figure, and one
@@ -1374,6 +1424,9 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         .tiers()
         .rows
         .map_or(max_batch, |rows| max_batch.min(rows));
+    // A batch holds running requests, so the deployment's bound on those bounds it as well: a media
+    // deployment captures no decode graph, and its bound is the only one it states.
+    let max_batch = max_batch.min(u32::try_from(config.max_running_requests.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size

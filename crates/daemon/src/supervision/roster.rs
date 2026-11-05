@@ -524,13 +524,25 @@ impl Roster for ProcessRoster {
         }
     }
 
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        self.launches.entry(generation).or_insert_with(|| Launch {
+            host: host.to_owned(),
+            group: group.to_owned(),
+            rank: u64::from(rank),
+            epoch: None,
+            pid: None,
+        });
+        // A process of this deployment is numbered by the engine it states, which for one the
+        // engine control started is its launch generation.
+        self.engines.insert(generation, generation);
+    }
+
     fn serve(&mut self, epoch: u64, requests: &str) {
         self.requests = requests.to_owned();
+        // A frontend in this process follows the epochs' record, and one of its own hears the
+        // command below: either way the record says what serves.
+        self.epochs.announce_serve(epoch);
         let Some(frontend) = self.frontend else {
-            tracing::warn!(
-                epoch,
-                "the frontend is not connected: nothing serves the epoch"
-            );
             return;
         };
         if let Err(error) = self.link.commands.send(

@@ -346,6 +346,7 @@ impl EpochPlan {
         device: DeviceId,
         resident: u64,
         snapshot: u64,
+        streams: usize,
     ) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
@@ -406,12 +407,20 @@ impl EpochPlan {
         Ok(GraphStorage {
             bytes,
             budget,
-            // Two ranges, because two streams walk this device's graphs: the serving generation's
-            // runner and the preparation's beside it - `graph.bytes` is already `pool * 2` for
-            // exactly that reason, and `Pools::pool` allocates ONE stream's share of it whole.
-            // With one range the first walk takes the reservation entire and the preparation's
-            // range has nothing to take, which is an update that cannot map its own capture.
-            streams: 2,
+            // The range is divided among the streams that will map it, and `streams` is that
+            // count: one per runner the device serves plus one for a preparation, which walks its
+            // own generation on a stream of its own. `bytes` above is the design's figure for the
+            // device - one graph pool, two while a preparation is alive - so a stream's share is
+            // `bytes / streams` and a device that serves more runners takes a smaller share each.
+            // The figure is NOT scaled by the runner count: 10% of the device is the budget for a
+            // device's graphs, and a media rank with five runners may not claim 50%.
+            //
+            // A count short of the streams that actually map is not a tuning error: the first
+            // streams take the range whole and the next one is refused at `Pools::pool` with
+            // "cannot give out N more", which reads as an allocator fault rather than a plan.
+            // `Executor::spawn` therefore refuses a device whose runners outnumber the streams the
+            // range was divided for, by name, before any capture.
+            streams,
             scratch,
             // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
             // the reservation that also holds the state group's snapshot (7.3, 4.5).
@@ -820,6 +829,29 @@ impl EpochPlan {
         &self.targets
     }
 
+    /// The streams `device` maps graphs on: one per runner it serves, plus one for a preparation.
+    ///
+    /// The count is the number of `NamedRunner`s [`EpochPlan::runners`] builds for this class, and
+    /// the two are checked against each other where the runners exist: `Executor::spawn` refuses a
+    /// device whose runners outnumber the streams its graph range was divided for, naming both
+    /// figures. That refusal is what keeps this constant honest - a runner added without the count
+    /// following it stops at the spawn instead of at a capture nobody can read.
+    ///
+    /// A preparation walks its own generation on a stream of its own, so it takes one more range
+    /// than the serving generation does, whether or not an update is in flight when the process
+    /// starts: a range that appeared only at the first precopy would be mapped after the model and
+    /// the cache, and the device would have nothing left to give it.
+    fn streams_on(served: &Served) -> usize {
+        let serving = match served {
+            // The text class serves one causal-language runner (4.3).
+            Served::Text(_) => 1,
+            // The media class serves its encoder, its denoise step, its decoder, its audio
+            // decoder and its host stage: five runners, one stream each.
+            Served::Media(_) => 5,
+        };
+        serving + 1
+    }
+
     /// The runners `device` serves: one per block of the loaded model (§4.3).
     ///
     /// The model's class was resolved once, when it was loaded and its resident memory opened
@@ -962,11 +994,14 @@ impl EpochPlan {
                     placement.expert_parallel as usize,
                     placement.expert_rank as usize,
                 )?;
-                let model = qwen3_moe::load(
+                // The checkpoint states its own representation: a calibrated export is read packed,
+                // and a dense one dense. The layout is the one the serving programs are built for.
+                let model = qwen3_moe::load::load_checkpoint(
                     &self.checkpoint,
                     partition,
                     &mut loader,
                     placement.load_options,
+                    ops::fp4::ScaleLayout::Linear,
                 )?;
                 let served = Served::Text(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
@@ -1163,7 +1198,7 @@ impl EpochPlan {
             _ => 0,
         };
         let snapshot = planned.state_snapshot_bytes();
-        let graph = self.graph(device, resident, snapshot)?;
+        let graph = self.graph(device, resident, snapshot, Self::streams_on(served))?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;

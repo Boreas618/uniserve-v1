@@ -135,6 +135,23 @@ pub enum Task {
     VideoGeneration,
 }
 
+/// What a replica needs to follow an epoch switch onto its target (§7.4).
+pub(crate) struct SwitchTarget {
+    /// The spec the target is welcomed with.
+    pub(crate) spec: wire::EngineSpec,
+    /// The configuration the target serves.
+    pub(crate) config: ServeConfig,
+    /// The programs the target takes before it is promoted.
+    pub(crate) programs: crate::epoch::FilledPrograms,
+    /// The Program Servers that select those programs' revisions, and the host that leads them.
+    pub(crate) servers: Vec<crate::engine::control::ProgramServer>,
+    pub(crate) leader: String,
+    /// The target's launch generation, the number its links state.
+    pub(crate) engine: u64,
+    /// The epoch the target serves.
+    pub(crate) epoch: u64,
+}
+
 /// Records each scheduler's statistics under `model_name`, and with
 /// `observer`, which reads each world's rates.
 pub(crate) fn stats_sink(
@@ -1644,7 +1661,10 @@ impl Leader {
     /// Server's default socket on that host (§5.1, §6.3). The targets are the
     /// Program Server's own: the daemon does not query the devices of another
     /// host to name them.
-    fn program_servers(&self, config: &ServeConfig) -> Vec<crate::engine::control::ProgramServer> {
+    pub(crate) fn program_servers(
+        &self,
+        config: &ServeConfig,
+    ) -> Vec<crate::engine::control::ProgramServer> {
         let socket = config
             .program_server
             .clone()
@@ -1674,7 +1694,7 @@ impl Leader {
     /// which every other host is then asked for exactly: the epoch's engine
     /// host when the configuration names one, and otherwise the first host
     /// of the deployment.
-    fn program_leader_host(
+    pub(crate) fn program_leader_host(
         &self,
         config: &ServeConfig,
         servers: &[crate::engine::control::ProgramServer],
@@ -1974,6 +1994,114 @@ impl Replica {
 
     pub(crate) fn hold(&self) -> &Arc<RequestHold> {
         &self.hold
+    }
+
+    /// Moves this replica onto an epoch switch's target when the switch serves it (§7.4).
+    ///
+    /// The target's child dials this daemon's request socket as it starts, and the switch commands
+    /// it on its process link from then on. The frontend of this process moves when the record says
+    /// the target serves: the responses the drained epoch ends then migrate to the client the hold
+    /// serves, and a switch that fails never moves it.
+    pub(crate) fn follow_switch(
+        self: &Arc<Self>,
+        control: Arc<EngineControl>,
+        updates: Arc<crate::updates::driver::Driver>,
+        target: SwitchTarget,
+    ) {
+        let replica = Arc::clone(self);
+        let SwitchTarget {
+            mut spec,
+            config,
+            programs,
+            servers,
+            leader,
+            engine,
+            epoch,
+        } = target;
+        let mut served = updates.epochs().served();
+        tokio::spawn(async move {
+            let sink = stats_sink(
+            replica.model_name.clone(),
+            Arc::clone(&replica.observer),
+            replica.ordinal,
+            );
+            let welcomed = spec.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                control.join_target(engine, welcomed, sink)
+            })
+            .await;
+            let client = match joined {
+                Ok(Ok(client)) => Arc::new(client),
+                Ok(Err(error)) => {
+                    warn!(engine, "the switch's target did not join: {error:#}");
+                    return;
+                }
+                Err(error) => {
+                    warn!(engine, "joining the switch's target ended: {error}");
+                    return;
+                }
+            };
+            // The target parks with no programs: it takes them here, and the switch promotes it
+            // once it holds them.
+            let host = config.host_identity.clone();
+            let handing = Arc::clone(updates.epochs());
+            let handed = tokio::task::spawn_blocking(move || {
+                // The update names backends, and a revision is the Program Server's to select.
+                let steps = crate::engine::control::PrepareSteps::new();
+                let pinned = crate::engine::control::prepare_epoch(
+                    &servers,
+                    &leader,
+                    &programs,
+                    &[],
+                    &steps,
+                )
+                .map_err(|error| crate::epoch::Failure {
+                    kind: "prepare_failed".to_owned(),
+                    reason: format!("{error:#}"),
+                    device: None,
+                })?;
+                handing.hand_target(&config.host_identity, engine, &config, &pinned)
+            })
+            .await;
+            match handed {
+                Ok(Ok(())) => updates.handed(&host),
+                Ok(Err(failure)) => {
+                    warn!(engine, "the switch's target took no programs: {}", failure.reason);
+                    updates.rollback(&failure.reason);
+                    return;
+                }
+                Err(error) => {
+                    warn!(engine, "handing the switch's target its programs ended: {error}");
+                    updates.rollback(&error.to_string());
+                    return;
+                }
+            }
+            while *served.borrow_and_update() < epoch {
+                if served.changed().await.is_err() {
+                    return;
+                }
+            }
+            spec.predecessor = None;
+            let before = locked(&replica.served).replace(spec);
+            // The previous client stays until the switch settles: it is what keeps the previous
+            // epoch's process, which the switch drains next and serves again on a revert.
+            let previous = replica.hold.client();
+            replica.hold.serve(Arc::clone(&client));
+            tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
+            info!(engine, epoch, "the switch's target serves this replica");
+            while !updates.settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let committed = updates
+                .epochs()
+                .serving()
+                .is_some_and(|(serving, _)| serving == epoch);
+            if !committed && let Some(previous) = previous {
+                *locked(&replica.served) = before;
+                replica.hold.serve(previous);
+                warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+            }
+        });
     }
 
     /// Restarts the committed world while the caller owns its replacement
