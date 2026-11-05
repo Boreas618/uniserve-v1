@@ -485,7 +485,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
         conditions: &[],
         vision_spans: &[],
     };
-    let (_, packing) = layouts.layout(&request)?;
+    let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
     let canvas = layouts.canvas(&request)?;
     let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
@@ -533,6 +533,15 @@ fn stage_denoise(args: &Args) -> Result<()> {
     //    prefix source and the latents - and reserves the sum. `Denoiser::layout` is the same
     //    `Layouts::cover` the packing above used, so there is one layout for this request.
     let shape = <Denoiser as nn::capability::Denoiser>::layout(&block, &request);
+    // The harness derives the packing from `Layouts` and the block answers the layout it will
+    // compute in: two statements of one arrangement, from one function today. If they ever diverge,
+    // the trajectory would be written against one arrangement and computed in another - the class a
+    // dropped condition hid inside - so they are compared rather than asserted in a comment.
+    if layout != shape {
+        return Err(Failure::message(format!(
+            "the harness's layout {layout:?} is not the block's {shape:?}"
+        )));
+    }
     let planned: u64 = block
         .denoise_arena(&shape)?
         .iter()
@@ -676,6 +685,25 @@ fn stage_denoise(args: &Args) -> Result<()> {
         audio: audio_latents,
     };
     block.draw_noise(&forward, nn::capability::Seed(args.seed), shape, latents)?;
+    stream.synchronize()?;
+
+    // The schedule's start, applied once (`Denoiser::prepare_latents`). It is a no-op on every
+    // released and distilled grid and a scaled draw on a parallel-decoding student, which is why it
+    // is a call and not an assumption: a harness that skipped it would agree with this one on every
+    // checkpoint shipped today and diverge silently on the first one that scales.
+    block.prepare_latents(
+        &forward,
+        nn::capability::Conditioning {
+            text,
+            source: None,
+            media: &[],
+            images: None,
+            audio: None,
+            state: &state,
+            step: None,
+        },
+        latents,
+    )?;
     stream.synchronize()?;
 
     // 9. The schedule the checkpoint states, and how much of it this case runs. The case may shorten
