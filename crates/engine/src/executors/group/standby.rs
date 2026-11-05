@@ -17,18 +17,18 @@
 //! its launch to its failure domain's standby world (`Relaunch`), which a
 //! round of the domain promotes as a whole.
 
-use super::WorkerGroup;
+use super::ExecutorGroup;
 use super::{holding, validate_replacement_info};
-use crate::worker::WorkerProcess;
+use crate::executors::ExecutorProcess;
 
 /// The standby rank group of a serving group.
 pub(super) struct Standby {
-    workers: Vec<WorkerProcess>,
+    workers: Vec<ExecutorProcess>,
     /// Whether every rank reported its startup and parked.
     ready: bool,
 }
 
-impl WorkerGroup {
+impl ExecutorGroup {
     /// Whether the group keeps a standby in place: `worker_config.standby`,
     /// for a group that is its own failure domain on the engine's host.
     fn keeps_standby(&self) -> bool {
@@ -63,7 +63,7 @@ impl WorkerGroup {
             domain.offer_standby(*index, args);
             return;
         }
-        let started = (|| -> anyhow::Result<Vec<WorkerProcess>> {
+        let started = (|| -> anyhow::Result<Vec<ExecutorProcess>> {
             let launched =
                 args.spawn_workers(None, &self.registry, &self.processes, &self.claims, None)?;
             let mut workers = args.adopt_workers(launched)?;
@@ -176,12 +176,12 @@ impl WorkerGroup {
     }
 
     /// The deployment's storage claims.
-    pub(crate) fn claims(&self) -> &crate::worker::claims::StorageClaims {
+    pub(crate) fn claims(&self) -> &crate::executors::claims::StorageClaims {
         &self.claims
     }
 
     /// Commits the group's world, which succeeded another
-    /// (`WorkerProcessArgs::predecessor`): each rank takes the
+    /// (`ExecutorProcessArgs::predecessor`): each rank takes the
     /// predecessor's segments it mapped read-only, once the Storage Server
     /// has their writer out (the predecessor's processes are gone), and the
     /// group relaunches on a loss and keeps its standby from then on.
@@ -207,7 +207,7 @@ impl WorkerGroup {
         Ok(results)
     }
 
-    /// Runs the worker hook `name` on the group's serving ranks; each rank's
+    /// Runs the executor hook `name` on the group's serving ranks; each rank's
     /// result, in rank order.
     ///
     /// The hooks that give cache segments back or create them again answer
@@ -216,7 +216,7 @@ impl WorkerGroup {
     /// replace a sleeping group's start awake, and warm up on the planes as
     /// they held them before it.
     pub(crate) fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
-        let results = crate::worker::process::hook_all(
+        let results = crate::executors::process::hook_all(
             &mut self.workers,
             name,
             payload,
@@ -267,7 +267,7 @@ impl WorkerGroup {
     /// Each rank's description as a rank that replaces it must report it
     /// (`validate_replacement_info`): its startup report, with what the
     /// group's planes hold now ([`holding`]).
-    pub(super) fn replacement_infos(&self) -> Vec<ipc::WorkerInfo> {
+    pub(super) fn replacement_infos(&self) -> Vec<ipc::MainProcessInfo> {
         let planes = self.info.prefix_cache.as_ref();
         self.workers
             .iter()
@@ -298,7 +298,7 @@ impl WorkerGroup {
             return None;
         }
         let mut standby = self.standby.take()?;
-        let promoted = crate::worker::process::promote_all(
+        let promoted = crate::executors::process::promote_all(
             &mut standby.workers,
             self.process_args.watchdog_timeout,
         )

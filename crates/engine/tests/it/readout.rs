@@ -5,7 +5,7 @@
 //! and answers once with every candidate's log-probability before finishing.
 //! The simulator reports `sim_candidate_logprob(request, token)` for each
 //! candidate, so the expected answer is known exactly. Tests observe calls at
-//! the executor boundary, the protocol the worker consumes.
+//! the executor boundary, the protocol the executor consumes.
 
 use crate::support;
 
@@ -29,7 +29,7 @@ use ipc::{ImageParams, RequestId, SamplingParams};
 /// Canvas token that marks an answer slot.
 const MASK: u32 = 4;
 
-/// A block-diffusion worker: prompt prefill, canvas denoising and vision
+/// A block-diffusion executor: prompt prefill, canvas denoising and vision
 /// encoding, no token decode, with 16-token cache pages.
 fn readout_worker() -> SimEngine {
     let mut sim = SimEngine::new();
@@ -283,7 +283,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     assert_eq!(readout.candidate_ids, vec![7, 8, 9, 10, 11, 12]);
 }
 
-/// A worker reporting a non-finite candidate log-probability fails the
+/// An executor reporting a non-finite candidate log-probability fails the
 /// readout without an answer, and the request's terminal error names the
 /// field, the readout row and slot the value belongs to, and why it was
 /// rejected.
@@ -576,7 +576,7 @@ fn a_context_prefill_writes_every_image_it_reaches() {
     assert_eq!(forward.seq_lens, vec![4, 9, 17, 24, 32]);
 }
 
-/// The rows a worker stages per call bound numerical segments, even when one
+/// The rows an executor stages per call bound numerical segments, even when one
 /// request's context has more segments than a call can hold.
 #[test]
 fn image_contexts_respect_the_workers_staged_row_capacity() {
@@ -681,9 +681,9 @@ fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
     );
 }
 
-/// The worker prepares each inline input image as one task on its rank's
+/// The executor prepares each inline input image as one task on its rank's
 /// host task pool, so an image encode waits in the scheduler while the pool
-/// is full instead of reaching the worker: with one host task per rank,
+/// is full instead of reaching the executor: with one host task per rank,
 /// image encodes of different requests are never in flight together, and
 /// every request is still answered.
 #[test]

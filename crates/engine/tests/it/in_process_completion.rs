@@ -21,7 +21,7 @@ use engine::{
     Stage,
 };
 use executor::batch::{Batch, Batches, Inventory, Placement};
-use ipc::{ComponentConfig, ImageParams, SamplingParams, WorkerEndpoint, WorkerInfo};
+use ipc::{ComponentConfig, ImageParams, SamplingParams, MainProcessEndpoint, MainProcessInfo};
 
 use crate::support::SAMPLED;
 

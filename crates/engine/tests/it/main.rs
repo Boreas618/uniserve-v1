@@ -1,5 +1,5 @@
 //! The engine's integration tests: its scheduler over the simulator, and
-//! real CPU worker processes over the channel.
+//! real CPU executor processes over the channel.
 
 #![cfg(test)]
 // A case that loses its `#[test]` compiles as a private function and runs nothing;

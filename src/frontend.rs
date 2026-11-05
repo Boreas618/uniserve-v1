@@ -3,7 +3,7 @@
 //! The frontend serves the HTTP and OpenAI API, processes requests' input and
 //! output, keeps the facts of the requests in flight, migrates them between
 //! epochs, and hands its own streams and their connections to a successor on
-//! a hot restart (`specs/worker.md` §2.1, §7.5.1). It takes the deployment's
+//! a hot restart (`specs/executor.md` §2.1, §7.5.1). It takes the deployment's
 //! configuration like `serve`: the options it reads are the host layer's, and
 //! the daemon starts it with the same file, flags and `--set` assignments the
 //! deployment was configured with (§7.7).

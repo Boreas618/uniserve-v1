@@ -1,13 +1,13 @@
-//! The engine's client of the process interface: how its workers are started
+//! The engine's client of the process interface: how its executors are started
 //! and supervised on every node.
 //!
 //! The engine starts no process itself. It connects to the leader daemon's
-//! process socket and asks it to start each worker on the worker's node
+//! process socket and asks it to start each executor on the executor's node
 //! (`Spawn`), to hold the store socket a group's first rank serves on that
 //! rank's node until the rank inherits it (`Reserve`), to claim the
 //! deployment at each node's Storage Server (`Claim`), and to stop a group's
-//! workers on every node ahead of the group's next launch (`Stop`). The
-//! daemons report each worker's exit; a worker that registered dies when its
+//! executors on every node ahead of the group's next launch (`Stop`). The
+//! daemons report each executor's exit; an executor that registered dies when its
 //! connection to the engine closes, and one that has not yet registered is
 //! known lost by its exit report.
 //!
@@ -47,7 +47,7 @@ pub(crate) struct Retirement {
     pub(crate) worlds: Vec<u64>,
 }
 
-/// The deployment's connection to its daemons, shared by its worker groups.
+/// The deployment's connection to its daemons, shared by its executor groups.
 pub(crate) type Processes = Arc<Mutex<ProcessClient>>;
 
 /// The daemon's commands for this main process, filed as they arrive.
@@ -80,7 +80,7 @@ pub(crate) fn take_commands() -> Option<crossbeam_channel::Receiver<proto::proce
 
 /// This process's connection to its daemons, once it has one.
 ///
-/// The connection is the deployment's, shared by the worker groups; a report
+/// The connection is the deployment's, shared by the executor groups; a report
 /// needs no answer, so it does not need to be the thread that made a request.
 static CONNECTION: OnceLock<Processes> = OnceLock::new();
 
@@ -130,7 +130,7 @@ struct ExitReports {
 }
 
 impl ExitReports {
-    /// Records that `group`'s workers are launched under `generation`.
+    /// Records that `group`'s executors are launched under `generation`.
     fn launch(&mut self, group: &str, generation: u64) {
         self.running
             .entry(group.to_owned())
@@ -146,7 +146,7 @@ impl ExitReports {
             .get(&exit.group)
             .is_some_and(|generations| generations.contains(&exit.generation));
         if !running {
-            tracing::debug!(group = %exit.group, rank = exit.rank, generation = exit.generation, "discarding the exit of a stopped worker");
+            tracing::debug!(group = %exit.group, rank = exit.rank, generation = exit.generation, "discarding the exit of a stopped executor");
             return;
         }
         self.reported
@@ -307,7 +307,7 @@ impl ProcessClient {
             .with_context(|| format!("the address of host {host} is {}", node.address))
     }
 
-    /// Starts one worker as `spawn` describes; its group's exits of that
+    /// Starts one executor as `spawn` describes; its group's exits of that
     /// generation are kept from here on.
     ///
     /// # Errors
@@ -317,7 +317,7 @@ impl ProcessClient {
         self.exits.launch(&spawn.group, spawn.generation);
         let (group, rank, host) = (spawn.group.clone(), spawn.rank, spawn.host.clone());
         self.request(request::Kind::Spawn(spawn))
-            .with_context(|| format!("starting rank {rank} of worker group {group} on host {host}"))
+            .with_context(|| format!("starting rank {rank} of executor group {group} on host {host}"))
             .map(|_| ())
     }
 
@@ -495,7 +495,7 @@ impl ProcessClient {
                 .claim
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("a claim token is not 16 bytes"))?,
-            // The engine states whether its workers use the host KV cache.
+            // The engine states whether its executors use the host KV cache.
             host_kv_cache: false,
             tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
             // The engine names the other nodes' servers (`Claims::launch`).
@@ -507,7 +507,7 @@ impl ProcessClient {
         })
     }
 
-    /// Stops `group`'s workers on every node ahead of its next launch. The
+    /// Stops `group`'s executors on every node ahead of its next launch. The
     /// group's launch ends first, even if the stop cannot be sent: its exits
     /// are discarded, and so is every later report of them.
     ///
@@ -585,7 +585,7 @@ impl ProcessClient {
             Some(downstream::Kind::Event(event)) => {
                 match event.kind {
                     Some(event::Kind::Exit(exit)) => {
-                        tracing::warn!(group = %exit.group, rank = exit.rank, host = %exit.host, status = %exit.status, "a worker exited");
+                        tracing::warn!(group = %exit.group, rank = exit.rank, host = %exit.host, status = %exit.status, "an executor exited");
                         self.exits.file(exit);
                     }
                     // The daemon's command for this main process (§7.3): filed

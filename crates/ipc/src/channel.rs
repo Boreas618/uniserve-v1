@@ -883,14 +883,14 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{WorkerRequest, WorkerResponse, WorkerResponseError};
+    use crate::{MainProcessRequest, MainProcessResponse, MainProcessResponseError};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     /// An error response whose encoded message is `filler` bytes of text plus
     /// a fixed envelope.
-    fn response_of(message_id: u64, filler: usize) -> WorkerResponse {
-        let mut response = WorkerResponse::error(WorkerResponseError {
+    fn response_of(message_id: u64, filler: usize) -> MainProcessResponse {
+        let mut response = MainProcessResponse::error(MainProcessResponseError {
             message: "m".repeat(filler),
             code: None,
             fatal: false,
@@ -979,14 +979,14 @@ mod tests {
             assert_eq!(near.local_addr().unwrap(), far.peer_addr().unwrap());
             assert_eq!(near.peer_addr().unwrap(), far.local_addr().unwrap());
 
-            let mut request = WorkerRequest::info();
+            let mut request = MainProcessRequest::info();
             request.set_message_id(Some(77));
             near.send(&request).unwrap();
-            assert_eq!(recv::<WorkerRequest>(&mut far).unwrap(), request);
+            assert_eq!(recv::<MainProcessRequest>(&mut far).unwrap(), request);
 
             let answer = response_of(77, 16);
             far.send(&answer).unwrap();
-            assert_eq!(recv::<WorkerResponse>(&mut near).unwrap(), answer);
+            assert_eq!(recv::<MainProcessResponse>(&mut near).unwrap(), answer);
         }
     }
 
@@ -1018,18 +1018,18 @@ mod tests {
         peer.write_all(&second[..second.len() - 2]).unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
 
-        assert_eq!(recv::<WorkerResponse>(&mut channel).unwrap(), first);
-        let error = recv::<WorkerResponse>(&mut channel).expect_err("truncation must fail");
+        assert_eq!(recv::<MainProcessResponse>(&mut channel).unwrap(), first);
+        let error = recv::<MainProcessResponse>(&mut channel).expect_err("truncation must fail");
         assert!(error.to_string().contains("incomplete frame"), "{error}");
-        assert!(channel.send(&WorkerRequest::info()).is_err());
+        assert!(channel.send(&MainProcessRequest::info()).is_err());
     }
 
     #[test]
     fn a_frame_decodes_only_as_the_message_it_carries() {
         let (mut channel, mut peer) = with_raw_peer();
-        peer.write_all(&frame_of(&WorkerRequest::info())).unwrap();
+        peer.write_all(&frame_of(&MainProcessRequest::info())).unwrap();
         assert!(matches!(
-            recv::<WorkerResponse>(&mut channel),
+            recv::<MainProcessResponse>(&mut channel),
             Err(IpcError::Encoding(_))
         ));
     }
@@ -1081,7 +1081,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            recv::<WorkerResponse>(&mut channel).unwrap(),
+            recv::<MainProcessResponse>(&mut channel).unwrap(),
             response_of(1, 5)
         );
 
@@ -1107,7 +1107,7 @@ mod tests {
         let _peer = writer.join().unwrap();
         for message_id in [2, 3] {
             assert_eq!(
-                channel.try_recv::<WorkerResponse>().unwrap(),
+                channel.try_recv::<MainProcessResponse>().unwrap(),
                 Some(response_of(message_id, 5))
             );
         }
@@ -1134,7 +1134,7 @@ mod tests {
             "a closed channel blocked a wait"
         );
         assert_eq!(
-            channel.try_recv::<WorkerResponse>().unwrap(),
+            channel.try_recv::<MainProcessResponse>().unwrap(),
             Some(response_of(1, 5))
         );
     }
@@ -1214,7 +1214,7 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(60);
         let received = loop {
-            if let Some(message) = far.try_recv::<WorkerResponse>().unwrap() {
+            if let Some(message) = far.try_recv::<MainProcessResponse>().unwrap() {
                 break message;
             }
             assert!(
@@ -1245,7 +1245,7 @@ mod tests {
             let hangup = channel.hangup().unwrap();
             let (cancel, canceller) = UnixStream::pair().unwrap();
 
-            peer.send(&WorkerRequest::info()).unwrap();
+            peer.send(&MainProcessRequest::info()).unwrap();
             let cancelling = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(100));
                 drop(canceller);

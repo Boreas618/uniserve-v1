@@ -45,6 +45,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifndef UNISERVE_CONV_ENTRY
 #error "the package's build script defines UNISERVE_CONV_ENTRY: the module's launch entry"
@@ -471,67 +472,144 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   // or the first proposal.
   void* plan = nullptr;
   if (built) {
-    void* heuristic = nullptr;
-    built = make(kDescriptorEngineHeuristic, &heuristic) &&
-            set(heuristic, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1, &graph) &&
-            set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &kHeuristicModeA) &&
-            finalize(heuristic, "the heuristic");
-    // **Two of the heuristic's five attributes were never stated.** `SM_COUNT_TARGET` is the
-    // device's multiprocessor count and `DEVICEPROP` names the device the plan is for; cuDNN
-    // treats both as optional, and an engine that needs a device property the request does not
-    // name is not proposed at all - so a shape can have an engine and still come back with three
-    // empty lists. Both are stated best-effort: a cuDNN that refuses either still asks, and the
-    // refusal records which it accepted, because a sentence about an empty list cannot say whether
-    // the request reached the library the way the caller meant.
+    // **One heuristic descriptor per mode.** An attribute cannot be reset once a descriptor is
+    // finalized, so re-asking a finalized heuristic for a second list answers nothing - and
+    // "nothing" is exactly the answer this loop exists to tell apart from "no engine". Each mode
+    // builds its own descriptor, and the refusal records what each one said: a list that could not
+    // be asked for and a list that came back empty have different cures.
     bool sm_counted = false;
     bool device_named = false;
     int32_t ordinal = 0;
     int multiprocessors = 0;
-    if (built && cudaGetDevice(&ordinal) == cudaSuccess &&
+    void* properties = nullptr;
+    if (cudaGetDevice(&ordinal) == cudaSuccess &&
         cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, ordinal) ==
             cudaSuccess &&
         multiprocessors > 0) {
-      int64_t target = multiprocessors;
-      sm_counted =
-          library.backend_set(heuristic, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
-          kSuccess;
       int64_t device_id = ordinal;
-      void* properties = nullptr;
       const bool made =
           library.backend_create(kDescriptorDeviceProp, &properties) == kSuccess &&
           library.backend_set(properties, kAttrDevicePropDeviceId, kTypeInt64, 1, &device_id) ==
               kSuccess &&
           library.backend_finalize(properties) == kSuccess;
-      device_named = made && library.backend_set(heuristic, kAttrEngineHeurDeviceProp,
-                                                 kTypeBackendDescriptor, 1, &properties) ==
-                                 kSuccess;
-      if (!device_named && properties != nullptr) {
-        library.backend_destroy(properties);
+      if (!made) {
+        if (properties != nullptr) {
+          library.backend_destroy(properties);
+        }
+        properties = nullptr;
       }
     }
-    void* configs[kMaxEngineConfigs] = {};
-    int64_t count = 0;
+    void* heuristic = nullptr;
+    std::vector<void*> configs;
     bool listed = false;
-    if (built) {
-      listed = library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor,
-                                   kMaxEngineConfigs, &count, configs) == kSuccess &&
-               count > 0;
+    // **A list longer than the array is a query cuDNN refuses, and a refused query reads exactly
+    // like an empty one.** The count is asked for separately - zero elements, no array - and the
+    // array is sized from the answer, so the exhaustive list is readable whatever its length. The
+    // cap keeps a library that reports nonsense from taking the process with it.
+    // Answers the number of configurations the list holds, `0` for a list that is empty, and `-1`
+    // for a query the library refused - three states, because "answered nothing" and "not answered"
+    // have different cures and used to be one sentence.
+    auto ask = [&library, &configs](void* heuristic) -> int64_t {
+      int64_t needed = 0;
+      const bool sized = library.backend_get(heuristic, kAttrEngineHeurResults,
+                                             kTypeBackendDescriptor, 0, &needed, nullptr) ==
+                         kSuccess;
+      int64_t room = sized && needed > 0 ? needed : kMaxEngineConfigs;
+      if (room > kMaxEngineConfigs * 64) {
+        room = kMaxEngineConfigs * 64;
+      }
+      configs.assign(static_cast<size_t>(room), nullptr);
+      int64_t count = 0;
+      const bool answered =
+          library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor, room,
+                              &count, configs.data()) == kSuccess;
+      if (!answered) {
+        // A refused query may have written some of its array: those are engine configurations the
+        // library handed over and only this function can release them.
+        for (void* config : configs) {
+          if (config != nullptr) {
+            library.backend_destroy(config);
+          }
+        }
+        configs.clear();
+        return -1;
+      }
+      if (count <= 0) {
+        // A query the library answered with nothing is the *empty list*, which is a different fact
+        // from a query it refused and is the one this mode's record has to tell apart.
+        configs.clear();
+        return 0;
+      }
+      if (count > room) {
+        count = room;
+      }
+      configs.resize(static_cast<size_t>(count));
+      return count;
+    };
+    char tried[160] = {};
+    const int32_t modes[3] = {kHeuristicModeA, kHeuristicModeB, kHeuristicModeFallback};
+    const char* names[3] = {"shortlist", "exhaustive", "fallback"};
+    for (int32_t at_mode = 0; built && at_mode < 3 && !listed; ++at_mode) {
+      const int32_t mode = modes[at_mode];
+      char said[48];
+      void* asked = nullptr;
+      bool ready = library.backend_create(kDescriptorEngineHeuristic, &asked) == kSuccess;
+      ready = ready &&
+              library.backend_set(asked, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1,
+                                  &graph) == kSuccess;
+      if (ready && multiprocessors > 0) {
+        int64_t target = multiprocessors;
+        sm_counted = sm_counted ||
+                     library.backend_set(asked, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
+                         kSuccess;
+      }
+      if (ready && properties != nullptr) {
+        device_named =
+            device_named ||
+            library.backend_set(asked, kAttrEngineHeurDeviceProp, kTypeBackendDescriptor, 1,
+                                &properties) == kSuccess;
+      }
+      ready = ready &&
+              library.backend_set(asked, kAttrEngineHeurMode, kTypeHeurMode, 1, &mode) ==
+                  kSuccess &&
+              library.backend_finalize(asked) == kSuccess;
+      if (!ready) {
+        std::snprintf(said, sizeof(said), "%s unbuilt, ", names[at_mode]);
+      } else {
+        const int64_t got = ask(asked);
+        if (got > 0) {
+          listed = true;
+          heuristic = asked;
+          break;
+        }
+        std::snprintf(said, sizeof(said), got < 0 ? "%s unanswered, " : "%s none, ",
+                      names[at_mode]);
+      }
+      if (asked != nullptr) {
+        library.backend_destroy(asked);
+      }
+      std::strncat(tried, said, sizeof(tried) - std::strlen(tried) - 1);
     }
-    // **A shortlist with no entry is when the exhaustive list earns its cost.** Mode A is cuDNN's
-    // performance shortlist and mode B is every engine the library implements for the graph; a
-    // shape with no shortlist entry can still have an engine, and the video VAE's first
-    // convolution at [1, 3, 19, 258, 258] f32 is one. The shape is planned once per program load,
-    // so the price is a build's, not a call's.
-    const int32_t wider[2] = {kHeuristicModeB, kHeuristicModeFallback};
-    for (int32_t at_mode = 0; at_mode < 2 && built && !listed; ++at_mode) {
-      int32_t mode = wider[at_mode];
-      count = 0;
-      listed = set(heuristic, kAttrEngineHeurMode, kTypeHeurMode, 1, &mode) &&
-               library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor,
-                                   kMaxEngineConfigs, &count, configs) == kSuccess &&
-               count > 0;
-    }
+    (void)names;
     if (built && !listed) {
+      // **The geometry is checked here, before the library is blamed.** cuDNN answers an implied
+      // output shape that disagrees with the stated one with no engines at all, not with a geometry
+      // error, so a graph whose arithmetic is wrong reads exactly like a shape the library cannot
+      // serve. The forward's axis is `(in + 2p - d(k-1) - 1)/s + 1` and the backward-data pass's is
+      // `(dy - 1)s - 2p + d(k-1) + 1`; both are recomputed from the stated input, weight and
+      // geometry, and the refusal prints them beside the stated output.
+      int64_t implied[3] = {0, 0, 0};
+      bool agrees = true;
+      for (int32_t axis = 0; axis < kSpatial; ++axis) {
+        const int64_t window =
+            static_cast<int64_t>(call.dilation[axis]) * (static_cast<int64_t>(call.kernel[axis]) - 1) + 1;
+        const int64_t spread = 2 * static_cast<int64_t>(call.padding[axis]);
+        const int64_t step = static_cast<int64_t>(call.stride[axis]);
+        const int64_t source = x_dims[axis + 2];
+        implied[axis] = transposed ? (source - 1) * step - spread + window
+                                   : (source + spread - window) / step + 1;
+        agrees = agrees && implied[axis] == y_dims[axis + 2];
+      }
       // **The graph travels with the refusal.** An empty engine list is an answer about one exact
       // request: these dims, these strides, this geometry, this element type and this permission.
       // A reader given only the sentence has to guess which of them cuDNN would not take - and the
@@ -539,13 +617,19 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       char why[512];
       std::snprintf(
           why, sizeof(why),
-          "cuDNN proposes no engine for this convolution: %s, x [%lld %lld %lld %lld %lld] "
-          "strides [%lld %lld %lld %lld %lld] type %d, w [%lld %lld %lld %lld %lld] type %d, "
-          "y [%lld %lld %lld %lld %lld] type %d, kernel [%lld %lld %lld] stride [%lld %lld %lld] "
-          "padding [%lld %lld %lld] dilation [%lld %lld %lld], tf32 %d, channels_last %d, "
-          "sm_count_target %s, device_property %s - the shortlist, the exhaustive list and the "
-          "fallback list all name none",
-          transposed ? "backward-data" : "forward", static_cast<long long>(x_dims[0]),
+          // The two things that decide the cure come first, so that a message truncated by its own
+          // room still says which lists were asked and whether the geometry agrees: `asked` names
+          // each list and what it said, and `geometry` compares the stated output with the one the
+          // input, weight and geometry imply. The graph follows, because a reader with only the
+          // verdict has to guess which shape cuDNN would not take.
+          "cuDNN proposes no engine for this convolution: %s, asked %s, geometry %s (imply [%lld "
+          "%lld %lld]); x [%lld %lld %lld %lld %lld] strides [%lld %lld %lld %lld %lld] type %d, "
+          "w [%lld %lld %lld %lld %lld] type %d, y [%lld %lld %lld %lld %lld] type %d, kernel "
+          "[%lld %lld %lld] stride [%lld %lld %lld] padding [%lld %lld %lld] dilation [%lld %lld "
+          "%lld], tf32 %d, channels_last %d, sm_count_target %s, device_property %s",
+          transposed ? "backward-data" : "forward", tried, agrees ? "agrees" : "DISAGREES",
+          static_cast<long long>(implied[0]), static_cast<long long>(implied[1]),
+          static_cast<long long>(implied[2]), static_cast<long long>(x_dims[0]),
           static_cast<long long>(x_dims[1]), static_cast<long long>(x_dims[2]),
           static_cast<long long>(x_dims[3]), static_cast<long long>(x_dims[4]),
           static_cast<long long>(x_strides[0]), static_cast<long long>(x_strides[1]),
@@ -588,7 +672,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     int64_t take = -1;
     bool hosted = false;
     bool named_narrows = false;
-    for (int64_t at = 0; at < count && built; ++at) {
+    for (int64_t at = 0; at < static_cast<int64_t>(configs.size()) && built; ++at) {
       void* engine = nullptr;
       if (library.backend_get(configs[at], kAttrEngineCfgEngine, kTypeBackendDescriptor, 1,
                               nullptr, &engine) != kSuccess ||
@@ -640,10 +724,16 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
                   &configs[take]) &&
               finalize(plan, "the plan");
     }
-    for (int64_t at = 0; at < count; ++at) {
-      library.backend_destroy(configs[at]);
+    for (void* config : configs) {
+      library.backend_destroy(config);
     }
-    library.backend_destroy(heuristic);
+    // The winning heuristic names the device-properties descriptor, so it outlives it.
+    if (heuristic != nullptr) {
+      library.backend_destroy(heuristic);
+    }
+    if (properties != nullptr) {
+      library.backend_destroy(properties);
+    }
   }
   library.backend_destroy(graph);
   library.backend_destroy(operation);
