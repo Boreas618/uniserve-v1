@@ -212,5 +212,23 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
         expected[GENERATED..GENERATED + CONTINUED],
         "the continuation generates what the uninterrupted request generates after those tokens"
     );
+
+    // The tokens alone cannot tell inheritance from trust: a pool that
+    // followed `generated_token_ids` and prefilled the whole prompt again
+    // would sample the same ids from the same extent. What separates them is
+    // the successor's first batch, so the case reads it.
+    let batches = successor_pool.submitted();
+    let first = batches.first().expect("the successor served the continuation");
+    assert_eq!(
+        first.shape.tokens, 1,
+        "the successor decodes one token from the parked cache rather than prefilling the prompt \
+         again: its first batch holds {} tokens",
+        first.shape.tokens
+    );
+    assert_eq!(
+        first.columns.rows.seq_lens.first().copied().unwrap_or(0) as usize,
+        (8 + GENERATED) as usize,
+        "the successor's row starts where the predecessor stopped"
+    );
     successor.shutdown();
 }
