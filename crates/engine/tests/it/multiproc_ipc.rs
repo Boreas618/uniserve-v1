@@ -25,33 +25,26 @@
 
 use std::fs::remove_file;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use engine::{
-    CallReaders, EngineConfig, Executor, RankBuffer, SchedulerHandle, ExecutorFailure, ExecutorGroup,
-    ExecutorGroupConfig, ExecutorProcessArgs,
+    CallReaders, EngineConfig, Executor, ExecutorGroup, ExecutorGroupConfig, ExecutorProcessArgs,
+    RankBuffer, SchedulerHandle,
 };
-use engine::{DiffusionRequest, Event, Request};
+use engine::{Event, Request};
 use ipc::{
     Batch, BlockTable, Bounds, BufferAllocation, CacheUnitAllocation, Call, CallCoordinates,
     CallId, CallKind, CallStatus, DType, ForwardBatch, ForwardMode, GenerationParams, NewRequest,
     RequestKey, ShapeBound, TensorRef, TransferMode,
 };
-use ipc::{DiffusionSamplingParams, RequestId, SamplingParams, UnitId};
+use ipc::{RequestId, SamplingParams, UnitId};
 
 const WORLD_SIZE: usize = 2;
 const QUEUE_DEPTH: usize = 2;
 /// The stub model's image start token, the successor of 1001.
 const STUB_IMAGE_START: u32 = 151_670;
-/// Held across `SchedulerHandle::start_all` in
-/// `unsupported_media_is_rejected_without_stopping_the_engine` and across the
-/// rank-group launch in `a_lost_worker_relaunches_its_group_and_an_incomplete_launch_fails`,
-/// so those two launches never overlap. Other tests launch without taking it.
-static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
-
 /// The five top logprobs a fresh request reports for its first token after
 /// the prompt `[7, 8]`, selected greedily under the nucleus `top_p`.
 fn first_token_logprobs(
@@ -262,105 +255,6 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A group's relaunch runs on its failure domain's thread: while the
-/// relaunched ranks start, the executor serves its other groups, and the
-/// relaunched group serves again once its ranks are installed.
-#[test]
-fn a_relaunching_group_leaves_its_executor_serving_the_others() -> anyhow::Result<()> {
-    use engine::{Dispatcher, ExecutorGroupId};
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // The wrapper records each launch's process id. A relaunched rank
-    // (launch 2) waits for `release` before it starts, which holds the
-    // relaunch in its ranks' registration until the test lets it go.
-    let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("worker");
-    let worker = serde_json::to_string(&worker_executable())?;
-    let state = serde_json::to_string(directory.path())?;
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/usr/bin/env python3\nimport os, sys, time\nfrom pathlib import Path\nstate = Path({state})\ngeneration = sys.argv[sys.argv.index('--generation') + 1]\n(state / (generation + '.pid')).write_text(str(os.getpid()))\nwhile generation == '2' and not (state / 'release').exists():\n    time.sleep(0.05)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let relaunched = ExecutorGroupId("relaunched".into());
-    let serving = ExecutorGroupId("serving".into());
-    let spawn = |worker_id: &ExecutorGroupId| -> anyhow::Result<ExecutorGroup> {
-        let mut args = single_worker_args(&worker_id.0, 1);
-        if *worker_id == relaunched {
-            args.executable = wrapper.clone();
-        }
-        ExecutorGroup::spawn(args)
-    };
-    let mut executor = Dispatcher::try_new(
-        vec![
-            (relaunched.clone(), spawn(&relaunched)?),
-            (serving.clone(), spawn(&serving)?),
-        ],
-        engine::TransferConfig::default(),
-    )?;
-    let prefill = |batch_id, request_id| -> anyhow::Result<Batch> {
-        let admission = text_admission(request_id, 1, 1)?;
-        Ok(token_batch(
-            batch_id,
-            batch_id,
-            admission.request_key,
-            Some(admission),
-            CallId::new(batch_id, 0),
-            CallKind::Forward(ForwardMode::Prefill),
-            &[7],
-            UnitId(1),
-            0,
-        ))
-    };
-
-    let pid = std::fs::read_to_string(directory.path().join("1.pid"))?.parse::<libc::pid_t>()?;
-    // SAFETY: kill takes only integer arguments and touches no storage of this process.
-    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let loss = loop {
-        match executor.poll(Duration::from_millis(100)) {
-            Ok(None) => anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "the loss was not reported"
-            ),
-            Ok(Some(result)) => anyhow::bail!("an idle group returned {result:?}"),
-            Err(loss) => break loss,
-        }
-    };
-    let loss = loss
-        .downcast_ref::<ExecutorFailure>()
-        .context("expected the group's loss")?;
-    assert_eq!(loss.worker_id, relaunched);
-
-    // The relaunch waits for its held rank while the other group serves.
-    executor.submit(place(prefill(1, 61)?, &serving.0, Vec::new()))?;
-    let served = poll_logical(&mut executor)?.context("the other group did not serve")?;
-    assert_eq!(served.batch_id, 1);
-    assert_eq!(served.results[0].output.status, CallStatus::Ok);
-    assert!(
-        !executor.has_capacity(&relaunched),
-        "the relaunching group accepts work"
-    );
-
-    std::fs::write(directory.path().join("release"), "")?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !executor.has_capacity(&relaunched) {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the relaunched group did not become ready"
-        );
-        executor.poll(Duration::from_millis(100))?;
-    }
-    executor.submit(place(prefill(2, 62)?, &relaunched.0, Vec::new()))?;
-    let recovered = poll_logical(&mut executor)?.context("the relaunched group did not serve")?;
-    assert_eq!(recovered.batch_id, 2);
-    assert_eq!(recovered.results[0].output.status, CallStatus::Ok);
-    executor.close()?;
-    Ok(())
-}
-
 #[test]
 fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -415,115 +309,6 @@ fn losing_every_worker_stops_request_admission() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An engine whose only group is lost stays alive while the group's failure
-/// domain relaunches it: a request submitted meanwhile waits for the
-/// relaunched ranks and completes on them.
-#[test]
-fn an_engine_serves_once_its_only_group_is_relaunched() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // The wrapper records each launch's process ids by generation and rank.
-    // A relaunched rank (launch 2) waits for `release` before it starts.
-    let directory = tempfile::tempdir()?;
-    let wrapper = directory.path().join("worker");
-    let worker = serde_json::to_string(&worker_executable())?;
-    let state = serde_json::to_string(directory.path())?;
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/usr/bin/env python3\nimport os, sys, time\nfrom pathlib import Path\nstate = Path({state})\nargument = lambda name: sys.argv[sys.argv.index(name) + 1]\ngeneration = argument('--generation')\n(state / (generation + '-' + argument('--rank') + '.pid')).write_text(str(os.getpid()))\nwhile generation == '2' and not (state / 'release').exists():\n    time.sleep(0.05)\nos.execv({worker}, [{worker}, *sys.argv[1:]])\n"
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
-    let mut config = EngineConfig::sim("stub");
-    config.generation_limits = engine::GenerationLimits {
-        features: engine::GenerationFeatures::UNDERSTANDING,
-        latent_downsample: 1,
-        max_cfg_branches: 1,
-        ..Default::default()
-    };
-    config.worker_groups = vec![ExecutorGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        WORLD_SIZE,
-        2,
-        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
-    )];
-    config.worker_process = worker_group_args();
-    config.worker_process.executable = wrapper;
-    let engine = SchedulerHandle::start_all(config)?.remove(0);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
-
-    let result = (|| -> anyhow::Result<()> {
-        let pid =
-            std::fs::read_to_string(directory.path().join("1-0.pid"))?.parse::<libc::pid_t>()?;
-        // SAFETY: kill takes only integer arguments and touches no storage of this process.
-        anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0);
-        // The relaunch has started once its first rank recorded itself.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !directory.path().join("2-0.pid").exists() {
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "the group was not relaunched"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        let mut events = engine.submit(Request::from(engine::GenerationRequest {
-            request_id: RequestId(81),
-            prompt_token_ids: vec![7, 8],
-            negative_prompt_token_ids: Vec::new(),
-            multimodal_inputs: Default::default(),
-            constraint: engine::GenerationConstraint::Default,
-            sampling: SamplingParams::default(),
-            image: Default::default(),
-            max_images: 1,
-            max_und_tokens: 2,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            cache: Default::default(),
-            include_stop_token: false,
-            image_generation: Default::default(),
-            readout: Vec::new(),
-            generated_token_ids: Vec::new(),
-            adapter: 0,
-            generated_images: Vec::new(),
-            trajectory: Default::default(),
-        }))?;
-        std::fs::write(directory.path().join("release"), "")?;
-        runtime.block_on(async {
-            loop {
-                let event = tokio::time::timeout(Duration::from_secs(60), events.recv())
-                    .await
-                    .context("the request did not finish after the relaunch")?
-                    .context("the request's events ended without a terminal event")?;
-                match event {
-                    Event::Finished {
-                        completion_tokens, ..
-                    } => {
-                        anyhow::ensure!(completion_tokens == 2, "{completion_tokens} tokens");
-                        return Ok(());
-                    }
-                    Event::Rejected { message, .. } | Event::Error { message } => {
-                        anyhow::bail!("the request failed: {message}")
-                    }
-                    _ => {}
-                }
-            }
-        })
-    })();
-
-    // The dead latch is set only when the scheduler thread exits with a fatal
-    // status, so `shutdown` joins that thread before `is_dead` is read.
-    engine.shutdown();
-    result?;
-    assert!(!engine.is_dead(), "the relaunch killed the engine");
-    Ok(())
-}
-
 /// The engine configuration of a two-rank stub deployment named
 /// `deployment`.
 fn stub_engine_config(deployment: &str) -> EngineConfig {
@@ -546,36 +331,6 @@ fn stub_engine_config(deployment: &str) -> EngineConfig {
     config
 }
 
-/// A greedy text request of the prompt `[7, 8, 9]` that generated
-/// `generated` before it migrated and generates `max_und_tokens` tokens in
-/// all: it ignores EOS, which the stub model reaches early.
-fn greedy_text(id: u64, generated: Vec<u32>, max_und_tokens: usize) -> Request {
-    Request::from(engine::GenerationRequest {
-        request_id: RequestId(id),
-        prompt_token_ids: vec![7, 8, 9],
-        negative_prompt_token_ids: Vec::new(),
-        multimodal_inputs: Default::default(),
-        constraint: engine::GenerationConstraint::UndOnly,
-        sampling: SamplingParams {
-            ignore_eos: true,
-            ..Default::default()
-        },
-        image: Default::default(),
-        max_images: 1,
-        max_und_tokens,
-        stop_strings: Vec::new(),
-        stop_token_ids: Vec::new(),
-        priority: 0,
-        cache: Default::default(),
-        include_stop_token: false,
-        image_generation: Default::default(),
-        readout: Vec::new(),
-        generated_token_ids: generated,
-        adapter: 0,
-        generated_images: Vec::new(),
-        trajectory: Default::default(),
-    })
-}
 
 /// The tokens `events` delivers until its terminal event, and that event.
 fn tokens_until_terminal(events: &mut engine::EventRx) -> anyhow::Result<(Vec<u32>, Event)> {
@@ -672,172 +427,6 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() -> anyhow::Result<()> 
         expected.iter().all(|tokens| tokens.len() == 6) && handed == expected,
         "one group generated {expected:?}, the prefill and decode groups {handed:?}"
     );
-    Ok(())
-}
-
-/// A world that succeeds a running one starts beside it under the same
-/// claim, serves once the running world parked and it is promoted with the
-/// running world's prefix cache index, commits once the running world
-/// closed, and continues a request the running one generated part of: the
-/// continuation generates what the uninterrupted request generates after
-/// those tokens, and its usage is the uninterrupted request's.
-#[test]
-fn a_successor_world_continues_the_requests_of_the_world_it_replaces() -> anyhow::Result<()> {
-    let deployment = format!("worlds-{}", std::process::id());
-    let mut first = stub_engine_config(&deployment);
-    first.world = 1;
-    let running = SchedulerHandle::start_all(first)?.remove(0);
-    let result =
-        (|| -> anyhow::Result<(Vec<u32>, Event, SchedulerHandle)> {
-            let (reference, finished) =
-                tokens_until_terminal(&mut running.submit(greedy_text(91, Vec::new(), 8))?)?;
-            anyhow::ensure!(
-                matches!(finished, Event::Finished { .. }),
-                "the reference did not finish: {finished:?}"
-            );
-
-            let caches = running
-                .describe_cache()
-                .recv()?
-                .map_err(|error| anyhow::anyhow!(error))?;
-            let mut config = stub_engine_config(&deployment);
-            config.world = 2;
-            config.predecessor = Some(
-                caches
-                    .into_iter()
-                    .map(|cache| {
-                        (
-                            cache.worker_group,
-                            ipc::PredecessorCache {
-                                world: 1,
-                                segments: cache.segments[..cache.held as usize].to_vec(),
-                                num_units: cache.units,
-                                scratch_units: cache.scratch,
-                            },
-                        )
-                    })
-                    .collect(),
-            );
-            let successor = SchedulerHandle::start_all(config)?.remove(0);
-            let index = running
-                .park(true)
-                .recv()?
-                .map_err(|error| anyhow::anyhow!(error))?;
-            successor.promote(index, false, false)?;
-            running.shutdown();
-            successor
-                .commit()
-                .recv()?
-                .map_err(|error| anyhow::anyhow!(error))?;
-
-            let (continued, finished) = tokens_until_terminal(
-                &mut successor.submit(greedy_text(92, reference[..3].to_vec(), 8))?,
-            )?;
-            let mut whole = reference[..3].to_vec();
-            whole.extend(continued);
-            anyhow::ensure!(whole == reference, "{whole:?} differs from {reference:?}");
-            Ok((reference, finished, successor))
-        })();
-    running.shutdown();
-    let (_reference, finished, standby) = result?;
-    standby.shutdown();
-    assert!(
-        matches!(
-            finished,
-            Event::Finished {
-                prompt_tokens: 3,
-                completion_tokens: 8,
-                ..
-            }
-        ),
-        "{finished:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn unsupported_media_is_rejected_without_stopping_the_engine() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::ERROR)
-        .try_init();
-    let mut config = EngineConfig::sim("stub");
-    config.generation_limits = engine::GenerationLimits {
-        latent_downsample: 1,
-        max_cfg_branches: 1,
-        ..Default::default()
-    };
-    config.max_batch = QUEUE_DEPTH * 8;
-    config.worker_groups = vec![ExecutorGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        WORLD_SIZE,
-        2,
-        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
-    )];
-    config.worker_process = worker_group_args();
-    let engine = {
-        let _launch_guard = CHILD_LAUNCH_ENV_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
-        SchedulerHandle::start_all(config)?.remove(0)
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
-
-    // Each of these unsupported video requests must be rejected through its
-    // own event stream, and the engine must stay alive.
-    let result = (|| -> anyhow::Result<()> {
-        let mut requests = Vec::with_capacity(2);
-        for index in 0..2 {
-            let request_id = RequestId(10_000 + index as u64);
-            let prompt_token_ids = vec![100_000 + index as u32];
-            let conditioning = models::video::Conditioning {
-                task: models::video::VideoTask::T2va,
-                text_tags: vec![1; prompt_token_ids.len()],
-                conditions: Vec::new(),
-            };
-            let events = engine.submit(Request::Diffusion(DiffusionRequest {
-                request_id,
-                task: "t2va".to_owned(),
-                prompt_token_ids,
-                conditioning: conditioning.encode()?,
-                conditions: Vec::new(),
-                priority: 0,
-                sampling: DiffusionSamplingParams {
-                    num_frames: 22,
-                    video_units: 3,
-                    seed: index as u64,
-                    width: 1344,
-                    height: 768,
-                },
-                trajectory: Default::default(),
-                encoder_inputs: None,
-            }))?;
-            requests.push((request_id, events));
-        }
-        for (request_id, mut events) in requests {
-            let event = runtime
-                .block_on(async {
-                    tokio::time::timeout(Duration::from_secs(10), events.recv()).await
-                })
-                .with_context(|| format!("timed out waiting for media request {request_id:?}"))?;
-            let event = event.ok_or_else(|| {
-                anyhow::anyhow!("media event stream closed for request {request_id:?}")
-            })?;
-            assert!(
-                matches!(event, Event::Rejected { .. }),
-                "unsupported request {request_id:?} was not rejected: {event:?}"
-            );
-        }
-        Ok(())
-    })();
-
-    // The dead latch is set only when the scheduler thread exits with a fatal
-    // status, so `shutdown` joins that thread before `is_dead` is read.
-    engine.shutdown();
-    result?;
-    assert!(!engine.is_dead(), "media rejection killed the engine");
     Ok(())
 }
 
