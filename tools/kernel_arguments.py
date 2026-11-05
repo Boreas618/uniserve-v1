@@ -204,10 +204,13 @@ def packed(chain: str) -> tuple[list[str], bool, bool]:
     arguments. The `if` arm is read and the `else` arm is dropped, and the conditional is reported so
     a reader knows a second packing exists.
     """
-    conditional = "} else {" in chain
-    if conditional:
-        start = chain.index("} else {")
-        depth, index = 1, start + len("} else {")
+    # `} else {` is one spelling of the join; a chain that writes the brace on its own line is the
+    # same conditional, and reading both arms counted four words where the operator packs two.
+    join = re.search(r"}\s*else\s*\{", chain)
+    conditional = join is not None
+    if join is not None:
+        start = join.start()
+        depth, index = 1, join.end()
         while index < len(chain) and depth:
             if chain[index] == "{":
                 depth += 1
@@ -463,6 +466,130 @@ def header_structs(header: pathlib.Path) -> list[tuple[str, list[tuple[str, str]
     return found
 
 
+#: The word a C parameter occupies, in the same vocabulary the Rust chain packs. An address is an
+#: address: `view` and `pointer` differ in what the launch records, not in the word it passes.
+_C_WORDS = {
+    "void*": "address",
+    "int": "i32",
+    "int32_t": "i32",
+    "int64_t": "i64",
+    "unsigned": "u32",
+    "unsigned int": "u32",
+    "uint32_t": "u32",
+    "uint64_t": "u64",
+    "float": "f32",
+    "double": "f64",
+}
+
+_WORDS = {"view": "address", "tensor": "address", "pointer": "address"}
+
+
+def entry_parameters(source: pathlib.Path) -> tuple[str, list[str]] | None:
+    """A cubin module's entry and the words its parameter list takes, in order.
+
+    A package that ships no call structure passes its arguments as kernel parameters - `topk_softmax`
+    takes `const void* scores, int score_kind, ...` - so the declared side is that list and its
+    comparison is against the words the operator's `Arguments` chain packs.
+    """
+    text = source.read_text()
+    entry = re.search(
+        r"__global__\s+void\s+(\w+)\s*\(([^)]*)\)", text, re.S
+    )
+    if entry is None:
+        return None
+    parameters = [
+        re.sub(r"\b(const|volatile|__restrict__)\b", " ", parameter)
+        .replace("*", "*")
+        .strip()
+        for parameter in entry.group(2).split(",")
+        if parameter.strip()
+    ]
+    words = []
+    for parameter in parameters:
+        kind = re.split(r"(?<=\w)\s+|\s+", parameter)
+        spelling = " ".join(kind[:-1]).strip() if len(kind) > 1 else parameter
+        spelling = re.sub(r"\s*\*\s*", "*", spelling).strip()
+        if spelling.endswith("*"):
+            words.append("address")
+        else:
+            words.append(_C_WORDS.get(spelling, spelling))
+    return entry.group(1), words
+
+
+def native_parameters(
+    op: str, package: pathlib.Path, verbose: bool
+) -> tuple[str, str] | None:
+    """One package's entry parameter list against the words the operator's chain packs.
+
+    Answers `(kind, text)` where kind is `ok`, `problem` or `gap`, or `None` when the package has no
+    entry to read at all.
+    """
+    found = rust_launch(op)
+    if found is None:
+        return None
+    chain = found[1]
+    if not chain:
+        return None
+    # A chain that chooses its words in a `match` arm is not one list: counting every arm counted
+    # thirteen words for `topk_softmax`, whose entry takes eleven. Which arm a call takes is a
+    # descriptor's business, so the comparison stops and says so rather than picking one.
+    if re.search(r"\bmatch\b", chain):
+        arms = {
+            tuple(packed(arm)[0])
+            for arm in re.findall(r"=>\s*\{([^{}]*)\}", chain)
+        }
+        if len(arms) == 1 and not any(len(arm) == 0 for arm in arms):
+            # Every arm packs the same words, so the arms are not a choice about the entry's
+            # parameters and the list they agree on is the chain's one packing.
+            # Keep the words the chain packs outside the `match` and take one arm's for the rest.
+            opening = chain.index("{", chain.index("match"))
+            depth, index = 1, opening + 1
+            while index < len(chain) and depth:
+                if chain[index] == "{":
+                    depth += 1
+                elif chain[index] == "}":
+                    depth -= 1
+                index += 1
+            arm = next(iter(arms))
+            chain = chain[:opening] + "{" + "".join(f".{word}()" for word in arm) + "}" + chain[index:]
+        else:
+            words = packed(chain)[0]
+            return (
+                "gap",
+                f"{op}/{package.name}: the chain packs {len(words)} word(s) across "
+                f"{len(arms)} distinct match arm(s), and its entry's parameter list is one arm's "
+                f"packing - not compared rather than guessed",
+            )
+    words = packed(chain)[0]
+    if not words:
+        return None
+    declared = None
+    for source in sorted(package.rglob("*.cu")):
+        declared = entry_parameters(source)
+        if declared is not None:
+            break
+    if declared is None:
+        return None
+    entry, words = declared
+    packed_words = [_WORDS.get(word, word) for word in packed(chain)[0]]
+    if len(words) != len(packed_words):
+        return (
+            "problem",
+            f"{op}/{package.name} {entry}: {len(words)} parameter(s) and {len(packed_words)} "
+            f"packed word(s)",
+        )
+    for index, (declared_word, packed_word) in enumerate(zip(words, packed_words)):
+        if declared_word != packed_word:
+            return (
+                "problem",
+                f"{op}/{package.name} {entry}: parameter {index} is {declared_word} and the "
+                f"chain packs {packed_word}",
+            )
+    if verbose:
+        print(f"  {op}/{package.name}: {entry} = {len(words)} word(s), the chain agrees")
+    return ("ok", "")
+
+
 def native(verbose: bool) -> tuple[list[str], list[str]]:
     """Every native package's call structure, compared with the Rust structure it mirrors.
 
@@ -479,18 +606,31 @@ def native(verbose: bool) -> tuple[list[str], list[str]]:
     gaps: list[str] = []
     compared = 0
     for package in sorted(KERNELS.glob("*/*")):
+        op = package.parent.name
         # A Triton package's arguments are its `spec()` and the recorded signature its cell carries,
         # which the sweep compares; this mode is the native package, whose arguments are a C struct.
         if not _native_package(package):
             continue
         headers = sorted(package.rglob("*.h"))
         if not headers:
+            # A package that ships no call structure may pass its arguments as kernel parameters:
+            # `topk_softmax` is a cubin whose entry takes `const void* scores, int score_kind, ...`,
+            # and its declared side is that list rather than a struct.
+            outcome = native_parameters(op, package, verbose)
+            if outcome is not None:
+                kind, text = outcome
+                if kind == "gap":
+                    gaps.append(text)
+                    continue
+                compared += 1
+                if kind == "problem":
+                    problems.append(text)
+                continue
             gaps.append(
-                f"{package.parent.name}/{package.name}: no header, so no call structure to "
-                f"compare - the module states its arguments somewhere this reader has not found"
+                f"{op}/{package.name}: no header, so no call structure to compare - the module "
+                f"states its arguments somewhere this reader has not found"
             )
             continue
-        op = package.parent.name
         where = rust_calls(op)
         structures = [
             (header, name, fields)
