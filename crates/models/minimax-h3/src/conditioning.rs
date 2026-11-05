@@ -344,15 +344,22 @@ impl TokenRefiner {
         programs.launch::<DenseAttention>(
             &attention.dense_descriptor(stream, stream, stream, hidden, true),
         );
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-            stream,
-            u64::from(config.intermediate_size),
-            Activation::Silu,
-            u64::from(config.intermediate_size),
-            u64::from(config.intermediate_size),
-            u64::from(inner),
-            true,
-        )?);
+        // **Both row strides are twice the width**: the refiner reads its two halves through the
+        // same packed projection the transformer does, so each half's row stride is `2 *
+        // intermediate` - the launch record states `gate_stride_28672` where this stated 14336.
+        // And both width classes are reachable, as at the transformer's packed site.
+        let packed_stride = 2 * u64::from(config.intermediate_size);
+        for elements in [u64::from(inner), 1] {
+            programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+                stream,
+                u64::from(config.intermediate_size),
+                Activation::Silu,
+                packed_stride,
+                packed_stride,
+                elements,
+                true,
+            )?);
+        }
 
         Ok(programs.finish())
     }
