@@ -403,9 +403,12 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     /// Publishes the encoded states this replay's launch wrote: one `Text` product per request of
     /// the batch staged last.
     ///
-    /// The region is the runner's own hidden column, which the captured graph addresses, so the
-    /// view names memory that stays this runner's until it launches this bucket again - the store
-    /// names it and the copy that moves it is the reader's, ordered on the reader's stream.
+    /// The region is the runner's own hidden **column** - pinned memory the runner owns rather than
+    /// a graph pool's arena - so the view stays readable until the next encode writes it, whatever
+    /// else the device launches in between. That is why the states are a column and not arena
+    /// scratch: a graph pool's buckets share one base (`arena::Pools::record`: a stream's plans are
+    /// extents and the addresses repeat), so an arena-backed product would be good only until the
+    /// next capture or replay of *any* bucket on the producer's stream.
     ///
     /// Only `Text` is published. The conditioning rows a `ref2va` request lays out are a different
     /// packing of a vision tower's features rather than a slice of this sequence, and this encoder
