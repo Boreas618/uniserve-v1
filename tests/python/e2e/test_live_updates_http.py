@@ -606,6 +606,7 @@ def _log_trouble(log: Path, limit: int = 40) -> str:
             "the successor took the responses in flight over",
             "the service goes on from the previous daemon",
             "the responses in flight are paused",
+            "adopted the processes the previous daemon supervised",
         )
         trouble = []
         for line in _log_lines(log):

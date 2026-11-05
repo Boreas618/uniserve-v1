@@ -130,7 +130,7 @@ impl HostAction for MediaWork {
     type Output = Option<Vec<u8>>;
 
     fn run(&self) -> Result<Self::Output> {
-        match self.stage {
+        let outcome = match self.stage {
             Stage::Unit {
                 frames,
                 height,
@@ -152,11 +152,21 @@ impl HostAction for MediaWork {
                 Ok(None)
             }
             Stage::Mux => Ok(Some(self.output.finish(self.request)?)),
+        };
+        if outcome.is_err() {
+            // A stage that fails ends its request short of an artifact, so the assembly this
+            // request opened is closed here: it lives in `crates/media`'s runner, one mux session
+            // per request, and nothing else reaches it - the engine aborts the request and its
+            // calls are never served again, so a session left open would hold a writer until the
+            // stage is dropped. `discard` is a no-op for a request whose assembly never opened.
+            self.output.discard(self.request);
         }
+        outcome
     }
 
     /// Nothing to release: the bytes are this action's own host buffer, and dropping the action
-    /// returns them. `stage` resolves them to the encoder's copy inside `run`.
+    /// returns them. `stage` resolves them to the encoder's copy inside `run`. An assembly the
+    /// action opened and did not finish is closed by `run`'s error path.
     fn release(&self) -> Result<()> {
         Ok(())
     }
@@ -335,7 +345,9 @@ impl Output {
         Ok(self.media.finish_mux(request_id(request))?)
     }
 
-    /// Drops `request`'s assembly, for a request that ends before it could be finished.
+    /// Drops `request`'s assembly, for a request that ends before it could be finished: a stage
+    /// that fails calls this from `MediaWork::run`, so a failed call leaves no open mux session
+    /// behind. Idempotent: `close_mux` removes a session if one exists.
     pub fn discard(&self, request: RequestKey) {
         self.opened
             .lock()
@@ -396,8 +408,13 @@ pub struct MediaStage {
     /// The frames of each video unit of a request's timeline: the model's schedule, handed in as a
     /// function because it is the model's arithmetic and the executor holds no copy of it.
     units_of: fn(u32) -> Result<Vec<u32>>,
-    /// What `submit` staged and `serve` performs, for the one job in flight.
-    pending: Option<Prepared>,
+    /// What `submit` staged, one entry per call of the batch it was handed, and what `serve`
+    /// performs call by call.
+    ///
+    /// A batch holds a call for each of its requests - the mechanism batches media requests as they
+    /// arrive, and a host bucket states no bound (`Bucket::holds_computation`) - so staging one entry
+    /// would leave every request after the first without an answer.
+    pending: Vec<Prepared>,
 }
 
 /// One staged host call: the product's bytes, and the stage that reads them.
@@ -436,7 +453,7 @@ impl MediaStage {
             lane,
             products: None,
             units_of,
-            pending: None,
+            pending: Vec::new(),
         }
     }
 
@@ -482,19 +499,18 @@ impl MediaStage {
 
     /// Performs the staged stage on the media lane, answering the call's completion.
     fn perform(&mut self, call: CallId) -> Result<BatchOutput> {
-        let prepared = self.pending.take().ok_or_else(|| {
-            crate::Error::Invariant(format!(
-                "the media stage was asked to serve call {} with no stage staged: a host job is \
-                 returned by `submit` and served once, in that order",
-                call.0
-            ))
-        })?;
-        if prepared.call != call {
-            return Err(crate::Error::Invariant(format!(
-                "the media stage staged call {} and the device asked it for call {}",
-                prepared.call.0, call.0
-            )));
-        }
+        let position = self
+            .pending
+            .iter()
+            .position(|prepared| prepared.call == call)
+            .ok_or_else(|| {
+                crate::Error::Invariant(format!(
+                    "the media stage was asked to serve call {} with no stage staged for it: a host \
+                     job is returned by `submit` and served once, in that order",
+                    call.0
+                ))
+            })?;
+        let prepared = self.pending.remove(position);
         let work = MediaWork::new(
             Arc::clone(&self.output),
             prepared.request,
@@ -544,6 +560,51 @@ impl MediaStage {
             },
         })
     }
+}
+
+/// Stages every request of one host-call batch, in the batch's order.
+///
+/// A batch holds one call per request, and the requests need not be at the same place in their
+/// timelines: each request states its own canvas, its own frame count and its own count of
+/// appended units, so the entry a request takes is its own. Answering the first and leaving the
+/// rest would complete a call whose stage never ran - the mux of that request would then wait for
+/// units nothing encoded.
+fn stage_batch(
+    computation: crate::plan::Computation,
+    requests: &[crate::batch::StagedRequest],
+    units_of: &dyn Fn(u32) -> Result<Vec<u32>>,
+    appended: &dyn Fn(RequestKey) -> usize,
+) -> Result<Vec<StagedCall>> {
+    let mut staged_calls = Vec::with_capacity(requests.len());
+    for request in requests {
+        let units = units_of(request.frames)?;
+        let (stage, product) = staged(
+            computation,
+            (request.width, request.height),
+            &units,
+            appended(request.request),
+        )?;
+        staged_calls.push(StagedCall {
+            request: request.request,
+            units,
+            stage,
+            product,
+        });
+    }
+    Ok(staged_calls)
+}
+
+/// One request of a host-call batch, staged: where in its timeline the stage works, and the product
+/// it reads.
+struct StagedCall {
+    /// The request whose assembly the stage appends to.
+    request: RequestKey,
+    /// That request's timeline, as its schedule states it.
+    units: Vec<u32>,
+    /// The stage and the extent it works at.
+    stage: Stage,
+    /// The product the stage reads, and nothing for the mux.
+    product: Option<Product>,
 }
 
 /// Which stage a host call is, and which product it reads.
@@ -619,35 +680,36 @@ impl Runner for MediaStage {
         })?;
         media.check()?;
         let computation = media.computation;
-        let call = *batch.calls.first().ok_or_else(|| {
-            crate::Error::Invalid(
-                "a media batch advances no call: a host stage answers one call's completion".into(),
-            )
-        })?;
-        let request = media.request(0)?;
-        let units = (self.units_of)(request.frames)?;
-        let appended = self.output.units_appended(request.request);
-        let (stage, product) = staged(
+        let requests = (0..batch.calls.len())
+            .map(|index| media.request(index))
+            .collect::<Result<Vec<_>>>()?;
+        let staged_calls = stage_batch(
             computation,
-            (request.width, request.height),
-            &units,
-            appended,
+            &requests,
+            &|frames| (self.units_of)(frames),
+            &|request| self.output.units_appended(request),
         )?;
-        let input = match product {
-            Some(kind) => Some(self.stage_product(request.request, kind)?),
-            None => None,
-        };
-        self.pending = Some(Prepared {
-            call,
-            request: request.request,
-            units,
-            stage,
-            input,
-        });
-        Ok(Jobs::new([Job::Host {
-            runner: self.id,
-            call,
-        }]))
+        let mut prepared = Vec::with_capacity(staged_calls.len());
+        let mut jobs = Vec::with_capacity(staged_calls.len());
+        for (call, staged_call) in batch.calls.iter().copied().zip(staged_calls) {
+            let input = match staged_call.product {
+                Some(kind) => Some(self.stage_product(staged_call.request, kind)?),
+                None => None,
+            };
+            prepared.push(Prepared {
+                call,
+                request: staged_call.request,
+                units: staged_call.units,
+                stage: staged_call.stage,
+                input,
+            });
+            jobs.push(Job::Host {
+                runner: self.id,
+                call,
+            });
+        }
+        self.pending = prepared;
+        Ok(Jobs::new(jobs))
     }
 
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
@@ -798,6 +860,81 @@ mod tests {
     /// track, and the mux reads neither - its inputs are the two encodes the deployment's output
     /// already holds. A call of another class reaching the stage would otherwise be answered with an
     /// empty completion the mechanism reads as success.
+    /// A batch of two requests stages both, each at its own timeline's entry.
+    ///
+    /// The mechanism batches media requests as they arrive, and a host bucket states no bound, so a
+    /// batch of two encodes is two requests whose artifacts are being assembled at once. Each has
+    /// its own canvas, its own frame count and its own count of appended units: staging the first
+    /// and answering the batch would leave the second's mux waiting for a unit nothing encoded.
+    #[test]
+    fn a_batch_of_two_requests_stages_both_at_their_own_entries() {
+        let requests = [
+            crate::batch::StagedRequest {
+                request: ipc::RequestKey::new(1, ipc::RequestId(7), 0),
+                conditioning: Vec::new(),
+                step: 0,
+                steps: 8,
+                seed: 11,
+                width: 1344,
+                height: 768,
+                frames: 56,
+            },
+            crate::batch::StagedRequest {
+                request: ipc::RequestKey::new(1, ipc::RequestId(8), 0),
+                conditioning: Vec::new(),
+                step: 0,
+                steps: 8,
+                seed: 12,
+                width: 768,
+                height: 768,
+                frames: 39,
+            },
+        ];
+        let video = crate::plan::Computation {
+            call: ipc::MediaCall::VideoEncoding,
+            rows: 2,
+            tokens: 0,
+            extent: crate::plan::Extent::None,
+        };
+        // The second request has already had one unit appended; the first has had none.
+        let appended = |request: ipc::RequestKey| usize::from(request.request_id.0 == 8);
+        let units_of = |frames: u32| match frames {
+            56 => Ok(vec![22_u32, 22, 12]),
+            39 => Ok(vec![22_u32, 17]),
+            other => Err(crate::Error::Invalid(format!("no schedule for {other}"))),
+        };
+
+        let staged_calls = stage_batch(video, &requests, &units_of, &appended).expect("both");
+        assert_eq!(
+            staged_calls
+                .iter()
+                .map(|staged_call| (staged_call.request, staged_call.stage))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    requests[0].request,
+                    Stage::Unit {
+                        frames: 22,
+                        height: 768,
+                        width: 1344,
+                    },
+                ),
+                (
+                    requests[1].request,
+                    Stage::Unit {
+                        frames: 17,
+                        height: 768,
+                        width: 768,
+                    },
+                ),
+            ],
+            "the first request's first unit, and the second's second"
+        );
+        assert!(staged_calls
+            .iter()
+            .all(|staged_call| staged_call.product == Some(Product::Video)));
+    }
+
     #[test]
     fn a_host_call_states_the_stage_and_the_product_it_reads() {
         let video = crate::plan::Computation {
