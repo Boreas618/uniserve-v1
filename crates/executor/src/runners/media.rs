@@ -3,10 +3,10 @@
 //!
 //! `crates/media` holds the codecs, the muxer and one assembly per request (`MediaRunner`'s
 //! `MuxSession`); this module is what the executor owes it - the two published products' bytes, and
-//! the one arithmetic between a decoded clip and an encoder's input. A clip is the video VAE's
-//! output, `f16` NCDHW, and the encoder takes `[frames, height, width, 3]` uint8; the range that
-//! maps one to the other is the model's statement (`Decoder::pixel_range`), not a number this module
-//! may hold.
+//! the request's two published products' bytes. **The clip this reads is the postprocessor's output,
+//! `[frames, rows, columns, 3]` uint8** - the `video_decoder` component's second entry point, which
+//! drops the VAE's padding frames, cross-fades the clip seams and de-normalises the RGB - so nothing
+//! here converts a raster: an encoder's input and a postprocessor's output are the same bytes.
 //!
 //! Everything here is host work on blocking threads by design (`specs/worker.md` §4.5): an
 //! encoding, a mux and a reader are not device computations, and the executor's `Media` lane is
@@ -64,85 +64,6 @@ impl Rates {
     }
 }
 
-/// One clip's `f16` NCDHW samples as the encoder's RGB24 frames, `[frames, height, width, 3]`.
-///
-/// `range` is the closed interval one channel's values occupy and the endpoints map to `0` and
-/// `255`; a value outside it is clamped rather than wrapped, because a wrapped pixel is a colour
-/// nobody computed. The clip is `[3, frames, height, width]` with red plane first, which is the
-/// video VAE's output order.
-///
-/// # Errors
-///
-/// [`crate::Error::Invalid`] when the clip's length is not `3 * frames * height * width` `f16`
-/// samples, when the range is not increasing, or when a sample is not finite: a non-finite value is
-/// a decode that diverged, and turning it into a pixel would be the one place that could not be
-/// seen.
-pub fn pixels(
-    clip: &[u8],
-    frames: u32,
-    height: u32,
-    width: u32,
-    range: (f32, f32),
-) -> Result<Vec<u8>> {
-    let (low, high) = range;
-    if !(low < high) || !low.is_finite() || !high.is_finite() {
-        return Err(crate::Error::Invalid(format!(
-            "a clip's value range is ({low}, {high}): a range must be two finite values and \
-             increasing, or every pixel of the clip is a clamped constant"
-        )));
-    }
-    let plane = frames as usize * height as usize * width as usize;
-    let want = plane * 3 * size_of::<u16>();
-    if clip.len() != want {
-        return Err(crate::Error::Invalid(format!(
-            "a clip of {}x{}x{} frames is {want} byte(s) of f16 samples and carries {}: the \
-             raster the model decoded and the raster the encoder was told of disagree",
-            frames,
-            height,
-            width,
-            clip.len()
-        )));
-    }
-    // The scale is the range's own: the interval's ends map to the two ends of a byte.
-    let scale = 255.0 / (high - low);
-    let mut out = vec![0_u8; plane * 3];
-    for (index, pixel) in out.iter_mut().enumerate() {
-        // The output is frame-major and the clip is planar: output pixel `p`'s channel `c` is the
-        // sample at `c * plane + p`. A reader that walked the planes in order instead would write
-        // an image whose channels are three separate pictures.
-        let sample = index % 3 * plane + index / 3;
-        let bits = u16::from_ne_bytes([clip[sample * 2], clip[sample * 2 + 1]]);
-        let value = half_to_f32(bits);
-        if !value.is_finite() {
-            return Err(crate::Error::Invalid(format!(
-                "a clip's sample {sample} is {value}: a non-finite value is a decode that \
-                 diverged, and no pixel states it"
-            )));
-        }
-        let unit = ((value - low) * scale).clamp(0.0, 255.0);
-        *pixel = unit.round() as u8;
-    }
-    Ok(out)
-}
-
-/// One little-endian `f16` bit pattern as a float.
-///
-/// The executor copies bytes and never converts between element types; this is the reader's
-/// conversion, and it is written here rather than taken from a layer because the media group reads
-/// host bytes that a device wrote in the model's own representation.
-fn half_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = ((bits >> 10) & 0x1f) as i32;
-    let fraction = (bits & 0x03ff) as f32;
-    match exponent {
-        0 if fraction == 0.0 => sign * 0.0,
-        0 => sign * fraction * 2.0_f32.powi(-24),
-        31 if fraction == 0.0 => sign * f32::INFINITY,
-        31 => f32::NAN,
-        _ => sign * (1.0 + fraction / 1024.0) * 2.0_f32.powi(exponent - 15),
-    }
-}
-
 /// One request's media output: the encodes of its clips and track, and the MP4 they assemble.
 ///
 /// The assembly itself lives in `crates/media`'s `MediaRunner`, one `MuxSession` per request, so
@@ -176,16 +97,16 @@ impl Output {
     /// Encodes one clip of `request` into the unit it covers.
     ///
     /// `frames` is the request's whole frame count, which fixes the timeline the assembly covers;
-    /// the first call opens it. `clip` is the product's bytes and `shape` the decoded raster the
-    /// fragment covers - `(frames, height, width)` of this unit, taken from the clip the decoder
-    /// published rather than recomputed here.
+    /// the first call opens it. `clip` is the bytes the `video_decoder` component published -
+    /// `[frames, height, width, 3]` uint8, the postprocessor's own order - and `shape` is
+    /// `(frames, height, width)` of this unit. Nothing is converted here: a postprocessor that
+    /// de-normalised the raster and an encoder that takes RGB24 agree on the bytes.
     pub fn encode_clip(
         &self,
         request: RequestKey,
         frames: u32,
         shape: (u32, u32, u32),
         clip: &[u8],
-        range: (f32, f32),
     ) -> Result<()> {
         let (unit_frames, height, width) = shape;
         let units = self.rates.units(frames);
@@ -212,12 +133,20 @@ impl Output {
                 &units,
             )?;
         }
-        let rgb24 = pixels(clip, unit_frames, height, width, range)?;
+        let decoded = unit_frames as usize * height as usize * width as usize * 3;
+        if clip.len() != decoded {
+            return Err(crate::Error::Invalid(format!(
+                "a unit of {unit_frames} frame(s) of {width}x{height} RGB24 is {decoded} byte(s) \
+                 and the clip carries {}: the raster the postprocessor spliced and the raster the \
+                 encoder was told of disagree",
+                clip.len()
+            )));
+        }
         let row = self.rates.encoded_unit_bytes(unit_frames, height, width);
         let mut framed = vec![0_u8; row];
         let written = self.media.encode_unit(
             media::Rgb24Frames {
-                pixels: &rgb24,
+                pixels: clip,
                 height,
                 width,
             },
@@ -308,91 +237,29 @@ mod tests {
         assert_eq!(rates.samples(&rates.units(96)), 96 * 32_000 / 24);
     }
 
-    /// One clip becomes RGB24 in the model's stated range, in the encoder's frame-major order.
+    /// A clip that is not `frames * height * width * 3` bytes is refused before an encoder sees it.
     ///
-    /// The three planes are red, green and blue; the range's endpoints are the byte's ends and a
-    /// value outside it is clamped. A reader that wrote the channels in the wrong order would pass
-    /// every count and produce a clip whose red and blue are swapped.
+    /// The postprocessor writes RGB24 by definition, so a clip of another size is a raster that
+    /// disagrees with the timeline the assembly was opened for - and an encoder handed it would
+    /// encode whatever the shorter buffer held.
     #[test]
-    fn a_clip_becomes_the_encoders_frames_in_its_stated_range() {
-        let planes: [[f32; 4]; 3] = [
-            [-1.0, 0.0, 1.0, 2.0],
-            [0.5, 0.5, 0.5, 0.5],
-            [-0.5, 0.5, 0.0, 1.0],
-        ];
-        let clip: Vec<u8> = planes
-            .into_iter()
-            .flatten()
-            .map(f32_to_half)
-            .flat_map(u16::to_ne_bytes)
-            .collect();
-        let rgb = pixels(&clip, 1, 2, 2, (-1.0, 1.0)).expect("one clip of the stated range");
-        assert_eq!(rgb.len(), 12);
-        // The four pixels, in the encoder's order: red, green, blue of each.
-        let pixels: [[u8; 3]; 4] = [
-            [0, 191, 64],    // red at the low end, green mid, blue between
-            [128, 191, 191], // red at zero is the middle of the range
-            [255, 191, 128], // red at the high end is the last byte
-            [255, 191, 255], // red above it clamps rather than wrapping
-        ];
-        for (index, want) in pixels.iter().enumerate() {
-            assert_eq!(&rgb[index * 3..index * 3 + 3], want, "pixel {index}");
-        }
-    }
-
-    /// A clip whose byte count disagrees with the raster is refused rather than read past.
-    #[test]
-    fn a_clip_that_disagrees_with_its_raster_is_refused() {
-        let error = pixels(&[0_u8; 8], 1, 2, 2, (-1.0, 1.0)).expect_err("a short clip");
+    fn a_clip_that_disagrees_with_the_unit_raster_is_refused() {
+        let output = Output::new(
+            std::sync::Arc::new(media::MediaRunner::new(media::MediaConfig::default())),
+            Rates {
+                frame_rate: 24,
+                unit_frames: 17,
+                audio_rate: 32_000,
+            },
+        );
+        let request = RequestKey::new(0, ipc::RequestId(1), 0);
+        let error = output
+            .encode_clip(request, 17, (17, 2, 2), &[0_u8; 16])
+            .expect_err("a short clip");
         let message = format!("{error}");
         assert!(
-            message.contains("24"),
-            "the refusal names the raster: {message}"
+            message.contains("204") && message.contains("16"),
+            "the refusal names both byte counts: {message}"
         );
-    }
-
-    /// The range is the model's, and a range that is not a range is refused.
-    #[test]
-    fn a_range_that_is_not_increasing_is_refused() {
-        let clip = vec![0_u8; 3 * 4 * 2];
-        for range in [(1.0, 1.0), (1.0, -1.0), (f32::NAN, 1.0)] {
-            assert!(pixels(&clip, 2, 1, 1, range).is_err(), "{range:?}");
-        }
-    }
-
-    /// A non-finite sample is a diverged decode, and it never becomes a pixel.
-    #[test]
-    fn a_non_finite_sample_is_refused() {
-        let mut clip: Vec<u8> = [0.0_f32; 12]
-            .iter()
-            .map(|&value| f32_to_half(value))
-            .flat_map(u16::to_ne_bytes)
-            .collect();
-        clip[0..2].copy_from_slice(&f32_to_half(f32::NAN).to_ne_bytes());
-        let error = pixels(&clip, 1, 2, 2, (-1.0, 1.0)).expect_err("a NaN sample");
-        assert!(format!("{error}").contains("non-finite"), "{error}");
-    }
-
-    /// `f16` bits for a test's sample, written out rather than taken from a kernel: the reader's
-    /// conversion is what is under test, and a fixture that used the code under test would agree
-    /// with itself.
-    fn f32_to_half(value: f32) -> u16 {
-        let bits = value.to_bits();
-        let sign = ((bits >> 16) & 0x8000) as u16;
-        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-        let mantissa = ((bits >> 13) & 0x03ff) as u16;
-        if value == 0.0 {
-            return sign;
-        }
-        if value.is_nan() {
-            return sign | 0x7c00 | 0x0200;
-        }
-        if exponent <= 0 {
-            return sign;
-        }
-        if exponent >= 31 {
-            return sign | 0x7c00;
-        }
-        sign | ((exponent as u16) << 10) | mantissa
     }
 }
