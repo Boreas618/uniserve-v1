@@ -130,8 +130,10 @@ fn next(events: &mut engine::EventRx, what: &str) -> Event {
 #[test]
 fn unsupported_media_is_rejected_without_stopping_the_engine() {
     let pool = Arc::new(Serving::new(vec![support::pool("model")]));
-    let mut config = EngineConfig::sim("in-process-media");
-    config.max_batch = 8;
+    // The configuration the green text case uses: a batch bound is not part
+    // of what this case asserts, and a construct that differs from the one
+    // known to serve text would make a refusal unattributable.
+    let config = EngineConfig::sim("in-process-media");
     let engine = SchedulerHandle::over_batches(config, pool.clone() as Arc<dyn Batches>)
         .expect("the text deployment serves");
     install(&engine, &pool);
