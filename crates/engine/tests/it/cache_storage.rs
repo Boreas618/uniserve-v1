@@ -1473,15 +1473,21 @@ fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
     assert!(!lent.is_empty());
     assert_eq!(parked.lent, lent);
 
-    // The units kept: those past the sentinel less the lent ones. A request
-    // of as many prompt pages needs one more page for its token.
+    // The units kept: those past the sentinel less the lent ones. The waiting
+    // request asks for one page more than the world keeps, and its prompt
+    // shares no prefix with the request in flight: a request draws its token
+    // before it needs a page for it, and a shared prefix is served from the
+    // pages the request in flight publishes, so either would let it fit in
+    // the units the world kept and the case would test nothing.
     let kept = SEGMENTS * SEGMENT_UNITS - 1 - lent.len() as u32 * SEGMENT_UNITS;
     let resumed = handle
         .resume(false)
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers");
     assert!(resumed.is_ok(), "{resumed:?}");
-    let mut waiting = handle.submit(request(2, kept, 1)).unwrap();
+    let mut asking = request(2, kept + 1, 1);
+    asking.prompt_token_ids = vec![9; asking.prompt_token_ids.len()];
+    let mut waiting = handle.submit(asking).unwrap();
     thread::sleep(Duration::from_millis(500));
     assert!(
         std::iter::from_fn(|| waiting.try_recv().ok()).all(|event| !event.is_terminal()),
