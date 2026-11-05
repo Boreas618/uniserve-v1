@@ -100,12 +100,8 @@ pub(crate) struct LoadedModel {
 
 /// What renders a loaded checkpoint's requests, fixed by its layout.
 pub(crate) enum LoadedRenderer {
-    /// A token model's chat template, with the checkpoint files it was read
-    /// from, which the System One readout renders its own prompts from.
-    Chat {
-        renderer: Box<HfChatRenderer>,
-        files: ResolvedModelFiles,
-    },
+    /// A token model's chat template.
+    Chat { renderer: Box<HfChatRenderer> },
     /// A video pipeline's conditioner vision processor geometry; the video
     /// service built from the denoiser handshake plans requests against it.
     Video(ProcessorConfig),
@@ -221,7 +217,6 @@ impl LoadModel for ModelConfig {
             tokenizer,
             renderer: LoadedRenderer::Chat {
                 renderer: Box::new(renderer),
-                files,
             },
         })
     }

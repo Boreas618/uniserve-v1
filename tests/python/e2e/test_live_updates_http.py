@@ -2461,11 +2461,16 @@ def _lose_the_serving_engine(
     before it — that is what says the surviving engine serves the same model and
     not merely a live one.
     """
-    baseline = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)[
-        "choices"
-    ][0]["message"]["content"]
+    answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)
+    baseline = answer["choices"][0]["message"]["content"]
     baseline_numbers = _numbers([baseline])
-    assert baseline_numbers[:10] == list(range(1, 11)), baseline[:200]
+    # The prompt's own token count is in the answer, and it is what separates a
+    # deployment that reads the question wrongly from one that answers wrongly:
+    # this sentence is about twenty tokens long, so a `prompt_tokens` of a
+    # handful says the request never reached the model as text it could read.
+    assert baseline_numbers[:10] == list(range(1, 11)), (
+        f"{baseline[:200]!r} usage={answer.get('usage')}"
+    )
 
     read: list[str] = []
     done = threading.Event()
