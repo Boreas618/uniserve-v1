@@ -2075,7 +2075,8 @@ impl Denoiser {
         let video = config.video_channels;
 
         // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
-        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(dtype));
+        // The patch reads the latents, and a trajectory is FP32 whatever the stack's type is.
+        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(nn::DType::F32));
         programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor());
         programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
             dtype,
@@ -2088,9 +2089,18 @@ impl Denoiser {
 
         // The three gathers outside the modulation: the prefix rows of the packed stream, the solver's
         // step coefficient, and the trace's row copy the diagnosis takes.
-        for columns in [u64::from(config.hidden_size), 1] {
-            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
+        for (gathered, columns) in [(nn::DType::F32, 1u64), (nn::DType::I32, 1u64)] {
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
+                gathered, columns,
+            )?);
         }
+        // The token stream's own placement: one row per token at the stack's width, in the three
+        // gathers the packed stream takes.
+        programs.launch::<ops::rows::Rows>(&nn::layers::Rows::descriptor_of(
+            dtype,
+            ops::rows::Mode::Replace,
+            config.hidden_size,
+        ));
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
@@ -2115,6 +2125,16 @@ impl Denoiser {
             (dtype, nn::DType::F32, u64::from(config.hidden_size)),
             (dtype, nn::DType::F32, u64::from(config.time_dim)),
         ];
+        // The projections' FP32 output is narrowed into the packed rows (f32 -> the stack's type),
+        // and the crossings above are the widening side of the same boundary.
+        for (target, source, columns) in [
+            (nn::DType::F32, dtype, u64::from(config.hidden_size)),
+            (nn::DType::F32, dtype, 1u64),
+        ] {
+            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
+                target, source, columns,
+            )?);
+        }
         // A conditioned deployment carries audio, so its patched audio rows cross the boundary too.
         if groups == crate::modulation::Groups::Conditioned {
             crossings.push((nn::DType::F32, dtype, u64::from(config.audio_channels)));
@@ -2125,7 +2145,13 @@ impl Denoiser {
             )?);
         }
 
-        // The solver's step: one gated residual over the whole trajectory of each modality.
+        // The solver's step: one gated residual over the whole trajectory of each modality. Its
+        // coefficient is one FP32 column, gathered per evaluation rather than per buffer.
+        programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
+            nn::DType::F32,
+            1,
+            false,
+        )?);
         programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
             dtype,
             u64::from(video) * 4,
@@ -3371,7 +3397,9 @@ mod tests {
             vec![
                 "target_bf16_source_f32_columns_2688_block_1024",
                 "target_bf16_source_f32_columns_5376_block_1024",
+                "target_f32_source_bf16_columns_1_block_1024",
                 "target_f32_source_bf16_columns_32_block_1024",
+                "target_f32_source_bf16_columns_5376_block_1024",
                 "target_f32_source_bf16_columns_96_block_1024",
             ],
             "one program per crossing, keyed by the pair of element types"

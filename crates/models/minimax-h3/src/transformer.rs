@@ -656,28 +656,37 @@ impl Transformer {
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
         // the group count, so a conditioned deployment's cache is a second program.
         for columns in [
-            u64::from(groups.count()),
             18 * u64::from(hidden),
             2 * u64::from(hidden),
+            u64::from(hidden),
         ] {
             programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-                nn::DType::I32,
-                columns,
+                dtype, columns,
             )?);
         }
+        // The step's own entry per group is an index row, not a table row.
+        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
+            nn::DType::I32,
+            u64::from(groups.count()),
+        )?);
 
-        // The block's two modulated normalizations: the attention's (no update, no gate) and the
-        // feed-forward's (both, retaining the normalized row for the projection).
-        for (update, retain) in [(false, false), (true, true)] {
+        // The video stack's modulation carries two vectors and no gate, at the attention's width and
+        // at the six of the feed-forward's; the audio's carries six of each and a gate. The walk stated
+        // one form of each width's group and the recorder measured the three the stack launches.
+        for (gate, stride, update, retain) in [
+            (0, 2 * u64::from(hidden), false, false),
+            (0, interaction, false, false),
+            (interaction, interaction, true, true),
+        ] {
             programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
                 dtype,
                 dtype,
                 nn::DType::I32,
                 hidden,
                 config.norm_eps,
-                interaction,
-                interaction,
-                interaction,
+                gate,
+                stride,
+                stride,
                 update,
                 retain,
             ));
@@ -690,14 +699,15 @@ impl Transformer {
         )?);
 
         // The rotation and the attention, both over this rank's heads.
-        let sections = nn::layers::Sections::new(&rotated_axes(config))
-            .map_err(Error::from)?
-            .interleaved();
+        // The reference's rotation splits each axis in half (`uniserve/nn/functional/_rope.py:157`), so
+        // the sections are stated as they are; the table the step reads is I32, which is the layout's
+        // own declaration. Both were the walk's guess and the recorder measured against the launch.
+        let sections = nn::layers::Sections::new(&rotated_axes(config)).map_err(Error::from)?;
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
             rotated,
             1.0,
             Some(sections),
-            nn::DType::F32,
+            nn::DType::I32,
         ));
         programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
             head,
@@ -1279,8 +1289,10 @@ mod tests {
 
         assert_eq!(count("gemm"), 1);
         assert_eq!(count("rms_norm"), 1);
-        assert_eq!(count("logits_gather"), 3);
-        assert_eq!(count("modulated_rms_norm"), 2);
+        assert_eq!(count("logits_gather"), 4);
+        // Three forms: the video stack's two (no gate, at the attention's and the feed-forward's
+        // modulation widths) and the audio's one (gated, retaining the normalized row).
+        assert_eq!(count("modulated_rms_norm"), 3);
         assert_eq!(count("gated_residual"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("dense_attention"), 1);
