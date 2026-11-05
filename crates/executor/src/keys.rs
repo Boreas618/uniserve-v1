@@ -108,7 +108,14 @@ impl FileIdentity {
             )
         })?;
         let now = now_ns();
-        let changed = nanos(status.ctime(), status.ctime_nsec());
+        // The modification time decides whether the identity can name the
+        // contents: it is the stamp a writer sets, so the check is about whether
+        // the file may still be rewritten within the resolution its own writer
+        // had. The change time cannot serve here: it moves on any metadata
+        // write, so a writer that states when a checkpoint was made - a restore,
+        // a staged copy given its source's time - could never settle the file,
+        // and the same checkpoint would answer a new identity on every load.
+        let changed = nanos(status.mtime(), status.mtime_nsec());
         let settled = now.saturating_sub(changed);
         if settled < SETTLED_NS {
             // The file may still be rewritten within this timestamp, so this
