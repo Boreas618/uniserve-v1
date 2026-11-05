@@ -1025,9 +1025,14 @@ fn encode(args: &Args) -> Result<(), String> {
             .iter()
             .map(|buffer| buffer.bytes())
             .sum();
-    let text_elements = u64::from(layout.text_rows) * hidden;
+    // **One buffer, not two.** The model's `prepare_conditioning` writes a request's condition rows
+    // into `Conditioning::text`, which is the *prefix source* the runner owns - the text capacity,
+    // the condition capacity and the zero row - so this stage allocates that one buffer and reads the
+    // verdict out of it. A stage that kept a prompt-sized `text` apart from a prefix-sized `prefix`
+    // had the model write into the first and compared the second, and it refused at the capacity
+    // check before it could show that.
+    let text_elements = rows * hidden;
     let source_elements = u64::from(layout.text_rows) * source_width;
-    let prefix_elements = rows * hidden;
     let pixel_elements = u64::from(config.video_vae.in_channels)
         * u64::from(pixels.frames)
         * u64::from(pixels.height)
@@ -1123,7 +1128,7 @@ fn encode(args: &Args) -> Result<(), String> {
     let needed = conditioning_bytes
         + encoder_bytes
         + tables
-        + (text_elements + source_elements + prefix_elements) * width
+        + (text_elements + source_elements) * width
         + (pixel_elements + draw_elements) * 4
         + extras;
     let arena_bytes = needed;
@@ -1171,16 +1176,13 @@ fn encode(args: &Args) -> Result<(), String> {
     //    encoder's output (stage 4 is that), and it is the *refiner's* input, so it is written in the
     //    deployment's type; the source is the encoder's features, one block wide.
     let text = arena
-        .tensor(dtype, Shape::new(&[u64::from(layout.text_rows), hidden]))
+        .tensor(dtype, Shape::new(&[rows, hidden]))
         .map_err(show)?;
     let source = arena
         .tensor(
             dtype,
             Shape::new(&[u64::from(layout.text_rows), source_width]),
         )
-        .map_err(show)?;
-    let prefix = arena
-        .tensor(dtype, Shape::new(&[rows, hidden]))
         .map_err(show)?;
     // The diagnosis's own views: one `[rows, channels * 4]` F32 buffer per **visual** condition, for
     // the rows the video encoder emits before the anchor mixes the draw in and before the projection.
@@ -1355,7 +1357,7 @@ fn encode(args: &Args) -> Result<(), String> {
     // it catches is every piece zero, which is a condition the reader gathers nothing for
     // (`39a41fd55`). The zero row is a different claim: no write may reach it, so a non-zero value
     // there is a defect whatever the pieces hold.
-    let produced = download(&stream, prefix)?;
+    let produced = download(&stream, text)?;
     let values = to_f32(&produced, dtype);
     let mut readback = String::new();
     let mut non_zero = 0_usize;
