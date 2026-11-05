@@ -589,6 +589,8 @@ impl Leader {
             spawn_generation,
         };
         let programs = next.programs.clone();
+        let servers = self.program_servers(&target);
+        let leader = self.program_leader_host(&target, &servers);
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(spec)) = (&applied, joining) {
             self.updates.await_programs(&target.host_identity);
@@ -599,6 +601,8 @@ impl Leader {
                     spec,
                     config: target.clone(),
                     programs,
+                    servers,
+                    leader,
                     engine: spawn_generation,
                     epoch: target_epoch,
                 },
