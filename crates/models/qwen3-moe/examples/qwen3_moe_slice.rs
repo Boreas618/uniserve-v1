@@ -1885,6 +1885,41 @@ mod tests {
 
     use super::{Encoded, KvPages, Stage, argmax_over, check_continuation, needed_keys, slot_for};
 
+    /// An encoded deployment's install list holds its packed product, at the class its own rows
+    /// round to.
+    ///
+    /// `nvfp4_gemm` belongs to neither the model's operator list nor the three routed products, so
+    /// while it was absent from both every stage's list dropped it: the generation loaded, the first
+    /// packed product found no kernel, and the key had been in the fixture the whole time.
+    #[test]
+    fn an_encoded_deployment_installs_its_packed_product() {
+        let encoded = Encoded {
+            declared: true,
+            tokens: Some(16),
+            generated: Some(1),
+        };
+        let keys = needed_keys(
+            Path::new("a store root the pre-flight never reads"),
+            Stage::Decode,
+            true,
+            KvPages::Bf16,
+            encoded,
+        )
+        .expect("the deployment's list");
+
+        let packed: Vec<&str> = keys
+            .iter()
+            .filter(|(operator, _)| operator == "nvfp4_gemm")
+            .map(|(_, descriptor)| descriptor.as_str())
+            .collect();
+        // Sixteen rows round to the first class, and one continuation row to the same one, so the
+        // list holds the three projections at that class and no other.
+        assert_eq!(packed.len(), 3, "no packed product in {keys:?}");
+        for descriptor in &packed {
+            assert!(descriptor.contains("_m_128_"), "{descriptor}");
+        }
+    }
+
     /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
     /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
     /// deployment is held up by the other one's program.
@@ -3069,9 +3104,20 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
 /// list at two and keeps a missing `log_softmax` program out of the way of a token's id.
 const SAMPLER_OPERATORS: &[&str] = &["logits_shape", "argmax"];
 
-/// The operators an encoded checkpoint's step launches: the activation encoder, the packed product,
-/// and the two routed products whose grid is the sorted rows.
-const ENCODED_OPERATORS: &[&str] = &["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"];
+/// The operators an encoded checkpoint's step launches: the activation encoder, the four packed
+/// products (the attention projections, the dense path's gated product, and the two routed ones whose
+/// grid is the sorted rows).
+///
+/// The packed product belongs here and not in the model's own list: `nvfp4_gemm` is compiled per row
+/// class, so a row of it is required only for the classes this run launches, and the filter above is
+/// what keeps those. Leaving it out of both lists dropped every `nvfp4_gemm` row from every stage's
+/// install list, and the generation then held no kernel for the first product it launched.
+const ENCODED_OPERATORS: &[&str] = &[
+    "nvfp4_quantize",
+    "nvfp4_gemm",
+    "gather_gemm_nvfp4",
+    "route_gemm_nvfp4",
+];
 
 /// What an encoded deployment asks the store for, and which row counts.
 #[derive(Clone, Copy, Default)]
