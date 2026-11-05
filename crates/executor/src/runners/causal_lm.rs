@@ -747,6 +747,34 @@ struct Sampled {
 /// own token, so a row that ends a prompt answers 1 and a slot that already held four answers 5. The
 /// greedy host path is valid only for the first: it argmaxes the raw logits row, and the penalties a
 /// continuing slot carries are computed by the captured sampler and not by this path.
+/// The classes of the rows a batch carries, as a reader of a refusal needs them.
+///
+/// A device's graph serves one class: a prefill evaluates a chunk of prompt tokens and a decode one
+/// token per row. The mechanism partitions by class before it plans, so a batch that mixes them is a
+/// planning disagreement - and the refusal says which rows were which, not only that two classes met.
+fn row_classes(rows: &nn::BatchRows) -> String {
+    if rows.calls.is_empty() {
+        return "no rows".to_owned();
+    }
+    let mut classes = Vec::with_capacity(rows.calls.len());
+    for call in &rows.calls {
+        let kind = match call.kind {
+            nn::RowKind::Prefill => "prefill",
+            nn::RowKind::Decode => "decode",
+            nn::RowKind::Verify => "verify",
+        };
+        classes.push(format!("rows {}..{} {kind}", call.rows.start, call.rows.end));
+    }
+    let mixed = rows
+        .calls
+        .windows(2)
+        .any(|pair| pair[0].kind != pair[1].kind);
+    match mixed {
+        true => format!("a batch of two classes: {}", classes.join(", ")),
+        false => classes.join(", "),
+    }
+}
+
 fn committed_before(readback: i32) -> usize {
     usize::try_from(readback).unwrap_or(0).saturating_sub(1)
 }
@@ -1281,12 +1309,28 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
         let shape = batch.shape;
-        batch.columns.check(&shape)?;
-        let bucket = self.bucket_for(&shape)?;
-        self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        // What a refusal is about, said before it happens: the classes the rows carry are the fact
+        // no other owner of this batch can report, and a batch that mixes them is refused for them.
+        let classes = row_classes(&batch.columns.rows);
+        let refused = |error: Error| {
+            tracing::debug!(
+                batch = batch.id.0,
+                shape = %shape,
+                classes = %classes,
+                %error,
+                "a batch is refused before its replay"
+            );
+            error
+        };
+        batch.columns.check(&shape).map_err(refused)?;
+        let bucket = self.bucket_for(&shape).map_err(refused)?;
+        self.staging
+            .stage(&batch.columns, &batch.calls, &shape, bucket)
+            .map_err(refused)?;
         // A batch is homogeneous in its sampling path, and the check is about this batch's own
         // rows: a warm pose has no request rows, so it is made here rather than in the capture.
-        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))
+            .map_err(refused)?;
         // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
         // pooled table, so the row must state the request's own pages before the replay, and the
         // table states where the row begins (`start_page`) and how far it runs.
@@ -1476,7 +1520,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 batch,
                 ..
             } => {
-                let _ = batch;
+                // A request that never reaches a replay is invisible from every other owner: the
+                // mechanism sees a submission it waits on, the main process a timer. One line per
+                // replayed bucket is what tells a served request from an unplanned one.
+                tracing::debug!(
+                    bucket = %bucket,
+                    rows = bucket.rows,
+                    tokens = bucket.tokens,
+                    generation,
+                    batch = batch.0,
+                    stream = self.stream.raw(),
+                    "a bucket is replayed"
+                );
                 let stream = self.stream.clone();
                 // The batch's columns are uploaded here, on the device thread, before the graph
                 // reads them: the scheduler hands over a `Batch` and the device thread stages and
