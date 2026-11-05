@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use minimax_h3::audio_vae::AudioDecoder;
+use minimax_h3::audio_vae::BigVgan;
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::denoiser::{Arrangement, Denoiser, Layouts};
 use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
@@ -539,7 +539,7 @@ fn audio_encoder(request: &Request) -> Result<Vec<(String, String)>, String> {
 ///
 /// The decoder's `forward` takes the latents `[2, latent_channels, frames]` and writes `[samples, 2]`, and every
 /// intermediate is FP32 — the audio VAE's arithmetic is stated in that type whatever the deployment's sample
-/// type is. The frames are the bucket a decode of a 64-frame window serves, which is the one `AudioDecoder`'s
+/// type is. The frames are the bucket a decode of a 64-frame window serves, which is the one `BigVgan`'s
 /// own `programs` states its per-row launches at.
 fn audio_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     let config = audio_config(&request.root)?;
@@ -547,13 +547,16 @@ fn audio_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // The same extents table the encoder needs: the decoder's stages carry weight-normalized convolutions too,
     // and a fold reads its direction tensor's extents rather than its own.
     let mut loader = WeightLoader::stated(DType::F32, Some(&request.extents));
-    let decoder = AudioDecoder::load(&config, &mut loader).map_err(|error| error.to_string())?;
+    let decoder = BigVgan::load(&config, &mut loader).map_err(|error| error.to_string())?;
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
 
-    // The clips the deployment serves are the decoder's buckets, as the walk states them.
-    let frames = request.clip;
+    // A clip's video frame count is not the decoder's latent frame count: the audio track is packed at
+    // its own rate, so the latent frames come from the packing's arithmetic and every stage's length
+    // follows from them. Handing the clip's frames in as latent frames launches a ladder no decode
+    // makes - the same quantity stated twice, which is what the walk and this harness must not do.
+    let frames = minimax_h3::packing::audio_latent_frames(request.clip);
     let latent_channels = u64::from(config.latent_channels);
     let latents = arena
         .tensor(
@@ -1561,11 +1564,11 @@ fn requested_names(root: &Path, component: &str) -> Result<Vec<String>, String> 
     let names = match component {
         "all" => {
             let mut names = AudioEncoder::keys(&config).map_err(|error| error.to_string())?;
-            names.extend(AudioDecoder::keys(&config).map_err(|error| error.to_string())?);
+            names.extend(BigVgan::keys(&config).map_err(|error| error.to_string())?);
             names
         }
         "audio-encoder" => AudioEncoder::keys(&config).map_err(|error| error.to_string())?,
-        "audio-decoder" => AudioDecoder::keys(&config).map_err(|error| error.to_string())?,
+        "audio-decoder" => BigVgan::keys(&config).map_err(|error| error.to_string())?,
         other => return Err(format!("component {other} asks for no names here")),
     };
     Ok(names)

@@ -122,10 +122,6 @@ const HIDDEN: u32 = 5376;
 /// gated residual over the whole trajectory, so that width is both an input and a residual.
 const VIDEO_CHANNELS: u32 = 24;
 
-/// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
-/// tables and the one cast that narrows the timestep activation into them are this wide.
-const TIME_DIM: u32 = 2688;
-
 /// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
 /// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
 const ROPE_FREQ_DIM: u32 = 16;
@@ -190,7 +186,44 @@ const FFN: u32 = 14336;
 /// of the model: the model's frame rule says which lengths a request can be snapped to, and no source
 /// says which of those this deployment drives. The delivery's stages and the model's bound are the
 /// list; `--frames` states another, and it may not omit one of these.
-const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, 25, 49, 121, minimax_h3::config::MAX_FRAMES];
+/// The stage lengths the delivery drives, in **frames**.
+///
+/// These are the stages' own lengths - what a request asks for - not the clips the sampler produces.
+/// A generation runs `17n + 5` frames (`packing::video_latent_frames`), so five of these six are not
+/// clips at all: 17, 25, 49, 121 and 1024 are counts the video *encoder* accepts (a condition is cut
+/// and padded) and the sampler does not. [`deployment_clips`] is the model's own rounding of them,
+/// and that is what the rows are keyed for.
+/// The durations the delivery serves, in **seconds** - the eval workloads' own four.
+///
+/// `uniserve_eval/workloads/minimax_h3/` asks for 5, 8, 10 and 15 seconds, so those are the requests a
+/// store has to answer and nothing else is inventory worth carrying. A duration is what a request
+/// states; the frame count is what the model makes of it, and the clip is what the packing accepts.
+const DELIVERY_SECONDS: [u32; 4] = [5, 8, 10, 15];
+
+/// The clips the delivery's durations snap to, by the model's own rule.
+///
+/// Three steps, each one function: seconds to frames at the model's rate, frames to the next generated
+/// timeline (`align_num_frames`: `17n + 5`, at least 22, and no longer than the rule's last rung), and
+/// one clip per distinct result. At 24 fps and one canvas that is 120, 192, 240 and 360 frames and
+/// **124, 192, 243 and 362** clips - two of the four are exactly producible and two are not, which is
+/// why a list of durations is not a list of clips.
+fn deployment_clips() -> Vec<u32> {
+    // The largest clip the model generates, which is the last rung of its rule and **not** `MAX_FRAMES`:
+    // a request of `MAX_FRAMES` rounds up past it, so a ladder built by rounding alone would state one
+    // clip longer than the model has (1025 against a 1024-frame maximum).
+    let longest = minimax_h3::programs::Deployment::generated()
+        .last()
+        .copied()
+        .unwrap_or(minimax_h3::config::MAX_FRAMES);
+    let mut clips: Vec<u32> = DELIVERY_SECONDS
+        .iter()
+        .map(|seconds| seconds * minimax_h3::config::FPS)
+        .map(|frames| minimax_h3::packing::align_num_frames(frames).min(longest))
+        .collect();
+    clips.sort_unstable();
+    clips.dedup();
+    clips
+}
 
 const AUDIO_ATTENTION_HEADS: u32 = 8;
 const AUDIO_LATENT_DIM: u32 = 2048;
@@ -209,12 +242,26 @@ const NORM_EPSILON: f32 = 1e-5;
 /// representation (BF16 for the DiT, the text stack, the conditioner and the sampler), and a
 /// deployment that states FP32 makes every one of those programs a different key - the descriptor
 /// carries the element type, and a store holding one set cannot serve the other.
-const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
+/// The one deployment the checkpoint is: its text encoder and its DiT are BF16.
+///
+/// This was two element types, because the deployment's type *was* a parameter - and now the
+/// checkpoint's own storage decides each component's (`load::deployment_dtype`), so the second pass
+/// stated a deployment no invocation can select. **A crossing is not a second deployment**: the sites
+/// that widen into a head or narrow out of it state both types inside `rows()`, and those rows stay.
+const DEPLOYMENTS: [DType; 1] = [DType::BF16];
 
-/// The element types a video VAE may be stored and run in: FP16 at `dtype = "auto"`, FP32 where the
-/// deployment states it. Its programs are the ones the *checkpoint's* representation decides, which is
-/// the opposite of the stack above - so these rows carry both and nothing else about them moves.
-const VAES: [DType; 2] = [DType::F16, DType::F32];
+/// The element type the video VAE is: **F32, as the checkpoint stores it.**
+///
+/// This was `[F16, F32]`, on the design's sentence that the video VAE decoder runs at FP16. The
+/// measurement is the other way: `component-tensors.json` counts 703 `vae` tensors and 1087
+/// `audio_vae` tensors, **none of them F16**, and the device's own arena line settles it - the decoder
+/// asks `14 721 024 B = 1797 rows x 2048 columns x 4`, which is a residual stream at F32. With
+/// `dtype = "auto"` converting nothing, no invocation selects an F16 cell, and both deployments' walks
+/// state zero F16 rows.
+///
+/// A deployment that runs the VAE at FP16 is **a different checkpoint**, not a different run: it would
+/// be loaded converted, and its own walk would state its own rows.
+const VAES: [DType; 1] = [DType::F32];
 
 /// The value a flag was given, or a message naming the flag that was given none.
 ///
@@ -256,6 +303,10 @@ fn main() {
     // list has that is absent here is typed drift. It exits before the header, so a diff of its
     // output against the file is the review artifact.
     let mut derived = false;
+    // Which attention backend the deployment runs. **One deployment runs one**, so this is what the
+    // file is a deployment of, not a filter over a union: without it the sparse selection's rows are
+    // absent, and a store built from the file serves the dense deployment and only that.
+    let mut sparse = false;
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
@@ -276,6 +327,12 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            "--sparse" => {
+                // The value the walk takes (`tile_rows,sparsity,max_tiles`) is what the sparse
+                // deployment is; the generator only needs to know it is that deployment.
+                let _ = value(&mut arguments, "--sparse");
+                sparse = true;
+            }
             other => panic!("unknown flag {other}"),
         }
     }
@@ -333,25 +390,46 @@ fn main() {
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::F32,
+                // The checkpoint's own type for the component, which is also what every launch reads:
+                // the stack's buffers are allocated at the hidden states' type, the modulation cache
+                // with them (`denoiser.rs:2992`, `arena.tensor(hidden.dtype, ..)`), and each refiner
+                // block carries the type of its `to_q` weight (`conditioning.rs:122`,
+                // `dtype: query_dtype`). A second type here states rows for launches that ask BF16 -
+                // cells nothing selects, in a file that reads as covering both.
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
             clip_frames.clone(),
+            // **The tasks the deployment serves are its checkpoint's**, not this walk's: a task states
+            // the modulation cache's groups and a cache width is a program key, so a set narrower than
+            // the checkpoint serves leaves another task's requests without a cell.
+            minimax_h3::programs::Deployment::checkpoint_tasks(std::path::Path::new(&root))
+                .unwrap_or_else(|error| panic!("the checkpoint's tasks: {error}")),
         )
         .unwrap_or_else(|error| panic!("the deployment is not statable: {error}"));
-        let partition = minimax_h3::Partition::single();
+        // The serving partition, not the released default: `Partition::serving` derives the capacity
+        // from the task, and the packed row bound - hence the gated activation's `wide` form and the
+        // sparse tile class - follows from it. `Partition::single()` states 128 text and 192 condition
+        // rows, which is a deployment no conditioned request asks for.
+        let partition = minimax_h3::Partition::serving(
+            &config,
+            nn::VideoTask::ReferenceToVideoAudio,
+            1,
+            1,
+            0,
+            0,
+        )
+        .unwrap_or_else(|error| {
+            panic!("the deployment's serving partition is not statable: {error}")
+        });
         let Some(dies) = config.denoisers.values().next() else {
             panic!("the checkpoint states no DiT, so its arrangement is not statable")
         };
         let arrangement = partition
             .arrangement(dies)
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-        match deployment.denoiser_rows(
-            &partition,
-            &arrangement,
-            minimax_h3::modulation::Groups::of(true),
-        ) {
+        match deployment.denoiser_rows(&partition, &arrangement) {
             Ok(stated) => rows.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
         }
@@ -371,9 +449,35 @@ fn main() {
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
     // twice, once per element type, which is the point.
+    // Once, before any row: `Layouts::rows_bound` derives the packed bound from the arrangement, and
+    // **the bound is the serving path's**, so the partition is too - `Partition::serving` derives the
+    // capacity from the task (two latent frames of difference between tasks), while `Partition::single()`
+    // states the released defaults and gives a bound no conditioned request asks for. Two rows are
+    // reachable only at the bound (the gated activation's `wide` form switches on the row count), and
+    // the header states it.
+    let serving =
+        minimax_h3::Partition::serving(&config, nn::VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
+            .unwrap_or_else(|error| {
+                panic!("the deployment's serving partition is not statable: {error}")
+            });
+    let bound = {
+        let dies = config
+            .denoisers
+            .get(&minimax_h3::checkpoint::Dit::Base)
+            .unwrap_or_else(|| {
+                panic!("the checkpoint holds no base DiT, so its bound is not statable")
+            });
+        serving
+            .arrangement(dies)
+            .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement))
+            .and_then(|rules| rules.rows_bound())
+            .unwrap_or_else(|error| {
+                panic!("the deployment's packed bound is not statable: {error}")
+            })
+    };
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
-        lines.extend(rows(deployment));
+        lines.extend(rows(deployment, bound, sparse));
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -450,14 +554,15 @@ fn main() {
     // nothing else would notice. It covers **default against stated, not stated against legal**: the
     // frame rule (`align_num_frames`) says which lengths a request snaps to, and the deployment says
     // which of those it drives.
+    let deployment_clips = deployment_clips();
     if clip_frames.is_empty() {
-        clip_frames = DEPLOYMENT_FRAMES.to_vec();
+        clip_frames = deployment_clips.clone();
     } else {
-        for frames in DEPLOYMENT_FRAMES {
-            if !clip_frames.contains(&frames) {
+        for frames in &deployment_clips {
+            if !clip_frames.contains(frames) {
                 panic!(
                     "the run states the ladder {clip_frames:?}, which omits {frames} - a clip the \
-                     deployment drives; state a superset of {DEPLOYMENT_FRAMES:?} or no --frames"
+                     deployment drives; state a superset of {deployment_clips:?} or no --frames"
                 );
             }
         }
@@ -467,28 +572,22 @@ fn main() {
     // above are being replaced by one component at a time. Emitting it beside them is a no-op today
     // (a row is a set member) and is what makes the replacement checkable: the set must not move.
     // The partition the deployment states, and the packed bound the rows are cut at. Both are stated
-    // once, outside the VAE loop: `Layouts::rows_bound` derives the bound from the arrangement, and
-    // the header states it because two rows are reachable only at it.
-    let partition = minimax_h3::Partition::single();
-    let Some(dies) = config.denoisers.values().next() else {
-        panic!("the checkpoint states no DiT, so its arrangement is not statable")
-    };
-    let arrangement = partition
-        .arrangement(dies)
-        .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-    let bound = minimax_h3::denoiser::Layouts::new(dies.clone(), arrangement)
-        .and_then(|rules| rules.rows_bound())
-        .unwrap_or_else(|error| panic!("the deployment's packed bound is not statable: {error}"));
+    assert!(
+        config.denoisers.values().next().is_some(),
+        "the checkpoint states no DiT, so its arrangement is not statable"
+    );
     for vae in VAES {
         let deployment = minimax_h3::programs::Deployment::new(
             config.clone(),
             minimax_h3::programs::Types {
                 text_encoder: DType::BF16,
-                transformer: DType::F32,
+                transformer: DType::BF16,
                 video: vae,
                 audio: DType::F32,
             },
             clip_frames.clone(),
+            minimax_h3::programs::Deployment::checkpoint_tasks(std::path::Path::new(&root))
+                .unwrap_or_else(|error| panic!("the checkpoint's tasks: {error}")),
         )
         .unwrap_or_else(|error| panic!("the deployment's VAE rows are not statable: {error}"));
         match deployment.own_vae_rows() {
@@ -505,11 +604,7 @@ fn main() {
         let arrangement = partition
             .arrangement(dies)
             .unwrap_or_else(|error| panic!("the partition has no arrangement: {error}"));
-        match deployment.denoiser_rows(
-            &partition,
-            &arrangement,
-            minimax_h3::modulation::Groups::of(true),
-        ) {
+        match deployment.denoiser_rows(&partition, &arrangement) {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
         }
@@ -534,7 +629,7 @@ fn main() {
         )
         .collect();
     if !clip_frames.is_empty() {
-        match minimax_h3::audio_vae::AudioDecoder::programs(audio, &latents) {
+        match minimax_h3::audio_vae::BigVgan::programs(audio, &latents) {
             Ok(rows) => lines.extend(rows),
             Err(error) => panic!("the audio decoder states no programs: {error}"),
         }
@@ -610,9 +705,11 @@ fn header(
         clip_frames,
     );
     println!(
-        "# deployment: **a union, not one deployment's rows** - the stack at {} and the video VAE at \
-         {}; a run states which deployment it serves and a store built from this file serves all of \
-         them, which is why one operator appears at more than one element type.",
+        "# deployment: **one deployment** - the stack at {} and the video VAE at {}, which are the \
+         checkpoint's own storage and what `dtype = \"auto\"` loads without converting. An operator \
+         appears at more than one element type only where a site crosses between them (a widening into \
+         a head, a table the reference computes in F32), and each such row is stated by the site that \
+         takes both.",
         DEPLOYMENTS
             .iter()
             .map(|dtype| format!("{dtype:?}"))
@@ -666,7 +763,10 @@ fn header(
 }
 
 /// Every row one deployment's dtype asks for.
-fn rows(deployment: DType) -> Vec<(String, String)> {
+/// Every row the DiT, the text encoder and the orchestration around them state at `deployment`'s
+/// element type. `bound` is the deployment's packed row bound: the gated activation's `wide` form is a
+/// property of `bound · width`, so a walk cannot state it without the bound it serves.
+fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -1261,7 +1361,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::residual::ScaledAddDescriptor {
             target: deployment,
             source: DType::F32,
-            columns: HIDDEN,
             block: ops::residual::RESIDUAL_BLOCK,
         }
         .to_string(),
@@ -1283,24 +1382,22 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target: deployment,
                 source: DType::F32,
-                columns: TIME_DIM,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
     }
-    for columns in [32, 96, HIDDEN] {
-        push(
-            "scaled_add",
-            ops::residual::ScaledAddDescriptor {
-                target: DType::F32,
-                source: deployment,
-                columns,
-                block: ops::residual::RESIDUAL_BLOCK,
-            }
-            .to_string(),
-        );
-    }
+    // One row, not three: the columns these three widths state are the operands' and reach no
+    // compiled code, so a row per width is a row set that describes one request's shape.
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::F32,
+            source: deployment,
+            block: ops::residual::RESIDUAL_BLOCK,
+        }
+        .to_string(),
+    );
     // **The conditioner's per-head normalization.** `TokenRefiner::programs` states two norm widths -
     // the hidden state's and **one head's**, `config.head_dim` = 128 - because its attention
     // normalizes each query and key over a head rather than through the fused `qk_norm_rope` the DiT's
@@ -1325,7 +1422,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::residual::ScaledAddDescriptor {
                 target,
                 source,
-                columns: 4 * VIDEO_CHANNELS,
                 block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
@@ -1790,18 +1886,15 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // FP32 throughout. `scaled_add` is the operator that widens and narrows in the diffusion path, and
     // no row of it existed at any of these four widths: the encoder's residual adds are the only
     // consumer of that family at a VAE channel count.
-    for columns in [128_u32, 256, 512, 1024] {
-        push(
-            "scaled_add",
-            ops::residual::ScaledAddDescriptor {
-                target: DType::F32,
-                source: DType::F32,
-                columns,
-                block: ops::residual::RESIDUAL_BLOCK,
-            }
-            .to_string(),
-        );
-    }
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::F32,
+            source: DType::F32,
+            block: ops::residual::RESIDUAL_BLOCK,
+        }
+        .to_string(),
+    );
 
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
     //
@@ -1950,7 +2043,10 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             activation: ops::activation::Activation::Silu,
             gate_stride: 2 * 14336,
             value_stride: 2 * 14336,
-            wide: false,
+            // `wide` is the index-width class: the launch addresses `bound` rows of `width`, so at a
+            // deployment whose product passes `u32::MAX` the kernel takes 64-bit offsets. Stating it
+            // as `false` was a cell for a class the launch does take and none for the one it asks.
+            wide: u64::from(bound) * 14_336 > u64::from(u32::MAX),
             pdl: PDL,
             stepwise: true,
         }
@@ -2030,18 +2126,26 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // **Its tile is a function of the raster's width**, not a constant: `FramePadDescriptor::tiles`
     // takes `min(ROW_PIXELS 512, next_power_of_two(columns))` pixels per program and divides
     // `ROW_ELEMENTS 2048` by it, so a raster at least 512 pixels wide gives the 512-pixel tile with
-    // four channels per program — every realistic clip width — and a narrower one re-keys to its own
-    // pixel block. This row is the wide case; a request whose width is under 512 compiles another.
-    push(
-        "frame_pad",
-        ops::frame::FramePadDescriptor {
-            dtype: DType::F32,
-            reflect: true,
-            block_pixels: 512,
-            block_channels: 4,
-        }
-        .to_string(),
-    );
+    // four channels per program and a narrower one re-keys to its own pixel block.
+    //
+    // The four rungs below are the classes the walk states over the deployment's six canvases and its
+    // tile widths, and **a walk is the authority for them**. The 64-pixel rung is the tiled driver's
+    // own pad (`ClipEncoder`'s tile at `TILE_PIXELS`), which no `Deployment` row derives yet - the
+    // call site and the harness that would witness it are the open item. It is stated here because a
+    // class a launch takes that the file lacks stops a run with a store that reads as complete, while
+    // a class nothing takes costs a compile.
+    for (block_pixels, block_channels) in [(64, 32), (128, 16), (256, 8), (512, 4)] {
+        push(
+            "frame_pad",
+            ops::frame::FramePadDescriptor {
+                dtype: DType::F32,
+                reflect: true,
+                block_pixels,
+                block_channels,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
@@ -2265,7 +2369,6 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         (deployment, ops::rows::Mode::Replace, HIDDEN),
         // The voxel rows' own width, at the VAE's representation rather than the stack's.
         (VAES[0], ops::rows::Mode::Replace, VAE_WIDTH),
-        (VAES[1], ops::rows::Mode::Replace, VAE_WIDTH),
     ] {
         push(
             "rows",
@@ -2300,5 +2403,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     //   belong to the sampler's chain and the Qwen3 slice, the two residuals to a stream that folds
     //   its normalization in one launch, and the composition to the VSA chain's last step.
 
+    // **A deployment runs one attention backend.** The `vsa_*` selection and `sparse_attention` are the
+    // video-sparse deployment's rows: the dense deployment never launches them, and a file that held
+    // both would be a union of two deployments - the thing that made a store's size describe a model
+    // nobody runs. They are emitted under `--sparse` and nowhere else.
+    if !sparse {
+        lines.retain(|(operator, _)| {
+            !operator.starts_with("vsa_") && operator != "sparse_attention"
+        });
+    }
     lines
 }
