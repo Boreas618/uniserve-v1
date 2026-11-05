@@ -207,6 +207,25 @@ const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
 /// the opposite of the stack above - so these rows carry both and nothing else about them moves.
 const VAES: [DType; 2] = [DType::F16, DType::F32];
 
+/// The value a flag was given, or a message naming the flag that was given none.
+///
+/// The generator's flags are the deployment's, so a missing one is a caller's mistake rather than a
+/// condition to recover from; naming the flag is the whole of the help it needs.
+fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> String {
+    match arguments.next() {
+        Some(value) => value,
+        None => panic!("{flag} needs a value"),
+    }
+}
+
+/// One component of a `HxW` raster, or a message naming the raster and the part that is not a number.
+fn parse(part: &str, raster: &str, what: &str) -> u32 {
+    match part.parse() {
+        Ok(value) => value,
+        Err(_) => panic!("{raster}: {part} is not {what}"),
+    }
+}
+
 fn main() {
     // The checkpoint states the geometry the derived rows are built from, so the generator reads it
     // rather than restating it: `--root`, or the deployment's own path. A generator that transcribed
@@ -216,23 +235,15 @@ fn main() {
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
-            "--root" => {
-                root = std::path::PathBuf::from(
-                    arguments
-                        .next()
-                        .expect("--root needs the checkpoint's directory"),
-                );
-            }
+            "--root" => root = std::path::PathBuf::from(value(&mut arguments, "--root")),
             "--rasters" => {
-                for raster in arguments
-                    .next()
-                    .expect("--rasters needs HxW,...")
-                    .split(',')
-                {
-                    let (height, width) = raster.trim().split_once('x').expect("HxW");
+                for raster in value(&mut arguments, "--rasters").split(',') {
+                    let Some((height, width)) = raster.trim().split_once('x') else {
+                        panic!("{raster} is not HxW");
+                    };
                     rasters.push((
-                        height.parse().expect("a height"),
-                        width.parse().expect("a width"),
+                        parse(height, raster, "a height"),
+                        parse(width, raster, "a width"),
                     ));
                 }
             }
@@ -245,15 +256,20 @@ fn main() {
             .map(|canvas| (canvas.height, canvas.width))
             .collect();
     }
-    let config = minimax_h3::config::Config::read(&root, None)
-        .expect("the checkpoint's configuration, read at the loading boundary");
+    let config = match minimax_h3::config::Config::read(&root, None) {
+        Ok(config) => config,
+        Err(error) => panic!(
+            "the checkpoint at {} has no configuration to read: {error}",
+            root.display()
+        ),
+    };
     // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
     // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
     // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
     // twice, once per element type, which is the point.
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
-        lines.extend(rows(deployment, &config, &rasters));
+        lines.extend(rows(deployment));
     }
     // ---- The video encoder's rows, **derived rather than written**.
     //
@@ -281,21 +297,19 @@ fn main() {
     // **The canvases the deployment serves**, which are the ones the model offers - not the raster a
     // test case happens to use. The encoder's frame operators key on the canvas, so this is the whole
     // reason the rows are derived: a written set covers one canvas and leaves the others without a
-    // program. `NAMED_CANVASES` is the offered set, and every one of them is a request the store must
-    // answer.
-    let rasters = minimax_h3::NAMED_CANVASES
-        .iter()
-        .map(|canvas| (canvas.width, canvas.height))
-        .collect::<Vec<_>>();
+    // program. `NAMED_CANVASES` is the offered set - it is what `--rasters` defaults to above, so a
+    // caller who narrows the canvases narrows the rows, and the two cannot say different things.
     lines.extend(
-        minimax_h3::encoding::VideoEncoder::programs(&video_vae, &rasters)
-            .unwrap_or_else(|error| panic!("the video encoder's programs: {error}")),
+        match minimax_h3::encoding::VideoEncoder::programs(&video_vae, &rasters) {
+            Ok(rows) => rows,
+            Err(error) => panic!("the video encoder's programs: {error}"),
+        },
     );
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
     lines.dedup();
-    header(&lines);
+    header(&lines, &config.video_vae, &rasters);
     for (operator, descriptor) in lines {
         println!("{operator}\t{descriptor}");
     }
@@ -307,7 +321,11 @@ fn main() {
 /// questioned at least once. Every number here is computed from the rows themselves, so the header
 /// cannot disagree with them; `build_fixtures` reads only the rows, so a line starting `#` is a
 /// reader's and never a cell.
-fn header(lines: &[(String, String)]) {
+fn header(
+    lines: &[(String, String)],
+    video_vae: &minimax_h3::config::VideoVaeConfig,
+    rasters: &[(u32, u32)],
+) {
     let operators = lines
         .iter()
         .map(|(operator, _)| operator.as_str())
@@ -348,6 +366,19 @@ fn header(lines: &[(String, String)]) {
          config, so one set of rows serves the base network and the reference DiT."
     );
     println!("# generator: cargo run -q -p minimax-h3 --example minimax_h3_keys");
+    // The four fields that decide the derived rows, printed from the checkpoint that decided them. A
+    // reader asking "which canvas is this file for" gets the answer beside the count, and the answer
+    // cannot drift from the rows: both come from one read of `--root`.
+    println!(
+        "# derived: the video encoder's canvas-class rows, from `--root`'s own config (default \
+         /opt/uv/models/MiniMax-H3). block_out_channels {:?}, spatial_downsample_factors {:?}, \
+         temporal_downsample_factors {:?}, latent_channels {}; rasters (height, width) {:?}.",
+        video_vae.block_out_channels,
+        video_vae.spatial_downsample_factors,
+        video_vae.temporal_downsample_factors,
+        video_vae.latent_channels,
+        rasters,
+    );
     // The second category of a row that varies with the request, distinct from a deployment's type.
     // A store built from this file serves the canvases and lengths its rows describe; a key derived
     // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
@@ -373,11 +404,7 @@ fn header(lines: &[(String, String)]) {
 }
 
 /// Every row one deployment's dtype asks for.
-fn rows(
-    deployment: DType,
-    config: &minimax_h3::config::Config,
-    rasters: &[(u32, u32)],
-) -> Vec<(String, String)> {
+fn rows(deployment: DType) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -2132,19 +2159,6 @@ fn rows(
             .to_string(),
         );
     }
-
-    // ---- The video encoder: derived from the component, not written here.
-    //
-    // `VideoEncoder::programs` is the function the block that launches these rows calls, so a row it
-    // states cannot disagree with that block. The section was hand-written until it held 5 of the 20
-    // rows the encoder launches at the deployment's canvases, and the store, built from this file,
-    // would have stopped a `ref2va` encode at its first pad. The encoder runs FP32 at every raster
-    // (spec 9's TF32 row), so this call takes no element type: a dtype argument here would be the
-    // deployment's for a component the deployment does not decide.
-    lines.extend(
-        minimax_h3::encoding::VideoEncoder::programs(&config.video_vae, rasters)
-            .expect("the video encoder's programs from its own configuration"),
-    );
 
     // Gaps this file does not fill, named rather than invented. Each is a number the deployment
     // owns, not one this file could read off a config:
