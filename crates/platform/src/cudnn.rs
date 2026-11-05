@@ -1386,8 +1386,26 @@ impl Cudnn {
             HEURISTIC_MODE_A
         };
         let mut proposal = self.configs(&operation.graph, MAX_ENGINE_CONFIGS, mode, exact)?;
+        // **A heuristic that lists nothing is the one case where the exhaustive search earns its
+        // cost.** Mode A is cuDNN's shortlist; mode B is every engine the library implements, and a
+        // shape with no shortlist entry can still have an engine - the video VAE's first
+        // convolution at `[1, 3, 19, 258, 258]` is one. This runs at load, once per shape, and the
+        // plan is recorded in the program's tuning data, so the price is a build's, not a call's.
+        let mut exhausted = mode == HEURISTIC_MODE_B;
+        if proposal.kept.is_empty() && !exhausted {
+            exhausted = true;
+            proposal = self.configs(&operation.graph, MAX_ENGINE_CONFIGS, HEURISTIC_MODE_B, exact)?;
+        }
         if proposal.kept.is_empty() {
-            return Err(proposal.empty("this convolution"));
+            let error = proposal.empty("this convolution");
+            return Err(if exhausted && mode == HEURISTIC_MODE_A {
+                Error::invalid(format!(
+                    "{error}; the heuristic that precedes the exhaustive list listed none either, \
+                     so no engine this cuDNN version implements serves the shape"
+                ))
+            } else {
+                error
+            });
         }
         let position = match engine {
             Some(recorded) => {
