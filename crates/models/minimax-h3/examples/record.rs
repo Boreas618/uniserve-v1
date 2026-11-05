@@ -82,6 +82,7 @@ fn main() -> ExitCode {
 type Harness = fn(&Request) -> Result<Vec<(String, String)>, String>;
 
 /// What the recorder was asked to record — the deployment, stated so the output can say what it is.
+#[derive(Clone)]
 struct Request {
     root: PathBuf,
     clip: u32,
@@ -325,18 +326,42 @@ fn run() -> Result<(), String> {
     // about it: the rows go out deduplicated, in the order a fixture holds them, and the summary below
     // is the count of exactly what was printed.
     let mut all: Vec<(String, String)> = Vec::new();
-    let mut refusals: Vec<(&str, String)> = Vec::new();
-    for (name, harness) in &harnesses {
-        match harness(&request) {
-            Ok(rows) => {
-                eprintln!("# {name}: {} rows", rows.len());
-                all.extend(rows);
-            }
-            Err(reason) => {
-                // A refusal is a row of the output, not an exit.
-                println!("# refused: {name}: {reason}");
-                eprintln!("# refused: {name}: {reason}");
-                refusals.push((name, reason));
+    let mut refusals: Vec<(String, String)> = Vec::new();
+    // **Every canvas the recording claims is driven, not only the first.** The walk states a
+    // deployment's rows over each of its offered canvases, and a harness that reads the single
+    // `raster` certifies one canvas while the header names six - the frame operators' classes are
+    // derived from a frame's extent, so a mean canvas hides the extreme ones. Driving the harness
+    // list once per raster is the one place the scope can be got wrong, so it is stated here rather
+    // than in each harness: rows deduplicate, and a component that refuses on one canvas is named
+    // with the canvas it refused on.
+    let canvases = if request.rasters.is_empty() {
+        vec![request.raster]
+    } else {
+        request.rasters.clone()
+    };
+    let many = canvases.len() > 1;
+    for (height, width) in canvases {
+        let per = Request {
+            raster: (height, width),
+            ..request.clone()
+        };
+        for (name, harness) in &harnesses {
+            match harness(&per) {
+                Ok(rows) => {
+                    eprintln!("# {name} at {width}x{height}: {} rows", rows.len());
+                    all.extend(rows);
+                }
+                Err(reason) => {
+                    // A refusal is a row of the output, not an exit.
+                    let why = if many {
+                        format!("{reason} (at {width}x{height})")
+                    } else {
+                        reason
+                    };
+                    println!("# refused: {name}: {why}");
+                    eprintln!("# refused: {name}: {why}");
+                    refusals.push((name.to_string(), why));
+                }
             }
         }
     }
@@ -375,22 +400,23 @@ fn run() -> Result<(), String> {
     let mut operators: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
     operators.sort_unstable();
     operators.dedup();
+    // A component that refused on more than one canvas is one component refused: the count is of
+    // components, and each refusal line above names the canvas it happened on.
+    let mut refused_names: Vec<&str> = refusals.iter().map(|(name, _)| name.as_str()).collect();
+    refused_names.sort_unstable();
+    refused_names.dedup();
     eprintln!(
         "# {} data rows, {} operators, {} of {} components refused{}",
         all.len(),
         operators.len(),
-        refusals.len(),
+        refused_names.len(),
         harnesses.len(),
-        if refusals.is_empty() {
+        if refused_names.is_empty() {
             String::new()
         } else {
             format!(
                 ": {}",
-                refusals
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                refused_names.join(", ")
             )
         }
     );
