@@ -3880,12 +3880,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 // a `tokens`-token extent. A decode bucket has rows == tokens and gets the identity.
                 seq_lens: {
                     let mut lengths = vec![1_i32; rows];
-                    lengths[0] = bucket.tokens as i32;
+                    if !bucket.variant.is_decode() {
+                        lengths[0] = bucket.tokens as i32;
+                    }
                     lengths
                 },
                 query_offsets: {
-                    let mut offsets = vec![bucket.tokens as i32; rows + 1];
-                    offsets[0] = 0;
+                    let mut offsets = if bucket.variant.is_decode() {
+                        // A decode row is one query token of its own sequence, so the partition is
+                        // the identity: row `i` holds `cum_seq_lens_q[i]..cum_seq_lens_q[i + 1]` and
+                        // that is one token. The prefill form below gives the first row the whole
+                        // run and the rest none, which for a decode bucket would say row 0 holds
+                        // every token while the query tensor holds one row per token - and a kernel
+                        // told that computes a partition no tensor has.
+                        (0..=rows as i32).collect::<Vec<i32>>()
+                    } else {
+                        let mut offsets = vec![bucket.tokens as i32; rows + 1];
+                        offsets[0] = 0;
+                        offsets
+                    };
+                    if rows == 0 {
+                        offsets = vec![0];
+                    }
                     offsets
                 },
                 logits_rows: vec![-1; rows],
