@@ -1291,9 +1291,18 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     // declared limits are these bounds, not a second opinion about them. A
     // prefill chunk that the deployment states larger than its token bound is
     // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
+    // The token bound is the deployment's stated budget, and when it states
+    // none the largest shape its captured graphs bound a batch to — the figure
+    // the engine admits a batch under (`proto::catalog::largest_tier`, read by
+    // both ends). Without this fallback a deployment that captures a 512-token
+    // prefill graph and states no budget hands its policy the guest's 8192-token
+    // default, and the mechanism refuses the epoch's limits against the graph's
+    // ceiling after the weights are loaded. A stated bound above the catalog is
+    // refused at load (`ServeConfig::validate`), never clamped here.
     let token_bound = config
         .max_num_batched_tokens
-        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX));
+        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
+        .or_else(|| config.cuda_graph_config.token_bound());
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size
@@ -1858,11 +1867,13 @@ mod tests {
 
     /// The policy's declared limits are the launch's own bounds: the token
     /// bound the deployment gives its workers is the policy's
-    /// `max_num_batched_tokens`, and an unstated prefill chunk is that same
-    /// bound, so the policy's limits cannot disagree with the workers'
+    /// `max_num_batched_tokens`, or the largest shape its captured graphs bound
+    /// a batch to when it states no budget; an unstated prefill chunk is that
+    /// same bound, so the policy's limits cannot disagree with the workers'
     /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
     /// its bound keeps its own value here — the mechanism refuses it
-    /// (`PolicyError::BadLimits`) rather than this code clamping it.
+    /// (`PolicyError::BadLimits`), and `ServeConfig::validate` refuses it at
+    /// load by the option's name, rather than this code clamping it.
     #[test]
     fn the_policys_limits_are_the_launchs_own_token_bound() {
         let mut config = ServeConfig::default();
@@ -1888,8 +1899,33 @@ mod tests {
             toml::Value::Integer(16384)
         );
 
-        // A deployment that states no token bound states no limit, and the
-        // mechanism's ceilings are the workers' own.
+        // A deployment that states a graph catalog and no budget gives its
+        // policy the largest shape the catalog bounds a batch to: the same
+        // figure the engine admits a batch under, so a policy that states no
+        // bound of its own never declares more than the engine built for.
+        let mut config = ServeConfig::default();
+        config.cuda_graph_config.prefill_token_sizes = Some(vec![
+            NonZeroU32::new(128).unwrap(),
+            NonZeroU32::new(512).unwrap(),
+        ]);
+        config.cuda_graph_config.decode_batch_sizes = Some(vec![
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(8).unwrap(),
+        ]);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(512),
+            "an unstated budget is the largest shape the captured graphs bound a batch to"
+        );
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(512),
+            "and an unstated chunk is that same bound"
+        );
+
+        // A deployment that states no token bound and no catalog states no
+        // limit, and the mechanism's ceilings are the workers' own.
         let config = ServeConfig::default();
         let programs = FilledPrograms::of(&config);
         assert!(

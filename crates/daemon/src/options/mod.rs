@@ -609,6 +609,29 @@ pub struct CudaGraphOptions {
     pub flow_shapes: Option<Vec<ImageSize>>,
 }
 
+impl CudaGraphOptions {
+    /// The largest shape the deployment's captured graphs bound a batch to.
+    ///
+    /// This is the bound the engine admits a batch under and the bound a
+    /// scheduling policy's declared limits must fit inside
+    /// (`proto::catalog::largest_tier`, which both ends read). `None` when the
+    /// deployment states no catalog: the worker's own catalog then bounds the
+    /// batch, and there is no stated figure to hold a policy against.
+    pub fn token_bound(&self) -> Option<u32> {
+        let sizes = |values: &Option<Vec<NonZeroU32>>| -> Vec<u32> {
+            values
+                .iter()
+                .flatten()
+                .map(|size| size.get())
+                .collect::<Vec<_>>()
+        };
+        proto::catalog::largest_tier(
+            &sizes(&self.decode_batch_sizes),
+            &sizes(&self.prefill_token_sizes),
+        )
+    }
+}
+
 impl Default for CudaGraphOptions {
     fn default() -> Self {
         Self {
@@ -1160,6 +1183,37 @@ impl ServeConfig {
             "`model` is required on the leader of several nodes: name MODEL on the command line \
              or set `model` in --config"
         );
+        // A token bound the deployment states above its own graph catalog is
+        // refused here, by the option, before any weight loads: the engine
+        // admits no batch larger than its largest captured bucket, so the
+        // policy's declared limits would be refused at the first prepare
+        // instead (`crates/scheduling/src/limits.rs`). A stated value is never
+        // clamped — the deployment either means it or is wrong.
+        if let Some(ceiling) = self.cuda_graph_config.token_bound() {
+            let mut stated = Vec::new();
+            if let Some(budget) = self.max_num_batched_tokens {
+                stated.push((
+                    "max_num_batched_tokens",
+                    u32::try_from(budget.get()).unwrap_or(u32::MAX),
+                ));
+            }
+            if let Some(chunk) = self.scheduler_config.chunked_prefill_size {
+                stated.push((
+                    "scheduler_config.chunked_prefill_size",
+                    u32::try_from(chunk.get()).unwrap_or(u32::MAX),
+                ));
+            }
+            for (option, value) in stated {
+                anyhow::ensure!(
+                    value <= ceiling,
+                    "`{option}` is {value}, above the {ceiling} tokens the deployment's captured \
+                     graphs bound a batch to: the engine admits no batch larger than its largest \
+                     bucket, so the scheduling policy's limits would be refused at the first \
+                     prepare. State a bound at or below {ceiling}, or capture a larger bucket in \
+                     `cuda_graph_config`"
+                );
+            }
+        }
         let speculation = &self.speculative_config;
         if let Some(speedup) = speculation.expected_speedup {
             anyhow::ensure!(
