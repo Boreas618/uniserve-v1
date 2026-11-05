@@ -1001,7 +1001,7 @@ impl Scheduler {
     ///
     /// Waits in `Executor::poll` and applies at most one returned result.
     /// Commands and consumer reads fire the engine's `CommandWaker`. A real
-    /// waker, such as `WorkerExecutor::command_waker`, ends the poll early.
+    /// waker, such as `Dispatcher::command_waker`, ends the poll early.
     /// With the no-op waker, a command waits for the executor's own wake
     /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
     /// liveness deadline.

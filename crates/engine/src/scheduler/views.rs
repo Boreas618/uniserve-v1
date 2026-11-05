@@ -1296,7 +1296,7 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
-/// One entry per worker the world reports, in the order `WorkerGroup::spawn_all`
+/// One entry per worker the world reports, in the order `ExecutorGroup::spawn_all`
 /// returned them — the same length and order as the control thread's
 /// `routing.slots`, so an index into this list and an index into that one name
 /// the same rank. The two are built on different threads and carry different

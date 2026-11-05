@@ -18,7 +18,7 @@ use ipc::WorkerInfo;
 
 use crate::WorkerGroupId;
 use crate::executor::{ExecutorInfo, PoolPlacement, RankEncoderPools};
-use crate::worker::executor::codecs::video_unit_codecs;
+use crate::executors::dispatch::codecs::video_unit_codecs;
 
 impl ExecutorInfo {
     /// The capability information of the pools `pools` describes, as the mechanism reads it.

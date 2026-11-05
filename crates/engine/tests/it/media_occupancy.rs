@@ -991,7 +991,7 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
 /// encoders on one, and the denoiser, decoders and muxer on the other, as a
 /// deployment that places its encoders apart from its denoiser serves them.
 ///
-/// Submission keeps the two rules a `WorkerExecutor` applies across pools. A
+/// Submission keeps the two rules a `Dispatcher` applies across pools. A
 /// pool without a free slot hands a batch back, as the encoder pool does
 /// once, for the first batch carrying the `hand_back` call. A call is
 /// accepted only after the call producing each of its inputs has been, since

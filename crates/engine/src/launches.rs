@@ -141,7 +141,7 @@ pub fn plan_ranks(
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use crate::worker::{claims::Claims, processes, registry};
+    use crate::executors::{claims::Claims, processes, registry};
     use anyhow::Context;
 
     let config = EngineConfig::from_spec(spec)?;
@@ -159,7 +159,7 @@ pub fn plan_ranks(
         .next()
         .context("the deployment has no leader node")?;
     let registry =
-        registry::WorkerRegistry::bind(launches.iter().any(|rank| rank.host != coordinator))?;
+        registry::ExecutorRegistry::bind(launches.iter().any(|rank| rank.host != coordinator))?;
     let reachable = processes::lock(&processes)?.address(&coordinator)?;
     let mut generations = BTreeMap::new();
     for launch in &launches {

@@ -522,7 +522,7 @@ impl CudaExports {
             ));
         }
         // The engine places a CUDA VMM edge across hosts only where both
-        // devices export fabric handles (`WorkerExecutor::try_new`), so a
+        // devices export fabric handles (`Dispatcher::try_new`), so a
         // read from another host imports a fabric handle.
         let same_host = locator.source.host == source.host;
         if !matches!(device, MemoryKind::Cuda(_)) {

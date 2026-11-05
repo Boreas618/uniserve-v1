@@ -64,7 +64,7 @@ struct GroupEntry {
     replicas: usize,
     /// The group's ranks, every replica's together, in rank order.
     ranks: Vec<RankRange>,
-    /// Physical runs in flight per rank (`WorkerProcessArgs::queue_depth`).
+    /// Physical runs in flight per rank (`ExecutorProcessArgs::queue_depth`).
     queue_depth: usize,
     /// Per-rank device-storage share; the server-wide `mem_fraction_static`
     /// applies when absent.

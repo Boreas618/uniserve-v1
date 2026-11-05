@@ -246,7 +246,7 @@ pub(super) struct MediaTensorAllocation {
     pub(super) shape_bound: ShapeBound,
 }
 
-/// Independent scheduler address spaces for one physical media WorkerGroup.
+/// Independent scheduler address spaces for one physical media ExecutorGroup.
 /// Replicas intentionally reuse row numbers and byte offsets in their own
 /// processes; the worker identity keeps those physical addresses distinct.
 ///

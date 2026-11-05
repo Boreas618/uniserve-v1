@@ -5,7 +5,7 @@
 //! scheduler's thread and is the front door request producers submit and
 //! control requests through.
 //!
-//! [`WorkerGroupConfig`] is the static deployment description: each WorkerGroup has
+//! [`WorkerGroupConfig`] is the static deployment description: each ExecutorGroup has
 //! an ordered list of physical [`WorkerRank`]s and named components whose
 //! `ranks` index into that list. [`EngineConfig`] adds scheduler budgets,
 //! transfer bindings, and rank launch defaults. `SchedulerHandle::start_all`
@@ -34,7 +34,7 @@ use crate::scheduler::{
 use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats};
-use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
+use crate::executors::{Dispatcher, ExecutorGroup, ExecutorProcessArgs};
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
 use executor::batch::Batches;
@@ -96,13 +96,13 @@ pub struct WorkerGroupConfig {
     /// Components keyed by name, each listing indices into `ranks`.
     pub components: BTreeMap<String, ComponentConfig>,
     /// Maximum number of physical runs in flight per rank, launched as
-    /// `WorkerProcessArgs::queue_depth`.
+    /// `ExecutorProcessArgs::queue_depth`.
     pub queue_depth: usize,
     /// Per-rank share of device storage available to this worker process for
     /// static allocations (weights and KV cache).
     ///
     /// When set, `SchedulerHandle::start_all` launches the group's ranks with it as
-    /// `WorkerProcessArgs::mem_fraction_static` instead of the engine-wide
+    /// `ExecutorProcessArgs::mem_fraction_static` instead of the engine-wide
     /// default, which `--mem-fraction-static` sets.
     ///
     /// Distinct WorkerGroups may share one physical GPU. Their configured
@@ -113,7 +113,7 @@ pub struct WorkerGroupConfig {
 }
 
 impl WorkerGroupConfig {
-    /// Validates one WorkerGroup in isolation.
+    /// Validates one ExecutorGroup in isolation.
     ///
     /// Fails when the identity is not a valid `WorkerGroupId`, `queue_depth` is
     /// zero, `validate_mem_fraction_static` refuses a set `mem_fraction_static`, or
@@ -139,7 +139,7 @@ impl WorkerGroupConfig {
 
     /// Checks a per-process static storage fraction: a group's
     /// `mem_fraction_static` or the engine-wide
-    /// `WorkerProcessArgs::mem_fraction_static` default.
+    /// `ExecutorProcessArgs::mem_fraction_static` default.
     ///
     /// Each rank grants itself this share of every device's total storage,
     /// less what its process already holds and never more than the device
@@ -165,7 +165,7 @@ impl WorkerGroupConfig {
     /// equal to its rank count; one with a distribution must have world size
     /// one.
     ///
-    /// `WorkerGroup::spawn_all` calls this again for each group before
+    /// `ExecutorGroup::spawn_all` calls this again for each group before
     /// starting its ranks.
     pub fn validate_members(
         ranks: &[WorkerRank],
@@ -196,7 +196,7 @@ impl WorkerGroupConfig {
         Ok(())
     }
 
-    /// Validates unique WorkerGroup identities and every local placement.
+    /// Validates unique ExecutorGroup identities and every local placement.
     ///
     /// Component names may repeat across WorkerGroups. Repeated names are
     /// replicas of the same numerical component; the scheduler binds each
@@ -209,7 +209,7 @@ impl WorkerGroupConfig {
         let mut ids = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
-            anyhow::ensure!(ids.insert(&worker.id), "WorkerGroup identity is repeated");
+            anyhow::ensure!(ids.insert(&worker.id), "ExecutorGroup identity is repeated");
         }
         // A request prefilled on a prefill group decodes on a decode group,
         // which holds the same text model and nothing else.
@@ -402,11 +402,11 @@ pub struct EngineConfig {
     /// others at those layers, while attention and every other layer stay
     /// data-parallel. `None` keeps every expert on every scheduler.
     pub expert_parallel: Option<ExpertExchange>,
-    /// Rank launch defaults refined by each WorkerGroup configuration.
+    /// Rank launch defaults refined by each ExecutorGroup configuration.
     ///
     /// Every constructor also reads the model identifier (`model`) and
     /// `model_dtype` from here.
-    pub worker_process: WorkerProcessArgs,
+    pub worker_process: ExecutorProcessArgs,
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
     /// Token identifiers that terminate generation.
@@ -583,7 +583,7 @@ impl EngineConfig {
         let worker_groups = vec![group_config];
         let transfer = TransferConfig::default().with_worker_defaults(&worker_groups)?;
 
-        let worker_process = WorkerProcessArgs {
+        let worker_process = ExecutorProcessArgs {
             model: model.clone(),
             dtype,
             ranks: ranks.clone(),
@@ -596,7 +596,7 @@ impl EngineConfig {
             peers: facts.peers.clone().unwrap_or_default(),
             watchdog_timeout: facts
                 .watchdog_timeout
-                .unwrap_or_else(|| WorkerProcessArgs::default().watchdog_timeout),
+                .unwrap_or_else(|| ExecutorProcessArgs::default().watchdog_timeout),
             queue_depth: 1,
             block_size: facts.block_size,
             kv_cache_dtype: facts.kv_cache_dtype,
@@ -608,7 +608,7 @@ impl EngineConfig {
                 .context("`max_running_requests` exceeds the worker field width")?,
             max_model_len: facts.max_model_len.unwrap_or(0),
             world,
-            ..WorkerProcessArgs::default()
+            ..ExecutorProcessArgs::default()
         };
 
         Ok(Self {
@@ -658,7 +658,7 @@ impl EngineConfig {
     /// has no spawnable worker process.
     #[cfg(feature = "testing")]
     pub fn sim(model: impl Into<String>) -> Self {
-        let worker_process = WorkerProcessArgs {
+        let worker_process = ExecutorProcessArgs {
             model: model.into(),
             ranks: WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
@@ -672,7 +672,7 @@ impl EngineConfig {
             queue_depth: 2,
             max_batch_calls: DEFAULT_MAX_BATCH as u32,
             max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,
-            ..WorkerProcessArgs::default()
+            ..ExecutorProcessArgs::default()
         };
         Self {
             generation_limits: crate::sim::SimEngine::generation_limits(),
@@ -777,7 +777,7 @@ pub struct SchedulerHandle {
 /// and what the schedulers are assembled from.
 pub(crate) struct GroupArguments {
     /// The model groups', scheduler by scheduler, then the expert groups'.
-    pub(crate) arguments: Vec<WorkerProcessArgs>,
+    pub(crate) arguments: Vec<ExecutorProcessArgs>,
     /// The model groups each scheduler holds.
     pub(crate) per_core: usize,
     /// Each scheduler's resolved transfer edges.
@@ -944,7 +944,7 @@ impl SchedulerHandle {
                 .map(|worker| (worker.id.to_string(), worker.components.clone()))
                 .collect::<BTreeMap<_, _>>();
             for worker in *core_group {
-                arguments.push(WorkerProcessArgs {
+                arguments.push(ExecutorProcessArgs {
                     worker_id: worker.id.to_string(),
                     role: worker.role,
                     ranks: worker.ranks.clone(),
@@ -957,7 +957,7 @@ impl SchedulerHandle {
                         .unwrap_or(config.worker_process.mem_fraction_static),
                     transfer: transfer.clone(),
                     expert_parallel: config.expert_parallel.filter(|_| !tensor_experts).map(
-                        |exchange| crate::worker::ExpertParallelPlacement {
+                        |exchange| crate::executors::ExpertParallelPlacement {
                             rank: union_rank as u32,
                             size: expert_world_size as u32,
                             attention_ranks: attention_ranks as u32,
@@ -972,7 +972,7 @@ impl SchedulerHandle {
             }
         }
         for worker in &expert_workers {
-            arguments.push(WorkerProcessArgs {
+            arguments.push(ExecutorProcessArgs {
                 worker_id: worker.id.to_string(),
                 role: worker.role,
                 ranks: worker.ranks.clone(),
@@ -985,7 +985,7 @@ impl SchedulerHandle {
                     .unwrap_or(config.worker_process.mem_fraction_static),
                 transfer: transfers[0].clone(),
                 expert_parallel: config.expert_parallel.map(|exchange| {
-                    crate::worker::ExpertParallelPlacement {
+                    crate::executors::ExpertParallelPlacement {
                         rank: union_rank as u32,
                         size: expert_world_size as u32,
                         attention_ranks: attention_ranks as u32,
@@ -1033,7 +1033,7 @@ impl SchedulerHandle {
     /// way SGLang runs one scheduler per data-parallel rank behind its
     /// `DataParallelController` and vLLM one engine core per data-parallel
     /// rank. Every group of every scheduler launches through one
-    /// `WorkerGroup::spawn_all`, so the schedulers load their models at the
+    /// `ExecutorGroup::spawn_all`, so the schedulers load their models at the
     /// same time and one daemon per node serves all of them.
     ///
     /// Schedulers exchange no products: every configured transfer edge must
@@ -1084,7 +1084,7 @@ impl SchedulerHandle {
             .context("the config states no transfer edges")?;
         // `spawn_all` returns groups in argument order, which pairs each with
         // its identity: the rank's model groups, then its expert groups.
-        let launched = WorkerGroup::spawn_all(arguments)?;
+        let launched = ExecutorGroup::spawn_all(arguments)?;
         let workers = model_workers
             .iter()
             .chain(&expert_workers)
@@ -1125,7 +1125,7 @@ impl SchedulerHandle {
 
         // `spawn_all` returns groups in argument order, which pairs each group
         // with its identity and, block by block, with its scheduler.
-        let launched = WorkerGroup::spawn_all(arguments)?;
+        let launched = ExecutorGroup::spawn_all(arguments)?;
         let mut groups = model_workers
             .iter()
             .chain(&expert_workers)
@@ -1172,9 +1172,9 @@ impl SchedulerHandle {
     fn launch(
         config: &EngineConfig,
         max_running_requests: usize,
-        workers: Vec<(WorkerGroupId, WorkerGroup)>,
+        workers: Vec<(WorkerGroupId, ExecutorGroup)>,
     ) -> anyhow::Result<Self> {
-        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
+        let executor = Dispatcher::try_new(workers, config.transfer.clone())?;
         let info = executor.info().runtime_info()?;
         Self::check_rows(&info, max_running_requests)?;
         let waker = executor.command_waker();
@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn the_shorthand_blocks_ranks_across_the_hosts_it_is_given() {
         // Eight devices over two four-device hosts, the engine's host first as
-        // the CLI lists them. `WorkerGroup` refuses a muxer off the engine's
+        // the CLI lists them. `ExecutorGroup` refuses a muxer off the engine's
         // host, so a deployment that places its muxer on rank zero needs the
         // lowest ranks on the first host, and each host must number its own
         // devices from zero.

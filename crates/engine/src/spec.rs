@@ -22,7 +22,7 @@ use crate::executor::TransferConfig;
 use crate::scheduler::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
 };
-use crate::worker::WorkerProcessArgs;
+use crate::executors::ExecutorProcessArgs;
 
 /// The value the word `value` names for the option at `option`, read as the
 /// serving options name it.
@@ -169,7 +169,7 @@ impl EngineConfig {
                     .context("a retained cache key must contain 32 bytes")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let worker_process = WorkerProcessArgs {
+        let worker_process = ExecutorProcessArgs {
             executable: PathBuf::from(&workers.executable),
             // A deployment is what one daemon serves under its served name.
             deployment: spec.deployment.clone(),
@@ -480,8 +480,8 @@ fn order_devices(
 fn graph_arguments(
     graphs: &CudaGraphs,
     flashinfer: &FlashInfer,
-) -> anyhow::Result<WorkerProcessArgs> {
-    Ok(WorkerProcessArgs {
+) -> anyhow::Result<ExecutorProcessArgs> {
+    Ok(ExecutorProcessArgs {
         graph_policy: named(&graphs.policy, "cuda_graph_config.policy")?,
         decode_graph_batch_sizes: sizes(&graphs.decode_batch_sizes),
         prefill_graph_token_sizes: sizes(&graphs.prefill_token_sizes),
@@ -505,7 +505,7 @@ fn graph_arguments(
         flashinfer_decode_split_tile_size: flashinfer.decode_split_tile_size,
         flashinfer_prefill_split_tile_size: flashinfer.prefill_split_tile_size,
         flashinfer_split_kv: flashinfer.split_kv,
-        ..WorkerProcessArgs::default()
+        ..ExecutorProcessArgs::default()
     })
 }
 

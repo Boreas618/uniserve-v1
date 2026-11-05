@@ -1,5 +1,5 @@
-//! Routing of worker results: call completions published as they arrive,
-//! command receipts once every worker finished the batch, the executor's
+//! Routing of executor results: call completions published as they arrive,
+//! command receipts once every executor finished the batch, the executor's
 //! retirement bookkeeping for each applied command, and the routing a finished
 //! request leaves behind.
 
@@ -8,19 +8,19 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Context;
 use ipc::{BatchCommand, BufferId, CallKind, CallStatus, ForwardMode, RequestKey, TransferMode};
 
-use super::WorkerExecutor;
+use super::Dispatcher;
 use crate::executor::WorkerResult;
 use crate::executor::{CommandOutcome, WorkerFailure, logical_result};
 
-impl WorkerExecutor {
-    /// Routes a worker result into its worker aggregate and publishes transferable products.
+impl Dispatcher {
+    /// Routes an executor result into its executor aggregate and publishes transferable products.
     ///
-    /// Validates the report against the worker's pending calls, stores the
+    /// Validates the report against the executor's pending calls, stores the
     /// product and cache exports it returns, and publishes its completions.
     /// When some calls failed, the report, failed completions included, is
     /// still published and the method then returns a `WorkerFailure` naming
     /// the failed calls' requests and the buffers those calls would have
-    /// produced. A request the worker refused, an input-error completion that
+    /// produced. A request the executor refused, an input-error completion that
     /// states why, is named with that reason, so the scheduler rejects it
     /// instead of failing it.
     pub(super) fn route_result(
@@ -35,7 +35,7 @@ impl WorkerExecutor {
             .filter(|completion| completion.output.status == ipc::CallStatus::Error)
             .map(|completion| (completion.output.request_key, completion.output.call_id))
             .collect::<HashSet<_>>();
-        // A refusal is the worker's verdict on the request itself, and its
+        // A refusal is the executor's verdict on the request itself, and its
         // reason is the caller's to read. The failure carries it because the
         // scheduler reconciles the failure before it applies the completion.
         let refusals = report
@@ -51,9 +51,9 @@ impl WorkerExecutor {
             })
             .collect::<HashMap<_, _>>();
         if !failed_calls.is_empty() {
-            // The worker names the code; the caller of a request it did not
+            // The executor names the code; the caller of a request it did not
             // refuse sees only that its dependent work could not complete, so
-            // the code is recorded here, where the failing call and worker
+            // the code is recorded here, where the failing call and executor
             // are known.
             let failed = report
                 .results
@@ -71,7 +71,7 @@ impl WorkerExecutor {
                 worker = %self.workers[worker_index].0,
                 batch_id = report.batch_id,
                 ?failed,
-                "worker returned failed calls"
+                "executor returned failed calls"
             );
         }
         let failed_buffers = self
@@ -82,20 +82,20 @@ impl WorkerExecutor {
             .collect();
 
         // Every completion must answer a distinct call still pending on this
-        // worker, and a terminal report must answer all of them.
+        // executor, and a terminal report must answer all of them.
         let batch_id = report.batch_id;
         {
             let pending_batch = self
                 .pending
                 .get_mut(&batch_id)
-                .ok_or_else(|| anyhow::anyhow!("worker returned unknown batch {batch_id}"))?;
+                .ok_or_else(|| anyhow::anyhow!("executor returned unknown batch {batch_id}"))?;
             let worker = pending_batch
                 .workers
                 .get(&worker_index)
-                .context("worker returned an unexpected batch")?;
+                .context("executor returned an unexpected batch")?;
             anyhow::ensure!(
                 worker.submitted,
-                "worker returned a batch before submission"
+                "executor returned a batch before submission"
             );
             let mut seen = HashSet::new();
             for completion in &report.results {
@@ -103,8 +103,8 @@ impl WorkerExecutor {
                 let kind = worker
                     .calls
                     .get(&identity)
-                    .context("worker returned an unknown call")?;
-                anyhow::ensure!(seen.insert(identity), "worker returned a duplicate call");
+                    .context("executor returned an unknown call")?;
+                anyhow::ensure!(seen.insert(identity), "executor returned a duplicate call");
                 // A completion's payload must fit the kind of the call it
                 // answers: only a successful cache-export call exports cache
                 // state, and only a successful token-denoising call reports
@@ -114,35 +114,35 @@ impl WorkerExecutor {
                 anyhow::ensure!(
                     output.cache_output.is_none()
                         || (successful && *kind == CallKind::Transfer(TransferMode::CacheExport)),
-                    "worker returned a cache export for a call that does not export one"
+                    "executor returned a cache export for a call that does not export one"
                 );
                 anyhow::ensure!(
                     output.candidate_logprobs.is_empty()
                         || (successful && *kind == CallKind::Forward(ForwardMode::TokenDenoising)),
-                    "worker returned candidate log-probabilities for a call that reads none"
+                    "executor returned candidate log-probabilities for a call that reads none"
                 );
             }
             anyhow::ensure!(
                 !report.done || seen.len() == worker.calls.len(),
-                "worker {worker_index} ended batch {batch_id} before every call completed"
+                "executor {worker_index} ended batch {batch_id} before every call completed"
             );
         }
 
         // Store returned exports. Each must come from its buffer's
-        // producing worker; a later report for the same buffer adds locations.
+        // producing executor; a later report for the same buffer adds locations.
         for product in report.products.drain(..) {
             let route = self
                 .buffer_routes
                 .get(&product.product.buffer_id())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "worker {worker_index} returned an unplanned cross-worker product {:?}",
+                        "executor {worker_index} returned an unplanned cross-worker product {:?}",
                         product.product
                     )
                 })?;
             anyhow::ensure!(
                 route.worker_index == worker_index,
-                "worker {worker_index} returned a cross-worker product owned by worker {}",
+                "executor {worker_index} returned a cross-worker product owned by worker {}",
                 route.worker_index
             );
             if let Some(existing) = self.transfer_products.get_mut(&product.product.buffer_id()) {
@@ -160,7 +160,7 @@ impl WorkerExecutor {
             let route = self
                 .buffer_routes
                 .get(&export.source)
-                .context("worker returned an unplanned cache export")?;
+                .context("executor returned an unplanned cache export")?;
             anyhow::ensure!(
                 route.worker_index == worker_index,
                 "cache export was returned by another owner"
@@ -182,11 +182,11 @@ impl WorkerExecutor {
             pending.workers.remove(&worker_index);
         } else {
             // Computation can finish before command-only ranks acknowledge.
-            // Keep that worker's ownership until its terminal report arrives.
+            // Keep that executor's ownership until its terminal report arrives.
             let worker = pending
                 .workers
                 .get_mut(&worker_index)
-                .context("result has no pending worker")?;
+                .context("result has no pending executor")?;
             for completion in &report.results {
                 worker
                     .calls
@@ -216,10 +216,10 @@ impl WorkerExecutor {
         self.dispatch_ready()
     }
 
-    /// Publishes ready calls immediately; only lifecycle receipts wait for all workers.
+    /// Publishes ready calls immediately; only lifecycle receipts wait for all executors.
     ///
-    /// The batch is terminal once no worker remains in its pending record;
-    /// callers remove workers from it as they finish. A terminal result
+    /// The batch is terminal once no executor remains in its pending record;
+    /// callers remove executors from it as they finish. A terminal result
     /// carries a receipt for every lifecycle command other than `Start`, with
     /// its recorded outcome or `Applied`, and applies the executor's own
     /// retirement bookkeeping for each command that did not fail. A result is
@@ -265,7 +265,7 @@ impl WorkerExecutor {
                             .retain(|identity, _| *identity != buffer);
                     }
                     BatchCommand::Start { .. } => {
-                        unreachable!("admissions are tracked by worker ownership")
+                        unreachable!("admissions are tracked by executor ownership")
                     }
                 }
             }

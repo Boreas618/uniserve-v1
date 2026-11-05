@@ -1,10 +1,10 @@
-//! WorkerGroup process configuration, IPC execution, rank aggregation, and recovery.
+//! Executor process configuration, IPC execution, rank aggregation, and recovery.
 //!
-//! The engine drives GPU and host work through worker processes. A
-//! `WorkerGroup` (in `group`) is one worker group's cooperating workers: it projects
+//! The engine drives GPU and host work through executor processes. An
+//! `ExecutorGroup` (in `group`) is one group's cooperating executor processes: it projects
 //! each submitted `Batch` onto the ranks whose components own its calls, joins
 //! their agreeing results into `WorkerResult`s, and replaces the whole group
-//! when a rank is lost. `WorkerExecutor` (in `executor`) submits explicitly
+//! when a rank is lost. `Dispatcher` (in `dispatch`) submits explicitly
 //! targeted work to the groups of a deployment. `process` owns one rank's
 //! channel, `registry` the listener ranks connect to and register at, and
 //! `processes` the engine's connection to the deployment's daemons, which
@@ -12,7 +12,7 @@
 //! the deployment's Storage Server claims (`claims`).
 
 pub(crate) mod claims;
-pub(crate) mod executor;
+pub(crate) mod dispatch;
 mod group;
 mod incarnations;
 mod process;
@@ -21,36 +21,36 @@ pub(crate) use process::stall_failure;
 pub(crate) mod processes;
 pub(crate) mod registry;
 
-pub use executor::WorkerExecutor;
-pub use group::{CallReaders, WorkerGroup};
+pub use dispatch::Dispatcher;
+pub use group::{CallReaders, ExecutorGroup};
 pub(crate) use incarnations::IncarnationRegistry;
-use process::{PendingWorker, WorkerProcess};
+use process::{PendingWorker, ExecutorProcess};
 use proto::request::{ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat};
 
-/// Backpressure and terminal failures returned by a WorkerGroup batch submission.
+/// Backpressure and terminal failures returned by a ExecutorGroup batch submission.
 #[derive(Debug, thiserror::Error)]
 pub enum BatchSubmitError {
     /// Returns the unaccepted physical submission when the group has no capacity.
     ///
     /// The batch is handed back unchanged so the caller can resubmit it
     /// later; nothing was recorded or sent for it.
-    #[error("worker batch queue is full")]
+    #[error("executor batch queue is full")]
     WouldBlock(Box<ipc::Batch>),
     /// Reports a terminal transport or execution failure.
     #[error(transparent)]
     Failed(anyhow::Error),
 }
 
-/// Everything required to create or recreate one worker process.
+/// Everything required to create or recreate one executor process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct WorkerProcessArgs {
-    /// Worker group identity assigned by the engine.
+pub struct ExecutorProcessArgs {
+    /// Executor group identity assigned by the engine.
     pub worker_id: String,
-    /// The `uniserve` executable each worker of the group runs as (its
-    /// `worker` command), and that starts a host's Storage Server when the
+    /// The `uniserve` executable each executor of the group runs as (its
+    /// `executor` command), and that starts a host's Storage Server when the
     /// host has none (its `storage serve` command).
     pub executable: std::path::PathBuf,
-    /// The deployment the group belongs to, which its workers' storage
+    /// The deployment the group belongs to, which its executors' storage
     /// scopes name: the served model name.
     pub deployment: String,
     /// Whether the engine copies the group's cache pages through the
@@ -63,28 +63,28 @@ pub struct WorkerProcessArgs {
     /// Whether the group keeps a standby rank group beside its serving one
     /// (`worker_config.standby`), promoted when the serving group fails.
     pub keep_standby: bool,
-    /// Whether this launch's workers stand by for the group's serving
-    /// workers: they map the exclusive storages those hold without taking
+    /// Whether this launch's executors stand by for the group's serving
+    /// executors: they map the exclusive storages those hold without taking
     /// write access, warm up on scratch units, and park until promoted.
     pub standby: bool,
     /// How a standby launch keeps its graph storage while it parks
     /// (`worker_config.standby_storage`).
     pub standby_storage: proto::request::StandbyStorage,
     /// The exact KV cache segments the group's planes are made of, and the
-    /// leading ones its ranks hold: the serving workers' for a standby
+    /// leading ones its ranks hold: the serving executors' for a standby
     /// launch, the lost ranks' for a relaunch, the committed world's for an
     /// engine that replaces a lost one (`EngineConfig::segments`); `None`
     /// lays them out afresh, as a world's first launch does.
     pub segments: Option<ipc::CacheTable>,
-    /// The world the group's workers belong to, which keys the storage they
+    /// The world the group's executors belong to, which keys the storage they
     /// create and retains what they use.
     pub world: u64,
     /// Worlds of the deployment whose storage ends on every node before the
-    /// group's workers start: a world on trial a rollback discards, whose
+    /// group's executors start: a world on trial a rollback discards, whose
     /// storage the previous world, started again, needs.
     pub retire: Vec<u64>,
     /// The KV cache of the predecessor world's group of the same identity,
-    /// whose segments the group's workers map read-only; `None` for a world
+    /// whose segments the group's executors map read-only; `None` for a world
     /// that succeeds none.
     pub predecessor: Option<ipc::PredecessorCache>,
     /// Map writable warmup storage and reserve the remaining virtual cache
@@ -92,7 +92,7 @@ pub struct WorkerProcessArgs {
     pub stage_cache: bool,
     /// Existing Host cache keys this world's restart keeps for rollback.
     pub cache_keys: Vec<[u8; 32]>,
-    /// The weights the group's workers receive from the world the engine
+    /// The weights the group's executors receive from the world the engine
     /// succeeds, as the daemon planned a change of the parallel
     /// configuration; `None` binds or loads them.
     pub received_weights: Option<ipc::ReceivedWeights>,
@@ -101,7 +101,7 @@ pub struct WorkerProcessArgs {
     /// A plugin's weight source (`scheme://...`) that streams the
     /// checkpoint's tensors in place of its files; `None` reads the files.
     pub weights: Option<String>,
-    /// Ordered physical members of this worker group.
+    /// Ordered physical members of this executor group.
     pub ranks: Vec<crate::WorkerRank>,
     /// This process's own host identity. The engine owns exactly the ranks
     /// whose placement host matches it, so a placement may name its host
@@ -111,15 +111,15 @@ pub struct WorkerProcessArgs {
     pub role: crate::WorkerGroupRole,
     /// Component membership and parallel geometry.
     pub components: std::collections::BTreeMap<String, crate::ComponentConfig>,
-    /// Every worker's component membership, keyed by worker identity, this
+    /// Every executor's component membership, keyed by executor identity, this
     /// group included. A rank is told which ranks read its products, and the
-    /// consuming component may belong to another worker.
+    /// consuming component may belong to another executor.
     pub peers: std::collections::BTreeMap<
         String,
         std::collections::BTreeMap<String, crate::ComponentConfig>,
     >,
     /// The leader daemon's process socket, through which the engine starts
-    /// the group's workers on their nodes (`unix:<path>`).
+    /// the group's executors on their nodes (`unix:<path>`).
     pub daemon: String,
     /// How long the group waits for progress of its ranks (a joined result)
     /// while a batch is pending before it treats them as hung and replaces
@@ -132,7 +132,7 @@ pub struct WorkerProcessArgs {
     /// expires, even for a forward that started up to half of it after the
     /// group's last progress.
     pub watchdog_timeout: std::time::Duration,
-    /// Launch the worker without model weights, using its deterministic test
+    /// Launch the executor without model weights, using its deterministic test
     /// model. Only the engine's own tests and examples set this; the serving
     /// command line cannot request it.
     pub stub: bool,
@@ -141,24 +141,24 @@ pub struct WorkerProcessArgs {
     /// Optional prefix cache capacity in tokens (`kv_cache_config.max_tokens`).
     pub max_total_tokens: Option<u64>,
     /// Tokens per cache page of the cache group with the widest token rows;
-    /// the worker derives every other group's block size from it. `None`
-    /// lets the worker choose it from its cache layers and attention
+    /// the executor derives every other group's block size from it. `None`
+    /// lets the executor choose it from its cache layers and attention
     /// kernels.
     pub block_size: Option<u32>,
-    /// Maximum calls accepted in one worker batch.
+    /// Maximum calls accepted in one executor batch.
     pub max_batch_calls: u32,
-    /// Maximum tokens accepted in one worker batch.
+    /// Maximum tokens accepted in one executor batch.
     pub max_batch_tokens: u32,
-    /// Request rows each rank holds: the size of the worker's request pool,
+    /// Request rows each rank holds: the size of the executor's request pool,
     /// whose rows carry per-request state such as canvases, sampling state
-    /// and block tables. A worker that fits its request tensors to device
+    /// and block tables. An executor that fits its request tensors to device
     /// storage takes this as the largest pool it may choose.
     pub max_request_pool_size: u32,
     /// Attention provider name, forwarded to the ranks verbatim. The ranks'
     /// attention registry owns the names and refuses one it does not
     /// provide when the model loads; `auto` lets it select per call.
     pub attention_backend: String,
-    /// Product transport exposed by the worker pool.
+    /// Product transport exposed by the executor pool.
     pub transfer: crate::executor::TransferConfig,
     /// Checkpoint loader format.
     pub load_format: LoadFormat,
@@ -167,7 +167,7 @@ pub struct WorkerProcessArgs {
     /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
     /// The tensor- and expert-parallel degrees retained weight storage is
-    /// chunked for; empty for every degree up to the GPUs the worker sees.
+    /// chunked for; empty for every degree up to the GPUs the executor sees.
     pub parallel_degrees: Vec<u32>,
     /// Numeric data type used by model parameters and activations.
     pub dtype: crate::ModelDtype,
@@ -189,7 +189,7 @@ pub struct WorkerProcessArgs {
     pub decode_graph_batch_sizes: Option<Vec<u32>>,
     /// Whether any prefill call of the deployment samples a token or scores
     /// its prompt. Without it every prefill only writes the prefix cache, and
-    /// the worker's prefill graphs stop at the final layer's cache write.
+    /// the executor's prefill graphs stop at the final layer's cache write.
     pub prefill_outputs: bool,
     /// The most draft tokens a call proposes with the model's drafter; zero
     /// when the deployment does not speculate.
@@ -206,8 +206,8 @@ pub struct WorkerProcessArgs {
     pub video_text_capacities: Option<Vec<u32>>,
     /// Resolution classes (`768p`) a video deployment prepares, crossed with
     /// `video_aspect_ratios` resolution-major in the order the deployment
-    /// names them. Its workers' video denoiser names the canvas of each pair;
-    /// the workers prepare exactly those and report them back, with their
+    /// names them. Its executors' video denoiser names the canvas of each pair;
+    /// the executors prepare exactly those and report them back, with their
     /// names, as the only canvases requests may target. Empty takes every
     /// class the denoiser offers.
     pub video_resolutions: Vec<String>,
@@ -216,7 +216,7 @@ pub struct WorkerProcessArgs {
     pub video_aspect_ratios: Vec<String>,
     /// Block-diffusion sampling of every canvas the deployment generates, as
     /// the server resolves it; `None` when the served model generates no
-    /// canvases. The worker keeps the argmax history its stability
+    /// canvases. The executor keeps the argmax history its stability
     /// threshold needs, prepares its canvas steps for exactly this sampling,
     /// and refuses a request that carries another.
     pub canvas_sampling: Option<ipc::CanvasSampling>,
@@ -243,7 +243,7 @@ pub struct WorkerProcessArgs {
     /// The probed components whose probes are off, as name patterns
     /// (`profiling_config.fence_probes_off`).
     pub fence_probes_off: Vec<String>,
-    /// Whether the workers keep PC sampling enabled for their life
+    /// Whether the executors keep PC sampling enabled for their life
     /// (`profiling_config.graph_pc_sampling`).
     pub graph_pc_sampling: bool,
     /// Maximum model context length in tokens.
@@ -253,8 +253,8 @@ pub struct WorkerProcessArgs {
     /// admits.
     pub max_video_seconds: f64,
     /// Most denoiser rows a video request's conditions may take, which bounds
-    /// the condition products a video worker provisions; `None` provisions
-    /// the largest condition set the worker's denoiser admits.
+    /// the condition products a video executor provisions; `None` provisions
+    /// the largest condition set the executor's denoiser admits.
     pub max_condition_rows: Option<u32>,
     /// Image features each rank's encoder cache keeps resident, which bounds
     /// the context images one request may pin.
@@ -262,7 +262,7 @@ pub struct WorkerProcessArgs {
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub ffmpeg: std::path::PathBuf,
     /// Shortest video duration in seconds the serving API admits, which
-    /// bounds the frame counts a video worker provisions from below; `None`
+    /// bounds the frame counts a video executor provisions from below; `None`
     /// provisions every frame count the model generates.
     pub min_video_seconds: Option<f64>,
     /// This group's place in the expert-parallel world its data-parallel
@@ -279,7 +279,7 @@ pub struct WorkerProcessArgs {
     pub expert_microbatches: u32,
 }
 
-/// A worker group's consecutive ranks in the deployment's expert union.
+/// An executor group's consecutive ranks in the deployment's expert union.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ExpertParallelPlacement {
     /// The group's first physical rank in the expert union.
@@ -288,7 +288,7 @@ pub struct ExpertParallelPlacement {
     pub size: u32,
     /// Leading source-only ranks; zero for colocated expert parallelism.
     pub attention_ranks: u32,
-    /// TCP address of the world's rendezvous store. `WorkerGroup::spawn_all`
+    /// TCP address of the world's rendezvous store. `ExecutorGroup::spawn_all`
     /// reserves it once the deployment's hosts are known; world rank 0 serves
     /// it on a socket the engine binds.
     pub address: Option<String>,
@@ -348,6 +348,6 @@ pub(crate) fn park_descriptors(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = timeout;
-        anyhow::bail!("worker progress descriptors require Linux poll support")
+        anyhow::bail!("executor progress descriptors require Linux poll support")
     }
 }

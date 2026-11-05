@@ -182,7 +182,7 @@ type Handoff = Arc<Mutex<VecDeque<Event>>>;
 /// A nonblocking Unix socket pair: the `CommandWaker` from [`Self::waker`]
 /// owns the write end and writes a byte per wake (a full socket already holds
 /// a pending notification), and the owner polls [`Self::descriptor`] for
-/// readability and consumes the bytes with [`Self::drain`]. `WorkerExecutor`
+/// readability and consumes the bytes with [`Self::drain`]. `Dispatcher`
 /// owns one beside its worker groups and polls it with their progress
 /// descriptors.
 pub(crate) struct WakeSignal {

@@ -6,15 +6,15 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::Context;
 
-use super::WorkerExecutor;
+use super::Dispatcher;
 use crate::executor::WorkerResult;
 use crate::executor::{CommandOutcome, WorkerFailure};
 
-impl WorkerExecutor {
+impl Dispatcher {
     /// Reconciles abandoned work and its dependents while retaining live physical owners.
     ///
     /// A failure is one of two kinds. With endpoints it is a loss: the
-    /// `WorkerGroup` terminated its ranks and holds none of its resident
+    /// `ExecutorGroup` terminated its ranks and holds none of its resident
     /// requests, buffers, or exports. Without endpoints the group is
     /// intact and only the named calls, requests or batch failed; the calls
     /// of a named request still queued are retired here.
@@ -22,7 +22,7 @@ impl WorkerExecutor {
     /// Returns the failure extended to everything it invalidates: `requests`
     /// and `buffers` include the dependents found here, and `retired` lists
     /// every pending call that will now never complete, each removed from its
-    /// pending batch. Batches left with no pending worker publish an empty
+    /// pending batch. Batches left with no pending executor publish an empty
     /// terminal result. An error that is not a `WorkerFailure` is returned
     /// unchanged.
     pub(super) fn reconcile_worker_failure(
@@ -33,14 +33,14 @@ impl WorkerExecutor {
         let index = *self
             .routing
             .get(&loss.worker_id)
-            .context("failed WorkerGroup is not bound")?;
+            .context("failed ExecutorGroup is not bound")?;
         let lost = !loss.endpoints.is_empty();
         if lost {
             self.refresh_worker(index);
         }
 
         // Without a loss, an execution error names the batch that failed on
-        // this worker; only a batch already submitted here can have failed.
+        // this executor; only a batch already submitted here can have failed.
         let failed_run = (!lost)
             .then(|| loss.execution.as_ref().and_then(|error| error.batch_id))
             .flatten()
@@ -61,7 +61,7 @@ impl WorkerExecutor {
         let mut buffers = loss.buffers.iter().cloned().collect::<HashSet<_>>();
 
         // A lost incarnation's locations are gone. An export that no longer
-        // covers its whole value is invalid; one that other ranks or workers
+        // covers its whole value is invalid; one that other ranks or executors
         // still cover in full stays usable.
         if lost {
             for (buffer, payload) in &mut self.transfer_products {
@@ -93,7 +93,7 @@ impl WorkerExecutor {
             }
         }
 
-        // Buffers produced on the lost worker that were never published are
+        // Buffers produced on the lost executor that were never published are
         // gone with it, and a failed call's outputs will never be produced.
         for (buffer, route) in &self.buffer_routes {
             if (lost
@@ -105,7 +105,7 @@ impl WorkerExecutor {
                 buffers.insert(*buffer);
             }
         }
-        // On a loss, every request with a call still pending on the worker is
+        // On a loss, every request with a call still pending on the executor is
         // affected.
         if lost {
             for pending in self.pending.values() {
@@ -144,7 +144,7 @@ impl WorkerExecutor {
         }
 
         // Remove the tainted requests' calls, and the dependencies no remaining
-        // call reads, from every queued submission. A lost worker's queued
+        // call reads, from every queued submission. A lost executor's queued
         // commands are dropped too, since the state they act on is gone. A
         // submission left empty is discarded.
         for (worker_index, queue) in self.worker_submissions.iter_mut().enumerate() {
@@ -173,7 +173,7 @@ impl WorkerExecutor {
             *queue = active;
         }
 
-        // Retire this worker's outstanding calls in every batch on a loss, or in
+        // Retire this executor's outstanding calls in every batch on a loss, or in
         // the failed batch only. The group sends no report for such a batch, so
         // the entry stops awaiting one. Commands of tainted requests are
         // marked `Retired`, and in the failed batch the reported requests'
@@ -200,7 +200,7 @@ impl WorkerExecutor {
         }
 
         // Remove every retired call from its pending batch. Each must still be
-        // pending on some worker, or the bookkeeping has diverged.
+        // pending on some executor, or the bookkeeping has diverged.
         loss.retired.clear();
         for (batch_id, request, call) in retired {
             let pending_batch = self
@@ -215,7 +215,7 @@ impl WorkerExecutor {
             loss.retired.push((batch_id, request, call));
         }
 
-        // A lost worker holds no admissions or allocations: a later call on it
+        // A lost executor holds no admissions or allocations: a later call on it
         // sends its request's `Start` again, and no `Free` targets it.
         if lost {
             self.admitted_workers.retain(|(worker, _)| *worker != index);
@@ -226,8 +226,8 @@ impl WorkerExecutor {
             }
         }
 
-        // Drop workers with nothing left to report, then complete the batches
-        // that no worker still owes a result.
+        // Drop executors with nothing left to report, then complete the batches
+        // that no executor still owes a result.
         for (batch_id, pending) in &mut self.pending {
             pending.workers.retain(|worker_index, worker| {
                 worker.submitted
