@@ -2001,6 +2001,11 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
                 },
                 bias: true,
                 tf32: true,
+                // The iteration order is a call's, not a module's: it changes the strides the entry
+                // derives and the plan it selects, so one row covers both orders and this value is
+                // never the reason a row exists. Under this geometry (no padding) every launch is
+                // channels-first.
+                channels_last: false,
                 rank: 3,
                 transposed: false,
             }
@@ -2254,6 +2259,9 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
                     groups: 1,
                 },
                 bias: true,
+                // One row covers both orders - the order keys no module - and this row is the
+                // preset's declaration, not any one launch's.
+                channels_last: false,
                 // The preset's declaration for a model convolution in FP32 (the video VAE keeps it
                 // on, and the audio VAEs are the same FP32 numerical path).
                 tf32: true,
@@ -2291,6 +2299,9 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
                     },
                     bias: true,
                     tf32: true,
+                    // A one-dimensional convolution's package refuses channels-last by name, so this
+                    // row is channels-first by the operator's own contract.
+                    channels_last: false,
                     rank: 1,
                     transposed: false,
                 }
