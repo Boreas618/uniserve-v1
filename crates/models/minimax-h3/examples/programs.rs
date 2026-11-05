@@ -471,16 +471,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rows_bound.div_ceil(contract.tile).next_power_of_two()
             }
         };
-        rows.extend(Denoiser::programs(
-            &config,
-            attention,
-            stack_type,
-            max,
-            Groups::of(conditioned),
-            &partition,
-            &elements,
-            tiles,
-        )?);
+        // **The groups are the served tasks', not this walk's.** A task fixes how many timestep
+        // groups the modulation cache holds and the cache's width is a program key, so stating one
+        // task's cache leaves another task's requests with no cell - `logits_gather columns_2` is that
+        // row, and nothing but iterating the served set states it.
+        for groups in [Groups::of(false), Groups::of(true)] {
+            rows.extend(Denoiser::programs(
+                &config, attention, stack_type, max, groups, &partition, &elements, tiles,
+            )?);
+        }
     }
 
     // Deduplicate first: a count of the launches before deduplication is a count of something else
