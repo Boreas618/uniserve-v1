@@ -735,9 +735,27 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
 
     let mut recorded = Recorded::default();
     ops::capture::set_sink(Some(&mut recorded));
-    let run = denoiser.denoise(&forward, &step, latents, cond);
+    // The prompt's refinement runs before the first step, over the layout's own text rows: the
+    // encoder's features at their width into the network's rows.
+    let text_width = u64::from(config.text_encoder.hidden_size);
+    let run = arena
+        .tensor(
+            request.dtype,
+            Shape::new(&[u64::from(packing.text_rows), text_width]),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|source| {
+            denoiser
+                .refine_conditioning(&forward, source, text, &tables, None)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|()| {
+            denoiser
+                .denoise(&forward, &step, latents, cond)
+                .map_err(|error| error.to_string())
+        });
     ops::capture::set_sink(None);
-    run.map_err(|error| error.to_string())?;
+    run?;
     Ok(recorded.0)
 }
 
