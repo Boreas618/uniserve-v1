@@ -58,7 +58,15 @@ def rows_of(path):
     for line in pathlib.Path(path).read_text().split('\n'):
         if not line or line.startswith('#'):
             continue
-        operator, key = line.split('\t')
+        fields = line.split('\t')
+        if len(fields) != 2:
+            # A third field is the backend `tools/build_store.py` reads, which pins the package that
+            # builds a cell. This tool audits the declared dimensions, so it has nothing to say about
+            # a row whose backend is pinned - it says so rather than unpacking three values into two.
+            raise SystemExit(
+                f"{path}: a row is `op<TAB>key`; {len(fields)} field(s) in {line!r}"
+            )
+        operator, key = fields
         rows.append((operator, key))
     return rows
 
