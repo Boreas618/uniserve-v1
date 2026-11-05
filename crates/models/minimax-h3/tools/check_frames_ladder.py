@@ -8,8 +8,10 @@ silently narrows the default**. Both are one question:
 
     run with no `--frames`, run with the ladder the header states, compare the rows.
 
-The ladder is read from the generator's own header and never restated here: a tool carrying its
-own copy of `17n + 5` could agree with itself while disagreeing with the file.
+The ladder is computed from **the model's own frame rule**, read from `config/mod.rs` - `CLIP_FRAMES`,
+`CLIP_LATENTS` and `MAX_FRAMES` - and never typed here: a tool carrying its own copy of `17n + 5` could
+agree with itself while disagreeing with the file. If the generator's header states its ladder, that
+statement is checked too, and the two must agree.
 
     python crates/models/minimax-h3/tools/check_frames_ladder.py
     python crates/models/minimax-h3/tools/check_frames_ladder.py --self-test
@@ -27,8 +29,15 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 
-# The generator's header states the clip lengths it served: `clip lengths: [22, 39, ...]`.
+# The generator's header may state the clip lengths it served: `clip lengths: [22, 39, ...]`.
 LADDER = re.compile(r"clip lengths: \[(?P<list>[^\]]*)\]")
+
+# The model's frame rule lives in three constants. They are read, never restated: the rule is
+# `CLIP_FRAMES n + CLIP_LATENTS`, at least one clip, up to `MAX_FRAMES`.
+CONSTANTS = pathlib.Path("crates/models/minimax-h3/src/config/mod.rs")
+CONSTANT = re.compile(
+    r"pub const (?P<name>CLIP_FRAMES|CLIP_LATENTS|MAX_FRAMES): u32 = (?P<value>\d+);"
+)
 
 
 def generate(*arguments: str) -> tuple[str, list[str]]:
@@ -52,6 +61,31 @@ def generate(*arguments: str) -> tuple[str, list[str]]:
         "\n".join(line for line in lines if line.startswith("#")),
         [line for line in lines if "\t" in line],
     )
+
+
+def servable() -> list[int]:
+    """The clip lengths the model's own rule admits, read from its constants."""
+    values = {
+        found["name"]: int(found["value"])
+        for found in CONSTANT.finditer((ROOT / CONSTANTS).read_text())
+    }
+    missing = {"CLIP_FRAMES", "CLIP_LATENTS", "MAX_FRAMES"} - set(values)
+    if missing:
+        raise SystemExit(
+            f"{CONSTANTS} states no {', '.join(sorted(missing))}: the frame rule is read"
+            " from there rather than restated here, so a constant that is gone is refused"
+        )
+    # The rule refuses anything shorter than one clip: `num_frames < CLIP_FRAMES + CLIP_LATENTS`
+    # is the same comparison `packing::video_latent_frames` makes.
+    frames, step = (
+        values["CLIP_LATENTS"] + values["CLIP_FRAMES"],
+        values["CLIP_FRAMES"],
+    )
+    rungs = []
+    while frames <= values["MAX_FRAMES"]:
+        rungs.append(frames)
+        frames += step
+    return rungs
 
 
 def ladder(header: str) -> list[int]:
@@ -108,14 +142,22 @@ def main(argv: list[str] | None = None) -> int:
             "the generator produced no rows: an empty list is a build failure, not a"
             " ladder"
         )
-    clip_frames = ladder(header)
+    clip_frames = servable()
+    if LADDER.search(header) and ladder(header) != clip_frames:
+        raise SystemExit(
+            f"the header states the ladder {ladder(header)} and the model's rule gives"
+            f" {clip_frames}: a stated ladder that is not the rule is a second statement"
+            " of one truth"
+        )
     if not clip_frames:
         raise SystemExit(
             "the header states an empty ladder: a deployment that serves no clip length"
             " cannot answer an audio request, and that is a statement to make on purpose"
         )
 
-    stated_header, stated = generate("--frames", ",".join(map(str, clip_frames)))
+    stated_header, stated = generate(
+        "--frames", ",".join(map(str, clip_frames))
+    )
     if ladder(stated_header) != clip_frames:
         raise SystemExit(
             f"--frames {clip_frames} was asked for and the header states"
@@ -133,7 +175,13 @@ def self_test() -> int:
     assert report(base, {"a\t1", "b\t2", "c\t3"}) == 1
     stated = "# deployment: ... clip lengths: [22, 39, 56]."
     assert ladder(stated) == [22, 39, 56], ladder(stated)
-    print("ok   the ladder comparison, both drift directions, and the header's parse")
+    # The rule as the model states it: `17n + 5`, at least one clip, to `MAX_FRAMES`.
+    rungs = servable()
+    assert rungs[0] == 22 and rungs[1] == 39 and rungs[-1] <= 1024, rungs[:3]
+    assert all(rung % 17 == 5 for rung in rungs), rungs
+    print(
+        "ok   the ladder comparison, both drift directions, and the header's parse"
+    )
     return 0
 
 

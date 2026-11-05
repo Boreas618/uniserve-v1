@@ -111,6 +111,28 @@ def types_of(key):
 CANVAS_CLASS = ("frame_pad", "scaled_add")
 
 
+def clips(path):
+    """The clip lengths a walk states it ran at.
+
+    A width that is an exact multiple of the walk's clip length is derived from that length - the
+    audio decoder multiplies it by each stage's rate, the postprocessor's `scaled_add` covers a
+    whole frame - so the multiple is a fact about the derivation and not about the list. Printing
+    it stops such a width being read as a canvas's or a request's.
+    """
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            if "clip lengths:" in line:
+                inner = line.split("clip lengths:", 1)[1].split("]", 1)[0]
+                return [
+                    int(value)
+                    for value in inner.strip(" [").split(",")
+                    if value.strip()
+                ]
+    return []
+
+
 def statements(path):
     """What a file says about the raster it describes: `(rasters, text)`.
 
@@ -312,7 +334,16 @@ def by_shape(args):
             mark = (
                 f"  MISSING at every type, launched at {', '.join(launched_at)}"
             )
-        print(f"{mark}: {operator}\t{key}")
+        lengths = sorted({clip for path in where for clip in clips(path)})
+        multiples = [
+            f"{number} = clip {clip} x {number // clip}"
+            for field, number in extents_in(key)
+            if field in ("columns", "elements")
+            for clip in lengths
+            if number % clip == 0 and number != clip
+        ]
+        note = f"  [{'; '.join(multiples)}]" if multiples else ""
+        print(f"{mark}: {operator}\t{key}{note}")
         print(f"    launched at {', '.join(launched_at)} by {', '.join(where)}")
     if canvas:
         fixture_says = fixture_text or "nothing"
