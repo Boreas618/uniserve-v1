@@ -1589,38 +1589,34 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             }
             .to_string(),
         );
-        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window, and
-        // **no offsets** - `attend_dense(..., None, None, rows, ...)` attends one clip as one
-        // sequence, and the key names that form only by its `cu_seq_lens_false` suffix.
+        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window.
         //
-        // **A named gap, not a missing row: only the FP32 backend serves the offset-free form.**
-        // `dense_attention/fa4` is the F16/BF16 backend and its package states why it serves the packed
-        // form alone - FlashAttention-4's interface takes the sequence offsets, so a key without them
-        // is not a launch it can make. So an export that stores its VAE half has the decoder's
-        // attention unresolved until either this call passes one sequence's offsets (`[0, rows]`, the
-        // packed form every other consumer uses) or the FP32 backend's SGEMM program gains an F16
-        // form. Neither is this list's to choose; writing the row here would be a cell no program can
-        // run, which is the one thing this list does not do.
-        if vae == DType::F32 {
-            push(
-                "dense_attention",
-                ops::attention::DenseDescriptor {
-                    query: vae,
-                    key_value: vae,
-                    output: vae,
-                    head_dim: 64,
-                    q_heads: 32,
-                    kv_heads: 32,
-                    mask: ops::attention::Mask::Dense,
-                    windowed: false,
-                    // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
-                    // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
-                    max_kv_len: 2048,
-                    cu_seq_lens: false,
-                }
-                .to_string(),
-            );
-        }
+        // **The form follows the element type**, because the two programs serve different shapes and
+        // each key names its own. The FP32 program is a GEMM and a softmax over one sequence and
+        // reads no offsets, so its key carries `cu_seq_lens_false`; FlashAttention-4's kernel serves
+        // the packed form, takes the offsets table and refuses a null one, so its key carries no
+        // suffix at all. One sequence makes them arithmetically identical, and the layer states the
+        // same predicate (`video_vae.rs`'s `block_attention` and `packed`), so the element type alone
+        // decides - a clip decoded at the checkpoint's own FP16 must not ask the FP32 package for a
+        // row, nor the flash kernel for one at f32.
+        push(
+            "dense_attention",
+            ops::attention::DenseDescriptor {
+                query: vae,
+                key_value: vae,
+                output: vae,
+                head_dim: 64,
+                q_heads: 32,
+                kv_heads: 32,
+                mask: ops::attention::Mask::Dense,
+                windowed: false,
+                // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
+                // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
+                max_kv_len: 2048,
+                cu_seq_lens: vae != DType::F32,
+            }
+            .to_string(),
+        );
         // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
         // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
         for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
