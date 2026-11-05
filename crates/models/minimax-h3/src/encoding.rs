@@ -555,7 +555,11 @@ impl AudioStack {
 /// The latent frames a track of `samples` encodes to: `ceil(samples / hop)`.
 ///
 /// One statement of the rule, because two callers need it: the stack's geometry and the encoder's own
-/// output extent. The ceiling is the reference's (`encoding.py:244`), and it is a ceiling because its
+/// output extent. **This is the encode's direction:** a requested duration is covered, so the track is
+/// `+0..hop-1` samples longer than the request and never short. [`crate::packing::audio_latent_frames`]
+/// is the other direction - a request's video frame count to its latents, rounded to nearest - and the
+/// two are deliberately named alike and documented against each other, because a reader who takes one
+/// for the other gets a figure that looks right. The ceiling is the reference's (`encoding.py:244`), and it is a ceiling because its
 /// `unpack_samples` right-pads the track with zeros to [`padded_samples`] first, so every strided
 /// convolution divides exactly and the last latent frame reads those zeros.
 pub fn audio_latent_frames(samples: u64, hop: u64) -> Result<u64> {

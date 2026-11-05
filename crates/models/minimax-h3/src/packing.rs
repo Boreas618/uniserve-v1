@@ -173,6 +173,14 @@ pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
 ///
 /// At 24 fps and 40 Hz the exact value is never halfway between two steps, so the rounding
 /// direction is unambiguous; it is round-half-to-even because the reference uses Python's `round`.
+///
+/// **This is the request's direction, and it is not the encode's.** 24 and 40 reduce by 8, so 3 frames
+/// are exactly 5 latents: a whole latent count is always a multiple of 5, so a track is a whole number
+/// of 4000-sample steps while the video's duration is a multiple of `4000 / 3`, and the two differ by
+/// up to a third of a hop unless the frame count is a multiple of 3.
+/// [`crate::encoding::audio_latent_frames`] is the other direction - samples to latents, `ceil`, so an
+/// encoded track covers its request and is never short - and the two share a name on purpose no more:
+/// one answers "what does this request need", the other "what does this track encode to".
 pub fn audio_latent_frames(num_frames: u32) -> u32 {
     let exact =
         f64::from(num_frames) * f64::from(crate::config::AUDIO_LATENTS_PER_SECOND) / f64::from(FPS);
