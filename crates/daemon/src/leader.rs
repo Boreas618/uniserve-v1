@@ -131,8 +131,6 @@ pub enum Task {
     /// Chat completions (`/v1/chat/completions`): every model that renders
     /// a chat prompt.
     Generate,
-    /// Image generation (`/v1/images/generations`).
-    ImageGeneration,
     /// Video generation (`/v1/videos`, `/v1/capabilities`).
     VideoGeneration,
 }
@@ -1067,9 +1065,6 @@ impl Leader {
             tasks.push(Task::VideoGeneration);
         } else {
             tasks.push(Task::Generate);
-        }
-        if self.processor.supports_image_output() {
-            tasks.push(Task::ImageGeneration);
         }
         tasks
     }
