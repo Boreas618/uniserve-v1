@@ -481,11 +481,12 @@ fn stage_decode(args: &Args) -> Result<()> {
         u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
     // The loader also publishes what the export does not hold, and the pool charges a block for every
     // one of them: the input affine this stage folds on the host (`folded_input`, two tensors) and the
-    // five constants the decoder declares in `video_vae::constants` (the zero row and rows, the two
-    // index tables, the rotary frequencies and the voxel rows). A reservation built from the
-    // checkpoint's names alone is short by every one of these - the failure that made this stage stop
-    // on the 588th tensor - and the decoder's list is the one statement of them, checked at each
-    // publish.
+    // constants the decoder declares in `video_vae::constants` (the zero row and rows, the two index
+    // tables, the rotary frequencies, the voxel rows and the sequence offsets). A reservation built
+    // from the checkpoint's names alone is short by every one of these - the failure that made this
+    // stage stop on the 588th tensor - and the decoder's list is the one statement of them, checked at
+    // each publish. No count is written here: the list is iterated, so a constant added to it is
+    // covered without an edit to this comment or this sum.
     let affine = (width * latent_channels + width) * u64::from(dtype.bits()) / 8;
     let mut synthesized = affine.max(1).next_multiple_of(granularity);
     for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width, dtype)? {
