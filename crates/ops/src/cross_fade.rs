@@ -112,7 +112,26 @@ impl Op for CrossFade {
             ));
         }
         for (name, view) in [("previous", args.previous), ("current", args.current)] {
-            view.require_shape(Self::NAME, args.current.shape)?;
+            // Named here rather than left to `require_shape`, because the mistake this catches is
+            // specific and the generic refusal sends the reader to the wrong place: a caller that
+            // hands over two whole tiles differing by the grid's stride is told an overlap does not
+            // fit an axis, and goes looking at `extent`. What a cross-fade blends is the band each
+            // tile contributes to the seam — the last `extent` voxels of one and the first `extent`
+            // of the next — so both operands are the same shape by construction.
+            if view.shape != args.current.shape {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "a cross-fade blends two views of the SAME shape, and {name} is {:?} against \
+                         the current tile's {:?}: the operands are the seam band each tile \
+                         contributes along axis {} (the band is {extent} voxels wide), not the tiles \
+                         themselves",
+                        view.shape.dims(),
+                        args.current.shape.dims(),
+                        descriptor.axis
+                    ),
+                ));
+            }
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
