@@ -21,6 +21,17 @@
 //!   streams; a runner that issued its own cross-device copy would be ordering against a stream it
 //!   does not hold.
 //!
+//! # What is deliberately not a product here
+//!
+//! **The request's raw condition media.** `nn::capability::Conditioning::media` is a `MediaInput` per
+//! condition - the input's pixels, its audio and its anchoring draw, all device views the media
+//! reader produced - and a conditioner encodes them in its own forward. It is an **input** to the
+//! conditioning rather than a row of it, it is per condition rather than per request, and the
+//! scheduler already names each condition's product (`MediaFlowState::condition_media`, keyed by the
+//! condition's own name). A region named `(request, kind)` cannot carry a list, so putting it here
+//! would state a mechanism the other side cannot use. The kinds below are the ones a request has
+//! exactly one of, which is what makes one name per kind enough.
+//!
 //! # What a runner may assume
 //!
 //! A region is written once per producing call and read by many later calls; a reader never writes.
@@ -51,8 +62,6 @@ pub enum Product {
     Images,
     /// `[rows, …]` encoded reference audio.
     Audio,
-    /// The raw media a conditioner builds its condition rows from.
-    Media,
     /// The request's latent trajectory: a denoise advances it step by step and a decode reads it.
     Latents,
 }
@@ -65,7 +74,6 @@ impl Product {
             Self::Source => "source",
             Self::Images => "images",
             Self::Audio => "audio",
-            Self::Media => "media",
             Self::Latents => "latents",
         }
     }
