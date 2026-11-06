@@ -83,7 +83,7 @@ def reference(scores, values, sizes, dtype):
 def launch(kernel, sizes, dtype=torch.float32):
     """Launch one compression and answer what it wrote beside the operands."""
     scores, values, sizes_tensor, out = tensors(sizes, dtype)
-    kernel[(QUERY_TILES, HEADS, 1)](
+    kernel[(1, HEADS, 1)](
         scores,
         values,
         sizes_tensor,
@@ -95,7 +95,8 @@ def launch(kernel, sizes, dtype=torch.float32):
         0,
         HEADS=HEADS,
         WIDTH=WIDTH,
-        MAX_TILES=MAX_TILES,
+        QUERIES=16,
+        KEYS=4,
         BLOCK=BLOCK,
     )
     return scores, values, sizes_tensor, out

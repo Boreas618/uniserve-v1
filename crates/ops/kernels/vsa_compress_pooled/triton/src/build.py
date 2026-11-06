@@ -22,15 +22,15 @@ POOLED = "*fp32"
 DTYPES = {"bf16": "*bf16", "f16": "*fp16", "f32": "*fp32"}
 
 
-def warps_of(block, tiles):
-    """The warp count a `[tiles, block]` step needs."""
-    return 8 if block * min(tiles, 64) >= 16384 else 4
+#: The query tiles a program holds and the key tiles one step reads. The first is the launch's grid
+#: divisor as well, which `crates/ops/src/segments.rs` states as `POOLED_QUERIES`.
+QUERIES = 16
+KEYS = 64
 
 
 def spec(fields, parameters, target):
     """The compilation of one vsa_compress_pooled descriptor."""
     block = int(fields["block"])
-    max_tiles = int(fields["max_tiles"])
     return {
         "kernel": kernels._vsa_compress_pooled_kernel,
         "signature": {
@@ -43,17 +43,19 @@ def spec(fields, parameters, target):
             "pdl": "i32",
             "HEADS": "constexpr",
             "WIDTH": "constexpr",
-            "MAX_TILES": "constexpr",
             "BLOCK": "constexpr",
+            "QUERIES": "constexpr",
+            "KEYS": "constexpr",
         },
         "constexprs": {
             "HEADS": int(fields["heads"]),
             "WIDTH": int(fields["width"]),
-            "MAX_TILES": max(2, 1 << (max_tiles - 1).bit_length()),
             "BLOCK": block,
+            "QUERIES": QUERIES,
+            "KEYS": KEYS,
         },
         "options": {
-            "num_warps": warps_of(block, max_tiles),
+            "num_warps": 4,
             "launch_pdl": fields["pdl"] == "true",
         },
     }
