@@ -1231,6 +1231,16 @@ impl Pace {
     pub fn step(&self) {
         let _ = self.0.send(());
     }
+
+    /// Lets the simulator execute one more batch unless it has not taken the
+    /// last permit yet. A simulator with nothing to execute leaves its permits
+    /// queued, and each queued permit later runs a batch no step of the test
+    /// asked for.
+    pub fn offer(&self) {
+        if self.0.is_empty() {
+            self.step();
+        }
+    }
 }
 
 /// One write a simulated request's call made to its context: the KV cache a
@@ -1583,6 +1593,34 @@ impl SimEngine {
                 let visual_state =
                     !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
+                // A call that extends the prompt scores its tokens when the
+                // request asks, as a rank does: every token but the prompt's
+                // first, which no position predicts.
+                let extends_prompt = work == CallKind::Forward(ForwardMode::Prefill)
+                    && call.latent_feature_input.is_none()
+                    && call.completion_output.is_none();
+                if extends_prompt
+                    && request
+                        .sampling()
+                        .is_some_and(SamplingParams::prompt_logprobs_requested)
+                {
+                    let scored = usize::from(call.coordinates.logical_position == 0);
+                    record.prompt_logprobs = call
+                        .input_token_ids
+                        .iter()
+                        .skip(scored)
+                        .map(|&token_id| {
+                            vec![TokenLogprob {
+                                token_id,
+                                logprob: sim_candidate_logprob(
+                                    call.request_key.request_id,
+                                    token_id,
+                                ),
+                                rank: 1,
+                            }]
+                        })
+                        .collect();
+                }
                 if visual_state {
                     request.positions_from_model = true;
                     request.cache_visible_len = request
@@ -1908,12 +1946,10 @@ impl SimEngine {
                     // A decoding that writes the request's feedback image
                     // product publishes its values after the PNG, as a
                     // executor does.
-                    let mut media = synthetic_png_b64(width, height)?.into_bytes();
+                    let seed = image.seed.unwrap_or(call.request_key.request_id.0);
+                    let mut media =
+                        synthetic_png_b64(width, height, seed, request.image_index)?.into_bytes();
                     if call.image_output.is_some() {
-                        let seed = request
-                            .image()
-                            .and_then(|image| image.seed)
-                            .unwrap_or(call.request_key.request_id.0);
                         let values =
                             synthetic_feedback_values(seed, request.image_index, height, width);
                         ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
@@ -2446,7 +2482,17 @@ fn publish_media(
 }
 
 /// Encodes a deterministic RGB gradient as a base64 PNG artifact.
-fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
+fn synthetic_png_b64(
+    width: u32,
+    height: u32,
+    seed: u64,
+    image_index: u32,
+) -> anyhow::Result<String> {
+    // The simulated denoiser predicts zero velocity, so an image is its initial
+    // latent decoded: the seed and the image's index decide its pixels, as they
+    // decide its feedback values.
+    let latent =
+        digest(&[seed.to_le_bytes(), u64::from(image_index).to_le_bytes()].concat()).to_le_bytes();
     let mut bytes = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut bytes, width, height);
@@ -2460,7 +2506,7 @@ fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
                 let index = y * row_bytes + x * 3;
                 image[index] = ((x * 255) / width.max(1) as usize) as u8;
                 image[index + 1] = ((y * 255) / height.max(1) as usize) as u8;
-                image[index + 2] = 128;
+                image[index + 2] = latent[x % latent.len()];
             }
         }
         writer.write_image_data(&image)?;
@@ -2488,7 +2534,8 @@ impl SimEngine {
     /// last, so calls in the same batch still execute against a finishing
     /// request.
     ///
-    /// Errors on a readmission with a different descriptor, a call for a request that is not admitted or
+    /// Errors on a readmission with a different descriptor other than a hand-off's, a call for a
+    /// request that is not admitted or
     /// whose key differs from the admission, a predicate naming an unresolved
     /// product, or any `execute_call` error. An error abandons the rest of
     /// the batch and its `Finish` commands; admissions, `Free` commands,
@@ -2526,7 +2573,19 @@ impl SimEngine {
 
         let admissions = batch.admissions().cloned().collect::<Vec<_>>();
         for admission in admissions {
-            match self.requests.get(&admission.request_key.request_id) {
+            // A hand-off's install admits the request on its decode group, which
+            // starts from the install's descriptor. The prefill group serves it
+            // no more, so one state stands for the request on either.
+            let handed_off = batch.requests.iter().any(|(call, _)| {
+                call.request_key == admission.request_key
+                    && call.kind == CallKind::Transfer(TransferMode::CacheInstall)
+            });
+            match self.requests.get_mut(&admission.request_key.request_id) {
+                Some(request) if handed_off => {
+                    let last_token = request.last_token;
+                    *request = SimRequestState::new(admission);
+                    request.last_token = last_token;
+                }
                 Some(request) => anyhow::ensure!(
                     request.admission == admission,
                     "request {} was readmitted with a different descriptor",

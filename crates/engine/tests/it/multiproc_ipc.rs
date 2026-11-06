@@ -9,8 +9,9 @@
 //! Info, admission, retirement, close and signals; token batches run the
 //! stub's text runtime (prefill, decode, verification, sampling, logprobs and
 //! device token relays). The executable comes from
-//! `UNISERVE_WORKER_EXECUTABLE` or the repository environment's
-//! `.venv/bin/uniserve`. Several tests replace that executable with a
+//! `UNISERVE_WORKER_EXECUTABLE`, the repository environment's
+//! `.venv/bin/uniserve` or the target directory's own build of it. Several
+//! tests replace that executable with a
 //! small wrapper script that records an executor's process id, exits a chosen rank, starts a relaunched rank as a
 //! stand-in that reports changed executor info, registers under another build
 //! or for an earlier launch, or holds a rank's exit until its peers have
@@ -234,17 +235,19 @@ fn a_launch_names_the_host_whose_daemon_is_absent() {
     );
 }
 
-/// Spawns the default two-rank stub group from `worker_group_args`.
-fn spawn_worker_group() -> anyhow::Result<ExecutorGroup> {
-    ExecutorGroup::spawn(worker_group_args())
-}
-
 /// Launch arguments for a two-rank stub group on the local host's CPU.
 ///
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
 /// in flight. Tests adjust the returned value (for example components, executable or transfer edges)
 /// before spawning.
+///
+/// Each group has a name of its own. The tests share one daemon, which files
+/// a process by its group, rank and launch: two groups of one name would be
+/// one group to it, where a launch replaces the other's ranks and a stop ends
+/// them.
 fn worker_group_args() -> ExecutorProcessArgs {
+    static GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let group = GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let executable = worker_executable();
     let config = ExecutorProcessArgs {
         stub: true,
@@ -255,6 +258,7 @@ fn worker_group_args() -> ExecutorProcessArgs {
     };
     ExecutorProcessArgs {
         executable,
+        worker_id: format!("group-{group}"),
         daemon: crate::support::daemon(),
         model: String::new(),
         ranks: ExecutorGroupConfig::placed(
@@ -278,13 +282,7 @@ fn worker_group_args() -> ExecutorProcessArgs {
 }
 
 fn worker_executable() -> PathBuf {
-    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(".venv/bin/uniserve")
-        })
+    crate::support::uniserve_executable()
 }
 
 /// Places a batch's buffer spans at the same offsets on every rank of the
@@ -940,7 +938,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
     use std::os::unix::fs::PermissionsExt as _;
 
     // The ranks are `media_worker` processes speaking the rank protocol. Each
-    // answers Info with a real stub group's executor info, completes every
+    // answers Info with the simulated rank's executor info, completes every
     // call it receives and attaches a shared-memory media payload to a
     // completion, selected by case: a valid payload from rank 0
     // ("retained"), a payload on a call identity the batch never carried
@@ -948,11 +946,10 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
     // declaring one byte more than it stores ("short-storage").
     let template = tempfile::tempdir()?;
     let info_path = template.path().join("info.json");
-    {
-        let mut worker = spawn_worker_group()?;
-        std::fs::write(&info_path, serde_json::to_vec(worker.info())?)?;
-        worker.close()?;
-    }
+    std::fs::write(
+        &info_path,
+        serde_json::to_vec(engine::SimEngine::new().mut_info_for_test())?,
+    )?;
     let executable = serde_json::to_string(&std::env::current_exe()?)?;
     for case in ["retained", "unknown-call", "rank-output", "short-storage"] {
         let directory = tempfile::tempdir()?;
@@ -1088,7 +1085,7 @@ fn media_worker() -> anyhow::Result<()> {
     // take the launch descriptor it answers with.
     let mut server = Channel::connect(argument("--engine")?)?;
     server.send(&Registration::Worker {
-        worker_id: argument("--worker-id")?.clone(),
+        worker_id: argument("--executor-id")?.clone(),
         rank: argument("--rank")?.parse()?,
         generation: argument("--generation")?.parse()?,
         version: ipc::VERSION.into(),
