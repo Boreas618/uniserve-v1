@@ -431,9 +431,9 @@ fn main() {
         for deployment in DEPLOYMENTS {
             rows.extend(
                 minimax_h3::conditioning::TokenRefiner::programs(&base.transformer, deployment)
-                .unwrap_or_else(|error| {
-                    panic!("the token refiner states no rows at {deployment:?}: {error}")
-                }),
+                    .unwrap_or_else(|error| {
+                        panic!("the token refiner states no rows at {deployment:?}: {error}")
+                    }),
             );
         }
         for vae in VAES {

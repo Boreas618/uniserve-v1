@@ -216,8 +216,8 @@ impl Splice {
 /// clip as state, and writes the kept frames as `[frames, rows, columns, 3]` bytes.
 ///
 /// The blend is two `scaled_add` launches per overlap frame, with the frame's two weights as host
-/// scalars: the two sources a frame reads are each one contiguous block (a `[3, 25, H, W]` clip and a
-/// `[3, 5, H, W]` tail), which is the operands `scaled_add` takes. It is **not** `CrossFade` with the
+/// scalars: the two sources a frame reads are each one contiguous run (one frame of a clip and one
+/// frame of a `[3, 5, H, W]` tail), which is the operands `scaled_add` takes. It is **not** `CrossFade` with the
 /// frames axis: that operator is the row-and-column seam blend and refuses frames, so a frame-axis
 /// blend has no `CrossFade` row and this component states none.
 ///
@@ -275,11 +275,13 @@ impl VideoPostprocessor {
     /// `clip` is the clip's decoded raster `[3, frames, rows, columns]` in [`Self::dtype`]; `previous`
     /// is the predecessor's tail `[3, overlap, rows, columns]` and is `None` for the timeline's first
     /// clip, which has nothing to fade against; `out` is `[splice.frames(), rows, columns, 3]` bytes.
-    /// The blend's scratch is reserved here, in the arena the executor sized from the plan: the model is
+    /// The fade's scratch is reserved here, in the arena the executor sized from the plan: the model is
     /// the one reserver, and a buffer the runner placed would be a second mechanism.
     ///
-    /// The clip's tail is not written here unless `splice.last`: it is the state the caller hands the
-    /// next clip, and passing it on is the runner's.
+    /// The fade replaces the body's **first** frames, which are the ones the predecessor's tail shares
+    /// with this clip; the rest of the body and the last clip's tail are the clip's own and are read
+    /// where the decoder wrote them. The clip's tail is not written here unless `splice.last`: it is
+    /// the state the caller hands the next clip, and passing it on is the runner's.
     pub fn forward(
         &self,
         f: &Forward,
@@ -290,57 +292,68 @@ impl VideoPostprocessor {
     ) -> Result<()> {
         let raster = Raster::of(clip)?;
         raster.check_out(out, splice)?;
-        let source = match previous {
-            Some(previous) => {
-                raster.check_previous(previous, self.dtype)?;
-                let blended = f.arena().tensor(clip.dtype, clip.shape)?;
-                self.blend(f, &raster, previous, clip, splice.overlap, blended)?;
-                blended
-            }
-            None => clip,
-        };
         // The byte step writes as many frames as it reads, so each range goes to its own slice of `out`:
         // the body to the clip's kept frames, and the last clip's tail after them. Handing `out` whole to
         // either write would be refused by the layer's own shape check, and the tail written at the front
         // of a wider output would overwrite the body's first frames.
         let (body_out, tail_out) = raster.destinations(out, splice)?;
-        self.bytes
-            .forward(f, raster.body(source, splice)?, body_out)?;
+        match previous {
+            Some(previous) => {
+                raster.check_previous(previous, self.dtype)?;
+                let fade = Rgb::OVERLAP_FRAMES;
+                let kept = splice.body.1 - splice.body.0;
+                let faded = f.arena().tensor(clip.dtype, previous.shape)?;
+                self.blend(f, &raster, previous, clip, splice.body.0, faded)?;
+                self.bytes
+                    .forward(f, faded, frames_of(body_out, 0, fade)?)?;
+                self.bytes.forward(
+                    f,
+                    raster.written(clip, (splice.body.0 + fade, splice.body.1))?,
+                    frames_of(body_out, fade, kept)?,
+                )?;
+            }
+            None => self
+                .bytes
+                .forward(f, raster.body(clip, splice)?, body_out)?,
+        }
         if let Some(tail_out) = tail_out {
             self.bytes
-                .forward(f, raster.written(source, splice.overlap)?, tail_out)?;
+                .forward(f, raster.written(clip, splice.overlap)?, tail_out)?;
         }
         Ok(())
     }
 }
 
 impl VideoPostprocessor {
-    /// Fade the clip in against its predecessor, five frames at a time.
+    /// Fade the clip in against its predecessor, one overlap frame at a time.
     ///
     /// The reference's weights are `i/5` for frame `i` of the overlap, `0` to `0.8`: the blend is
-    /// `previous · (1 − w) + clip · w`. The two scalars the sum takes are host values, so each frame is two
-    /// launches of the operator every other sum in the model uses. The reference builds its ramp in the
-    /// raster's type and this one in FP32; the products and the sum are FP32 either way and round to the
-    /// raster once, so the difference is at most the ramp's own last bit. `CrossFade` is the row-and-column seam blend and refuses the frames axis; a
-    /// blend along frames is not that operator with another argument, and this is the arithmetic with the
-    /// operands a raster has - one contiguity per channel per frame, which is what `scaled_add` reads.
+    /// `previous · (1 − w) + clip · w`, and `clip` is frame `first + i`, the head of the clip's body
+    /// (`models/decoder.py`: `overlap * (1 - weights) + body[:, :, :extent] * weights`). `faded` is
+    /// `[channels, overlap, rows, columns]`, the shape of `previous`. The two scalars the sum takes are
+    /// host values, so each frame is two launches of the operator every other sum in the model uses.
+    /// The reference builds its ramp in the raster's type and this one in FP32; the products and the
+    /// sum are FP32 and round to the raster once. `CrossFade` is the row-and-column seam blend and
+    /// refuses the frames axis; a blend along frames is not that operator with another argument, and
+    /// this is the arithmetic with the operands a raster has - one contiguity per channel per frame,
+    /// which is what `scaled_add` reads.
     fn blend(
         &self,
         f: &Forward,
         raster: &Raster,
         previous: TensorView,
         clip: TensorView,
-        overlap: (u32, u32),
-        blended: TensorView,
+        first: u32,
+        faded: TensorView,
     ) -> Result<()> {
-        let count = overlap.1 - overlap.0;
+        let count = Rgb::OVERLAP_FRAMES;
         let pixels = u64::from(raster.height) * u64::from(raster.width);
         for channel in 0..u64::from(Rgb::CHANNELS) {
             for frame in 0..count {
                 let weight = fade_weight(frame, count);
                 let target = TensorView::new(
-                    blended.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
-                    blended.dtype,
+                    faded.element(&[channel, u64::from(frame), 0, 0]),
+                    faded.dtype,
                     Shape::new(&[1, pixels]),
                 );
                 let source = TensorView::new(
@@ -348,11 +361,11 @@ impl VideoPostprocessor {
                     previous.dtype,
                     Shape::new(&[1, pixels]),
                 );
-                // `target ← (1 − w) · previous + w · clip`, in two steps because the operator scales its own
-                // target: the adjacent frame of the clip is only read.
+                // `target ← (1 − w) · previous + w · clip`, in two steps because the operator scales its
+                // own target. A zero `beta` does not read the target, so the scratch needs no clearing.
                 ScaledAdd.forward(f, target, source, 1.0, 0.0)?;
                 let current = TensorView::new(
-                    clip.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
+                    clip.element(&[channel, u64::from(first + frame), 0, 0]),
                     clip.dtype,
                     Shape::new(&[1, pixels]),
                 );
@@ -467,11 +480,13 @@ impl nn::capability::Decoder for VideoPostprocessor {
         let raster = Raster::of(clip).map_err(|error| refuse(format!("{error}")))?;
         // The checkpoint's clip is 25 decoded frames: 17 the timeline keeps and, after three padding
         // frames, a five-frame tail. A clip a successor follows hands that tail on; the clip that ends the
-        // timeline keeps it, which the runner states by keeping frames beyond the body.
-        let internal = Splice {
-            body: (0, CLIP_FRAMES),
-            overlap: (CLIP_OUTPUT_FRAMES - splice.overlap, CLIP_OUTPUT_FRAMES),
-            last: splice.keep > CLIP_FRAMES,
+        // timeline keeps it, which the runner states by keeping frames beyond the body. The tail is the
+        // clip's own whatever `splice.overlap` says: that field counts the frames it fades against its
+        // **predecessor**, and the timeline's only clip has none and still keeps its tail.
+        let internal = if splice.keep > CLIP_FRAMES {
+            Splice::LAST
+        } else {
+            Splice::CLIP
         };
         // The clip's frames go where the runner says they do, so the view handed to the write starts at
         // `first`: the raster is `[frames, rows, columns, channels]` and a frame is one contiguous block.
@@ -699,12 +714,13 @@ impl Raster {
     }
 }
 
-/// The blend's scratch for one clip: a clip raster in the decoded element type.
+/// The fade's scratch for one clip: the overlap frames of a raster in the decoded element type.
 ///
-/// [`VideoPostprocessor::forward`] fades a clip against its predecessor's tail into a buffer of the
-/// clip's own shape, because the fade's destination cannot be the source it reads; that buffer is the
-/// only thing the splice reserves, and it is named here so the executor sizes the arena from
-/// arithmetic rather than from the module's own guess. A clip with no predecessor reserves nothing.
+/// [`VideoPostprocessor::forward`] fades the head of a clip's body against its predecessor's tail into a
+/// buffer of the tail's shape, because the clip's own raster stays the runner's to keep the tail from;
+/// that buffer is the only thing the splice reserves, and it is named here so the executor sizes the
+/// arena from arithmetic rather than from the module's own guess. A clip with no predecessor reserves
+/// nothing.
 pub fn splice_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
@@ -721,12 +737,9 @@ pub fn splice_arena(
     };
     let (height, width) = canvas.pixels(config);
     Ok(vec![Buffer {
-        name: "blended".to_owned(),
+        name: "faded".to_owned(),
         element,
-        elements: u64::from(Rgb::CHANNELS)
-            * u64::from(crate::decoding::CLIP_OUTPUT_FRAMES)
-            * u64::from(height)
-            * u64::from(width),
+        elements: Rgb::of(0, height, width).overlap_elements(),
     }])
 }
 
@@ -893,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn the_splices_scratch_is_one_clip_raster() {
+    fn the_splices_scratch_is_the_overlap_frames_of_one_raster() {
         let config = crate::video_vae::tests::video_config();
         let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
         let (height, width) = canvas.pixels(&config);
@@ -903,12 +916,12 @@ mod tests {
             1,
             "the fade's destination is the only reservation"
         );
-        // The blend writes one clip, so the scratch is the clip's raster: channels, the decoder's
-        // frames, and the canvas's pixels - the same extent `forward` reserves.
+        // The fade writes the overlap frames and nothing else, so the scratch is those frames of the
+        // canvas's pixels - the same extent `forward` reserves.
         assert_eq!(
             buffers[0].elements,
             u64::from(Rgb::CHANNELS)
-                * u64::from(CLIP_OUTPUT_FRAMES)
+                * u64::from(OVERLAP_FRAMES)
                 * u64::from(height)
                 * u64::from(width)
         );
@@ -960,6 +973,100 @@ mod tests {
         assert_eq!(pcm.quantize(1.5 / PCM_MAX), 2);
         assert_eq!(pcm.elements(), 1600);
         assert_eq!(pcm.bytes(), 3200);
+    }
+
+    /// The operators a splice launches, in order.
+    struct Launches(Vec<&'static str>);
+
+    impl ops::capture::Sink for Launches {
+        fn launched(&mut self, operator: &'static str, _key: &str) {
+            self.0.push(operator);
+        }
+    }
+
+    /// One recorded splice of a decoder's 28-frame raster: the launches and the arena it used.
+    fn recorded_splice(
+        previous: bool,
+        splice: nn::capability::Splice,
+    ) -> (nn::Result<()>, Vec<&'static str>, u64) {
+        use nn::capability::{DecodedMedia, Decoder};
+        let (height, width) = (16_u64, 16_u64);
+        let block =
+            VideoPostprocessor::new(DType::F32, constants(PIXEL_MEAN), constants(PIXEL_STD))
+                .expect("a postprocessor");
+        let arena = nn::Arena::new(nn::DevicePtr::new(0), 1 << 30);
+        let held = nn::Arena::new(nn::DevicePtr::new(1 << 40), 1 << 30);
+        let raster = held
+            .tensor(DType::F32, Shape::new(&[3, 28, height, width]))
+            .expect("the decoded raster");
+        let tail = held
+            .tensor(DType::F32, Shape::new(&[3, 5, height, width]))
+            .expect("the predecessor's tail");
+        let video = held
+            .tensor(
+                DType::U8,
+                Shape::new(&[u64::from(splice.keep), height, width, 3]),
+            )
+            .expect("the timeline's frames");
+        let forward = nn::Forward::recording(&arena);
+        let mut launches = Launches(Vec::new());
+        ops::capture::set_sink(Some(&mut launches));
+        let spliced = block.splice(
+            &forward,
+            previous.then_some(tail),
+            raster,
+            splice,
+            DecodedMedia {
+                video: Some(video),
+                audio: None,
+            },
+        );
+        ops::capture::set_sink(None);
+        (spliced, launches.0, arena.used())
+    }
+
+    /// A clip after the first fades the head of its body and reads the rest where the decoder wrote
+    /// it: the fade's scratch holds the overlap frames and nothing else, so no frame of the body is read
+    /// from a buffer the fade never wrote. A scratch of the clip's own shape read 12 unwritten frames
+    /// per clip, which is what the arena's size pins here.
+    #[test]
+    fn a_fade_writes_the_overlap_frames_and_the_body_is_read_from_the_clip() {
+        let (spliced, launches, used) = recorded_splice(
+            true,
+            nn::capability::Splice {
+                first: 0,
+                keep: CLIP_FRAMES,
+                overlap: OVERLAP_FRAMES,
+            },
+        );
+        spliced.expect("an interior clip");
+        let faded = u64::from(Rgb::CHANNELS) * u64::from(OVERLAP_FRAMES) * 16 * 16 * 4;
+        assert_eq!(used, faded.next_multiple_of(nn::forward::ALIGNMENT));
+        let count = |operator| launches.iter().filter(|name| **name == operator).count();
+        assert_eq!(
+            count("scaled_add") as u32,
+            2 * Rgb::CHANNELS * OVERLAP_FRAMES,
+            "two sums per frame of every channel: {launches:?}"
+        );
+        assert_eq!(count("rgb_bytes"), 2, "the faded head and the body's rest");
+    }
+
+    /// The timeline's first clip fades nothing, and the only clip of a one-clip timeline still keeps
+    /// its own tail: `overlap` counts the frames a clip fades against its **predecessor**, which says
+    /// nothing about the tail it owns. Read as the tail's length it made a one-clip timeline a body
+    /// with an empty tail, short of the 22 frames the schedule states.
+    #[test]
+    fn the_only_clip_of_a_timeline_keeps_its_own_tail() {
+        let schedule = VideoPostprocessor::splices_of(CLIP_FRAMES + OVERLAP_FRAMES)
+            .expect("a one-clip timeline");
+        let (spliced, launches, used) = recorded_splice(false, schedule[0]);
+        spliced.expect("the only clip");
+        assert_eq!(used, 0, "a clip with no predecessor reserves nothing");
+        assert_eq!(
+            launches,
+            ["rgb_bytes", "rgb_bytes"],
+            "its body and its tail"
+        );
     }
 
     /// The clip raster test views are built on: one contiguous `[3, 25, rows, columns]` F16 block, so
