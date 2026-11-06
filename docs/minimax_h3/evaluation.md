@@ -147,11 +147,11 @@ different things.
 
 `check-h3` is the order today's implementation is measured in: `check-base-ref2va` first, because that
 implementation shares one Storage Server key between the two base servers on one checkpoint and a weight
-its loader computes has no file, so whichever of them runs second inherits the first's pages. Measured:
-five cells pass under `--reuse-deployment`, the reference cell fails its warmup with
-`invalid_video_output: nonzero_video_variance` after them, passes alone on a fresh host, and fails again
-with the earlier servers' Storage Server alive and 61 GiB per GPU held. The ordering is how the baseline
-is measured; it is not a property the delivered service may need.
+its loader computes has no file, so whichever of them runs second inherits the first's pages. Measured
+both ways: with the reference cell first, all six pass under `--reuse-deployment`; with it last, after the
+other five, its warmup fails with `invalid_video_output: nonzero_video_variance`, it passes alone on a
+fresh host, and it fails again once the earlier servers' Storage Server is alive and holds 61 GiB per GPU.
+The ordering is how the baseline is measured; it is not a property the delivered service may need.
 
 `check-h3-reversed` is the same six points with the reference cell last, each writing its MP4 under
 `artifacts/minimax_h3/check-reversed/`: the evaluator never replaces a different MP4 at an existing
@@ -172,3 +172,13 @@ The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` f
 ```
 
 A run on a changed service moves `artifacts/minimax_h3/check/` and `artifacts/minimax_h3/check/results/` aside first: the evaluator refuses a non-empty result directory and never replaces a different MP4 at an existing fixed path.
+
+A plan asks the Rust rules through the `uniserve rules` subcommand, so the binary the commands run must be the one built from this tree: install it (`.venv/bin/uniserve`) or name it twice (`UNISERVE_EXECUTABLE` for the rules and `--executable` for the servers). A binary that predates the subcommand answers an unknown command and no JSON, and the failure reads as a missing command rather than a stale binary.
+
+The page a person reviews is written by `uniserve_eval/h3_review_manifest.py`: per cell, the task, the checkpoint the cell confirms, the prompt, the seed, the input files the request conditions on, and the MP4. Given `--results` and `--candidate-results` it puts the candidate's MP4 on the same line as the baseline's, which is what makes the six videos reviewable side by side.
+
+```bash
+.venv/bin/python -m uniserve_eval.h3_review_manifest \
+  --config uniserve_eval/check_h3.toml \
+  --results <baseline results root> --candidate-results <candidate results root>
+```

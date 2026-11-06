@@ -33,9 +33,9 @@ A world change of the denoiser's parallel configuration, from Ulysses 2 on
 both GPUs to the whole denoiser on the first, computes the same: the
 successor's one denoising rank lays the pages both serving ranks stored
 out in its own pages and continues from the stored step. The re-layout
-moves values without computing any (its exactness, bit for bit, is the
-contract ``tests/python/integration/executor/test_video_latent_relayout.py``
-checks), but the steps after it run with another division of the rows and
+moves values without computing any (the in-process test that checked its
+exactness retired with the planner it used, ``latent_restore_copies``), but
+the steps after it run with another division of the rows and
 so another order of reductions, which a parallel configuration may change
 without changing what the denoiser computes: the video is not expected to
 equal either configuration's uninterrupted video bit for bit. The test
