@@ -240,7 +240,14 @@ fn a_launch_names_the_host_whose_daemon_is_absent() {
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
 /// in flight. Tests adjust the returned value (for example components, executable or transfer edges)
 /// before spawning.
+///
+/// Each group has a name of its own. The tests share one daemon, which files
+/// a process by its group, rank and launch: two groups of one name would be
+/// one group to it, where a launch replaces the other's ranks and a stop ends
+/// them.
 fn worker_group_args() -> ExecutorProcessArgs {
+    static GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let group = GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let executable = worker_executable();
     let config = ExecutorProcessArgs {
         stub: true,
@@ -251,6 +258,7 @@ fn worker_group_args() -> ExecutorProcessArgs {
     };
     ExecutorProcessArgs {
         executable,
+        worker_id: format!("group-{group}"),
         daemon: crate::support::daemon(),
         model: String::new(),
         ranks: ExecutorGroupConfig::placed(
