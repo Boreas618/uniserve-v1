@@ -2639,7 +2639,13 @@ impl Denoiser {
             cu_seq_lens_k: tables.get("refiner_cu_seq_lens_k")?,
             key_rows: self.refiner.rows(),
         };
-        let total = u32::try_from(text.shape.dim(0))
+        // The conditioning column holds the layout's condition rows below the prompt's, and they are
+        // the encoders' to write: the refiner's bound is the text capacity, and it reads and writes
+        // that many rows.
+        let rows = text.shape.dim(0).min(u64::from(self.refiner.rows()));
+        let source = row_range(source, 0, rows)?;
+        let text = row_range(text, 0, rows)?;
+        let total = u32::try_from(rows)
             .map_err(|_| Error::checkpoint("a conditioning row count above u32::MAX".to_owned()))?;
         self.refiner.forward(f, source, &documents, total, text)?;
         if let Some(trace) = trace {
