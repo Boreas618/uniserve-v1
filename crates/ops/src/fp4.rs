@@ -135,13 +135,13 @@ pub struct QuantizeArgs {
     /// `[rows]` FP32: the row's **dequantization factor**, the number the product multiplies a
     /// block's E4M3 scale by.
     ///
-    /// Encoding is two-level micro-scaling, not one: a row is first brought into the range of the
-    /// block format by a factor the row itself determines, and each sixteen-element block then
-    /// carries its own E4M3 scale relative to that factor. A product reads both, so the factor is
+    /// Encoding is two-level micro-scaling, not one: a row is brought into the range of the block
+    /// format by `global_scale`, the calibrated factor a module states once, and each sixteen-element
+    /// block then carries its own E4M3 scale relative to it. A product reads both, so the factor is
     /// an output of the encode beside `values` and `scales`.
     ///
-    /// The value is the reference encoder's: `token_scale[r] = amax(row r) * global_scale`, and
-    /// the block's scale is `block_amax / (6 * amax(row r))`, so a dequantized element is
+    /// The value is the reciprocal of `global_scale`, in every row, and a block's scale is
+    /// `block_amax * global_scale / 6`, so a dequantized element is
     /// `code * block_scale * token_scale`. This is a *data* output and not a descriptor field: the
     /// same module serves every row count, and no compilation depends on how many rows there are.
     pub token_scale: TensorView,
