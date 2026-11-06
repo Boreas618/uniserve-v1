@@ -114,9 +114,12 @@ pub struct Candidates {
     pub ids: TensorView,
     /// `[rows, width]` f32 the candidates' probabilities, in the reference's token order.
     pub probabilities: TensorView,
-    /// `[rows, width]` f32 the filtered candidates in ascending token id order.
+    /// `[rows, width]` f32 the filtered candidates in ascending token id order, whole to the width:
+    /// the slots no candidate took hold `-inf`, which carries no mass.
     pub ordered_values: TensorView,
-    /// `[rows, width]` i32 the ids of `ordered_values`, in the same order.
+    /// `[rows, width]` i32 the ids of `ordered_values`, in the same order, whole to the width: the
+    /// slots no candidate took hold `-1`, which is outside every vocabulary. A slot is therefore
+    /// never memory nothing wrote, and it cannot read as the legitimate token `0`.
     pub ordered_ids: TensorView,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
     pub valid: TensorView,

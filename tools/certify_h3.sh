@@ -30,7 +30,6 @@ out=${3:-$here/artifacts/h3-certification/$tip}
 mkdir -p "$out"
 
 dense=$here/notes/programs/minimax-h3-keys.txt
-sparse=$here/notes/programs/minimax-h3-sparse-keys.txt
 
 # A count is of the copy it read: two checkouts of one path hold two files, and the
 # fixture's own `# commit:` line states the tree its rows describe, which is not
@@ -85,11 +84,10 @@ ended=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     echo "element types: $types"
     echo "element-types bytes: $(wc -c <"$types" | tr -d ' ') sha256: $(digest "$types")"
     echo
-    echo "## the two files, as this run read them"
+    echo "## the file, as this run read it"
     echo
     printf '%-8s %-6s %-12s %-64s %s\n' file rows "row stamp" sha256 path
     printf '%-8s %-6s %-12s %-64s %s\n' dense "$(rows "$dense")" "$(stamp "$dense")" "$(digest "$dense")" "$dense"
-    printf '%-8s %-6s %-12s %-64s %s\n' sparse "$(rows "$sparse")" "$(stamp "$sparse")" "$(digest "$sparse")" "$sparse"
     echo
     echo "## the eight answers, as the run printed them"
     echo

@@ -98,7 +98,7 @@ def pool(slots, vocab, width, future_stride, seed, device):
     return state, guards
 
 
-def reference(state, rows, tokens, valid, active, continuation, points):
+def reference(state, rows, tokens, valid, active, continuation, points, vocab):
     """The state the operator's formulas say a step leaves."""
     expected = {name: value.clone() for name, value in state.items()}
     for row in rows:
@@ -127,6 +127,10 @@ def reference(state, rows, tokens, valid, active, continuation, points):
         if not sampled:
             continue
         token = int(tokens[task]) & TOKEN_VALUE_MASK
+        # An id at or above the vocabulary is not a token: the operator installs no next input column
+        # and adds no penalty for it, so neither moves here either.
+        if token >= vocab:
+            continue
         expected["future"][slot, 0] = token
         expected["predicates"][slot] = continuation[task]
         if row[PENALTIES] != 0 and valid[task] != 0 and active[task] != 0:
@@ -173,6 +177,7 @@ def run(scenario, device):
         scenario["active"],
         scenario["continuation"],
         scenario["points"],
+        scenario["vocab"],
     )
     # Only the element in front of each view is a guard; the rest of its buffer is the
     # state the step is meant to write.
@@ -281,6 +286,30 @@ def scenarios(flags):
             "valid": [1, 0],
             "active": [1, 1],
             "continuation": [0, 0],
+            "points": [1, 1],
+            "rows": [
+                [0, DECODE, 0, 0, 0, 0, 0, 1],
+                [1, DECODE, 1, 0, 0, 0, 0, 1],
+            ],
+        },
+        {
+            # The sampler can answer one past its vocabulary — an `argmax` over a row with no
+            # numeric value answers the row's width. Such a value is not a token, and the operator
+            # installs nothing for it: the next input column and the penalty counts keep what they
+            # held. The impossible draw is in the *first* slot, so an unguarded penalty add would
+            # land in the second slot's row of the count plane where the comparison reads it.
+            "label": "a draw that answered the vocabulary installs no token and no penalty",
+            "slots": 2,
+            "vocab": 8,
+            "width": 2,
+            "stride": stride,
+            "future_stride": flags.future_stride,
+            "block": flags.block,
+            "seed": 4,
+            "tokens": [8, 3],
+            "valid": [1, 1],
+            "active": [1, 1],
+            "continuation": [0, 1],
             "points": [1, 1],
             "rows": [
                 [0, DECODE, 0, 0, 0, 0, 0, 1],
