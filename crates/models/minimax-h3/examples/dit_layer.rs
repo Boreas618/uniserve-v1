@@ -2099,8 +2099,10 @@ const SPARSE_OPERATORS: [&str; 6] = [
 
 /// Print the sparse chain's cell counts, and refuse when the store holds none of one.
 ///
-/// The store is the deployment's: a sparse deployment's is built from
-/// `notes/programs/minimax-h3-sparse-keys.txt`, and one built from the dense list cannot serve it.
+/// The store is the deployment's: `notes/programs/minimax-h3-keys.txt` states the video-sparse
+/// deployment's rows, which include the dense deployment's, so one store built from it serves
+/// either - while a store built from a dense-only list stops at the first sparse launch, with no
+/// kernel for it.
 fn check_sparse_store(generation: &ops::Generation, attention: AttentionKind) -> Result<()> {
     if !matches!(attention, AttentionKind::Sparse { .. }) {
         return Ok(());
