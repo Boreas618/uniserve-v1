@@ -108,7 +108,7 @@ fn channels_last_strides(shape: Shape) -> Strides {
     let (rows, columns) = (shape.dim(3), shape.dim(4));
     let plane = columns * channels;
     let body = rows * plane;
-    Strides::new(&[depth * body, 1, body, plane, columns])
+    Strides::new(&[depth * body, 1, body, plane, channels])
 }
 
 /// Refuse a channels-last convolution whose operand is not stored channels-last.
