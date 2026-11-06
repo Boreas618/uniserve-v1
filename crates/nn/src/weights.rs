@@ -691,9 +691,11 @@ pub struct QuantizedWeight {
     pub packed: Weight,
     /// `ScaleLayout::shape(rows, columns)` U8: one E4M3 block scale per sixteen elements.
     pub scales: Weight,
-    /// The reciprocal of the checkpoint's FP32 tensor scale.
+    /// The checkpoint's FP32 tensor scale for this projection — the value, not its reciprocal.
     ///
-    /// It enters a kernel as a launch scalar, which is why it is a plain value.
+    /// It enters a kernel as a launch scalar, which is why it is a plain value, and it multiplies:
+    /// the operand's reconstruction is `codes · block scale · token scale`, which is the operand in
+    /// real units, so the weight's tensor scale has to be applied exactly once and as a factor.
     pub global_scale: f32,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
@@ -1432,7 +1434,8 @@ impl<'a> WeightLoader<'a> {
                     "calibration's activation scale",
                     names.input_scale,
                 )?;
-                let reciprocal = self.activation_reciprocal(request)?;
+                // This value *is* the encoder's factor, so it is the one place the ceiling applies.
+                let reciprocal = self.encoder_factor(request)?;
                 let shape = Shape::new(&[1]);
                 let bytes = reciprocal.to_le_bytes();
                 // The activation's reciprocal is computed from one file: the suffix names the
@@ -1505,7 +1508,23 @@ impl<'a> WeightLoader<'a> {
     /// activation's `input_scale` — are one positive float each, and every kernel that consumes one
     /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
     /// encoded at the wrong magnitude.
+    ///
+    /// The reciprocal is answered as the checkpoint states it. Whether it can encode is
+    /// [`Self::encoder_factor`]'s question, and only an operand that *is* the encoder's factor is
+    /// asked it: an expert stack publishes its experts' activation scales as the checkpoint's own
+    /// data and no operand multiplies a value by them, so bounding those would refuse a checkpoint
+    /// over a number nothing reads.
     fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
+        Ok(1.0 / self.tensor_scale(request)?)
+    }
+
+    /// The activation encoder's factor for one calibrated projection.
+    ///
+    /// Not bounded: a calibrated `input_scale` near `1e-3` is a normal calibration (its factor is
+    /// then about 724), so a ceiling here would refuse a healthy checkpoint. The encoder's block
+    /// scale is computed from the row it actually sees, which is why the bound does not belong to
+    /// the operand's scale.
+    fn encoder_factor(&self, request: &WeightRequest) -> Result<f32> {
         Ok(1.0 / self.tensor_scale(request)?)
     }
 

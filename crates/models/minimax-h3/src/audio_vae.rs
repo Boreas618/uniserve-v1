@@ -366,7 +366,11 @@ pub fn audio_arena(
         });
     };
     let mut length = u64::from(frames);
-    push("track".to_owned(), u64::from(config.latent_channels), length);
+    push(
+        "track".to_owned(),
+        u64::from(config.latent_channels),
+        length,
+    );
     push(
         "restored".to_owned(),
         u64::from(config.latent_channels),
@@ -1497,12 +1501,14 @@ pub(crate) fn dilated_geometry(
     padding: u32,
     dilation: u32,
 ) -> Result<ConvGeometry> {
+    // The operator states a 1-d convolution's length as the first spatial axis, `[length, 1, 1]`, so
+    // the geometry's other two axes are the identity: a filter of one, no padding.
     Ok(ConvGeometry::new(
         1,
-        [kernel; 3],
-        [stride; 3],
-        [padding; 3],
-        [dilation; 3],
+        [kernel, 1, 1],
+        [stride, 1, 1],
+        [padding, 0, 0],
+        [dilation, 1, 1],
         1,
     )?)
 }
