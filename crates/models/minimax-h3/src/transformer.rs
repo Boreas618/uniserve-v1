@@ -651,6 +651,10 @@ impl Transformer {
             );
             programs.launch::<SparseAttention>(&fine.descriptor_of(dtype));
         }
+        // A Ulysses group sets each member's heads side by side once its rows are back.
+        if partition.ulysses_degree > 1 {
+            programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(dtype));
+        }
 
         // Every projection of the stack: the video and audio entrances, the four of each block's
         // attention, its feed-forward pair, and the head per modality. None carries a bias.

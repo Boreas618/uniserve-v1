@@ -55,7 +55,6 @@
 //! | [`conv::Conv1d`] | `conv1d` | [`conv`] |
 //! | [`conv::ConvTranspose1d`] | `conv_transpose1d` | [`conv`] |
 //! | [`transpose::Transpose`] | `transpose` | [`transpose`] |
-//! | [`exchange::scatter`], [`exchange::gather`] | `ulysses_exchange` | [`exchange`] |
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.
 //!
@@ -91,7 +90,6 @@ pub mod cross_fade;
 pub mod descriptor;
 pub mod embedding;
 pub mod error;
-pub mod exchange;
 pub mod fp4;
 pub mod frame;
 pub mod gelu;

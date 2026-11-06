@@ -846,13 +846,17 @@ pub struct Placement {
     pub components: std::collections::BTreeMap<String, ComponentConfig>,
 }
 
-/// The mechanism's `Batches` over a rank's devices (2.4, 4.4): a batch goes to the device whose
+/// The mechanism's `Batches` over a node's devices (2.4, 4.4): a batch goes to every device whose
 /// runners serve its phase.
 ///
-/// A rank's executors are its devices, and a device's runners are the blocks of the model placed
+/// A node's executors are its devices, and a device's runners are the blocks of the model placed
 /// on it; the mechanism addresses a batch by phase, not by device. This is the one place that
-/// translation happens, so a scheduler never needs to know how many devices a rank holds. It is a
-/// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
+/// translation happens, so a scheduler never needs to know how many devices it drives. A phase one
+/// device serves is that device's. A phase several devices serve is a parallel group's: each runs
+/// its part of one batch, so each must see it. The scheduler's thread is the one thread that submits,
+/// so every device's queue holds the group's batches in one order, which is the order their
+/// collectives need. It is a plain route on purpose: the phase list is fixed at spawn, so no lock,
+/// no schedule, no retry.
 pub struct Executors {
     executors: Vec<Arc<crate::device::Executor>>,
     /// The pools this rank serves, as the deployment launched them (4.2): the scheduler builds its
@@ -862,11 +866,7 @@ pub struct Executors {
 }
 
 impl Executors {
-    /// The rank's devices, in the order they were spawned.
-    ///
-    /// Every phase a batch can name must be served by exactly one of them; a rank that spawns two
-    /// devices serving one phase is refused, because a batch could go to either and the two would
-    /// disagree about the model's state.
+    /// The node's devices, in the order they were spawned.
     pub fn new(executors: Vec<crate::device::Executor>) -> Result<Self> {
         Self::shared(executors.into_iter().map(Arc::new).collect())
     }
@@ -876,19 +876,8 @@ impl Executors {
     /// A main process holds one handle per device from the moment it spawns them: the control
     /// thread reads their running jobs for the stall rule and their counters for the metrics,
     /// and a scheduler submits through the same handles. Sharing them rather than moving them in
-    /// keeps one device one owner, and the phase check is the same one [`Executors::new`] makes.
+    /// keeps one device one owner.
     pub fn shared(executors: Vec<Arc<crate::device::Executor>>) -> Result<Self> {
-        let mut served: Vec<PhaseId> = Vec::new();
-        for executor in &executors {
-            for phase in executor.phases() {
-                if served.contains(phase) {
-                    return Err(Error::Invalid(format!(
-                        "two devices of this rank serve phase {phase:?}"
-                    )));
-                }
-                served.push(*phase);
-            }
-        }
         Ok(Self {
             executors,
             inventory: Vec::new(),
@@ -922,6 +911,22 @@ impl Executors {
                         .collect::<Vec<_>>(),
                 )
             })
+    }
+
+    /// Hands `batch` to every device that serves its phase, as one submission.
+    fn on_every_device(
+        &self,
+        batch: Batch,
+        submit: impl Fn(&crate::device::Executor, Batch) -> Result<Submission>,
+    ) -> Result<Submission> {
+        let first = self.route(batch.phase)?;
+        let mut peers = Vec::new();
+        for peer in self.executors.iter().filter(|executor| {
+            executor.serves(batch.phase) && !Arc::ptr_eq(executor, first)
+        }) {
+            peers.push(submit(peer, batch.clone())?);
+        }
+        Ok(submit(first, batch)?.joined(peers))
     }
 
     /// How many devices the rank hands batches to.
@@ -967,11 +972,11 @@ impl Batches for Executors {
     }
 
     fn submit(&self, batch: Batch) -> Result<Submission> {
-        self.route(batch.phase)?.submit(batch)
+        self.on_every_device(batch, |executor, batch| executor.submit(batch))
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission> {
-        self.route(batch.phase)?.shadow(batch)
+        self.on_every_device(batch, |executor, batch| executor.shadow(batch))
     }
 }
 
@@ -1048,6 +1053,8 @@ impl JobKind {
 pub struct Submission {
     id: SubmissionId,
     state: Arc<SubmissionState>,
+    /// The same batch on the other ranks that serve it: the submission completes when they all did.
+    peers: Vec<Submission>,
 }
 
 pub(crate) struct SubmissionState {
@@ -1066,7 +1073,22 @@ impl Submission {
             failure: Mutex::new(None),
             ready: Condvar::new(),
         });
-        Self { id, state }
+        Self {
+            id,
+            state,
+            peers: Vec::new(),
+        }
+    }
+
+    /// This submission and the same batch's on `peers`, as one.
+    ///
+    /// The ranks of a group run one batch together, so it has ended when every one of them ended:
+    /// this rank's outcome is the answer, and a peer's failure replaces it, because a rank that
+    /// failed leaves the others' output without its part.
+    #[must_use]
+    pub fn joined(mut self, peers: Vec<Submission>) -> Self {
+        self.peers = peers;
+        self
     }
 
     /// A submission waiting for its jobs' completion, with the state the queue completes.
@@ -1080,6 +1102,7 @@ impl Submission {
             Self {
                 id,
                 state: Arc::clone(&state),
+                peers: Vec::new(),
             },
             state,
         )
@@ -1097,6 +1120,27 @@ impl Submission {
 
     /// Waits until the submission completed and answers its outcome.
     pub fn wait(&self) -> Outcome<BatchOutput> {
+        let own = self.wait_own();
+        let peers: Vec<Outcome<BatchOutput>> = self.peers.iter().map(Self::wait).collect();
+        Self::joined_outcome(own, peers)
+    }
+
+    /// This rank's outcome unless a peer's says the batch did not complete.
+    fn joined_outcome(
+        own: Outcome<BatchOutput>,
+        peers: Vec<Outcome<BatchOutput>>,
+    ) -> Outcome<BatchOutput> {
+        match own {
+            Outcome::Success(_) => peers
+                .into_iter()
+                .find(|peer| !matches!(peer, Outcome::Success(_)))
+                .unwrap_or(own),
+            failed => failed,
+        }
+    }
+
+    /// Waits until this rank's part completed and answers its outcome.
+    fn wait_own(&self) -> Outcome<BatchOutput> {
         let mut outcome = lock(&self.state.outcome);
         while outcome.is_none() {
             outcome = match self.state.ready.wait(outcome) {
@@ -1115,6 +1159,16 @@ impl Submission {
     /// Waits at most `timeout` for the submission's completion.
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<BatchOutput>> {
         let deadline = Instant::now() + timeout;
+        let own = self.wait_own_until(deadline)?;
+        let mut peers = Vec::with_capacity(self.peers.len());
+        for peer in &self.peers {
+            peers.push(peer.wait_timeout(deadline.saturating_duration_since(Instant::now()))?);
+        }
+        Some(Self::joined_outcome(own, peers))
+    }
+
+    /// Waits until `deadline` for this rank's part.
+    fn wait_own_until(&self, deadline: Instant) -> Option<Outcome<BatchOutput>> {
         let mut outcome = lock(&self.state.outcome);
         while outcome.is_none() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -1131,7 +1185,12 @@ impl Submission {
 
     /// The submission's outcome, when it completed.
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
-        lock(&self.state.outcome).clone()
+        let own = lock(&self.state.outcome).clone()?;
+        let mut peers = Vec::with_capacity(self.peers.len());
+        for peer in &self.peers {
+            peers.push(peer.outcome()?);
+        }
+        Some(Self::joined_outcome(own, peers))
     }
 
     /// What the submission was doing when it failed, when it did.
@@ -1139,7 +1198,9 @@ impl Submission {
     /// The device thread writes it where the failure happens - the job it was performing and the
     /// bucket, generation or operator that named it - because the caller holds only the bare error.
     pub fn failure_label(&self) -> Option<String> {
-        lock(&self.state.failure).clone()
+        lock(&self.state.failure)
+            .clone()
+            .or_else(|| self.peers.iter().find_map(Self::failure_label))
     }
 }
 

@@ -357,17 +357,12 @@ impl FromIterator<Component> for Components {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Projection {
     /// Every member gathers every member's rows and projects **its own head shard** with
-    /// head-partitioned weights, so a rank of `d` holds `1/d` of the attention projections.
-    ///
-    /// **This stack does not implement it.** `attention` and `attention_sparse` load whole
-    /// projections on every rank (`Attention::load` requests `to_q`/`to_k`/`to_v`/`to_out` at
-    /// `num_attention_heads * head_dim`) and then send each member that member's head shard, which is
-    /// [`Projection::Exchange`]. A deployment that states this mode is refused rather than loaded
-    /// with weights its field says it does not have.
+    /// head-partitioned weights, so a rank of `d` holds `1/d` of the attention projections: one
+    /// all-gather of the normalized rows per layer.
     Gather,
-    /// Every member projects its own rows for all heads with **whole weights** and sends each member
-    /// that member's head shard: three scatters and one gather around the attention, which is what
-    /// both attention layers do.
+    /// Every member projects its own rows for all heads with **whole weights**, one launch per
+    /// member so each member's head shard lands in its own block, and sends each member its block:
+    /// one all-to-all per projection.
     Exchange,
 }
 
@@ -413,6 +408,9 @@ pub struct Partition {
     /// Ulysses sequence-parallel degree of the denoiser: the heads each rank attends and the
     /// ranks the all-to-all runs over.
     pub ulysses_degree: usize,
+    /// How a Ulysses member's head projections reach it, which decides the weights it holds. A group
+    /// of one has no exchange and does not read this.
+    pub projection: Projection,
     /// Tensor-parallel degree of the text encoder: vocabulary, attention heads and dense
     /// projections are sharded over it.
     pub tensor_parallel: usize,
@@ -460,6 +458,7 @@ impl Partition {
     pub fn single() -> Self {
         Self {
             ulysses_degree: 1,
+            projection: Projection::Exchange,
             tensor_parallel: 1,
             tensor_rank: 0,
             sequence_rank: 0,
@@ -479,6 +478,12 @@ impl Partition {
     pub const fn sharded(mut self, ulysses_degree: usize, tensor_parallel: usize) -> Self {
         self.ulysses_degree = ulysses_degree;
         self.tensor_parallel = tensor_parallel;
+        self
+    }
+
+    /// The same partition, reaching its heads by `projection`.
+    pub const fn projecting(mut self, projection: Projection) -> Self {
+        self.projection = projection;
         self
     }
 
@@ -550,31 +555,6 @@ impl Partition {
                     .join(", ")
             )));
         }
-        // **The projection decides what a rank holds, so it is refused here rather than at the first
-        // attention.** A group of one has no exchange and no shard: both modes are the identity and
-        // the field is not consulted, so a one-rank deployment is accepted whichever mode it states.
-        if ulysses.degree > 1 {
-            if ulysses.projection == Projection::Gather {
-                return Err(Error::config(format!(
-                    "this stack exchanges head projections and gathers nothing: {} ranks were asked \
-                     for the gather mode, which needs head-partitioned weights and loads whole ones",
-                    ulysses.degree
-                )));
-            }
-            // The sparse attention composes a layer's compression across the exchange's members, and
-            // that composition is not written (`attention_sparse`). Refused here so a deployment
-            // learns it at its partition rather than at the first sparse layer's construction.
-            if matches!(
-                config.denoisers[&dit].attention,
-                crate::config::AttentionKind::Sparse { .. }
-            ) {
-                return Err(Error::config(format!(
-                    "the sparse attention composes its compression across {} ulysses ranks, whose \
-                     exchange is not written: a sparse deployment serves one rank",
-                    ulysses.degree
-                )));
-            }
-        }
         let mut blocks = Components::of([
             Component::TextEncoder,
             Component::VideoDecoder,
@@ -598,7 +578,8 @@ impl Partition {
             sequence_rank,
         )?
         .placing(blocks)
-        .sized(RELEASED_TEXT_ROWS, condition_rows(config, task)?);
+        .sized(RELEASED_TEXT_ROWS, condition_rows(config, task)?)
+        .projecting(ulysses.projection);
         partition.validate(config)?;
         Ok(partition)
     }
@@ -631,7 +612,13 @@ impl Partition {
                 self.ulysses_degree
             ))
         })?;
-        Arrangement::new(config, self.text_rows, self.condition_rows, shard)
+        Ok(Arrangement::new(config, self.text_rows, self.condition_rows, shard)?
+            .at_rank(u32::try_from(self.sequence_rank).map_err(|_| {
+                Error::config(format!(
+                    "a sequence rank of {} does not fit a row count",
+                    self.sequence_rank
+                ))
+            })?))
     }
 
     /// A deployment's partition, checked against the checkpoint's head counts.
@@ -643,12 +630,9 @@ impl Partition {
     /// The capacity is the released table's, as in [`Self::single`]: a caller that states programs
     /// wants [`Self::serving`], which derives it from the task.
     ///
-    /// **A partition built here is an exchange one, whatever a deployment states elsewhere**: this
-    /// constructor takes the degree and holds no projection, because the stack exchanges head
-    /// projections and gathers nothing (`attention::Attention::load` requests whole `to_q`/`to_k`/
-    /// `to_v`/`to_out` on every rank). A deployment that has a projection to state goes through
-    /// [`Self::serving`], which is the only constructor that can refuse the mode this stack does not
-    /// implement; a constructor that cannot refuse is the wrong one to hand a deployment to.
+    /// **A partition built here is an exchange one**, because this constructor takes the degree and
+    /// holds no projection; a deployment that has a projection to state goes through
+    /// [`Self::serving`] or [`Self::projecting`].
     pub fn new(
         config: &Config,
         ulysses_degree: usize,
@@ -658,6 +642,7 @@ impl Partition {
     ) -> Result<Self> {
         let partition = Self {
             ulysses_degree,
+            projection: Projection::Exchange,
             tensor_parallel,
             tensor_rank,
             sequence_rank,
@@ -1069,14 +1054,12 @@ mod tests {
     }
 
     #[test]
-    fn a_gathering_deployment_is_refused_by_name() {
-        // This stack exchanges head projections: every rank loads whole attention projections and
-        // sends each member that member's head shard. A deployment that states the gather mode asks
-        // for head-partitioned weights the model never loads, so the two would disagree about what a
-        // rank holds - refused at the partition, where the deployment's own mode arrives, rather than
-        // at the first attention to be built.
+    fn a_partition_carries_the_projection_its_deployment_states() {
+        // The mode decides what a rank holds: the gather holds its own heads' rows of the attention
+        // projections and the exchange holds every member's, so the partition keeps the statement
+        // for the layers to read.
         let config = config();
-        let refused = Partition::serving(
+        let gathered = Partition::serving(
             &config,
             VideoTask::TextToVideoAudio,
             Ulysses::of(2, Projection::Gather),
@@ -1084,10 +1067,8 @@ mod tests {
             0,
             0,
         )
-        .expect_err("a gathering deployment");
-        let said = refused.to_string();
-        assert!(said.contains("gathers nothing"), "{said}");
-        assert!(said.contains("2 ranks"), "{said}");
+        .expect("a gathering deployment");
+        assert_eq!(gathered.projection, Projection::Gather);
 
         // One rank has no exchange and no head shard, so both modes are the identity and the mode is
         // not consulted: a one-rank deployment is accepted whichever it states, which is what a
@@ -1105,10 +1086,9 @@ mod tests {
     }
 
     #[test]
-    fn a_sparse_deployment_serves_one_rank() {
-        // The sparse attention composes a layer's compression across the exchange's members, and that
-        // composition is not written. A sharded sparse deployment would attend its own rows alone and
-        // silently produce a different model, so the partition refuses it before a layer is built.
+    fn a_sparse_deployment_serves_a_ulysses_group() {
+        // A sharded sparse deployment attends every row for its own heads, so each member composes
+        // its own heads' compression and the partition places it like a dense one.
         let mut config = config();
         config
             .denoisers
@@ -1116,7 +1096,7 @@ mod tests {
             .expect("a base DiT")
             .attention =
             crate::config::AttentionKind::sparse(128, 0.8, None).expect("a sparse kind");
-        let refused = Partition::serving(
+        let two = Partition::serving(
             &config,
             VideoTask::TextToVideoAudio,
             Ulysses::of(2, Projection::Exchange),
@@ -1124,10 +1104,8 @@ mod tests {
             0,
             0,
         )
-        .expect_err("a sharded sparse deployment");
-        let said = refused.to_string();
-        assert!(said.contains("compression"), "{said}");
-        assert!(said.contains("2 ulysses ranks"), "{said}");
+        .expect("a sharded sparse deployment");
+        assert_eq!(two.ulysses_degree, 2);
 
         // One rank serves the sparse network, which is the deployment the tile bound is stated for.
         let one = Partition::serving(

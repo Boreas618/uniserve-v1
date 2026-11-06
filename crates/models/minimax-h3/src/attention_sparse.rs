@@ -1,22 +1,24 @@
-use nn::layers::{Linear, Rotary, Sections, SegmentAttention, SegmentTables, VsaTiles};
+use nn::layers::{
+    Linear, Rotary, Sections, SegmentAttention, SegmentTables, UlyssesExchange, VsaTiles,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
-use crate::attention::Factors;
+use crate::attention::{Factors, HeadProjection, HeadsToRows, projected_rows};
 use crate::config::TransformerConfig;
-use crate::partition::Partition;
+use crate::partition::{Partition, Projection};
 use crate::{Error, Result};
 
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.
 pub struct Sparse {
     /// The query, key and value projections, `[inner, hidden]` each.
-    pub query: Linear,
-    pub key: Linear,
-    pub value: Linear,
+    pub(crate) query: HeadProjection,
+    pub(crate) key: HeadProjection,
+    pub(crate) value: HeadProjection,
     /// The gate the compression is weighted by, `[inner, hidden]`: a fourth projection of the same
     /// fused matrix as the three above (`attention.py:139`).
-    pub gate: Linear,
+    pub(crate) gate: HeadProjection,
     /// The output projection back to the residual's width, `[hidden, inner]`.
     pub output: Linear,
     /// Per-head normalization gains of the query and the key.
@@ -35,6 +37,10 @@ pub struct Sparse {
     pub head_dim: u32,
     /// Rows of one tile.
     pub tile_rows: u32,
+    /// The Ulysses exchange, absent when one rank holds the sequence.
+    exchange: Option<UlyssesExchange>,
+    /// How this rank reaches its heads.
+    projection: Projection,
 }
 
 impl Sparse {
@@ -102,17 +108,10 @@ impl Sparse {
         // Contiguous sections, not the interleaved cycle: the reference's factors are one block
         // per coordinate axis (axis 0 first), and the cycle belongs to the text encoder's M-RoPE.
         .sectioned(Sections::new(rotated_axes)?)?;
-        // The reference composes a layer's compression across the exchange's members (`compose`,
-        // `slots`); until that is written, a sharded sparse deployment would attend its own rows
-        // alone and silently produce a different model.
-        if partition.ulysses_degree > 1 {
-            return Err(Error::config(format!(
-                "the sparse attention composes its compression across {} ulysses ranks, whose \
-                 exchange is not written",
-                partition.ulysses_degree
-            )));
-        }
-        let local_heads = partition.denoiser_heads(config.num_attention_heads);
+        let exchange = match partition.ulysses_degree {
+            1 => None,
+            degree => Some(UlyssesExchange::new(degree as u64)?),
+        };
         // The compression reduces over every key tile of the layout, so the layer states the
         // deployment's own tile bound once (`Layouts::tiles_bound`) and the score matrix is sized by
         // it rather than guessed from a layout at launch.
@@ -125,8 +124,11 @@ impl Sparse {
         // BF16 here was a constant that agreed with a BF16 deployment and disagreed with every other
         // one - an FP16 stack would have had its attended rows narrowed to BF16 by a layer that never
         // asked what the stack was.
-        let query_weight = matrix(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?;
-        let stack = query_weight.dtype();
+        let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
+            HeadProjection::load(loader, &format!("{prefix}.{name}"), inner, hidden, partition)
+        };
+        let query = head_projection(loader, "to_q.weight")?;
+        let stack = query.dtype();
         // One line, once per process: the type the walk read for the weight that decides the fine
         // attention's output, named with the weight it came from. A launch key states this type, and
         // a key that says `f32` is either a deployment converted to FP32 or a lookup that answered
@@ -149,15 +151,10 @@ impl Sparse {
             stack,
         )?;
         Ok(Self {
-            query: Linear::new(query_weight, None, WeightOrder::NxK)?,
-            key: projection(loader, &format!("{prefix}.to_k.weight"), inner, hidden)?,
-            value: projection(loader, &format!("{prefix}.to_v.weight"), inner, hidden)?,
-            gate: projection(
-                loader,
-                &format!("{prefix}.to_gate_compress.weight"),
-                inner,
-                hidden,
-            )?,
+            query,
+            key: head_projection(loader, "to_k.weight")?,
+            value: head_projection(loader, "to_v.weight")?,
+            gate: head_projection(loader, "to_gate_compress.weight")?,
             output: projection(loader, &format!("{prefix}.to_out.0.weight"), hidden, inner)?,
             query_gain,
             key_gain,
@@ -168,6 +165,8 @@ impl Sparse {
             local_heads,
             head_dim: config.head_dim,
             tile_rows,
+            exchange,
+            projection: partition.projection,
         })
     }
 
@@ -184,11 +183,13 @@ impl Sparse {
             .map_err(Error::from)
     }
 
-    /// Attend `normalized` `[rows, hidden]` and write `[rows, hidden]`.
+    /// Attend `normalized`, this rank's `[rows, hidden]`, and write this rank's `[rows, hidden]`.
     ///
     /// `sizes` is `[tiles]` int32, the valid rows of each tile; `segments` is `[tiles]` int32, the
     /// segment each tile belongs to, and `keep` is the tile-count-long table of each segment's kept
-    /// key tiles, as the reference builds it.
+    /// key tiles, as the reference builds it. All three cover the whole sequence, as do the rotary
+    /// factors: under Ulysses a rank attends every row for its own heads, so a tile's selection and
+    /// its compression are per head and need no other rank.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -201,17 +202,25 @@ impl Sparse {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        let rows = normalized.shape.dim(0);
+        // The sequence is whole here whatever this rank owns of it: the buffers below are the rows of
+        // every member, in member order, for this rank's heads.
+        let rows = scratch.query.shape.dim(0);
         if !rows.is_multiple_of(u64::from(self.tile_rows)) {
             return Err(Error::config(format!(
                 "{rows} rows do not fill {} tiles",
                 self.tile_rows
             )));
         }
-        self.query.forward(f, normalized, scratch.query)?;
-        self.key.forward(f, normalized, scratch.key)?;
-        self.value.forward(f, normalized, scratch.value)?;
-        self.gate.forward(f, normalized, scratch.gate)?;
+        let exchange = self.exchange.as_ref();
+        let source = projected_rows(f, exchange, self.projection, normalized, scratch.gathered_rows)?;
+        self.query
+            .forward(f, exchange, source, scratch.staging, scratch.query)?;
+        self.key
+            .forward(f, exchange, source, scratch.staging, scratch.key)?;
+        self.value
+            .forward(f, exchange, source, scratch.staging, scratch.value)?;
+        self.gate
+            .forward(f, exchange, source, scratch.staging, scratch.gate)?;
 
         // The rows are `[tiles * tile_rows, heads, width]` for the preparation; the pooled views are
         // `[tiles, heads, width]` FP32 and stay tile-major, which is the order the reference's
@@ -283,7 +292,16 @@ impl Sparse {
         // argument only, so folding into any other buffer would drop this branch without a shape
         // ever saying so (`vsa/segments.py:461-478`).
         self.tiles.add_gated(f, fine, scratch.compressed, gate)?;
-        Ok(self.output.forward(f, scratch.fine, out)?)
+        // Each member's rows of the gated sum are a contiguous block of `fine`, so the buffer is
+        // already the exchange's send buffer and no composition into a payload is needed.
+        let attended = match exchange {
+            None => scratch.fine,
+            Some(exchange) => {
+                HeadsToRows::forward(f, exchange, scratch.fine, scratch.staging, scratch.merged)?;
+                scratch.merged
+            }
+        };
+        Ok(self.output.forward(f, attended, out)?)
     }
 }
 
@@ -317,23 +335,50 @@ pub struct Scratch {
     pub counts: TensorView,
     pub fine: TensorView,
     pub compressed: TensorView,
+    /// The exchange's staging buffer, a member's block after another, for this rank's rows.
+    pub staging: TensorView,
+    /// The attended rows of every head, as the output projection reads them.
+    pub merged: TensorView,
+    /// The whole sequence's normalized rows, in the gather mode.
+    pub gathered_rows: TensorView,
 }
 
 impl Scratch {
-    /// Reserve the stack's sparse scratch for `rows` rows of `tiles` tiles.
+    /// Reserve the stack's sparse scratch for a sequence of `total_rows` rows, of which `normalized`
+    /// holds this rank's.
     pub fn reserve(
         layer: &Sparse,
         f: &Forward,
         normalized: TensorView,
-        tiles: u32,
+        total_rows: u32,
     ) -> Result<Self> {
         let dtype = normalized.dtype;
-        let rows = normalized.shape.dim(0);
+        let rows = u64::from(total_rows);
+        let own = normalized.shape.dim(0);
+        let tiles64 = rows / u64::from(layer.tile_rows);
         let inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
         let heads = u64::from(layer.local_heads);
-        let tiles64 = u64::from(tiles);
+        let every = u64::from(layer.heads) * u64::from(layer.head_dim);
         let arena = f.arena();
+        // A layer that does not communicate reserves nothing for it: on one rank these views are
+        // buffers the layer already holds, and the branches that read them do not run.
+        let (staging, merged) = match layer.exchange {
+            Some(_) => (
+                arena.tensor(dtype, Shape::new(&[own, every]))?,
+                arena.tensor(dtype, Shape::new(&[own, every]))?,
+            ),
+            None => (normalized, normalized),
+        };
+        let gathered_rows = match (&layer.exchange, layer.projection) {
+            (Some(_), Projection::Gather) => {
+                arena.tensor(dtype, Shape::new(&[rows, normalized.shape.last()]))?
+            }
+            _ => normalized,
+        };
         Ok(Self {
+            staging,
+            merged,
+            gathered_rows,
             query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
@@ -399,28 +444,17 @@ fn frequencies(
     )?)
 }
 
-/// One projection's weight, before it is wrapped: its element type is the stack's, and a caller
-/// that needs to know what the stack is reads it here.
-fn matrix(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    out_features: u64,
-    in_features: u64,
-) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[out_features, in_features]),
-    ))?)
-}
-
 fn projection(
     loader: &mut WeightLoader<'_>,
     name: &str,
     out_features: u64,
     in_features: u64,
 ) -> Result<Linear> {
-    let weight = matrix(loader, name, out_features, in_features)?;
+    let weight = loader.load(&WeightRequest::region(
+        name,
+        0,
+        Shape::new(&[out_features, in_features]),
+    ))?;
     Ok(Linear::new(weight, None, WeightOrder::NxK)?)
 }
 

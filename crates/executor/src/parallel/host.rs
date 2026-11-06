@@ -30,7 +30,7 @@ use crate::{Error, Result};
 
 /// How long startup waits for every member to join the mesh: torch's
 /// default collective timeout.
-pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Messages at most this long are written before reading without a helper
 /// thread: the kernel's socket buffers absorb them, so concurrent sends from
@@ -385,7 +385,7 @@ impl HostGroup {
     }
 
     /// `root`'s bytes on every member. Only `root` supplies `value`.
-    pub(crate) fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
+    pub fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
         if root >= self.size() {
             return Err(Error::Invalid(
                 "broadcast root is outside the host group".into(),

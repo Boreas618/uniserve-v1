@@ -16,21 +16,20 @@
 //!
 //! ## The partition
 //!
-//! The refiner belongs to the denoiser component, which a deployment shards over the packed
-//! sequence: a rank holds a contiguous slice of the rows and every head, projects its slice with
-//! the whole weight, and an all-to-all trades the row slice for a head shard of the whole sequence
-//! around the attention (design 4.3). With one rank the exchange is absent and every view is the
-//! rank's own.
+//! The refiner belongs to the denoiser component, but it is not sharded: it reads at most the
+//! prompt's rows once per request, so every rank of a Ulysses group refines the whole prompt with
+//! every head and holds the result, which is what every one of its own packed rows gathers from.
+//! Sharding two blocks over a thousand rows would save nothing and put two exchanges on the first
+//! step of every request.
 
 use nn::layers::{
-    Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange,
+    Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
 use crate::config::TransformerConfig;
-use crate::partition::Partition;
 use crate::{Error, Result};
 
 /// The fold's whole reservation from the configuration alone, in reservation order.
@@ -41,29 +40,19 @@ use crate::{Error, Result};
 /// is why the extents live here beside the fold that reserves them rather than in the plan.
 ///
 /// The working buffer is the whole refined document (`[rows, hidden]`, the input projection's
-/// output); every block then reserves its own [`Scratch`]. A rank holds `rows` of them and the
-/// exchange trades the row slice for a head shard of `total_rows`, which is the whole packed row
-/// count of the batch.
-pub fn fold_plan(
-    config: &TransformerConfig,
-    rows: u32,
-    total_rows: u32,
-    shard: u32,
-) -> Vec<(String, Shape)> {
+/// output); every block then reserves its own [`Scratch`].
+pub fn fold_plan(config: &TransformerConfig, rows: u32) -> Vec<(String, Shape)> {
     let mut plan = vec![(
         "refiner.working".to_owned(),
         Shape::new(&[u64::from(rows), u64::from(config.hidden_size)]),
     )];
-    let local_heads = config.num_attention_heads / shard.max(1);
     for index in 0..config.num_refiner_layers {
         let scratch = Scratch::new(
             config.hidden_size,
             config.head_dim,
             config.num_attention_heads,
-            local_heads,
             config.intermediate_size,
             rows,
-            total_rows,
         );
         for (name, shape) in scratch.entries() {
             plan.push((format!("refiner.{index}.{name}"), shape));
@@ -77,15 +66,9 @@ pub fn fold_plan(
 /// The denoiser's stage floor takes the larger of this and one evaluation's plan, because the two
 /// occupy the same offsets: the fold runs only on the live path, before the first replay, and the
 /// captured graph's nodes carry the planning walk's offsets from the region's base.
-pub fn fold_bytes(
-    config: &TransformerConfig,
-    rows: u32,
-    total_rows: u32,
-    shard: u32,
-    dtype: nn::DType,
-) -> u64 {
+pub fn fold_bytes(config: &TransformerConfig, rows: u32, dtype: nn::DType) -> u64 {
     let width = dtype.bytes().unwrap_or(4);
-    fold_plan(config, rows, total_rows, shard)
+    fold_plan(config, rows)
         .iter()
         .map(|(_, shape)| shape.dims().iter().product::<u64>())
         .sum::<u64>()
@@ -123,11 +106,8 @@ pub struct RefinerBlock {
     attention: Attention,
     /// The identity add of the attention and feed-forward residuals.
     residual: ScaledResidual,
-    /// `None` on one rank; the exchange otherwise.
-    exchange: Option<UlyssesExchange>,
     hidden_size: u32,
     head_dim: u32,
-    local_heads: u32,
     heads: u32,
     intermediate_size: u32,
     dtype: nn::DType,
@@ -139,7 +119,6 @@ impl RefinerBlock {
         index: u32,
         config: &TransformerConfig,
         rows: u32,
-        partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
         let prefix = format!("token_refiner.refiner_blocks.{index}");
@@ -166,11 +145,10 @@ impl RefinerBlock {
         )?;
         let down = projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?;
 
-        let local_heads = partition.denoiser_heads(config.num_attention_heads);
         let attention = Attention::dense(
             config.head_dim,
-            local_heads,
-            local_heads,
+            config.num_attention_heads,
+            config.num_attention_heads,
             rows,
             false,
             None,
@@ -214,29 +192,19 @@ impl RefinerBlock {
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
             residual: identity(loader, u64::from(config.hidden_size), stream)?,
-            exchange: exchange(partition),
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
-            local_heads,
             heads: config.num_attention_heads,
         })
     }
 
-    /// Refine one rank's row slice of `hidden`, in place.
-    fn forward(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        visible: &Documents,
-        total_rows: u32,
-    ) -> Result<()> {
-        let local_rows = u32::try_from(hidden.shape.dim(0))
+    /// Refine `hidden`, in place.
+    fn forward(&self, f: &Forward, hidden: TensorView, visible: &Documents) -> Result<()> {
+        let row_count = u32::try_from(hidden.shape.dim(0))
             .map_err(|_| Error::checkpoint("a refiner row count above u32::MAX".to_owned()))?;
-        let rows = Rows::reserve(self, f, local_rows, total_rows)?;
+        let rows = Rows::reserve(self, f, row_count)?;
 
-        // Attention: normalize, project every head of this rank's rows, normalize each head's
-        // query and key, trade the row slice for a head shard of the whole sequence, attend, and
-        // trade back.
+        // Attention: normalize, project every head, normalize each head's query and key, attend.
         self.norm1.forward(f, hidden, rows.normed)?;
         self.query.forward(f, rows.normed, rows.query)?;
         self.key.forward(f, rows.normed, rows.key)?;
@@ -247,7 +215,7 @@ impl RefinerBlock {
         // (`RmsNorm::forward` checks the row's extent) - and it refused the whole refiner, which is
         // why no forward of it had ever completed.
         let head = self.head_dim;
-        let heads = self.local_heads;
+        let heads = self.heads;
         self.query_norm.forward(
             f,
             rows.query.reshape(per_head(rows.query, head)),
@@ -259,11 +227,9 @@ impl RefinerBlock {
             rows.key_normed.reshape(per_head(rows.key, head)),
         )?;
 
-        let (query, key, value) = self.exchange(f, &rows)?;
+        let (query, key, value) = (rows.query_normed, rows.key_normed, rows.value);
         // The attention's operands are rank 3 - one axis of tokens, then the heads, then a head's
-        // channels (`ops/src/attention/dense.rs`) - while every buffer here is `[rows, inner]`. The
-        // reshape is by `heads`, which reads the token axis from the view's own element count: the
-        // exchanged path's rows are the whole sequence's and the local path's are this rank's.
+        // channels (`ops/src/attention/dense.rs`) - while every buffer here is `[rows, inner]`.
         self.attention.attend_dense(
             f,
             query.reshape(with_heads(query, heads, head)),
@@ -276,8 +242,7 @@ impl RefinerBlock {
             rows.attended
                 .reshape(with_heads(rows.attended, heads, head)),
         )?;
-        let attended = self.gather(f, rows.attended, &rows)?;
-        self.output.forward(f, attended, rows.update)?;
+        self.output.forward(f, rows.attended, rows.update)?;
         self.residual.forward(f, hidden, rows.update)?;
 
         // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
@@ -288,35 +253,6 @@ impl RefinerBlock {
         self.down.forward(f, rows.ffn, rows.update)?;
         self.residual.forward(f, hidden, rows.update)?;
         Ok(())
-    }
-
-    /// The query, key and value the attention reads: `[rows, local_heads, head_dim]` over the whole
-    /// sequence.
-    fn exchange(&self, f: &Forward, rows: &Rows) -> Result<(TensorView, TensorView, TensorView)> {
-        match &self.exchange {
-            None => Ok((rows.query_normed, rows.key_normed, rows.value)),
-            Some(exchange) => {
-                exchange.scatter(f, rows.query_normed, rows.exchanged_query)?;
-                exchange.scatter(f, rows.key_normed, rows.exchanged_key)?;
-                exchange.scatter(f, rows.value, rows.exchanged_value)?;
-                Ok((
-                    rows.exchanged_query,
-                    rows.exchanged_key,
-                    rows.exchanged_value,
-                ))
-            }
-        }
-    }
-
-    /// Put the attended head shards back together into this rank's rows.
-    fn gather(&self, f: &Forward, attended: TensorView, rows: &Rows) -> Result<TensorView> {
-        match &self.exchange {
-            None => Ok(attended),
-            Some(exchange) => {
-                exchange.gather(f, attended, rows.gathered)?;
-                Ok(rows.gathered)
-            }
-        }
     }
 }
 
@@ -453,7 +389,6 @@ impl TokenRefiner {
     pub fn load(
         config: &TransformerConfig,
         rows: u32,
-        partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
         if config.num_refiner_layers == 0 {
@@ -467,7 +402,7 @@ impl TokenRefiner {
         let bias = vector(loader, "context_embedder.bias", hidden)?;
         let input = Linear::new(weight, Some(bias), WeightOrder::NxK)?;
         let blocks = (0..config.num_refiner_layers)
-            .map(|index| RefinerBlock::load(index, config, rows, partition, loader))
+            .map(|index| RefinerBlock::load(index, config, rows, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             input,
@@ -490,23 +425,16 @@ impl TokenRefiner {
     }
 
     /// Refine `features` `[rows, text_dim]` into `out` `[rows, hidden_size]`.
-    ///
-    /// `total_rows` is the whole packed row count of the batch, which differs from the rows this
-    /// rank holds when the deployment shards the sequence.
     pub fn forward(
         &self,
         f: &Forward,
         features: TensorView,
         visible: &Documents,
-        total_rows: u32,
         out: TensorView,
     ) -> Result<()> {
-        let local_rows = u32::try_from(features.shape.dim(0))
-            .map_err(|_| Error::checkpoint("a refiner row count above u32::MAX".to_owned()))?;
-        if total_rows == 0 || local_rows == 0 || total_rows < local_rows {
-            return Err(Error::checkpoint(format!(
-                "{local_rows} of {total_rows} refiner rows is not a row slice"
-            )));
+        let rows = features.shape.dim(0);
+        if rows == 0 {
+            return Err(Error::checkpoint("a refiner reads at least one row".to_owned()));
         }
         if features.shape.last() != u64::from(self.text_dim) {
             return Err(Error::checkpoint(format!(
@@ -519,11 +447,11 @@ impl TokenRefiner {
         // projection is the same dtype as the features it reads.
         let working = f.arena().tensor(
             features.dtype,
-            Shape::new(&[u64::from(local_rows), u64::from(self.hidden_size)]),
+            Shape::new(&[rows, u64::from(self.hidden_size)]),
         )?;
         self.input.forward(f, features, working)?;
         for block in &self.blocks {
-            block.forward(f, working, visible, total_rows)?;
+            block.forward(f, working, visible)?;
         }
         Ok(self.norm.forward(f, working, out)?)
     }
@@ -539,11 +467,7 @@ struct Rows {
     value: TensorView,
     query_normed: TensorView,
     key_normed: TensorView,
-    exchanged_query: TensorView,
-    exchanged_key: TensorView,
-    exchanged_value: TensorView,
     attended: TensorView,
-    gathered: TensorView,
     update: TensorView,
     packed: TensorView,
     ffn: TensorView,
@@ -554,48 +478,32 @@ struct Rows {
 /// **One statement for the two readers.** The fold reserves these from the denoiser's arena
 /// ([`Rows::reserve`]) and the same arena is sized by the denoiser's plan before any request arrives
 /// (`crate::denoiser::denoise_arena`), so a buffer added here is priced there without a second edit.
-/// The two sizes differ for one buffer: a rank holds `local_rows` rows and the exchange trades them
-/// for a head shard of the whole `total_rows`.
 #[derive(Clone, Copy, Debug)]
 pub struct Scratch {
-    /// `[local_rows, hidden]` the normalized rows.
+    /// `[rows, hidden]` the normalized rows.
     normed: Shape,
     query: Shape,
     key: Shape,
     value: Shape,
     query_normed: Shape,
     key_normed: Shape,
-    exchanged_query: Shape,
-    exchanged_key: Shape,
-    exchanged_value: Shape,
     attended: Shape,
-    gathered: Shape,
     update: Shape,
     packed: Shape,
     ffn: Shape,
 }
 
 impl Scratch {
-    /// The scratch of a block that is `hidden` wide, with `heads` heads of `head_dim` (of which
-    /// `local_heads` are this rank's) and `intermediate` feed-forward columns.
-    pub fn new(
-        hidden: u32,
-        head_dim: u32,
-        heads: u32,
-        local_heads: u32,
-        intermediate: u32,
-        local_rows: u32,
-        total_rows: u32,
-    ) -> Self {
+    /// The scratch of a block that is `hidden` wide, with `heads` heads of `head_dim` and
+    /// `intermediate` feed-forward columns.
+    pub fn new(hidden: u32, head_dim: u32, heads: u32, intermediate: u32, rows: u32) -> Self {
         let hidden = u64::from(hidden);
         let head = u64::from(head_dim);
         let inner = u64::from(heads) * head;
-        let local_inner = u64::from(local_heads) * head;
         // The gate projection's rows hold the checkpoint's two fused halves of one width.
         let packed_width = 2 * u64::from(intermediate);
         let ffn = u64::from(intermediate);
-        let rows = u64::from(local_rows);
-        let total = u64::from(total_rows);
+        let rows = u64::from(rows);
         Self {
             normed: Shape::new(&[rows, hidden]),
             query: Shape::new(&[rows, inner]),
@@ -603,11 +511,7 @@ impl Scratch {
             value: Shape::new(&[rows, inner]),
             query_normed: Shape::new(&[rows, inner]),
             key_normed: Shape::new(&[rows, inner]),
-            exchanged_query: Shape::new(&[total, local_inner]),
-            exchanged_key: Shape::new(&[total, local_inner]),
-            exchanged_value: Shape::new(&[total, local_inner]),
-            attended: Shape::new(&[total, local_inner]),
-            gathered: Shape::new(&[rows, inner]),
+            attended: Shape::new(&[rows, inner]),
             update: Shape::new(&[rows, hidden]),
             packed: Shape::new(&[rows, packed_width]),
             ffn: Shape::new(&[rows, ffn]),
@@ -615,7 +519,7 @@ impl Scratch {
     }
 
     /// Every buffer in reservation order, named as a plan names it.
-    pub fn entries(&self) -> [(&'static str, Shape); 14] {
+    pub fn entries(&self) -> [(&'static str, Shape); 10] {
         [
             ("normed", self.normed),
             ("query", self.query),
@@ -623,18 +527,14 @@ impl Scratch {
             ("value", self.value),
             ("query_normed", self.query_normed),
             ("key_normed", self.key_normed),
-            ("exchanged_query", self.exchanged_query),
-            ("exchanged_key", self.exchanged_key),
-            ("exchanged_value", self.exchanged_value),
             ("attended", self.attended),
-            ("gathered", self.gathered),
             ("update", self.update),
             ("packed", self.packed),
             ("ffn", self.ffn),
         ]
     }
 
-    /// The elements all fourteen hold.
+    /// The elements all ten hold.
     pub fn elements(&self) -> u64 {
         self.entries()
             .iter()
@@ -644,21 +544,14 @@ impl Scratch {
 }
 
 impl Rows {
-    fn reserve(
-        block: &RefinerBlock,
-        f: &Forward,
-        local_rows: u32,
-        total_rows: u32,
-    ) -> Result<Self> {
+    fn reserve(block: &RefinerBlock, f: &Forward, rows: u32) -> Result<Self> {
         let dtype = block.dtype;
         let scratch = Scratch::new(
             block.hidden_size,
             block.head_dim,
             block.heads,
-            block.local_heads,
             block.intermediate_size,
-            local_rows,
-            total_rows,
+            rows,
         );
         let arena = f.arena();
         Ok(Self {
@@ -668,11 +561,7 @@ impl Rows {
             value: arena.tensor(dtype, scratch.value)?,
             query_normed: arena.tensor(dtype, scratch.query_normed)?,
             key_normed: arena.tensor(dtype, scratch.key_normed)?,
-            exchanged_query: arena.tensor(dtype, scratch.exchanged_query)?,
-            exchanged_key: arena.tensor(dtype, scratch.exchanged_key)?,
-            exchanged_value: arena.tensor(dtype, scratch.exchanged_value)?,
             attended: arena.tensor(dtype, scratch.attended)?,
-            gathered: arena.tensor(dtype, scratch.gathered)?,
             update: arena.tensor(dtype, scratch.update)?,
             packed: arena.tensor(dtype, scratch.packed)?,
             ffn: arena.tensor(dtype, scratch.ffn)?,
@@ -699,14 +588,6 @@ fn with_heads(view: TensorView, heads: u32, head_dim: u32) -> Shape {
 /// The attention scale of one head: `1 / sqrt(head_dim)`.
 fn scaling(head_dim: u32) -> f32 {
     1.0 / (head_dim as f32).sqrt()
-}
-
-/// The exchange of a partition's sequence degree, absent when one rank holds the sequence.
-fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
-    match partition.ulysses_degree {
-        1 => None,
-        degree => UlyssesExchange::new(degree as u64).ok(),
-    }
 }
 
 /// The identity residual: every channel's update added unchanged.
@@ -794,12 +675,5 @@ mod tests {
         // Both views hold the buffer's own elements: a reshape, not a copy or a second allocation.
         assert_eq!(normed.numel(), flat.shape.numel());
         assert_eq!(attended.numel(), flat.shape.numel());
-        // And the head count the norm's rows carry is the projection's, not a deployment constant:
-        // under Ulysses the exchanged buffer is the whole sequence's rows of this rank's heads.
-        let exchanged = view(&[rows * 3, (heads / 2) * head]);
-        assert_eq!(
-            per_head(exchanged, head as u32).dims(),
-            &[rows * 3 * heads / 2, head]
-        );
     }
 }

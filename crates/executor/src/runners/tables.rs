@@ -142,7 +142,8 @@ impl Tables {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .allocator()
-                .allocate(TABLE_POOL, bytes.len())?;
+                // A rank may own none of a modality's rows, and an allocation is never empty.
+                .allocate(TABLE_POOL, bytes.len().max(1))?;
             allocated.push((*table, buffer));
         }
         for ((table, buffer), host) in allocated.into_iter().zip(host) {

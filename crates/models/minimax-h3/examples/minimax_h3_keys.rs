@@ -388,20 +388,6 @@ fn main() {
             other => panic!("unknown flag {other}"),
         }
     }
-    // **A sparse deployment has no Ulysses degree in this port**, and the walk says so rather than
-    // emitting rows for a launch the model refuses: `AttentionSparse::new` declines a degree above one
-    // because the compression's cross-rank composition is not written, so every `vsa_*` row this file
-    // can produce is a row for a single-rank launch. A walk that emitted the same descriptors under a
-    // sharded header would describe a deployment that cannot load, and a store built from it would
-    // hold programs for a launch that never happens.
-    if sparse && ulysses > 1 {
-        panic!(
-            "a sparse deployment at a Ulysses degree of {ulysses} has no program to enumerate: the \
-             sparse attention refuses a degree above one, because the compression's cross-rank \
-             composition is not written - a store for that deployment would hold rows for a launch \
-             the model would not perform"
-        );
-    }
     if rasters.is_empty() {
         rasters = minimax_h3::NAMED_CANVASES
             .iter()
@@ -532,9 +518,19 @@ fn main() {
     // states the released defaults and gives a bound no conditioned request asks for. Two rows are
     // reachable only at the bound (the gated activation's `wide` form switches on the row count), and
     // the header states it.
+    // The reference task where the checkpoint states it, because it reserves the most rows; an
+    // export that states only others is sized by the last of them.
+    let stated = config.tasks();
+    let widest = if stated.contains(&nn::VideoTask::ReferenceToVideoAudio) {
+        nn::VideoTask::ReferenceToVideoAudio
+    } else {
+        *stated
+            .last()
+            .unwrap_or_else(|| panic!("the checkpoint states no task"))
+    };
     let serving = minimax_h3::Partition::serving(
         &config,
-        nn::VideoTask::ReferenceToVideoAudio,
+        widest,
         minimax_h3::partition::Ulysses::of(ulysses, minimax_h3::partition::Projection::Exchange),
         tensor_parallel,
         0,
@@ -681,6 +677,11 @@ fn main() {
         match deployment.denoiser_rows(&partition, &arrangement) {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
+        }
+        // The text stack at the deployment's tensor degree: its heads and widths are a rank's.
+        match deployment.text_rows(&partition, &[text_tokens.unwrap_or(1024)]) {
+            Ok(stated) => lines.extend(stated),
+            Err(error) => panic!("the text encoder states no rows: {error}"),
         }
     }
     let audio = &config.audio_vae;
@@ -939,9 +940,13 @@ fn deployment_bound(
 ) -> u32 {
     let mut bound = 0u32;
     for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
+        // An export holds the networks of the tasks it states, and only those reach a bound.
         let Some(dies) = config.denoisers.get(&dit) else {
-            panic!("this checkpoint holds no {} network", dit.directory());
+            continue;
         };
+        if !config.tasks().contains(&task) {
+            continue;
+        }
         let mut network = dies.clone();
         if let Some(kind) = &sparse {
             network.attention = *kind;

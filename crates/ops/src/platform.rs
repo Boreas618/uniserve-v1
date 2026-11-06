@@ -144,28 +144,6 @@ pub(crate) fn copy_bytes(
     Ok(())
 }
 
-/// A device-to-device all-to-all of `count` elements per rank through `communicator`.
-///
-/// # Safety
-///
-/// `send` and `receive` address `count` elements of `dtype` for each rank, bytes that stay valid
-/// until the collective completes.
-pub(crate) fn all_to_all(
-    communicator: &mut Communicator,
-    send: DevicePtr,
-    receive: DevicePtr,
-    count: usize,
-    dtype: CollectiveType,
-    stream: &Stream,
-) -> crate::Result<()> {
-    let bytes = dtype.bytes() * count;
-    let send = DeviceRange::new(PlatformDevicePtr::from_address(send.address()), bytes);
-    let receive = DeviceRange::new(PlatformDevicePtr::from_address(receive.address()), bytes);
-    communicator
-        .all_to_all(stream, send, receive, count, dtype)
-        .map_err(crate::Error::Platform)
-}
-
 /// The collective element type for one of `ops`' element types, when NCCL speaks it.
 ///
 /// A sub-byte type has no collective counterpart: it travels inside a program's own encoded layout,
