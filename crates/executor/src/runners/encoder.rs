@@ -470,7 +470,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch(bucket)?;
         let forward = nn::Forward::new(&stream, generation, &arena);
