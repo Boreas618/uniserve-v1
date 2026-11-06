@@ -107,6 +107,9 @@ pub enum Product {
     /// a conditioner reads the first, the muxer's audio encode reads the second, and a store that
     /// gave them one name would let a `ref2va` request read its input as its output.
     Track,
+    /// The last frames of decoded clip `n`, `[channels, frames, rows, columns]`, which clip `n + 1`
+    /// fades against. It is a product because the two clips may be decoded on different ranks.
+    Tail(u32),
 }
 
 impl Product {
@@ -121,6 +124,7 @@ impl Product {
             Self::AudioLatents => "audio latents",
             Self::Video(_) => "video",
             Self::Track => "track",
+            Self::Tail(_) => "tail",
         }
     }
 }
@@ -333,6 +337,112 @@ pub fn absent(request: RequestKey, kind: Product) -> crate::Error {
 /// request ends it here; the entries are views, so what leaks is bookkeeping and not memory.
 pub struct Held {
     entries: Mutex<HashMap<(RequestKey, Product), Placed>>,
+}
+
+/// The products of a group of ranks: each rank's own, and the ones a rank makes for another.
+///
+/// The ranks of a parallel group compute one block together and each holds the result, so a rank's
+/// conditioning and trajectory are its own bytes on its own device under the name every rank
+/// publishes: one store for the group would hold the last rank's region under it. What one rank
+/// produces for another - a clip's frames, its tail, the track - is named once and read by whichever
+/// rank reads it, so those are shared.
+pub struct GroupProducts {
+    ranks: Vec<Held>,
+    shared: Held,
+}
+
+impl GroupProducts {
+    /// The store of a group of `ranks` ranks.
+    pub fn new(ranks: usize) -> Arc<Self> {
+        Arc::new(Self {
+            ranks: (0..ranks).map(|_| Held::new()).collect(),
+            shared: Held::new(),
+        })
+    }
+}
+
+/// One rank's view of its group's products.
+pub struct RankProducts {
+    group: Arc<GroupProducts>,
+    rank: usize,
+}
+
+impl RankProducts {
+    /// The view of rank `rank` of `group`.
+    pub fn new(group: Arc<GroupProducts>, rank: usize) -> Self {
+        Self { group, rank }
+    }
+
+    /// The store that holds `kind` for this rank.
+    fn store(&self, kind: Product) -> &Held {
+        match kind {
+            Product::Video(_) | Product::Track | Product::Tail(_) => &self.group.shared,
+            _ => &self.group.ranks[self.rank],
+        }
+    }
+}
+
+impl Products for RankProducts {
+    fn publish(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        device: DeviceId,
+        stream: StreamId,
+        written: Option<Arc<Event>>,
+        view: &TensorView,
+    ) -> Result<()> {
+        self.store(kind)
+            .publish(request, kind, device, stream, written, view)
+    }
+
+    fn borrow(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        device: DeviceId,
+        stream: StreamId,
+    ) -> Result<Option<TensorView>> {
+        self.store(kind).borrow(request, kind, device, stream)
+    }
+
+    fn holds(&self, request: RequestKey, kind: Product) -> bool {
+        self.store(kind).holds(request, kind)
+    }
+
+    fn product(&self, request: RequestKey, kind: Product) -> Result<Option<Published>> {
+        self.store(kind).product(request, kind)
+    }
+
+    fn copy_into(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        destination: &TensorView,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        self.store(kind).copy_into(request, kind, destination, stream)
+    }
+
+    fn stage(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        out: &platform::PinnedBuffer,
+        stream: &platform::Stream,
+    ) -> Result<bool> {
+        self.store(kind).stage(request, kind, out, stream)
+    }
+
+    fn forget(&self, request: RequestKey) -> usize {
+        let own: usize = self
+            .group
+            .ranks
+            .iter()
+            .map(|rank| rank.forget(request))
+            .sum();
+        own + self.group.shared.forget(request)
+    }
 }
 
 /// One product's region and the write that filled it.

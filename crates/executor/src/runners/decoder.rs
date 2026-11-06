@@ -47,6 +47,9 @@ use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
+/// How long a clip waits for its predecessor's tail before it names the rank that never answered.
+const TAIL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The channels of a decoded raster: red, green and blue, whatever the latents carry.
 const RASTER_CHANNELS: u32 = 3;
 
@@ -157,13 +160,14 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// Sized at bind for the bucket's own clip raster, which no splice exceeds - a splice keeps at
     /// most the frames the decoder wrote, since the tail it adds is a subset of them.
     frames: Option<Column>,
-    /// The predecessor clip's tail, `[channels, overlap, rows, columns]` in the model's type, which
-    /// the next clip's five-frame fade reads. Sized on the first splice from the schedule's own
-    /// overlap count, which is the model's number rather than this runner's, and reused after.
+    /// The tails this runner's clips leave, one `[channels, overlap, rows, columns]` slot per clip of
+    /// the timeline in the model's type, which the next clip's five-frame fade reads. Sized on the
+    /// first splice from the schedule's own overlap count, which is the model's number rather than
+    /// this runner's, and reused after.
     tail: Option<Column>,
-    /// How many clips of each request's timeline this runner has spliced, which is where the next
-    /// splice starts.
-    spliced: std::collections::HashMap<ipc::RequestKey, u32>,
+    /// The predecessor clip's tail, copied from the store: the clip before this one may have been
+    /// decoded by another rank.
+    incoming: Option<Column>,
     /// The frames the staged request's timeline holds, from its own row
     /// (`StagedRequest::frames`): the schedule's length, which is what the last clip's keep depends
     /// on.
@@ -277,7 +281,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             postprocessor,
             frames: None,
             tail: None,
-            spliced: std::collections::HashMap::new(),
+            incoming: None,
             staged_frames: None,
             staged_keep: None,
             diag: crate::runners::diag::Diag::from_env(),
@@ -587,6 +591,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         clip_is_releasable(request, self.published_for, still_held)?;
         self.staged_request = Some(request);
         self.staged_frames = Some(media.request(0)?.frames);
+        self.staged_unit = media.request(0)?.unit;
         self.size_timeline(bucket, media.request(0)?.frames)?;
         // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
         // is the request's conditioning blob and its parameter record; the latent trajectory is
@@ -671,8 +676,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // The trajectory is `[channels, voxels]` of the whole timeline, and the block the model reads
         // is `[rows, channels]` of one clip's window in its own row order, so this crossing also
         // takes the window and lays it out.
-        let clip = self.spliced.get(&request).copied().unwrap_or(0);
-        let first = self.model.clip_start(clip);
+        let first = self.model.clip_start(self.staged_unit);
         let block = self.block_of(&layout, &converted, first)?;
         self.columns.latents.write(&block)?;
         Ok(())
@@ -946,7 +950,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 request.request_id.0
             ))
         })?;
-        let index = self.spliced.get(&request).copied().unwrap_or(0);
+        let index = self.staged_unit;
         let schedule = postprocessor.splices(frames).map_err(|error| {
             Error::Invalid(format!(
                 "request {} asked for a timeline of {frames} frame(s) and the postprocessor serves \
@@ -972,19 +976,12 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // its **successor's**: the timeline's first clip fades nothing and still owes the second clip
         // its tail, and the last clip has no one to hand one to.
         let successor = tail_for_successor(&schedule, index);
-        self.size_tail(channels, height, width, successor)?;
-        let previous = match self.tail.as_ref() {
-            Some(tail) if splice.overlap > 0 => Some(TensorView::new(
-                tail.device.ptr,
-                self.dtype,
-                Shape::new(&[
-                    u64::from(channels),
-                    u64::from(splice.overlap),
-                    u64::from(height),
-                    u64::from(width),
-                ]),
-            )),
-            _ => None,
+        let overlap = successor.max(splice.overlap);
+        self.size_tail(channels, height, width, overlap, schedule.len() as u32)?;
+        let previous = if splice.overlap > 0 {
+            Some(self.predecessor_tail(request, index, channels, height, width, splice.overlap)?)
+        } else {
+            None
         };
         let clip = self.raster(bucket, layout)?;
         if self.diag.enabled() {
@@ -1034,26 +1031,27 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
-        self.keep_tail(&clip, channels, height, width, successor)?;
-        // The timeline's last clip has no successor, so the request's place in it ends here: a
-        // decode after it would be a clip the timeline does not hold, which the schedule refuses
-        // above by naming the count.
-        if index + 1 == schedule.len() as u32 {
-            self.spliced.remove(&request);
-        } else {
-            self.spliced.insert(request, index + 1);
-        }
+        self.keep_tail(request, index, &clip, channels, height, width, successor)?;
         self.staged_keep = Some(splice.keep);
         self.staged_first = splice.first;
-        self.staged_unit = index;
         Ok(())
     }
 
-    /// Sizes the tail column for an overlap of `overlap` frames, the first time one is needed.
+    /// Sizes the tail columns for an overlap of `overlap` frames and a timeline of `clips` clips, the
+    /// first time they are needed.
     ///
     /// The count is the schedule's, not this runner's: a timeline whose fade reads five frames and one
-    /// that reads ten are one formula apart in the block and one column here.
-    fn size_tail(&mut self, channels: u32, height: u32, width: u32, overlap: u32) -> Result<()> {
+    /// that reads ten are one formula apart in the block and one column here. **Each clip keeps its
+    /// own slot**, because a rank's next clip is decoded while its neighbour may still be reading the
+    /// last one's tail.
+    fn size_tail(
+        &mut self,
+        channels: u32,
+        height: u32,
+        width: u32,
+        overlap: u32,
+        clips: u32,
+    ) -> Result<()> {
         if overlap == 0 {
             return Ok(());
         }
@@ -1062,23 +1060,86 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             .and_then(|elements| elements.checked_mul(u64::from(height)))
             .and_then(|elements| elements.checked_mul(u64::from(width)))
             .ok_or_else(|| Error::Invalid("a clip's tail extent overflows".into()))?;
+        let slots = elements
+            .checked_mul(u64::from(clips))
+            .ok_or_else(|| Error::Invalid("a timeline's tails overflow".into()))?;
         if self
             .tail
             .as_ref()
+            .is_none_or(|column| column.device.numel() < slots)
+        {
+            self.tail = Some(Column::new(self.device, self.dtype, slots)?);
+        }
+        if self
+            .incoming
+            .as_ref()
             .is_none_or(|column| column.device.numel() < elements)
         {
-            self.tail = Some(Column::new(self.device, self.dtype, elements)?);
+            self.incoming = Some(Column::new(self.device, self.dtype, elements)?);
         }
         Ok(())
     }
 
-    /// Keeps the clip's last `overlap` frames for the next clip's fade.
+    /// The tail clip `index` fades against, which its predecessor's rank published.
+    ///
+    /// The predecessor may be on another rank, decoding at the same time, so this waits for the
+    /// publication. A decode needs nothing but its own latents, so no rank waits on one that waits
+    /// on it, and the wait is bounded by one decode; the bound here names a rank that never answers.
+    fn predecessor_tail(
+        &self,
+        request: ipc::RequestKey,
+        index: u32,
+        channels: u32,
+        height: u32,
+        width: u32,
+        overlap: u32,
+    ) -> Result<TensorView> {
+        let store = self
+            .products
+            .as_ref()
+            .ok_or_else(|| crate::runners::products::no_store(request))?;
+        let incoming = self.incoming.as_ref().ok_or_else(|| {
+            Error::Invariant("a clip fades and no incoming tail column was sized".into())
+        })?;
+        let view = TensorView::new(
+            incoming.device.ptr,
+            self.dtype,
+            Shape::new(&[
+                u64::from(channels),
+                u64::from(overlap),
+                u64::from(height),
+                u64::from(width),
+            ]),
+        );
+        let kind = Product::Tail(index - 1);
+        let deadline = std::time::Instant::now() + TAIL_WAIT;
+        while !store.holds(request, kind) {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Invalid(format!(
+                    "request {} waited {} s for the tail of clip {} and its rank published none",
+                    request.request_id.0,
+                    TAIL_WAIT.as_secs(),
+                    index - 1
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        if !store.copy_into(request, kind, &view, &self.stream)? {
+            return Err(crate::runners::products::absent(request, kind));
+        }
+        Ok(view)
+    }
+
+    /// Keeps the clip's last `overlap` frames for the next clip's fade, and publishes them.
     ///
     /// The tail is one contiguous run per channel of the clip's own raster (`[channels, frames, rows,
     /// columns]`), so this is `channels` copies on the runner's stream and no arithmetic. It has to
     /// happen before the next decode, which writes over the clip's column.
+    #[allow(clippy::too_many_arguments)]
     fn keep_tail(
         &self,
+        request: ipc::RequestKey,
+        index: u32,
         clip: &TensorView,
         channels: u32,
         height: u32,
@@ -1109,9 +1170,10 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let stride = u64::from(overlap)
             .saturating_mul(u64::from(height))
             .saturating_mul(u64::from(width));
+        let slot = u64::from(index) * u64::from(channels) * stride;
         for channel in 0..u64::from(channels) {
             let source = clip.element(&[channel, start, 0, 0]);
-            let destination = tail.device.element(&[channel * stride]);
+            let destination = tail.device.element(&[slot + channel * stride]);
             // SAFETY: both regions are this runner's own buffers, the source's run of `bytes` lies
             // inside the clip's raster (its frames axis is at least `overlap` long) and the
             // destination's inside the tail column, sized for exactly this overlap; the copy is
@@ -1125,7 +1187,28 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 )?;
             }
         }
-        Ok(())
+        let store = self
+            .products
+            .as_ref()
+            .ok_or_else(|| crate::runners::products::no_store(request))?;
+        let published = TensorView::new(
+            tail.device.element(&[slot]),
+            self.dtype,
+            Shape::new(&[
+                u64::from(channels),
+                u64::from(overlap),
+                u64::from(height),
+                u64::from(width),
+            ]),
+        );
+        store.publish(
+            request,
+            Product::Tail(index),
+            self.device,
+            self.stream_id(),
+            Some(crate::runners::products::written_on(&self.stream)?),
+            &published,
+        )
     }
 
     /// The frames the splice wrote, `[frames, rows, columns, 3]` bytes, as the product states them.

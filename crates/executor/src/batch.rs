@@ -373,9 +373,9 @@ impl MediaColumns {
 /// A staged request is two buffers, in this order:
 ///
 /// - **0**, the conditioning blob, byte for byte as `DiffusionRequest::conditioning` holds it;
-/// - **1**, fifty-six bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
+/// - **1**, sixty bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
 ///   `height: u32`, `frames: u32`, then the identity - `engine_id: u64`, `request_id: u64`,
-///   `request_epoch: u64` - and `handed: u32`.
+///   `request_epoch: u64` - and `handed: u32` and `unit: u32`.
 ///
 /// Little-endian and fixed width so that a worker and an engine of different architectures read one
 /// record, and so that a runner reads offsets rather than a parser.
@@ -410,6 +410,9 @@ pub struct StagedRequest {
     /// The encoded rounds this call hands over, which only a muxing call states: the final muxing
     /// call hands none, and that is what makes it the one that finishes the artifact.
     pub handed: u32,
+    /// The first timeline unit a unit-measured call covers: the clip a video decode is. Zero for
+    /// every other call.
+    pub unit: u32,
 }
 
 impl StagedRequest {
@@ -426,6 +429,7 @@ impl StagedRequest {
         record.extend_from_slice(&self.request.request_id.0.to_le_bytes());
         record.extend_from_slice(&self.request.request_epoch.to_le_bytes());
         record.extend_from_slice(&self.handed.to_le_bytes());
+        record.extend_from_slice(&self.unit.to_le_bytes());
         vec![self.conditioning.clone(), record]
     }
 
@@ -445,8 +449,8 @@ impl StagedRequest {
             // handed over. What the reader needs is which record this is and what arrived.
             return Err(Error::Invalid(format!(
                 "a media request's parameter record is step, steps, seed, width, height, frames, \
-                 the request's three identities and the rounds it hands over; this one is {} \
-                 bytes, which is not that shape",
+                 the request's three identities, the rounds it hands over and its first unit; this \
+                 one is {} bytes, which is not that shape",
                 record.len()
             )));
         }
@@ -475,13 +479,15 @@ impl StagedRequest {
             height: word(20),
             frames: word(24),
             handed: word(52),
+            unit: word(56),
         })
     }
 }
 
 /// The width of a staged request's parameter record: `step`, `steps`, `seed`, `width`, `height` and
-/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`), then `handed`.
-const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8) + 4;
+/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`), then `handed`
+/// and `unit`.
+const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8) + 4 + 4;
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
@@ -913,6 +919,30 @@ impl Executors {
             })
     }
 
+    /// The one device a unit-measured call runs on, when `batch` is one.
+    ///
+    /// A video decode is one unit of the timeline and needs no other unit, so the devices that serve
+    /// the phase take the units in turn instead of each decoding the same one: a device's clip is
+    /// independent of its neighbours' but for the tail the decoder hands across.
+    fn device_of_unit(&self, batch: &Batch) -> Result<Option<&Arc<crate::device::Executor>>> {
+        let Some(media) = &batch.media else {
+            return Ok(None);
+        };
+        if media.computation.call != ipc::MediaCall::VideoDecoding {
+            return Ok(None);
+        }
+        let serving: Vec<&Arc<crate::device::Executor>> = self
+            .executors
+            .iter()
+            .filter(|executor| executor.serves(batch.phase))
+            .collect();
+        if serving.is_empty() {
+            return Err(route_refusal(batch.phase, &[]));
+        }
+        let unit = media.request(0)?.unit as usize;
+        Ok(Some(serving[unit % serving.len()]))
+    }
+
     /// Hands `batch` to every device that serves its phase, as one submission.
     fn on_every_device(
         &self,
@@ -972,7 +1002,10 @@ impl Batches for Executors {
     }
 
     fn submit(&self, batch: Batch) -> Result<Submission> {
-        self.on_every_device(batch, |executor, batch| executor.submit(batch))
+        match self.device_of_unit(&batch)? {
+            Some(executor) => executor.submit(batch),
+            None => self.on_every_device(batch, |executor, batch| executor.submit(batch)),
+        }
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission> {
@@ -1241,6 +1274,30 @@ impl std::fmt::Debug for SubmissionState {
 }
 
 #[cfg(test)]
+mod joined_tests {
+    use super::*;
+
+    fn done(id: u64) -> Submission {
+        Submission::completed(SubmissionId(id), Outcome::Success(BatchOutput::default()))
+    }
+
+    /// A batch a group runs together has ended when every rank's part ended, and the rank that
+    /// failed decides the answer: the others' output lacks its part.
+    #[test]
+    fn a_joined_submission_waits_for_every_rank_and_answers_a_peers_failure() {
+        let (pending, state) = Submission::pending(SubmissionId(2));
+        let joined = done(1).joined(vec![pending]);
+        assert!(joined.outcome().is_none(), "a peer has not ended");
+        state.finish(Outcome::Failed(Arc::new(Error::State("a peer failed"))));
+        assert!(matches!(joined.outcome(), Some(Outcome::Failed(_))));
+        assert!(matches!(joined.wait(), Outcome::Failed(_)));
+
+        let joined = done(3).joined(vec![done(4), done(5)]);
+        assert!(matches!(joined.wait(), Outcome::Success(_)));
+    }
+}
+
+#[cfg(test)]
 mod media_tests {
     use super::*;
     use crate::plan::{Computation, Extent, Variant};
@@ -1348,6 +1405,7 @@ mod media_tests {
     #[test]
     fn a_staged_request_is_the_conditioning_blob_and_its_parameter_record() {
         let staged = StagedRequest {
+            unit: 0,
             request: ipc::RequestKey::new(7, ipc::RequestId(41), 3),
             conditioning: vec![9, 8, 7],
             step: 3,

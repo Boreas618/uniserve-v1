@@ -107,7 +107,7 @@ use executor::memory::Memory;
 use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
 use executor::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
-use executor::runners::products::Held;
+use executor::runners::products::{GroupProducts, RankProducts};
 use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
@@ -1065,7 +1065,9 @@ impl MainProcess {
             .first()
             .map(|rank| rank.plan.scheduled())
             .context("this process serves no rank")?;
-        for rank in ranks {
+        // The group's products, which every rank's runners reach through their own view of them.
+        let group_products = GroupProducts::new(ranks.len());
+        for (rank_index, rank) in ranks.into_iter().enumerate() {
             let LoadedRank {
                 plan: rank_plan,
                 client,
@@ -1086,11 +1088,9 @@ impl MainProcess {
             // The shadow region alone: the twins allocate it, and the reservation beside it holds
             // the state group's snapshot too (7.3, 4.5).
             let shadow = graph.shadow;
-            // A rank's products are its own: the group's encoders each write the rows their rank's
-            // denoiser reads, on their own device, so a store shared by the group would hold one
-            // rank's copy under the name the others read.
-            let products: Arc<dyn executor::runners::products::Products> =
-                Arc::new(Held::new());
+            let products: Arc<dyn executor::runners::products::Products> = Arc::new(
+                RankProducts::new(Arc::clone(&group_products), rank_index),
+            );
             for device in rank_plan.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
                 let runners = rank_plan.runners(
@@ -2413,9 +2413,11 @@ impl MainProcess {
             let ordinal = executor.device();
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
-            let Some(target) = self.targets.get(index).cloned() else {
+            // `targets` holds each distinct architecture once, so a device's own is read from it.
+            let target = crate::engine_plan::target_of(&device);
+            if !self.targets.contains(&target) {
                 return Err(invalid(format!("device {} has no build target", ordinal.0)));
-            };
+            }
             // One request per package, in the store's own order so two runs ask alike.
             let requests: Vec<PrepareRequest> = groups
                 .values()
