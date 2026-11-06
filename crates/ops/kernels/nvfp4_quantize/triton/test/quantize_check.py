@@ -307,7 +307,7 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
 
     # The global scale is a device operand: one FP32 element, as the operator passes it.
     scale = torch.tensor([global_scale], dtype=torch.float32, device="cuda")
-    # One program per row: the row's factor is a reduction over the row.
+    # One program per row.
     token_scale = torch.zeros(rows, dtype=torch.float32, device="cuda")
     module.launch((rows, 1, 1), source, values, scales, rows, scale, token_scale)
 
@@ -362,9 +362,9 @@ def stage_zero_row(module, rows, columns, block, layout, global_scale, seed):
     """A row whose values are all zero encodes to zeros with a finite factor.
 
     Not a rounding case, and the rest of the check cannot see it: every other stage
-    feeds `randn`, and a zero row's amax is 0, so its factor is 0 and the encoder's
-    reciprocal of it is infinite — the block scale becomes a NaN-E4M3 byte and the
-    codes NaN. A deployment reaches it wherever a bucket carries padded rows (a
+    feeds `randn`, and a zero row's blocks have an amax of 0, so their E4M3 scale is 0
+    and the reciprocal of it is infinite, which would make the codes NaN. A deployment
+    reaches it wherever a bucket carries padded rows (a
     prefill's tail), and a NaN row in the cache poisons every later attention step,
     which is how it reaches a logits row that is not a number.
     """

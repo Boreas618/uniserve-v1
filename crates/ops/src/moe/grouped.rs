@@ -679,8 +679,8 @@ pub struct GatherGemmNvfp4Args {
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[2, experts]` f32, contiguous: the reciprocals of each expert's tensor scales, one **per
-    /// projection** in the fused reading order — row 0 is the value half (up), row 1 the gate half. A
+    /// `[2, experts]` f32, contiguous: each expert's tensor scales, one **per projection** in the
+    /// fused reading order — row 0 is the value half (up), row 1 the gate half. A
     /// checkpoint carries two separate per-expert scalar tables, and the product's kernel reads each
     /// as its own array of `experts` floats, so the two halves are two *rows* here and not an
     /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
@@ -1362,8 +1362,7 @@ pub struct RouteGemmNvfp4Args {
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale, one **per projection** — this
-    /// product fuses a single projection, so the table is one array of `experts` floats, the shape a
+    /// `[experts]` f32: each expert's tensor scale, one **per projection** — this product fuses a single projection, so the table is one array of `experts` floats, the shape a
     /// reader that indexes `array[expert]` takes.
     pub global_scale: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
