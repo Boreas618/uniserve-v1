@@ -208,7 +208,7 @@ impl ExecutorRegistry {
             } = registration;
             anyhow::ensure!(
                 version == VERSION,
-                "rank {rank} of worker {worker_id} is build {version} and the engine is build \
+                "rank {rank} of executor {worker_id} is build {version} and the engine is build \
                  {VERSION}; reinstall so that both run the same build"
             );
             let current = self.generations.get(&worker_id).copied();
@@ -288,7 +288,7 @@ pub(crate) fn collect(
             // wait can see, so a silent wait is a canary for the event path
             // rather than a mystery about registration.
             anyhow::bail!(
-                "ranks {missing:?} of worker {worker_id} did not register within {}s, and this \
+                "ranks {missing:?} of executor {worker_id} did not register within {}s, and this \
                  engine was told of no exit for them: either they are alive but silent, or the \
                  launch's exit events never arrived",
                 REGISTRATION_TIMEOUT.as_secs()
