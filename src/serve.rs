@@ -44,11 +44,16 @@ async fn serve(args: daemon::options::ServeArgs) -> Result<()> {
     // configured. Followers join the leader without loading a model.
     if config.leads() && config.model.is_none() {
         info!(
-            host = %config.server_config.host,
-            port = config.server_config.port,
+            host = %config.admin_config.host,
+            port = config.admin_config.port,
             "serving no deployment until PUT /admin/config"
         );
-        return daemon::node(config.server_config, crate::shutdown_signal()).await;
+        return daemon::node(
+            config.admin_config,
+            config.server_config,
+            crate::shutdown_signal(),
+        )
+        .await;
     }
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
