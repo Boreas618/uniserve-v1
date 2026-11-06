@@ -1,10 +1,13 @@
 #!/bin/sh
-# Re-cut the two H3 deployment fixtures from the walk, and certify both.
+# Re-cut the H3 deployment fixture from the walk, and certify both deployments against it.
 #
-# A fixture is one deployment's rows: the dense walk and the sparse one, each at the deployment's own
-# bounds and each component's own element type. Both are produced here from `minimax-h3`'s own
-# enumeration, so a fixture cannot disagree with the walk about what the model launches — the failure
-# this lane has hit most often.
+# One file holds the rows: the video-sparse deployment's, which are a superset of the dense one's, so
+# one store built from it serves either deployment. The two walks are both run and both certified -
+# the sparse one for the rows the file states, the dense one for the fact that its own rows are a
+# subset rather than that the file says less than a run launches - each at its deployment's own bounds
+# and each component's own element type. Rows come from `minimax-h3`'s own enumeration, so a fixture
+# cannot disagree with the walk about what the model launches — the failure this lane has hit most
+# often.
 #
 # Usage:
 #   tools/recut_h3_fixtures.sh <checkpoint root> <element-types json> [<commit>]
@@ -14,8 +17,8 @@
 #                         e.g. artifacts/h3-reference/component-tensors.json
 #   <commit>              the revision the rows are stamped with; defaults to HEAD
 #
-# Everything is written to a staging directory first and only moved into `notes/programs/` once both
-# files certify, so an interrupted run leaves the checked-in fixtures untouched rather than half
+# Everything is written to a staging directory first and only moved into `notes/programs/` once the
+# cut certifies, so an interrupted run leaves the checked-in fixture untouched rather than half
 # replaced.
 
 set -eu

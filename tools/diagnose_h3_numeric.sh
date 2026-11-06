@@ -6,11 +6,13 @@
 # own layer does not explain. Nothing here fails a build; a non-zero exit means an artifact could
 # not be produced, never that a number is bad.
 #
-# Stage 1 is the text encoder (prompt -> hidden), stage 2 the denoiser's blocks, stage 3 the sampler
-# (the sigma ladder the denoiser steps along), stage 4 the video encoder's rows and stage 5 the
-# conditioned path (`fl2va`) that binds it. Stages 4 and 5 compare **the encoder's own rows**, not
-# the projected prefix: a difference past the projection cannot say whether the encoder or the
-# projection made it.
+# The stages are the canon's (`notes/h3/diagnosis.md`), and a number is quoted with its name: stage 1
+# is the text encoder (prompt -> hidden), stage 2 the video decoder, stage 3 the sampler (the sigma
+# ladder the denoiser steps along), stage 4 the video encoder and stage 5 the conditioned path
+# (`fl2va`) that binds it. **The denoiser's own blocks have no canon number**: stage 3 exercises them
+# at its ladder's sigmas, so this script names them by name and never "stage 2". Stages 4 and 5
+# compare **the encoder's own rows**, not the projected prefix: a difference past the projection
+# cannot say whether the encoder or the projection made it.
 #
 # Usage:
 #   tools/diagnose_h3_numeric.sh <checkpoint root> [<out dir>]
@@ -51,7 +53,7 @@ tail -3 "$run/schedule-compare.txt" | sed 's/^/   /'
 # 2. Stage 1: the text encoder. The load's own name check runs anywhere the index is; the numeric
 #    half needs the shards and a device, so its two commands are printed rather than run.
 echo
-echo "== stage 1: the load's name check"
+echo "== before stage 1: the load's name check (a precondition of stage 1, not a stage)"
 cargo run -q -p minimax-h3 --example encoder -- \
     --stage weights --root "$root" 2>&1 | grep -E '^(names|io):' | sed 's/^/   /' || true
 
@@ -75,12 +77,13 @@ Recorded here rather than run because this host has the text encoder's index and
 the load's name check passes (see above) and the first payload read stops.
 COMMANDS
 sed 's/^/   /' "$run/stage1-commands.txt" | head -3
-# 2b. Stage 2: the denoiser's own blocks. The probe catalogue is read from the harness that draws
-#     the reference, so the list and the probes cannot drift; the host-only probes are attempted
-#     when a case is given, and whatever stops them is named rather than assumed away. The device
-#     half needs the run host and is printed as stage 1's is.
+# 2b. The denoiser's own blocks - no canon number, exercised by stage 3 (the sampler) at its
+#     ladder's sigmas. The probe catalogue is read from the harness that draws the reference, so the
+#     list and the probes cannot drift; the host-only probes are attempted when a case is given, and
+#     whatever stops them is named rather than assumed away. The device half needs the run host and
+#     is printed as the name check's is.
 echo
-echo "== stage 2: the denoiser's probes"
+echo "== the denoiser's blocks (stage 3's subject, no canon number of its own): the probes"
 .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --list \
     > "$run/denoiser-probes.txt" 2>&1 || true
 sed 's/^/   /' "$run/denoiser-probes.txt" | head -7
@@ -109,8 +112,9 @@ else
     echo "   (a stated example is artifacts/diagnosis/denoiser-rows/case.json)"
 fi
 
-cat >"$run/stage2-commands.txt" <<COMMANDS
-Stage 2 (the denoiser) numeric half: the reference's probes, then ours against them.
+cat >"$run/denoiser-commands.txt" <<COMMANDS
+The denoiser's blocks (stage 3's subject, no canon number of their own) numeric half: the
+reference's probes, then ours against them.
 
   # the reference's host-only probes, on the host that can import its stack
   .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
@@ -128,7 +132,7 @@ Stage 2 (the denoiser) numeric half: the reference's probes, then ours against t
   python3 tools/diagnosis/compare.py --ref $run/ref-trajectory --got <diag dir> \\
       --out $run/report-denoiser.json
 COMMANDS
-sed 's/^/   /' "$run/stage2-commands.txt" | head -3
+sed 's/^/   /' "$run/denoiser-commands.txt" | head -3
 
 
 # 2c. Stages 4 and 5: the video encoder, and the conditioned path that binds it. The comparison is
@@ -195,13 +199,13 @@ echo "== the first block whose error its layer does not explain"
     fi
     echo "   stage 1 has no numbers on this host: see $run/stage1-commands.txt"
     if [ -f "$run/report-noise.md" ]; then
-        echo "   stage 2 has a comparison: $run/report-noise.md"
+        echo "   the denoiser's blocks have a comparison: $run/report-noise.md"
     else
-        echo "   stage 2 has no numbers on this host: see $run/stage2-commands.txt"
+        echo "   the denoiser's blocks have no numbers on this host: see $run/denoiser-commands.txt"
     fi
 } | tee "$run/reading.txt"
 
 echo
 echo "artifacts under $run: the schedule dump, its comparison, the probe catalogue, the stage-1"
-echo "and stage-2 commands, and the reading."
+echo "and denoiser commands, and the reading."
 echo "This is a diagnosis (design 10): nothing above gates the branch."
