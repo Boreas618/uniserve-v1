@@ -1499,16 +1499,24 @@ impl Leader {
             .epochs()
             .program_update()
             .filter(|program| program.update.number == number);
-        if program.is_none() {
+        let Some(program) = program else {
             return Ok(false);
-        }
+        };
         let epochs = Arc::clone(&self.epochs());
-        tokio::task::spawn_blocking(move || epochs.commit_programs())
+        let committed = tokio::task::spawn_blocking(move || epochs.commit_programs())
             .await
             .map_err(|error| {
                 UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
             })?
-            .map_err(UpdateError::Failed)
+            .map_err(UpdateError::Failed)?;
+        // The configuration is what the next apply starts from and what a successor takes over:
+        // one that kept the values before this update would undo it at the next change.
+        if committed {
+            for replica in self.replicas() {
+                *locked(&replica.config) = program.update.target.config.clone();
+            }
+        }
+        Ok(committed)
     }
 
     /// Returns every main process to the generation it served before update
