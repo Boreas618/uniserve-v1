@@ -1164,6 +1164,12 @@ impl Runner for MediaStage {
         &self.phases
     }
 
+    /// A host call reads products through the store, in order after their writers, so it runs beside
+    /// a clip the device is still decoding.
+    fn overlaps_replays(&self) -> bool {
+        true
+    }
+
     fn stream(&self) -> Option<&platform::Stream> {
         Some(&self.stream)
     }
