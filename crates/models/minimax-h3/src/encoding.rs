@@ -2098,6 +2098,10 @@ pub struct AudioEncoder {
     output: Conv1d,
     projection: Projection,
     mean: Conv1d,
+    /// The latent space's affine, `(latent - mean) / std` per channel. The reference's `LatentEncoder`
+    /// applies it to the posterior mode, and the DiT's audio input reads normalized rows: the
+    /// statistics are the same ones the audio decoder restores.
+    normalize: Conv1d,
     transpose: Transpose,
 }
 
@@ -2177,7 +2181,7 @@ impl AudioEncoder {
     ///
     /// | row | asked for by | the number's source |
     /// | --- | --- | --- |
-    /// | `conv1d` (three element types) | `self.input.forward` (input), each unit's two `convs[i].forward`, `stage.widen.forward`, `self.output.forward` | `crate::audio_vae::geometry(7, 1, 3)` and `dilated_geometry(7, 1, 3 · dilation, dilation)` at [`Self::load`] - **one row, because `conv1d/cudnn/package.toml` declares only `input`, `weight` and `output`: the geometry travels as a launch argument, dilation included** |
+    /// | `conv1d` (three element types) | `self.input.forward` (input), each unit's two `convs[i].forward`, `stage.widen.forward`, `self.output.forward` | `crate::audio_vae::geometry(7, 1, 3)`, `geometry(1, 1, 0)` and `dilated_geometry(7, 1, 3 · dilation, dilation)` at [`Self::load`] - **one row, because `conv1d/cudnn/package.toml` declares only `input`, `weight` and `output`: the geometry travels as a launch argument, dilation included** |
     /// | `snake` per width | each unit's two snakes and the stage's tail snake (`unit.snakes[i].forward`, `stage.snake.forward`) | [`Self::load`]'s `widths`: `config.encoder_dim` doubled once per `config.encoder_rates` entry, then once more for the tail |
     /// | `layer_norm` at `width` and at `channels` | the projection's three normalizations | `width` = the last entry of [`Self::load`]'s `widths`; `channels` = `config.latent_channels` |
     /// | `gemm` | `self.projection`'s four dense products | `Linear::descriptor_of(config.latent_channels, ..., WeightOrder::NxK, ...)` |
@@ -2446,8 +2450,9 @@ impl AudioEncoder {
             })?;
             let at = |name: &str| format!("stages.{index}.{name}");
             let mut units = Vec::with_capacity(3);
-            // The three units are the same shape at dilations 1, 3 and 9; the first convolution is the
-            // dilated one, whose padding keeps the length, and the second returns to it.
+            // The three units are the same shape at dilations 1, 3 and 9: the first convolution is
+            // seven wide and dilated, its padding keeping the length, and the second is the reference's
+            // `Conv1d(channels, channels, 1)`, a pointwise mix.
             for (unit, dilation) in [1u32, 3, 9].into_iter().enumerate() {
                 let name = |slot: &str| at(&format!("units.{unit}.{slot}"));
                 let first = Conv1d::new(
@@ -2459,7 +2464,7 @@ impl AudioEncoder {
                 let second = Conv1d::new(
                     binder.normalized(&name("convs.1.weight"))?,
                     Some(binder.region(&name("convs.1.bias"), &[u64::from(inner)])?),
-                    crate::audio_vae::geometry(7, 1, 3)?,
+                    crate::audio_vae::geometry(1, 1, 0)?,
                     false,
                 )?;
                 units.push(EncoderUnit {
@@ -2513,6 +2518,24 @@ impl AudioEncoder {
             false,
         )?;
         binder.finish()?;
+        // The latent space's affine: the config states its statistics, not a tensor for them.
+        let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
+        let normalize = Conv1d::new(
+            constants(
+                loader,
+                "audio_vae.normalize.weight",
+                Shape::new(&[channels, channels, 1]),
+                &scale,
+            )?,
+            Some(constants(
+                loader,
+                "audio_vae.normalize.bias",
+                Shape::new(&[channels]),
+                &shift,
+            )?),
+            crate::audio_vae::geometry(1, 1, 0)?,
+            false,
+        )?;
         Ok(Self {
             config: config.clone(),
             frames,
@@ -2523,11 +2546,13 @@ impl AudioEncoder {
             output,
             projection,
             mean,
+            normalize,
             transpose: Transpose::new(DType::F32)?,
         })
     }
 
-    /// Encode a `[batch, 1, length]` track into `out [batch · frames, latent_channels]` F32 rows.
+    /// Encode a `[batch, 1, length]` track into `out [batch · frames, latent_channels]` F32 rows of
+    /// the normalized latent, `(mode - mean) / std`.
     ///
     /// The reference's encoder is mono per batch row (`audio_vae.py:448-452`, "encode mono
     /// `[batch, 1, samples]` waveforms") and its latent is a **two-row batch**: a stereo reference
@@ -2659,8 +2684,13 @@ impl AudioEncoder {
                 .arena()
                 .tensor(DType::F32, Shape::new(&[1, channels, extent]))?;
             self.mean.forward(f, batched, narrowed)?;
+            let normalized = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[1, channels, extent]))?;
+            self.normalize.forward(f, narrowed, normalized)?;
             // One row's latent, channel-major rows: `[extent, channels]` at the row's place in `out`.
-            let plane = TensorView::new(narrowed.ptr, DType::F32, Shape::new(&[channels, extent]));
+            let plane =
+                TensorView::new(normalized.ptr, DType::F32, Shape::new(&[channels, extent]));
             let written = TensorView::new(
                 out.ptr.offset(row * extent * channels * 4),
                 DType::F32,
@@ -3136,15 +3166,13 @@ impl Projection {
         self.shortcut.forward(f, normed, shortcut)?;
         self.attention_norm.forward(f, values, normed)?;
         // Three contiguous head-group blocks, then causal attention over the frames.
-        let attended = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[frames, heads, u64::from(self.attention.head_dim())]),
-        )?;
+        let head_shape = Shape::new(&[frames, heads, u64::from(self.attention.head_dim())]);
+        let attended = f.arena().tensor(DType::F32, head_shape)?;
         let mut head_views = Vec::with_capacity(3);
         for linear in [&self.query, &self.key, &self.value] {
             let out = f.arena().tensor(DType::F32, shape)?;
             linear.forward(f, normed, out)?;
-            head_views.push(out);
+            head_views.push(TensorView::new(out.ptr, DType::F32, head_shape));
         }
         self.attention.attend_dense(
             f,
