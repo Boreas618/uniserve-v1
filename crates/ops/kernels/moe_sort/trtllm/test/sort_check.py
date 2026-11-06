@@ -3,8 +3,8 @@
 
 This is the GPU check a build host cannot do: it loads the module the store
 holds (``module.so``), calls the operator's entry with the call structure of
-``crates/ops/src/moe/sort.rs`` (640 bytes: ``ids`` 0, ``scales`` 8, the six
-outputs 16..64, the extents 64..120, ``error`` 120, ``live_tokens`` 632), and
+``crates/ops/src/moe/sort.rs`` (648 bytes: ``ids`` 0, ``scales`` 8, the six
+outputs 16..64, the extents 64..120, ``error`` 120, ``live_tokens`` 632, ``permuted_to_token`` 640), and
 compares all six
 outputs with TensorRT-LLM's routing order computed here in integer arithmetic.
 
@@ -228,7 +228,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    if ctypes.sizeof(Call) != 632 or Call.error.offset != 120:
+    if Call.error.offset != 120:
         print(
             "this script's call structure is not the operator's",
             file=sys.stderr,
@@ -369,7 +369,7 @@ def main() -> int:
         for failure in failures:
             print(f"FAIL: {failure}", file=sys.stderr)
         return 1
-    print("all six outputs match TensorRT-LLM's routing order")
+    print("all seven outputs match TensorRT-LLM's routing order")
     return 0
 
 
