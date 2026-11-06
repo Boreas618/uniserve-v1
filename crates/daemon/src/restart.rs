@@ -802,6 +802,11 @@ async fn prepared_successor(
     )
     .context("resuming the node's daemon service")?;
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
+    // Every later update commands the same main processes through this daemon's
+    // channel, as the first daemon's did after its start.
+    if let Some(commands) = daemon.commands() {
+        epoch_records.supervise(commands);
+    }
     let (updates, awake) = daemon
         .updates(
             Arc::clone(&epoch_records),
@@ -876,7 +881,9 @@ async fn prepared_successor(
     first.adopt_unavailable(handed.unavailable);
     // §2.5 continues across the handoff: the successor adopts the engines and
     // then keeps a standby of its own, or the deployment would serve without one
-    // until the next restart.
+    // until the next restart. The epoch's programs serve already, so it prepares
+    // from them as soon as it parks.
+    first.prepare_standby();
     first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
@@ -892,6 +899,7 @@ async fn prepared_successor(
         replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
         replica.adopt_unavailable(handed.unavailable);
         replica.monitor();
+        replica.prepare_standby();
         replica.start_standby();
         leader
             .replicas
