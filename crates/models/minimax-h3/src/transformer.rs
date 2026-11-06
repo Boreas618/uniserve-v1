@@ -717,6 +717,7 @@ impl Transformer {
         // named the stack's type was a row the forward never launches and, in the other direction,
         // the row the forward does launch was missing.
         programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_hidden_dim));
+        programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is

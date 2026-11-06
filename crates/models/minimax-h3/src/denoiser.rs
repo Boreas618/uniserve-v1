@@ -725,11 +725,17 @@ impl Layouts {
             .map(|size| *size as i32)
             .collect();
         let audio: Vec<i32> = packing.audio_indices().map(|row| row as i32).collect();
-        let video: Vec<i32> = packing
+        // The table is read in raster order: the patch writes raster rows, the scatter puts row `r`
+        // at `table[r]`, and the gather before the head reads them back. So it holds the packed row
+        // of each raster row, which is what orders a sparse layout's video rows tile-major.
+        let mut video = vec![0_i32; packing.video_indices.len()];
+        for (packed, raster) in packing
             .video_indices
             .iter()
-            .map(|row| *row as i32)
-            .collect();
+            .zip(&packing.video_raster_indices)
+        {
+            video[*raster as usize] = *packed as i32;
+        }
         // The refiner's document: one prompt, so its queries are every padded row and its keys stop
         // at the prompt's last row. The prompt's row count is the media clock's own start.
         let refiner_q = integers(&[0, layout.text_rows as i32]);
