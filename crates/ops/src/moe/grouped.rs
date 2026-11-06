@@ -663,7 +663,7 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
 pub struct GatherGemmNvfp4Args {
     /// `[tokens, hidden/2]` U8: the activations, encoded — two E2M1 codes a byte along the
     /// contraction, exactly what `nvfp4_quantize` produces. **Token-major**: the product gathers its
-    /// rows itself, through the route map the cta maps and `permuted_to_expanded` describe, which is
+    /// rows itself, through the route map the cta maps and `permuted_to_token` describe, which is
     /// what every kernel in the artifact with an E2M1 weight and a BF16 output does (their routing
     /// implementation is `Ldgsts` or `Tma`, never `NoRoute`). A route-major buffer here would be
     /// read as tokens and gathered a second time.
@@ -690,8 +690,10 @@ pub struct GatherGemmNvfp4Args {
     pub tile_to_expert: TensorView,
     /// `[tiles]` i32: the local row limit of that tile.
     pub tile_to_limit: TensorView,
-    /// `[routes]` i32: the gathered row of each route.
-    pub permuted_to_expanded: TensorView,
+    /// `[routes]` i32: the token row each permuted row gathers, `-1` on a tile's padding. The
+    /// product indexes the token-major activations with it, so an expanded route here would read
+    /// past the last token.
+    pub permuted_to_token: TensorView,
     /// `[1]` i32: the number of tiles that have work.
     pub num_non_exiting_tiles: TensorView,
     /// `[routes, intermediate]` the gated product.
@@ -756,7 +758,7 @@ pub struct GatherNvfp4Call {
     /// `[tiles]` i32: the local row limit of that tile.
     pub tile_to_limit: *const i32,
     /// `[routes]` i32: the gathered row of each route.
-    pub permuted_to_expanded: *const i32,
+    pub permuted_to_token: *const i32,
     /// `[1]` i32: the number of tiles that have work.
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, intermediate]`: the gated product.
@@ -1070,18 +1072,18 @@ impl GatherGemmNvfp4 {
         }
         // `routes` is the permuted row count -- the output's rows, which the sort pads to whole tiles
         // -- while the activations are the caller's *token* rows. The product gathers through
-        // `permuted_to_expanded`, so checking the activations against the permuted count would
+        // `permuted_to_token`, so checking the activations against the permuted count would
         // refuse every launch whose sort pads anything. Neither artifact launch reads a per-route
         // expert id: the routing is the sort's, and the product takes the tile maps the sort
         // computed.
-        args.permuted_to_expanded
+        args.permuted_to_token
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
-        if args.permuted_to_expanded.dtype != DType::I32 {
+        if args.permuted_to_token.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected i32 permuted rows, found {}",
-                    args.permuted_to_expanded.dtype
+                    args.permuted_to_token.dtype
                 ),
             ));
         }
@@ -1128,7 +1130,7 @@ impl Op for GatherGemmNvfp4 {
                 as *const c_void,
             tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
             tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
-            permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
+            permuted_to_token: address(args.permuted_to_token.ptr) as usize as *const i32,
             num_non_exiting_tiles: address(args.num_non_exiting_tiles.ptr) as usize as *const i32,
             out: address(args.out.ptr) as usize as *mut c_void,
             workspace: address(args.workspace.ptr) as usize as *mut c_void,
@@ -1619,7 +1621,7 @@ mod nvfp4_launch_tests {
             global_scale: table(DType::F32, &[2, 128]),
             tile_to_expert: table(DType::I32, &[2]),
             tile_to_limit: table(DType::I32, &[2]),
-            permuted_to_expanded: table(DType::I32, &[32]),
+            permuted_to_token: table(DType::I32, &[32]),
             num_non_exiting_tiles: table(DType::I32, &[1]),
             out: table(DType::BF16, &[32, 768]),
             workspace: table(DType::U8, &[4096]),
@@ -1630,12 +1632,12 @@ mod nvfp4_launch_tests {
     fn the_activations_are_the_token_rows_and_the_output_the_permuted_ones() {
         // Builder01's M963: `routes` (the output's rows) is the sort's padded count and is never the
         // activation count. The invariant is `hidden = [tokens, hidden]` and
-        // `permuted_to_expanded = [routes]`, which is what the program gathers through.
+        // `permuted_to_token = [routes]`, which is what the program gathers through.
         let descriptor = fc1();
         let args = fc1_args();
         assert_eq!(args.hidden.rows(), 3);
         assert_eq!(args.out.rows(), 32);
-        assert_eq!(args.permuted_to_expanded.shape.dims()[0], 32);
+        assert_eq!(args.permuted_to_token.shape.dims()[0], 32);
         // The scales cover one block per output row along the contraction, not one row's worth.
         assert_eq!(args.scales.shape.dims(), &[128, 1536, 128]);
         assert_eq!(descriptor.hidden / crate::fp4::BLOCK_ELEMENTS, 128);
@@ -1704,7 +1706,7 @@ mod nvfp4_call_layout_tests {
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_expert), 56);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_limit), 64);
         assert_eq!(
-            std::mem::offset_of!(GatherNvfp4Call, permuted_to_expanded),
+            std::mem::offset_of!(GatherNvfp4Call, permuted_to_token),
             72
         );
         assert_eq!(
