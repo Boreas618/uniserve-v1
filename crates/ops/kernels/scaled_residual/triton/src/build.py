@@ -21,6 +21,8 @@ def spec(fields, parameters, target):
     """The compilation of one scaled_residual descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["hidden_ptr", "update_ptr", "update_bias_ptr", "scale_ptr", "elements"] if int(fields["columns"]) % 16 == 0 else [],
         "kernel": kernels._scaled_residual_kernel,
         "signature": {
             "hidden_ptr": dtype,

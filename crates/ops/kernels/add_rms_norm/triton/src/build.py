@@ -22,6 +22,8 @@ def spec(fields, parameters, target):
     dtype = "*" + DTYPES[fields["dtype"]]
     pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["x_ptr", "r_ptr", "w_ptr", "y_ptr", "c_ptr"] + (["columns"] if int(fields["columns"]) % 16 == 0 else []),
         "kernel": kernels._add_rms_norm_kernel,
         "signature": {
             "x_ptr": dtype,
