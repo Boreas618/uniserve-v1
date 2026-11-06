@@ -642,6 +642,15 @@ impl Epochs {
     pub fn precopied(&self, epoch: u64, programs: FilledPrograms) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
+            // The programs are already in the main process, so an epoch with no
+            // record serves them under a record that says nothing about them: the
+            // probation would read as a serving epoch that kept no previous
+            // generation, which is the same sentence an actual revert fault makes.
+            tracing::error!(
+                epoch,
+                "a pre copy finished for an epoch with no record: the programs serve and the \
+                 record does not name the generation they replaced"
+            );
             return;
         };
         record.previous_kernels = std::mem::replace(&mut record.kernels, programs.kernels);
@@ -658,6 +667,11 @@ impl Epochs {
     pub fn committed(&self, epoch: u64) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
+            tracing::error!(
+                epoch,
+                "a commit finished for an epoch with no record: the generation it replaced is \
+                 still the record's, and nothing says it was dropped"
+            );
             return;
         };
         record.previous_kernels.clear();
@@ -680,8 +694,23 @@ impl Epochs {
     pub fn reverted(&self, epoch: u64) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
+            tracing::error!(
+                epoch,
+                "a revert finished for an epoch with no record: the generation it went back from \
+                 is not named anywhere"
+            );
             return;
         };
+        if record.previous_kernels.is_empty() && record.previous_policy.is_none() {
+            // A revert with nothing kept is the state this record's reader reports
+            // as "the epoch on probation kept no previous kernel programs to
+            // revert to"; it is the daemon's own inconsistency, never a no-op.
+            tracing::error!(
+                epoch,
+                "a revert found no previous generation kept: the epoch serves what it served, \
+                 and the record cannot say what the update had prepared"
+            );
+        }
         if !record.previous_kernels.is_empty() || record.previous_policy.is_some() {
             record.kernels = std::mem::take(&mut record.previous_kernels);
             record.policy = record
