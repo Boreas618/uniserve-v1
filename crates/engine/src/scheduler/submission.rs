@@ -609,8 +609,9 @@ impl InProcess {
         // own stated parameters. A batch that states both would be served twice over, and one that
         // states neither cannot be served at all.
         if let Some(media) = batch.media.clone() {
+            // A text encoding is the one media computation that reads token columns: its prompt.
             anyhow::ensure!(
-                batch.columns.is_none(),
+                batch.columns.is_none() || media.computation.call == ipc::MediaCall::TextEncoding,
                 "batch {} states token columns and media columns: one batch is one computation",
                 batch.id
             );
@@ -660,9 +661,10 @@ impl InProcess {
                     tokens: computation.tokens,
                     variant,
                 },
-                // A media computation reads none of the token columns, so its batch carries none:
-                // the fields the kernels read are the model's own, staged inside the runner.
-                columns: executor::batch::BatchColumns::default(),
+                // A text encoding reads its prompt as token columns. Every other media computation
+                // reads none, so its batch carries none: the fields its kernels read are the
+                // model's own, staged inside the runner.
+                columns: batch.columns.clone().unwrap_or_default(),
                 generation,
                 cache_units: Vec::new(),
                 block_tables: Vec::new(),

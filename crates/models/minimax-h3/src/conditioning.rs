@@ -177,6 +177,7 @@ impl RefinerBlock {
             scaling(config.head_dim),
         )?;
 
+        let stream = query.dtype();
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
@@ -212,7 +213,7 @@ impl RefinerBlock {
             down: Linear::new(down, None, WeightOrder::NxK)?,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
-            residual: identity(loader)?,
+            residual: identity(loader, u64::from(config.hidden_size), stream)?,
             exchange: exchange(partition),
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
@@ -335,12 +336,9 @@ impl TokenRefiner {
     /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
     /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
     /// gated activation, and the residual each block folds its two updates through.
-    /// `dtype` is the type the blocks' output has - the stack's - and `boundary` is the type the
-    /// refiner's stream carries. The two differ on a checkpoint whose boundary tensors are F32 while
-    /// the stack is BF16, and every row below follows one or the other for its own reason.
+    /// `boundary` is the type the refiner's stream carries.
     pub fn programs(
         config: &TransformerConfig,
-        dtype: nn::DType,
         boundary: nn::DType,
     ) -> Result<Vec<(String, String)>> {
         use crate::programs::Programs;
@@ -383,11 +381,6 @@ impl TokenRefiner {
             u64::from(hidden),
             false,
         )?);
-        // The refiner's identity scale: one published FP32 value applied to the whole stream, so the
-        // row is one column wide and keyed at the stream's own type - the target's, not the scale's.
-        // A conditioned request is the only one that reaches the refiner, which is why this row
-        // appears in no unconditioned recording.
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, 1, false)?);
 
         // The attention over the request's document, and the stepwise gated activation.
         let attention = Attention::dense(
@@ -717,13 +710,29 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
 }
 
 /// The identity residual: every channel's update added unchanged.
-fn identity(loader: &mut WeightLoader<'_>) -> Result<ScaledResidual> {
-    let one = 1.0f32.to_le_bytes();
+///
+/// The layer's width is its scale's, so the scale holds one element per channel of the stream.
+///
+/// The operator reads the scale in the stream's element type, so the ones are stated in it.
+fn identity(
+    loader: &mut WeightLoader<'_>,
+    hidden: u64,
+    stream: nn::DType,
+) -> Result<ScaledResidual> {
+    let one: &[u8] = match stream {
+        nn::DType::F32 => &[0x00, 0x00, 0x80, 0x3f],
+        nn::DType::BF16 => &[0x80, 0x3f],
+        other => {
+            return Err(Error::checkpoint(format!(
+                "a refiner's stream is F32 or BF16, not {other}"
+            )));
+        }
+    };
     let scale = loader.constant(
         "refiner.identity_scale",
-        nn::DType::F32,
-        Shape::new(&[1]),
-        &one,
+        stream,
+        Shape::new(&[hidden]),
+        &one.repeat(hidden as usize),
         "minimax-h3",
     )?;
     Ok(ScaledResidual::new(scale, None)?)
