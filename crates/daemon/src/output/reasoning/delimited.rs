@@ -5,8 +5,8 @@
 //! completes or rules it out, or the stream ends. Each delimiter begins with a
 //! single vocabulary token, whose id `initialize` looks for in the prompt to
 //! choose the initial region. A section label may follow the start token,
-//! such as the channel name in Gemma-4's `<|channel>thought\n`; it belongs to
-//! the delimiter and is stripped from the reasoning.
+//! such as the channel name in a `<|channel>thought\n` delimiter; it belongs
+//! to the delimiter and is stripped from the reasoning.
 
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
@@ -98,12 +98,13 @@ impl DelimitedReasoningParser {
     /// Names the section labels that may follow the start token.
     ///
     /// A label belongs to the delimiter, so it is neither reasoning nor
-    /// content text: Gemma-4 opens reasoning with the `<|channel>` token and
-    /// the channel name `thought`, normally followed by a newline. The longest
-    /// label that opens a section is stripped; a section that opens with none
-    /// keeps all of its text as reasoning. Prompt initialization matches the
-    /// start token alone, and a prompt that opens the section carries its
-    /// label, so generation that starts inside reasoning strips none.
+    /// content text: a `<|channel>` delimiter opens reasoning with that token
+    /// and a channel name such as `thought`, normally followed by a newline.
+    /// The longest label that opens a section is stripped; a section that
+    /// opens with none keeps all of its text as reasoning. Prompt
+    /// initialization matches the start token alone, and a prompt that opens
+    /// the section carries its label, so generation that starts inside
+    /// reasoning strips none.
     pub fn with_start_labels<I, S>(mut self, labels: I) -> Self
     where
         I: IntoIterator<Item = S>,

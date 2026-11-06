@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system with a Python numerical library. Rust owns HTTP admission, scheduling, worker processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. `uniserve` supplies the numerical layers, loading, resource binding and the models; each worker is a `uniserve worker` process that runs the Rust worker runtime and calls those same numerical implementations through TVM-FFI.
+UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. The Python package `uniserve` is the reference implementation of the numerics the Rust executor performs; no Rust code loads it, and no serving process carries a Python interpreter.
 
 The configured model descriptions are `qwen3` and `minimax_h3`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` executable (its `serve`, `worker` and `storage` commands), the worker runtime library, and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` executable and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -48,7 +48,7 @@ uniserve serve "$H3_MODEL" \
   --max-running-requests 2
 ```
 
-Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Until preparation finishes, the log reports `worker still busy during Worker startup` with the elapsed seconds. Then generate a video:
+Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Until preparation finishes, the log reports `executors still busy during startup` with `elapsed_secs`. Then generate a video:
 
 ```bash
 curl --fail-with-body --max-time 600 \
@@ -202,41 +202,46 @@ done
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
-For decision-session replay, use the `systemone` dataset with a non-empty `session_id` on every JSONL row. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`; the sessions run concurrently, one request in flight per session. A session trace has no repeated-row warmup: each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
+For decision-session replay, give every row of a JSON Lines workload a non-empty `session_id`. The evaluator preserves file order within each session and sends the next decision only after that session's previous response. Set `load.request_rate = inf`; the sessions run concurrently, one request in flight per session. A session trace has no repeated-row warmup: each initial cold request is included in the measured trace. Session identifiers are benchmark metadata and are not sent to the model. Rows without session identifiers retain the seeded shuffled workload behavior.
 
 ## Repository layout
 
-The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the workers divide the work, how a rank divides it between Rust and Python, and how a request travels through them.
+The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the executors divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-crates/proto/                 The interfaces across builds: the request interface and the process interface (Protobuf)
-crates/models/rules/          Model-family request semantics: the family registry, the checkpoint facts and prompt rules of the Qwen3 and MiniMax-H3 families
-crates/storage/               The Storage Server's protocol and client
-crates/storage-server/        The Storage Server, its Mooncake connector and its Transfer Server
-crates/ipc/                   Engine-to-rank messages, serialization, rank channels and the launch descriptor
-crates/cuda/                  CUDA driver, VMM, NVML and NCCL bindings loaded at runtime
-crates/nixl/                  NIXL agents with the UCX backend: storage registration, metadata exchange and READs, loaded at runtime
-crates/daemon/                The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, model profiles, input and output processing, the HTTP API, metrics and the engine's client
-crates/engine/                The engine process: schedulers, KV allocation, executors, worker groups and the request interface's service
-crates/worker/                Rank runtime: the library a rank process loads through TVM-FFI
-  launch/, config/            Launch descriptor, rank configuration and startup
-  model/                      Model description, loading and the components each rank holds
-  executor/, runner/          Batch execution per computation and its CUDA graphs
-  request/, sampling/         Request progress and sampling state
-  storage/                     KV, latent, tensor, request-slot and output backing
-  transfer/                   Local, shared-memory, CUDA VMM and channel transfers
-  parallel/                   Host groups, topology and collectives across ranks
-  stream/, host/, capacity/   CUDA streams and events, host pools, capacity planning
-src/                          The root package, `uniserve`: one module per command (`serve`, `frontend`, `engine`, `worker`, `storage`, `program-server`)
-uniserve/                     Numerical layers, loading, resource binding, concrete models and checkpoint catalog
-  runner/                     The Python half of each runner, which the worker runtime calls
-  worker.py                   Rank process entry: loads the worker runtime and hands it the library's import function
-uniserve_kernels/             Native CUDA, Triton and CuTe kernels
-uniserve_eval/                Serving evaluator, profiles, and request workloads
-configs/                      Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
-docs/architecture.md          Processes, the rank planes and the request path
-docs/configuration.md         The serving option tree, configuration files and deployment files
-docs/minimax_h3/              H3 serving, library and evaluation guides, container files
+crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf)
+crates/ipc/             Scheduler-to-main-process messages, rank channels and the launch descriptor
+crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy
+crates/storage/         The Storage Server's protocol and client
+crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server
+crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
+crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
+crates/ops/             The interface between Rust and kernel programs: operators, launch code and the kernels a program compiles
+crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and a loaded model's blocks
+crates/models/          The concrete models and the rules their requests carry
+  rules/                Model-family request semantics: the family registry, checkpoint facts and prompt rules of Qwen3 and MiniMax-H3
+  qwen3-moe/            `Qwen3MoeForCausalLM`: its checkpoint configuration, mathematical partition and composition
+  minimax-h3/           MiniMax-H3 and FastH3: their checkpoint configuration, mathematical partition and components
+crates/executor/        The host half of the main process: the one thread that issues work to the devices
+crates/engine/          The engine process: schedulers, KV allocation, executors, executor groups and the request interface's service
+crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, input and output processing, the HTTP API, metrics and the engine's client
+crates/frontend/        The deployment's application process: the HTTP and OpenAI API, input and output processing
+crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
+crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one process per host
+crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
+src/                    The root package, `uniserve`: one module per command (`serve`, `frontend`, `engine`, `storage`, `program-server`, `rules`)
+uniserve/               The Python reference implementation of the numerics: layers, loading, resource binding and the checkpoint catalog; no serving process carries a Python interpreter
+  runner/               The Python half of each runner, as the reference the Rust executor's numerics are held to
+  worker.py             The TVM-FFI import-path entry (`uniserve.worker.import_path`) the Python tests use
+uniserve_kernels/       Native CUDA, Triton and CuTe kernels
+uniserve_eval/          Serving evaluator, profiles, and request workloads
+configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
+docs/architecture.md    Processes, the rank planes and the request path
+docs/configuration.md   The serving option tree, configuration files and deployment files
+docs/admin.md           The admin API: a node's status, event log, deployment and configuration
+docs/profiling.md       Timeline, native and Python profiling
+docs/minimax_h3/        H3 serving, library and evaluation guides, container files
+docs/qwen3_moe/         Qwen3-MoE serving and its GSM8K quality confirmation
 ```
 
 ## License
