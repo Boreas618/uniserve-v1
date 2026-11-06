@@ -1953,7 +1953,7 @@ mod product_tests {
     #[test]
     fn a_staged_request_states_its_own_prompt_length_within_the_plan() {
         let warm = WarmRequest {
-            task: nn::VideoTask::T2va,
+            task: nn::VideoTask::TextToVideoAudio,
             width: 768,
             height: 768,
             frames: 107,
