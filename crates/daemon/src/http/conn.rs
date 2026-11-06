@@ -542,13 +542,32 @@ impl Connection {
         if let Some(handed) = held {
             self.pending
                 .extend_from_slice(&head_bytes(&parts, chunked, content_length, closing));
-            match handed.stream.opened().await {
+            // A one-document response produces nothing until it ends, so this wait can be the
+            // request's whole generation. A pause ends it: the restart must not wait for the
+            // request, and the queued head travels with the frozen response.
+            let mut pause_requested = handed.registration.watch();
+            let opened = loop {
+                if *pause_requested.borrow() {
+                    break None;
+                }
+                tokio::select! {
+                    opened = handed.stream.opened() => break Some(opened),
+                    changed = pause_requested.changed() => {
+                        if changed.is_err() {
+                            break Some(handed.stream.opened().await);
+                        }
+                    }
+                }
+            };
+            match opened {
+                // Frozen or resumed, `write_handed` writes the response from here.
+                None => {}
                 // A held head promises one document, so a first frame that is
                 // itself empty is the same empty success the `Ended` arm below
                 // refuses: the client reads a 200 whose document is nothing.
                 // The body's own first frame states it, not the head, so the
                 // failure is written here with the status the client sees.
-                Opened::Frame(frame) if frame.is_empty() => {
+                Some(Opened::Frame(frame)) if frame.is_empty() => {
                     warn!(
                         request = %handed.request_id,
                         "a response's document opened with an empty frame, which a client reads as an empty success"
@@ -559,13 +578,13 @@ impl Connection {
                     let document = Self::failure_document(&error);
                     return self.write_failure(error, vec![document], closing).await;
                 }
-                Opened::Frame(frame) => opening = Some(frame),
-                Opened::Failed(error, frames) => {
+                Some(Opened::Frame(frame)) => opening = Some(frame),
+                Some(Opened::Failed(error, frames)) => {
                     return self.write_failure(error, frames, closing).await;
                 }
                 // One document, so a body that ends before producing one is a
                 // failure rather than an empty response.
-                Opened::Ended => {
+                Some(Opened::Ended) => {
                     let error = crate::openai::error::ApiError::server_error(
                         "the response ended before it wrote its document".to_owned(),
                     );
