@@ -2531,7 +2531,8 @@ impl SimEngine {
     /// last, so calls in the same batch still execute against a finishing
     /// request.
     ///
-    /// Errors on a readmission with a different descriptor, a call for a request that is not admitted or
+    /// Errors on a readmission with a different descriptor other than a hand-off's, a call for a
+    /// request that is not admitted or
     /// whose key differs from the admission, a predicate naming an unresolved
     /// product, or any `execute_call` error. An error abandons the rest of
     /// the batch and its `Finish` commands; admissions, `Free` commands,
@@ -2569,7 +2570,19 @@ impl SimEngine {
 
         let admissions = batch.admissions().cloned().collect::<Vec<_>>();
         for admission in admissions {
-            match self.requests.get(&admission.request_key.request_id) {
+            // A hand-off's install admits the request on its decode group, which
+            // starts from the install's descriptor. The prefill group serves it
+            // no more, so one state stands for the request on either.
+            let handed_off = batch.requests.iter().any(|(call, _)| {
+                call.request_key == admission.request_key
+                    && call.kind == CallKind::Transfer(TransferMode::CacheInstall)
+            });
+            match self.requests.get_mut(&admission.request_key.request_id) {
+                Some(request) if handed_off => {
+                    let last_token = request.last_token;
+                    *request = SimRequestState::new(admission);
+                    request.last_token = last_token;
+                }
                 Some(request) => anyhow::ensure!(
                     request.admission == admission,
                     "request {} was readmitted with a different descriptor",
