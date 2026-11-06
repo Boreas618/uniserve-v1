@@ -177,6 +177,7 @@ impl RefinerBlock {
             scaling(config.head_dim),
         )?;
 
+        let stream = query.dtype();
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
@@ -212,7 +213,7 @@ impl RefinerBlock {
             down: Linear::new(down, None, WeightOrder::NxK)?,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
-            residual: identity(loader, u64::from(config.hidden_size))?,
+            residual: identity(loader, u64::from(config.hidden_size), stream)?,
             exchange: exchange(partition),
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
@@ -711,13 +712,27 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
 /// The identity residual: every channel's update added unchanged.
 ///
 /// The layer's width is its scale's, so the scale holds one element per channel of the stream.
-fn identity(loader: &mut WeightLoader<'_>, hidden: u64) -> Result<ScaledResidual> {
-    let ones = 1.0f32.to_le_bytes().repeat(hidden as usize);
+///
+/// The operator reads the scale in the stream's element type, so the ones are stated in it.
+fn identity(
+    loader: &mut WeightLoader<'_>,
+    hidden: u64,
+    stream: nn::DType,
+) -> Result<ScaledResidual> {
+    let one: &[u8] = match stream {
+        nn::DType::F32 => &[0x00, 0x00, 0x80, 0x3f],
+        nn::DType::BF16 => &[0x80, 0x3f],
+        other => {
+            return Err(Error::checkpoint(format!(
+                "a refiner's stream is F32 or BF16, not {other}"
+            )));
+        }
+    };
     let scale = loader.constant(
         "refiner.identity_scale",
-        nn::DType::F32,
+        stream,
         Shape::new(&[hidden]),
-        &ones,
+        &one.repeat(hidden as usize),
         "minimax-h3",
     )?;
     Ok(ScaledResidual::new(scale, None)?)
