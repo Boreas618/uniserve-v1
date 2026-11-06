@@ -1586,6 +1586,15 @@ mod tests {
             layout(1, 1, 1, 1, 1)
         }
 
+        fn prepare_conditioning(
+            &self,
+            _f: &nn::Forward,
+            _cond: Conditioning<'_>,
+        ) -> nn::Result<()> {
+            // The fixture has no conditioner: its denoiser reads the request's text rows alone.
+            Ok(())
+        }
+
         fn draw_noise(
             &self,
             _f: &nn::Forward,

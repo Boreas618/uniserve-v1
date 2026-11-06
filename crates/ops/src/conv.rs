@@ -263,28 +263,25 @@ impl Conv {
         }
         let channels = args.input.shape.dim(1);
         let channels_per_group = channels / u64::from(descriptor.geometry.groups);
-        match descriptor.transposed {
-            false => args.weight.require_shape(
-                operator,
-                Shape::new(&[
-                    args.out.shape.dim(1),
-                    channels_per_group,
-                    u64::from(descriptor.geometry.kernel[0]),
-                    u64::from(descriptor.geometry.kernel[1]),
-                    u64::from(descriptor.geometry.kernel[2]),
-                ]),
-            )?,
-            true => args.weight.require_shape(
-                operator,
-                Shape::new(&[
-                    channels,
-                    args.out.shape.dim(1) / u64::from(descriptor.geometry.groups),
-                    u64::from(descriptor.geometry.kernel[0]),
-                    u64::from(descriptor.geometry.kernel[1]),
-                    u64::from(descriptor.geometry.kernel[2]),
-                ]),
-            )?,
-        }
+        // A filter holds one kernel axis per spatial axis: a 1-d one is `[out, in, k]`, as a checkpoint
+        // stores it, and the call structure's five slots pad it with ones below.
+        let (first, second) = match descriptor.transposed {
+            false => (args.out.shape.dim(1), channels_per_group),
+            true => (
+                channels,
+                args.out.shape.dim(1) / u64::from(descriptor.geometry.groups),
+            ),
+        };
+        let taps = descriptor.geometry.kernel;
+        let filter = [
+            first,
+            second,
+            u64::from(taps[0]),
+            u64::from(taps[1]),
+            u64::from(taps[2]),
+        ];
+        args.weight
+            .require_shape(operator, Shape::new(&filter[..rank + 2]))?;
 
         let bias = match (descriptor.bias, args.bias) {
             (true, Some(bias)) => {
@@ -329,11 +326,9 @@ impl Conv {
             target[3] = to_i64(spatial[1])?;
             target[4] = to_i64(spatial[2])?;
         }
-        weight_shape[0] = to_i64(args.weight.shape.dim(0))?;
-        weight_shape[1] = to_i64(args.weight.shape.dim(1))?;
-        weight_shape[2] = to_i64(args.weight.shape.dim(2))?;
-        weight_shape[3] = to_i64(args.weight.shape.dim(3))?;
-        weight_shape[4] = to_i64(args.weight.shape.dim(4))?;
+        for (axis, extent) in weight_shape.iter_mut().enumerate().take(rank + 2) {
+            *extent = to_i64(args.weight.shape.dim(axis))?;
+        }
 
         let geometry = descriptor.geometry;
         let mut call = Call {

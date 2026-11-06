@@ -33,7 +33,9 @@ pub struct ConvGeometry {
 }
 
 impl ConvGeometry {
-    /// The geometry of a `rank`-dimensional convolution: the trailing axes of the three-axis form.
+    /// The geometry of a `rank`-dimensional convolution: the leading axes of the three-axis form, as
+    /// the operator orders them. A 1-d convolution's length is the first spatial axis, and its other
+    /// two axes are a filter of one with no padding.
     pub fn new(
         rank: usize,
         kernel: [u32; 3],

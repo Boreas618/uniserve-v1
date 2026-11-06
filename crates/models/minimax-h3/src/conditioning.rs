@@ -33,6 +33,65 @@ use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
 
+/// The fold's whole reservation from the configuration alone, in reservation order.
+///
+/// The prompt's refinement runs once per request, inside the denoiser's arena and before the first
+/// evaluation (`Denoiser::prepare_conditioning`), so its scratch is part of a stage's floor. The
+/// plan that sizes the arena (`crate::denoiser::denoise_arena`) prices it from this function, which
+/// is why the extents live here beside the fold that reserves them rather than in the plan.
+///
+/// The working buffer is the whole refined document (`[rows, hidden]`, the input projection's
+/// output); every block then reserves its own [`Scratch`]. A rank holds `rows` of them and the
+/// exchange trades the row slice for a head shard of `total_rows`, which is the whole packed row
+/// count of the batch.
+pub fn fold_plan(
+    config: &TransformerConfig,
+    rows: u32,
+    total_rows: u32,
+    shard: u32,
+) -> Vec<(String, Shape)> {
+    let mut plan = vec![(
+        "refiner.working".to_owned(),
+        Shape::new(&[u64::from(rows), u64::from(config.hidden_size)]),
+    )];
+    let local_heads = config.num_attention_heads / shard.max(1);
+    for index in 0..config.num_refiner_layers {
+        let scratch = Scratch::new(
+            config.hidden_size,
+            config.head_dim,
+            config.num_attention_heads,
+            local_heads,
+            config.intermediate_size,
+            rows,
+            total_rows,
+        );
+        for (name, shape) in scratch.entries() {
+            plan.push((format!("refiner.{index}.{name}"), shape));
+        }
+    }
+    plan
+}
+
+/// The bytes the fold's whole reservation needs, from the configuration alone.
+///
+/// The denoiser's stage floor takes the larger of this and one evaluation's plan, because the two
+/// occupy the same offsets: the fold runs only on the live path, before the first replay, and the
+/// captured graph's nodes carry the planning walk's offsets from the region's base.
+pub fn fold_bytes(
+    config: &TransformerConfig,
+    rows: u32,
+    total_rows: u32,
+    shard: u32,
+    dtype: nn::DType,
+) -> u64 {
+    let width = dtype.bytes().unwrap_or(4);
+    fold_plan(config, rows, total_rows, shard)
+        .iter()
+        .map(|(_, shape)| shape.dims().iter().product::<u64>())
+        .sum::<u64>()
+        * width
+}
+
 /// The per-request device tables the refiner's attention reads.
 ///
 /// Both are int32 cumulative counts over the packed rows, `[documents + 1]` long: the queries cover
@@ -497,6 +556,100 @@ struct Rows {
     ffn: TensorView,
 }
 
+/// The extents one refiner block's scratch holds, in the order the block reserves them.
+///
+/// **One statement for the two readers.** The fold reserves these from the denoiser's arena
+/// ([`Rows::reserve`]) and the same arena is sized by the denoiser's plan before any request arrives
+/// (`crate::denoiser::denoise_arena`), so a buffer added here is priced there without a second edit.
+/// The two sizes differ for one buffer: a rank holds `local_rows` rows and the exchange trades them
+/// for a head shard of the whole `total_rows`.
+#[derive(Clone, Copy, Debug)]
+pub struct Scratch {
+    /// `[local_rows, hidden]` the normalized rows.
+    normed: Shape,
+    query: Shape,
+    key: Shape,
+    value: Shape,
+    query_normed: Shape,
+    key_normed: Shape,
+    exchanged_query: Shape,
+    exchanged_key: Shape,
+    exchanged_value: Shape,
+    attended: Shape,
+    gathered: Shape,
+    update: Shape,
+    packed: Shape,
+    ffn: Shape,
+}
+
+impl Scratch {
+    /// The scratch of a block that is `hidden` wide, with `heads` heads of `head_dim` (of which
+    /// `local_heads` are this rank's) and `intermediate` feed-forward columns.
+    pub fn new(
+        hidden: u32,
+        head_dim: u32,
+        heads: u32,
+        local_heads: u32,
+        intermediate: u32,
+        local_rows: u32,
+        total_rows: u32,
+    ) -> Self {
+        let hidden = u64::from(hidden);
+        let head = u64::from(head_dim);
+        let inner = u64::from(heads) * head;
+        let local_inner = u64::from(local_heads) * head;
+        // The gate projection's rows hold the checkpoint's two fused halves of one width.
+        let packed_width = 2 * u64::from(intermediate);
+        let ffn = u64::from(intermediate);
+        let rows = u64::from(local_rows);
+        let total = u64::from(total_rows);
+        Self {
+            normed: Shape::new(&[rows, hidden]),
+            query: Shape::new(&[rows, inner]),
+            key: Shape::new(&[rows, inner]),
+            value: Shape::new(&[rows, inner]),
+            query_normed: Shape::new(&[rows, inner]),
+            key_normed: Shape::new(&[rows, inner]),
+            exchanged_query: Shape::new(&[total, local_inner]),
+            exchanged_key: Shape::new(&[total, local_inner]),
+            exchanged_value: Shape::new(&[total, local_inner]),
+            attended: Shape::new(&[total, local_inner]),
+            gathered: Shape::new(&[rows, inner]),
+            update: Shape::new(&[rows, hidden]),
+            packed: Shape::new(&[rows, packed_width]),
+            ffn: Shape::new(&[rows, ffn]),
+        }
+    }
+
+    /// Every buffer in reservation order, named as a plan names it.
+    pub fn entries(&self) -> [(&'static str, Shape); 14] {
+        [
+            ("normed", self.normed),
+            ("query", self.query),
+            ("key", self.key),
+            ("value", self.value),
+            ("query_normed", self.query_normed),
+            ("key_normed", self.key_normed),
+            ("exchanged_query", self.exchanged_query),
+            ("exchanged_key", self.exchanged_key),
+            ("exchanged_value", self.exchanged_value),
+            ("attended", self.attended),
+            ("gathered", self.gathered),
+            ("update", self.update),
+            ("packed", self.packed),
+            ("ffn", self.ffn),
+        ]
+    }
+
+    /// The elements all fourteen hold.
+    pub fn elements(&self) -> u64 {
+        self.entries()
+            .iter()
+            .map(|(_, shape)| shape.dims().iter().product::<u64>())
+            .sum()
+    }
+}
+
 impl Rows {
     fn reserve(
         block: &RefinerBlock,
@@ -505,32 +658,31 @@ impl Rows {
         total_rows: u32,
     ) -> Result<Self> {
         let dtype = block.dtype;
-        let hidden = u64::from(block.hidden_size);
-        let head = u64::from(block.head_dim);
-        let inner = u64::from(block.heads) * head;
-        let local_inner = u64::from(block.local_heads) * head;
-        // The gate projection's rows hold the checkpoint's two fused halves of one width.
-        let packed_width = 2 * u64::from(block.intermediate_size);
-        let ffn = u64::from(block.intermediate_size);
-
-        let rows = u64::from(local_rows);
-        let total = u64::from(total_rows);
+        let scratch = Scratch::new(
+            block.hidden_size,
+            block.head_dim,
+            block.heads,
+            block.local_heads,
+            block.intermediate_size,
+            local_rows,
+            total_rows,
+        );
         let arena = f.arena();
         Ok(Self {
-            normed: arena.tensor(dtype, Shape::new(&[rows, hidden]))?,
-            query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            query_normed: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            key_normed: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            exchanged_query: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            exchanged_key: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            exchanged_value: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            attended: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            gathered: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            update: arena.tensor(dtype, Shape::new(&[rows, hidden]))?,
-            packed: arena.tensor(dtype, Shape::new(&[rows, packed_width]))?,
-            ffn: arena.tensor(dtype, Shape::new(&[rows, ffn]))?,
+            normed: arena.tensor(dtype, scratch.normed)?,
+            query: arena.tensor(dtype, scratch.query)?,
+            key: arena.tensor(dtype, scratch.key)?,
+            value: arena.tensor(dtype, scratch.value)?,
+            query_normed: arena.tensor(dtype, scratch.query_normed)?,
+            key_normed: arena.tensor(dtype, scratch.key_normed)?,
+            exchanged_query: arena.tensor(dtype, scratch.exchanged_query)?,
+            exchanged_key: arena.tensor(dtype, scratch.exchanged_key)?,
+            exchanged_value: arena.tensor(dtype, scratch.exchanged_value)?,
+            attended: arena.tensor(dtype, scratch.attended)?,
+            gathered: arena.tensor(dtype, scratch.gathered)?,
+            update: arena.tensor(dtype, scratch.update)?,
+            packed: arena.tensor(dtype, scratch.packed)?,
+            ffn: arena.tensor(dtype, scratch.ffn)?,
         })
     }
 }
