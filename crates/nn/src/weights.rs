@@ -133,6 +133,8 @@ impl WeightLayout {
     /// The same values after `shuffleMatrixA`: rows permuted inside blocks of sixteen or
     /// thirty-two, which is the arrangement the trtllm-gen products read (`useShuffledMatrix`).
     pub const NVFP4_VALUES_SHUFFLED: Self = Self("nvfp4_values_shuffled");
+    /// [`ValueLayout::InterleavedShuffled`]'s row order.
+    pub const NVFP4_VALUES_INTERLEAVED_SHUFFLED: Self = Self("nvfp4_values_interleaved_shuffled");
 
     /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout: `[rows, columns / 16]`.
     pub const NVFP4_SCALES_LINEAR: Self = Self("nvfp4_scales_linear");
@@ -586,6 +588,14 @@ pub enum ValueLayout {
         /// `get_shuffle_block_size` states.
         epilogue_tile_m: u32,
     },
+    /// A gated product's row order: the matrix's two row halves interleave, so row `i` of the first
+    /// half sits at `2i` and row `i` of the second half at `2i + 1` (`reorderRowsForGatedActGemm`),
+    /// and the result shuffles as [`Self::Shuffled`] does. The product's epilogue then reads the
+    /// linear and the gate row of one output channel side by side.
+    InterleavedShuffled {
+        /// Rows one MMA tile of the product covers, as [`Self::Shuffled`] states it.
+        epilogue_tile_m: u32,
+    },
 }
 
 impl ValueLayout {
@@ -594,6 +604,7 @@ impl ValueLayout {
         match self {
             Self::Plain => WeightLayout::NVFP4_VALUES,
             Self::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
+            Self::InterleavedShuffled { .. } => WeightLayout::NVFP4_VALUES_INTERLEAVED_SHUFFLED,
         }
     }
 
@@ -601,7 +612,7 @@ impl ValueLayout {
     pub fn block(self) -> Option<u64> {
         match self {
             Self::Plain => None,
-            Self::Shuffled { epilogue_tile_m } => {
+            Self::Shuffled { epilogue_tile_m } | Self::InterleavedShuffled { epilogue_tile_m } => {
                 Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
             }
         }
@@ -621,13 +632,19 @@ impl ValueLayout {
         for expert in 0..experts {
             let base = expert * rows * row_bytes;
             for row in 0..rows {
+                let interleaved = match self {
+                    Self::InterleavedShuffled { .. } if row < rows / 2 => 2 * row,
+                    Self::InterleavedShuffled { .. } => 2 * (row - rows / 2) + 1,
+                    _ => row,
+                };
                 // The reference's maps in closed form: within its block, a source row `r` moves to
                 // `(r % lanes) * 8 + r / lanes`, the interleave of `lanes` eight-row groups that the
                 // artifact's `srcToDstBlk16RowMap` and `srcToDstBlk32RowMap` list. The block is
                 // taken first: a row's offset inside its own block decides where it goes, and its
                 // block decides where that block starts.
-                let within = row % block;
-                let destination = (row / block) * block + (within % lanes) * 8 + within / lanes;
+                let within = interleaved % block;
+                let destination =
+                    (interleaved / block) * block + (within % lanes) * 8 + within / lanes;
                 let source = (base + row * row_bytes) as usize;
                 let target = (base + destination * row_bytes) as usize;
                 arranged[target..target + stride].copy_from_slice(&bytes[source..source + stride]);
@@ -2754,6 +2771,35 @@ mod tests {
                 error.contains(&from.to_string()) && error.contains(&to.to_string()),
                 "{from} to {to} was refused without naming both: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod value_layout_tests {
+    use super::ValueLayout;
+
+    /// A gated stack's rows: logical row `i` of each half reaches the position the reference states,
+    /// `2i` or `2i + 1` before the shuffle, then `(r % 4) · 8 + r / 4` inside its 32-row block.
+    #[test]
+    fn a_gated_stack_interleaves_its_halves_before_the_shuffle() {
+        let rows = 256_u64;
+        let bytes: Vec<u8> = (0..rows).map(|row| row as u8).collect();
+        let layout = ValueLayout::InterleavedShuffled {
+            epilogue_tile_m: 128,
+        };
+        let arranged = layout.arrange(&bytes, 1, rows, 1);
+        for half in 0..2_u64 {
+            for index in 0..rows / 2 {
+                let position = 2 * index + half;
+                let within = position % 32;
+                let stored = (position / 32) * 32 + (within % 4) * 8 + within / 4;
+                assert_eq!(
+                    u64::from(arranged[stored as usize]),
+                    half * (rows / 2) + index,
+                    "row {index} of half {half} belongs at {stored}"
+                );
+            }
         }
     }
 }
