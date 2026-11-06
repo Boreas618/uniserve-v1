@@ -319,6 +319,35 @@ fn run() -> Result<(), String> {
     }
     println!("  total {total} elements at {}", args.dtype);
 
+    // 6. The stage's floor, which is the LARGER of the evaluation and the prompt's fold: the two
+    // occupy the same offsets, because the capture walk runs the evaluation alone from the region's
+    // base and the fold runs only on the live path, before the first replay.
+    let fold_rows = layout.text_rows.saturating_add(layout.condition_rows);
+    let fold = minimax_h3::conditioning::fold_bytes(
+        &denoiser.transformer,
+        fold_rows,
+        fold_rows,
+        arrangement.shard,
+        args.dtype,
+    );
+    // The plan's own reservation, not the element count times one width: a plan carries `f32`,
+    // `bf16` and `i32` entries, and the executor sums each entry's own width.
+    let evaluation = minimax_h3::decoding::arena_reservation(&plan);
+    println!(
+        "floor  max(evaluation {} MiB, fold {} MiB) = {} MiB",
+        evaluation / (1 << 20),
+        fold / (1 << 20),
+        evaluation.max(fold) / (1 << 20)
+    );
+    if fold > evaluation {
+        disagreements.push(format!(
+            "the prompt's fold reserves {} MiB and one evaluation {evaluation} MiB: the floor is \
+             the fold here, and a deployment sized by the evaluation alone would stop at its first \
+             request",
+            fold / (1 << 20)
+        ));
+    }
+
     // 5. The state tables the runner writes from this layout, with their values.
     //
     // `prepare_state` is the executor's per-request call and `write_state` is a host function, so

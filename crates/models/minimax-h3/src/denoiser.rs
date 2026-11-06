@@ -1508,10 +1508,33 @@ impl nn::capability::Denoiser for Denoiser {
     /// storage from the number the forward fills rather than from a literal beside it. Nothing here
     /// allocates or touches a device: the model states what its forward needs and the runtime owner
     /// allocates to it.
+    /// The stage's floor: **the larger of one evaluation and the prompt's fold**, because the two
+    /// reuse one region rather than following one another in it.
+    ///
+    /// The captured graph's nodes carry the offsets the planning walk recorded, and that walk starts
+    /// its arena at the region's base and runs the evaluation alone. The fold runs only on the live
+    /// path (`first_step`, before the first replay) and writes its result into the conditioning
+    /// column, so its scratch and the graph's buffers occupy the same offsets by construction: the
+    /// graph clobbers the fold's scratch, which is dead, and never the fold's output, which is a
+    /// column. Adding the two would refuse a deployment that serves - and the plan's entries are
+    /// storage the executor allocates by name, so an added entry is memory rather than a bound.
+    ///
+    /// The larger, then, and not the sum: at every deployment here the evaluation is the larger (the
+    /// fold is 532 MiB against the evaluation's 6.1 GiB at a 1024-row capacity), and the `max` is
+    /// stated rather than assumed because a deployment whose evaluation were smaller would need it.
     fn arena_bytes(&self, request: &VideoRequest<'_>) -> nn::Result<u64> {
         let layout = self.layout(request);
         let plan = self.denoise_arena(&layout).map_err(flattened)?;
-        Ok(crate::decoding::arena_reservation(&plan))
+        let evaluation = crate::decoding::arena_reservation(&plan);
+        let rows = layout.text_rows.saturating_add(layout.condition_rows);
+        let fold = crate::conditioning::fold_bytes(
+            &self.config.transformer,
+            rows,
+            rows,
+            self.shard,
+            self.transformer.dtype(),
+        );
+        Ok(evaluation.max(fold))
     }
 
     /// The denoising steps this checkpoint runs for `task`.
