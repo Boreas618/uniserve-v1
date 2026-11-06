@@ -2047,6 +2047,7 @@ impl Replica {
             epoch,
         } = target;
         let mut served = updates.epochs().served();
+        let serving_config = config.clone();
         tokio::spawn(async move {
             let sink = stats_sink(
             replica.model_name.clone(),
@@ -2111,6 +2112,9 @@ impl Replica {
             }
             spec.predecessor = None;
             let before = locked(&replica.served).replace(spec);
+            // The configuration is the one the target serves from here, as the spec is, and a
+            // revert puts both back: the next apply starts from it, and the operator reads it.
+            let config_before = std::mem::replace(&mut *locked(&replica.config), serving_config);
             // The previous client stays until the switch settles: it is what keeps the previous
             // epoch's process, which the switch drains next and serves again on a revert.
             let previous = replica.hold.client();
@@ -2126,6 +2130,7 @@ impl Replica {
                 .is_some_and(|(serving, _)| serving == epoch);
             if !committed && let Some(previous) = previous {
                 *locked(&replica.served) = before;
+                *locked(&replica.config) = config_before;
                 replica.hold.serve(previous);
                 warn!(engine, epoch, "the switch returned this replica to the previous epoch");
             }
