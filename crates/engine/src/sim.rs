@@ -1612,7 +1612,10 @@ impl SimEngine {
                         .map(|&token_id| {
                             vec![TokenLogprob {
                                 token_id,
-                                logprob: sim_candidate_logprob(call.request_key.request_id, token_id),
+                                logprob: sim_candidate_logprob(
+                                    call.request_key.request_id,
+                                    token_id,
+                                ),
                                 rank: 1,
                             }]
                         })
@@ -2488,8 +2491,8 @@ fn synthetic_png_b64(
     // The simulated denoiser predicts zero velocity, so an image is its initial
     // latent decoded: the seed and the image's index decide its pixels, as they
     // decide its feedback values.
-    let latent = digest(&[seed.to_le_bytes(), u64::from(image_index).to_le_bytes()].concat())
-        .to_le_bytes();
+    let latent =
+        digest(&[seed.to_le_bytes(), u64::from(image_index).to_le_bytes()].concat()).to_le_bytes();
     let mut bytes = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut bytes, width, height);
