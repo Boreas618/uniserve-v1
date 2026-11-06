@@ -285,10 +285,11 @@ pub struct GemmDescriptor {
     pub n: u32,
     /// The contraction length in elements: the packed operands each hold `k / 2` bytes a row.
     pub k: u32,
-    /// Launch with programmatic dependent launch.
-    pub pdl: bool,
 }
 
+/// The key states what the compiled object is built for. **Not `pdl`**: the program does not carry
+/// it - there is no such field left to state - because the two values compile one object, measured
+/// byte for byte in both the host and the device code.
 impl fmt::Display for GemmDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
@@ -301,7 +302,6 @@ impl fmt::Display for GemmDescriptor {
             .field("m", self.m)
             .field("n", self.n)
             .field("k", self.k)
-            .field("pdl", self.pdl)
             .finish(formatter)
     }
 }
@@ -582,7 +582,6 @@ mod tests {
             m: 128,
             n: 4096,
             k: 2048,
-            pdl: false,
         };
         assert!(
             check_gemm(&descriptor(DType::U8, DType::F8E4M3)).is_ok(),
@@ -631,7 +630,6 @@ mod tests {
             m: 4,
             n: 4096,
             k: 4096,
-            pdl: true,
         };
         let key = crate::descriptor::key(&gemm);
         assert!(key.contains("layout_swizzled_128x4"), "{key}");

@@ -618,6 +618,14 @@ pub struct ArgMaxArgs {
 }
 
 /// The largest value's index, per row.
+///
+/// **A row with no numeric value answers the row's width, not an index.** The program's running
+/// index starts at `width` and every tile's index is the smallest column equal to that tile's
+/// largest value, falling back to `width`; a row whose elements are all NaN or all `-inf` therefore
+/// answers `width`, which is one past the last column. When the row is a vocabulary that value is
+/// the vocabulary itself — a number a caller can mistake for a token id. So a reader of `out`
+/// refuses `index >= width` where it reads a token, and the refusal names the row, because only the
+/// reader can say that the row it sampled had no finite logit.
 pub struct ArgMax;
 
 impl Op for ArgMax {
@@ -879,15 +887,25 @@ pub struct OrderArgs {
     /// `[rows, width]` the candidate token ids.
     pub ids: TensorView,
     /// `[rows, width]` the values in ascending token order.
+    ///
+    /// Every slot of the row is written. A candidate's rank is the count of smaller ids before it,
+    /// so the first `k` slots hold `k` candidates and the rest hold the program's sentinel: value
+    /// [`f32::NEG_INFINITY`] and id `-1`. A slot nothing wrote is therefore not a reading anyone has
+    /// to interpret — it cannot be mistaken for the legitimate token `0`, and a draw does not select
+    /// it because it carries no mass.
     pub ordered_values: TensorView,
-    /// `[rows, width]` the ids in ascending token order.
+    /// `[rows, width]` the ids in ascending token order, whole to the width as [`Self::ordered_values`]
+    /// is: the counted candidates first, then `-1`.
     pub ordered_ids: TensorView,
-    /// `[rows, vocabulary]` i32 scratch, one count per token id and then that id's rank.
+    /// `[rows, vocabulary]` i32 scratch, one count per token id and then the rank each id's next
+    /// candidate takes.
     ///
     /// The program counts rather than compares, because a row's candidates may be the whole
     /// vocabulary: an ordering that compares every candidate with every other is quadratic in the
     /// vocabulary, and 151936 candidates in one program is sixteen seconds. This buffer is the id
-    /// space's, and the program owns it for the duration of the launch.
+    /// space's, and the program owns it for the duration of the launch. It doubles as the rank
+    /// counter — each candidate takes the value its id holds and increments it — so two candidates
+    /// with one id land in consecutive slots instead of overwriting each other.
     pub counts: TensorView,
     /// The id space `counts` covers: the model's vocabulary.
     pub vocabulary: u64,
