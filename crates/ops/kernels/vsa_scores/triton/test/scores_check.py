@@ -68,7 +68,7 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     key = torch.randn(key_tiles, heads, width, dtype=torch.float32)
     out = torch.full((heads, query_tiles, key_tiles), float("nan"), dtype=torch.float32)
 
-    module._vsa_scores_kernel[(query_tiles, heads, 1)](
+    module._vsa_scores_kernel[((query_tiles + 15) // 16, heads, 1)](
         query,
         key,
         out,
@@ -78,6 +78,7 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
         WIDTH=width,
         BLOCK=block,
         KEY_TILES=16,
+        QUERIES=16,
     )
 
     # The reference: the same operands in FP64, rounded once into FP32.
@@ -88,7 +89,12 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
 
     bound = declared_bound(width)
     error = (out - expected).abs()
-    allowed = bound * expected.abs()
+    # A dot product's error scales with the sum of its terms' magnitudes, and a score that cancels
+    # to near zero has no such scale of its own.
+    magnitude = torch.einsum(
+        "ihw,jhw->hij", query.abs().to(torch.float64), key.abs().to(torch.float64)
+    ) / width**0.5
+    allowed = bound * magnitude.to(torch.float32)
     unset = int(torch.isnan(out).sum())
     # `~(error <= allowed)` counts a NaN difference as outside, which also covers the scores the
     # kernel never wrote — so `unset` is reported but not added.
