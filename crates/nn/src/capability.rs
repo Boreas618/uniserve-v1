@@ -922,6 +922,15 @@ pub trait Decoder {
     /// the point of this boundary is that the alternative - guessing - is silent.
     fn element_type(&self) -> DType;
 
+    /// The element type of the latent block [`Self::decode`] reads, when it is not
+    /// [`Self::element_type`].
+    ///
+    /// A decoder whose reference restores the latents in a wider type than it decodes them to says
+    /// so here, and the runner stages the block in that type rather than narrowing it on the way in.
+    fn latent_type(&self) -> DType {
+        self.element_type()
+    }
+
     /// For each row of the latent block [`Self::decode`] reads, the clip's voxel it holds, counted
     /// frame by frame, row by row.
     ///

@@ -41,4 +41,9 @@ dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], 
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8"], k_heads = ["1", "2", "28", "32", "4", "56", "8"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false", "true"], rotated = ["48", "64", "96", "128"]}
 
+# The strided form the video VAE's decoder launches: heads read through a row stride, a factor table
+# of the activation's type that repeats per tile. Named by `factors` and `strided`.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8"], k_heads = ["1", "2", "28", "32", "4", "56", "8"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false", "true"], rotated = ["48", "64", "96", "128"], factors = ["f16", "f32"], strided = ["true"] }
+
 [parameters]

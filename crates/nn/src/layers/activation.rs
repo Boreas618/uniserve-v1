@@ -30,6 +30,10 @@ use crate::weights::Weight;
 /// statement handles; a power of two keeps every vector load aligned.
 pub const BLOCK: u32 = 1024;
 
+/// The elements one program of the packed gated activation walks: wide enough that each lane moves a
+/// whole vector of a half-precision row, which is what this memory-bound step runs at.
+const PACKED_BLOCK: u32 = 4096;
+
 /// `out = act(gate) · value` over two views.
 pub struct GatedActivation {
     activation: Activation,
@@ -319,7 +323,7 @@ impl PackedSwiGlu {
             dtype,
             width: u32::try_from(width)
                 .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
-            block: BLOCK,
+            block: PACKED_BLOCK,
             input_stride,
             bias,
             absmax,

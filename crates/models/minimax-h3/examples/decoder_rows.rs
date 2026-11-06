@@ -8,23 +8,17 @@
 //!
 //! ## Why this exists
 //!
-//! `VideoDecoder::programs` states more rows than one tile's decode launches, and the difference is
+//! `VideoDecoder::programs` states one row more than the transformer launches, and the difference is
 //! not an over-statement: the component's decode is a decoder **and a clip stitcher**, and the stitcher
-//! owns one unpatchify, one compiled blend per seam width and axis, and the copy that makes a seam's
-//! neighbour readable - a single tile's decode launches none of them. The numbers are printed rather
-//! than stated here, because the blend table is **derived from the canvases the deployment offers**:
-//! it holds a width exactly when an offered canvas launches it, so a canvas added to the model adds
-//! its seams and this program's output changes without this sentence being edited. (A ladder of
-//! alignment steps to the tile size was once written out instead; it stated 24 widths, of which 8 ever
-//! launch.)
+//! owns one launch of its own.
 //!
 //! The distinction matters because the three instruments that certify a store see only a list: a row
 //! with a plausible owner and a row nothing launches look the same to `keys_delta`, `key_coverage` and
 //! `build_store`.
 //!
 //! So this file splits the enumeration into the families it is made of, drives the decoder's own
-//! `decode` for the first, reads the stitcher's declared blends for the second, and prints anything
-//! left over - which is the only shape in which an unattributed row would appear.
+//! `decode` for the first, reads the stitcher's declared row for the second, and prints anything left
+//! over - which is the only shape in which an unattributed row would appear.
 //!
 //! ## What it drives
 //!
@@ -50,12 +44,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use minimax_h3::decoding::{ClipDecoder, arena_reservation, video_arena};
+use minimax_h3::video_vae::{ACTIVATION, STREAM};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder};
 use nn::capability::Decoder;
 use nn::forward::Arena;
-use nn::layers::{Linear, WeightOrder};
 use nn::tensor::DevicePtr;
-use nn::weights::{WeightLoader, WeightRequest};
+use nn::weights::WeightLoader;
 use nn::{DType, Shape};
 use ops::capture::{self, Sink};
 
@@ -119,9 +113,8 @@ fn run() -> Result<(), String> {
 
     let config = video_config(&root)?;
     let extents = extents(&root, extents_path)?;
-    let stated = VideoDecoder::programs(&config, DType::F32).map_err(|error| error.to_string())?;
+    let stated = VideoDecoder::programs(&config).map_err(|error| error.to_string())?;
     let ratio = config.spatial_compression();
-    let model_width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
 
     println!(
         "# the video decoder's {} stated rows, split by the object that launches them",
@@ -138,43 +131,29 @@ fn run() -> Result<(), String> {
         let mut loader = WeightLoader::stated(DType::F32, Some(&extents));
         let clip_canvas = Canvas::clip(&config, height / ratio, width / ratio);
         let tiles = Tiles::of(&config, &clip_canvas).map_err(|error| error.to_string())?;
-        let canvas = tiles
-            .tiles(&config, &clip_canvas)
+        let grid = tiles.tiles(&config, &clip_canvas);
+        let canvas = grid
             .first()
             .copied()
             .ok_or("a clip with no tiles to decode")?
             .canvas;
-        let projection = loader
-            .load(&WeightRequest::region(
-                "virtual.proj_in.weight",
-                0,
-                Shape::new(&[u64::from(model_width), u64::from(config.latent_channels)]),
-            ))
-            .map_err(|error| error.to_string())?;
-        let bias = loader
-            .load(&WeightRequest::region(
-                "virtual.proj_in.bias",
-                0,
-                Shape::new(&[u64::from(model_width)]),
-            ))
-            .map_err(|error| error.to_string())?;
-        let input = Linear::new(projection, Some(bias), WeightOrder::NxK)
-            .map_err(|error| error.to_string())?;
+        let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+        let token_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
         // The decoder serves the clip's raster: `load` states canvases in pixels, and this example
         // knows the clip's latent extents.
         let spatial = config.spatial_compression();
         let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
-        let decoder = VideoDecoder::load(&config, &[raster], DType::F32, input, &mut loader)
+        let decoder = VideoDecoder::load(&config, &[raster], &mut loader)
             .map_err(|error| error.to_string())?;
 
         let scratch = decoder
-            .scratch(&f, &canvas)
+            .scratch(&f, &clip_canvas)
             .map_err(|error| error.to_string())?;
         let latents = f
             .arena()
             .tensor(
-                DType::F32,
-                Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
+                STREAM,
+                Shape::new(&[voxels, u64::from(config.latent_channels)]),
             )
             .map_err(|error| error.to_string())?;
         // The positions table is FP32 by the layout's declaration, not the sample's type.
@@ -188,17 +167,16 @@ fn run() -> Result<(), String> {
             * u64::from(config.spatial_compression());
         let out = f
             .arena()
-            .tensor(DType::F32, Shape::new(&[canvas.rows(), out_channels]))
+            .tensor(ACTIVATION, Shape::new(&[token_rows, out_channels]))
             .map_err(|error| error.to_string())?;
         let mut recorded = Recorded::default();
         capture::set_sink(Some(&mut recorded));
-        let run = decoder.decode(&f, &canvas, latents, positions, out, &scratch);
+        let run = decoder.decode(&f, &clip_canvas, latents, positions, out, &scratch);
         capture::set_sink(None);
         run.map_err(|error| format!("{height}x{width}: {error}"))?;
         let rows = distinct(&recorded);
         println!(
-            "{height}x{width}: one tile of {} rows launches {} distinct rows",
-            canvas.rows(),
+            "{height}x{width}: a clip of {token_rows} rows launches {} distinct rows",
             rows.len()
         );
         for row in rows {
@@ -208,33 +186,12 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // The stitcher: one compiled blend per seam width and axis, and the unpatchify it places tiles with.
-    let stitcher = ClipDecoder::new(&config, DType::F32).map_err(|error| error.to_string())?;
-    let mut blends: Vec<(String, String)> = stitcher
-        .blends()
-        .iter()
-        .map(|(_, _, layer)| ("cross_fade".to_owned(), layer.descriptor().to_string()))
-        .collect();
-    blends.sort();
-    blends.dedup();
-    // The stitcher's other row: the unpatchify it places every decoded tile through, derived the way
-    // the decoder's enumeration derives it.
-    let unpatchify = nn::layers::UnpatchifyVideo::new(
-        DType::F32,
-        u64::from(config.out_channels),
-        config.temporal_compression(),
-        config.spatial_compression().max(1),
-    )
-    .map_err(|error| error.to_string())?
-    .descriptor()
-    .to_string();
-    let mut stitcher: Vec<(String, String)> = blends.clone();
-    stitcher.push(("unpatchify_video".to_owned(), unpatchify));
-    stitcher.sort();
-    println!(
-        "# the stitcher declares {} distinct blend row(s) and one unpatchify",
-        blends.len()
-    );
+    // The stitcher's one row.
+    let clip_stitch = ClipDecoder::new(&config).map_err(|error| error.to_string())?;
+    let stitcher: Vec<(String, String)> = vec![(
+        "tile_stitch".to_owned(),
+        clip_stitch.stitch().descriptor().to_string(),
+    )];
 
     union.sort();
     let mut missing: Vec<&(String, String)> =
@@ -282,7 +239,7 @@ fn run() -> Result<(), String> {
 
     // The plan is the figure a runner sizes storage from, so it is checked by driving the decode it
     // describes rather than by reading it.
-    fit_arenas(&config, &extents, &canvases, model_width)?;
+    fit_arenas(&config, &extents, &canvases)?;
 
     if rows_agree {
         Ok(())
@@ -311,7 +268,6 @@ fn fit_arenas(
     config: &minimax_h3::VideoVaeConfig,
     extents: &BTreeMap<String, (DType, Shape)>,
     canvases: &[(u32, u32)],
-    model_width: u32,
 ) -> Result<(), String> {
     let ratio = config.spatial_compression();
     let mut failures: Vec<String> = Vec::new();
@@ -328,28 +284,11 @@ fn fit_arenas(
                 .tiles(config, &clip_canvas)
                 .to_vec();
             let mut loader = WeightLoader::stated(dtype, Some(extents));
-            let projection = loader
-                .load(&WeightRequest::region(
-                    "virtual.proj_in.weight",
-                    0,
-                    Shape::new(&[u64::from(model_width), u64::from(config.latent_channels)]),
-                ))
-                .map_err(|error| error.to_string())?;
-            let bias = loader
-                .load(&WeightRequest::region(
-                    "virtual.proj_in.bias",
-                    0,
-                    Shape::new(&[u64::from(model_width)]),
-                ))
-                .map_err(|error| error.to_string())?;
-            let input = Linear::new(projection, Some(bias), WeightOrder::NxK)
-                .map_err(|error| error.to_string())?;
             let spatial = config.spatial_compression();
             let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
-            let decoder = VideoDecoder::load(config, &[raster], dtype, input, &mut loader)
+            let decoder = VideoDecoder::load(config, &[raster], &mut loader)
                 .map_err(|error| error.to_string())?;
-            let plan =
-                video_arena(config, &clip_canvas, dtype).map_err(|error| error.to_string())?;
+            let plan = video_arena(config, &clip_canvas).map_err(|error| error.to_string())?;
             let need = arena_reservation(&plan);
 
             // The number a runner allocates from, asked of the capability rather than recomputed
@@ -373,16 +312,25 @@ fn fit_arenas(
             let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
             let latents = caller
                 .tensor(
-                    dtype,
+                    STREAM,
                     Shape::new(&[voxels, u64::from(config.latent_channels)]),
                 )
                 .map_err(|error| error.to_string())?;
             let positions = caller
                 .tensor(DType::F32, Shape::new(&[3, Canvas::rows(&tiles[0].canvas)]))
                 .map_err(|error| error.to_string())?;
+            let stitch_table = caller
+                .tensor(
+                    DType::I32,
+                    Shape::new(&[
+                        u64::from(height) + u64::from(width),
+                        ops::tile_stitch::TABLE_WIDTH,
+                    ]),
+                )
+                .map_err(|error| error.to_string())?;
             let out = caller
                 .tensor(
-                    dtype,
+                    ACTIVATION,
                     Shape::new(&[
                         u64::from(minimax_h3::output::Rgb::CHANNELS),
                         u64::from(clip_canvas.frames_out(config)),
@@ -395,10 +343,11 @@ fn fit_arenas(
             // Exactly the plan: not one buffer more.
             let clip_arena = Arena::new(DevicePtr::new(0), need);
             let f = nn::Forward::recording(&clip_arena);
-            let stitch = ClipDecoder::new(config, dtype).map_err(|error| error.to_string())?;
+            let stitch = ClipDecoder::new(config).map_err(|error| error.to_string())?;
             let mut recorded = Recorded::default();
             capture::set_sink(Some(&mut recorded));
-            let run = stitch.decode_clip(&f, &decoder, &tiles, latents, positions, out);
+            let run =
+                stitch.decode_clip(&f, &decoder, &tiles, latents, positions, stitch_table, out);
             capture::set_sink(None);
             let used = clip_arena.used();
             match run {
