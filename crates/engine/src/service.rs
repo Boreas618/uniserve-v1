@@ -2117,6 +2117,16 @@ fn apply(command: wire::Command, front: usize, routing: &Routing) {
     }
 }
 
+/// How long an ended response's events are held for a consumer that has not
+/// taken them.
+///
+/// The hold exists for a successor's takeover, which replays from the position a
+/// consumer stated; it is not a liveness rule for the consumer. A reader that is
+/// gone - a disconnected client, a dropped stream - never states a further
+/// position, and an epoch's shutdown joins this forwarder, so an unbounded wait
+/// here is an epoch that cannot end.
+const CONSUMER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Forwards each request's events to the daemon that submitted it, and
 /// every scheduler's statistics to every daemon, until no request is in
 /// flight and the readers have stopped handing over streams.
@@ -2304,6 +2314,14 @@ async fn forward(stream: Stream, routing: &Routing) {
             if consumed >= sent {
                 break;
             }
+            // A consumer that went away cannot take the rest, so the wait for it
+            // is bounded: this hold exists to replay events a successor may still
+            // need, not to keep an epoch alive for a reader that is gone. The
+            // grace is the takeover's own window, and a request released this way
+            // says so, because the alternative reading - a consumer that is
+            // merely slow - is a handoff that lost tokens instead.
+            let grace = tokio::time::sleep(CONSUMER_GRACE);
+            tokio::pin!(grace);
             tokio::select! {
                 changed = credit.changed() => {
                     if changed.is_err() {
@@ -2314,6 +2332,16 @@ async fn forward(stream: Stream, routing: &Routing) {
                     if changed.is_err() {
                         break;
                     }
+                }
+                () = &mut grace => {
+                    tracing::warn!(
+                        request = id.0,
+                        sent,
+                        consumed,
+                        grace = ?CONSUMER_GRACE,
+                        "a consumer stopped taking an ended response's events; the request is released"
+                    );
+                    break;
                 }
             }
             continue;
