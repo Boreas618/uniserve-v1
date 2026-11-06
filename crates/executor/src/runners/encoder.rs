@@ -27,7 +27,7 @@ use ops::{DType, PhaseKind};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, Jobs};
+use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_i32};
@@ -130,6 +130,8 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     ids: Vec<u32>,
     /// The bucket the columns are staged for, so a capture smaller than the largest bucket knows how
     /// far the columns it uploads run.
+    /// The calls of the batch staged last, which its replay answers.
+    calls: Vec<CallId>,
     staged: Option<Bucket>,
     /// The epoch's product store, attached by the executor that starts this runner: what an encode
     /// produces and a denoise step of the same request reads.
@@ -184,6 +186,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             tables: Tables::new(),
             columns,
             ids: Vec::new(),
+            calls: Vec::new(),
             staged: None,
             products: None,
             pending: Vec::new(),
@@ -551,6 +554,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             ))
         })?;
         self.stage(&batch, bucket)?;
+        self.calls.clone_from(&batch.calls);
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -659,7 +663,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 // makes them readable, and the wait is the executor's on the runner's stream.
                 self.publish()?;
                 Ok(BatchOutput {
-                    calls: Vec::new(),
+                    calls: answered(&mut self.calls),
                     timing: TimingCounters {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()

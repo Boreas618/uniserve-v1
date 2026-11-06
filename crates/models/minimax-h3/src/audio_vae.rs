@@ -979,7 +979,7 @@ impl BigVgan {
                     let first = Conv1d::new(
                         binder.normalized(&at(&format!("convs1.{step}.weight")))?,
                         Some(binder.region(&at(&format!("convs1.{step}.bias")), &[width])?),
-                        geometry(block.kernel, 1, dilation.padding)?,
+                        dilated_geometry(block.kernel, 1, dilation.padding, dilation.dilation)?,
                         false,
                     )?;
                     let first_activation =
