@@ -848,6 +848,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                  rather than a request's conditioning"
             )));
         }
+        // The encoder's rows stay in `source` for the request's life, and only the first step folds
+        // them: a later step's copy would write bytes no launch reads.
+        if self.staged_step != Some(0) {
+            return Ok(());
+        }
         let Some(products) = self.products.clone() else {
             return Ok(());
         };
@@ -1221,13 +1226,50 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             staged,
             ..
         } = &mut self.columns;
-        text.write(&staged.text)?;
-        source.write(&staged.source)?;
+        // The refined rows are the request's for its whole schedule: `first_step` folds them once,
+        // and every later step reads them where they are. Only a first step starts from zeros.
+        if self.staged_step == Some(0) {
+            text.write(&staged.text)?;
+            source.write(&staged.source)?;
+        }
         step.write(&staged.step)?;
-        self.columns.text.upload(&stream)?;
-        self.columns.source.upload(&stream)?;
+        if self.staged_step == Some(0) {
+            self.columns.text.upload(&stream)?;
+            self.columns.source.upload(&stream)?;
+        }
         self.columns.step.upload(&stream)?;
         Ok(())
+    }
+
+    /// Runs the staged step operator by operator instead of replaying its graph.
+    ///
+    /// This is the diagnosis' own control: a step that is right here and wrong in a replay says the
+    /// capture is what differs.
+    fn eager_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved();
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let layout = layout_of(bucket)?;
+        let tables = self.model.state_tables(&layout);
+        let key = Self::key(bucket);
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        let index = self.staged_step.unwrap_or(0);
+        let step = self
+            .schedule(bucket)?
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
+        let media: [nn::capability::MediaInput; 0] = [];
+        let latents = self.latents(bucket, 0)?;
+        let cond = self.conditioning(bucket, 0, &state, &media)?;
+        self.model
+            .denoise(&forward, step, latents, cond)
+            .map_err(Error::from)
     }
 
     /// Walks one step of `bucket`'s first request, recording every operator launch into the
@@ -1486,7 +1528,20 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                     self.dump_latents(*bucket, step);
                 }
                 let launched = std::time::Instant::now();
-                captured.launch(&stream)?;
+                let eager = self.diag.eager();
+                if eager {
+                    self.eager_step(*bucket, *generation)?;
+                }
+                let (_, captured) = self
+                    .lifecycle
+                    .graphs
+                    .captured_for(*bucket, *generation)
+                    .ok_or_else(|| {
+                        Error::Invariant(format!("no graph of bucket {bucket} at generation {generation}"))
+                    })?;
+                if !eager {
+                    captured.launch(&stream)?;
+                }
                 // The graph advanced the trajectory in place; what a decode reads next is this
                 // column, and the store records that view rather than a copy of it.
                 self.publish(*bucket)?;

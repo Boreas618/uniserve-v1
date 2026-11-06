@@ -47,6 +47,11 @@ impl Diag {
         Self { dir }
     }
 
+    /// Whether a step runs operator by operator rather than from its graph: `UNISERVE_DIAG_EAGER`.
+    pub(crate) fn eager(&self) -> bool {
+        self.dir.is_some() && std::env::var_os("UNISERVE_DIAG_EAGER").is_some()
+    }
+
     /// Whether a dump will be written.
     pub(crate) fn enabled(&self) -> bool {
         self.dir.is_some()
