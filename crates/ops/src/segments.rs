@@ -826,10 +826,12 @@ impl Op for VsaPrepareTiles {
                         Self::NAME,
                         Shape::new(&[rows, u64::from(descriptor.rotated / 2)]),
                     )?;
-                    if view.dtype != descriptor.dtype {
+                    // The factors are the rotary operator's output, FP32 whatever the rows' type:
+                    // the kernel rounds each product to the rows' type as two eager operations do.
+                    if view.dtype != DType::F32 {
                         return Err(Error::argument(
                             Self::NAME,
-                            format!("the {name} table is not {}", descriptor.dtype),
+                            format!("the {name} table is not f32"),
                         ));
                     }
                     if view.strides.get(0) != descriptor.factor_stride {

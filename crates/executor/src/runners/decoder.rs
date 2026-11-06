@@ -47,6 +47,18 @@ use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
+/// The channels of a decoded raster: red, green and blue, whatever the latents carry.
+const RASTER_CHANNELS: u32 = 3;
+
+/// The rows of the latent block `layout`'s decode reads: the decoder's own, or one per voxel.
+fn block_rows<M: nn::capability::Decoder + ?Sized>(model: &M, layout: &Layout) -> Result<u64> {
+    let video = layout.video;
+    Ok(match model.latent_rows(layout).map_err(Error::from)? {
+        Some(rows) => rows.len() as u64,
+        None => u64::from(video.frames) * u64::from(video.height) * u64::from(video.width),
+    })
+}
+
 /// The columns one clip's decode is staged into, sized for the largest canvas the runner serves.
 ///
 /// A decoder's buckets differ by canvas, and its columns are sized by the largest of them: the clip
@@ -63,10 +75,9 @@ impl DecoderColumns {
     /// `(layout, name)` and `fill` puts the model's bytes in the cache the graph addresses
     /// (`walk` reads `self.tables.views`), so a host column per table would be a second copy that
     /// nothing reads — and the second copy is what let a staged buffer land in a table's place.
-    fn new(device: DeviceId, layout: &Layout, dtype: DType) -> Result<Self> {
+    fn new(device: DeviceId, layout: &Layout, dtype: DType, rows: u64) -> Result<Self> {
         let video = layout.video;
-        let voxels = u64::from(video.frames) * u64::from(video.height) * u64::from(video.width);
-        let elements = voxels
+        let elements = rows
             .checked_mul(u64::from(video.channels))
             .ok_or_else(|| Error::Invalid("a clip's latent extent overflows".into()))?;
         let latents = Column::new(device, dtype, elements)?;
@@ -230,7 +241,8 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )
         })?;
         let dtype = model.element_type();
-        let columns = DecoderColumns::new(binding.device, layout, dtype)?;
+        let rows = block_rows(model.as_ref(), layout)?;
+        let columns = DecoderColumns::new(binding.device, layout, dtype, rows)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -401,7 +413,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )));
         };
         let layout = self.layout(bucket)?;
-        let elements = u64::from(layout.video.channels)
+        let elements = u64::from(RASTER_CHANNELS)
             .checked_mul(u64::from(frames))
             .and_then(|elements| elements.checked_mul(u64::from(height)))
             .and_then(|elements| elements.checked_mul(u64::from(width)))
@@ -564,16 +576,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 Product::VideoLatents,
             ));
         };
-        if published.dtype == self.dtype {
-            let latents = self.latents(&layout);
-            if !store.copy_into(request, Product::VideoLatents, &latents, &self.stream)? {
-                return Err(crate::runners::products::absent(
-                    request,
-                    Product::VideoLatents,
-                ));
-            }
-            return Ok(());
-        }
         // **The boundary's one conversion.** The denoiser accumulates in FP32 (`SAMPLE_DTYPE`) and
         // this decoder reads the checkpoint's own type; the reference spans the two with
         // `torch.autocast`, which design 9 replaced with declared per-layer precision, so exactly
@@ -610,8 +612,44 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             "the denoiser's trajectory",
         )
         .map_err(Error::from)?;
-        self.columns.latents.write(&converted)?;
+        // The trajectory is `[channels, voxels]`, and the block the model reads is `[rows, channels]`
+        // in its own row order, so this crossing also lays the clip out for it.
+        let block = self.block_of(&layout, &converted)?;
+        self.columns.latents.write(&block)?;
         Ok(())
+    }
+
+    /// `converted`, the clip's `[channels, voxels]` latents, as the model's `[rows, channels]` block.
+    fn block_of(&self, layout: &Layout, converted: &[u8]) -> Result<Vec<u8>> {
+        let video = layout.video;
+        let voxels = usize::try_from(
+            u64::from(video.frames) * u64::from(video.height) * u64::from(video.width),
+        )
+        .map_err(|_| Error::Invalid("a clip's latent extent overflows".into()))?;
+        let channels = video.channels as usize;
+        let element = usize::try_from(self.dtype.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.dtype))
+        })?)
+        .map_err(|_| Error::Invalid("an element wider than memory".into()))?;
+        if converted.len() != channels * voxels * element {
+            return Err(Error::Invalid(format!(
+                "a clip of {channels} channels and {voxels} voxels is {} bytes, and the trajectory \
+                 holds {}",
+                channels * voxels * element,
+                converted.len()
+            )));
+        }
+        let order = self.model.latent_rows(layout).map_err(Error::from)?;
+        let order: Vec<u32> = order.unwrap_or_else(|| (0..voxels as u32).collect());
+        let mut block = vec![0_u8; order.len() * channels * element];
+        for (row, voxel) in order.iter().enumerate() {
+            for channel in 0..channels {
+                let from = (channel * voxels + *voxel as usize) * element;
+                let to = (row * channels + channel) * element;
+                block[to..to + element].copy_from_slice(&converted[from..from + element]);
+            }
+        }
+        Ok(block)
     }
 
     /// The pinned host scratch a trajectory of another element type lands in, sized to it once.
@@ -663,18 +701,14 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     }
 
     /// The clip's latents, `[voxels, channels]`, as the model reads them.
-    fn latents(&self, layout: &Layout) -> TensorView {
+    fn latents(&self, layout: &Layout) -> Result<TensorView> {
         let video = layout.video;
-        TensorView::new(
+        let rows = block_rows(self.model.as_ref(), layout)?;
+        Ok(TensorView::new(
             self.columns.latents.device.ptr,
             self.dtype,
-            Shape::new(&[
-                u64::from(video.frames),
-                u64::from(video.height),
-                u64::from(video.width),
-                u64::from(video.channels),
-            ]),
-        )
+            Shape::new(&[rows, u64::from(video.channels)]),
+        ))
     }
 
     /// The raster this runner's replay writes, `[channels, frames, rows, columns]`.
@@ -693,7 +727,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.columns.raster.device.ptr,
             self.dtype,
             Shape::new(&[
-                u64::from(layout.video.channels),
+                u64::from(RASTER_CHANNELS),
                 u64::from(frames),
                 u64::from(height),
                 u64::from(width),
@@ -767,7 +801,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let state = self
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let latents = self.latents(&layout);
+        let latents = self.latents(&layout)?;
         let raster = self.raster(bucket, &layout)?;
         self.model
             .decode(
@@ -846,7 +880,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 "bucket {bucket} is not a decode bucket and a clip was spliced"
             )));
         };
-        let channels = layout.video.channels;
+        let channels = RASTER_CHANNELS;
         self.size_tail(channels, height, width, splice.overlap)?;
         let previous = match self.tail.as_ref() {
             Some(tail) if splice.overlap > 0 => Some(TensorView::new(

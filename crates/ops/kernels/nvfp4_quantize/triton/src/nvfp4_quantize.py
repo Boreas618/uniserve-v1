@@ -16,13 +16,10 @@ than composed arithmetic:
 * ``cvt.rn.satfinite.e2m1x2.f32`` rounds a pair of values to E2M1 codes packed
   into one byte, lower column in the lower nibble.
 
-Encoding is two-level micro-scaling. A row is first brought into the block format's range by a
-factor the row itself determines -- ``token_scale = amax(row) * global_scale`` -- and each
-sixteen-element block then carries an E4M3 scale relative to that factor. The product that reads
-the encoding multiplies both, so this kernel writes the factor beside the values and the scales.
-That is why one program owns a whole row: the factor is a reduction over the row, and every block
-of the row is scaled against it, so a program owning a fragment of a row could not state it. A
-program walks its row twice -- once for the row's amax, once to encode -- for the same reason.
+Encoding is two-level micro-scaling. A calibrated export states one activation scale per module,
+``global_scale`` is its reciprocal, and each sixteen-element block carries an E4M3 scale relative to
+it. A code dequantizes to ``code * block_scale * token_scale``, where ``token_scale`` is the
+activation scale itself, written beside the values for the products that read a factor per row.
 
 A block whose E4M3 scale rounds to zero encodes to zeros: the reciprocal of a
 zero scale is not a number, and the vendor encoder multiplies by zero there.
@@ -151,29 +148,15 @@ def _nvfp4_quantize_kernel(
     chunks = COLUMNS // BLOCK
     row = tl.program_id(0)
 
-    # Pass one: the row's amax. The per-token factor is the row's own dequantization
-    # factor, `amax * global_scale`, which is what the reference encoder publishes;
-    # the encode multiplier is its approximate reciprocal, as the reference's
-    # `reciprocal_approximate_ftz` is, so the bytes agree with it.
-    # One-element vectors rather than scalars: the value is loop-carried, and a Triton loop's
-    # carried variable needs a shape it can unify across iterations.
-    row_amax = tl.zeros([1], tl.float32)
-    for chunk in range(chunks):
-        columns = chunk * BLOCK + tl.arange(0, BLOCK)
-        values = tl.load(input_ptr + row * COLUMNS + columns).to(tl.float32)
-        row_amax = tl.maximum(row_amax, tl.max(tl.abs(values).reshape([BLOCK])))
-
-    token_scale = row_amax * global_scale
-    ## A row whose values are all zero has no magnitude to scale by, and the reciprocal of a zero
-    ## factor is infinite: the row would encode to NaN rather than to zeros, and the product that
-    ## reads the factor would divide by zero. The factor is floored at a value whose reciprocal is
-    ## finite, so a zero row encodes as zeros with a finite factor and its product is zero.
-    token_scale = tl.maximum(token_scale, 1.0e-30)
-    tl.store(token_scale_ptr + row + tl.arange(0, 1), token_scale)
-    ## The encode multiplier is the approximate reciprocal of the row's factor, as the reference
-    ## encoder's `reciprocal_approximate_ftz` is: the bytes agree with it, not merely the values.
-    encode = _rcp_approx(token_scale)
+    # The encode multiplier is the calibrated global scale, the reciprocal of the export's activation
+    # scale, as the vendor encoder's is. A block's E4M3 scale is `amax / 6` under it, which the
+    # calibration keeps inside the format's range. The row's dequantization factor is the reciprocal
+    # of that multiplier, the same for every row. A factor derived from the row's own magnitude
+    # instead would multiply the calibrated scale by the row's amax and round every block scale to
+    # zero, which is an all-zero product.
+    encode = tl.zeros([1], tl.float32) + global_scale
     inverse_encode = _rcp_approx(encode)
+    tl.store(token_scale_ptr + row + tl.arange(0, 1), inverse_encode)
 
     # Pass two: each block's E4M3 scale relative to the row's factor, and its codes.
     sixth = _rcp_approx(tl.full([1], 6.0, tl.float32))
