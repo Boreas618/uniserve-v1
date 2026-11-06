@@ -85,7 +85,9 @@ fn run() -> Result<(), String> {
             "--width" => args.width = number(&value("--width"), "--width")?,
             "--height" => args.height = number(&value("--height"), "--height")?,
             "--frames" => args.frames = number(&value("--frames"), "--frames")?,
-            "--text-tokens" => args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?),
+            "--text-tokens" => {
+                args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?)
+            }
             "--column-width" => {
                 args.column_width = Some(number(&value("--column-width"), "--column-width")?)
             }
@@ -96,9 +98,7 @@ fn run() -> Result<(), String> {
                     "fl2va" => VideoTask::FirstLastToVideoAudio,
                     "ref2va" => VideoTask::ReferenceToVideoAudio,
                     other => {
-                        return Err(format!(
-                            "--task takes t2va, fl2va or ref2va, not `{other}`"
-                        ));
+                        return Err(format!("--task takes t2va, fl2va or ref2va, not `{other}`"));
                     }
                 }
             }
@@ -227,7 +227,9 @@ fn run() -> Result<(), String> {
     // it (`nn::capability::Denoiser::text_width`, H3 answering `hidden_size`); from a configuration
     // the two halves are the same two numbers.
     println!("conditioning");
-    println!("  text   [rows, {hidden}]   what the denoiser reads (prepare_conditioning writes it)");
+    println!(
+        "  text   [rows, {hidden}]   what the denoiser reads (prepare_conditioning writes it)"
+    );
     println!("  source [rows, {text_dim}]   what the text encoder wrote");
     if text_dim == hidden {
         println!("  one width: the refiner does not widen, so a runner may size both alike");
@@ -266,12 +268,16 @@ fn run() -> Result<(), String> {
         layout.video.channels, layout.video.frames, layout.video.height, layout.video.width
     );
     if let Some(audio) = layout.audio {
-        println!("  audio latent [channels {}, frames {}]", audio.channels, audio.frames);
+        println!(
+            "  audio latent [channels {}, frames {}]",
+            audio.channels, audio.frames
+        );
     }
 
     // 3. The checks that are statements about statements.
     let tokens = u64::from(
-        denoiser::packed_rows(&denoiser, &arrangement, &layout).map_err(|error| error.to_string())?,
+        denoiser::packed_rows(&denoiser, &arrangement, &layout)
+            .map_err(|error| error.to_string())?,
     );
     if layout.text_rows != arrangement.text_rows {
         disagreements.push(format!(
@@ -324,9 +330,10 @@ fn run() -> Result<(), String> {
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let elements = spec.shape.dims().iter().product::<u64>();
-        let width = spec.dtype.bytes().ok_or_else(|| {
-            format!("the state table `{}` is {}", spec.name, spec.dtype)
-        })?;
+        let width = spec
+            .dtype
+            .bytes()
+            .ok_or_else(|| format!("the state table `{}` is {}", spec.name, spec.dtype))?;
         let bytes = usize::try_from(elements * width)
             .map_err(|_| format!("the state table `{}` is larger than memory", spec.name))?;
         written.push(vec![0u8; bytes]);
@@ -347,7 +354,10 @@ fn run() -> Result<(), String> {
     }
 
     if disagreements.is_empty() {
-        println!("denoise shapes: {} statement(s) agree", plan.len() + 6 + specs.len());
+        println!(
+            "denoise shapes: {} statement(s) agree",
+            plan.len() + 6 + specs.len()
+        );
         Ok(())
     } else {
         for disagreement in &disagreements {

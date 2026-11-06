@@ -345,12 +345,10 @@ fn main() {
             "--derived" => derived = true,
             "--text-tokens" => {
                 let stated = value(&mut arguments, "--text-tokens");
-                text_tokens = Some(
-                    stated
-                        .trim()
-                        .parse::<u32>()
-                        .unwrap_or_else(|_| panic!("--text-tokens is not a row count: {}", stated)),
-                );
+                text_tokens =
+                    Some(stated.trim().parse::<u32>().unwrap_or_else(|_| {
+                        panic!("--text-tokens is not a row count: {}", stated)
+                    }));
             }
             // **The sequence and tensor degrees are key axes, not deployment decorations.** A sparse
             // attention's program takes the heads one exchange rank attends (`Partition::denoiser_heads`,
