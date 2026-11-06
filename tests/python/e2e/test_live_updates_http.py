@@ -102,7 +102,7 @@ OPTIONS = (
 )
 # A change of the options that only a new world executes: graphs of other
 # decode batch sizes.
-CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
 # The deployment's host KV cache on the host, in GiB.
 HOST_GIB = 8
 PROMPT = (
@@ -1625,7 +1625,7 @@ def _restart_while_streaming(
     # applied when the trial starts: the configuration moves once the target serves.
     _wait_until(
         lambda: served_config()["cuda_graph_config"]["decode_batch_sizes"]
-        == [1, 2, 4, 8, 16],
+        == [1, 2, 8],
         300,
         "the switch's target never served its configuration",
     )
