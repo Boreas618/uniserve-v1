@@ -171,6 +171,8 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// The frames the splice staged last wrote for the staged request's clip: the extent the product
     /// states, taken from the schedule rather than recomputed here.
     staged_keep: Option<u32>,
+    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
+    diag: crate::runners::diag::Diag,
     /// The timeline frame the clip staged last starts at, and the unit it is.
     staged_first: u32,
     staged_unit: u32,
@@ -278,6 +280,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             spliced: std::collections::HashMap::new(),
             staged_frames: None,
             staged_keep: None,
+            diag: crate::runners::diag::Diag::from_env(),
             staged_first: 0,
             staged_unit: 0,
             published_units: 0,
@@ -965,6 +968,26 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             _ => None,
         };
         let clip = self.raster(bucket, layout)?;
+        if self.diag.enabled() {
+            let _ = self.diag.write(
+                self.device,
+                &self.stream,
+                "decoder",
+                &format!("raster_{index}"),
+                clip,
+            );
+            let _ = self.diag.write(
+                self.device,
+                &self.stream,
+                "decoder",
+                &format!("latents_{index}"),
+                TensorView::new(
+                    self.columns.latents.device.ptr,
+                    self.dtype,
+                    Shape::new(&[self.columns.latents.device.numel()]),
+                ),
+            );
+        }
         let column = self.frames.as_ref().ok_or_else(|| {
             Error::Invariant(
                 "a postprocessor is bound and no frames column was sized for the bucket".into(),
