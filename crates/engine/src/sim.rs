@@ -1918,12 +1918,10 @@ impl SimEngine {
                     // A decoding that writes the request's feedback image
                     // product publishes its values after the PNG, as a
                     // executor does.
-                    let mut media = synthetic_png_b64(width, height)?.into_bytes();
+                    let seed = image.seed.unwrap_or(call.request_key.request_id.0);
+                    let mut media =
+                        synthetic_png_b64(width, height, seed, request.image_index)?.into_bytes();
                     if call.image_output.is_some() {
-                        let seed = request
-                            .image()
-                            .and_then(|image| image.seed)
-                            .unwrap_or(call.request_key.request_id.0);
                         let values =
                             synthetic_feedback_values(seed, request.image_index, height, width);
                         ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
@@ -2456,7 +2454,17 @@ fn publish_media(
 }
 
 /// Encodes a deterministic RGB gradient as a base64 PNG artifact.
-fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
+fn synthetic_png_b64(
+    width: u32,
+    height: u32,
+    seed: u64,
+    image_index: u32,
+) -> anyhow::Result<String> {
+    // The simulated denoiser predicts zero velocity, so an image is its initial
+    // latent decoded: the seed and the image's index decide its pixels, as they
+    // decide its feedback values.
+    let latent = digest(&[seed.to_le_bytes(), u64::from(image_index).to_le_bytes()].concat())
+        .to_le_bytes();
     let mut bytes = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut bytes, width, height);
@@ -2470,7 +2478,7 @@ fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
                 let index = y * row_bytes + x * 3;
                 image[index] = ((x * 255) / width.max(1) as usize) as u8;
                 image[index + 1] = ((y * 255) / height.max(1) as usize) as u8;
-                image[index + 2] = 128;
+                image[index + 2] = latent[x % latent.len()];
             }
         }
         writer.write_image_data(&image)?;
