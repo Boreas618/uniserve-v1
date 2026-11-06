@@ -87,6 +87,11 @@ mod tests {
             unreachable!("the collapse draws nothing")
         }
 
+        fn prepare_conditioning(&self, _: &Forward, _: Conditioning<'_>) -> Result<()> {
+            // The collapse reads no conditioning: it is a shape probe, not a generation.
+            Ok(())
+        }
+
         fn prepare_latents(&self, _: &Forward, _: Conditioning<'_>, _: Latents) -> Result<()> {
             unreachable!("the collapse prepares nothing")
         }
