@@ -1548,6 +1548,13 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         &self.phases
     }
 
+    /// A step's graph reads the step's index from a state table the stream writes in order, so the
+    /// next step can be launched behind it. The diagnosis reads the columns between steps, so it
+    /// waits for each.
+    fn overlaps_replays(&self) -> bool {
+        !self.diag.enabled()
+    }
+
     fn stream(&self) -> Option<&platform::Stream> {
         Some(&self.stream)
     }

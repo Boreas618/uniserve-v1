@@ -41,6 +41,15 @@ pub trait Runner: Send {
         None
     }
 
+    /// Whether a replay of this runner may be launched while its previous replay still runs.
+    ///
+    /// Launching a large graph takes the driver milliseconds, and the device sits idle for them
+    /// when the launch waits for the previous replay to end. A runner that says yes reads nothing
+    /// of a replay's staging from memory the next `submit` or `serve` writes.
+    fn overlaps_replays(&self) -> bool {
+        false
+    }
+
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
