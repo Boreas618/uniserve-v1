@@ -33,7 +33,7 @@ use super::{middleware, retire_deployment, router, video_body_limit};
 use crate::leader::Leader;
 use crate::openai::ApiError;
 use crate::openai::video_jobs::VideoJobs;
-use crate::options::{ServeConfig, ServerOptions, resolve_text};
+use crate::options::{AdminOptions, ServeConfig, ServerOptions, resolve_text};
 use crate::supervision::Daemon;
 
 /// How often a deployment that is brought down checks for requests in
@@ -66,17 +66,21 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Serves the admin API on `server`'s address, and the deployments its first
+/// Serves the admin API on `admin`'s address, and the deployments its first
 /// `PUT /admin/config` brings up, until `shutdown` is cancelled; the deployment
 /// serving then is brought down and its storage released.
 ///
 /// # Errors
 ///
 /// Fails when the listener cannot be bound or the server fails.
-pub async fn node(server: ServerOptions, shutdown: CancellationToken) -> Result<()> {
-    let listener = Listener::bind(&server)
+pub async fn node(
+    admin: AdminOptions,
+    server: ServerOptions,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let listener = Listener::bind(&admin)
         .await
-        .context("failed to bind listener for the node")?;
+        .context("failed to bind the admin API's listener")?;
     let address = listener.local_addr()?;
     let node = Arc::new(Node {
         serving: Mutex::new(Serving::Idle),

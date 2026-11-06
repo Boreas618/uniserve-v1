@@ -112,19 +112,29 @@ Three backend-name fields the split names already exist in the code and are read
 
 ### `server_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer, frontend.** The frontend's own server reads these, as its process does; the daemon's listener has its own address (`admin_config`).
 
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `host` | `"127.0.0.1"` | TCP address the server listens on |
-| `port` | `8000` | TCP port the server listens on |
-| `uds` | Unset | Unix domain socket to listen on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
+| `host` | `"127.0.0.1"` | TCP address the frontend's server listens on |
+| `port` | `8000` | TCP port the frontend's server listens on |
+| `uds` | Unset | Unix domain socket the frontend's server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
 | `max_concurrent_requests` | Unset | In-flight chat, image generation, System One and synchronous video requests above which requests are shed with 503 |
 | `shutdown_timeout` | `"30s"` | Longest drain of in-flight requests at shutdown; `0` stops at once |
 | `request_id_headers` | `false` | Add an `X-Request-Id` response header with the ID the request ran under |
+
+### `admin_config`
+
+**Destination: host layer, daemon.** The daemon's listener reads it: the serving path, the node's admin API without a deployment, and the rebind a hot restart binds before the handover (`crates/daemon/src/http/listener.rs`). `uniserve serve --host` and `--port` set it.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `host` | `"127.0.0.1"` | TCP address the daemon's server listens on |
+| `port` | `8000` | TCP port the daemon's server listens on |
+| `uds` | Unset | Unix domain socket the daemon's server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 
 ### `load_config`
 
