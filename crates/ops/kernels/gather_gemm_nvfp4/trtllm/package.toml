@@ -41,9 +41,9 @@ architectures = ["sm_100a", "sm_100f"]
 #
 # `activation` names the fused gated epilogue: `silu` is the artifact's `Swiglu`,
 # `gelu_tanh` its `Geglu`. The manifest's `[parameters.selected]` states the rest of the
-# options a kernel must have been built with, including the two the entry fills itself:
-# the BF16-output gated kernels of this artifact all carry a per-column f32 bias
-# (`mBiasType = M`), and this operator has none, so the entry hands them zeros.
+# options a kernel must have been built with. The BF16-output gated kernels of this
+# artifact all carry a per-expert, per-column f32 bias (`mBiasType = M`); this operator
+# has none, and the entry hands them a null pointer, which the runner takes as no bias.
 [kernel.descriptors]
 dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "14336", "1536"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
 
