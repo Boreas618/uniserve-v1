@@ -706,7 +706,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         })
     }
 
-    /// The conditioning of request `index` of `bucket`, over the tables of its layout.
     /// The rows and the two widths one request's conditioning occupies: `(rows, source, text)`.
     ///
     /// Read from the columns rather than recomputed, so the view a step hands the model and the row
@@ -716,6 +715,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         (rows, self.columns.source_width, self.columns.text_width)
     }
 
+    /// The conditioning of request `index` of `bucket`, over the tables of its layout.
+    ///
+    /// `text` and `source` are two views of **two widths**: a conditioner may widen what the
+    /// denoiser reads, so a step that handed the model one width for both would address the wrong
+    /// columns of one of them.
     fn conditioning<'a>(
         &self,
         bucket: Bucket,
