@@ -1211,7 +1211,10 @@ message EngineSpec {
   KvCache kv_cache = 8;
   Workers workers = 9;
   CudaGraphs cuda_graphs = 10;
-  FlashInfer flashinfer = 11;
+  // Field 11 carried the FlashInfer provider's table, which is the attention
+  // program's arguments (§5.1, §7.7).
+  reserved 11;
+  reserved "flashinfer";
   Video video = 12;
   Experts experts = 13;
   ModelFacts model_facts = 14;
@@ -1325,8 +1328,9 @@ message Placement {
 }
 
 message Scheduling {
-  // `fcfs` or `priority`.
-  string policy = 1;
+  // The mechanism's limits: what the engine's schedulers admit and how they
+  // assemble a step. The scheduling policy's own name and parameters are its
+  // program's (§5.1, §7.7), not this message's.
   uint32 max_batch = 2;
   // Absent for the engine's default.
   optional uint32 max_num_batched_tokens = 3;
@@ -1335,11 +1339,11 @@ message Scheduling {
   optional uint64 max_queued_requests = 5;
   // Absent for the engine's default.
   optional uint32 chunked_prefill_size = 6;
-  // The draft cache refill policy of a deployment that speculates
-  // (`speculative_config.expected_speedup`, `refill_token_cost`); absent
-  // for the engine's defaults.
-  optional double expected_speedup = 7;
-  optional double refill_token_cost = 8;
+  // Field 1 named the scheduling policy's backend, fields 7 and 8 its
+  // draft-cache refill parameters: all three are the policy program's
+  // (§7.7).
+  reserved 1, 7, 8;
+  reserved "policy", "expected_speedup", "refill_token_cost";
 }
 
 message KvCache {
@@ -1436,14 +1440,15 @@ message Shape {
   uint32 width = 2;
 }
 
+// The FlashInfer provider's table is the attention program's arguments
+// (`specs/worker.md` §5.1, §7.7): the engine spec carries no second copy of it.
+// The name stays, with every field it had, so a peer of another build cannot
+// read an old meaning into a reused number.
 message FlashInfer {
-  uint64 workspace_size = 1;
-  optional bool use_tensor_core = 2;
-  string decode_backend = 3;
-  string prefill_backend = 4;
-  optional uint32 decode_split_tile_size = 5;
-  optional uint32 prefill_split_tile_size = 6;
-  bool split_kv = 7;
+  reserved 1 to 7;
+  reserved "workspace_size", "use_tensor_core", "decode_backend",
+      "prefill_backend", "decode_split_tile_size", "prefill_split_tile_size",
+      "split_kv";
 }
 
 message Video {

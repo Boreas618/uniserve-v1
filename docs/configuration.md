@@ -159,9 +159,9 @@ Three backend-name fields the split names already exist in the code and are read
 
 ### `scheduler_config`
 
-**Destination, per field:** `policy` is a program backend name (the scheduling policy); `max_queued_requests`, `chunked_prefill_size` and `max_batch` are program parameters of that policy, bounded by the build config's limits.
+**Destination, per field:** `policy` is a program backend name (the scheduling policy); `max_queued_requests`, `chunked_prefill_size`, `max_batch` and `max_num_batched_tokens` are program parameters of that policy, bounded by the build config's limits, and the same numbers are the limit each scheduler obeys, which `PUT /admin/config` applies in place within the batch the running processes were started for.
 
-**Read at:** `policy` in `crates/daemon/src/epoch.rs:1235`; `chunked_prefill_size` `:1379`; `max_queued_requests` `:1383`; `max_batch` `:1372`, where the captured decode graphs' rows bound it. `max_num_batched_tokens` is read at `:1364-1366`, and a value above the catalog is refused at load rather than clamped.
+**Read at:** `policy` selects the policy program's backend at `crates/daemon/src/epoch.rs:1311`; the four parameters are the policy program's arguments at `:1449-1466`, where the captured decode graphs' rows and the deployment's resident requests bound `max_batch`. `max_num_batched_tokens` is read at `:1439-1446`, and a value above the catalog is refused at load rather than clamped.
 
 
 | Option | Default | Meaning |
@@ -175,7 +175,7 @@ Three backend-name fields the split names already exist in the code and are read
 
 **Destination, per field:** `num_draft_tokens` is build config (it sizes the draft the main process builds); `expected_speedup` and `refill_token_cost` are program parameters of the scheduling policy.
 
-**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` `crates/daemon/src/epoch.rs:1388`; `refill_token_cost` `:1389`.
+**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` and `refill_token_cost` become the policy program's arguments at `crates/daemon/src/epoch.rs:1469-1470`, which the policy reads at `crates/engine/src/scheduler/policy.rs:96-97`.
 
 
 Speculative decoding with the model's own drafter, the multi-token prediction layer a checkpoint declares (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request an epoch change moved from an epoch that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / g` exceed the refill's tokens times `k`, both sides in decode steps, with `g` the speedup speculation gives a request and `k` the time of evaluating one context token. Each scheduler measures both from what its epoch executes, as averages over about the last sixteen observations: a verification carrying drafts commits `s` tokens, the workers' decoding step takes `v` with drafts and `d` without, and a prompt step `p` per token; speculating, a request takes `v / s` per token in place of `d`, so `g = s * d / v` and `k = p / d`, and while every step has carried drafts `d` is `v`. An epoch whose verification steps cost as many decode steps as they commit tokens (`g` at most `1`) refills nothing; until it has measured what it needs, an epoch refills, which measures it. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request serves eagerly in any case.
@@ -183,8 +183,8 @@ Speculative decoding with the model's own drafter, the multi-token prediction la
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `num_draft_tokens` | `0` | The most draft tokens a verification carries per request; `0` does not speculate. An epoch that speculates keeps the draft cache in its pool and runs the drafter, so setting or changing it is an epoch change (`PUT /admin/config`) |
-| `expected_speedup` | Measured | The refill policy's speedup `g`, stated in place of the measured one, at least `1`; applied in place by `PUT /admin/config` |
-| `refill_token_cost` | Measured | The refill policy's time `k` of evaluating one context token in a refill, in decode steps, stated in place of the measured one, not negative; applied in place by `PUT /admin/config` |
+| `expected_speedup` | Measured | The refill policy's speedup `g`, stated in place of the measured one, at least `1`; a change of it moves the policy program at `PUT /admin/config` (§7.3) |
+| `refill_token_cost` | Measured | The refill policy's time `k` of evaluating one context token in a refill, in decode steps, stated in place of the measured one, not negative; a change of it moves the policy program at `PUT /admin/config` (§7.3) |
 
 ### `migration_config`
 
@@ -277,7 +277,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 **Destination: program parameters** of the FlashInfer attention program.
 
-**Read at:** `crates/daemon/src/epoch.rs:1300`, which turns the section into the attention program's TOML arguments; an argument the program does not declare reaches it as data rather than being dropped here.
+**Read at:** `crates/daemon/src/epoch.rs:1376`, which turns the section into the attention program's TOML arguments; an argument the program does not declare reaches it as data rather than being dropped here.
 
 
 | Option | Default | Meaning |
