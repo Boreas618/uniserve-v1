@@ -691,9 +691,11 @@ pub struct QuantizedWeight {
     pub packed: Weight,
     /// `ScaleLayout::shape(rows, columns)` U8: one E4M3 block scale per sixteen elements.
     pub scales: Weight,
-    /// The reciprocal of the checkpoint's FP32 tensor scale.
+    /// The checkpoint's FP32 tensor scale for this projection — the value, not its reciprocal.
     ///
-    /// It enters a kernel as a launch scalar, which is why it is a plain value.
+    /// It enters a kernel as a launch scalar, which is why it is a plain value, and it multiplies:
+    /// the operand's reconstruction is `codes · block scale · token scale`, which is the operand in
+    /// real units, so the weight's tensor scale has to be applied exactly once and as a factor.
     pub global_scale: f32,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,

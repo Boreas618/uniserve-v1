@@ -839,7 +839,8 @@ pub struct RouteNvfp4Call {
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
     pub scales: *const c_void,
-    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale.
+    /// `[experts, 1]` f32: each expert's tensor scale, as the checkpoint states it — a factor the
+    /// product multiplies, not its reciprocal.
     pub global_scale: *const c_void,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: *const i32,
@@ -1362,9 +1363,11 @@ pub struct RouteGemmNvfp4Args {
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
     pub scales: TensorView,
-    /// `[experts]` f32: the reciprocal of each expert's tensor scale, one **per projection** — this
-    /// product fuses a single projection, so the table is one array of `experts` floats, the shape a
-    /// reader that indexes `array[expert]` takes.
+    /// `[experts]` f32: each expert's tensor scale, one **per projection** — this product fuses a
+    /// single projection, so the table is one array of `experts` floats, the shape a reader that
+    /// indexes `array[expert]` takes. The values are the checkpoint's scales, factors the product
+    /// multiplies, not their reciprocals: the operand's own reconstruction already carries the
+    /// encoder's factor, so a reciprocal here would divide the scale out twice.
     pub global_scale: TensorView,
     /// `[tiles]` i32: the expert a tile's rows belong to.
     pub tile_to_expert: TensorView,
