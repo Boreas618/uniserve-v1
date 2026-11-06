@@ -22,6 +22,9 @@ DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
 def spec(fields, parameters, target):
     """The compilation of one value_first_swiglu descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
+    aligned = ["value_gate_ptr", "output_ptr"]
+    if int(fields["width"]) % 16 == 0 and int(fields["input_stride"]) % 16 == 0:
+        aligned += ["elements", "input_row_stride"]
     return {
         "kernel": kernels._value_first_swiglu_kernel,
         "signature": {
@@ -46,6 +49,9 @@ def spec(fields, parameters, target):
         "options": {
             "num_warps": 8,
         },
+        # Every operand is an arena tensor and a row is a multiple of sixteen elements wherever this
+        # package is compiled: the launch states `width` and `input_stride` from the same key.
+        "aligned": aligned,
     }
 
 

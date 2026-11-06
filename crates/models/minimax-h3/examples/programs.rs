@@ -421,8 +421,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vae = root.join("vae/config.json");
     if vae.exists() {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
-        rows.extend(VideoDecoder::programs(&config, vae_type)?);
-        rows.extend(VideoPostprocessor::programs(vae_type, &rasters));
+        rows.extend(VideoDecoder::programs(&config)?);
+        rows.extend(VideoPostprocessor::programs(
+            minimax_h3::video_vae::ACTIVATION,
+            &rasters,
+        ));
         // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
         // raster derives — the one component of this model where the raster is load-bearing.
         rows.extend(VideoEncoder::programs(&config, &rasters)?);

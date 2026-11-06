@@ -120,6 +120,7 @@ pub mod segments;
 pub mod snake;
 pub mod snake_beta;
 pub mod tensor;
+pub mod tile_stitch;
 pub mod tolerance;
 pub mod transpose;
 pub mod twins;

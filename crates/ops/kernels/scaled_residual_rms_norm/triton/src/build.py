@@ -27,18 +27,22 @@ def spec(fields, parameters, target):
     """The compilation of one scaled_residual_rms_norm descriptor."""
     columns = int(fields["columns"])
     dtype = "*" + DTYPES[fields["dtype"]]
+    # The update and the normalized rows, when the key names a type narrower than the residual's.
+    activation = "*" + DTYPES[fields.get("activation", fields["dtype"])]
     absmax = fields["absmax"] == "true"
     signature = {
             "hidden_ptr": dtype,
-            "update_ptr": dtype,
+            "update_ptr": activation,
             "update_bias_ptr": dtype,
             "scale_ptr": dtype,
             "weight_ptr": dtype,
-            "output_ptr": dtype,
+            "output_ptr": activation,
         }
     if absmax:
         signature["partials_ptr"] = "*fp32"
     signature["eps"] = "fp32"
+    # The operator's scale is `[columns]` or `[1]`, and this word says which.
+    signature["scale_width"] = "u32"
     signature["HAS_UPDATE_BIAS"] = "constexpr"
     signature["WIDTH"] = "constexpr"
     signature["BLOCK"] = "constexpr"

@@ -341,6 +341,23 @@ pub struct QkNormRopeDescriptor {
     pub affine: bool,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+    /// Element type of the factor tables.
+    ///
+    /// FP32 is the trained transformers' form. The video VAE's decoder rotates with factors rounded
+    /// to its activation type, as the reference's `.to(compute_dtype)` does, so a table of another
+    /// type is its own variant; a key names it only then.
+    pub factors: DType,
+    /// Whether the queries and keys are views into wider rows, and the factor table repeats.
+    ///
+    /// `false` is the packed form: `[tokens, heads, head_dim]` contiguous, one factor row per token.
+    /// `true` is the video VAE's form. Its queries and keys are column ranges of one merged
+    /// projection, turned where they lie: a token's row advances by the view's own stride, and the
+    /// attention reads the same ranges, whose keys and values share that stride. It decodes many
+    /// tiles in one launch that share a position table, so token `t` reads factor row
+    /// `t % table rows`. Each program then owns `rows` tokens of one head rather than every head of
+    /// its tokens, because the rows are wide enough that the loop over heads is the launch's cost.
+    /// The form has no learned scale, its outputs are its inputs, and a key names it only when set.
+    pub strided: bool,
 }
 
 impl fmt::Display for QkNormRopeDescriptor {
@@ -370,8 +387,82 @@ impl fmt::Display for QkNormRopeDescriptor {
         } else {
             key.field("affine", false)
         };
+        let key = if self.factors == DType::F32 {
+            key
+        } else {
+            key.field("factors", self.factors)
+        };
+        let key = if self.strided {
+            key.field("strided", true)
+        } else {
+            key
+        };
         key.finish(formatter)
     }
+}
+
+/// The launch of the strided form: one program per block of tokens of one head.
+fn launch_strided(
+    kernel: &Kernel,
+    descriptor: &QkNormRopeDescriptor,
+    args: QkNormRopeArgs,
+    tokens: u64,
+    stream: &Stream,
+) -> Result<()> {
+    let name = QkNormRope::NAME;
+    if descriptor.affine || descriptor.q_heads != descriptor.k_heads {
+        return Err(Error::argument(
+            name,
+            "the strided form has no learned scale and as many key heads as query heads".to_owned(),
+        ));
+    }
+    let table = args.cosine.rows();
+    if table == 0 || args.sine.rows() != table || !tokens.is_multiple_of(table) {
+        return Err(Error::argument(
+            name,
+            format!(
+                "{tokens} tokens repeat a table of {table} cosine and {} sine rows",
+                args.sine.rows()
+            ),
+        ));
+    }
+    let [query_row, query_head, ..] = *args.query.strides.as_slice() else {
+        return Err(Error::argument(name, "a query has three axes".to_owned()));
+    };
+    let head_dim = u64::from(descriptor.head_dim);
+    if query_head != head_dim || args.key.strides != args.query.strides {
+        return Err(Error::argument(
+            name,
+            format!(
+                "the query's heads are {query_head} elements apart and its strides {:?} are the \
+                 key's {:?}: a head's channels and the two views' rows are what this form reads",
+                args.query.strides, args.key.strides
+            ),
+        ));
+    }
+    if args.q_out.ptr != args.query.ptr || args.k_out.ptr != args.key.ptr {
+        return Err(Error::argument(
+            name,
+            "the strided form turns its heads in place: each output is its input".to_owned(),
+        ));
+    }
+    let blocks = tokens.div_ceil(u64::from(descriptor.rows));
+    let mut arguments = Arguments::new();
+    arguments
+        .view(args.query)
+        .view(args.key)
+        .view(args.cosine)
+        .view(args.sine)
+        .u64(tokens)
+        .u64(query_row)
+        .u64(table)
+        .f32(f32::from_bits(descriptor.epsilon.0 as u32))
+        .flag(descriptor.pdl);
+    kernel.launch(
+        LaunchGrid::linear(blocks * u64::from(descriptor.q_heads))?,
+        &mut arguments,
+        stream,
+    )
 }
 
 /// The arguments of `qk_norm_rope`.
@@ -492,8 +583,13 @@ impl Op for QkNormRope {
             }
             None
         };
-        args.cosine.require_row(Self::NAME, DType::F32, pairs)?;
-        args.sine.require_row(Self::NAME, DType::F32, pairs)?;
+        args.cosine
+            .require_row(Self::NAME, descriptor.factors, pairs)?;
+        args.sine
+            .require_row(Self::NAME, descriptor.factors, pairs)?;
+        if descriptor.strided {
+            return launch_strided(kernel, descriptor, args, tokens, stream);
+        }
         if args.cosine.rows() != tokens || args.sine.rows() != tokens {
             return Err(Error::argument(
                 Self::NAME,
@@ -707,6 +803,8 @@ mod tests {
 
     fn descriptor(affine: bool) -> QkNormRopeDescriptor {
         QkNormRopeDescriptor {
+            factors: DType::F32,
+            strided: false,
             dtype: DType::BF16,
             output: DType::BF16,
             head_dim: 128,

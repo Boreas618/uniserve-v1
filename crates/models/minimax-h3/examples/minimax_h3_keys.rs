@@ -424,13 +424,13 @@ fn main() {
         }
         for vae in VAES {
             rows.extend(
-                minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, vae)
-                    .unwrap_or_else(|error| {
-                        panic!("the video decoder states no rows at {vae:?}: {error}")
-                    }),
+                minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae).unwrap_or_else(
+                    |error| panic!("the video decoder states no rows at {vae:?}: {error}"),
+                ),
             );
             rows.extend(minimax_h3::output::VideoPostprocessor::programs(
-                vae, &rasters,
+                minimax_h3::video_vae::ACTIVATION,
+                &rasters,
             ));
         }
         // The two DiTs, from the same value: the arrangement comes from the partition's own
@@ -590,12 +590,13 @@ fn main() {
     // A component the generator does not call is a component whose rows are missing from every store
     // built from this list, and nothing in the list can say so: the file reads complete.
     for dtype in VAES {
-        match minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae, dtype) {
+        match minimax_h3::video_vae::VideoDecoder::programs(&config.video_vae) {
             Ok(rows) => lines.extend(rows),
             Err(error) => panic!("the video decoder states no programs at {dtype:?}: {error}"),
         }
         lines.extend(minimax_h3::output::VideoPostprocessor::programs(
-            dtype, &rasters,
+            minimax_h3::video_vae::ACTIVATION,
+            &rasters,
         ));
     }
 
@@ -1086,6 +1087,8 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
         push(
             "qk_norm_rope",
             ops::rope::QkNormRopeDescriptor {
+                factors: ops::DType::F32,
+                strided: false,
                 dtype: deployment,
                 output: deployment,
                 head_dim: HEAD_DIM,
@@ -1431,6 +1434,8 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
         push(
             "qk_norm_rope",
             ops::rope::QkNormRopeDescriptor {
+                factors: ops::DType::F32,
+                strided: false,
                 dtype: vae,
                 output: vae,
                 head_dim: 64,
@@ -2144,6 +2149,8 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
         push(
             "qk_norm_rope",
             ops::rope::QkNormRopeDescriptor {
+                factors: ops::DType::F32,
+                strided: false,
                 dtype: deployment,
                 output: deployment,
                 head_dim: 128,

@@ -303,7 +303,11 @@ impl VideoPostprocessor {
                 let fade = Rgb::OVERLAP_FRAMES;
                 let kept = splice.body.1 - splice.body.0;
                 let faded = f.arena().tensor(clip.dtype, previous.shape)?;
-                self.blend(f, &raster, previous, clip, splice.body.0, faded)?;
+                let term = f.arena().tensor(
+                    clip.dtype,
+                    Shape::new(&[1, u64::from(raster.height) * u64::from(raster.width)]),
+                )?;
+                self.blend(f, &raster, previous, clip, splice.body.0, faded, term)?;
                 self.bytes
                     .forward(f, faded, frames_of(body_out, 0, fade)?)?;
                 self.bytes.forward(
@@ -327,16 +331,20 @@ impl VideoPostprocessor {
 impl VideoPostprocessor {
     /// Fade the clip in against its predecessor, one overlap frame at a time.
     ///
-    /// The reference's weights are `i/5` for frame `i` of the overlap, `0` to `0.8`: the blend is
-    /// `previous · (1 − w) + clip · w`, and `clip` is frame `first + i`, the head of the clip's body
-    /// (`models/decoder.py`: `overlap * (1 - weights) + body[:, :, :extent] * weights`). `faded` is
-    /// `[channels, overlap, rows, columns]`, the shape of `previous`. The two scalars the sum takes are
-    /// host values, so each frame is two launches of the operator every other sum in the model uses.
-    /// The reference builds its ramp in the raster's type and this one in FP32; the products and the
-    /// sum are FP32 and round to the raster once. `CrossFade` is the row-and-column seam blend and
-    /// refuses the frames axis; a blend along frames is not that operator with another argument, and
-    /// this is the arithmetic with the operands a raster has - one contiguity per channel per frame,
-    /// which is what `scaled_add` reads.
+    /// The reference's weights are `i/5` for frame `i` of the overlap, `0` to `0.8`, and its blend is
+    /// `overlap * (1 - weights) + body[:, :, :extent] * weights` in the decoded type: `clip` is frame
+    /// `first + i`, the head of the clip's body, and every step of that expression rounds. The weights
+    /// and their complement are therefore rounded to the raster's type here, each product rounds into
+    /// its own buffer, and the sum rounds once more; `scaled_add` computes each step in FP32 and rounds
+    /// at its store, so each launch is one step of the expression. `faded` is
+    /// `[channels, overlap, rows, columns]`, the shape of `previous`, and `term` is one frame.
+    /// `CrossFade` is the row-and-column seam blend and refuses the frames axis; a blend along frames
+    /// is not that operator with another argument, and this is the arithmetic with the operands a
+    /// raster has - one contiguity per channel per frame, which is what `scaled_add` reads.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fade's two sources, its window and its two buffers are the blend's own"
+    )]
     fn blend(
         &self,
         f: &Forward,
@@ -345,12 +353,14 @@ impl VideoPostprocessor {
         clip: TensorView,
         first: u32,
         faded: TensorView,
+        term: TensorView,
     ) -> Result<()> {
         let count = Rgb::OVERLAP_FRAMES;
         let pixels = u64::from(raster.height) * u64::from(raster.width);
         for channel in 0..u64::from(Rgb::CHANNELS) {
             for frame in 0..count {
-                let weight = fade_weight(frame, count);
+                let weight = self.rounded(fade_weight(frame, count));
+                let complement = self.rounded(1.0 - weight);
                 let target = TensorView::new(
                     faded.element(&[channel, u64::from(frame), 0, 0]),
                     faded.dtype,
@@ -361,18 +371,26 @@ impl VideoPostprocessor {
                     previous.dtype,
                     Shape::new(&[1, pixels]),
                 );
-                // `target ← (1 − w) · previous + w · clip`, in two steps because the operator scales its
-                // own target. A zero `beta` does not read the target, so the scratch needs no clearing.
-                ScaledAdd.forward(f, target, source, 1.0, 0.0)?;
+                // A zero `beta` does not read the target, so neither buffer needs clearing.
+                ScaledAdd.forward(f, target, source, complement, 0.0)?;
                 let current = TensorView::new(
                     clip.element(&[channel, u64::from(first + frame), 0, 0]),
                     clip.dtype,
                     Shape::new(&[1, pixels]),
                 );
-                ScaledAdd.forward(f, target, current, weight, 1.0 - weight)?;
+                ScaledAdd.forward(f, term, current, weight, 0.0)?;
+                ScaledAdd.forward(f, target, term, 1.0, 1.0)?;
             }
         }
         Ok(())
+    }
+
+    /// `value` at the raster's precision: what the reference's ramp holds in the decoded type.
+    fn rounded(&self, value: f32) -> f32 {
+        match self.dtype {
+            DType::F16 => nn::weights::half_to_f32(nn::weights::f32_to_half(value)),
+            _ => value,
+        }
     }
 }
 
@@ -718,9 +736,9 @@ impl Raster {
 ///
 /// [`VideoPostprocessor::forward`] fades the head of a clip's body against its predecessor's tail into a
 /// buffer of the tail's shape, because the clip's own raster stays the runner's to keep the tail from;
-/// that buffer is the only thing the splice reserves, and it is named here so the executor sizes the
-/// arena from arithmetic rather than from the module's own guess. A clip with no predecessor reserves
-/// nothing.
+/// that buffer and one frame for the second product are all the splice reserves, and they are named
+/// here so the executor sizes the arena from arithmetic rather than from the module's own guess. A clip
+/// with no predecessor reserves nothing.
 pub fn splice_arena(
     config: &crate::VideoVaeConfig,
     canvas: &crate::video_vae::Canvas,
@@ -736,11 +754,18 @@ pub fn splice_arena(
         }
     };
     let (height, width) = canvas.pixels(config);
-    Ok(vec![Buffer {
-        name: "faded".to_owned(),
-        element,
-        elements: Rgb::of(0, height, width).overlap_elements(),
-    }])
+    Ok(vec![
+        Buffer {
+            name: "faded".to_owned(),
+            element,
+            elements: Rgb::of(0, height, width).overlap_elements(),
+        },
+        Buffer {
+            name: "term".to_owned(),
+            element,
+            elements: u64::from(height) * u64::from(width),
+        },
+    ])
 }
 
 /// The frames `start..stop` of an output raster: `[frames, rows, columns, channels]` bytes.
@@ -913,8 +938,8 @@ mod tests {
         let buffers = splice_arena(&config, &canvas, DType::F16).expect("the scratch");
         assert_eq!(
             buffers.len(),
-            1,
-            "the fade's destination is the only reservation"
+            2,
+            "the fade's destination and one frame for its second product"
         );
         // The fade writes the overlap frames and nothing else, so the scratch is those frames of the
         // canvas's pixels - the same extent `forward` reserves.
@@ -1041,12 +1066,17 @@ mod tests {
         );
         spliced.expect("an interior clip");
         let faded = u64::from(Rgb::CHANNELS) * u64::from(OVERLAP_FRAMES) * 16 * 16 * 4;
-        assert_eq!(used, faded.next_multiple_of(nn::forward::ALIGNMENT));
+        let term = 16 * 16 * 4_u64;
+        assert_eq!(
+            used,
+            faded.next_multiple_of(nn::forward::ALIGNMENT)
+                + term.next_multiple_of(nn::forward::ALIGNMENT)
+        );
         let count = |operator| launches.iter().filter(|name| **name == operator).count();
         assert_eq!(
             count("scaled_add") as u32,
-            2 * Rgb::CHANNELS * OVERLAP_FRAMES,
-            "two sums per frame of every channel: {launches:?}"
+            3 * Rgb::CHANNELS * OVERLAP_FRAMES,
+            "two products and a sum per frame of every channel: {launches:?}"
         );
         assert_eq!(count("rgb_bytes"), 2, "the faded head and the body's rest");
     }

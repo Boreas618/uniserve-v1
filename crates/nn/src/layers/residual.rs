@@ -60,6 +60,22 @@ impl WeightedRmsNorm {
         self.weight.view()
     }
 
+    /// The descriptor one launch without a magnitude takes, for a walk without a device: rows of
+    /// `dtype`, normalized into `activation`.
+    pub fn descriptor_of(
+        columns: u32,
+        dtype: DType,
+        activation: DType,
+    ) -> residual::WeightedRmsNormDescriptor {
+        residual::WeightedRmsNormDescriptor {
+            dtype,
+            columns,
+            tile: row_tile(columns),
+            absmax: false,
+            activation,
+        }
+    }
+
     /// Normalize `x` into `out`; both are `[rows, columns]` and may alias.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         self.run(f, x, out, None)
@@ -84,13 +100,8 @@ impl WeightedRmsNorm {
         out: TensorView,
         partials: Option<TensorView>,
     ) -> Result<()> {
-        let columns = self.columns();
-        let descriptor = residual::WeightedRmsNormDescriptor {
-            dtype: x.dtype,
-            columns,
-            tile: row_tile(columns),
-            absmax: partials.is_some(),
-        };
+        let mut descriptor = Self::descriptor_of(self.columns(), x.dtype, out.dtype);
+        descriptor.absmax = partials.is_some();
         let args = residual::WeightedRmsNormArgs {
             x,
             weight: self.weight.view(),
@@ -267,14 +278,31 @@ impl ScaledResidualRmsNorm {
     /// is `[rows]` FP32 and is required exactly when the layer records the magnitude.
     /// The descriptor one launch takes, for a walk without a device; see
     /// [`ScaledResidual::descriptor`].
-    pub fn descriptor(&self, dtype: DType) -> residual::ScaledResidualRmsNormDescriptor {
-        let columns = self.columns();
+    pub fn descriptor(
+        &self,
+        dtype: DType,
+        activation: DType,
+    ) -> residual::ScaledResidualRmsNormDescriptor {
+        let mut descriptor =
+            Self::descriptor_of(self.columns(), dtype, activation, self.bias.is_some());
+        descriptor.absmax = self.absmax;
+        descriptor
+    }
+
+    /// The descriptor from the numbers alone: a residual of `dtype` folding updates of `activation`.
+    pub fn descriptor_of(
+        columns: u32,
+        dtype: DType,
+        activation: DType,
+        update_bias: bool,
+    ) -> residual::ScaledResidualRmsNormDescriptor {
         residual::ScaledResidualRmsNormDescriptor {
             dtype,
             columns,
             tile: row_tile(columns),
-            update_bias: self.bias.is_some(),
-            absmax: self.absmax,
+            update_bias,
+            absmax: false,
+            activation,
         }
     }
 
@@ -292,7 +320,7 @@ impl ScaledResidualRmsNorm {
                 "the magnitude buffer is present exactly when the layer records it".to_owned(),
             ));
         }
-        let descriptor = self.descriptor(hidden.dtype);
+        let descriptor = self.descriptor(hidden.dtype, update.dtype);
         let args = residual::ScaledResidualRmsNormArgs {
             hidden,
             update,
@@ -366,14 +394,35 @@ impl ScaledResidualLayerNorm {
     /// Fold `update` into `hidden` and normalize it into `out`.
     /// The descriptor one launch takes, for a walk without a device; see
     /// [`ScaledResidual::descriptor`].
-    pub fn descriptor(&self, dtype: DType) -> residual::ScaledResidualLayerNormDescriptor {
-        let columns = self.columns();
+    pub fn descriptor(
+        &self,
+        dtype: DType,
+        activation: DType,
+    ) -> residual::ScaledResidualLayerNormDescriptor {
+        let mut descriptor = Self::descriptor_of(
+            self.columns(),
+            dtype,
+            activation,
+            self.update_bias.is_some(),
+        );
+        descriptor.absmax = self.absmax;
+        descriptor
+    }
+
+    /// The descriptor from the numbers alone: a residual of `dtype` folding updates of `activation`.
+    pub fn descriptor_of(
+        columns: u32,
+        dtype: DType,
+        activation: DType,
+        update_bias: bool,
+    ) -> residual::ScaledResidualLayerNormDescriptor {
         residual::ScaledResidualLayerNormDescriptor {
             dtype,
             columns,
             tile: row_tile(columns),
-            update_bias: self.update_bias.is_some(),
-            absmax: self.absmax,
+            update_bias,
+            absmax: false,
+            activation,
         }
     }
 
@@ -391,7 +440,7 @@ impl ScaledResidualLayerNorm {
                 "the magnitude buffer is present exactly when the layer records it".to_owned(),
             ));
         }
-        let descriptor = self.descriptor(hidden.dtype);
+        let descriptor = self.descriptor(hidden.dtype, update.dtype);
         let args = residual::ScaledResidualLayerNormArgs {
             hidden,
             update,
