@@ -14,9 +14,9 @@ There is no softmax here. Both operands are FP32 — the type ``vsa_prepare_tile
 per-head means in — and the products accumulate in FP32, which is the operator's tolerance: the
 standard bound for a ``width``-term contraction.
 
-A program is one (head, query tile): it holds the query row in registers and walks the key tiles a
-tile of them at a time, so every key row is read once per query tile and the scores of a row are
-written contiguously. The destination is the contiguous ``[heads, query tiles, key tiles]`` matrix
+A program is one block of ``QUERIES`` query tiles of one head: it holds their rows and walks the key
+tiles ``KEY_TILES`` at a time as one FP32 matrix step, without TF32, because the reference's product
+is FP32. A key row is read once per block of queries. The destination is the contiguous ``[heads, query tiles, key tiles]`` matrix
 the selection reads, which the operator requires and nothing else may be.
 """
 
@@ -39,38 +39,47 @@ def _vsa_scores_kernel(
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     KEY_TILES: tl.constexpr,
+    QUERIES: tl.constexpr,
 ):
-    """Write one (head, query tile) row of scores.
+    """Write ``QUERIES`` (head, query tile) rows of scores.
 
     ``WIDTH`` is the contraction and ``BLOCK`` the lanes it uses, both the descriptor's; ``KEY_TILES``
-    is the key tiles one step contracts. ``query_tiles`` and ``key_tiles`` are the launch's words —
-    the grid names the query tile and the head — and ``pdl`` is a launching decision.
+    is the key tiles one step contracts and ``QUERIES`` the query tiles a program holds.
+    ``query_tiles`` and ``key_tiles`` are the launch's words - the grid names the block of query tiles
+    and the head - and ``pdl`` is a launching decision.
     """
-    tile = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
+    heads = tl.num_programs(1).to(tl.int64)
     lanes = tl.arange(0, BLOCK)
     live = lanes < WIDTH
 
     query_tiles = query_tiles.to(tl.int64)
     key_tiles = key_tiles.to(tl.int64)
+    rows = tl.program_id(0).to(tl.int64) * QUERIES + tl.arange(0, QUERIES).to(tl.int64)
+    row_live = rows < query_tiles
 
-    # The query row stays in registers: [BLOCK] FP32.
-    heads = tl.num_programs(1).to(tl.int64)
+    # The query rows stay in registers: [QUERIES, BLOCK] FP32.
     query = tl.load(
-        query_ptr + (tile * heads + head) * WIDTH + lanes, mask=live, other=0.0
+        query_ptr + (rows * heads + head)[:, None] * WIDTH + lanes[None, :],
+        mask=row_live[:, None] & live[None, :],
+        other=0.0,
     ).to(tl.float32)
-    root = tl.sqrt(tl.full((KEY_TILES,), WIDTH, tl.float32))
+    root = tl.sqrt(tl.full((QUERIES, KEY_TILES), WIDTH, tl.float32))
 
-    # One step contracts KEY_TILES key tiles: [KEY_TILES, BLOCK] loads against the query row.
+    # One step contracts KEY_TILES key tiles against the query rows.
     step = tl.arange(0, KEY_TILES).to(tl.int64)
-    out_base = (head * query_tiles + tile) * key_tiles
+    out_base = (head * query_tiles + rows) * key_tiles
     for start in range(0, key_tiles, KEY_TILES):
         keys = start + step
         key_mask = keys < key_tiles
         values = tl.load(
-            key_ptr + (keys * heads + head)[:, None] * WIDTH + lanes[None, :],
-            mask=key_mask[:, None] & live[None, :],
+            key_ptr + (keys * heads + head)[None, :] * WIDTH + lanes[:, None],
+            mask=live[:, None] & key_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(values * query[None, :], axis=1) / root
-        tl.store(out_ptr + out_base + keys, scores, mask=key_mask)
+        scores = tl.dot(query, values, input_precision="ieee") / root
+        tl.store(
+            out_ptr + out_base[:, None] + keys[None, :],
+            scores,
+            mask=row_live[:, None] & key_mask[None, :],
+        )

@@ -214,6 +214,7 @@ impl Executor {
         );
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
+            named.runner.claim_arena()?;
             named.runner.attach_counters(Arc::clone(&counters));
             named.runner.attach_uncompared(Arc::clone(&uncompared));
             named.runner.attach_products(Arc::clone(&products));

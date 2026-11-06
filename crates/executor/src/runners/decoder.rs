@@ -355,16 +355,29 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // device per stream - and the model states what one decode of a layout reserves, so a share
         // below the plan is refused while the deployment is being assembled, naming the bucket and
         // both numbers, rather than at the first frame that reaches the arena.
-        let offered = self.pool()?.reserved_on(self.stream_id());
+        self.claim()?;
+        for bucket in self.capture_order() {
+            self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// Claims the arena the largest bucket's decode plans.
+    fn claim(&mut self) -> Result<()> {
+        let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = Self::layout_of(&self.model, bucket)?;
             // One rule for both media runners, so the two cannot read an absent plan and a refused
-            // one differently: `floor::checked` passes over a decoder that states no plan, refuses
-            // any other answer by name, and refuses a share below the plan with both numbers.
-            super::floor::checked(bucket, self.model.arena_bytes(&layout), offered)?;
+            // one differently: `floor::checked` passes over a decoder that states no plan and refuses
+            // any other answer by name.
+            needed = needed.max(
+                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
+                    .unwrap_or(0),
+            );
         }
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         Ok(())
     }
@@ -674,9 +687,11 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         )
         .map_err(|_| Error::Invalid("a clip's latent extent overflows".into()))?;
         let channels = video.channels as usize;
-        let element = usize::try_from(self.dtype.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.dtype))
-        })?)
+        let element = usize::try_from(
+            self.dtype
+                .bytes()
+                .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.dtype)))?,
+        )
         .map_err(|_| Error::Invalid("an element wider than memory".into()))?;
         let plane = video.height as usize * video.width as usize;
         let start = first as usize * plane;
@@ -953,7 +968,11 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )));
         };
         let channels = RASTER_CHANNELS;
-        self.size_tail(channels, height, width, splice.overlap)?;
+        // What this clip fades against is the schedule's `overlap`, and what it must leave behind is
+        // its **successor's**: the timeline's first clip fades nothing and still owes the second clip
+        // its tail, and the last clip has no one to hand one to.
+        let successor = tail_for_successor(&schedule, index);
+        self.size_tail(channels, height, width, successor)?;
         let previous = match self.tail.as_ref() {
             Some(tail) if splice.overlap > 0 => Some(TensorView::new(
                 tail.device.ptr,
@@ -1015,7 +1034,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
-        self.keep_tail(&clip, channels, height, width, splice.overlap)?;
+        self.keep_tail(&clip, channels, height, width, successor)?;
         // The timeline's last clip has no successor, so the request's place in it ends here: a
         // decode after it would be a clip the timeline does not hold, which the schedule refuses
         // above by naming the count.
@@ -1130,6 +1149,16 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     }
 }
 
+/// The frames clip `index` must leave behind: what its successor fades against, none for the last.
+///
+/// A splice's `overlap` is the fade it **reads**, so reading it for the tail a clip keeps left the
+/// timeline's first clip keeping nothing, and the second clip then faded against a column nobody wrote.
+fn tail_for_successor(schedule: &[nn::capability::Splice], index: u32) -> u32 {
+    schedule
+        .get(index as usize + 1)
+        .map_or(0, |next| next.overlap)
+}
+
 /// Where timeline frame `first` of a `[frames, rows, columns, 3]` byte column starts.
 fn timeline_frame(column: &Column, first: u32, height: u32, width: u32) -> ops::DevicePtr {
     let elements = u64::from(first) * u64::from(height) * u64::from(width) * 3;
@@ -1230,6 +1259,10 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
@@ -1336,6 +1369,34 @@ mod tests {
     //!
     //! Nothing here needs a device: each behaviour is a function of the bucket and the model, which is
     //! why a model that refuses a canvas can be driven without one.
+
+    /// A clip keeps the tail its successor fades against, which the timeline's first clip owes too
+    /// though it fades nothing itself, and the last clip has no one to hand one to.
+    #[test]
+    fn a_clip_keeps_the_tail_its_successor_reads() {
+        use nn::capability::Splice;
+        let schedule = [
+            Splice {
+                first: 0,
+                keep: 17,
+                overlap: 0,
+            },
+            Splice {
+                first: 17,
+                keep: 17,
+                overlap: 5,
+            },
+            Splice {
+                first: 34,
+                keep: 22,
+                overlap: 5,
+            },
+        ];
+        let tails: Vec<u32> = (0..3)
+            .map(|index| super::tail_for_successor(&schedule, index))
+            .collect();
+        assert_eq!(tails, [5, 5, 0]);
+    }
 
     /// A clip still held under another request refuses a second decode, by both requests' names.
     ///

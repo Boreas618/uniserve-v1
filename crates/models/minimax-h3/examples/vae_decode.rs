@@ -12,6 +12,10 @@
 //!                  and every shape as it is handed over
 //! --stage decode   one clip on a device: the folded input affine, the 36 layers, the positions
 //!                  table, the tiled decode and the stitch, written as one tensor and its case
+//! --stage timeline a whole video on a device: a denoiser's final latents through the served decoder
+//!                  and the postprocessor's splice, clip by clip as the runner drives them, written
+//!                  as the `[frames, rows, columns, 3]` bytes the media stage reads
+//! --stage audio    a track on a device: the denoiser's rows, or a Philox draw, to `[samples, 2]` PCM
 //! ```
 //!
 //! All but `weights` need a program store: `--store <path>` or `UNISERVE_STORE`, holding committed
@@ -29,18 +33,14 @@
 //! The two payloads must differ: a decode that left its input in place is a silent failure the exit
 //! code would otherwise pass.
 //!
-//! **The stitch's layout.** `--stage decode` decodes the clip's tiles in `Tile` order, because the
-//! stitch reads what the tile above and the tile to its left have already written, and it hands the
+//! **The stitch's layout.** `--stage decode` decodes the clip's tiles in `Tile` order and hands the
 //! stitch the plan's tiled layout: `latents` in tile order, the largest tile's position table, and the
-//! clip's raster. A tile's neighbour is not one contiguous block of a raster wider than the tile, and
-//! the blend addresses its sources flat, so the stitch copies the neighbour into one tile-shaped block
-//! first - which is why the raster may be any width and why the walk states a `copy_block` row.
+//! clip's raster.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use minimax_h3::audio_vae::BigVgan;
-use minimax_h3::config::AttentionKind;
 use minimax_h3::config::offered_canvases;
 use minimax_h3::decoding::{ClipDecoder, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder, folded_input};
@@ -113,6 +113,7 @@ enum Stage {
     Raster,
     Plan,
     Audio,
+    Timeline,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,9 @@ struct Args {
     /// decoder's own hop. The reference probe's own default is twenty, so a comparison that does not
     /// name one agrees with the tool's catalogue.
     audio_frames: u32,
+    /// The frames of the video `--stage timeline` decodes: `17n + 5` output frames, whose clip schedule
+    /// is the postprocessor's.
+    timeline_frames: u32,
     /// An explicit arena size in GiB. Zero - the default - means the plan's own number, which is what
     /// a correct run needs; a stated size may only grow the reservation and the line says it did.
     arena_gib: u64,
@@ -168,6 +172,7 @@ impl Args {
             pattern: false,
             frames: None,
             audio_frames: 20,
+            timeline_frames: 107,
             arena_gib: 0,
             out: PathBuf::from("artifacts/h3-vae-decode"),
         };
@@ -192,10 +197,11 @@ impl Args {
                         "raster" => Stage::Raster,
                         "plan" => Stage::Plan,
                         "audio" => Stage::Audio,
+                        "timeline" => Stage::Timeline,
                         other => {
                             return Err(Failure::message(format!(
-                                "unknown stage `{other}`; expected weights, decode, raster, plan or \
-                                 audio"
+                                "unknown stage `{other}`; expected weights, decode, raster, plan, \
+                                 audio or timeline"
                             )));
                         }
                     };
@@ -215,16 +221,17 @@ impl Args {
                 "--pattern" => args.pattern = true,
                 "--frames" => args.frames = Some(number("--frames")?),
                 "--audio-frames" => args.audio_frames = number("--audio-frames")?,
+                "--timeline-frames" => args.timeline_frames = number("--timeline-frames")?,
                 "--arena-gib" => {
                     args.arena_gib = u64::from(number("--arena-gib")?);
                 }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
-                        "vae_decode --stage weights|decode|raster|audio [--root PATH] [--store PATH] \
-                         [--device N] [--latent-height N] [--latent-width N] [--latents FILE] \
-                         [--pixels FILE | --pattern] [--frames N] [--audio-frames N] \
-                         [--arena-gib N] [--out DIR]",
+                        "vae_decode --stage weights|decode|raster|audio|timeline [--root PATH] \
+                         [--store PATH] [--device N] [--latent-height N] [--latent-width N] \
+                         [--latents FILE] [--pixels FILE | --pattern] [--frames N] \
+                         [--audio-frames N] [--timeline-frames N] [--arena-gib N] [--out DIR]",
                     ));
                 }
                 other => {
@@ -293,6 +300,7 @@ fn run() -> Result<()> {
         Stage::Raster => stage_raster(&args),
         Stage::Plan => stage_plan(&args),
         Stage::Audio => stage_audio(&args),
+        Stage::Timeline => stage_timeline(&args),
     }
 }
 
@@ -364,14 +372,7 @@ fn stage_weights(args: &Args) -> Result<()> {
         let mut shards = loader.reborrow(source)?;
         let spatial = config.video_vae.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        let decoder = VideoDecoder::load(
-            &config.video_vae,
-            &[raster],
-            AttentionKind::Dense,
-            dtype,
-            input,
-            &mut shards,
-        )?;
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
         let _ = &decoder;
         println!(
             "loaded: {} layers, {} registers, clip {}x{} latent cells, {} frames kept of {} decoded",
@@ -521,14 +522,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         let mut shards = loader.reborrow(source)?;
         let spatial = config.video_vae.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        let decoder = VideoDecoder::load(
-            &config.video_vae,
-            &[raster],
-            AttentionKind::Dense,
-            dtype,
-            input,
-            &mut shards,
-        )?;
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
         // 4. The one table a decode reads: the per-voxel rotary positions, whose rows are the
         //    largest tile's - one table for every canvas of this grid.
         let tables = decoder.tables(args.latent_height, args.latent_width)?;
@@ -921,7 +915,10 @@ fn stage_decode(args: &Args) -> Result<()> {
     let raster = download(
         &stream,
         out,
-        usize::try_from(channels * frames * u64::from(height) * u64::from(width_px)).unwrap_or(0),
+        usize::try_from(
+            channels * frames * u64::from(height) * u64::from(width_px) * element_bytes,
+        )
+        .unwrap_or(0),
     )?;
     if raster.iter().all(|byte| *byte == 0) {
         return Err(Failure::message(
@@ -937,6 +934,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         channels,
         frames,
         u64::from(height) * u64::from(width_px),
+        element_bytes,
     );
     write_h3t(
         &directory.join("latents.h3t"),
@@ -1236,28 +1234,34 @@ fn stage_audio(args: &Args) -> Result<()> {
         arena_bytes >> 20
     );
 
-    // 5. The latents, drawn by the device's Philox at the posterior's seed - the same habit the raster
-    //    stage has, so the track is reproducible - and then written out, because the reference decodes
-    //    *this* draw rather than one of its own.
-    let latents = arena.tensor(
-        DType::F32,
-        Shape::new(&[
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-            channels,
-            frames,
-        ]),
-    )?;
-    nn::Noise::new().draw(
-        &forward,
-        latents.reshape(Shape::new(&[
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels,
-            frames,
-        ])),
-        nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
-        0,
-        0,
-        0,
-    )?;
+    // 5. The latents, in the rows a denoiser publishes: `[frames, 2 · channels]` over the bytes of
+    //    `[2 · frames, channels]`, the first stereo channel's rows before the second's. `--latents` names
+    //    a raw FP32 file of those rows; without one they are drawn by the device's Philox at the
+    //    posterior's seed - the same habit the raster stage has, so the track is reproducible - and
+    //    written out, because the reference decodes *this* draw rather than one of its own.
+    let track_rows = Shape::new(&[
+        frames,
+        u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels,
+    ]);
+    let latents = match &args.latents {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+            upload(&stream, &arena, DType::F32, track_rows, &bytes)?
+        }
+        None => {
+            let latents = arena.tensor(DType::F32, track_rows)?;
+            nn::Noise::new().draw(
+                &forward,
+                latents,
+                nn::NoiseKey::Scalar(minimax_h3::denoiser::POSTERIOR_SEED),
+                0,
+                0,
+                0,
+            )?;
+            latents
+        }
+    };
     // The window's own shape: `[samples, 2]`, interleaved, which is what `DecodedMedia.audio` is.
     let out = arena.tensor(
         DType::I16,
@@ -1312,9 +1316,8 @@ fn stage_audio(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("latents.h3t"),
         &[
-            u64::from(minimax_h3::audio_vae::PCM_CHANNELS),
-            channels,
             frames,
+            u64::from(minimax_h3::audio_vae::PCM_CHANNELS) * channels,
         ],
         CONTAINER_F32,
         &latent_bytes,
@@ -1352,6 +1355,295 @@ fn stage_audio(args: &Args) -> Result<()> {
         } else {
             ""
         }
+    );
+    Ok(())
+}
+
+/// A whole video on a device: a denoiser's final latents through the served decoder and splice.
+///
+/// `--latents` names a raw FP32 file in the layout a denoiser publishes its trajectory, `[channels,
+/// latent frames, rows, columns]`. This stage does what `DecoderRunner` does per clip, through the same
+/// capability calls in the same order and without the graph: it takes the clip's window of the
+/// trajectory, gathers the rows `latent_rows` names, decodes them, splices the clip into the timeline
+/// and keeps the tail the next clip fades against. It writes `<out>/timeline/frames.rgb`, the
+/// `[frames, rows, columns, 3]` bytes the media stage reads, and each clip's normalized raster as
+/// `raster_<clip>.npy` so a difference can be placed on one side of the splice.
+fn stage_timeline(args: &Args) -> Result<()> {
+    use nn::capability::{Clip, DecodedMedia, Decoder as _, Splice};
+
+    let store_root = args.store.clone().ok_or_else(|| {
+        Failure::message(
+            "stage `timeline` needs a program store: pass --store <path> or set UNISERVE_STORE",
+        )
+    })?;
+    let source = args.latents.clone().ok_or_else(|| {
+        Failure::message("stage `timeline` decodes the final latents `--latents` names")
+    })?;
+    let config = args.configuration()?;
+    let canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
+    let checkpoint = Checkpoint::open(&args.root)?;
+    let device = platform::Device::new(platform::DeviceId(args.device))?;
+    let _guard = device.enter()?;
+    let stream = device.stream()?;
+    let generation = load_generation(&device, &store_root)?;
+
+    // The weights, sized as `--stage decode` sizes them, with the two de-normalization constants and
+    // the position table the serving load publishes beside them.
+    let component = checkpoint.component(VAE)?;
+    let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
+    let latent_channels = u64::from(config.video_vae.latent_channels);
+    let granularity =
+        u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    let affine = (width * latent_channels + width) * u64::from(dtype.bits()) / 8;
+    let mut synthesized = affine.max(1).next_multiple_of(granularity) + 3 * granularity;
+    for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width, dtype)? {
+        synthesized += bytes.max(1).next_multiple_of(granularity);
+    }
+    let needed = resident_bytes(
+        component,
+        VideoDecoder::keys(&config.video_vae)?,
+        granularity,
+    )? + synthesized;
+    let mut weights = DeviceWeights::new(&device, needed, granularity)?;
+    let spatial = config.video_vae.spatial_compression();
+    let (decoder, postprocessor, positions) = {
+        let mut loader = WeightLoader::new(component, &mut weights, None, None);
+        let weight = loader.constant(
+            "video_decoder.input.weight",
+            dtype,
+            Shape::new(&[width, latent_channels]),
+            &weight,
+            "minimax-h3",
+        )?;
+        let bias = loader.constant(
+            "video_decoder.input.bias",
+            dtype,
+            Shape::new(&[width]),
+            &bias,
+            "minimax-h3",
+        )?;
+        let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
+        let bytes = |values: [f32; 3]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        let shape = Shape::new(&[3]);
+        let mean = loader.constant(
+            "video_postprocessor.pixel_mean",
+            DType::F32,
+            shape,
+            &bytes(minimax_h3::output::PIXEL_MEAN),
+            "minimax-h3",
+        )?;
+        let std = loader.constant(
+            "video_postprocessor.pixel_std",
+            DType::F32,
+            shape,
+            &bytes(minimax_h3::output::PIXEL_STD),
+            "minimax-h3",
+        )?;
+        let postprocessor = minimax_h3::output::VideoPostprocessor::new(dtype, mean, std)?;
+        let shards_source = checkpoint.component(VAE)?;
+        let mut shards = loader.reborrow(shards_source)?;
+        let raster = (canvas.width * spatial, canvas.height * spatial);
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
+        let tables = decoder.tables(args.latent_height, args.latent_width)?;
+        let [table] = tables.as_slice() else {
+            return Err(Failure::message(format!(
+                "the decoder declares {} layout tables; its decode reads one",
+                tables.len()
+            )));
+        };
+        let mut bytes = vec![Vec::new()];
+        decoder.table_bytes(args.latent_height, args.latent_width, &mut bytes)?;
+        let positions = loader
+            .constant(
+                "video_decoder.positions",
+                table.dtype,
+                table.shape,
+                &bytes[0],
+                "minimax-h3",
+            )?
+            .view();
+        (decoder, postprocessor, positions)
+    };
+
+    // What the runner asks the block for, once per bucket.
+    let (height, columns) = canvas.pixels(&config.video_vae);
+    let clip_frames = canvas.frames_out(&config.video_vae);
+    let layout = decoder.layout_of(Clip {
+        frames: clip_frames,
+        height,
+        width: columns,
+    })?;
+    let rows = decoder
+        .latent_rows(&layout)?
+        .ok_or_else(|| Failure::message("the video decoder states the rows it reads"))?;
+    let splices = postprocessor.splices(args.timeline_frames)?;
+    let element = usize::try_from(dtype.bytes().unwrap_or(0)).unwrap_or(0);
+    if dtype != DType::F32 {
+        return Err(Failure::message(format!(
+            "the timeline reads an FP32 trajectory and this decoder computes in {dtype}: this stage \
+             states no conversion"
+        )));
+    }
+
+    // Four buffers the runner holds in columns, then the region a decode's arena is cut from afresh.
+    let (pixels, channels) = (
+        u64::from(height) * u64::from(columns),
+        u64::from(minimax_h3::output::Rgb::CHANNELS),
+    );
+    let block_bytes = rows.len() as u64 * latent_channels * element as u64;
+    let raster_bytes = channels * u64::from(clip_frames) * pixels * element as u64;
+    let tail_bytes = channels * 5 * pixels * element as u64;
+    let frames_bytes = u64::from(args.timeline_frames) * pixels * channels;
+    let held_bytes = block_bytes + raster_bytes + tail_bytes + frames_bytes + (1 << 20);
+    let scratch_bytes = decoder.arena_bytes(&layout)?.max(args.arena_gib << 30);
+    let allocator = weights.allocator();
+    let total = usize::try_from(held_bytes + scratch_bytes).unwrap_or(usize::MAX);
+    allocator.reserve(platform::PoolKind::Graph, total)?;
+    let region = allocator.allocate(platform::PoolKind::Graph, total)?;
+    let held = Arena::new(DevicePtr::new(region.address()), held_bytes);
+    let block = held.tensor(dtype, Shape::new(&[rows.len() as u64, latent_channels]))?;
+    let raster = held.tensor(
+        dtype,
+        Shape::new(&[
+            channels,
+            u64::from(clip_frames),
+            u64::from(height),
+            u64::from(columns),
+        ]),
+    )?;
+    let tail = held.tensor(
+        dtype,
+        Shape::new(&[channels, 5, u64::from(height), u64::from(columns)]),
+    )?;
+    let timeline = held.tensor(
+        DType::U8,
+        Shape::new(&[
+            u64::from(args.timeline_frames),
+            u64::from(height),
+            u64::from(columns),
+            channels,
+        ]),
+    )?;
+    let scratch = DevicePtr::new(region.address() + held_bytes);
+
+    // The trajectory: `[channels, voxels]` over the whole timeline.
+    let trajectory = std::fs::read(&source)
+        .map_err(|error| Failure::message(format!("{}: {error}", source.display())))?;
+    let voxels = trajectory.len() / (usize::try_from(latent_channels).unwrap_or(1) * element);
+    let plane = (args.latent_height * args.latent_width) as usize;
+    let directory = args.out.join("timeline");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+
+    for (index, splice) in splices.iter().enumerate() {
+        // The clip's window, in the rows the block states.
+        let start = decoder.clip_start(index as u32) as usize * plane;
+        let width_channels = usize::try_from(latent_channels).unwrap_or(0);
+        let mut staged = vec![0_u8; rows.len() * width_channels * element];
+        for (row, voxel) in rows.iter().enumerate() {
+            for channel in 0..width_channels {
+                let from = (channel * voxels + start + *voxel as usize) * element;
+                let to = (row * width_channels + channel) * element;
+                staged[to..to + element].copy_from_slice(&trajectory[from..from + element]);
+            }
+        }
+        // SAFETY: `block` is `staged`'s length and `staged` outlives the copy, which is waited on.
+        unsafe {
+            platform::memcpy_async(
+                block.ptr.address(),
+                staged.as_ptr() as u64,
+                staged.len(),
+                &stream,
+            )?;
+        }
+        stream.synchronize()?;
+        let started = std::time::Instant::now();
+        let arena = Arena::new(scratch, scratch_bytes);
+        let forward = Forward::new(&stream, &generation, &arena);
+        // The capability's `decode`, not the inherent tile decoder of the same name.
+        nn::capability::Decoder::decode(
+            &decoder,
+            &forward,
+            block,
+            &[positions],
+            DecodedMedia {
+                video: Some(raster),
+                audio: None,
+            },
+        )?;
+        stream.synchronize()?;
+        println!(
+            "clip {index}: decoded in {:.3} s, arena used {} MiB of {} MiB",
+            started.elapsed().as_secs_f64(),
+            arena.used() >> 20,
+            scratch_bytes >> 20
+        );
+        let bytes = download(&stream, raster, usize::try_from(raster_bytes).unwrap_or(0))?;
+        minimax_h3::diagnosis::write_npy(
+            &directory.join(format!("raster_{index}.npy")),
+            raster.shape.dims(),
+            &bytes,
+        )
+        .map_err(Failure::message)?;
+
+        // The splice, on a fresh arena as the runner's is, and the tail its successor reads.
+        let arena = Arena::new(scratch, scratch_bytes);
+        let forward = Forward::new(&stream, &generation, &arena);
+        let video = TensorView::new(
+            timeline.element(&[u64::from(splice.first), 0, 0, 0]),
+            DType::U8,
+            Shape::new(&[
+                u64::from(splice.keep),
+                u64::from(height),
+                u64::from(columns),
+                channels,
+            ]),
+        );
+        postprocessor.splice(
+            &forward,
+            (splice.overlap > 0).then_some(tail),
+            raster,
+            Splice {
+                first: 0,
+                ..*splice
+            },
+            DecodedMedia {
+                video: Some(video),
+                audio: None,
+            },
+        )?;
+        for channel in 0..channels {
+            // SAFETY: both runs lie inside `raster` and `tail`, and the copy is ordered on the stream.
+            unsafe {
+                platform::memcpy_async(
+                    tail.element(&[channel, 0, 0, 0]).address(),
+                    raster
+                        .element(&[channel, u64::from(clip_frames) - 5, 0, 0])
+                        .address(),
+                    usize::try_from(5 * pixels * element as u64).unwrap_or(0),
+                    &stream,
+                )?;
+            }
+        }
+        stream.synchronize()?;
+    }
+    let frames = download(
+        &stream,
+        timeline,
+        usize::try_from(frames_bytes).unwrap_or(0),
+    )?;
+    std::fs::write(directory.join("frames.rgb"), frames)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    println!(
+        "timeline: {} clips, {} frames of {height}x{columns} at {dtype} -> {}",
+        splices.len(),
+        args.timeline_frames,
+        directory.display()
     );
     Ok(())
 }
@@ -2591,15 +2883,17 @@ fn gather_tile(
     Ok(())
 }
 
-/// `[channels, frames, rows x columns]` to `[frames, rows x columns, channels]`, both float16.
-fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u8> {
+/// `[channels, frames, rows x columns]` to `[frames, rows x columns, channels]`, elements of `width`
+/// bytes each.
+fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64, width: u64) -> Vec<u8> {
     let mut out = vec![0_u8; bytes.len()];
+    let element = width as usize;
     for channel in 0..channels {
         for frame in 0..frames {
             for pixel in 0..pixels {
-                let source = (((channel * frames + frame) * pixels + pixel) * 2) as usize;
-                let target = (((frame * pixels + pixel) * channels + channel) * 2) as usize;
-                out[target..target + 2].copy_from_slice(&bytes[source..source + 2]);
+                let source = (((channel * frames + frame) * pixels + pixel) * width) as usize;
+                let target = (((frame * pixels + pixel) * channels + channel) * width) as usize;
+                out[target..target + element].copy_from_slice(&bytes[source..source + element]);
             }
         }
     }

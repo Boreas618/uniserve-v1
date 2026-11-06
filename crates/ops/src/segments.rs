@@ -1009,6 +1009,10 @@ pub struct ScoresArgs {
     pub out: TensorView,
 }
 
+/// The query tiles one program of `vsa_scores` and `vsa_compress_pooled` holds: their packages' own
+/// `QUERIES`, which divides the launch's grid.
+const POOLED_QUERIES: u64 = 16;
+
 /// The pooled (query tile, key tile) similarities VSA's selection ranks.
 ///
 /// This is the step between pooling and selection: `vsa_prepare_tiles` pools each tile's per-head
@@ -1120,7 +1124,7 @@ impl Op for VsaScores {
             .flag(descriptor.pdl);
         // One program per (head, query tile): it walks the key tiles and writes one row of scores.
         kernel.launch(
-            LaunchGrid::new([query_tiles, heads, 1])?,
+            LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,
             &mut arguments,
             stream,
         )
@@ -1383,7 +1387,7 @@ impl Op for VsaCompressPooled {
             .flag(descriptor.pdl);
         // One program per (head, query tile): it reduces the key tiles and writes one row.
         kernel.launch(
-            LaunchGrid::new([query_tiles, heads, 1])?,
+            LaunchGrid::new([query_tiles.div_ceil(POOLED_QUERIES), heads, 1])?,
             &mut arguments,
             stream,
         )
