@@ -47,7 +47,7 @@ def spec(fields, parameters, target):
         },
         # The block is the operator's own constant; the descriptor does not carry it, so the key is
         # the two element types and a change of block is a change of this file.
-        "constexprs": {"BLOCK": 1024, "WIDE": wide},
+        "constexprs": {"BLOCK": 2048 if wide else 1024, "WIDE": wide},
         "options": {"num_warps": 4, "launch_pdl": False},
         # A wide copy's launch refuses anything else: `Op::launch` checks the same words.
         "aligned": ["source_ptr", "out_ptr", "e3", "s0", "s1", "s2", "d0", "d1", "d2"]

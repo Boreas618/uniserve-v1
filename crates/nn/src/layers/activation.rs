@@ -84,7 +84,7 @@ impl GatedActivation {
             width: u32::try_from(width).map_err(|_| {
                 Error::shape("GatedActivation", "a row wider than a u32".to_owned())
             })?,
-            block: BLOCK,
+            block: PACKED_BLOCK,
             activation,
             gate_stride,
             value_stride,

@@ -41,6 +41,10 @@ pub const COPY: u32 = 1024;
 /// The rank of every block this operator moves.
 pub const RANK: usize = 4;
 
+/// The elements one program of a wide copy moves: a row of one member's heads in one pass, with each
+/// lane on whole vectors.
+pub const WIDE_COPY: u32 = 2048;
+
 /// What a wide copy's module states of its launch words: each is a multiple of this.
 const WIDE_ALIGNMENT: u64 = 16;
 
@@ -211,14 +215,15 @@ impl Op for CopyBlock {
         // module's launch options and never passed in the argument list. A trailing block word here
         // is one parameter more than the kernel has, which reaches the driver as an unnamed argument
         // rather than as a refusal.
-        arguments.u64(elements).u32(COPY).flag(false);
+        let copy = if descriptor.wide { WIDE_COPY } else { COPY };
+        arguments.u64(elements).u32(copy).flag(false);
         // A last axis one program wide or more is walked a row at a time (the package's fast path),
         // so the grid counts each row's blocks rather than the elements.
-        let grid = if extents[3] >= u64::from(COPY) {
+        let grid = if descriptor.wide || extents[3] >= u64::from(copy) {
             let rows = extents[0] * extents[1] * extents[2];
-            LaunchGrid::linear(rows * extents[3].div_ceil(u64::from(COPY)))?
+            LaunchGrid::linear(rows * extents[3].div_ceil(u64::from(copy)))?
         } else {
-            LaunchGrid::covering(elements, u64::from(COPY))?
+            LaunchGrid::covering(elements, u64::from(copy))?
         };
         kernel.launch(grid, &mut arguments, stream)
     }
