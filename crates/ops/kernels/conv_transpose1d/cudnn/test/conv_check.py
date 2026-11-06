@@ -247,8 +247,6 @@ def main() -> int:
     def padded(shape):
         """A five-entry extent list: the leading axes, the spatial ones, then ones."""
         leading = list(shape[:2])
-        if len(shape) == 3:
-            return leading + [1, 1] + list(shape[2:])
         return leading + list(shape[2:]) + [1] * (5 - len(shape))
 
     call = Call()

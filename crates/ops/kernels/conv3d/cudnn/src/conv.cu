@@ -519,6 +519,43 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
     // Answers the number of configurations the list holds, `0` for a list that is empty, and `-1`
     // for a query the library refused - three states, because "answered nothing" and "not answered"
     // have different cures and used to be one sentence.
+    const bool exact_fp32 = kFp32Inputs && call.tf32 == 0;
+    auto narrows_inputs = [&library](void* engine, bool* narrows) {
+      int32_t notes[kMaxNumericalNotes] = {};
+      int64_t notes_count = 0;
+      if (library.backend_get(engine, kAttrEngineNumericalNote, kTypeNumericalNote,
+                              kMaxNumericalNotes, &notes_count, notes) != kSuccess) {
+        return false;
+      }
+      *narrows = false;
+      for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
+        *narrows = *narrows || notes[at] == kNumericalNoteDownConvertInputs ||
+                   notes[at] == kNumericalNoteTensorCore;
+      }
+      return true;
+    };
+    // Whether the list just read holds an engine the call's numerics allow. A heuristic's shortlist
+    // can be all tensor-core engines for a wide FP32 convolution while a wider list holds a plain one,
+    // so an exact call moves to the next list instead of stopping at the first that is not empty.
+    auto holds_exact = [&library, &configs, &narrows_inputs]() {
+      for (void* config : configs) {
+        void* engine = nullptr;
+        if (library.backend_create(kDescriptorEngine, &engine) != kSuccess) {
+          continue;
+        }
+        int64_t engines = 0;
+        bool narrows = true;
+        const bool read =
+            library.backend_get(config, kAttrEngineCfgEngine, kTypeBackendDescriptor, 1, &engines,
+                                &engine) == kSuccess &&
+            narrows_inputs(engine, &narrows);
+        library.backend_destroy(engine);
+        if (read && !narrows) {
+          return true;
+        }
+      }
+      return false;
+    };
     auto ask = [&library, &configs](void* heuristic) -> int64_t {
       int64_t needed = 0;
       const bool sized = library.backend_get(heuristic, kAttrEngineHeurResults,
@@ -594,12 +631,17 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
         std::snprintf(said, sizeof(said), "%s unbuilt, ", names[at_mode]);
       } else {
         const int64_t got = ask(asked);
-        if (got > 0) {
+        if (got > 0 && (!exact_fp32 || holds_exact())) {
           listed = true;
           heuristic = asked;
           break;
         }
-        std::snprintf(said, sizeof(said), got < 0 ? "%s unanswered, " : "%s none, ",
+        for (void* config : configs) {
+          library.backend_destroy(config);
+        }
+        configs.clear();
+        std::snprintf(said, sizeof(said),
+                      got < 0 ? "%s unanswered, " : got > 0 ? "%s narrows, " : "%s none, ",
                       names[at_mode]);
       }
       if (asked != nullptr) {
@@ -672,21 +714,6 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
     // The engine: the one the tuning data names, else the heuristic's first proposal
     // that keeps the call's numerics. With `tf32` clear, an engine that narrows FP32
     // inputs is not a candidate — that is what makes the permission mean something.
-    const bool exact_fp32 = kFp32Inputs && call.tf32 == 0;
-    auto narrows_inputs = [&library](void* engine, bool* narrows) {
-      int32_t notes[kMaxNumericalNotes] = {};
-      int64_t notes_count = 0;
-      if (library.backend_get(engine, kAttrEngineNumericalNote, kTypeNumericalNote,
-                              kMaxNumericalNotes, &notes_count, notes) != kSuccess) {
-        return false;
-      }
-      *narrows = false;
-      for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
-        *narrows = *narrows || notes[at] == kNumericalNoteDownConvertInputs ||
-                   notes[at] == kNumericalNoteTensorCore;
-      }
-      return true;
-    };
     int64_t take = -1;
     bool hosted = false;
     bool named_narrows = false;
