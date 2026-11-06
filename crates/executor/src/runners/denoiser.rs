@@ -599,7 +599,8 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let mut buckets: Vec<BucketPlan> = Vec::with_capacity(warm.len());
         for request in warm {
             let layout = model.layout(&request.view());
-            let bucket = Bucket::denoise(1, layout);
+            let bucket =
+                Bucket::denoise(1, layout).serving(request.frames, request.width, request.height);
             if buckets.iter().any(|plan| plan.bucket == bucket) {
                 // Two served tasks of one layout share one graph and one table set: the bucket is
                 // the layout, so a second entry would capture the same extent twice.
