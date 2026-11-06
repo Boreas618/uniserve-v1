@@ -7,7 +7,7 @@
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding
 ``module.so``. The module is loaded as a runner loads it, called with the call
-structure of ``crates/ops/src/conv.rs`` (728 bytes, ``error`` at 212), and
+structure of ``crates/ops/src/conv.rs`` (732 bytes, ``error`` at 216), and
 compared with ``torch.nn.functional``'s convolution in FP64.
 
 The tolerance is the operator's, not a guess: `conv.rs::tolerance` declares
@@ -86,6 +86,7 @@ class Call(ctypes.Structure):
         ("groups", ctypes.c_int32),
         ("transposed", ctypes.c_int32),
         ("tf32", ctypes.c_int32),
+        ("channels_last", ctypes.c_int32),
         ("error", ctypes.c_char * 512),
     ]
 
@@ -246,8 +247,6 @@ def main() -> int:
     def padded(shape):
         """A five-entry extent list: the leading axes, the spatial ones, then ones."""
         leading = list(shape[:2])
-        if len(shape) == 3:
-            return leading + [1, 1] + list(shape[2:])
         return leading + list(shape[2:]) + [1] * (5 - len(shape))
 
     call = Call()
