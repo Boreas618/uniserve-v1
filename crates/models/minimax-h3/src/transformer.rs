@@ -139,8 +139,8 @@ impl Layer {
     /// One layer from `hidden` into `out`, modulated by the step's gathered rows.
     ///
     /// `modulation` is this layer's `[3 · groups, 6 · hidden]` table and `rows` the `[tokens]`
-    /// AdaLN row each token reads. `out` receives the layer's output, so the stack alternates two
-    /// buffers and never copies the residual.
+    /// AdaLN row each token reads. The layer's output lands in `hidden`, and `out` holds the
+    /// attention's residual in between, so no copy of the residual is made.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -200,8 +200,10 @@ impl Layer {
         // rounding is stated per site rather than per operator.
         let (value, gate) = projection_halves(packed);
         self.gated.forward(f, gate, value, mlp)?;
-        self.down.forward(f, mlp, update)?;
-        Ok(GatedResidual::new(gate_mlp)?.forward(f, out, update, rows)?)
+        // `hidden` is spent by now, so the down projection lands there, and the gated residual
+        // writes over its `update` operand: the layer's output is `hidden`, in place.
+        self.down.forward(f, mlp, hidden)?;
+        Ok(GatedResidual::new(gate_mlp)?.forward(f, out, hidden, rows)?)
     }
 }
 
@@ -717,6 +719,7 @@ impl Transformer {
         // named the stack's type was a row the forward never launches and, in the other direction,
         // the row the forward does launch was missing.
         programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_hidden_dim));
+        programs.launch::<SiluOp>(&Silu::descriptor_of(boundary, config.time_dim));
 
         // The modulation: three row programs, one per gathered table width — the step's entry per
         // group, a layer's six vectors per tag, and the final normalization's two. The first width is
@@ -774,17 +777,14 @@ impl Transformer {
         // factors as `interleaved` named a key no launcher binds - the deployment list's contiguous row
         // was the launch's, and this statement was the one that disagreed.
         //
-        // The positions are the **integer** table: `position_ids` is declared `i32` beside the tables
-        // it is indexed with (`denoiser.rs`), a coordinate being an index rather than a measured value,
-        // so a statement typing them F32 named a key no launch binds - and the failure that produced
-        // says so in its own words (`generation 1 has no kernel for rotary_factors descriptor
-        // dtype_f32_positions_f32_columns_48`). The row the file holds is `positions_i32`.
+        // The positions are real numbers: the reference's `position_ids` is FP64 on a rescaled clock
+        // and raster, so the table is FP32 and the launch reads `positions_f32`.
         let sections = nn::layers::Sections::new(&rotated_axes(config)).map_err(Error::from)?;
         programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
             rotated,
             1.0,
             Some(sections),
-            nn::DType::I32,
+            nn::DType::F32,
         ));
         programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
             head,
@@ -1248,29 +1248,20 @@ impl Transformer {
         if let Some(trace) = trace {
             trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
         }
-        let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
+        let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
-        let mut current = hidden;
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, per_layer, rows, factors, visible, segments, &scratch,
+                f, hidden, alternate, per_layer, rows, factors, visible, segments, &scratch,
             )?;
-            std::mem::swap(&mut current, &mut alternate);
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
             // layer reads, copied into the caller's view by an identity gather.
             if let Some(trace) = trace
                 && let Some(position) = trace.layers.iter().position(|layer| *layer == index as u32)
             {
-                nn::layers::gather_rows(f, current, trace.index, trace.views[position])?;
+                nn::layers::gather_rows(f, hidden, trace.index, trace.views[position])?;
             }
-        }
-        // An odd number of layers leaves the stack's output one buffer away from the caller's.
-        if current.ptr != hidden.ptr {
-            return Err(Error::Unsupported(
-                "the H3 stack ends in the alternate buffer; the caller must read the returned view"
-                    .to_owned(),
-            ));
         }
         Ok(())
     }
@@ -1469,17 +1460,16 @@ mod tests {
         );
 
         // The rotation's factor table: **contiguous** sections over the three axes (one spectrum
-        // written in blocks) and **integer** positions, because `position_ids` is an `i32` table - a
-        // coordinate is an index, not a measured value. Stating either the other way named a key no
-        // launch binds, and the store had the launch's row both times.
+        // written in blocks) and **real-valued** positions, because `position_ids` holds places on a rescaled
+        // clock and raster. Stating either the other way names a key no launch binds.
         let factors = programs
             .iter()
             .find(|(name, _)| name == "rotary_factors")
             .map(|(_, key)| key.clone())
             .expect("the stack states one factor table");
         assert!(
-            factors.contains("positions_i32"),
-            "the factor table reads the integer position table: {factors}"
+            factors.contains("positions_f32"),
+            "the factor table reads the real-valued position table: {factors}"
         );
         assert!(
             factors.contains("sections_32-32-32") && !factors.contains("interleaved_true"),
