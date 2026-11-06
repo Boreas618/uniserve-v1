@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use proto::request::GenerationLimits;
-use proto::request::wire::{CudaGraphs, EngineSpec, FlashInfer, Placement, Scheduling, Sizes};
+use proto::request::wire::{CudaGraphs, EngineSpec, Placement, Scheduling, Sizes};
 use serde::de::DeserializeOwned;
 
 use crate::DEFAULT_COMPONENT;
@@ -136,7 +136,6 @@ impl EngineConfig {
         let kv_cache = required(&spec.kv_cache, "kv_cache")?;
         let workers = required(&spec.workers, "executors")?;
         let graphs = required(&spec.cuda_graphs, "cuda_graphs")?;
-        let flashinfer = required(&spec.flashinfer, "flashinfer")?;
         let video = required(&spec.video, "video")?;
         let experts = required(&spec.experts, "experts")?;
         let facts = required(&spec.model_facts, "model_facts")?;
@@ -278,7 +277,7 @@ impl EngineConfig {
                 .profiling
                 .as_ref()
                 .is_some_and(|profiling| profiling.graph_pc_sampling),
-            ..graph_arguments(graphs, flashinfer)?
+            ..graph_arguments(graphs)?
         };
 
         Ok(Self {
@@ -477,10 +476,7 @@ fn order_devices(
 }
 
 /// The launch arguments the graph and attention-provider tables state.
-fn graph_arguments(
-    graphs: &CudaGraphs,
-    flashinfer: &FlashInfer,
-) -> anyhow::Result<ExecutorProcessArgs> {
+fn graph_arguments(graphs: &CudaGraphs) -> anyhow::Result<ExecutorProcessArgs> {
     Ok(ExecutorProcessArgs {
         graph_policy: named(&graphs.policy, "cuda_graph_config.policy")?,
         decode_graph_batch_sizes: sizes(&graphs.decode_batch_sizes),
@@ -492,19 +488,6 @@ fn graph_arguments(
                 .map(|shape| [shape.height, shape.width])
                 .collect()
         }),
-        flashinfer_workspace_size: flashinfer.workspace_size,
-        flashinfer_use_tensor_core: flashinfer.use_tensor_core,
-        flashinfer_decode_backend: named(
-            &flashinfer.decode_backend,
-            "flashinfer_config.decode_backend",
-        )?,
-        flashinfer_prefill_backend: named(
-            &flashinfer.prefill_backend,
-            "flashinfer_config.prefill_backend",
-        )?,
-        flashinfer_decode_split_tile_size: flashinfer.decode_split_tile_size,
-        flashinfer_prefill_split_tile_size: flashinfer.prefill_split_tile_size,
-        flashinfer_split_kv: flashinfer.split_kv,
         ..ExecutorProcessArgs::default()
     })
 }
@@ -531,7 +514,6 @@ mod tests {
             }),
             transfer: String::new(),
             scheduling: Some(wire::Scheduling {
-                policy: "fcfs".into(),
                 max_batch: 128,
                 max_running_requests: 128,
                 ..wire::Scheduling::default()
@@ -548,11 +530,6 @@ mod tests {
             cuda_graphs: Some(CudaGraphs {
                 policy: "auto".into(),
                 ..CudaGraphs::default()
-            }),
-            flashinfer: Some(FlashInfer {
-                decode_backend: "fa2".into(),
-                prefill_backend: "auto".into(),
-                ..FlashInfer::default()
             }),
             video: Some(wire::Video {
                 max_seconds: 15.0,

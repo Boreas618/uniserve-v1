@@ -160,9 +160,9 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
     );
     admin.watch(&engine);
     let served = async {
-        let listener = Listener::bind(&config.server_config)
+        let listener = Listener::bind(&config.admin_config)
             .await
-            .context("failed to bind listener for HTTP server")?;
+            .context("failed to bind the daemon's listener")?;
         let jobs = Arc::new(VideoJobs::new(
             config.video_job_config.clone(),
             shutdown.child_token(),

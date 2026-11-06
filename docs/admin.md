@@ -32,14 +32,14 @@ Each write is an operation: it has an identity, runs on a task of its own, and e
 
 An epoch is one build of the main process serving a deployment: its executable and build identity, its parallel shape, its numerics, the programs it fills, and the KV cache it lays out. The daemon decides once, before anything starts, which layer a change moves on (`crates/daemon/src/updates/`):
 
-- **Program layer** — only what the main processes execute differs (a new kernel or scheduling-policy revision at an unchanged configuration). The serving epoch's processes install the programs and trial the new ones; nothing restarts.
+- **Program layer** — only what the main processes execute differs (a new kernel revision, or another scheduling policy or another of its parameters, at an unchanged configuration). The serving epoch's processes install the programs and trial the new ones; nothing restarts.
 - **Epoch layer** — the build config differs: the main-process executable (`worker_config.executable`), the parallel shape and block ownership, `dtype` or `quantization`, the KV layout, the graph tiers and the slot count. The daemon runs an epoch switch, below.
-- **Host layer** — the options the daemon or the frontend read alone (`server_config`, `logging_config`, `chat_config`, `image_fetch_config`, `media_config`, `video_job_config`, `migration_config`, `mm_processor_kwargs`). The daemon restarts itself in place (below).
+- **Host layer** — the options the daemon or the frontend read alone (`server_config` for the frontend, `admin_config` for the daemon's own listener, `logging_config`, `chat_config`, `image_fetch_config`, `media_config`, `video_job_config`, `migration_config`, `mm_processor_kwargs`). The daemon restarts itself in place (below).
 
 `PUT /admin/config` resolves the target against the serving configuration and answers with the layer that took it (`change`):
 
 - `none`: the target is the current configuration.
-- `in_place`: the scheduling options alone (`max_running_requests`, `max_num_batched_tokens`, `scheduler_config` and the refill policy of `speculative_config`), within the batch the running processes were started for, take effect at each scheduler's next step; a change of policy reorders the waiting requests by it. `profiling_config.fence_probes` alone switches every worker's fence probes at the next step boundary, the captured graphs keeping them (`docs/profiling.md`).
+- `in_place`: the schedulers' limits alone (`max_running_requests`, `max_num_batched_tokens`, and `scheduler_config`'s `max_batch`, `max_queued_requests` and `chunked_prefill_size`), within the batch the running processes were started for, take effect at each scheduler's next step. A change of the scheduling policy's own name or of the refill policy's parameters (`scheduler_config.policy`, `speculative_config.expected_speedup`, `refill_token_cost`) is a program change: they are the policy program's backend name and arguments (§7.7). `profiling_config.fence_probes` alone switches every worker's fence probes at the next step boundary, the captured graphs keeping them (`docs/profiling.md`).
 - `daemon`: a change of the host layer's options is a hot restart of the daemon with the target configuration (`docs/admin.md` below); the answer carries the successor's process id.
 - `epoch`: the epoch layer runs a switch; the answer reports the update and the epoch it targets.
 - `program`: the program layer runs inside the serving epoch; the answer reports the update and the epoch it executes in.

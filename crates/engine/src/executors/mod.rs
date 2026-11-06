@@ -25,7 +25,7 @@ pub use dispatch::Dispatcher;
 pub use group::{CallReaders, ExecutorGroup};
 pub(crate) use incarnations::IncarnationRegistry;
 use process::{PendingWorker, ExecutorProcess};
-use proto::request::{ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat};
+use proto::request::{ExpertExchange, GraphPolicy, LoadFormat};
 
 /// Backpressure and terminal failures returned by a ExecutorGroup batch submission.
 #[derive(Debug, thiserror::Error)]
@@ -220,21 +220,6 @@ pub struct ExecutorProcessArgs {
     /// threshold needs, prepares its canvas steps for exactly this sampling,
     /// and refuses a request that carries another.
     pub canvas_sampling: Option<ipc::CanvasSampling>,
-    /// FlashInfer workspace capacity in bytes.
-    pub flashinfer_workspace_size: u64,
-    /// FlashInfer tensor-core decode selection; `None` lets the backend
-    /// decide.
-    pub flashinfer_use_tensor_core: Option<bool>,
-    /// FlashInfer backend used for decode attention.
-    pub flashinfer_decode_backend: FlashInferBackend,
-    /// FlashInfer backend used for prefill attention.
-    pub flashinfer_prefill_backend: FlashInferBackend,
-    /// Optional split-KV tile size used for FlashInfer decode attention.
-    pub flashinfer_decode_split_tile_size: Option<u32>,
-    /// Optional split-KV tile size used for FlashInfer prefill attention.
-    pub flashinfer_prefill_split_tile_size: Option<u32>,
-    /// Whether FlashInfer may split the KV sequence across thread blocks.
-    pub flashinfer_split_kv: bool,
     /// Whether the fence probes record (`profiling_config.fence_probes`).
     pub fence_probes: bool,
     /// The components whose module instances carry fence probes, as name
