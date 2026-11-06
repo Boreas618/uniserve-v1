@@ -128,17 +128,20 @@ impl Local {
         })
     }
 
-    /// Answers one request for this node on behalf of `engine`.
-    fn answer(&mut self, engine: u64, request: &Request) -> Reply {
+    /// Answers one request for this node on behalf of `engine`. `reporter` is
+    /// the connection that asked, which a launch's exit report goes down.
+    fn answer(&mut self, engine: u64, reporter: u64, request: &Request) -> Reply {
         let mut reply = Reply {
             id: request.id,
             ..Reply::default()
         };
         match &request.kind {
-            Some(request::Kind::Spawn(spawn)) => match self.supervisor.spawn(engine, spawn) {
-                Ok(pid) => reply.kind = Some(reply::Kind::Spawned(Spawned { pid })),
-                Err(error) => reply.error = error,
-            },
+            Some(request::Kind::Spawn(spawn)) => {
+                match self.supervisor.spawn(engine, reporter, spawn) {
+                    Ok(pid) => reply.kind = Some(reply::Kind::Spawned(Spawned { pid })),
+                    Err(error) => reply.error = error,
+                }
+            }
             Some(request::Kind::Stop(stop)) => {
                 self.supervisor.stop(engine, &stop.group, stop.generation);
                 reply.kind = Some(reply::Kind::Stopped(Stopped {}));
@@ -354,6 +357,41 @@ struct EngineConnection {
 /// them for the daemon's life (§2.5, §7.4).
 pub(crate) const EPOCH_ENGINE: u64 = 0;
 
+/// The first key among the clients of the socket. A connection travels as one
+/// number to a member and back with a launch's answer and exit report, so a
+/// client's key must not be a number an engine holds or may state.
+const FIRST_CLIENT: u64 = 1 << 63;
+
+/// The connection `id` names, in the registry its range says.
+fn connection_of<'a>(
+    id: u64,
+    engines: &'a mut HashMap<u64, EngineConnection>,
+    clients: &'a mut HashMap<u64, EngineConnection>,
+) -> Option<&'a mut EngineConnection> {
+    if id >= FIRST_CLIENT {
+        clients.get_mut(&id)
+    } else {
+        engines.get_mut(&id)
+    }
+}
+
+/// Reports one exit: down the connection that asked for the launch, and to the
+/// epoch layer, whose switch reads every exit of the deployment (§7.3, §7.4).
+fn report_exit(
+    reporter: u64,
+    exit: Exit,
+    exits: &Sender<Exit>,
+    wake: &Sender<()>,
+    engines: &mut HashMap<u64, EngineConnection>,
+    clients: &mut HashMap<u64, EngineConnection>,
+) {
+    let _ = exits.send(exit.clone());
+    let _ = wake.send(());
+    if let Some(peer) = connection_of(reporter, engines, clients) {
+        let _ = peer.connection.send(&downstream_exit(exit));
+    }
+}
+
 /// Runs the leader's service until `stop`: engines connect on `listener`,
 /// `members` joined before, and other nodes may join at `joins`. Returns
 /// what it served when `stop` asks for a hot restart's handoff, and `None`
@@ -450,7 +488,7 @@ pub(crate) fn serve_leader(
             engines: HashMap::new(),
             next_engine: 1,
             clients: HashMap::new(),
-            next_client: 1,
+            next_client: FIRST_CLIENT,
             process_links: HashMap::new(),
             request_links: HashMap::new(),
             stops: HashMap::new(),
@@ -866,8 +904,10 @@ pub(crate) fn run_leader(
         }
         // Clients of the process socket: the daemon's own, and the ones a main
         // process's workers open. They ask (a device inventory, a storage
-        // ledger) and are answered; they are never commanded, and a client
-        // that goes takes nothing with it.
+        // ledger, a launch) and are answered; they are never commanded, and a
+        // client that goes takes with it the launches it asked for and nothing
+        // else: the deployment's owner stays, whose processes the epoch layer
+        // named.
         let mut gone = Vec::new();
         for (&client, peer) in &mut clients {
             loop {
@@ -902,6 +942,13 @@ pub(crate) fn run_leader(
         for client in gone {
             if let Some(number) = clients.remove(&client).and_then(|peer| peer.requests_of) {
                 request_links.remove(&number);
+            }
+            stops.retain(|&(asker, _), _| asker != client);
+            local.supervisor.release(client);
+            for member in &mut members {
+                let _ = member.connection.send(&ToMember {
+                    kind: Some(to_member::Kind::Released(client)),
+                });
             }
         }
 
@@ -952,11 +999,17 @@ pub(crate) fn run_leader(
                                     let Some(stop) = stops.remove(&(engine, reply.id)) else {
                                         continue;
                                     };
-                                    answer(engine, stop.reply, &mut pending, &mut engines);
+                                    answer(
+                                        engine,
+                                        stop.reply,
+                                        &mut pending,
+                                        &mut engines,
+                                        &mut clients,
+                                    );
                                     continue;
                                 }
                                 None => {
-                                    answer(engine, reply, &mut pending, &mut engines);
+                                    answer(engine, reply, &mut pending, &mut engines, &mut clients);
                                     continue;
                                 }
                             },
@@ -964,9 +1017,14 @@ pub(crate) fn run_leader(
                                 engine,
                                 exit: Some(exit),
                             })) => {
-                                if let Some(peer) = engines.get_mut(&engine) {
-                                    let _ = peer.connection.send(&downstream_exit(exit));
-                                }
+                                report_exit(
+                                    engine,
+                                    exit,
+                                    &exits,
+                                    &wake,
+                                    &mut engines,
+                                    &mut clients,
+                                );
                                 continue;
                             }
                             _ => continue,
@@ -998,7 +1056,7 @@ pub(crate) fn run_leader(
             }
             for key in settled {
                 if let Some(stop) = stops.remove(&key) {
-                    answer(key.0, stop.reply, &mut pending, &mut engines);
+                    answer(key.0, stop.reply, &mut pending, &mut engines, &mut clients);
                 }
             }
         }
@@ -1063,14 +1121,9 @@ pub(crate) fn run_leader(
             );
         }
 
-        // This node's exits, to the engines that started the processes and
-        // to the epoch layer, whose switch reads them (§7.3, §7.4).
-        for (engine, exit) in local.supervisor.exits() {
-            let _ = exits.send(exit.clone());
-            let _ = wake.send(());
-            if let Some(peer) = engines.get_mut(&engine) {
-                let _ = peer.connection.send(&downstream_exit(exit));
-            }
+        // This node's exits.
+        for (reporter, exit) in local.supervisor.exits() {
+            report_exit(reporter, exit, &exits, &wake, &mut engines, &mut clients);
         }
 
         let mut descriptors = vec![listener.descriptor(), stop.wake.as_raw_fd()];
@@ -1092,18 +1145,19 @@ struct PendingStop {
 }
 
 /// Delivers one reply: to the epoch layer when the main processes' owner
-/// asked, otherwise down the engine's own connection.
+/// asked, otherwise down the connection that asked.
 fn answer(
     engine: u64,
     reply: Reply,
     pending: &mut HashMap<u64, Sender<Reply>>,
     engines: &mut HashMap<u64, EngineConnection>,
+    clients: &mut HashMap<u64, EngineConnection>,
 ) {
     if engine == EPOCH_ENGINE {
         if let Some(waiter) = pending.remove(&reply.id) {
             let _ = waiter.send(reply);
         }
-    } else if let Some(peer) = engines.get_mut(&engine) {
+    } else if let Some(peer) = connection_of(engine, engines, clients) {
         let _ = peer.connection.send(&downstream_reply(reply));
     }
 }
@@ -1153,6 +1207,7 @@ fn route(
             .send(&ToMember {
                 kind: Some(to_member::Kind::Forwarded(Forwarded {
                     engine,
+                    owner,
                     request: Some(request.clone()),
                 })),
             })
@@ -1166,14 +1221,14 @@ fn route(
                 .iter_mut()
                 .filter_map(|member| forward(member).then_some(member.node_rank))
                 .collect();
-            let reply = local.answer(owner, request);
+            let reply = local.answer(owner, engine, request);
             if awaiting.is_empty() {
                 return Some(reply);
             }
             stops.insert((engine, request.id), PendingStop { reply, awaiting });
             None
         }
-        Some(target) if target == host => Some(local.answer(owner, request)),
+        Some(target) if target == host => Some(local.answer(owner, engine, request)),
         Some(target) => match members.iter_mut().find(|member| member.host == target) {
             Some(member) => {
                 if forward(member) {
@@ -1224,10 +1279,11 @@ pub(crate) fn serve_member(
                     kind:
                         Some(to_member::Kind::Forwarded(Forwarded {
                             engine,
+                            owner,
                             request: Some(request),
                         })),
                 })) => {
-                    let reply = local.answer(engine, &request);
+                    let reply = local.answer(owner, engine, &request);
                     leader.send(&FromMember {
                         kind: Some(from_member::Kind::Answered(Answered {
                             engine,
@@ -1520,7 +1576,10 @@ pub(crate) fn resume(
                     },
                 );
             }
-            let next_client = adopted_clients.keys().max().map_or(1, |client| client + 1);
+            let next_client = adopted_clients
+                .keys()
+                .max()
+                .map_or(FIRST_CLIENT, |client| (client + 1).max(FIRST_CLIENT));
             let mut adopted_members = Vec::with_capacity(members.len());
             for (node_rank, member_host, connection) in members {
                 adopted_members.push(Membership {

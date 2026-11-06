@@ -53,9 +53,13 @@ const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 /// daemon holds.
 pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
 
-/// A supervised process: the engine connection that started it, its worker
-/// group, its rank and the generation of the group's launch.
-type Key = (u64, String, u32, u64);
+/// A supervised process: the owner it is answered for, the connection that
+/// asked for it, its worker group, its rank and the generation of the group's
+/// launch. The connection is the launch's own: every client of the socket
+/// shares the deployment's owner, and two of them may name one group and rank,
+/// as two engines do during a world change. Its exit report goes down that
+/// connection, and it ends with that connection.
+type Key = (u64, u64, String, u32, u64);
 
 /// One supervised process.
 struct Supervised {
@@ -197,8 +201,19 @@ impl Supervisor {
     ///
     /// Fails when a reservation to inherit is not this engine's, or the
     /// process cannot be started.
-    pub(crate) fn spawn(&mut self, engine: u64, spawn: &Spawn) -> Result<u32, String> {
-        let key = (engine, spawn.group.clone(), spawn.rank, spawn.generation);
+    pub(crate) fn spawn(
+        &mut self,
+        engine: u64,
+        reporter: u64,
+        spawn: &Spawn,
+    ) -> Result<u32, String> {
+        let key = (
+            engine,
+            reporter,
+            spawn.group.clone(),
+            spawn.rank,
+            spawn.generation,
+        );
 
         let mut command = Command::new(&spawn.executable);
         command.args(&spawn.arguments);
@@ -341,7 +356,7 @@ impl Supervisor {
         let stopped: Vec<Key> = self
             .children
             .keys()
-            .filter(|(owner, name, _, launched)| {
+            .filter(|(owner, _, name, _, launched)| {
                 *owner == engine
                     && name == group
                     && generation.is_none_or(|generation| *launched == generation)
@@ -357,13 +372,13 @@ impl Supervisor {
         }
     }
 
-    /// Ends every process and reservation of an engine whose connection
-    /// closed.
+    /// Ends every process and reservation of a connection that closed: what
+    /// the engine it is owns, and what it asked for as a client.
     pub(crate) fn release(&mut self, engine: u64) {
         let owned: Vec<Key> = self
             .children
             .keys()
-            .filter(|(owner, _, _, _)| *owner == engine)
+            .filter(|(owner, reporter, ..)| *owner == engine || *reporter == engine)
             .cloned()
             .collect();
         self.terminate(owned);
@@ -378,8 +393,9 @@ impl Supervisor {
     }
 
     /// Notes each running child's NCCL names every
-    /// [`SEGMENT_NOTE_INTERVAL`], and returns, with its engine, every child
-    /// that exited since the last call, which is supervised no longer. A
+    /// [`SEGMENT_NOTE_INTERVAL`], and returns, with the connection that asked
+    /// for its launch, every child that exited since the last call, which is
+    /// supervised no longer. A
     /// child whose status cannot be read is reported as exited.
     pub(crate) fn exits(&mut self) -> Vec<(u64, Exit)> {
         let mut exited = Vec::new();
@@ -405,9 +421,9 @@ impl Supervisor {
         }
         exited
             .into_iter()
-            .map(|((engine, group, rank, generation), status, success, last_stderr)| {
+            .map(|((engine, reporter, group, rank, generation), status, success, last_stderr)| {
                 self.children
-                    .remove(&(engine, group.clone(), rank, generation));
+                    .remove(&(engine, reporter, group.clone(), rank, generation));
                 // The report names the engine the process was spawned for, its
                 // rank, how it ended, and the last line it wrote itself: a
                 // launch that failed for a reason outside the engine says so
@@ -418,7 +434,7 @@ impl Supervisor {
                     tracing::warn!(engine, %group, rank, generation, %status, last_stderr = ?last_stderr, "a process exited");
                 }
                 (
-                    engine,
+                    reporter,
                     Exit {
                         host: self.host.clone(),
                         group,
@@ -437,7 +453,7 @@ impl Supervisor {
         for key in keys {
             if let Some(mut supervised) = self.children.remove(&key) {
                 if let Err(error) = supervised.child.kill() {
-                    tracing::warn!(group = %key.1, rank = key.2, %error, "a process could not be stopped");
+                    tracing::warn!(group = %key.2, rank = key.3, %error, "a process could not be stopped");
                 }
                 ending.push(supervised);
             }
@@ -456,8 +472,9 @@ impl Supervisor {
         self.children
             .iter()
             .map(
-                |((engine, group, rank, generation), supervised)| HandedProcess {
+                |((engine, reporter, group, rank, generation), supervised)| HandedProcess {
                     engine: *engine,
+                    reporter: *reporter,
                     group: group.clone(),
                     rank: *rank,
                     generation: *generation,
@@ -480,10 +497,11 @@ impl Supervisor {
     pub(crate) fn hand_over(&mut self) -> std::io::Result<(HandedProcesses, Vec<OwnedFd>)> {
         let mut processes = Vec::with_capacity(self.children.len());
         let mut descriptors = Vec::with_capacity(self.children.len() + self.reservations.len());
-        for ((engine, group, rank, generation), supervised) in &self.children {
+        for ((engine, reporter, group, rank, generation), supervised) in &self.children {
             descriptors.push(supervised.child.pidfd()?);
             processes.push(HandedProcess {
                 engine: *engine,
+                reporter: *reporter,
                 group: group.clone(),
                 rank: *rank,
                 generation: *generation,
@@ -542,6 +560,7 @@ impl Supervisor {
             supervisor.children.insert(
                 (
                     process.engine,
+                    process.reporter,
                     process.group,
                     process.rank,
                     process.generation,
@@ -602,6 +621,10 @@ pub(crate) struct HandedProcesses {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandedProcess {
     pub(crate) engine: u64,
+    /// The connection its exit report goes down. A predecessor that states
+    /// none leaves the report to the epoch layer alone.
+    #[serde(default)]
+    pub(crate) reporter: u64,
     pub(crate) group: String,
     pub(crate) rank: u32,
     pub(crate) generation: u64,
@@ -1018,9 +1041,8 @@ time.sleep(600)
 
     /// Starts [`event_holder_rank`] and waits until its event storage exists.
     fn hold_event() -> (Holder, Vec<PathBuf>) {
-        let mut command = Command::new(
-            std::env::current_exe().expect("this test's own executable"),
-        );
+        let mut command =
+            Command::new(std::env::current_exe().expect("this test's own executable"));
         // The name is this binary's own path to the role: a test binary passes
         // the module path it printed in its own diagnostics, which is this
         // crate's modules under `daemon`'s lib.
@@ -1156,7 +1178,7 @@ time.sleep(600)
             arguments: vec!["600".to_owned()],
             ..Spawn::default()
         };
-        let pid = first.spawn(7, &spawn).unwrap();
+        let pid = first.spawn(7, 7, &spawn).unwrap();
         let reserved = first
             .reserve(
                 7,

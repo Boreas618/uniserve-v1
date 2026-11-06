@@ -154,6 +154,11 @@ impl Engine {
         assert!(matches!(reply.kind, Some(reply::Kind::Stopped(_))));
     }
 
+    /// How many exits arrived that nothing read yet.
+    pub(crate) fn reported_exits(&self) -> usize {
+        self.exits.len()
+    }
+
     /// Waits for the next exit the daemon reports.
     pub(crate) fn exit(&mut self) -> Exit {
         if let Some(exit) = self.exits.pop_front() {
