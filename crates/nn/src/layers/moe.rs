@@ -2139,11 +2139,11 @@ pub(super) mod tests {
         assert!(large > small, "{large} is not more than {small}");
         assert!(large < 16 << 20, "{large} exceeds the floor it replaced");
         // 15 tokens over 128 experts is 120 permuted tiles of 128 rows: the routed rows the caller
-        // launches. The gated product needs 6 160 + 740 356 and the contraction 8 208 + 987 140, so
-        // the shared buffer is the contraction's.
+        // launches. The gated product needs 16 + 740 356 and the contraction 16 + 987 140, so the
+        // shared buffer is the contraction's.
         assert_eq!(quantized.workspace_bytes(15_360), 987_156);
-        // A bucket small enough that the artifact's planes are a single tile still carries both
-        // preambles: the bias columns do not shrink with the row count.
+        // A bucket small enough that the artifact's planes are a single tile still carries the
+        // entry's preamble.
         assert_eq!(quantized.workspace_bytes(8), 9_236);
     }
 
