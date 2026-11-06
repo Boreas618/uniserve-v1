@@ -372,8 +372,23 @@ impl Layouts {
             },
             audio: Some(self.audio_latent(packing::audio_latent_frames(frames))),
             text_rows: self.arrangement.text_rows,
-            condition_rows: self.arrangement.condition_rows,
+            condition_rows: self.condition_rows_of(request),
             condition_elements: self.condition_elements(&conditions_of(request), &canvas),
+        }
+    }
+
+    /// The condition rows `request`'s layout holds: the deployment's capacity for a request with
+    /// conditions, and none for a request without.
+    ///
+    /// A deployment's capacity is sized for the widest task it serves, and a layout's rows are real
+    /// rows of every projection, every attention and every feed-forward of every step. A `t2va`
+    /// request at a capacity sized for `fl2va` carried 2048 empty rows through all of them.
+    fn condition_rows_of(&self, request: &VideoRequest) -> u32 {
+        let anchors = request.first_frames + request.last_frames + request.references;
+        if anchors == 0 && request.conditions.is_empty() {
+            0
+        } else {
+            self.arrangement.condition_rows
         }
     }
 
@@ -393,7 +408,7 @@ impl Layouts {
             frames,
             &canvas,
             self.arrangement.text_rows,
-            self.arrangement.condition_rows,
+            self.condition_rows_of(request),
             self.arrangement.shard,
         )?;
         let elements = self.condition_elements(&conditions_of(request), &canvas);
