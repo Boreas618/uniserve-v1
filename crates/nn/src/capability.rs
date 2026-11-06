@@ -1023,6 +1023,35 @@ pub trait Decoder {
     /// the point of this boundary is that the alternative - guessing - is silent.
     fn element_type(&self) -> DType;
 
+    /// The element type of the latent block [`Self::decode`] reads, when it is not
+    /// [`Self::element_type`].
+    ///
+    /// A decoder whose reference restores the latents in a wider type than it decodes them to says
+    /// so here, and the runner stages the block in that type rather than narrowing it on the way in.
+    fn latent_type(&self) -> DType {
+        self.element_type()
+    }
+
+    /// Write the latent block of the clip starting at latent frame `first`, on the forward's stream.
+    ///
+    /// `trajectory` is the timeline's latents as a denoiser publishes them, `[channels, voxels]`, and
+    /// `block` is the buffer [`Self::decode`] reads, `[rows, channels]` in [`Self::latent_rows`]'
+    /// order. A decoder that reads a trajectory says how its rows lie in it; the runner stages the
+    /// trajectory and asks, so a clip never crosses to the host.
+    fn gather_latents(
+        &self,
+        f: &crate::Forward,
+        layout: &Layout,
+        trajectory: TensorView,
+        first: u32,
+        block: TensorView,
+    ) -> Result<()> {
+        let _ = (f, layout, trajectory, first, block);
+        Err(Error::Unsupported(
+            "this decoder reads no denoiser trajectory".to_owned(),
+        ))
+    }
+
     /// For each row of the latent block [`Self::decode`] reads, the clip's voxel it holds, counted
     /// frame by frame, row by row.
     ///

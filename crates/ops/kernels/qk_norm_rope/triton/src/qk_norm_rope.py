@@ -183,6 +183,72 @@ def _norm_rope(
         )
 
 
+@triton.jit
+def _qk_norm_rope_strided_kernel(
+    query_ptr,
+    key_ptr,
+    cosine_ptr,
+    sine_ptr,
+    tokens,
+    row_stride,
+    table_rows,
+    epsilon,
+    pdl,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    ROTATED: tl.constexpr,
+    ROWS: tl.constexpr,
+    PDL: tl.constexpr,
+):
+    """No learned scale, heads turned in place through a row stride, a factor table that repeats.
+
+    One program owns ``ROWS`` tokens of one head, which is the tile the reference's kernel
+    (``uniserve_kernels/src/uniserve_kernels/rope.py``, ``_qk_rms_norm_partial_rope_kernel``)
+    gives a wide row: a loop over heads inside one token would serialize what the machine can run
+    side by side. The program index walks the heads fastest, so neighbouring programs read
+    neighbouring columns of the same rows. The numbers are that kernel's: FP32 statistics over the
+    head, the pair read back as its normalized value, one rounding at the store. Every value a
+    program reads, partners included, belongs to its own tile and is loaded before it stores.
+    """
+    _pdl_prologue(PDL)
+    program = tl.program_id(0)
+    head = (program % HEADS).to(tl.int64)
+    token = (program // HEADS).to(tl.int64) * ROWS + tl.arange(0, ROWS).to(tl.int64)
+    columns = tl.arange(0, DIM)
+    live = (token < tokens)[:, None]
+    half: tl.constexpr = ROTATED // 2
+
+    partner = tl.where(columns < half, columns + half, columns - half)
+    partner = tl.where(columns < ROTATED, partner, columns)
+    base = token[:, None] * row_stride + head * DIM
+    offsets = base + columns[None, :]
+    partners = base + partner[None, :]
+
+    # Compact factors hold one phase per rotated pair, shared by every head of the token and by
+    # every tile of the launch.
+    turned = live & (columns < ROTATED)[None, :]
+    factors = (token % table_rows)[:, None] * half + (columns % half)[None, :]
+    cosine = tl.load(cosine_ptr + factors, mask=turned, other=1.0).to(tl.float32)
+    sine = tl.load(sine_ptr + factors, mask=turned, other=0.0).to(tl.float32)
+    sign = tl.where(columns[None, :] < half, -1.0, 1.0)
+
+    query = tl.load(query_ptr + offsets, mask=live, other=0.0).to(tl.float32)
+    query_rstd = tl.rsqrt(tl.sum(query * query, axis=1) / DIM + epsilon)
+    query = query * query_rstd[:, None]
+    query_partner = tl.load(query_ptr + partners, mask=live, other=0.0).to(tl.float32)
+    query_partner = query_partner * query_rstd[:, None]
+    query_turned = query * cosine + sign * query_partner * sine
+    tl.store(query_ptr + offsets, tl.where(turned, query_turned, query), mask=live)
+
+    key = tl.load(key_ptr + offsets, mask=live, other=0.0).to(tl.float32)
+    key_rstd = tl.rsqrt(tl.sum(key * key, axis=1) / DIM + epsilon)
+    key = key * key_rstd[:, None]
+    key_partner = tl.load(key_ptr + partners, mask=live, other=0.0).to(tl.float32)
+    key_partner = key_partner * key_rstd[:, None]
+    key_turned = key * cosine + sign * key_partner * sine
+    tl.store(key_ptr + offsets, tl.where(turned, key_turned, key), mask=live)
+
+
 # The four entry points a call's arguments can name.
 #
 # The operator's call carries the weight views exactly when the descriptor says

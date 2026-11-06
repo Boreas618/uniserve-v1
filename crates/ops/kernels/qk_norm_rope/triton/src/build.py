@@ -25,6 +25,41 @@ def float_of(bits):
     return struct.unpack("<f", struct.pack("<I", int(bits, 16)))[0]
 
 
+def strided_spec(fields, head_dim, rotated, pdl):
+    """The compilation of the strided form: one kernel, no learned scale."""
+    dtype = "*" + DTYPES[fields["dtype"]]
+    factors = "*" + DTYPES[fields.get("factors", "f32")]
+    return {
+        "kernel": kernels._qk_norm_rope_strided_kernel,
+        "signature": {
+            "query_ptr": dtype,
+            "key_ptr": dtype,
+            "cosine_ptr": factors,
+            "sine_ptr": factors,
+            "tokens": "i64",
+            "row_stride": "i64",
+            "table_rows": "i64",
+            "epsilon": "fp32",
+            "pdl": "i32",
+            "HEADS": "constexpr",
+            "DIM": "constexpr",
+            "ROTATED": "constexpr",
+            "ROWS": "constexpr",
+            "PDL": "constexpr",
+        },
+        "constexprs": {
+            "HEADS": int(fields["q_heads"]),
+            "DIM": head_dim,
+            "ROTATED": rotated,
+            "ROWS": int(fields["rows"]),
+            "PDL": pdl,
+        },
+        "options": {"num_warps": 4, "launch_pdl": pdl},
+        # The two ranges start at multiples of a head, and a row is a whole number of heads.
+        "aligned": ["query_ptr", "key_ptr", "cosine_ptr", "sine_ptr", "row_stride"],
+    }
+
+
 def spec(fields, parameters, target):
     """The compilation of one qk_norm_rope descriptor."""
     head_dim = int(fields["head_dim"])
@@ -37,6 +72,8 @@ def spec(fields, parameters, target):
     # The turned pairs in tiles of a power of two: 96 channels turn 48 pairs.
     pair_lanes = 1 << (rotated // 2 - 1).bit_length()
     pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+    if fields.get("strided") == "true":
+        return strided_spec(fields, head_dim, rotated, pdl)
 
     signature = {
         "query_ptr": "*" + DTYPES[fields["dtype"]],

@@ -27,8 +27,10 @@ def spec(fields, parameters, target):
     """The compilation of one weighted_rms_norm descriptor."""
     columns = int(fields["columns"])
     dtype = "*" + DTYPES[fields["dtype"]]
+    # The update and the normalized rows, when the key names a type narrower than the residual's.
+    activation = "*" + DTYPES[fields.get("activation", fields["dtype"])]
     absmax = fields["absmax"] == "true"
-    signature = {"hidden_ptr": dtype, "weight_ptr": dtype, "output_ptr": dtype}
+    signature = {"hidden_ptr": dtype, "weight_ptr": dtype, "output_ptr": activation}
     if absmax:
         signature["partials_ptr"] = "*fp32"
     signature["eps"] = "fp32"

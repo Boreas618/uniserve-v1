@@ -122,6 +122,7 @@ const OPERATORS: &[&str] = &[
     <crate::unpatchify::Unpatchify as Op>::NAME,
     <crate::copy_block::CopyBlock as Op>::NAME,
     <crate::cross_fade::CrossFade as Op>::NAME,
+    <crate::tile_stitch::TileStitch as Op>::NAME,
     <crate::posterior::Posterior as Op>::NAME,
     <crate::rope::RopeApply as Op>::NAME,
     <crate::pcm::PcmInterleave as Op>::NAME,

@@ -43,7 +43,7 @@ use std::process::ExitCode;
 use minimax_h3::audio_vae::BigVgan;
 use minimax_h3::config::offered_canvases;
 use minimax_h3::decoding::{ClipDecoder, video_arena};
-use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder, folded_input};
+use minimax_h3::video_vae::{ACTIVATION, Canvas, STREAM, Tiles, VideoDecoder};
 use nn::{
     Arena, Backing, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape, TensorView,
     WeightKey, WeightLoader,
@@ -347,32 +347,15 @@ fn stage_weights(args: &Args) -> Result<()> {
         }
     };
     let component = checkpoint.component(VAE)?;
-    let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
-    println!("folded input: {width} columns of {dtype} from the checkpoint's three affines");
     let canvas = Canvas::clip(&config.video_vae, args.latent_height, args.latent_width);
     let mut store = HostWeights::default();
     {
         let mut loader = WeightLoader::new(component, &mut store, None, None);
-        let weight = loader.constant(
-            "video_decoder.input.weight",
-            dtype,
-            Shape::new(&[width, u64::from(config.video_vae.latent_channels)]),
-            &weight,
-            "minimax-h3",
-        )?;
-        let bias = loader.constant(
-            "video_decoder.input.bias",
-            dtype,
-            Shape::new(&[width]),
-            &bias,
-            "minimax-h3",
-        )?;
-        let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
         let mut shards = loader.reborrow(source)?;
         let spatial = config.video_vae.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], &mut shards)?;
         let _ = &decoder;
         println!(
             "loaded: {} layers, {} registers, clip {}x{} latent cells, {} frames kept of {} decoded",
@@ -466,7 +449,11 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    it is composed from the checkpoint's bytes at the loading boundary, so a decode never sees
     //    the reference's three separate steps.
     let component = checkpoint.component(VAE)?;
-    let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
+    let width = u64::from(
+        config.video_vae.decoder_num_attention_heads * config.video_vae.decoder_attention_head_dim,
+    );
+    // The latents are FP32 and the raster is the decoder's declared activation type.
+    let dtype = STREAM;
     // The latent container carries the decode's own element type, whatever the deployment states:
     // `dtype = "auto"` converts nothing, so the export's VAE representation *is* the decode's, and a
     // container of another width would write bytes labelled one width from a buffer of another - a
@@ -490,9 +477,8 @@ fn stage_decode(args: &Args) -> Result<()> {
     // stage stop on the 588th tensor - and the decoder's list is the one statement of them, checked at
     // each publish. No count is written here: the list is iterated, so a constant added to it is
     // covered without an edit to this comment or this sum.
-    let affine = (width * latent_channels + width) * u64::from(dtype.bits()) / 8;
-    let mut synthesized = affine.max(1).next_multiple_of(granularity);
-    for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width, dtype)? {
+    let mut synthesized = 3 * granularity;
+    for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width)? {
         synthesized += bytes.max(1).next_multiple_of(granularity);
     }
     let needed = resident_bytes(
@@ -501,30 +487,15 @@ fn stage_decode(args: &Args) -> Result<()> {
         granularity,
     )? + synthesized;
     let mut weights = DeviceWeights::new(&device, needed, granularity)?;
-    let (decoder, positions, rows) = {
+    let (decoder, positions, stitch_table, rows) = {
         let mut loader = WeightLoader::new(component, &mut weights, None, None);
-        let weight = loader.constant(
-            "video_decoder.input.weight",
-            dtype,
-            Shape::new(&[width, latent_channels]),
-            &weight,
-            "minimax-h3",
-        )?;
-        let bias = loader.constant(
-            "video_decoder.input.bias",
-            dtype,
-            Shape::new(&[width]),
-            &bias,
-            "minimax-h3",
-        )?;
-        let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let source = checkpoint.component(VAE)?;
         let mut shards = loader.reborrow(source)?;
         let spatial = config.video_vae.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
-        // 4. The one table a decode reads: the per-voxel rotary positions, whose rows are the
-        //    largest tile's - one table for every canvas of this grid.
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], &mut shards)?;
+        // 4. The two tables a decode reads: the per-voxel rotary positions, whose rows are the
+        //    largest tile's - one table for every canvas of this grid - and the stitch's.
         let tables = decoder.tables(args.latent_height, args.latent_width)?;
         let mut bytes: Vec<Vec<u8>> = tables.iter().map(|_| Vec::new()).collect();
         for (buffer, table) in bytes.iter_mut().zip(&tables) {
@@ -535,9 +506,9 @@ fn stage_decode(args: &Args) -> Result<()> {
             );
         }
         decoder.table_bytes(args.latent_height, args.latent_width, &mut bytes)?;
-        let [table] = bytes.as_slice() else {
+        let [table, stitch_bytes] = bytes.as_slice() else {
             return Err(Failure::message(format!(
-                "the decoder declares {} layout tables; its decode reads one",
+                "the decoder declares {} layout tables; its decode reads two",
                 bytes.len()
             )));
         };
@@ -550,7 +521,16 @@ fn stage_decode(args: &Args) -> Result<()> {
             "minimax-h3",
         )?;
         let positions = positions.view();
-        (decoder, positions, rows)
+        let stitch_table = loader
+            .constant(
+                "video_decoder.stitch",
+                tables[1].dtype,
+                tables[1].shape,
+                stitch_bytes,
+                "minimax-h3",
+            )?
+            .view();
+        (decoder, positions, stitch_table, rows)
     };
     // What the reservation was for, against what it held: the two numbers a reader needs to tell a
     // tight pool from a wrong one, both about publishing and nothing else.
@@ -581,7 +561,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     // 5. The arena: `video_arena` is the plan the runner reserves by, and this harness uses it rather
     //    than an estimate, because an estimate that is short would surface as a reservation inside the
     //    decode and name a buffer rather than the plan.
-    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
+    let plan = video_arena(&config.video_vae, &canvas)?;
     // **Each buffer at the arena's alignment, not at its raw size.** The arena aligns every give-out
     // to `nn::forward::ALIGNMENT`, so the raw sum is short by up to 255 bytes per buffer - and the
     // first run to meet it was 64 bytes short of a 372 MiB region, which is the two rotary tables'
@@ -601,12 +581,13 @@ fn stage_decode(args: &Args) -> Result<()> {
         ))
     })?;
     let (pixel_height, pixel_width) = canvas.pixels(&config.video_vae);
-    let held = element_bytes
-        * (voxels * latent_channels
-            + u64::from(minimax_h3::output::Rgb::CHANNELS)
-                * u64::from(canvas.frames_out(&config.video_vae))
-                * u64::from(pixel_height)
-                * u64::from(pixel_width));
+    let raster_bytes = ACTIVATION.bytes().unwrap_or(2);
+    let held = element_bytes * voxels * latent_channels
+        + raster_bytes
+            * u64::from(minimax_h3::output::Rgb::CHANNELS)
+            * u64::from(canvas.frames_out(&config.video_vae))
+            * u64::from(pixel_height)
+            * u64::from(pixel_width);
     // The plan's own number plus what this harness holds. A stated `--arena-gib` may raise it - a real
     // over-reserve is honest if it says so - and the line below prints all three, so a short
     // reservation is visible as a number rather than as a failure inside the decode.
@@ -848,17 +829,25 @@ fn stage_decode(args: &Args) -> Result<()> {
     let frames = u64::from(canvas.frames_out(&config.video_vae));
     let (height, width_px) = canvas.pixels(&config.video_vae);
     let out = arena.tensor(
-        dtype,
+        ACTIVATION,
         Shape::new(&[channels, frames, u64::from(height), u64::from(width_px)]),
     )?;
-    let clip = ClipDecoder::new(&config.video_vae, dtype)?;
+    let clip = ClipDecoder::new(&config.video_vae)?;
     // The walk: what this decode binds, recorded rather than inferred. `tools/walk_gaps.py` diffs it
     // against the store's key list, so a bound key the store has no program for is one command away
     // instead of one device round. Installed for the duration of the decode and removed whether it
     // succeeds or fails: a sink left installed would be reported to by every later launch.
     let mut walk = Walk(Vec::new());
     ops::capture::set_sink(Some(&mut walk));
-    let decode_result = clip.decode_clip(&forward, &decoder, &tiles, latents, positions, out);
+    let decode_result = clip.decode_clip(
+        &forward,
+        &decoder,
+        &tiles,
+        latents,
+        positions,
+        stitch_table,
+        out,
+    );
     ops::capture::set_sink(None);
     // The walk is written before the outcome is read: the launch after its last line is the one that
     // stopped, so a decode that fails still says where it got to. A walk written only on success makes
@@ -915,10 +904,8 @@ fn stage_decode(args: &Args) -> Result<()> {
     let raster = download(
         &stream,
         out,
-        usize::try_from(
-            channels * frames * u64::from(height) * u64::from(width_px) * element_bytes,
-        )
-        .unwrap_or(0),
+        usize::try_from(channels * frames * u64::from(height) * u64::from(width_px) * raster_bytes)
+            .unwrap_or(0),
     )?;
     if raster.iter().all(|byte| *byte == 0) {
         return Err(Failure::message(
@@ -934,7 +921,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         channels,
         frames,
         u64::from(height) * u64::from(width_px),
-        element_bytes,
+        raster_bytes,
     );
     write_h3t(
         &directory.join("latents.h3t"),
@@ -951,7 +938,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("raster.h3t"),
         &[frames, u64::from(height), u64::from(width_px), channels],
-        element_of(dtype)?,
+        element_of(ACTIVATION)?,
         &transposed,
     )?;
     // **The raster in numpy's own container, beside the crate's.** `tools/diagnosis/compare.py`
@@ -964,7 +951,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     minimax_h3::diagnosis::write_npy(
         &directory.join("raster.npy"),
         &raster_shape,
-        &widen_to_f32(&transposed, dtype)?,
+        &widen_to_f32(&transposed, ACTIVATION)?,
     )
     .map_err(Failure::message)?;
     // **The seams, stated where the comparison reads them.** A blend's arithmetic is invisible in a
@@ -1071,10 +1058,6 @@ fn stage_plan(args: &Args) -> Result<()> {
         }
         canvas
     };
-    // The video VAE is F32 in every export this model serves (`component-tensors.json`: 703 tensors,
-    // all F32), and `--stage decode` pins the latent container to the checkpoint's own type for the
-    // same reason. The plan's element types follow the decode's, so the plan is stated at that type.
-    let dtype = nn::DType::F32;
     let (height, width) = canvas.pixels(&config.video_vae);
     let tiles = minimax_h3::video_vae::Tiles::of(&config.video_vae, &canvas)?;
     let grid = tiles.tiles(&config.video_vae, &canvas);
@@ -1088,7 +1071,22 @@ fn stage_plan(args: &Args) -> Result<()> {
         width,
         grid.len()
     );
-    let plan = video_arena(&config.video_vae, &canvas, dtype)?;
+    // The rows a store must hold for this decoder and its splice, in the store's list format.
+    let mut rows = VideoDecoder::programs(&config.video_vae)?;
+    rows.extend(minimax_h3::output::VideoPostprocessor::programs(
+        ACTIVATION,
+        &[(height, width)],
+    ));
+    let listed: String = rows
+        .iter()
+        .map(|(operator, key)| format!("{operator}\t{key}\n"))
+        .collect();
+    std::fs::create_dir_all(&args.out)
+        .map_err(|error| Failure::message(format!("{}: {error}", args.out.display())))?;
+    let path = args.out.join("decoder-keys.txt");
+    std::fs::write(&path, listed)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+    let plan = video_arena(&config.video_vae, &canvas)?;
     let mut total = 0_u64;
     for buffer in &plan {
         let bytes = buffer.bytes();
@@ -1390,13 +1388,15 @@ fn stage_timeline(args: &Args) -> Result<()> {
     // The weights, sized as `--stage decode` sizes them, with the two de-normalization constants and
     // the position table the serving load publishes beside them.
     let component = checkpoint.component(VAE)?;
-    let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
+    let width = u64::from(
+        config.video_vae.decoder_num_attention_heads * config.video_vae.decoder_attention_head_dim,
+    );
+    let dtype = ACTIVATION;
     let latent_channels = u64::from(config.video_vae.latent_channels);
     let granularity =
         u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
-    let affine = (width * latent_channels + width) * u64::from(dtype.bits()) / 8;
-    let mut synthesized = affine.max(1).next_multiple_of(granularity) + 3 * granularity;
-    for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width, dtype)? {
+    let mut synthesized = 5 * granularity;
+    for (_, bytes) in minimax_h3::video_vae::constants(&config.video_vae, canvas, width)? {
         synthesized += bytes.max(1).next_multiple_of(granularity);
     }
     let needed = resident_bytes(
@@ -1406,23 +1406,8 @@ fn stage_timeline(args: &Args) -> Result<()> {
     )? + synthesized;
     let mut weights = DeviceWeights::new(&device, needed, granularity)?;
     let spatial = config.video_vae.spatial_compression();
-    let (decoder, postprocessor, positions) = {
+    let (decoder, postprocessor, positions, stitch_table) = {
         let mut loader = WeightLoader::new(component, &mut weights, None, None);
-        let weight = loader.constant(
-            "video_decoder.input.weight",
-            dtype,
-            Shape::new(&[width, latent_channels]),
-            &weight,
-            "minimax-h3",
-        )?;
-        let bias = loader.constant(
-            "video_decoder.input.bias",
-            dtype,
-            Shape::new(&[width]),
-            &bias,
-            "minimax-h3",
-        )?;
-        let input = nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
         let bytes = |values: [f32; 3]| -> Vec<u8> {
             values
                 .iter()
@@ -1448,15 +1433,15 @@ fn stage_timeline(args: &Args) -> Result<()> {
         let shards_source = checkpoint.component(VAE)?;
         let mut shards = loader.reborrow(shards_source)?;
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        let decoder = VideoDecoder::load(&config.video_vae, &[raster], dtype, input, &mut shards)?;
+        let decoder = VideoDecoder::load(&config.video_vae, &[raster], &mut shards)?;
         let tables = decoder.tables(args.latent_height, args.latent_width)?;
-        let [table] = tables.as_slice() else {
+        let [table, stitch] = tables.as_slice() else {
             return Err(Failure::message(format!(
-                "the decoder declares {} layout tables; its decode reads one",
+                "the decoder declares {} layout tables; its decode reads two",
                 tables.len()
             )));
         };
-        let mut bytes = vec![Vec::new()];
+        let mut bytes = vec![Vec::new(), Vec::new()];
         decoder.table_bytes(args.latent_height, args.latent_width, &mut bytes)?;
         let positions = loader
             .constant(
@@ -1467,7 +1452,16 @@ fn stage_timeline(args: &Args) -> Result<()> {
                 "minimax-h3",
             )?
             .view();
-        (decoder, postprocessor, positions)
+        let stitch_table = loader
+            .constant(
+                "video_decoder.stitch",
+                stitch.dtype,
+                stitch.shape,
+                &bytes[1],
+                "minimax-h3",
+            )?
+            .view();
+        (decoder, postprocessor, positions, stitch_table)
     };
 
     // What the runner asks the block for, once per bucket.
@@ -1482,13 +1476,9 @@ fn stage_timeline(args: &Args) -> Result<()> {
         .latent_rows(&layout)?
         .ok_or_else(|| Failure::message("the video decoder states the rows it reads"))?;
     let splices = postprocessor.splices(args.timeline_frames)?;
-    let element = usize::try_from(dtype.bytes().unwrap_or(0)).unwrap_or(0);
-    if dtype != DType::F32 {
-        return Err(Failure::message(format!(
-            "the timeline reads an FP32 trajectory and this decoder computes in {dtype}: this stage \
-             states no conversion"
-        )));
-    }
+    // The latents are a denoiser's FP32 and the rasters the decoder's own type.
+    let element = usize::try_from(STREAM.bytes().unwrap_or(0)).unwrap_or(0);
+    let raster_element = dtype.bytes().unwrap_or(0);
 
     // Four buffers the runner holds in columns, then the region a decode's arena is cut from afresh.
     let (pixels, channels) = (
@@ -1496,17 +1486,21 @@ fn stage_timeline(args: &Args) -> Result<()> {
         u64::from(minimax_h3::output::Rgb::CHANNELS),
     );
     let block_bytes = rows.len() as u64 * latent_channels * element as u64;
-    let raster_bytes = channels * u64::from(clip_frames) * pixels * element as u64;
-    let tail_bytes = channels * 5 * pixels * element as u64;
+    let raster_bytes = channels * u64::from(clip_frames) * pixels * raster_element;
+    let tail_bytes = channels * 5 * pixels * raster_element;
     let frames_bytes = u64::from(args.timeline_frames) * pixels * channels;
-    let held_bytes = block_bytes + raster_bytes + tail_bytes + frames_bytes + (1 << 20);
+    let trajectory_room = std::fs::metadata(&source)
+        .map_err(|error| Failure::message(format!("{}: {error}", source.display())))?
+        .len();
+    let held_bytes =
+        block_bytes + raster_bytes + tail_bytes + frames_bytes + trajectory_room + (1 << 20);
     let scratch_bytes = decoder.arena_bytes(&layout)?.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     let total = usize::try_from(held_bytes + scratch_bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, total)?;
     let region = allocator.allocate(platform::PoolKind::Graph, total)?;
     let held = Arena::new(DevicePtr::new(region.address()), held_bytes);
-    let block = held.tensor(dtype, Shape::new(&[rows.len() as u64, latent_channels]))?;
+    let block = held.tensor(STREAM, Shape::new(&[rows.len() as u64, latent_channels]))?;
     let raster = held.tensor(
         dtype,
         Shape::new(&[
@@ -1532,45 +1526,44 @@ fn stage_timeline(args: &Args) -> Result<()> {
     let scratch = DevicePtr::new(region.address() + held_bytes);
 
     // The trajectory: `[channels, voxels]` over the whole timeline.
-    let trajectory = std::fs::read(&source)
+    let trajectory_bytes = std::fs::read(&source)
         .map_err(|error| Failure::message(format!("{}: {error}", source.display())))?;
-    let voxels = trajectory.len() / (usize::try_from(latent_channels).unwrap_or(1) * element);
-    let plane = (args.latent_height * args.latent_width) as usize;
+    let trajectory = held.tensor(
+        STREAM,
+        Shape::new(&[(trajectory_bytes.len() / element) as u64]),
+    )?;
+    // SAFETY: `trajectory` is `trajectory_bytes`' length, and the bytes outlive the copy, which is
+    // waited on.
+    unsafe {
+        platform::memcpy_async(
+            trajectory.ptr.address(),
+            trajectory_bytes.as_ptr() as u64,
+            trajectory_bytes.len(),
+            &stream,
+        )?;
+    }
+    stream.synchronize()?;
     let directory = args.out.join("timeline");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
 
     for (index, splice) in splices.iter().enumerate() {
-        // The clip's window, in the rows the block states.
-        let start = decoder.clip_start(index as u32) as usize * plane;
-        let width_channels = usize::try_from(latent_channels).unwrap_or(0);
-        let mut staged = vec![0_u8; rows.len() * width_channels * element];
-        for (row, voxel) in rows.iter().enumerate() {
-            for channel in 0..width_channels {
-                let from = (channel * voxels + start + *voxel as usize) * element;
-                let to = (row * width_channels + channel) * element;
-                staged[to..to + element].copy_from_slice(&trajectory[from..from + element]);
-            }
-        }
-        // SAFETY: `block` is `staged`'s length and `staged` outlives the copy, which is waited on.
-        unsafe {
-            platform::memcpy_async(
-                block.ptr.address(),
-                staged.as_ptr() as u64,
-                staged.len(),
-                &stream,
-            )?;
-        }
-        stream.synchronize()?;
         let started = std::time::Instant::now();
         let arena = Arena::new(scratch, scratch_bytes);
         let forward = Forward::new(&stream, &generation, &arena);
+        decoder.gather_latents(
+            &forward,
+            &layout,
+            trajectory,
+            decoder.clip_start(index as u32),
+            block,
+        )?;
         // The capability's `decode`, not the inherent tile decoder of the same name.
         nn::capability::Decoder::decode(
             &decoder,
             &forward,
             block,
-            &[positions],
+            &[positions, stitch_table],
             DecodedMedia {
                 video: Some(raster),
                 audio: None,
@@ -1584,12 +1577,14 @@ fn stage_timeline(args: &Args) -> Result<()> {
             scratch_bytes >> 20
         );
         let bytes = download(&stream, raster, usize::try_from(raster_bytes).unwrap_or(0))?;
-        minimax_h3::diagnosis::write_npy(
-            &directory.join(format!("raster_{index}.npy")),
-            raster.shape.dims(),
-            &bytes,
-        )
-        .map_err(Failure::message)?;
+        if std::env::var_os("H3_RASTERS").is_some() {
+            minimax_h3::diagnosis::write_npy(
+                &directory.join(format!("raster_{index}.npy")),
+                raster.shape.dims(),
+                &widen_to_f32(&bytes, dtype)?,
+            )
+            .map_err(Failure::message)?;
+        }
 
         // The splice, on a fresh arena as the runner's is, and the tail its successor reads.
         let arena = Arena::new(scratch, scratch_bytes);
@@ -1625,7 +1620,7 @@ fn stage_timeline(args: &Args) -> Result<()> {
                     raster
                         .element(&[channel, u64::from(clip_frames) - 5, 0, 0])
                         .address(),
-                    usize::try_from(5 * pixels * element as u64).unwrap_or(0),
+                    usize::try_from(5 * pixels * raster_element).unwrap_or(0),
                     &stream,
                 )?;
             }

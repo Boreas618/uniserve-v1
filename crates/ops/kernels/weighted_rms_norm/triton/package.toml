@@ -30,7 +30,12 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
+[[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["768", "1024", "1536", "2048", "3072", "4096", "5120", "5376", "6144", "7168", "8192", "12288", "16384"], tile = ["1024", "2048", "4096", "8192", "16384"], absmax = ["true", "false"] }
+
+# A residual held wider than the rows a projection reads: the update and the normalized rows are
+# `activation`, and the key names it only then. The video VAE's decoder keeps an FP32 stream.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["768", "1024", "1536", "2048", "3072", "4096", "5120", "5376", "6144", "7168", "8192", "12288", "16384"], tile = ["1024", "2048", "4096", "8192", "16384"], absmax = ["true", "false"] , activation = ["bf16", "f16"] }
 
 [parameters]

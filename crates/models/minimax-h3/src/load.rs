@@ -838,10 +838,9 @@ pub fn load(
             Component::VideoPostprocessor => {
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
                 // deviations, uploaded once as the two `[3]` weights the byte step reads. It reads and
-                // writes the video decoder's rasters, so it holds their element type - the decoder's,
-                // which is the type the checkpoint stores it in whatever the deployment states for
-                // the rest of the pipeline.
-                let dtype = stored_dtype(checkpoint, Component::VideoDecoder.directories()[0])?;
+                // writes the video decoder's rasters, so it holds their element type, which the
+                // decoder declares.
+                let dtype = crate::video_vae::ACTIVATION;
                 let bytes = |values: [f32; 3]| -> Vec<u8> {
                     values
                         .iter()
@@ -898,56 +897,12 @@ pub fn load(
                 // built here too so that no layer is built on a request's path.
                 // The decoder converts the deployment's pixel rasters to its latent canvases and
                 // checks each is whole cells; this file only passes them through.
-                // The clip's rows are packed in the attention's order, so the decoder needs it at
-                // load. It is the denoisers' and it must be one: two partitions that attend
-                // differently would pack one clip two ways, and one table can only gather one.
-                let mut kinds = config.denoisers.values().map(|dit| dit.attention);
-                let attention = kinds.next().ok_or_else(|| {
-                    Error::checkpoint(
-                        "the checkpoint states no DiT, so no attention kind packs the video \
-                         decoder's clip rows"
-                            .to_owned(),
-                    )
-                })?;
-                if kinds.any(|kind| kind != attention) {
-                    return Err(Error::Unsupported(format!(
-                        "the {} block gathers a clip's rows in the denoisers' attention order, and \
-                         this checkpoint's DiT partitions attend differently",
-                        component.name()
-                    )));
-                }
-                // The decoder's three reference steps before its transformer - denormalise,
-                // post-quantise, project - are one affine, composed here from the checkpoint's own
-                // bytes. Its element type is the type those weights are stored in: `dtype = "auto"`
-                // converts nothing, and the reference reads the projection's type for the same reason.
-                let vae = checkpoint.component(component.directories()[0])?;
-                let (width, dtype, weight, bias) =
-                    crate::video_vae::folded_input(vae, &config.video_vae)?;
-                let latent = u64::from(config.video_vae.latent_channels);
-                let weight = loader.constant(
-                    "video_decoder.input.weight",
-                    dtype,
-                    nn::Shape::new(&[width, latent]),
-                    &weight,
-                    "minimax-h3",
-                )?;
-                let bias = loader.constant(
-                    "video_decoder.input.bias",
-                    dtype,
-                    nn::Shape::new(&[width]),
-                    &bias,
-                    "minimax-h3",
-                )?;
-                let input =
-                    nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
                 let source = checkpoint.component(component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
                 let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,
                     canvases,
-                    dtype,
-                    input,
                     &mut shards,
                 )?);
                 video_decoder = Some(Arc::clone(&decoder));

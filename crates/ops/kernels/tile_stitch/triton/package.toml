@@ -1,0 +1,33 @@
+# The tile_stitch operator's Triton backend: design 5.2's program package.
+#
+# One module per descriptor: a clip's decoded tiles from their tokens into its raster, with the seam
+# blends and the crop on the way. The element type, the channels and the patch are compiled; the
+# raster's extents, its strides and the grid's numbers are the launch's words, and the grid itself
+# arrives as two tables, so one module serves every canvas.
+
+op = "tile_stitch"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/tile_stitch.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_f16_channels_3_patch_frames_4_patch_side_16_block_1024`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["3"], patch_frames = ["4"], patch_side = ["16"], block = ["1024"] }
+
+[parameters]
