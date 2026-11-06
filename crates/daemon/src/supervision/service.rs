@@ -1361,9 +1361,9 @@ impl LeaderService {
             nodes,
             engines,
             next_engine,
-            // A client of the process socket goes on with the rest: a main
-            // process's executors are started, relaunched and stopped on one
-            // for the engine's life, and a daemon's control connection is one.
+            // A client of the process socket goes on with the rest: a daemon's
+            // control connection is one, and the connection its engine's process
+            // lives under outlives a query.
             clients,
             // The successor numbers its clients on from those it adopts.
             next_client: _,
