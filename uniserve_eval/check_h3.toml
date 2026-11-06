@@ -14,10 +14,12 @@
 # voice, auto canvas, 5 s) and of their seed-42 warmup rows, so the check set
 # does not depend on the order or content of the performance manifests.
 #
-# Every point writes its MP4 to a fixed per-cell directory,
-# artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4, so a
-# confirmed cell keeps the same path for people to watch; the result bundles
-# go to artifact_root. The automatic checks are exactly the ones the video
+# Every point writes its MP4 to a fixed per-cell directory, so a confirmed cell
+# keeps the same path for people to watch: artifacts/minimax_h3/check/
+# <checkpoint>-<task>/<request id>.mp4 in check-h3, and
+# artifacts/minimax_h3/check-reversed/<checkpoint>-<task>/<request id>.mp4 in
+# check-h3-reversed. Both suites' result bundles go to artifact_root, under
+# the point's own name. The automatic checks are exactly the ones the video
 # task already makes (MP4 validity: canvas, frame count, frame rate, stereo
 # soundtrack) and the protected performance metrics; nothing else is added.
 #
