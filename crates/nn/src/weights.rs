@@ -761,16 +761,10 @@ pub struct QuantizedStack {
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
-    /// `[1]` f32: the activation encoder's global scale for this stack's activations — **1.0**.
-    ///
-    /// One, and published rather than defaulted at the call site, because of what the encoder's two
-    /// levels do. With `s = max(|x / g|) / 6` and a code `round(x / (g · s))`, the effective step is
-    /// `g · s = max(|x|) / 6`: **the code does not depend on `g`, and neither does the reconstruction
-    /// `code · s' · token`, in which the encoder's own factor cancels.** So the calibrated activation
-    /// scale changes no value in a dynamically quantized activation, and folding it into
-    /// [`Self::global_scale`] would fold a factor into a table that has already absorbed it. The
-    /// checkpoint's per-expert activation scales stay published beside the weights as the
-    /// checkpoint's own data ([`Self::input_scale`]) and no operand multiplies a value by them.
+    /// `[1]` f32: the activation encoder's global scale for this stack's activations: the
+    /// reciprocal of the widest calibrated activation scale among its experts. The encoder writes
+    /// that activation scale as each row's factor, and the product multiplies it in, so the table
+    /// [`Self::global_scale`] holds the weights' tensor scales alone.
     pub encode_scale: Weight,
     /// `[projections, experts]` f32, row-major, in the same order: the reciprocal of each expert's
     /// **per-projection** activation tensor scale, when the caller asked for it.
@@ -1577,7 +1571,7 @@ impl<'a> WeightLoader<'a> {
         let mut columns = None;
         let mut values_bytes = Vec::new();
         let mut scales_bytes = Vec::new();
-        let mut reciprocals = Vec::with_capacity(experts as usize);
+        let mut tensor_scales = Vec::with_capacity(experts as usize);
         let mut activation_reciprocals = Vec::with_capacity(experts as usize * projections.len());
         let mut scale_shape = None;
         let mut scale_dtype = None;
@@ -1688,7 +1682,7 @@ impl<'a> WeightLoader<'a> {
                         format!("a tensor scale of {scale} is not a positive number"),
                     ));
                 }
-                reciprocals.push(1.0 / scale);
+                tensor_scales.push(scale);
                 if input_scale {
                     let request = WeightRequest::region(&activation_name, 0, Shape::new(&[1]));
                     activation_reciprocals.push(self.activation_reciprocal(&request)?);
@@ -1737,21 +1731,21 @@ impl<'a> WeightLoader<'a> {
             layout.shape(rows, columns).dim(0),
             layout.shape(rows, columns).dim(1),
         ]);
-        // `reciprocals` was collected expert-major, in the checkpoint's own reading order; the
+        // `tensor_scales` was collected expert-major, in the checkpoint's own reading order; the
         // published table is projection-major, one packed row per projection.
         let projections_shape = Shape::new(&[per, count]);
         let strides = Projections::new(per, count);
-        if reciprocals.len() != strides.len() {
+        if tensor_scales.len() != strides.len() {
             return Err(Error::weight(
                 name,
                 format!(
                     "{per} projections of {count} experts are {} scales, and the checkpoint gave {}",
                     strides.len(),
-                    reciprocals.len()
+                    tensor_scales.len()
                 ),
             ));
         }
-        let scale_bytes: Vec<u8> = strides.bytes(&reciprocals);
+        let scale_bytes: Vec<u8> = strides.bytes(&tensor_scales);
         let files = self.identities(&fields)?;
 
         let values = self.publish_computed(
@@ -1864,14 +1858,18 @@ impl<'a> WeightLoader<'a> {
         } else {
             None
         };
-        // The encoder's global scale is one: the calibrated activation scale cancels out of both the
-        // code and the reconstruction (see `QuantizedStack::encode_scale`), and a host value here
-        // would be a number someone later "corrects" back to the checkpoint's.
+        // One encoder serves the whole stack, so it takes the widest of its experts' calibrated
+        // activation scales, whose reciprocal is the smallest: no expert's block scale saturates.
+        let encode = activation_reciprocals
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let encode = if encode.is_finite() { encode } else { 1.0 };
         let encode_scale = self.constant(
             &format!("{name}__nvfp4_encode_scale"),
             DType::F32,
             Shape::new(&[1]),
-            &1.0_f32.to_ne_bytes(),
+            &encode.to_ne_bytes(),
             "nn",
         )?;
         Ok(QuantizedStack {

@@ -126,7 +126,7 @@ pub(crate) enum Projection {
         /// The encoder and the packed product, which carry the checkpoint's scales. Boxed because it
         /// is several times the dense layer's size and a layer holds seven projections.
         linear: Box<Nvfp4Linear>,
-        /// The reciprocal of the weight's tensor scale, as the product takes it.
+        /// The product of the weight's and the activation's tensor scales.
         alpha: Weight,
     },
 }

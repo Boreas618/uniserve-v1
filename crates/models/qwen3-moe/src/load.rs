@@ -603,6 +603,9 @@ fn encoded(
         0,
         Shape::new(&[1]),
     );
+    // A dense product dequantizes `code * block_scale` on both sides, so its alpha is the two tensor
+    // scales' product: the weight's and the activation's.
+    let product_alpha = global_scale * loader.tensor_scale(&input_scale)?;
     // `layout` is the **checkpoint's** arrangement — linear, one scale per sixteen elements — and
     // not the product's, which the loader is given separately and states back in
     // `QuantizedWeight::layout`, so the two cannot be confused for one another.
@@ -621,7 +624,7 @@ fn encoded(
         &format!("{parameter}.alpha"),
         DType::F32,
         Shape::new(&[1]),
-        &quantized.global_scale.to_le_bytes(),
+        &product_alpha.to_le_bytes(),
         "qwen3-moe",
     )?;
     let linear = Nvfp4Linear::new(
@@ -831,7 +834,7 @@ fn expert_block(
                     epilogue_tile_m: 128,
                 },
                 WEIGHT_SCALE_LAYOUT,
-                false,
+                true,
             )
             .map_err(Error::from)?;
         let down: QuantizedStack = loader
@@ -845,7 +848,7 @@ fn expert_block(
                     epilogue_tile_m: 128,
                 },
                 WEIGHT_SCALE_LAYOUT,
-                false,
+                true,
             )
             .map_err(Error::from)?;
         let activation = activation(config.hidden_act)?;
