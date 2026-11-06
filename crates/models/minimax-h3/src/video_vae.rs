@@ -1725,6 +1725,12 @@ impl Decoder for VideoDecoder {
         VideoPostprocessor::splices_of(frames)
     }
 
+    /// Clip `k` decodes latent frames `[5k, 5k + 7)`: five that advance the timeline, and two the
+    /// next clip's window also reads.
+    fn clip_start(&self, clip: u32) -> u32 {
+        clip * crate::CLIP_LATENTS
+    }
+
     /// The checkpoint's own element type, read at load rather than chosen (design 1).
     fn element_type(&self) -> nn::DType {
         self.dtype
